@@ -1,0 +1,77 @@
+<template>
+  <section class="daily-card">
+    <div class="daily-head">
+      <div>
+        <p class="muted">每日 10 点推送</p>
+        <h2>下午好，这是昨日的经营数据</h2>
+      </div>
+      <div class="date-pill">
+        <b>{{ day }}</b>
+        <span>{{ month }}</span>
+      </div>
+    </div>
+    <p class="daily-summary">{{ summary }}</p>
+    <div class="metric-grid">
+      <div v-for="item in metricItems" :key="item.label" class="metric-item">
+        <span>{{ item.label }}</span>
+        <strong>{{ item.value }}</strong>
+      </div>
+    </div>
+    <div class="advice-panel">
+      <h3>经营建议</h3>
+      <div v-for="(suggestion, index) in report.suggestions" :key="suggestion" class="advice-row">
+        <p>{{ suggestion }}</p>
+        <button
+          type="button"
+          :class="{ adopted: adoptedSuggestions.has(index) }"
+          @click="adopt(index)"
+        >
+          {{ adoptedSuggestions.has(index) ? '已采纳' : '采纳' }}
+        </button>
+      </div>
+    </div>
+  </section>
+</template>
+
+<script setup>
+import { computed, ref } from 'vue'
+
+const props = defineProps({
+  report: {
+    type: Object,
+    required: true
+  }
+})
+
+const adoptedSuggestions = ref(new Set())
+
+const metricItems = computed(() => {
+  const metrics = props.report.metrics || {}
+  return Object.entries(metrics).map(([label, value]) => ({
+    label,
+    value: formatValue(label, value)
+  }))
+})
+
+const date = computed(() => props.report.date || '2026-05-23')
+const day = computed(() => new Date(date.value).getDate())
+const month = computed(() => `${new Date(date.value).getMonth() + 1}月`)
+const summary = computed(() => {
+  const gmv = Number((props.report.metrics || {})['昨日总gmv金额'] || 0)
+  return gmv > 0 ? '昨日已有成交数据，建议继续关注转化和售后表现。' : '暂无昨日经营数据，建议您积极经营，加油哦。'
+})
+
+function formatValue(label, value) {
+  const numeric = Number(value || 0)
+  if (label.includes('金额') || label.toLowerCase().includes('gmv')) {
+    return `￥${numeric.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`
+  }
+  return numeric.toLocaleString('zh-CN')
+}
+
+function adopt(index) {
+  const next = new Set(adoptedSuggestions.value)
+  next.add(index)
+  adoptedSuggestions.value = next
+}
+</script>

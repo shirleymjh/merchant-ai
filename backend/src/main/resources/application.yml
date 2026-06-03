@@ -1,0 +1,30 @@
+server:
+  port: ${SERVER_PORT:8088}
+
+spring:
+  application:
+    name: yshopping-merchant-ai
+
+yshopping:
+  company-name: yshopping
+  merchant-id: ${YSHOPPING_MERCHANT_ID:100}
+  llm:
+    base-url: ${YSHOPPING_LLM_BASE_URL:https://way.ydata.vip/v1}
+    model: ${YSHOPPING_LLM_MODEL:gpt-5.5}
+    api-key: ${YSHOPPING_LLM_API_KEY:}
+  wiki-path: ${YSHOPPING_WIKI_PATH:}
+  datasource:
+    doris:
+      url: ${YSHOPPING_DORIS_JDBC_URL:jdbc:mysql://127.0.0.1:9030/yshopping?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai}
+      username: ${YSHOPPING_DORIS_USERNAME:root}
+      password: ${YSHOPPING_DORIS_PASSWORD:}
+    answer:
+      url: ${YSHOPPING_ANSWER_JDBC_URL:jdbc:mysql://127.0.0.1:9030/yshopping?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai}
+      username: ${YSHOPPING_ANSWER_USERNAME:root}
+      password: ${YSHOPPING_ANSWER_PASSWORD:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
