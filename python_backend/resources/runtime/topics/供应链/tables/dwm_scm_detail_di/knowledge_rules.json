@@ -1,0 +1,25 @@
+[ {
+  "title" : "时间范围过滤",
+  "content" : "涉及最近N天、昨天、上个月等时间表达时，必须优先使用 `pt` 做业务日期过滤。",
+  "alwaysApply" : true,
+  "keywords" : [ "时间", "最近", "pt" ],
+  "evidence" : "Topic Builder 从时间字段识别"
+}, {
+  "title" : "商家范围过滤",
+  "content" : "回答单个商家问题时，必须用 `merchant_id` 过滤当前商家，避免查到全站数据。",
+  "alwaysApply" : true,
+  "keywords" : [ "商家", "过滤", "merchant_id" ],
+  "evidence" : "Topic Builder 从 merchant_id/seller_id 字段识别"
+}, {
+  "title" : "明细查询优先使用明细表",
+  "content" : "用户问“明细、哪几单、列表、记录”时，应使用该明细表返回真实单据，不要用 ads 指标表兜底伪装明细。",
+  "alwaysApply" : true,
+  "keywords" : [ "明细", "哪几单", "列表", "记录" ],
+  "evidence" : "明细表命名规则"
+}, {
+  "title" : "供应链履约口径",
+  "content" : "dwm_scm_detail_di 覆盖入库、质检、鉴定、出库全流程；发货超时明细按 `outbound_modify_time > outbound_latest_time` 判断，经营画像中的发货超时指标只适合汇总趋势。",
+  "alwaysApply" : true,
+  "keywords" : [ "履约", "发货超时", "出库", "质检", "鉴定" ],
+  "evidence" : "供应链全流程字段语义"
+} ]

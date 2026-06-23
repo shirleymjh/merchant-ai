@@ -1,0 +1,3070 @@
+{
+  "topic": "身份信息",
+  "questionCategory": "IDENTITY",
+  "tableName": "dim_merchant_df",
+  "tableComment": "dim-商家域-商家信息表",
+  "dataGrain": "商家主体/资质快照粒度",
+  "timeColumn": "pt",
+  "merchantFilterColumn": "merchant_id",
+  "status": "PENDING_REVIEW",
+  "version": "",
+  "generatedAt": "2026-06-15T18:17:34",
+  "reviewedAt": "",
+  "reviewer": "",
+  "reviewNote": "",
+  "manualNotes": "商家信息维表，承载商家主体、资质、入驻状态、结算、发货模式和保证金余额",
+  "schemaColumns": [
+    {
+      "columnName": "user_id",
+      "dataType": "varchar(128)",
+      "comment": "用户id",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "merchant_id",
+      "dataType": "varchar(128)",
+      "comment": "商家id",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "merchant_type_code",
+      "dataType": "bigint",
+      "comment": "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "merchant_type_name",
+      "dataType": "varchar(128)",
+      "comment": "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "brand_type_code",
+      "dataType": "bigint",
+      "comment": "资质类型code -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "brand_type_name",
+      "dataType": "varchar(128)",
+      "comment": "资质类型name -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "audit_user_list",
+      "dataType": "varchar(512)",
+      "comment": "审批人aclIds，逗号分隔",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "merchant_apply_status_code",
+      "dataType": "bigint",
+      "comment": "审核状态code，商家提交资料-0，保证金/账单/费率/协议填写审核-100，保证金低于标准，二次审核-110，初审不通过-120，初审通过，等待特批费率/类目运营审核-130，初审完成-140，待法务审核-200，法务审核不通过-210，法务审核通过，商家协议待确认-300，商家协议确认成功，保证金待缴纳-500，保证金转账待审核-520，保证金转账审核不通过-530，商家入驻被驳回-600，保证金转账审核通过，入驻完成-800",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "merchant_apply_status_name",
+      "dataType": "varchar(255)",
+      "comment": "审核状态name",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "init_deposit_amt",
+      "dataType": "bigint",
+      "comment": "商户入驻初始保证金元",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "balance_type_code",
+      "dataType": "bigint",
+      "comment": "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "balance_type_name",
+      "dataType": "varchar(128)",
+      "comment": "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "mobile",
+      "dataType": "varchar(64)",
+      "comment": "商家手机号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "company_name",
+      "dataType": "varchar(255)",
+      "comment": "公司名称",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "license_id",
+      "dataType": "varchar(128)",
+      "comment": "营业执照编号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "license_period_start",
+      "dataType": "varchar(32)",
+      "comment": "营业执照有效期 开始时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "license_period_end",
+      "dataType": "varchar(32)",
+      "comment": "营业执照有效期 结束时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "company_province",
+      "dataType": "varchar(128)",
+      "comment": "省",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "company_city",
+      "dataType": "varchar(128)",
+      "comment": "市",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "company_district",
+      "dataType": "varchar(128)",
+      "comment": "区",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "company_address",
+      "dataType": "varchar(512)",
+      "comment": "详细地址",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "corporation_name",
+      "dataType": "varchar(128)",
+      "comment": "法人姓名",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "corporation_idcard",
+      "dataType": "varchar(128)",
+      "comment": "法人身份证号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "corporation_idcard_period_start",
+      "dataType": "varchar(32)",
+      "comment": "法人身份有效期 开始时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "corporation_idcard_period_end",
+      "dataType": "varchar(32)",
+      "comment": "法人身份有效期 结束时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "is_unconditional_refund",
+      "dataType": "bigint",
+      "comment": "是否支持七天无理由退货 0 否 1 是",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "is_invoice",
+      "dataType": "bigint",
+      "comment": "是否支持开具发票 0否 1是",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "refund_mobile",
+      "dataType": "varchar(64)",
+      "comment": "退货地址收货人手机号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "inviter",
+      "dataType": "varchar(128)",
+      "comment": "入驻邀约人姓名",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "inviter_mobile",
+      "dataType": "varchar(64)",
+      "comment": "入驻邀约人手机号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "currency",
+      "dataType": "varchar(32)",
+      "comment": "币种",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "ship_model_code",
+      "dataType": "varchar(64)",
+      "comment": "发货模式code 1-集货模式 2-自发货模式",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "ship_model_name",
+      "dataType": "varchar(128)",
+      "comment": "发货模式name 1-集货模式 2-自发货模式",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "contact_name",
+      "dataType": "varchar(128)",
+      "comment": "联系人姓名",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "contact_idcard",
+      "dataType": "varchar(128)",
+      "comment": "联系人身份证号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "contact_idcard_period_start",
+      "dataType": "bigint",
+      "comment": "联系人身份有效期 开始时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "contact_idcard_period_end",
+      "dataType": "bigint",
+      "comment": "联系人身份有效期 结束时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "contact_idcard_type",
+      "dataType": "bigint",
+      "comment": "联系人默认大陆身份证，类型包括：100 大陆身份证；105 港澳居民往来内地通行证；106 台湾同胞往来大陆通行证；108 外国人居留证",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "contact_mobile",
+      "dataType": "varchar(64)",
+      "comment": "联系人手机号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "business_province",
+      "dataType": "varchar(128)",
+      "comment": "经营商省地区",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "business_city",
+      "dataType": "varchar(128)",
+      "comment": "经营商所在城市地区",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "business_district",
+      "dataType": "varchar(128)",
+      "comment": "经营商街道地区",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "business_address",
+      "dataType": "varchar(512)",
+      "comment": "经营商详细地址",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "send_province",
+      "dataType": "varchar(128)",
+      "comment": "发货省",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "send_city",
+      "dataType": "varchar(128)",
+      "comment": "发货市",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "send_district",
+      "dataType": "varchar(128)",
+      "comment": "发货区",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "send_street",
+      "dataType": "varchar(128)",
+      "comment": "退货地址街道",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "send_address",
+      "dataType": "varchar(512)",
+      "comment": "发货详细地址",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "refnd_province",
+      "dataType": "varchar(128)",
+      "comment": "退货地址省",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "refnd_city",
+      "dataType": "varchar(128)",
+      "comment": "退货地址市",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "refnd_district",
+      "dataType": "varchar(128)",
+      "comment": "退货地址区",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "refnd_street",
+      "dataType": "varchar(128)",
+      "comment": "退货地址街道",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "refnd_address",
+      "dataType": "varchar(512)",
+      "comment": "退货地址详细地址",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "service_version",
+      "dataType": "bigint",
+      "comment": "协议版本",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "min_poundage",
+      "dataType": "bigint",
+      "comment": "手续费下限",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "max_poundage",
+      "dataType": "bigint",
+      "comment": "手续费上限",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "bank_name",
+      "dataType": "varchar(255)",
+      "comment": "开户行",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "bank_account",
+      "dataType": "varchar(128)",
+      "comment": "银行账号",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "account_type_code",
+      "dataType": "bigint",
+      "comment": "账户类型code 1.对公 2.对私",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "account_type_name",
+      "dataType": "varchar(128)",
+      "comment": "账户类型name 1.对公 2.对私",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "deposit_freeze",
+      "dataType": "bigint",
+      "comment": "冻结保证金",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "deposit_amt",
+      "dataType": "bigint",
+      "comment": "保证金",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "poundage_discount",
+      "dataType": "varchar(64)",
+      "comment": "费率折扣",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "discount_start_time",
+      "dataType": "varchar(19)",
+      "comment": "费率折扣开始时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "discount_end_time",
+      "dataType": "varchar(19)",
+      "comment": "费率折扣结束时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "create_time",
+      "dataType": "varchar(19)",
+      "comment": "添加时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "modify_time",
+      "dataType": "varchar(19)",
+      "comment": "修改时间",
+      "nullable": false,
+      "keyType": ""
+    },
+    {
+      "columnName": "pt",
+      "dataType": "date",
+      "comment": "日期分区yyyyMMdd",
+      "nullable": false,
+      "keyType": ""
+    }
+  ],
+  "profiles": [
+    {
+      "columnName": "user_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "user_dim_merchant_df_001",
+        "user_dim_merchant_df_002",
+        "user_dim_merchant_df_003",
+        "user_dim_merchant_df_004",
+        "user_dim_merchant_df_005",
+        "user_dim_merchant_df_006",
+        "user_dim_merchant_df_007",
+        "user_dim_merchant_df_008"
+      ]
+    },
+    {
+      "columnName": "merchant_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 1,
+      "sampleValues": [
+        "100"
+      ]
+    },
+    {
+      "columnName": "merchant_type_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "merchant_type_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "merchant_type_name_1",
+        "merchant_type_name_2",
+        "merchant_type_name_3",
+        "merchant_type_name_4",
+        "merchant_type_name_5",
+        "merchant_type_name_6",
+        "merchant_type_name_7",
+        "merchant_type_name_8"
+      ]
+    },
+    {
+      "columnName": "brand_type_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "brand_type_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "brand_type_name_1",
+        "brand_type_name_2",
+        "brand_type_name_3",
+        "brand_type_name_4",
+        "brand_type_name_5",
+        "brand_type_name_6",
+        "brand_type_name_7",
+        "brand_type_name_8"
+      ]
+    },
+    {
+      "columnName": "audit_user_list",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "merchant_apply_status_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "merchant_apply_status_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "init_deposit_amt",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.61",
+        "12.72",
+        "13.83",
+        "14.94",
+        "16.05",
+        "17.16",
+        "18.27",
+        "19.38"
+      ]
+    },
+    {
+      "columnName": "balance_type_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "balance_type_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "balance_type_name_1",
+        "balance_type_name_2",
+        "balance_type_name_3",
+        "balance_type_name_4",
+        "balance_type_name_5",
+        "balance_type_name_6",
+        "balance_type_name_7",
+        "balance_type_name_8"
+      ]
+    },
+    {
+      "columnName": "mobile",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "company_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "license_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "license_period_start",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "license_period_end",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "company_province",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "company_city",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "company_district",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "company_address",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "corporation_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "corporation_idcard",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "corporation_idcard_period_start",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "corporation_idcard_period_end",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "is_unconditional_refund",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 2,
+      "sampleValues": [
+        "1",
+        "0"
+      ]
+    },
+    {
+      "columnName": "is_invoice",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 2,
+      "sampleValues": [
+        "1",
+        "0"
+      ]
+    },
+    {
+      "columnName": "refund_mobile",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "inviter",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "inviter_mobile",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "currency",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "ship_model_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "ship_model_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "ship_model_name_1",
+        "ship_model_name_2",
+        "ship_model_name_3",
+        "ship_model_name_4",
+        "ship_model_name_5",
+        "ship_model_name_6",
+        "ship_model_name_7",
+        "ship_model_name_8"
+      ]
+    },
+    {
+      "columnName": "contact_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "contact_idcard",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "contact_idcard_period_start",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "contact_idcard_period_end",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "contact_idcard_type",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "contact_mobile",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "business_province",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "business_city",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "business_district",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "business_address",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "send_province",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "send_city",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "send_district",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "send_street",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "send_address",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "refnd_province",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "refnd_city",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "refnd_district",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "refnd_street",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "refnd_address",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "service_version",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "min_poundage",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.6100",
+        "12.7200",
+        "13.8300",
+        "14.9400",
+        "16.0500",
+        "17.1600",
+        "18.2700",
+        "19.3800"
+      ]
+    },
+    {
+      "columnName": "max_poundage",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.6100",
+        "12.7200",
+        "13.8300",
+        "14.9400",
+        "16.0500",
+        "17.1600",
+        "18.2700",
+        "19.3800"
+      ]
+    },
+    {
+      "columnName": "bank_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "bank_account",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "account_type_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "account_type_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "deposit_freeze",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.61",
+        "12.72",
+        "13.83",
+        "14.94",
+        "16.05",
+        "17.16",
+        "18.27",
+        "19.38"
+      ]
+    },
+    {
+      "columnName": "deposit_amt",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.61",
+        "12.72",
+        "13.83",
+        "14.94",
+        "16.05",
+        "17.16",
+        "18.27",
+        "19.38"
+      ]
+    },
+    {
+      "columnName": "poundage_discount",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.6100",
+        "12.7200",
+        "13.8300",
+        "14.9400",
+        "16.0500",
+        "17.1600",
+        "18.2700",
+        "19.3800"
+      ]
+    },
+    {
+      "columnName": "discount_start_time",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "discount_end_time",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "create_time",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "modify_time",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "pt",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "2026-02-25",
+        "2026-02-26",
+        "2026-02-27",
+        "2026-02-28",
+        "2026-03-01",
+        "2026-03-02",
+        "2026-03-03",
+        "2026-03-04"
+      ]
+    }
+  ],
+  "semanticColumns": [
+    {
+      "columnName": "user_id",
+      "businessName": "用户id",
+      "role": "KEY",
+      "description": "用户id",
+      "aliases": [
+        "用户id",
+        "user_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=用户id; samples=[user_dim_merchant_df_001, user_dim_merchant_df_002, user_dim_merchant_df_003, user_dim_merchant_df_004, user_dim_merchant_df_005, user_dim_merchant_df_006, user_dim_merchant_df_007, user_dim_merchant_df_008]"
+    },
+    {
+      "columnName": "merchant_id",
+      "businessName": "商家id",
+      "role": "KEY",
+      "description": "商家id",
+      "aliases": [
+        "商家id",
+        "merchant_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=商家id; samples=[100]"
+    },
+    {
+      "columnName": "merchant_type_code",
+      "businessName": "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+      "role": "DIMENSION",
+      "description": "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方",
+      "aliases": [
+        "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+        "merchant_type_code",
+        "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方"
+      ],
+      "enumValues": [
+        "1=急速发货商户",
+        "2=企业商户",
+        "3=认证商户",
+        "4=跨境商家",
+        "5=个人普通商户",
+        "6=品牌方"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方"
+    },
+    {
+      "columnName": "merchant_type_name",
+      "businessName": "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+      "role": "DIMENSION",
+      "description": "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方",
+      "aliases": [
+        "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+        "merchant_type_name",
+        "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方"
+      ],
+      "enumValues": [
+        "merchant_type_name_1",
+        "merchant_type_name_2",
+        "merchant_type_name_3",
+        "merchant_type_name_4",
+        "merchant_type_name_5",
+        "merchant_type_name_6",
+        "merchant_type_name_7",
+        "merchant_type_name_8"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方; samples=[merchant_type_name_1, merchant_type_name_2, merchant_type_name_3, merchant_type_name_4, merchant_type_name_5, merchant_type_name_6, merchant_type_name_7, merchant_type_name_8]"
+    },
+    {
+      "columnName": "brand_type_code",
+      "businessName": "资质类型code",
+      "role": "DIMENSION",
+      "description": "资质类型code -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商",
+      "aliases": [
+        "资质类型code",
+        "brand_type_code",
+        "资质类型code -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商"
+      ],
+      "enumValues": [
+        "1=代表商家是服务商",
+        "0=商家入驻时填基本信息",
+        "1=品牌方",
+        "2=经销商",
+        "3=市场贸易商",
+        "4=扫货商",
+        "5=零售百货商"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=资质类型code -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商"
+    },
+    {
+      "columnName": "brand_type_name",
+      "businessName": "资质类型name",
+      "role": "DIMENSION",
+      "description": "资质类型name -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商",
+      "aliases": [
+        "资质类型name",
+        "brand_type_name",
+        "资质类型name -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商"
+      ],
+      "enumValues": [
+        "brand_type_name_1",
+        "brand_type_name_2",
+        "brand_type_name_3",
+        "brand_type_name_4",
+        "brand_type_name_5",
+        "brand_type_name_6",
+        "brand_type_name_7",
+        "brand_type_name_8"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=资质类型name -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商; samples=[brand_type_name_1, brand_type_name_2, brand_type_name_3, brand_type_name_4, brand_type_name_5, brand_type_name_6, brand_type_name_7, brand_type_name_8]"
+    },
+    {
+      "columnName": "audit_user_list",
+      "businessName": "审批人aclIds",
+      "role": "OTHER",
+      "description": "审批人aclIds，逗号分隔",
+      "aliases": [
+        "审批人aclIds",
+        "audit_user_list",
+        "审批人aclIds，逗号分隔"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=审批人aclIds，逗号分隔"
+    },
+    {
+      "columnName": "merchant_apply_status_code",
+      "businessName": "审核状态code",
+      "role": "DIMENSION",
+      "description": "审核状态code，商家提交资料-0，保证金/账单/费率/协议填写审核-100，保证金低于标准，二次审核-110，初审不通过-120，初审通过，等待特批费率/类目运营审核-130，初审完成-140，待法务审核-200，法务审核不通过-210，法务审核通过，商家协议待确认-300，商家协议确认成功，保证金待缴纳-500，保证金转账待审核-520，保证金转账审核不通过-530，商家入驻被驳回-600，保证金转账审核通过，入驻完成-800",
+      "aliases": [
+        "审核状态code",
+        "merchant_apply_status_code",
+        "审核状态code，商家提交资料-0，保证金/账单/费率/协议填写审核-100，保证金低于标准，二次审核-110，初审不通过-120，初审通过，等待特批费率/类目运营审核-130，初审完成-140，待法务审核-200，法务审核不通过-210，法务审核通过，商家协议待确认-300，商家协议确认成功，保证金待缴纳-500，保证金转账待审核-520，保证金转账审核不通过-530，商家入驻被驳回-600，保证金转账审核通过，入驻完成-800"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=审核状态code，商家提交资料-0，保证金/账单/费率/协议填写审核-100，保证金低于标准，二次审核-110，初审不通过-120，初审通过，等待特批费率/类目运营审核-130，初审完成-140，待法务审核-200，法务审核不通过-210，法务审核通过，商家协议待确认-300，商家协议确认成功，保证金待缴纳-500，保证金转账待审核-520，保证金转账审核不通过-530，商家入驻被驳回-600，保证金转账审核通过，入驻完成-800"
+    },
+    {
+      "columnName": "merchant_apply_status_name",
+      "businessName": "审核状态name",
+      "role": "DIMENSION",
+      "description": "审核状态name",
+      "aliases": [
+        "审核状态name",
+        "merchant_apply_status_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=审核状态name"
+    },
+    {
+      "columnName": "init_deposit_amt",
+      "businessName": "商户入驻初始保证金元",
+      "role": "METRIC",
+      "description": "商户入驻初始保证金元",
+      "aliases": [
+        "商户入驻初始保证金元",
+        "init_deposit_amt"
+      ],
+      "enumValues": [],
+      "metricFormula": "SUM(init_deposit_amt)",
+      "confidence": 0.78,
+      "evidence": "schema comment=商户入驻初始保证金元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "columnName": "balance_type_code",
+      "businessName": "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+      "role": "DIMENSION",
+      "description": "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+      "aliases": [
+        "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+        "balance_type_code"
+      ],
+      "enumValues": [
+        "0=实时",
+        "1=周结",
+        "2=半月结",
+        "3=月结"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=结算类型code 0.实时 1.周结 2.半月结 3.月结"
+    },
+    {
+      "columnName": "balance_type_name",
+      "businessName": "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+      "role": "DIMENSION",
+      "description": "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+      "aliases": [
+        "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+        "balance_type_name"
+      ],
+      "enumValues": [
+        "balance_type_name_1",
+        "balance_type_name_2",
+        "balance_type_name_3",
+        "balance_type_name_4",
+        "balance_type_name_5",
+        "balance_type_name_6",
+        "balance_type_name_7",
+        "balance_type_name_8"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=结算类型name 0.实时 1.周结 2.半月结 3.月结; samples=[balance_type_name_1, balance_type_name_2, balance_type_name_3, balance_type_name_4, balance_type_name_5, balance_type_name_6, balance_type_name_7, balance_type_name_8]"
+    },
+    {
+      "columnName": "mobile",
+      "businessName": "商家手机号",
+      "role": "OTHER",
+      "description": "商家手机号",
+      "aliases": [
+        "商家手机号",
+        "mobile"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=商家手机号"
+    },
+    {
+      "columnName": "company_name",
+      "businessName": "公司名称",
+      "role": "DIMENSION",
+      "description": "公司名称",
+      "aliases": [
+        "公司名称",
+        "company_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=公司名称"
+    },
+    {
+      "columnName": "license_id",
+      "businessName": "营业执照编号",
+      "role": "KEY",
+      "description": "营业执照编号",
+      "aliases": [
+        "营业执照编号",
+        "license_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=营业执照编号"
+    },
+    {
+      "columnName": "license_period_start",
+      "businessName": "营业执照有效期 开始时间",
+      "role": "TIME",
+      "description": "营业执照有效期 开始时间",
+      "aliases": [
+        "营业执照有效期 开始时间",
+        "license_period_start"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=营业执照有效期 开始时间"
+    },
+    {
+      "columnName": "license_period_end",
+      "businessName": "营业执照有效期 结束时间",
+      "role": "TIME",
+      "description": "营业执照有效期 结束时间",
+      "aliases": [
+        "营业执照有效期 结束时间",
+        "license_period_end"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=营业执照有效期 结束时间"
+    },
+    {
+      "columnName": "company_province",
+      "businessName": "省",
+      "role": "DIMENSION",
+      "description": "省",
+      "aliases": [
+        "省",
+        "company_province"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=省"
+    },
+    {
+      "columnName": "company_city",
+      "businessName": "市",
+      "role": "DIMENSION",
+      "description": "市",
+      "aliases": [
+        "市",
+        "company_city"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=市"
+    },
+    {
+      "columnName": "company_district",
+      "businessName": "区",
+      "role": "OTHER",
+      "description": "区",
+      "aliases": [
+        "区",
+        "company_district"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=区"
+    },
+    {
+      "columnName": "company_address",
+      "businessName": "详细地址",
+      "role": "OTHER",
+      "description": "详细地址",
+      "aliases": [
+        "详细地址",
+        "company_address"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=详细地址"
+    },
+    {
+      "columnName": "corporation_name",
+      "businessName": "法人姓名",
+      "role": "DIMENSION",
+      "description": "法人姓名",
+      "aliases": [
+        "法人姓名",
+        "corporation_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=法人姓名"
+    },
+    {
+      "columnName": "corporation_idcard",
+      "businessName": "法人身份证号",
+      "role": "OTHER",
+      "description": "法人身份证号",
+      "aliases": [
+        "法人身份证号",
+        "corporation_idcard"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=法人身份证号"
+    },
+    {
+      "columnName": "corporation_idcard_period_start",
+      "businessName": "法人身份有效期 开始时间",
+      "role": "TIME",
+      "description": "法人身份有效期 开始时间",
+      "aliases": [
+        "法人身份有效期 开始时间",
+        "corporation_idcard_period_start"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=法人身份有效期 开始时间"
+    },
+    {
+      "columnName": "corporation_idcard_period_end",
+      "businessName": "法人身份有效期 结束时间",
+      "role": "TIME",
+      "description": "法人身份有效期 结束时间",
+      "aliases": [
+        "法人身份有效期 结束时间",
+        "corporation_idcard_period_end"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=法人身份有效期 结束时间"
+    },
+    {
+      "columnName": "is_unconditional_refund",
+      "businessName": "是否支持七天无理由退货 0 否 1 是",
+      "role": "DIMENSION",
+      "description": "是否支持七天无理由退货 0 否 1 是",
+      "aliases": [
+        "是否支持七天无理由退货 0 否 1 是",
+        "is_unconditional_refund"
+      ],
+      "enumValues": [
+        "1",
+        "0"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=是否支持七天无理由退货 0 否 1 是; samples=[1, 0]"
+    },
+    {
+      "columnName": "is_invoice",
+      "businessName": "是否支持开具发票 0否 1是",
+      "role": "DIMENSION",
+      "description": "是否支持开具发票 0否 1是",
+      "aliases": [
+        "是否支持开具发票 0否 1是",
+        "is_invoice"
+      ],
+      "enumValues": [
+        "1",
+        "0"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=是否支持开具发票 0否 1是; samples=[1, 0]"
+    },
+    {
+      "columnName": "refund_mobile",
+      "businessName": "退货地址收货人手机号",
+      "role": "OTHER",
+      "description": "退货地址收货人手机号",
+      "aliases": [
+        "退货地址收货人手机号",
+        "refund_mobile"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址收货人手机号"
+    },
+    {
+      "columnName": "inviter",
+      "businessName": "入驻邀约人姓名",
+      "role": "OTHER",
+      "description": "入驻邀约人姓名",
+      "aliases": [
+        "入驻邀约人姓名",
+        "inviter"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=入驻邀约人姓名"
+    },
+    {
+      "columnName": "inviter_mobile",
+      "businessName": "入驻邀约人手机号",
+      "role": "OTHER",
+      "description": "入驻邀约人手机号",
+      "aliases": [
+        "入驻邀约人手机号",
+        "inviter_mobile"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=入驻邀约人手机号"
+    },
+    {
+      "columnName": "currency",
+      "businessName": "币种",
+      "role": "OTHER",
+      "description": "币种",
+      "aliases": [
+        "币种",
+        "currency"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=币种"
+    },
+    {
+      "columnName": "ship_model_code",
+      "businessName": "发货模式code 1",
+      "role": "DIMENSION",
+      "description": "发货模式code 1-集货模式 2-自发货模式",
+      "aliases": [
+        "发货模式code 1",
+        "ship_model_code",
+        "发货模式code 1-集货模式 2-自发货模式"
+      ],
+      "enumValues": [
+        "1=集货模式",
+        "2=自发货模式"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=发货模式code 1-集货模式 2-自发货模式"
+    },
+    {
+      "columnName": "ship_model_name",
+      "businessName": "发货模式name 1",
+      "role": "DIMENSION",
+      "description": "发货模式name 1-集货模式 2-自发货模式",
+      "aliases": [
+        "发货模式name 1",
+        "ship_model_name",
+        "发货模式name 1-集货模式 2-自发货模式"
+      ],
+      "enumValues": [
+        "ship_model_name_1",
+        "ship_model_name_2",
+        "ship_model_name_3",
+        "ship_model_name_4",
+        "ship_model_name_5",
+        "ship_model_name_6",
+        "ship_model_name_7",
+        "ship_model_name_8"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=发货模式name 1-集货模式 2-自发货模式; samples=[ship_model_name_1, ship_model_name_2, ship_model_name_3, ship_model_name_4, ship_model_name_5, ship_model_name_6, ship_model_name_7, ship_model_name_8]"
+    },
+    {
+      "columnName": "contact_name",
+      "businessName": "联系人姓名",
+      "role": "DIMENSION",
+      "description": "联系人姓名",
+      "aliases": [
+        "联系人姓名",
+        "contact_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=联系人姓名"
+    },
+    {
+      "columnName": "contact_idcard",
+      "businessName": "联系人身份证号",
+      "role": "OTHER",
+      "description": "联系人身份证号",
+      "aliases": [
+        "联系人身份证号",
+        "contact_idcard"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=联系人身份证号"
+    },
+    {
+      "columnName": "contact_idcard_period_start",
+      "businessName": "联系人身份有效期 开始时间",
+      "role": "TIME",
+      "description": "联系人身份有效期 开始时间",
+      "aliases": [
+        "联系人身份有效期 开始时间",
+        "contact_idcard_period_start"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=联系人身份有效期 开始时间"
+    },
+    {
+      "columnName": "contact_idcard_period_end",
+      "businessName": "联系人身份有效期 结束时间",
+      "role": "TIME",
+      "description": "联系人身份有效期 结束时间",
+      "aliases": [
+        "联系人身份有效期 结束时间",
+        "contact_idcard_period_end"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=联系人身份有效期 结束时间"
+    },
+    {
+      "columnName": "contact_idcard_type",
+      "businessName": "联系人默认大陆身份证",
+      "role": "DIMENSION",
+      "description": "联系人默认大陆身份证，类型包括：100 大陆身份证；105 港澳居民往来内地通行证；106 台湾同胞往来大陆通行证；108 外国人居留证",
+      "aliases": [
+        "联系人默认大陆身份证",
+        "contact_idcard_type",
+        "联系人默认大陆身份证，类型包括：100 大陆身份证；105 港澳居民往来内地通行证；106 台湾同胞往来大陆通行证；108 外国人居留证"
+      ],
+      "enumValues": [
+        "100=大陆身份证",
+        "105=港澳居民往来内地通行证",
+        "106=台湾同胞往来大陆通行证",
+        "108=外国人居留证"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=联系人默认大陆身份证，类型包括：100 大陆身份证；105 港澳居民往来内地通行证；106 台湾同胞往来大陆通行证；108 外国人居留证"
+    },
+    {
+      "columnName": "contact_mobile",
+      "businessName": "联系人手机号",
+      "role": "OTHER",
+      "description": "联系人手机号",
+      "aliases": [
+        "联系人手机号",
+        "contact_mobile"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=联系人手机号"
+    },
+    {
+      "columnName": "business_province",
+      "businessName": "经营商省地区",
+      "role": "DIMENSION",
+      "description": "经营商省地区",
+      "aliases": [
+        "经营商省地区",
+        "business_province"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=经营商省地区"
+    },
+    {
+      "columnName": "business_city",
+      "businessName": "经营商所在城市地区",
+      "role": "DIMENSION",
+      "description": "经营商所在城市地区",
+      "aliases": [
+        "经营商所在城市地区",
+        "business_city"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=经营商所在城市地区"
+    },
+    {
+      "columnName": "business_district",
+      "businessName": "经营商街道地区",
+      "role": "OTHER",
+      "description": "经营商街道地区",
+      "aliases": [
+        "经营商街道地区",
+        "business_district"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=经营商街道地区"
+    },
+    {
+      "columnName": "business_address",
+      "businessName": "经营商详细地址",
+      "role": "OTHER",
+      "description": "经营商详细地址",
+      "aliases": [
+        "经营商详细地址",
+        "business_address"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=经营商详细地址"
+    },
+    {
+      "columnName": "send_province",
+      "businessName": "发货省",
+      "role": "DIMENSION",
+      "description": "发货省",
+      "aliases": [
+        "发货省",
+        "send_province"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=发货省"
+    },
+    {
+      "columnName": "send_city",
+      "businessName": "发货市",
+      "role": "DIMENSION",
+      "description": "发货市",
+      "aliases": [
+        "发货市",
+        "send_city"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=发货市"
+    },
+    {
+      "columnName": "send_district",
+      "businessName": "发货区",
+      "role": "OTHER",
+      "description": "发货区",
+      "aliases": [
+        "发货区",
+        "send_district"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=发货区"
+    },
+    {
+      "columnName": "send_street",
+      "businessName": "退货地址街道",
+      "role": "OTHER",
+      "description": "退货地址街道",
+      "aliases": [
+        "退货地址街道",
+        "send_street"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址街道"
+    },
+    {
+      "columnName": "send_address",
+      "businessName": "发货详细地址",
+      "role": "OTHER",
+      "description": "发货详细地址",
+      "aliases": [
+        "发货详细地址",
+        "send_address"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=发货详细地址"
+    },
+    {
+      "columnName": "refnd_province",
+      "businessName": "退货地址省",
+      "role": "DIMENSION",
+      "description": "退货地址省",
+      "aliases": [
+        "退货地址省",
+        "refnd_province"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址省"
+    },
+    {
+      "columnName": "refnd_city",
+      "businessName": "退货地址市",
+      "role": "DIMENSION",
+      "description": "退货地址市",
+      "aliases": [
+        "退货地址市",
+        "refnd_city"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址市"
+    },
+    {
+      "columnName": "refnd_district",
+      "businessName": "退货地址区",
+      "role": "OTHER",
+      "description": "退货地址区",
+      "aliases": [
+        "退货地址区",
+        "refnd_district"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址区"
+    },
+    {
+      "columnName": "refnd_street",
+      "businessName": "退货地址街道",
+      "role": "OTHER",
+      "description": "退货地址街道",
+      "aliases": [
+        "退货地址街道",
+        "refnd_street"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址街道"
+    },
+    {
+      "columnName": "refnd_address",
+      "businessName": "退货地址详细地址",
+      "role": "OTHER",
+      "description": "退货地址详细地址",
+      "aliases": [
+        "退货地址详细地址",
+        "refnd_address"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=退货地址详细地址"
+    },
+    {
+      "columnName": "service_version",
+      "businessName": "协议版本",
+      "role": "OTHER",
+      "description": "协议版本",
+      "aliases": [
+        "协议版本",
+        "service_version"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=协议版本"
+    },
+    {
+      "columnName": "min_poundage",
+      "businessName": "手续费下限",
+      "role": "OTHER",
+      "description": "手续费下限",
+      "aliases": [
+        "手续费下限",
+        "min_poundage"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=手续费下限; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+    },
+    {
+      "columnName": "max_poundage",
+      "businessName": "手续费上限",
+      "role": "OTHER",
+      "description": "手续费上限",
+      "aliases": [
+        "手续费上限",
+        "max_poundage"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=手续费上限; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+    },
+    {
+      "columnName": "bank_name",
+      "businessName": "开户行",
+      "role": "DIMENSION",
+      "description": "开户行",
+      "aliases": [
+        "开户行",
+        "bank_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=开户行"
+    },
+    {
+      "columnName": "bank_account",
+      "businessName": "银行账号",
+      "role": "OTHER",
+      "description": "银行账号",
+      "aliases": [
+        "银行账号",
+        "bank_account"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=银行账号"
+    },
+    {
+      "columnName": "account_type_code",
+      "businessName": "账户类型code 1.对公 2.对私",
+      "role": "DIMENSION",
+      "description": "账户类型code 1.对公 2.对私",
+      "aliases": [
+        "账户类型code 1.对公 2.对私",
+        "account_type_code"
+      ],
+      "enumValues": [
+        "1=对公",
+        "2=对私"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=账户类型code 1.对公 2.对私"
+    },
+    {
+      "columnName": "account_type_name",
+      "businessName": "账户类型name 1.对公 2.对私",
+      "role": "DIMENSION",
+      "description": "账户类型name 1.对公 2.对私",
+      "aliases": [
+        "账户类型name 1.对公 2.对私",
+        "account_type_name"
+      ],
+      "enumValues": [
+        "1=对公",
+        "2=对私"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=账户类型name 1.对公 2.对私"
+    },
+    {
+      "columnName": "deposit_freeze",
+      "businessName": "冻结保证金",
+      "role": "OTHER",
+      "description": "冻结保证金",
+      "aliases": [
+        "冻结保证金",
+        "deposit_freeze"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=冻结保证金; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "columnName": "deposit_amt",
+      "businessName": "保证金",
+      "role": "METRIC",
+      "description": "保证金",
+      "aliases": [
+        "deposit_amt"
+      ],
+      "enumValues": [],
+      "metricFormula": "SUM(deposit_amt)",
+      "confidence": 0.78,
+      "evidence": "schema comment=保证金; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "columnName": "poundage_discount",
+      "businessName": "费率折扣",
+      "role": "OTHER",
+      "description": "费率折扣",
+      "aliases": [
+        "费率折扣",
+        "poundage_discount"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=费率折扣; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+    },
+    {
+      "columnName": "discount_start_time",
+      "businessName": "费率折扣开始时间",
+      "role": "TIME",
+      "description": "费率折扣开始时间",
+      "aliases": [
+        "费率折扣开始时间",
+        "discount_start_time"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=费率折扣开始时间"
+    },
+    {
+      "columnName": "discount_end_time",
+      "businessName": "费率折扣结束时间",
+      "role": "TIME",
+      "description": "费率折扣结束时间",
+      "aliases": [
+        "费率折扣结束时间",
+        "discount_end_time"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=费率折扣结束时间"
+    },
+    {
+      "columnName": "create_time",
+      "businessName": "添加时间",
+      "role": "TIME",
+      "description": "添加时间",
+      "aliases": [
+        "添加时间",
+        "create_time"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=添加时间"
+    },
+    {
+      "columnName": "modify_time",
+      "businessName": "修改时间",
+      "role": "TIME",
+      "description": "修改时间",
+      "aliases": [
+        "修改时间",
+        "modify_time"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=修改时间"
+    },
+    {
+      "columnName": "pt",
+      "businessName": "日期分区yyyyMMdd",
+      "role": "TIME",
+      "description": "日期分区yyyyMMdd",
+      "aliases": [
+        "日期分区yyyyMMdd",
+        "pt"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=日期分区yyyyMMdd; samples=[2026-02-25, 2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02, 2026-03-03, 2026-03-04]"
+    }
+  ],
+  "metrics": [
+    {
+      "metricKey": "init_deposit_amt",
+      "businessName": "商户入驻初始保证金元",
+      "formula": "SUM(init_deposit_amt)",
+      "unit": "元",
+      "description": "商户入驻初始保证金元",
+      "sourceColumns": [
+        "init_deposit_amt"
+      ],
+      "aliases": [
+        "商户入驻初始保证金元",
+        "init_deposit_amt"
+      ],
+      "confidence": 0.78,
+      "evidence": "schema comment=商户入驻初始保证金元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "metricKey": "deposit_amt",
+      "businessName": "保证金",
+      "formula": "SUM(deposit_amt)",
+      "unit": "元",
+      "description": "保证金",
+      "sourceColumns": [
+        "deposit_amt"
+      ],
+      "aliases": [
+        "deposit_amt"
+      ],
+      "confidence": 0.78,
+      "evidence": "schema comment=保证金; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "metricKey": "merchant_cnt",
+      "businessName": "商家数",
+      "formula": "COUNT(DISTINCT merchant_id)",
+      "unit": "个",
+      "description": "按商家 ID 去重统计商家数量",
+      "sourceColumns": [
+        "merchant_id"
+      ],
+      "aliases": [
+        "商家数"
+      ],
+      "confidence": 0.82,
+      "evidence": "由 Topic Builder 基于字段组合自动生成"
+    },
+    {
+      "metricKey": "merchant_deposit_amt",
+      "businessName": "保证金余额",
+      "formula": "SUM(deposit_amt)",
+      "unit": "元",
+      "description": "商家当前保证金余额；单商家查询时代表该商家的保证金",
+      "sourceColumns": [
+        "deposit_amt"
+      ],
+      "aliases": [
+        "保证金余额"
+      ],
+      "confidence": 0.82,
+      "evidence": "由 Topic Builder 基于字段组合自动生成"
+    },
+    {
+      "metricKey": "merchant_deposit_freeze_amt",
+      "businessName": "冻结保证金",
+      "formula": "SUM(deposit_freeze)",
+      "unit": "元",
+      "description": "商家当前冻结保证金金额",
+      "sourceColumns": [
+        "deposit_freeze"
+      ],
+      "aliases": [
+        "冻结保证金"
+      ],
+      "confidence": 0.82,
+      "evidence": "由 Topic Builder 基于字段组合自动生成"
+    }
+  ],
+  "terms": [
+    {
+      "term": "用户id",
+      "description": "用户id",
+      "aliases": [
+        "用户id",
+        "user_id"
+      ],
+      "relatedColumns": [
+        "user_id"
+      ],
+      "evidence": "来自字段 `user_id` 的语义注释"
+    },
+    {
+      "term": "商家id",
+      "description": "商家id",
+      "aliases": [
+        "商家id",
+        "merchant_id"
+      ],
+      "relatedColumns": [
+        "merchant_id"
+      ],
+      "evidence": "来自字段 `merchant_id` 的语义注释"
+    },
+    {
+      "term": "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+      "description": "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方",
+      "aliases": [
+        "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+        "merchant_type_code",
+        "商户类型code 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方"
+      ],
+      "relatedColumns": [
+        "merchant_type_code"
+      ],
+      "evidence": "来自字段 `merchant_type_code` 的语义注释"
+    },
+    {
+      "term": "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+      "description": "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方",
+      "aliases": [
+        "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6",
+        "merchant_type_name",
+        "商户类型name 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家 5.个人普通商户 6-品牌方"
+      ],
+      "relatedColumns": [
+        "merchant_type_name"
+      ],
+      "evidence": "来自字段 `merchant_type_name` 的语义注释"
+    },
+    {
+      "term": "资质类型code",
+      "description": "资质类型code -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商",
+      "aliases": [
+        "资质类型code",
+        "brand_type_code",
+        "资质类型code -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商"
+      ],
+      "relatedColumns": [
+        "brand_type_code"
+      ],
+      "evidence": "来自字段 `brand_type_code` 的语义注释"
+    },
+    {
+      "term": "资质类型name",
+      "description": "资质类型name -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商",
+      "aliases": [
+        "资质类型name",
+        "brand_type_name",
+        "资质类型name -1代表商家是服务商 0、商家入驻时填基本信息，还没填资质信息 1.品牌方 2.经销商 3.市场贸易商 4.扫货商 5.零售百货商"
+      ],
+      "relatedColumns": [
+        "brand_type_name"
+      ],
+      "evidence": "来自字段 `brand_type_name` 的语义注释"
+    },
+    {
+      "term": "审批人aclIds",
+      "description": "审批人aclIds，逗号分隔",
+      "aliases": [
+        "审批人aclIds",
+        "audit_user_list",
+        "审批人aclIds，逗号分隔"
+      ],
+      "relatedColumns": [
+        "audit_user_list"
+      ],
+      "evidence": "来自字段 `audit_user_list` 的语义注释"
+    },
+    {
+      "term": "审核状态code",
+      "description": "审核状态code，商家提交资料-0，保证金/账单/费率/协议填写审核-100，保证金低于标准，二次审核-110，初审不通过-120，初审通过，等待特批费率/类目运营审核-130，初审完成-140，待法务审核-200，法务审核不通过-210，法务审核通过，商家协议待确认-300，商家协议确认成功，保证金待缴纳-500，保证金转账待审核-520，保证金转账审核不通过-530，商家入驻被驳回-600，保证金转账审核通过，入驻完成-800",
+      "aliases": [
+        "审核状态code",
+        "merchant_apply_status_code",
+        "审核状态code，商家提交资料-0，保证金/账单/费率/协议填写审核-100，保证金低于标准，二次审核-110，初审不通过-120，初审通过，等待特批费率/类目运营审核-130，初审完成-140，待法务审核-200，法务审核不通过-210，法务审核通过，商家协议待确认-300，商家协议确认成功，保证金待缴纳-500，保证金转账待审核-520，保证金转账审核不通过-530，商家入驻被驳回-600，保证金转账审核通过，入驻完成-800"
+      ],
+      "relatedColumns": [
+        "merchant_apply_status_code"
+      ],
+      "evidence": "来自字段 `merchant_apply_status_code` 的语义注释"
+    },
+    {
+      "term": "审核状态name",
+      "description": "审核状态name",
+      "aliases": [
+        "审核状态name",
+        "merchant_apply_status_name"
+      ],
+      "relatedColumns": [
+        "merchant_apply_status_name"
+      ],
+      "evidence": "来自字段 `merchant_apply_status_name` 的语义注释"
+    },
+    {
+      "term": "商户入驻初始保证金元",
+      "description": "商户入驻初始保证金元",
+      "aliases": [
+        "商户入驻初始保证金元",
+        "init_deposit_amt"
+      ],
+      "relatedColumns": [
+        "init_deposit_amt"
+      ],
+      "evidence": "来自字段 `init_deposit_amt` 的语义注释"
+    },
+    {
+      "term": "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+      "description": "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+      "aliases": [
+        "结算类型code 0.实时 1.周结 2.半月结 3.月结",
+        "balance_type_code"
+      ],
+      "relatedColumns": [
+        "balance_type_code"
+      ],
+      "evidence": "来自字段 `balance_type_code` 的语义注释"
+    },
+    {
+      "term": "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+      "description": "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+      "aliases": [
+        "结算类型name 0.实时 1.周结 2.半月结 3.月结",
+        "balance_type_name"
+      ],
+      "relatedColumns": [
+        "balance_type_name"
+      ],
+      "evidence": "来自字段 `balance_type_name` 的语义注释"
+    },
+    {
+      "term": "商家手机号",
+      "description": "商家手机号",
+      "aliases": [
+        "商家手机号",
+        "mobile"
+      ],
+      "relatedColumns": [
+        "mobile"
+      ],
+      "evidence": "来自字段 `mobile` 的语义注释"
+    },
+    {
+      "term": "公司名称",
+      "description": "公司名称",
+      "aliases": [
+        "公司名称",
+        "company_name"
+      ],
+      "relatedColumns": [
+        "company_name"
+      ],
+      "evidence": "来自字段 `company_name` 的语义注释"
+    },
+    {
+      "term": "营业执照编号",
+      "description": "营业执照编号",
+      "aliases": [
+        "营业执照编号",
+        "license_id"
+      ],
+      "relatedColumns": [
+        "license_id"
+      ],
+      "evidence": "来自字段 `license_id` 的语义注释"
+    },
+    {
+      "term": "营业执照有效期 开始时间",
+      "description": "营业执照有效期 开始时间",
+      "aliases": [
+        "营业执照有效期 开始时间",
+        "license_period_start"
+      ],
+      "relatedColumns": [
+        "license_period_start"
+      ],
+      "evidence": "来自字段 `license_period_start` 的语义注释"
+    },
+    {
+      "term": "营业执照有效期 结束时间",
+      "description": "营业执照有效期 结束时间",
+      "aliases": [
+        "营业执照有效期 结束时间",
+        "license_period_end"
+      ],
+      "relatedColumns": [
+        "license_period_end"
+      ],
+      "evidence": "来自字段 `license_period_end` 的语义注释"
+    },
+    {
+      "term": "省",
+      "description": "省",
+      "aliases": [
+        "省",
+        "company_province"
+      ],
+      "relatedColumns": [
+        "company_province"
+      ],
+      "evidence": "来自字段 `company_province` 的语义注释"
+    },
+    {
+      "term": "市",
+      "description": "市",
+      "aliases": [
+        "市",
+        "company_city"
+      ],
+      "relatedColumns": [
+        "company_city"
+      ],
+      "evidence": "来自字段 `company_city` 的语义注释"
+    },
+    {
+      "term": "区",
+      "description": "区",
+      "aliases": [
+        "区",
+        "company_district"
+      ],
+      "relatedColumns": [
+        "company_district"
+      ],
+      "evidence": "来自字段 `company_district` 的语义注释"
+    },
+    {
+      "term": "详细地址",
+      "description": "详细地址",
+      "aliases": [
+        "详细地址",
+        "company_address"
+      ],
+      "relatedColumns": [
+        "company_address"
+      ],
+      "evidence": "来自字段 `company_address` 的语义注释"
+    },
+    {
+      "term": "法人姓名",
+      "description": "法人姓名",
+      "aliases": [
+        "法人姓名",
+        "corporation_name"
+      ],
+      "relatedColumns": [
+        "corporation_name"
+      ],
+      "evidence": "来自字段 `corporation_name` 的语义注释"
+    },
+    {
+      "term": "法人身份证号",
+      "description": "法人身份证号",
+      "aliases": [
+        "法人身份证号",
+        "corporation_idcard"
+      ],
+      "relatedColumns": [
+        "corporation_idcard"
+      ],
+      "evidence": "来自字段 `corporation_idcard` 的语义注释"
+    },
+    {
+      "term": "法人身份有效期 开始时间",
+      "description": "法人身份有效期 开始时间",
+      "aliases": [
+        "法人身份有效期 开始时间",
+        "corporation_idcard_period_start"
+      ],
+      "relatedColumns": [
+        "corporation_idcard_period_start"
+      ],
+      "evidence": "来自字段 `corporation_idcard_period_start` 的语义注释"
+    },
+    {
+      "term": "法人身份有效期 结束时间",
+      "description": "法人身份有效期 结束时间",
+      "aliases": [
+        "法人身份有效期 结束时间",
+        "corporation_idcard_period_end"
+      ],
+      "relatedColumns": [
+        "corporation_idcard_period_end"
+      ],
+      "evidence": "来自字段 `corporation_idcard_period_end` 的语义注释"
+    },
+    {
+      "term": "是否支持七天无理由退货 0 否 1 是",
+      "description": "是否支持七天无理由退货 0 否 1 是",
+      "aliases": [
+        "是否支持七天无理由退货 0 否 1 是",
+        "is_unconditional_refund"
+      ],
+      "relatedColumns": [
+        "is_unconditional_refund"
+      ],
+      "evidence": "来自字段 `is_unconditional_refund` 的语义注释"
+    },
+    {
+      "term": "是否支持开具发票 0否 1是",
+      "description": "是否支持开具发票 0否 1是",
+      "aliases": [
+        "是否支持开具发票 0否 1是",
+        "is_invoice"
+      ],
+      "relatedColumns": [
+        "is_invoice"
+      ],
+      "evidence": "来自字段 `is_invoice` 的语义注释"
+    },
+    {
+      "term": "退货地址收货人手机号",
+      "description": "退货地址收货人手机号",
+      "aliases": [
+        "退货地址收货人手机号",
+        "refund_mobile"
+      ],
+      "relatedColumns": [
+        "refund_mobile"
+      ],
+      "evidence": "来自字段 `refund_mobile` 的语义注释"
+    },
+    {
+      "term": "入驻邀约人姓名",
+      "description": "入驻邀约人姓名",
+      "aliases": [
+        "入驻邀约人姓名",
+        "inviter"
+      ],
+      "relatedColumns": [
+        "inviter"
+      ],
+      "evidence": "来自字段 `inviter` 的语义注释"
+    },
+    {
+      "term": "入驻邀约人手机号",
+      "description": "入驻邀约人手机号",
+      "aliases": [
+        "入驻邀约人手机号",
+        "inviter_mobile"
+      ],
+      "relatedColumns": [
+        "inviter_mobile"
+      ],
+      "evidence": "来自字段 `inviter_mobile` 的语义注释"
+    },
+    {
+      "term": "币种",
+      "description": "币种",
+      "aliases": [
+        "币种",
+        "currency"
+      ],
+      "relatedColumns": [
+        "currency"
+      ],
+      "evidence": "来自字段 `currency` 的语义注释"
+    },
+    {
+      "term": "发货模式code 1",
+      "description": "发货模式code 1-集货模式 2-自发货模式",
+      "aliases": [
+        "发货模式code 1",
+        "ship_model_code",
+        "发货模式code 1-集货模式 2-自发货模式"
+      ],
+      "relatedColumns": [
+        "ship_model_code"
+      ],
+      "evidence": "来自字段 `ship_model_code` 的语义注释"
+    },
+    {
+      "term": "发货模式name 1",
+      "description": "发货模式name 1-集货模式 2-自发货模式",
+      "aliases": [
+        "发货模式name 1",
+        "ship_model_name",
+        "发货模式name 1-集货模式 2-自发货模式"
+      ],
+      "relatedColumns": [
+        "ship_model_name"
+      ],
+      "evidence": "来自字段 `ship_model_name` 的语义注释"
+    },
+    {
+      "term": "联系人姓名",
+      "description": "联系人姓名",
+      "aliases": [
+        "联系人姓名",
+        "contact_name"
+      ],
+      "relatedColumns": [
+        "contact_name"
+      ],
+      "evidence": "来自字段 `contact_name` 的语义注释"
+    },
+    {
+      "term": "联系人身份证号",
+      "description": "联系人身份证号",
+      "aliases": [
+        "联系人身份证号",
+        "contact_idcard"
+      ],
+      "relatedColumns": [
+        "contact_idcard"
+      ],
+      "evidence": "来自字段 `contact_idcard` 的语义注释"
+    },
+    {
+      "term": "联系人身份有效期 开始时间",
+      "description": "联系人身份有效期 开始时间",
+      "aliases": [
+        "联系人身份有效期 开始时间",
+        "contact_idcard_period_start"
+      ],
+      "relatedColumns": [
+        "contact_idcard_period_start"
+      ],
+      "evidence": "来自字段 `contact_idcard_period_start` 的语义注释"
+    },
+    {
+      "term": "联系人身份有效期 结束时间",
+      "description": "联系人身份有效期 结束时间",
+      "aliases": [
+        "联系人身份有效期 结束时间",
+        "contact_idcard_period_end"
+      ],
+      "relatedColumns": [
+        "contact_idcard_period_end"
+      ],
+      "evidence": "来自字段 `contact_idcard_period_end` 的语义注释"
+    },
+    {
+      "term": "联系人默认大陆身份证",
+      "description": "联系人默认大陆身份证，类型包括：100 大陆身份证；105 港澳居民往来内地通行证；106 台湾同胞往来大陆通行证；108 外国人居留证",
+      "aliases": [
+        "联系人默认大陆身份证",
+        "contact_idcard_type",
+        "联系人默认大陆身份证，类型包括：100 大陆身份证；105 港澳居民往来内地通行证；106 台湾同胞往来大陆通行证；108 外国人居留证"
+      ],
+      "relatedColumns": [
+        "contact_idcard_type"
+      ],
+      "evidence": "来自字段 `contact_idcard_type` 的语义注释"
+    },
+    {
+      "term": "联系人手机号",
+      "description": "联系人手机号",
+      "aliases": [
+        "联系人手机号",
+        "contact_mobile"
+      ],
+      "relatedColumns": [
+        "contact_mobile"
+      ],
+      "evidence": "来自字段 `contact_mobile` 的语义注释"
+    },
+    {
+      "term": "经营商省地区",
+      "description": "经营商省地区",
+      "aliases": [
+        "经营商省地区",
+        "business_province"
+      ],
+      "relatedColumns": [
+        "business_province"
+      ],
+      "evidence": "来自字段 `business_province` 的语义注释"
+    },
+    {
+      "term": "经营商所在城市地区",
+      "description": "经营商所在城市地区",
+      "aliases": [
+        "经营商所在城市地区",
+        "business_city"
+      ],
+      "relatedColumns": [
+        "business_city"
+      ],
+      "evidence": "来自字段 `business_city` 的语义注释"
+    },
+    {
+      "term": "经营商街道地区",
+      "description": "经营商街道地区",
+      "aliases": [
+        "经营商街道地区",
+        "business_district"
+      ],
+      "relatedColumns": [
+        "business_district"
+      ],
+      "evidence": "来自字段 `business_district` 的语义注释"
+    },
+    {
+      "term": "经营商详细地址",
+      "description": "经营商详细地址",
+      "aliases": [
+        "经营商详细地址",
+        "business_address"
+      ],
+      "relatedColumns": [
+        "business_address"
+      ],
+      "evidence": "来自字段 `business_address` 的语义注释"
+    },
+    {
+      "term": "发货省",
+      "description": "发货省",
+      "aliases": [
+        "发货省",
+        "send_province"
+      ],
+      "relatedColumns": [
+        "send_province"
+      ],
+      "evidence": "来自字段 `send_province` 的语义注释"
+    },
+    {
+      "term": "发货市",
+      "description": "发货市",
+      "aliases": [
+        "发货市",
+        "send_city"
+      ],
+      "relatedColumns": [
+        "send_city"
+      ],
+      "evidence": "来自字段 `send_city` 的语义注释"
+    },
+    {
+      "term": "发货区",
+      "description": "发货区",
+      "aliases": [
+        "发货区",
+        "send_district"
+      ],
+      "relatedColumns": [
+        "send_district"
+      ],
+      "evidence": "来自字段 `send_district` 的语义注释"
+    },
+    {
+      "term": "退货地址街道",
+      "description": "退货地址街道",
+      "aliases": [
+        "退货地址街道",
+        "send_street",
+        "refnd_street"
+      ],
+      "relatedColumns": [
+        "send_street",
+        "refnd_street"
+      ],
+      "evidence": "来自字段 `send_street` 的语义注释"
+    },
+    {
+      "term": "发货详细地址",
+      "description": "发货详细地址",
+      "aliases": [
+        "发货详细地址",
+        "send_address"
+      ],
+      "relatedColumns": [
+        "send_address"
+      ],
+      "evidence": "来自字段 `send_address` 的语义注释"
+    },
+    {
+      "term": "退货地址省",
+      "description": "退货地址省",
+      "aliases": [
+        "退货地址省",
+        "refnd_province"
+      ],
+      "relatedColumns": [
+        "refnd_province"
+      ],
+      "evidence": "来自字段 `refnd_province` 的语义注释"
+    },
+    {
+      "term": "退货地址市",
+      "description": "退货地址市",
+      "aliases": [
+        "退货地址市",
+        "refnd_city"
+      ],
+      "relatedColumns": [
+        "refnd_city"
+      ],
+      "evidence": "来自字段 `refnd_city` 的语义注释"
+    },
+    {
+      "term": "退货地址区",
+      "description": "退货地址区",
+      "aliases": [
+        "退货地址区",
+        "refnd_district"
+      ],
+      "relatedColumns": [
+        "refnd_district"
+      ],
+      "evidence": "来自字段 `refnd_district` 的语义注释"
+    },
+    {
+      "term": "退货地址详细地址",
+      "description": "退货地址详细地址",
+      "aliases": [
+        "退货地址详细地址",
+        "refnd_address"
+      ],
+      "relatedColumns": [
+        "refnd_address"
+      ],
+      "evidence": "来自字段 `refnd_address` 的语义注释"
+    },
+    {
+      "term": "协议版本",
+      "description": "协议版本",
+      "aliases": [
+        "协议版本",
+        "service_version"
+      ],
+      "relatedColumns": [
+        "service_version"
+      ],
+      "evidence": "来自字段 `service_version` 的语义注释"
+    },
+    {
+      "term": "手续费下限",
+      "description": "手续费下限",
+      "aliases": [
+        "手续费下限",
+        "min_poundage"
+      ],
+      "relatedColumns": [
+        "min_poundage"
+      ],
+      "evidence": "来自字段 `min_poundage` 的语义注释"
+    },
+    {
+      "term": "手续费上限",
+      "description": "手续费上限",
+      "aliases": [
+        "手续费上限",
+        "max_poundage"
+      ],
+      "relatedColumns": [
+        "max_poundage"
+      ],
+      "evidence": "来自字段 `max_poundage` 的语义注释"
+    },
+    {
+      "term": "开户行",
+      "description": "开户行",
+      "aliases": [
+        "开户行",
+        "bank_name"
+      ],
+      "relatedColumns": [
+        "bank_name"
+      ],
+      "evidence": "来自字段 `bank_name` 的语义注释"
+    },
+    {
+      "term": "银行账号",
+      "description": "银行账号",
+      "aliases": [
+        "银行账号",
+        "bank_account"
+      ],
+      "relatedColumns": [
+        "bank_account"
+      ],
+      "evidence": "来自字段 `bank_account` 的语义注释"
+    },
+    {
+      "term": "账户类型code 1.对公 2.对私",
+      "description": "账户类型code 1.对公 2.对私",
+      "aliases": [
+        "账户类型code 1.对公 2.对私",
+        "account_type_code"
+      ],
+      "relatedColumns": [
+        "account_type_code"
+      ],
+      "evidence": "来自字段 `account_type_code` 的语义注释"
+    },
+    {
+      "term": "账户类型name 1.对公 2.对私",
+      "description": "账户类型name 1.对公 2.对私",
+      "aliases": [
+        "账户类型name 1.对公 2.对私",
+        "account_type_name"
+      ],
+      "relatedColumns": [
+        "account_type_name"
+      ],
+      "evidence": "来自字段 `account_type_name` 的语义注释"
+    },
+    {
+      "term": "冻结保证金",
+      "description": "冻结保证金",
+      "aliases": [
+        "冻结保证金",
+        "deposit_freeze"
+      ],
+      "relatedColumns": [
+        "deposit_freeze"
+      ],
+      "evidence": "来自字段 `deposit_freeze` 的语义注释"
+    },
+    {
+      "term": "保证金",
+      "description": "保证金",
+      "aliases": [
+        "deposit_amt",
+        "保证金充值",
+        "保证金补缴"
+      ],
+      "relatedColumns": [
+        "deposit_amt"
+      ],
+      "evidence": "来自字段 `deposit_amt` 的语义注释"
+    },
+    {
+      "term": "费率折扣",
+      "description": "费率折扣",
+      "aliases": [
+        "费率折扣",
+        "poundage_discount"
+      ],
+      "relatedColumns": [
+        "poundage_discount"
+      ],
+      "evidence": "来自字段 `poundage_discount` 的语义注释"
+    },
+    {
+      "term": "费率折扣开始时间",
+      "description": "费率折扣开始时间",
+      "aliases": [
+        "费率折扣开始时间",
+        "discount_start_time"
+      ],
+      "relatedColumns": [
+        "discount_start_time"
+      ],
+      "evidence": "来自字段 `discount_start_time` 的语义注释"
+    },
+    {
+      "term": "费率折扣结束时间",
+      "description": "费率折扣结束时间",
+      "aliases": [
+        "费率折扣结束时间",
+        "discount_end_time"
+      ],
+      "relatedColumns": [
+        "discount_end_time"
+      ],
+      "evidence": "来自字段 `discount_end_time` 的语义注释"
+    },
+    {
+      "term": "添加时间",
+      "description": "添加时间",
+      "aliases": [
+        "添加时间",
+        "create_time"
+      ],
+      "relatedColumns": [
+        "create_time"
+      ],
+      "evidence": "来自字段 `create_time` 的语义注释"
+    },
+    {
+      "term": "修改时间",
+      "description": "修改时间",
+      "aliases": [
+        "修改时间",
+        "modify_time"
+      ],
+      "relatedColumns": [
+        "modify_time"
+      ],
+      "evidence": "来自字段 `modify_time` 的语义注释"
+    },
+    {
+      "term": "日期分区yyyyMMdd",
+      "description": "日期分区yyyyMMdd",
+      "aliases": [
+        "日期分区yyyyMMdd",
+        "pt"
+      ],
+      "relatedColumns": [
+        "pt"
+      ],
+      "evidence": "来自字段 `pt` 的语义注释"
+    },
+    {
+      "term": "商家档案",
+      "description": "商家主体、资质、结算、保证金和发货模式等基础信息",
+      "aliases": [
+        "商家信息",
+        "主体信息",
+        "入驻信息"
+      ],
+      "relatedColumns": [],
+      "evidence": "由表名/字段语义自动沉淀"
+    }
+  ],
+  "knowledgeRules": [
+    {
+      "title": "时间范围过滤",
+      "content": "涉及最近N天、昨天、上个月等时间表达时，必须优先使用 `pt` 做业务日期过滤。",
+      "alwaysApply": true,
+      "keywords": [
+        "时间",
+        "最近",
+        "pt"
+      ],
+      "evidence": "Topic Builder 从时间字段识别"
+    },
+    {
+      "title": "商家范围过滤",
+      "content": "回答单个商家问题时，必须用 `merchant_id` 过滤当前商家，避免查到全站数据。",
+      "alwaysApply": true,
+      "keywords": [
+        "商家",
+        "过滤",
+        "merchant_id"
+      ],
+      "evidence": "Topic Builder 从 merchant_id/seller_id 字段识别"
+    },
+    {
+      "title": "商家档案快照口径",
+      "content": "dim_merchant_df 是商家主体/资质/结算/保证金快照表，回答当前商家信息、发货模式、保证金余额时使用；流水变化需查对应明细表。",
+      "alwaysApply": true,
+      "keywords": [
+        "商家信息",
+        "入驻",
+        "保证金余额",
+        "发货模式",
+        "结算"
+      ],
+      "evidence": "商家维表字段语义"
+    }
+  ]
+}

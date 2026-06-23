@@ -1,0 +1,44 @@
+# 术语与同义词
+
+- 赔付单号：赔付单号，PF190827160812345，同义词=赔付单号、bill_id、赔付单号，PF190827160812345，关联字段=bill_id
+- 业务日期：业务日期，同义词=业务日期、pt，关联字段=pt
+- 赔付原因：赔付原因，同义词=赔付原因、cause_id、reason_code，关联字段=cause_id、reason_code
+- 订单号：订单号，同义词=订单号、order_id、订单，关联字段=order_id
+- 是否已退货 0否 1是：是否已退货 0否 1是，同义词=是否已退货 0否 1是、is_return，关联字段=is_return
+- 支付金额：支付金额，同义词=支付金额、repay_amt，关联字段=repay_amt
+- 工单号：工单号，同义词=工单号、ticket_id，关联字段=ticket_id
+- 赔付买家id：赔付买家id，同义词=赔付买家id、buyer_id，关联字段=buyer_id
+- 赔付买家用户名：赔付买家用户名，同义词=赔付买家用户名、buyer_name，关联字段=buyer_name
+- 赔付卖家用户id：赔付卖家用户id，同义词=赔付卖家用户id、seller_id，关联字段=seller_id
+- 赔付卖家用户名：赔付卖家用户名，同义词=赔付卖家用户名、seller_name，关联字段=seller_name
+- 备注：备注，同义词=备注、content，关联字段=content
+- 驳回原因：驳回原因，同义词=驳回原因、reject_content，关联字段=reject_content
+- 状态code：状态code，1审批中，2已驳回，3审批完成, 4已取消，同义词=状态code、repay_status_code、状态code，1审批中，2已驳回，3审批完成, 4已取消，关联字段=repay_status_code
+- 状态名称：状态名称，同义词=状态名称、repay_status_name，关联字段=repay_status_name
+- 建立人员：建立人员，同义词=建立人员、creator_id，关联字段=creator_id
+- 系统时间：系统时间，同义词=系统时间、create_time，关联字段=create_time
+- 修改人员：修改人员，同义词=修改人员、modifier_id，关联字段=modifier_id
+- 修改时间：修改时间，同义词=修改时间、modify_time，关联字段=modify_time
+- 到账状态code 1打款中 2打款失败 3打款成功：到账状态code 1打款中 2打款失败 3打款成功，同义词=到账状态code 1打款中 2打款失败 3打款成功、pay_status_code，关联字段=pay_status_code
+- 到账状态name：到账状态name，同义词=到账状态name、pay_status_name，关联字段=pay_status_name
+- 赔款方式code 1优惠券2现金3语兴好物币：赔款方式code 1优惠券2现金3语兴好物币，同义词=赔款方式code 1优惠券2现金3语兴好物币、pay_way_code，关联字段=pay_way_code
+- 赔款方式name：赔款方式name，同义词=赔款方式name、pay_way_name，关联字段=pay_way_name
+- 子订单号：子订单号，同义词=子订单号、sub_order_id、订单，关联字段=sub_order_id
+- 运单号：运单号，同义词=运单号、express_id，关联字段=express_id
+- 支付账户：支付账户，同义词=支付账户、pay_account，关联字段=pay_account
+- 流程ID：流程ID，同义词=流程ID、process_id，关联字段=process_id
+- 优惠券类型code 1满减券 2包邮券：优惠券类型code 1满减券 2包邮券，同义词=优惠券类型code 1满减券 2包邮券、coupon_type_code，关联字段=coupon_type_code
+- 优惠券类型name：优惠券类型name，同义词=优惠券类型name、coupon_type_name，关联字段=coupon_type_name
+- 满多少元：满多少元，同义词=满多少元、coupon_rule_a，关联字段=coupon_rule_a
+- 减多少元：减多少元，同义词=减多少元、coupon_rule_b，关联字段=coupon_rule_b
+- 优惠券使用期限：优惠券使用期限，格式：2019-08-25,2019-08-28，同义词=优惠券使用期限、coupon_time_limit、优惠券使用期限，格式：2019-08-25,2019-08-28，关联字段=coupon_time_limit
+- 优惠券id：优惠券id，同义词=优惠券id、coupon_id，关联字段=coupon_id
+- 活动id：活动id，同义词=活动id、activity_id，关联字段=activity_id
+- 一级理赔理由code：一级理赔理由code，同义词=一级理赔理由code、level1_reason_code，关联字段=level1_reason_code
+- 一级理赔理由name：一级理赔理由name，同义词=一级理赔理由name、level1_reason_name，关联字段=level1_reason_name
+- 二级理赔理由id：二级理赔理由id，同义词=二级理赔理由id、level2_reason_code，关联字段=level2_reason_code
+- 二级理赔理由name：二级理赔理由name，同义词=二级理赔理由name、level2_reason_name，关联字段=level2_reason_name
+- 三级理赔理由id：三级理赔理由id，同义词=三级理赔理由id、level3_reason_code，关联字段=level3_reason_code
+- 三级理赔理由name：三级理赔理由name，同义词=三级理赔理由name、level3_reason_name，关联字段=level3_reason_name
+- 赔付：客服理赔/补偿相关单据、金额和状态，同义词=理赔、补偿、赔偿
+- 工单：客服咨询、催单、关闭、评价等服务记录，同义词=客服单、咨询单、催单

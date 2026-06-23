@@ -1,0 +1,48 @@
+[
+  {
+    "name": "order_refund_by_sub_order",
+    "leftTable": "dwm_trade_order_detail_di",
+    "rightTable": "dwm_trade_refund_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
+    "grain": "sub_order_id_refund_id",
+    "useCases": ["订单明细关联退款明细", "退款订单对应订单状态"],
+    "cautions": ["汇总金额时避免一单多退导致订单金额重复计数"]
+  },
+  {
+    "name": "order_ticket_by_sub_order",
+    "leftTable": "dwm_trade_order_detail_di",
+    "rightTable": "dwm_cs_ticket_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
+    "grain": "sub_order_id_ticket_id",
+    "useCases": ["订单明细关联工单明细", "催单工单定位到订单"]
+  },
+  {
+    "name": "order_repay_by_sub_order",
+    "leftTable": "dwm_trade_order_detail_di",
+    "rightTable": "dwm_cs_repay_detail_df",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
+    "grain": "sub_order_id_bill_id",
+    "useCases": ["订单明细关联赔付明细", "赔付订单对应订单金额和商品"]
+  },
+  {
+    "name": "goods_order_by_spu_id",
+    "leftTable": "dwm_goods_detail_df",
+    "rightTable": "dwm_trade_order_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["spu_id", "spu_id"]],
+    "grain": "spu_id_sub_order_id",
+    "useCases": ["商品状态关联订单成交"]
+  },
+  {
+    "name": "merchant_order_by_user",
+    "leftTable": "dim_merchant_df",
+    "rightTable": "dwm_trade_order_detail_di",
+    "joinType": "LEFT",
+    "keys": [["merchant_id", "seller_id"]],
+    "grain": "merchant_sub_order_id",
+    "useCases": ["商家维度信息关联订单明细"]
+  }
+]

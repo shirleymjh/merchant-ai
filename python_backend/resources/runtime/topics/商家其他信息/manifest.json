@@ -1,0 +1,40 @@
+[
+  {
+    "tableName": "dwd_merchant_appeal_detail_df",
+    "tableComment": "dwd-商家域-商家申诉表",
+    "dataGrain": "商家申诉明细粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "merchant_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 4,
+    "ruleCount": 4
+  },
+  {
+    "tableName": "dwd_merchant_deposit_recharge_df",
+    "tableComment": "dwd-商家域-商家保证金充值表",
+    "dataGrain": "保证金充值流水粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "merchant_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 3,
+    "ruleCount": 3
+  }
+]

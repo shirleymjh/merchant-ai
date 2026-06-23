@@ -1,0 +1,277 @@
+[ {
+  "columnName" : "coupon_id",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "coupon_id_001", "coupon_id_002", "coupon_id_003", "coupon_id_004", "coupon_id_005", "coupon_id_006", "coupon_id_007", "coupon_id_008" ]
+}, {
+  "columnName" : "user_id",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "user_dwm_coupon_detail_di_001", "user_dwm_coupon_detail_di_002", "user_dwm_coupon_detail_di_003", "user_dwm_coupon_detail_di_004", "user_dwm_coupon_detail_di_005", "user_dwm_coupon_detail_di_006", "user_dwm_coupon_detail_di_007", "user_dwm_coupon_detail_di_008" ]
+}, {
+  "columnName" : "suit_owner_code",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "suit_owner_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_id",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_title",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "template_title_1", "template_title_2", "template_title_3", "template_title_4", "template_title_5", "template_title_6", "template_title_7", "template_title_8" ]
+}, {
+  "columnName" : "activity_id",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_amt",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "discount_way_code",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "discount_way_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "found_type_code",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "found_type_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_start_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_expire_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_send_status_code",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_send_status_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "coupon_send_status_name_1", "coupon_send_status_name_2", "coupon_send_status_name_3", "coupon_send_status_name_4", "coupon_send_status_name_5", "coupon_send_status_name_6", "coupon_send_status_name_7", "coupon_send_status_name_8" ]
+}, {
+  "columnName" : "threshold",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "send_source_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_content",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_create_time",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2026-02-25T14:05:31", "2026-02-26T17:03:08", "2026-02-27T22:22:57", "2026-02-28T14:35:18", "2026-03-01T22:10:10", "2026-03-02T18:59:58", "2026-03-03T02:33:13", "2026-03-04T10:58:35" ]
+}, {
+  "columnName" : "coupon_modify_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_receive",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "snap_create_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "snap_modify_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "coupon_refund_id",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "refund_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "allowance_amt",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_id",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 1,
+  "sampleValues" : [ "100" ]
+}, {
+  "columnName" : "seller_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "allowance_create_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "allowance_modify_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_createtor_id",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_createtor_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_remark",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_voucher",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_create_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_modify_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "template_valid_dur",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_start_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_expire_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_createtor_id",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_createtor_name",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_create_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "activity_modify_time",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "pt",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04" ]
+} ]

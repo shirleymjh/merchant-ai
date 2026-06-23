@@ -1,0 +1,44 @@
+[project]
+name = "yshopping-merchant-ai-python"
+version = "0.1.0"
+description = "Python FastAPI + LangGraph implementation of the yshopping Merchant AI backend."
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.4.0",
+  "langchain>=0.3.0",
+  "langchain-core>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langgraph>=0.2.50",
+  "pymysql>=1.1.0",
+  "requests>=2.32.0",
+  "sqlglot>=25.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.6.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.setuptools.packages.find]
+include = ["app*", "merchant_ai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-m 'not slow'"
+markers = [
+  "integration: requires real LLM and Doris connectivity",
+  "slow: long-running regression or harness tests",
+]

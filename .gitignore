@@ -1,0 +1,27 @@
+.DS_Store
+node_modules/
+dist/
+target/
+.idea/
+.vscode/
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+settings-local.xml
+/runtime/
+backend/application-local.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Merchant AI local runtime artifacts
+python_backend/.merchant-ai/

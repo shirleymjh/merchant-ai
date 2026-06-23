@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "dwm_cs_ticket_detail_di",
+    "tableComment": "dwm-客服域-工单域-明细宽表-增量表",
+    "dataGrain": "订单/子订单明细粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "seller_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 3,
+    "ruleCount": 3
+  }
+]

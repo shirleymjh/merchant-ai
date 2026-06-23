@@ -1,0 +1,570 @@
+[
+  {
+    "term": "券编号",
+    "description": "券编号",
+    "aliases": [
+      "券编号",
+      "coupon_id",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_id"
+    ],
+    "evidence": "来自字段 `coupon_id` 的语义注释"
+  },
+  {
+    "term": "用户id",
+    "description": "用户id",
+    "aliases": [
+      "用户id",
+      "user_id"
+    ],
+    "relatedColumns": [
+      "user_id"
+    ],
+    "evidence": "来自字段 `user_id` 的语义注释"
+  },
+  {
+    "term": "适用方code",
+    "description": "适用方code",
+    "aliases": [
+      "适用方code",
+      "suit_owner_code"
+    ],
+    "relatedColumns": [
+      "suit_owner_code"
+    ],
+    "evidence": "来自字段 `suit_owner_code` 的语义注释"
+  },
+  {
+    "term": "适用方name",
+    "description": "适用方name",
+    "aliases": [
+      "适用方name",
+      "suit_owner_name"
+    ],
+    "relatedColumns": [
+      "suit_owner_name"
+    ],
+    "evidence": "来自字段 `suit_owner_name` 的语义注释"
+  },
+  {
+    "term": "优惠券模板编号",
+    "description": "优惠券模板编号",
+    "aliases": [
+      "优惠券模板编号",
+      "template_id",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "template_id"
+    ],
+    "evidence": "来自字段 `template_id` 的语义注释"
+  },
+  {
+    "term": "标题",
+    "description": "标题",
+    "aliases": [
+      "标题",
+      "template_title"
+    ],
+    "relatedColumns": [
+      "template_title"
+    ],
+    "evidence": "来自字段 `template_title` 的语义注释"
+  },
+  {
+    "term": "活动id",
+    "description": "活动id",
+    "aliases": [
+      "活动id",
+      "activity_id"
+    ],
+    "relatedColumns": [
+      "activity_id"
+    ],
+    "evidence": "来自字段 `activity_id` 的语义注释"
+  },
+  {
+    "term": "优惠金额",
+    "description": "优惠金额",
+    "aliases": [
+      "优惠金额",
+      "coupon_amt",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_amt"
+    ],
+    "evidence": "来自字段 `coupon_amt` 的语义注释"
+  },
+  {
+    "term": "优惠方式code",
+    "description": "优惠方式code",
+    "aliases": [
+      "优惠方式code",
+      "discount_way_code",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "discount_way_code"
+    ],
+    "evidence": "来自字段 `discount_way_code` 的语义注释"
+  },
+  {
+    "term": "优惠方式name",
+    "description": "优惠方式name",
+    "aliases": [
+      "优惠方式name",
+      "discount_way_name",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "discount_way_name"
+    ],
+    "evidence": "来自字段 `discount_way_name` 的语义注释"
+  },
+  {
+    "term": "款项code",
+    "description": "款项code",
+    "aliases": [
+      "款项code",
+      "found_type_code"
+    ],
+    "relatedColumns": [
+      "found_type_code"
+    ],
+    "evidence": "来自字段 `found_type_code` 的语义注释"
+  },
+  {
+    "term": "款项name",
+    "description": "款项name",
+    "aliases": [
+      "款项name",
+      "found_type_name"
+    ],
+    "relatedColumns": [
+      "found_type_name"
+    ],
+    "evidence": "来自字段 `found_type_name` 的语义注释"
+  },
+  {
+    "term": "开始时间",
+    "description": "开始时间",
+    "aliases": [
+      "开始时间",
+      "coupon_start_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_start_time"
+    ],
+    "evidence": "来自字段 `coupon_start_time` 的语义注释"
+  },
+  {
+    "term": "过期时间",
+    "description": "过期时间",
+    "aliases": [
+      "过期时间",
+      "coupon_expire_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_expire_time"
+    ],
+    "evidence": "来自字段 `coupon_expire_time` 的语义注释"
+  },
+  {
+    "term": "状态code",
+    "description": "状态code",
+    "aliases": [
+      "状态code",
+      "coupon_send_status_code",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_send_status_code"
+    ],
+    "evidence": "来自字段 `coupon_send_status_code` 的语义注释"
+  },
+  {
+    "term": "状态name",
+    "description": "状态name",
+    "aliases": [
+      "状态name",
+      "coupon_send_status_name",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_send_status_name"
+    ],
+    "evidence": "来自字段 `coupon_send_status_name` 的语义注释"
+  },
+  {
+    "term": "门槛",
+    "description": "门槛",
+    "aliases": [
+      "门槛",
+      "threshold"
+    ],
+    "relatedColumns": [
+      "threshold"
+    ],
+    "evidence": "来自字段 `threshold` 的语义注释"
+  },
+  {
+    "term": "推送来源",
+    "description": "推送来源",
+    "aliases": [
+      "推送来源",
+      "send_source_name"
+    ],
+    "relatedColumns": [
+      "send_source_name"
+    ],
+    "evidence": "来自字段 `send_source_name` 的语义注释"
+  },
+  {
+    "term": "优惠券信息",
+    "description": "优惠券信息",
+    "aliases": [
+      "优惠券信息",
+      "coupon_content",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_content"
+    ],
+    "evidence": "来自字段 `coupon_content` 的语义注释"
+  },
+  {
+    "term": "优惠券创建时间",
+    "description": "优惠券创建时间",
+    "aliases": [
+      "优惠券创建时间",
+      "coupon_create_time",
+      "优惠券",
+      "template_create_time"
+    ],
+    "relatedColumns": [
+      "coupon_create_time",
+      "template_create_time"
+    ],
+    "evidence": "来自字段 `coupon_create_time` 的语义注释"
+  },
+  {
+    "term": "优惠券更新时间",
+    "description": "优惠券更新时间",
+    "aliases": [
+      "优惠券更新时间",
+      "coupon_modify_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_modify_time"
+    ],
+    "evidence": "来自字段 `coupon_modify_time` 的语义注释"
+  },
+  {
+    "term": "是否抢到优惠券",
+    "description": "是否抢到优惠券",
+    "aliases": [
+      "是否抢到优惠券",
+      "is_receive",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "is_receive"
+    ],
+    "evidence": "来自字段 `is_receive` 的语义注释"
+  },
+  {
+    "term": "抢券创建时间",
+    "description": "抢券创建时间",
+    "aliases": [
+      "抢券创建时间",
+      "snap_create_time"
+    ],
+    "relatedColumns": [
+      "snap_create_time"
+    ],
+    "evidence": "来自字段 `snap_create_time` 的语义注释"
+  },
+  {
+    "term": "抢券变更时间",
+    "description": "抢券变更时间",
+    "aliases": [
+      "抢券变更时间",
+      "snap_modify_time"
+    ],
+    "relatedColumns": [
+      "snap_modify_time"
+    ],
+    "evidence": "来自字段 `snap_modify_time` 的语义注释"
+  },
+  {
+    "term": "优惠券退回编号",
+    "description": "优惠券退回编号",
+    "aliases": [
+      "优惠券退回编号",
+      "coupon_refund_id",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "coupon_refund_id"
+    ],
+    "evidence": "来自字段 `coupon_refund_id` 的语义注释"
+  },
+  {
+    "term": "优惠券退回时间",
+    "description": "优惠券退回时间",
+    "aliases": [
+      "优惠券退回时间",
+      "refund_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "refund_time"
+    ],
+    "evidence": "来自字段 `refund_time` 的语义注释"
+  },
+  {
+    "term": "津贴金额",
+    "description": "津贴金额",
+    "aliases": [
+      "津贴金额",
+      "allowance_amt"
+    ],
+    "relatedColumns": [
+      "allowance_amt"
+    ],
+    "evidence": "来自字段 `allowance_amt` 的语义注释"
+  },
+  {
+    "term": "津贴商家id",
+    "description": "津贴商家id",
+    "aliases": [
+      "津贴商家id",
+      "seller_id"
+    ],
+    "relatedColumns": [
+      "seller_id"
+    ],
+    "evidence": "来自字段 `seller_id` 的语义注释"
+  },
+  {
+    "term": "津贴商家name",
+    "description": "津贴商家name",
+    "aliases": [
+      "津贴商家name",
+      "seller_name"
+    ],
+    "relatedColumns": [
+      "seller_name"
+    ],
+    "evidence": "来自字段 `seller_name` 的语义注释"
+  },
+  {
+    "term": "创建时间",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "allowance_create_time"
+    ],
+    "relatedColumns": [
+      "allowance_create_time"
+    ],
+    "evidence": "来自字段 `allowance_create_time` 的语义注释"
+  },
+  {
+    "term": "变更时间",
+    "description": "变更时间",
+    "aliases": [
+      "变更时间",
+      "allowance_modify_time",
+      "template_modify_time"
+    ],
+    "relatedColumns": [
+      "allowance_modify_time",
+      "template_modify_time"
+    ],
+    "evidence": "来自字段 `allowance_modify_time` 的语义注释"
+  },
+  {
+    "term": "优惠券创建人id",
+    "description": "优惠券创建人id",
+    "aliases": [
+      "优惠券创建人id",
+      "template_createtor_id",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "template_createtor_id"
+    ],
+    "evidence": "来自字段 `template_createtor_id` 的语义注释"
+  },
+  {
+    "term": "优惠券创建人name",
+    "description": "优惠券创建人name",
+    "aliases": [
+      "优惠券创建人name",
+      "template_createtor_name",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "template_createtor_name"
+    ],
+    "evidence": "来自字段 `template_createtor_name` 的语义注释"
+  },
+  {
+    "term": "优惠券备注信息",
+    "description": "优惠券备注信息",
+    "aliases": [
+      "优惠券备注信息",
+      "template_remark",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "template_remark"
+    ],
+    "evidence": "来自字段 `template_remark` 的语义注释"
+  },
+  {
+    "term": "是否代金券",
+    "description": "是否代金券",
+    "aliases": [
+      "是否代金券",
+      "is_voucher"
+    ],
+    "relatedColumns": [
+      "is_voucher"
+    ],
+    "evidence": "来自字段 `is_voucher` 的语义注释"
+  },
+  {
+    "term": "模板有效期间",
+    "description": "模板有效期间，天",
+    "aliases": [
+      "模板有效期间",
+      "template_valid_dur",
+      "模板有效期间，天"
+    ],
+    "relatedColumns": [
+      "template_valid_dur"
+    ],
+    "evidence": "来自字段 `template_valid_dur` 的语义注释"
+  },
+  {
+    "term": "优惠券活动name",
+    "description": "优惠券活动name",
+    "aliases": [
+      "优惠券活动name",
+      "activity_name",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_name"
+    ],
+    "evidence": "来自字段 `activity_name` 的语义注释"
+  },
+  {
+    "term": "优惠券活动开始时间",
+    "description": "优惠券活动开始时间",
+    "aliases": [
+      "优惠券活动开始时间",
+      "activity_start_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_start_time"
+    ],
+    "evidence": "来自字段 `activity_start_time` 的语义注释"
+  },
+  {
+    "term": "优惠券活动结束时间",
+    "description": "优惠券活动结束时间",
+    "aliases": [
+      "优惠券活动结束时间",
+      "activity_expire_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_expire_time"
+    ],
+    "evidence": "来自字段 `activity_expire_time` 的语义注释"
+  },
+  {
+    "term": "优惠券活动创建人id",
+    "description": "优惠券活动创建人id",
+    "aliases": [
+      "优惠券活动创建人id",
+      "activity_createtor_id",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_createtor_id"
+    ],
+    "evidence": "来自字段 `activity_createtor_id` 的语义注释"
+  },
+  {
+    "term": "优惠券活动创建人name",
+    "description": "优惠券活动创建人name",
+    "aliases": [
+      "优惠券活动创建人name",
+      "activity_createtor_name",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_createtor_name"
+    ],
+    "evidence": "来自字段 `activity_createtor_name` 的语义注释"
+  },
+  {
+    "term": "优惠券活动创建时间",
+    "description": "优惠券活动创建时间",
+    "aliases": [
+      "优惠券活动创建时间",
+      "activity_create_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_create_time"
+    ],
+    "evidence": "来自字段 `activity_create_time` 的语义注释"
+  },
+  {
+    "term": "优惠券活动变更时间",
+    "description": "优惠券活动变更时间",
+    "aliases": [
+      "优惠券活动变更时间",
+      "activity_modify_time",
+      "优惠券"
+    ],
+    "relatedColumns": [
+      "activity_modify_time"
+    ],
+    "evidence": "来自字段 `activity_modify_time` 的语义注释"
+  },
+  {
+    "term": "业务日期",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "relatedColumns": [
+      "pt"
+    ],
+    "evidence": "来自字段 `pt` 的语义注释"
+  },
+  {
+    "term": "优惠券",
+    "description": "优惠券、津贴、补贴活动相关明细与金额",
+    "aliases": [
+      "补贴",
+      "津贴"
+    ],
+    "relatedColumns": [],
+    "evidence": "由表名/字段语义自动沉淀"
+  }
+]

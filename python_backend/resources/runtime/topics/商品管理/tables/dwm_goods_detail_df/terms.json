@@ -1,0 +1,694 @@
+[
+  {
+    "term": "spu ID",
+    "description": "spu ID",
+    "aliases": [
+      "spu ID",
+      "spu_id"
+    ],
+    "relatedColumns": [
+      "spu_id"
+    ],
+    "evidence": "来自字段 `spu_id` 的语义注释"
+  },
+  {
+    "term": "商品名称",
+    "description": "商品名称",
+    "aliases": [
+      "商品名称",
+      "spu_name"
+    ],
+    "relatedColumns": [
+      "spu_name"
+    ],
+    "evidence": "来自字段 `spu_name` 的语义注释"
+  },
+  {
+    "term": "spu发布人id",
+    "description": "spu发布人id",
+    "aliases": [
+      "spu发布人id",
+      "seller_id"
+    ],
+    "relatedColumns": [
+      "seller_id"
+    ],
+    "evidence": "来自字段 `seller_id` 的语义注释"
+  },
+  {
+    "term": "spu发布人name",
+    "description": "spu发布人name",
+    "aliases": [
+      "spu发布人name",
+      "seller_name"
+    ],
+    "relatedColumns": [
+      "seller_name"
+    ],
+    "evidence": "来自字段 `seller_name` 的语义注释"
+  },
+  {
+    "term": "spu来源code",
+    "description": "spu来源code",
+    "aliases": [
+      "spu来源code",
+      "source_type_code"
+    ],
+    "relatedColumns": [
+      "source_type_code"
+    ],
+    "evidence": "来自字段 `source_type_code` 的语义注释"
+  },
+  {
+    "term": "spu来源name 个人卖家 企业卖家",
+    "description": "spu来源name 个人卖家 企业卖家",
+    "aliases": [
+      "spu来源name 个人卖家 企业卖家",
+      "source_type_name"
+    ],
+    "relatedColumns": [
+      "source_type_name"
+    ],
+    "evidence": "来自字段 `source_type_name` 的语义注释"
+  },
+  {
+    "term": "一级类目code",
+    "description": "一级类目code",
+    "aliases": [
+      "一级类目code",
+      "level1_category_code"
+    ],
+    "relatedColumns": [
+      "level1_category_code"
+    ],
+    "evidence": "来自字段 `level1_category_code` 的语义注释"
+  },
+  {
+    "term": "一级类目name",
+    "description": "一级类目name",
+    "aliases": [
+      "一级类目name",
+      "level1_category_name"
+    ],
+    "relatedColumns": [
+      "level1_category_name"
+    ],
+    "evidence": "来自字段 `level1_category_name` 的语义注释"
+  },
+  {
+    "term": "二级类目code",
+    "description": "二级类目code",
+    "aliases": [
+      "二级类目code",
+      "level2_category_code"
+    ],
+    "relatedColumns": [
+      "level2_category_code"
+    ],
+    "evidence": "来自字段 `level2_category_code` 的语义注释"
+  },
+  {
+    "term": "二级类目name",
+    "description": "二级类目name",
+    "aliases": [
+      "二级类目name",
+      "level2_category_name"
+    ],
+    "relatedColumns": [
+      "level2_category_name"
+    ],
+    "evidence": "来自字段 `level2_category_name` 的语义注释"
+  },
+  {
+    "term": "三级类目code",
+    "description": "三级类目code",
+    "aliases": [
+      "三级类目code",
+      "level3_category_code"
+    ],
+    "relatedColumns": [
+      "level3_category_code"
+    ],
+    "evidence": "来自字段 `level3_category_code` 的语义注释"
+  },
+  {
+    "term": "三级类目name",
+    "description": "三级类目name",
+    "aliases": [
+      "三级类目name",
+      "level3_category_name"
+    ],
+    "relatedColumns": [
+      "level3_category_name"
+    ],
+    "evidence": "来自字段 `level3_category_name` 的语义注释"
+  },
+  {
+    "term": "品牌code",
+    "description": "品牌code",
+    "aliases": [
+      "品牌code",
+      "brand_code"
+    ],
+    "relatedColumns": [
+      "brand_code"
+    ],
+    "evidence": "来自字段 `brand_code` 的语义注释"
+  },
+  {
+    "term": "品牌name",
+    "description": "品牌name",
+    "aliases": [
+      "品牌name",
+      "brand_name"
+    ],
+    "relatedColumns": [
+      "brand_name"
+    ],
+    "evidence": "来自字段 `brand_name` 的语义注释"
+  },
+  {
+    "term": "适用人群code",
+    "description": "适用人群code",
+    "aliases": [
+      "适用人群code",
+      "fit_code"
+    ],
+    "relatedColumns": [
+      "fit_code"
+    ],
+    "evidence": "来自字段 `fit_code` 的语义注释"
+  },
+  {
+    "term": "适用人群name",
+    "description": "适用人群name",
+    "aliases": [
+      "适用人群name",
+      "fit_name"
+    ],
+    "relatedColumns": [
+      "fit_name"
+    ],
+    "evidence": "来自字段 `fit_name` 的语义注释"
+  },
+  {
+    "term": "发售价分",
+    "description": "发售价分",
+    "aliases": [
+      "发售价分",
+      "spu_auth_price"
+    ],
+    "relatedColumns": [
+      "spu_auth_price"
+    ],
+    "evidence": "来自字段 `spu_auth_price` 的语义注释"
+  },
+  {
+    "term": "logo图",
+    "description": "logo图",
+    "aliases": [
+      "logo图",
+      "spu_logo_url"
+    ],
+    "relatedColumns": [
+      "spu_logo_url"
+    ],
+    "evidence": "来自字段 `spu_logo_url` 的语义注释"
+  },
+  {
+    "term": "视频图",
+    "description": "视频图",
+    "aliases": [
+      "视频图",
+      "spu_video_url"
+    ],
+    "relatedColumns": [
+      "spu_video_url"
+    ],
+    "evidence": "来自字段 `spu_video_url` 的语义注释"
+  },
+  {
+    "term": "货号",
+    "description": "货号",
+    "aliases": [
+      "货号",
+      "article_id"
+    ],
+    "relatedColumns": [
+      "article_id"
+    ],
+    "evidence": "来自字段 `article_id` 的语义注释"
+  },
+  {
+    "term": "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "description": "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "aliases": [
+      "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+      "spu_status_code"
+    ],
+    "relatedColumns": [
+      "spu_status_code"
+    ],
+    "evidence": "来自字段 `spu_status_code` 的语义注释"
+  },
+  {
+    "term": "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "description": "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "aliases": [
+      "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+      "spu_status_name"
+    ],
+    "relatedColumns": [
+      "spu_status_name"
+    ],
+    "evidence": "来自字段 `spu_status_name` 的语义注释"
+  },
+  {
+    "term": "商品描述",
+    "description": "商品描述",
+    "aliases": [
+      "商品描述",
+      "spu_desc"
+    ],
+    "relatedColumns": [
+      "spu_desc"
+    ],
+    "evidence": "来自字段 `spu_desc` 的语义注释"
+  },
+  {
+    "term": "创建时间",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "spu_apply_create_time"
+    ],
+    "relatedColumns": [
+      "spu_apply_create_time"
+    ],
+    "evidence": "来自字段 `spu_apply_create_time` 的语义注释"
+  },
+  {
+    "term": "变更时间",
+    "description": "变更时间",
+    "aliases": [
+      "变更时间",
+      "spu_apply_modify_time"
+    ],
+    "relatedColumns": [
+      "spu_apply_modify_time"
+    ],
+    "evidence": "来自字段 `spu_apply_modify_time` 的语义注释"
+  },
+  {
+    "term": "唯一ID",
+    "description": "唯一ID",
+    "aliases": [
+      "唯一ID",
+      "biz_id"
+    ],
+    "relatedColumns": [
+      "biz_id"
+    ],
+    "evidence": "来自字段 `biz_id` 的语义注释"
+  },
+  {
+    "term": "任务状态code。反馈问题",
+    "description": "任务状态code。反馈问题；提交任务；",
+    "aliases": [
+      "任务状态code。反馈问题",
+      "completion_operate_type_code",
+      "任务状态code。反馈问题；提交任务；",
+      "audit_operate_type_code"
+    ],
+    "relatedColumns": [
+      "completion_operate_type_code",
+      "audit_operate_type_code"
+    ],
+    "evidence": "来自字段 `completion_operate_type_code` 的语义注释"
+  },
+  {
+    "term": "任务状态name。反馈问题",
+    "description": "任务状态name。反馈问题；提交任务；",
+    "aliases": [
+      "任务状态name。反馈问题",
+      "completion_operate_type_name",
+      "任务状态name。反馈问题；提交任务；",
+      "audit_operate_type_name"
+    ],
+    "relatedColumns": [
+      "completion_operate_type_name",
+      "audit_operate_type_name"
+    ],
+    "evidence": "来自字段 `completion_operate_type_name` 的语义注释"
+  },
+  {
+    "term": "是否通过",
+    "description": "是否通过",
+    "aliases": [
+      "是否通过",
+      "is_completion_pass",
+      "is_audit_pass"
+    ],
+    "relatedColumns": [
+      "is_completion_pass",
+      "is_audit_pass"
+    ],
+    "evidence": "来自字段 `is_completion_pass` 的语义注释"
+  },
+  {
+    "term": "备注",
+    "description": "备注",
+    "aliases": [
+      "completion_remark",
+      "audit_remark"
+    ],
+    "relatedColumns": [
+      "completion_remark",
+      "audit_remark"
+    ],
+    "evidence": "来自字段 `completion_remark` 的语义注释"
+  },
+  {
+    "term": "首次操作人",
+    "description": "首次操作人",
+    "aliases": [
+      "首次操作人",
+      "first_completion_operate_id",
+      "first_audit_operate_id"
+    ],
+    "relatedColumns": [
+      "first_completion_operate_id",
+      "first_audit_operate_id"
+    ],
+    "evidence": "来自字段 `first_completion_operate_id` 的语义注释"
+  },
+  {
+    "term": "首次操作人name",
+    "description": "首次操作人name",
+    "aliases": [
+      "首次操作人name",
+      "first_completion_operate_name",
+      "first_audit_operate_name"
+    ],
+    "relatedColumns": [
+      "first_completion_operate_name",
+      "first_audit_operate_name"
+    ],
+    "evidence": "来自字段 `first_completion_operate_name` 的语义注释"
+  },
+  {
+    "term": "最新操作人",
+    "description": "最新操作人",
+    "aliases": [
+      "最新操作人",
+      "completion_operate_id",
+      "audit_operate_id"
+    ],
+    "relatedColumns": [
+      "completion_operate_id",
+      "audit_operate_id"
+    ],
+    "evidence": "来自字段 `completion_operate_id` 的语义注释"
+  },
+  {
+    "term": "最新操作人name",
+    "description": "最新操作人name",
+    "aliases": [
+      "最新操作人name",
+      "completion_operate_name",
+      "audit_operate_name"
+    ],
+    "relatedColumns": [
+      "completion_operate_name",
+      "audit_operate_name"
+    ],
+    "evidence": "来自字段 `completion_operate_name` 的语义注释"
+  },
+  {
+    "term": "首次操作时间",
+    "description": "首次操作时间",
+    "aliases": [
+      "首次操作时间",
+      "first_completion_operate_time",
+      "first_audit_operate_time"
+    ],
+    "relatedColumns": [
+      "first_completion_operate_time",
+      "first_audit_operate_time"
+    ],
+    "evidence": "来自字段 `first_completion_operate_time` 的语义注释"
+  },
+  {
+    "term": "操作时间",
+    "description": "操作时间",
+    "aliases": [
+      "操作时间",
+      "completion_operate_time",
+      "audit_operate_time"
+    ],
+    "relatedColumns": [
+      "completion_operate_time",
+      "audit_operate_time"
+    ],
+    "evidence": "来自字段 `completion_operate_time` 的语义注释"
+  },
+  {
+    "term": "首次操作人供应商名称",
+    "description": "首次操作人供应商名称",
+    "aliases": [
+      "首次操作人供应商名称",
+      "first_audit_operate_supplier_name"
+    ],
+    "relatedColumns": [
+      "first_audit_operate_supplier_name"
+    ],
+    "evidence": "来自字段 `first_audit_operate_supplier_name` 的语义注释"
+  },
+  {
+    "term": "最新操作人供应商名称",
+    "description": "最新操作人供应商名称",
+    "aliases": [
+      "最新操作人供应商名称",
+      "audit_operate_supplier_name"
+    ],
+    "relatedColumns": [
+      "audit_operate_supplier_name"
+    ],
+    "evidence": "来自字段 `audit_operate_supplier_name` 的语义注释"
+  },
+  {
+    "term": "导入任务id",
+    "description": "导入任务id",
+    "aliases": [
+      "导入任务id",
+      "import_task_id"
+    ],
+    "relatedColumns": [
+      "import_task_id"
+    ],
+    "evidence": "来自字段 `import_task_id` 的语义注释"
+  },
+  {
+    "term": "excel存放路径",
+    "description": "excel存放路径",
+    "aliases": [
+      "excel存放路径",
+      "excel_url"
+    ],
+    "relatedColumns": [
+      "excel_url"
+    ],
+    "evidence": "来自字段 `excel_url` 的语义注释"
+  },
+  {
+    "term": "导入excel名称",
+    "description": "导入excel名称",
+    "aliases": [
+      "导入excel名称",
+      "excel_name"
+    ],
+    "relatedColumns": [
+      "excel_name"
+    ],
+    "evidence": "来自字段 `excel_name` 的语义注释"
+  },
+  {
+    "term": "导入状态",
+    "description": "导入状态",
+    "aliases": [
+      "导入状态",
+      "is_import_pass"
+    ],
+    "relatedColumns": [
+      "is_import_pass"
+    ],
+    "evidence": "来自字段 `is_import_pass` 的语义注释"
+  },
+  {
+    "term": "导入时间",
+    "description": "导入时间",
+    "aliases": [
+      "导入时间",
+      "import_time"
+    ],
+    "relatedColumns": [
+      "import_time"
+    ],
+    "evidence": "来自字段 `import_time` 的语义注释"
+  },
+  {
+    "term": "操作人id",
+    "description": "操作人id",
+    "aliases": [
+      "操作人id",
+      "import_operate_id"
+    ],
+    "relatedColumns": [
+      "import_operate_id"
+    ],
+    "evidence": "来自字段 `import_operate_id` 的语义注释"
+  },
+  {
+    "term": "操作人name",
+    "description": "操作人name",
+    "aliases": [
+      "操作人name",
+      "import_operate_name"
+    ],
+    "relatedColumns": [
+      "import_operate_name"
+    ],
+    "evidence": "来自字段 `import_operate_name` 的语义注释"
+  },
+  {
+    "term": "是否风控审核通过",
+    "description": "是否风控审核通过",
+    "aliases": [
+      "是否风控审核通过",
+      "is_risk_audit_pass"
+    ],
+    "relatedColumns": [
+      "is_risk_audit_pass"
+    ],
+    "evidence": "来自字段 `is_risk_audit_pass` 的语义注释"
+  },
+  {
+    "term": "机审时间",
+    "description": "机审时间",
+    "aliases": [
+      "机审时间",
+      "machine_audit_time"
+    ],
+    "relatedColumns": [
+      "machine_audit_time"
+    ],
+    "evidence": "来自字段 `machine_audit_time` 的语义注释"
+  },
+  {
+    "term": "机审是否转人工",
+    "description": "机审是否转人工",
+    "aliases": [
+      "机审是否转人工",
+      "is_manual"
+    ],
+    "relatedColumns": [
+      "is_manual"
+    ],
+    "evidence": "来自字段 `is_manual` 的语义注释"
+  },
+  {
+    "term": "首次risk最新审核人ID",
+    "description": "首次risk最新审核人ID",
+    "aliases": [
+      "首次risk最新审核人ID",
+      "first_risk_tag_user_id"
+    ],
+    "relatedColumns": [
+      "first_risk_tag_user_id"
+    ],
+    "evidence": "来自字段 `first_risk_tag_user_id` 的语义注释"
+  },
+  {
+    "term": "首次risk最新审核人name",
+    "description": "首次risk最新审核人name",
+    "aliases": [
+      "首次risk最新审核人name",
+      "first_risk_tag_user_name"
+    ],
+    "relatedColumns": [
+      "first_risk_tag_user_name"
+    ],
+    "evidence": "来自字段 `first_risk_tag_user_name` 的语义注释"
+  },
+  {
+    "term": "risk最新审核人ID",
+    "description": "risk最新审核人ID",
+    "aliases": [
+      "risk最新审核人ID",
+      "risk_tag_user_id"
+    ],
+    "relatedColumns": [
+      "risk_tag_user_id"
+    ],
+    "evidence": "来自字段 `risk_tag_user_id` 的语义注释"
+  },
+  {
+    "term": "risk最新审核人名称",
+    "description": "risk最新审核人名称",
+    "aliases": [
+      "risk最新审核人名称",
+      "risk_tag_user_name"
+    ],
+    "relatedColumns": [
+      "risk_tag_user_name"
+    ],
+    "evidence": "来自字段 `risk_tag_user_name` 的语义注释"
+  },
+  {
+    "term": "risk最新审核人供应商",
+    "description": "risk最新审核人供应商",
+    "aliases": [
+      "risk最新审核人供应商",
+      "risk_operate_supplier_name"
+    ],
+    "relatedColumns": [
+      "risk_operate_supplier_name"
+    ],
+    "evidence": "来自字段 `risk_operate_supplier_name` 的语义注释"
+  },
+  {
+    "term": "是否加白",
+    "description": "是否加白",
+    "aliases": [
+      "是否加白",
+      "is_white"
+    ],
+    "relatedColumns": [
+      "is_white"
+    ],
+    "evidence": "来自字段 `is_white` 的语义注释"
+  },
+  {
+    "term": "业务日期",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "relatedColumns": [
+      "pt"
+    ],
+    "evidence": "来自字段 `pt` 的语义注释"
+  },
+  {
+    "term": "商品审核",
+    "description": "商品上新、审核通过/拒绝、上架状态相关流程",
+    "aliases": [
+      "商品拒绝",
+      "审核拒绝",
+      "商品上架"
+    ],
+    "relatedColumns": [],
+    "evidence": "由表名/字段语义自动沉淀"
+  }
+]

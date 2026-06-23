@@ -1,0 +1,847 @@
+[ {
+  "columnName" : "inbound_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_header_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_express_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_express_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_express_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_valid_status",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "unique_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_status_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_status_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "spu_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sku_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "spu_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "level1_category_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "level1_category_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "level2_category_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "level2_category_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "level3_category_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "level3_category_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "brand_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "brand_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "article_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_cnt",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_create_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_modify_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_receive_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_check",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "warehouse_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "warhouse_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "online_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "dispatch_bill_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_nick_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_address",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "deliver_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_cross",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_express",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_header_remark",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "expect_start_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_header_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "inbound_header_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "merchant_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "merchant_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "latest_inbound_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_operator_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_operator_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_group_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_group_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_salary",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_attend_start_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_attend_end_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_attend_days",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_source_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_source_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_status_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_status_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_remark",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_warhouse_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_create_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_modify_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_station_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_production_line_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "sorting_production_line_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_task_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_status_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_status_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "unpass_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "unpass_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_operator_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_operator_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_group_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_group_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_salary",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_attend_start_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_attend_end_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_attend_days",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_create_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_modify_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "photo_cnt",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_cnt",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "biz_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "biz_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_source_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_source_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_reason_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_reason_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "apply_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "apply_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_task_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_is_operate_pass",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_operate_remark",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_operator_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_operator_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_group_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_group_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_reason_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_reason_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_apply_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_check_apply_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_task_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_identify_online",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_identify",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_result_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_result_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identifier_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identifier_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_content",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "photo_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_create_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "identify_modify_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_identify_task_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_identify_pass_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_identify_pass_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_identify_operate_remark",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_identify_operator_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "first_identify_operator_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "asoutbound_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_create_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_modify_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_express_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_express_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_express_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "promise_type_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "promise_type_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_latest_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "operator_id",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "operator_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_group_code",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_group_name",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_salary",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_attend_start_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_attend_end_time",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "outbound_attend_days",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "pt",
+  "sampleCount" : 0,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+} ]

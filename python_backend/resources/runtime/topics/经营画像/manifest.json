@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "ads_merchant_profile",
+    "tableComment": "",
+    "dataGrain": "商家-日期粒度经营指标画像",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "merchant_id",
+    "freshnessType": "UNKNOWN",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 51,
+    "ruleCount": 3
+  }
+]

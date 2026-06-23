@@ -1,0 +1,950 @@
+[
+  {
+    "columnName": "spu_id",
+    "businessName": "spu ID",
+    "role": "KEY",
+    "description": "spu ID",
+    "aliases": [
+      "spu ID",
+      "spu_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu ID; samples=[spu_id_001, spu_id_002, spu_id_003, spu_id_004, spu_id_005, spu_id_006, spu_id_007, spu_id_008]"
+  },
+  {
+    "columnName": "spu_name",
+    "businessName": "商品名称",
+    "role": "DIMENSION",
+    "description": "商品名称",
+    "aliases": [
+      "商品名称",
+      "spu_name"
+    ],
+    "enumValues": [
+      "spu_name_1",
+      "spu_name_2",
+      "spu_name_3",
+      "spu_name_4",
+      "spu_name_5",
+      "spu_name_6",
+      "spu_name_7",
+      "spu_name_8"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品名称; samples=[spu_name_1, spu_name_2, spu_name_3, spu_name_4, spu_name_5, spu_name_6, spu_name_7, spu_name_8]"
+  },
+  {
+    "columnName": "seller_id",
+    "businessName": "spu发布人id",
+    "role": "KEY",
+    "description": "spu发布人id",
+    "aliases": [
+      "spu发布人id",
+      "seller_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu发布人id; samples=[100]"
+  },
+  {
+    "columnName": "seller_name",
+    "businessName": "spu发布人name",
+    "role": "DIMENSION",
+    "description": "spu发布人name",
+    "aliases": [
+      "spu发布人name",
+      "seller_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu发布人name"
+  },
+  {
+    "columnName": "source_type_code",
+    "businessName": "spu来源code",
+    "role": "DIMENSION",
+    "description": "spu来源code",
+    "aliases": [
+      "spu来源code",
+      "source_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu来源code"
+  },
+  {
+    "columnName": "source_type_name",
+    "businessName": "spu来源name 个人卖家 企业卖家",
+    "role": "DIMENSION",
+    "description": "spu来源name 个人卖家 企业卖家",
+    "aliases": [
+      "spu来源name 个人卖家 企业卖家",
+      "source_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu来源name 个人卖家 企业卖家"
+  },
+  {
+    "columnName": "level1_category_code",
+    "businessName": "一级类目code",
+    "role": "DIMENSION",
+    "description": "一级类目code",
+    "aliases": [
+      "一级类目code",
+      "level1_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=一级类目code"
+  },
+  {
+    "columnName": "level1_category_name",
+    "businessName": "一级类目name",
+    "role": "DIMENSION",
+    "description": "一级类目name",
+    "aliases": [
+      "一级类目name",
+      "level1_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=一级类目name"
+  },
+  {
+    "columnName": "level2_category_code",
+    "businessName": "二级类目code",
+    "role": "DIMENSION",
+    "description": "二级类目code",
+    "aliases": [
+      "二级类目code",
+      "level2_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=二级类目code"
+  },
+  {
+    "columnName": "level2_category_name",
+    "businessName": "二级类目name",
+    "role": "DIMENSION",
+    "description": "二级类目name",
+    "aliases": [
+      "二级类目name",
+      "level2_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=二级类目name"
+  },
+  {
+    "columnName": "level3_category_code",
+    "businessName": "三级类目code",
+    "role": "DIMENSION",
+    "description": "三级类目code",
+    "aliases": [
+      "三级类目code",
+      "level3_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=三级类目code"
+  },
+  {
+    "columnName": "level3_category_name",
+    "businessName": "三级类目name",
+    "role": "DIMENSION",
+    "description": "三级类目name",
+    "aliases": [
+      "三级类目name",
+      "level3_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=三级类目name"
+  },
+  {
+    "columnName": "brand_code",
+    "businessName": "品牌code",
+    "role": "DIMENSION",
+    "description": "品牌code",
+    "aliases": [
+      "品牌code",
+      "brand_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=品牌code"
+  },
+  {
+    "columnName": "brand_name",
+    "businessName": "品牌name",
+    "role": "DIMENSION",
+    "description": "品牌name",
+    "aliases": [
+      "品牌name",
+      "brand_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=品牌name"
+  },
+  {
+    "columnName": "fit_code",
+    "businessName": "适用人群code",
+    "role": "DIMENSION",
+    "description": "适用人群code",
+    "aliases": [
+      "适用人群code",
+      "fit_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=适用人群code"
+  },
+  {
+    "columnName": "fit_name",
+    "businessName": "适用人群name",
+    "role": "DIMENSION",
+    "description": "适用人群name",
+    "aliases": [
+      "适用人群name",
+      "fit_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=适用人群name"
+  },
+  {
+    "columnName": "spu_auth_price",
+    "businessName": "发售价分",
+    "role": "METRIC",
+    "description": "发售价分",
+    "aliases": [
+      "发售价分",
+      "spu_auth_price"
+    ],
+    "enumValues": [],
+    "metricFormula": "AVG(spu_auth_price)",
+    "confidence": 0.78,
+    "evidence": "schema comment=发售价分"
+  },
+  {
+    "columnName": "spu_logo_url",
+    "businessName": "logo图",
+    "role": "OTHER",
+    "description": "logo图",
+    "aliases": [
+      "logo图",
+      "spu_logo_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=logo图"
+  },
+  {
+    "columnName": "spu_video_url",
+    "businessName": "视频图",
+    "role": "OTHER",
+    "description": "视频图",
+    "aliases": [
+      "视频图",
+      "spu_video_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=视频图"
+  },
+  {
+    "columnName": "article_id",
+    "businessName": "货号",
+    "role": "KEY",
+    "description": "货号",
+    "aliases": [
+      "货号",
+      "article_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=货号"
+  },
+  {
+    "columnName": "spu_status_code",
+    "businessName": "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "role": "DIMENSION",
+    "description": "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "aliases": [
+      "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+      "spu_status_code"
+    ],
+    "enumValues": [
+      "0=下架",
+      "1=上架",
+      "2=待提交",
+      "3=待审核",
+      "4=审核通过"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过"
+  },
+  {
+    "columnName": "spu_status_name",
+    "businessName": "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "role": "DIMENSION",
+    "description": "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "aliases": [
+      "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+      "spu_status_name"
+    ],
+    "enumValues": [
+      "spu_status_name_1",
+      "spu_status_name_2",
+      "spu_status_name_3",
+      "spu_status_name_4",
+      "spu_status_name_5",
+      "spu_status_name_6",
+      "spu_status_name_7",
+      "spu_status_name_8"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过; samples=[spu_status_name_1, spu_status_name_2, spu_status_name_3, spu_status_name_4, spu_status_name_5, spu_status_name_6, spu_status_name_7, spu_status_name_8]"
+  },
+  {
+    "columnName": "spu_desc",
+    "businessName": "商品描述",
+    "role": "OTHER",
+    "description": "商品描述",
+    "aliases": [
+      "商品描述",
+      "spu_desc"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品描述"
+  },
+  {
+    "columnName": "spu_apply_create_time",
+    "businessName": "创建时间",
+    "role": "TIME",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "spu_apply_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=创建时间; samples=[2026-02-25T23:14:50, 2026-02-26T01:40:57, 2026-02-27T15:16:02, 2026-02-28T18:57:44, 2026-03-01T22:18:25, 2026-03-02T05:35:22, 2026-03-03T00:10:27, 2026-03-04T00:10:54]"
+  },
+  {
+    "columnName": "spu_apply_modify_time",
+    "businessName": "变更时间",
+    "role": "TIME",
+    "description": "变更时间",
+    "aliases": [
+      "变更时间",
+      "spu_apply_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=变更时间"
+  },
+  {
+    "columnName": "biz_id",
+    "businessName": "唯一ID",
+    "role": "KEY",
+    "description": "唯一ID",
+    "aliases": [
+      "唯一ID",
+      "biz_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=唯一ID"
+  },
+  {
+    "columnName": "completion_operate_type_code",
+    "businessName": "任务状态code。反馈问题",
+    "role": "DIMENSION",
+    "description": "任务状态code。反馈问题；提交任务；",
+    "aliases": [
+      "任务状态code。反馈问题",
+      "completion_operate_type_code",
+      "任务状态code。反馈问题；提交任务；"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务状态code。反馈问题；提交任务；"
+  },
+  {
+    "columnName": "completion_operate_type_name",
+    "businessName": "任务状态name。反馈问题",
+    "role": "DIMENSION",
+    "description": "任务状态name。反馈问题；提交任务；",
+    "aliases": [
+      "任务状态name。反馈问题",
+      "completion_operate_type_name",
+      "任务状态name。反馈问题；提交任务；"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务状态name。反馈问题；提交任务；"
+  },
+  {
+    "columnName": "is_completion_pass",
+    "businessName": "是否通过",
+    "role": "DIMENSION",
+    "description": "是否通过",
+    "aliases": [
+      "是否通过",
+      "is_completion_pass"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否通过"
+  },
+  {
+    "columnName": "completion_remark",
+    "businessName": "备注",
+    "role": "OTHER",
+    "description": "备注",
+    "aliases": [
+      "completion_remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=备注"
+  },
+  {
+    "columnName": "first_completion_operate_id",
+    "businessName": "首次操作人",
+    "role": "KEY",
+    "description": "首次操作人",
+    "aliases": [
+      "首次操作人",
+      "first_completion_operate_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作人"
+  },
+  {
+    "columnName": "first_completion_operate_name",
+    "businessName": "首次操作人name",
+    "role": "DIMENSION",
+    "description": "首次操作人name",
+    "aliases": [
+      "首次操作人name",
+      "first_completion_operate_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作人name"
+  },
+  {
+    "columnName": "completion_operate_id",
+    "businessName": "最新操作人",
+    "role": "KEY",
+    "description": "最新操作人",
+    "aliases": [
+      "最新操作人",
+      "completion_operate_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=最新操作人"
+  },
+  {
+    "columnName": "completion_operate_name",
+    "businessName": "最新操作人name",
+    "role": "DIMENSION",
+    "description": "最新操作人name",
+    "aliases": [
+      "最新操作人name",
+      "completion_operate_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=最新操作人name"
+  },
+  {
+    "columnName": "first_completion_operate_time",
+    "businessName": "首次操作时间",
+    "role": "TIME",
+    "description": "首次操作时间",
+    "aliases": [
+      "首次操作时间",
+      "first_completion_operate_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作时间"
+  },
+  {
+    "columnName": "completion_operate_time",
+    "businessName": "操作时间",
+    "role": "TIME",
+    "description": "操作时间",
+    "aliases": [
+      "操作时间",
+      "completion_operate_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作时间"
+  },
+  {
+    "columnName": "audit_operate_type_code",
+    "businessName": "任务状态code。反馈问题",
+    "role": "DIMENSION",
+    "description": "任务状态code。反馈问题；提交任务；",
+    "aliases": [
+      "任务状态code。反馈问题",
+      "audit_operate_type_code",
+      "任务状态code。反馈问题；提交任务；"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务状态code。反馈问题；提交任务；"
+  },
+  {
+    "columnName": "audit_operate_type_name",
+    "businessName": "任务状态name。反馈问题",
+    "role": "DIMENSION",
+    "description": "任务状态name。反馈问题；提交任务；",
+    "aliases": [
+      "任务状态name。反馈问题",
+      "audit_operate_type_name",
+      "任务状态name。反馈问题；提交任务；"
+    ],
+    "enumValues": [
+      "audit_operate_type_name_1",
+      "audit_operate_type_name_2",
+      "audit_operate_type_name_3",
+      "audit_operate_type_name_4",
+      "audit_operate_type_name_5",
+      "audit_operate_type_name_6",
+      "audit_operate_type_name_7",
+      "audit_operate_type_name_8"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务状态name。反馈问题；提交任务；; samples=[audit_operate_type_name_1, audit_operate_type_name_2, audit_operate_type_name_3, audit_operate_type_name_4, audit_operate_type_name_5, audit_operate_type_name_6, audit_operate_type_name_7, audit_operate_type_name_8]"
+  },
+  {
+    "columnName": "is_audit_pass",
+    "businessName": "是否通过",
+    "role": "DIMENSION",
+    "description": "是否通过",
+    "aliases": [
+      "是否通过",
+      "is_audit_pass"
+    ],
+    "enumValues": [
+      "1",
+      "0"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否通过; samples=[1, 0]"
+  },
+  {
+    "columnName": "audit_remark",
+    "businessName": "备注",
+    "role": "OTHER",
+    "description": "备注",
+    "aliases": [
+      "audit_remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=备注; samples=[audit_remark_dwm_goods_detail_df_1, audit_remark_dwm_goods_detail_df_2, audit_remark_dwm_goods_detail_df_3, audit_remark_dwm_goods_detail_df_4, audit_remark_dwm_goods_detail_df_5, audit_remark_dwm_goods_detail_df_6, audit_remark_dwm_goods_detail_df_7, audit_remark_dwm_goods_detail_df_8]"
+  },
+  {
+    "columnName": "first_audit_operate_id",
+    "businessName": "首次操作人",
+    "role": "KEY",
+    "description": "首次操作人",
+    "aliases": [
+      "首次操作人",
+      "first_audit_operate_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作人"
+  },
+  {
+    "columnName": "first_audit_operate_name",
+    "businessName": "首次操作人name",
+    "role": "DIMENSION",
+    "description": "首次操作人name",
+    "aliases": [
+      "首次操作人name",
+      "first_audit_operate_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作人name"
+  },
+  {
+    "columnName": "first_audit_operate_supplier_name",
+    "businessName": "首次操作人供应商名称",
+    "role": "DIMENSION",
+    "description": "首次操作人供应商名称",
+    "aliases": [
+      "首次操作人供应商名称",
+      "first_audit_operate_supplier_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作人供应商名称"
+  },
+  {
+    "columnName": "audit_operate_id",
+    "businessName": "最新操作人",
+    "role": "KEY",
+    "description": "最新操作人",
+    "aliases": [
+      "最新操作人",
+      "audit_operate_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=最新操作人"
+  },
+  {
+    "columnName": "audit_operate_name",
+    "businessName": "最新操作人name",
+    "role": "DIMENSION",
+    "description": "最新操作人name",
+    "aliases": [
+      "最新操作人name",
+      "audit_operate_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=最新操作人name"
+  },
+  {
+    "columnName": "audit_operate_supplier_name",
+    "businessName": "最新操作人供应商名称",
+    "role": "DIMENSION",
+    "description": "最新操作人供应商名称",
+    "aliases": [
+      "最新操作人供应商名称",
+      "audit_operate_supplier_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=最新操作人供应商名称"
+  },
+  {
+    "columnName": "first_audit_operate_time",
+    "businessName": "首次操作时间",
+    "role": "TIME",
+    "description": "首次操作时间",
+    "aliases": [
+      "首次操作时间",
+      "first_audit_operate_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次操作时间"
+  },
+  {
+    "columnName": "audit_operate_time",
+    "businessName": "操作时间",
+    "role": "TIME",
+    "description": "操作时间",
+    "aliases": [
+      "操作时间",
+      "audit_operate_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作时间"
+  },
+  {
+    "columnName": "import_task_id",
+    "businessName": "导入任务id",
+    "role": "KEY",
+    "description": "导入任务id",
+    "aliases": [
+      "导入任务id",
+      "import_task_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=导入任务id"
+  },
+  {
+    "columnName": "excel_url",
+    "businessName": "excel存放路径",
+    "role": "OTHER",
+    "description": "excel存放路径",
+    "aliases": [
+      "excel存放路径",
+      "excel_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=excel存放路径"
+  },
+  {
+    "columnName": "excel_name",
+    "businessName": "导入excel名称",
+    "role": "DIMENSION",
+    "description": "导入excel名称",
+    "aliases": [
+      "导入excel名称",
+      "excel_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=导入excel名称"
+  },
+  {
+    "columnName": "is_import_pass",
+    "businessName": "导入状态",
+    "role": "DIMENSION",
+    "description": "导入状态",
+    "aliases": [
+      "导入状态",
+      "is_import_pass"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=导入状态"
+  },
+  {
+    "columnName": "import_time",
+    "businessName": "导入时间",
+    "role": "TIME",
+    "description": "导入时间",
+    "aliases": [
+      "导入时间",
+      "import_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=导入时间"
+  },
+  {
+    "columnName": "import_operate_id",
+    "businessName": "操作人id",
+    "role": "KEY",
+    "description": "操作人id",
+    "aliases": [
+      "操作人id",
+      "import_operate_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人id"
+  },
+  {
+    "columnName": "import_operate_name",
+    "businessName": "操作人name",
+    "role": "DIMENSION",
+    "description": "操作人name",
+    "aliases": [
+      "操作人name",
+      "import_operate_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人name"
+  },
+  {
+    "columnName": "is_risk_audit_pass",
+    "businessName": "是否风控审核通过",
+    "role": "DIMENSION",
+    "description": "是否风控审核通过",
+    "aliases": [
+      "是否风控审核通过",
+      "is_risk_audit_pass"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否风控审核通过"
+  },
+  {
+    "columnName": "machine_audit_time",
+    "businessName": "机审时间",
+    "role": "TIME",
+    "description": "机审时间",
+    "aliases": [
+      "机审时间",
+      "machine_audit_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=机审时间"
+  },
+  {
+    "columnName": "is_manual",
+    "businessName": "机审是否转人工",
+    "role": "DIMENSION",
+    "description": "机审是否转人工",
+    "aliases": [
+      "机审是否转人工",
+      "is_manual"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=机审是否转人工"
+  },
+  {
+    "columnName": "first_risk_tag_user_id",
+    "businessName": "首次risk最新审核人ID",
+    "role": "KEY",
+    "description": "首次risk最新审核人ID",
+    "aliases": [
+      "首次risk最新审核人ID",
+      "first_risk_tag_user_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次risk最新审核人ID"
+  },
+  {
+    "columnName": "first_risk_tag_user_name",
+    "businessName": "首次risk最新审核人name",
+    "role": "DIMENSION",
+    "description": "首次risk最新审核人name",
+    "aliases": [
+      "首次risk最新审核人name",
+      "first_risk_tag_user_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次risk最新审核人name"
+  },
+  {
+    "columnName": "risk_tag_user_id",
+    "businessName": "risk最新审核人ID",
+    "role": "KEY",
+    "description": "risk最新审核人ID",
+    "aliases": [
+      "risk最新审核人ID",
+      "risk_tag_user_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=risk最新审核人ID"
+  },
+  {
+    "columnName": "risk_tag_user_name",
+    "businessName": "risk最新审核人名称",
+    "role": "DIMENSION",
+    "description": "risk最新审核人名称",
+    "aliases": [
+      "risk最新审核人名称",
+      "risk_tag_user_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=risk最新审核人名称"
+  },
+  {
+    "columnName": "risk_operate_supplier_name",
+    "businessName": "risk最新审核人供应商",
+    "role": "DIMENSION",
+    "description": "risk最新审核人供应商",
+    "aliases": [
+      "risk最新审核人供应商",
+      "risk_operate_supplier_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=risk最新审核人供应商"
+  },
+  {
+    "columnName": "is_white",
+    "businessName": "是否加白",
+    "role": "DIMENSION",
+    "description": "是否加白",
+    "aliases": [
+      "是否加白",
+      "is_white"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否加白"
+  },
+  {
+    "columnName": "pt",
+    "businessName": "业务日期",
+    "role": "TIME",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=业务日期; samples=[2026-02-25, 2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02, 2026-03-03, 2026-03-04]"
+  }
+]

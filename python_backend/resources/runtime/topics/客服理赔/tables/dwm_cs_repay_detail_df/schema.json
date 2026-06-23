@@ -1,0 +1,247 @@
+[ {
+  "columnName" : "bill_id",
+  "dataType" : "varchar(128)",
+  "comment" : "赔付单号，PF190827160812345",
+  "nullable" : false,
+  "keyType" : "UNI"
+}, {
+  "columnName" : "pt",
+  "dataType" : "date",
+  "comment" : "业务日期",
+  "nullable" : false,
+  "keyType" : "UNI"
+}, {
+  "columnName" : "cause_id",
+  "dataType" : "text",
+  "comment" : "赔付原因",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "order_id",
+  "dataType" : "text",
+  "comment" : "订单号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "is_return",
+  "dataType" : "bigint",
+  "comment" : "是否已退货 0否 1是",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "repay_amt",
+  "dataType" : "bigint",
+  "comment" : "支付金额",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_id",
+  "dataType" : "text",
+  "comment" : "工单号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_id",
+  "dataType" : "text",
+  "comment" : "赔付买家id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_name",
+  "dataType" : "text",
+  "comment" : "赔付买家用户名",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_id",
+  "dataType" : "text",
+  "comment" : "赔付卖家用户id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_name",
+  "dataType" : "text",
+  "comment" : "赔付卖家用户名",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "content",
+  "dataType" : "text",
+  "comment" : "备注",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "reject_content",
+  "dataType" : "text",
+  "comment" : "驳回原因",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "repay_status_code",
+  "dataType" : "bigint",
+  "comment" : "状态code，1审批中，2已驳回，3审批完成, 4已取消",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "repay_status_name",
+  "dataType" : "text",
+  "comment" : "状态名称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "creator_id",
+  "dataType" : "text",
+  "comment" : "建立人员",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "create_time",
+  "dataType" : "text",
+  "comment" : "系统时间",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "modifier_id",
+  "dataType" : "text",
+  "comment" : "修改人员",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "modify_time",
+  "dataType" : "text",
+  "comment" : "修改时间",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "pay_status_code",
+  "dataType" : "bigint",
+  "comment" : "到账状态code 1打款中 2打款失败 3打款成功",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "pay_status_name",
+  "dataType" : "text",
+  "comment" : "到账状态name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "pay_way_code",
+  "dataType" : "bigint",
+  "comment" : "赔款方式code 1优惠券2现金3语兴好物币",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "pay_way_name",
+  "dataType" : "text",
+  "comment" : "赔款方式name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "sub_order_id",
+  "dataType" : "text",
+  "comment" : "子订单号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "express_id",
+  "dataType" : "text",
+  "comment" : "运单号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "pay_account",
+  "dataType" : "text",
+  "comment" : "支付账户",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "process_id",
+  "dataType" : "text",
+  "comment" : "流程ID",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "reason_code",
+  "dataType" : "bigint",
+  "comment" : "赔付原因",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_type_code",
+  "dataType" : "bigint",
+  "comment" : "优惠券类型code 1满减券 2包邮券",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_type_name",
+  "dataType" : "text",
+  "comment" : "优惠券类型name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_rule_a",
+  "dataType" : "bigint",
+  "comment" : "满多少元",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_rule_b",
+  "dataType" : "bigint",
+  "comment" : "减多少元",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_time_limit",
+  "dataType" : "text",
+  "comment" : "优惠券使用期限，格式：2019-08-25,2019-08-28",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_id",
+  "dataType" : "text",
+  "comment" : "优惠券id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_id",
+  "dataType" : "text",
+  "comment" : "活动id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_reason_code",
+  "dataType" : "bigint",
+  "comment" : "一级理赔理由code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_reason_name",
+  "dataType" : "text",
+  "comment" : "一级理赔理由name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_reason_code",
+  "dataType" : "bigint",
+  "comment" : "二级理赔理由id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_reason_name",
+  "dataType" : "text",
+  "comment" : "二级理赔理由name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_reason_code",
+  "dataType" : "bigint",
+  "comment" : "三级理赔理由id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_reason_name",
+  "dataType" : "text",
+  "comment" : "三级理赔理由name",
+  "nullable" : true,
+  "keyType" : ""
+} ]

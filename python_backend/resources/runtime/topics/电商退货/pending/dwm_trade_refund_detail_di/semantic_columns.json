@@ -1,0 +1,1560 @@
+[
+  {
+    "columnName": "refund_id",
+    "businessName": "退货单号",
+    "role": "KEY",
+    "description": "退货单号",
+    "aliases": [
+      "退货单号",
+      "refund_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退货单号; samples=[refund_id_001, refund_id_002, refund_id_003, refund_id_004, refund_id_005, refund_id_006, refund_id_007, refund_id_008]"
+  },
+  {
+    "columnName": "pt",
+    "businessName": "业务日期",
+    "role": "TIME",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=业务日期; samples=[2026-02-25, 2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02, 2026-03-03, 2026-03-04]"
+  },
+  {
+    "columnName": "order_id",
+    "businessName": "主订单编号",
+    "role": "KEY",
+    "description": "主订单编号",
+    "aliases": [
+      "主订单编号",
+      "order_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=主订单编号; samples=[order_id_001, order_id_002, order_id_003, order_id_004, order_id_005, order_id_006, order_id_007, order_id_008]"
+  },
+  {
+    "columnName": "sub_order_id",
+    "businessName": "子订单号",
+    "role": "KEY",
+    "description": "子订单号",
+    "aliases": [
+      "子订单号",
+      "sub_order_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=子订单号; samples=[sub_order_id_001, sub_order_id_002, sub_order_id_003, sub_order_id_004, sub_order_id_005, sub_order_id_006, sub_order_id_007, sub_order_id_008]"
+  },
+  {
+    "columnName": "biz_type_code",
+    "businessName": "产品维度划分code",
+    "role": "DIMENSION",
+    "description": "产品维度划分code",
+    "aliases": [
+      "产品维度划分code",
+      "biz_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=产品维度划分code"
+  },
+  {
+    "columnName": "biz_type_name",
+    "businessName": "产品维度划分name",
+    "role": "DIMENSION",
+    "description": "产品维度划分name",
+    "aliases": [
+      "产品维度划分name",
+      "biz_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=产品维度划分name"
+  },
+  {
+    "columnName": "biz_channel_code",
+    "businessName": "购买渠道code",
+    "role": "DIMENSION",
+    "description": "购买渠道code",
+    "aliases": [
+      "购买渠道code",
+      "biz_channel_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=购买渠道code"
+  },
+  {
+    "columnName": "biz_channel_name",
+    "businessName": "购买渠道name",
+    "role": "DIMENSION",
+    "description": "购买渠道name",
+    "aliases": [
+      "购买渠道name",
+      "biz_channel_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=购买渠道name"
+  },
+  {
+    "columnName": "buyer_id",
+    "businessName": "买家id",
+    "role": "KEY",
+    "description": "买家id",
+    "aliases": [
+      "买家id",
+      "buyer_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=买家id"
+  },
+  {
+    "columnName": "buyer_name",
+    "businessName": "买家昵称",
+    "role": "DIMENSION",
+    "description": "买家昵称",
+    "aliases": [
+      "买家昵称",
+      "buyer_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=买家昵称"
+  },
+  {
+    "columnName": "seller_id",
+    "businessName": "卖家id",
+    "role": "KEY",
+    "description": "卖家id",
+    "aliases": [
+      "卖家id",
+      "seller_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家id; samples=[100]"
+  },
+  {
+    "columnName": "seller_name",
+    "businessName": "卖家昵称",
+    "role": "DIMENSION",
+    "description": "卖家昵称",
+    "aliases": [
+      "卖家昵称",
+      "seller_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家昵称"
+  },
+  {
+    "columnName": "refund_type_code",
+    "businessName": "退款类型code",
+    "role": "DIMENSION",
+    "description": "退款类型code",
+    "aliases": [
+      "退款类型code",
+      "refund_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款类型code"
+  },
+  {
+    "columnName": "refund_type_name",
+    "businessName": "退款类型name",
+    "role": "DIMENSION",
+    "description": "退款类型name",
+    "aliases": [
+      "退款类型name",
+      "refund_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款类型name"
+  },
+  {
+    "columnName": "refund_status_code",
+    "businessName": "退款状态code",
+    "role": "DIMENSION",
+    "description": "退款状态code",
+    "aliases": [
+      "退款状态code",
+      "refund_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款状态code"
+  },
+  {
+    "columnName": "refund_status_name",
+    "businessName": "退款状态name",
+    "role": "DIMENSION",
+    "description": "退款状态name",
+    "aliases": [
+      "退款状态name",
+      "refund_status_name"
+    ],
+    "enumValues": [
+      "refund_status_name_1",
+      "refund_status_name_2",
+      "refund_status_name_3",
+      "refund_status_name_4",
+      "refund_status_name_5",
+      "refund_status_name_6",
+      "refund_status_name_7",
+      "refund_status_name_8"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款状态name; samples=[refund_status_name_1, refund_status_name_2, refund_status_name_3, refund_status_name_4, refund_status_name_5, refund_status_name_6, refund_status_name_7, refund_status_name_8]"
+  },
+  {
+    "columnName": "refund_reason",
+    "businessName": "退款原因",
+    "role": "DIMENSION",
+    "description": "退款原因",
+    "aliases": [
+      "退款原因",
+      "refund_reason"
+    ],
+    "enumValues": [
+      "refund_reason_dwm_trade_refund_detail_di_1",
+      "refund_reason_dwm_trade_refund_detail_di_2",
+      "refund_reason_dwm_trade_refund_detail_di_3",
+      "refund_reason_dwm_trade_refund_detail_di_4",
+      "refund_reason_dwm_trade_refund_detail_di_5",
+      "refund_reason_dwm_trade_refund_detail_di_6",
+      "refund_reason_dwm_trade_refund_detail_di_7",
+      "refund_reason_dwm_trade_refund_detail_di_8"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款原因; samples=[refund_reason_dwm_trade_refund_detail_di_1, refund_reason_dwm_trade_refund_detail_di_2, refund_reason_dwm_trade_refund_detail_di_3, refund_reason_dwm_trade_refund_detail_di_4, refund_reason_dwm_trade_refund_detail_di_5, refund_reason_dwm_trade_refund_detail_di_6, refund_reason_dwm_trade_refund_detail_di_7, refund_reason_dwm_trade_refund_detail_di_8]"
+  },
+  {
+    "columnName": "sku_id",
+    "businessName": "skuid",
+    "role": "KEY",
+    "description": "skuid",
+    "aliases": [
+      "skuid",
+      "sku_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=skuid"
+  },
+  {
+    "columnName": "sku_title",
+    "businessName": "商品标题",
+    "role": "OTHER",
+    "description": "商品标题",
+    "aliases": [
+      "商品标题",
+      "sku_title"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品标题; samples=[sku_title_1, sku_title_2, sku_title_3, sku_title_4, sku_title_5, sku_title_6, sku_title_7, sku_title_8]"
+  },
+  {
+    "columnName": "sku_price",
+    "businessName": "商品单价",
+    "role": "OTHER",
+    "description": "商品单价",
+    "aliases": [
+      "商品单价",
+      "sku_price"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品单价"
+  },
+  {
+    "columnName": "sku_count",
+    "businessName": "商品数量",
+    "role": "METRIC",
+    "description": "商品数量",
+    "aliases": [
+      "商品数量",
+      "sku_count"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(sku_count)",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品数量"
+  },
+  {
+    "columnName": "item_json",
+    "businessName": "商品信息json",
+    "role": "OTHER",
+    "description": "商品信息json",
+    "aliases": [
+      "商品信息json",
+      "item_json"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品信息json"
+  },
+  {
+    "columnName": "buyer_note",
+    "businessName": "买家退款留言",
+    "role": "OTHER",
+    "description": "买家退款留言",
+    "aliases": [
+      "买家退款留言",
+      "buyer_note"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=买家退款留言"
+  },
+  {
+    "columnName": "refund_extra",
+    "businessName": "拓展属性",
+    "role": "OTHER",
+    "description": "拓展属性",
+    "aliases": [
+      "拓展属性",
+      "refund_extra"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=拓展属性"
+  },
+  {
+    "columnName": "refund_close_type_code",
+    "businessName": "退换货单关闭类型code",
+    "role": "DIMENSION",
+    "description": "退换货单关闭类型code",
+    "aliases": [
+      "退换货单关闭类型code",
+      "refund_close_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退换货单关闭类型code"
+  },
+  {
+    "columnName": "refund_close_type_name",
+    "businessName": "退换货单关闭类型name",
+    "role": "DIMENSION",
+    "description": "退换货单关闭类型name",
+    "aliases": [
+      "退换货单关闭类型name",
+      "refund_close_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退换货单关闭类型name"
+  },
+  {
+    "columnName": "refund_close_time",
+    "businessName": "关闭时间",
+    "role": "TIME",
+    "description": "关闭时间",
+    "aliases": [
+      "关闭时间",
+      "refund_close_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=关闭时间"
+  },
+  {
+    "columnName": "refund_amt_status_code",
+    "businessName": "退款状态code",
+    "role": "DIMENSION",
+    "description": "退款状态code",
+    "aliases": [
+      "退款状态code",
+      "refund_amt_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款状态code"
+  },
+  {
+    "columnName": "refund_amt_status_name",
+    "businessName": "退款状态name",
+    "role": "DIMENSION",
+    "description": "退款状态name",
+    "aliases": [
+      "退款状态name",
+      "refund_amt_status_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=退款状态name"
+  },
+  {
+    "columnName": "seller_type_code",
+    "businessName": "卖家类型code",
+    "role": "DIMENSION",
+    "description": "卖家类型code",
+    "aliases": [
+      "卖家类型code",
+      "seller_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家类型code"
+  },
+  {
+    "columnName": "seller_type_name",
+    "businessName": "卖家类型name",
+    "role": "DIMENSION",
+    "description": "卖家类型name",
+    "aliases": [
+      "卖家类型name",
+      "seller_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家类型name"
+  },
+  {
+    "columnName": "operator_id",
+    "businessName": "操作人id",
+    "role": "KEY",
+    "description": "操作人id",
+    "aliases": [
+      "操作人id",
+      "operator_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人id"
+  },
+  {
+    "columnName": "operator_type_code",
+    "businessName": "操作人类型code",
+    "role": "DIMENSION",
+    "description": "操作人类型code",
+    "aliases": [
+      "操作人类型code",
+      "operator_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人类型code"
+  },
+  {
+    "columnName": "operator_type_name",
+    "businessName": "操作人类型name",
+    "role": "DIMENSION",
+    "description": "操作人类型name",
+    "aliases": [
+      "操作人类型name",
+      "operator_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人类型name"
+  },
+  {
+    "columnName": "exchange_status_code",
+    "businessName": "换货状态code",
+    "role": "DIMENSION",
+    "description": "换货状态code",
+    "aliases": [
+      "换货状态code",
+      "exchange_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=换货状态code"
+  },
+  {
+    "columnName": "exchange_status_name",
+    "businessName": "换货状态name",
+    "role": "DIMENSION",
+    "description": "换货状态name",
+    "aliases": [
+      "换货状态name",
+      "exchange_status_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=换货状态name"
+  },
+  {
+    "columnName": "refund_create_time",
+    "businessName": "创建时间",
+    "role": "TIME",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "refund_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=创建时间; samples=[2026-02-25T14:59:27, 2026-02-26T15:47:11, 2026-02-27T16:45:48, 2026-02-28T12:07:17, 2026-03-01T14:33:30, 2026-03-02T17:29:03, 2026-03-03T10:35:15, 2026-03-04T07:53:20]"
+  },
+  {
+    "columnName": "refund_modify_time",
+    "businessName": "更新时间",
+    "role": "TIME",
+    "description": "更新时间",
+    "aliases": [
+      "更新时间",
+      "refund_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=更新时间"
+  },
+  {
+    "columnName": "bill_from_code",
+    "businessName": "金额来源code",
+    "role": "DIMENSION",
+    "description": "金额来源code",
+    "aliases": [
+      "金额来源code",
+      "bill_from_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=金额来源code"
+  },
+  {
+    "columnName": "bill_from_name",
+    "businessName": "金额来源name",
+    "role": "DIMENSION",
+    "description": "金额来源name",
+    "aliases": [
+      "金额来源name",
+      "bill_from_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=金额来源name"
+  },
+  {
+    "columnName": "pay_tool_code",
+    "businessName": "支付方式code",
+    "role": "DIMENSION",
+    "description": "支付方式code",
+    "aliases": [
+      "支付方式code",
+      "pay_tool_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付方式code"
+  },
+  {
+    "columnName": "pay_tool_name",
+    "businessName": "支付方式name",
+    "role": "DIMENSION",
+    "description": "支付方式name",
+    "aliases": [
+      "支付方式name",
+      "pay_tool_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付方式name"
+  },
+  {
+    "columnName": "pay_status_code",
+    "businessName": "支付状态code",
+    "role": "DIMENSION",
+    "description": "支付状态code",
+    "aliases": [
+      "支付状态code",
+      "pay_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付状态code"
+  },
+  {
+    "columnName": "pay_status_name",
+    "businessName": "支付状态name",
+    "role": "DIMENSION",
+    "description": "支付状态name",
+    "aliases": [
+      "支付状态name",
+      "pay_status_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付状态name"
+  },
+  {
+    "columnName": "out_pay_id",
+    "businessName": "支付单流水号",
+    "role": "KEY",
+    "description": "支付单流水号",
+    "aliases": [
+      "支付单流水号",
+      "out_pay_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付单流水号"
+  },
+  {
+    "columnName": "pay_amt",
+    "businessName": "支付金额",
+    "role": "METRIC",
+    "description": "支付金额",
+    "aliases": [
+      "支付金额",
+      "pay_amt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(pay_amt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "columnName": "pay_extra",
+    "businessName": "支付拓展属性",
+    "role": "OTHER",
+    "description": "支付拓展属性",
+    "aliases": [
+      "支付拓展属性",
+      "pay_extra"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付拓展属性"
+  },
+  {
+    "columnName": "pay_create_time",
+    "businessName": "支付创建时间",
+    "role": "TIME",
+    "description": "支付创建时间",
+    "aliases": [
+      "支付创建时间",
+      "pay_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付创建时间"
+  },
+  {
+    "columnName": "pay_modify_time",
+    "businessName": "支付更新时间",
+    "role": "TIME",
+    "description": "支付更新时间",
+    "aliases": [
+      "支付更新时间",
+      "pay_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=支付更新时间"
+  },
+  {
+    "columnName": "logistic_id",
+    "businessName": "全局唯一物流编号",
+    "role": "KEY",
+    "description": "全局唯一物流编号",
+    "aliases": [
+      "全局唯一物流编号",
+      "logistic_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=全局唯一物流编号"
+  },
+  {
+    "columnName": "logistic_stage_code",
+    "businessName": "物流阶段code",
+    "role": "DIMENSION",
+    "description": "物流阶段code",
+    "aliases": [
+      "物流阶段code",
+      "logistic_stage_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流阶段code"
+  },
+  {
+    "columnName": "logistic_stage_name",
+    "businessName": "物流阶段name",
+    "role": "DIMENSION",
+    "description": "物流阶段name",
+    "aliases": [
+      "物流阶段name",
+      "logistic_stage_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流阶段name"
+  },
+  {
+    "columnName": "express_type_code",
+    "businessName": "承运方code",
+    "role": "DIMENSION",
+    "description": "承运方code",
+    "aliases": [
+      "承运方code",
+      "express_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=承运方code"
+  },
+  {
+    "columnName": "express_type_name",
+    "businessName": "承运方name",
+    "role": "DIMENSION",
+    "description": "承运方name",
+    "aliases": [
+      "承运方name",
+      "express_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=承运方name"
+  },
+  {
+    "columnName": "express_id",
+    "businessName": "物流编号",
+    "role": "KEY",
+    "description": "物流编号",
+    "aliases": [
+      "物流编号",
+      "express_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流编号"
+  },
+  {
+    "columnName": "express_status_code",
+    "businessName": "物流状态code",
+    "role": "DIMENSION",
+    "description": "物流状态code",
+    "aliases": [
+      "物流状态code",
+      "express_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流状态code"
+  },
+  {
+    "columnName": "express_status_name",
+    "businessName": "物流状态name",
+    "role": "DIMENSION",
+    "description": "物流状态name",
+    "aliases": [
+      "物流状态name",
+      "express_status_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流状态name"
+  },
+  {
+    "columnName": "sender_address",
+    "businessName": "发货地址",
+    "role": "OTHER",
+    "description": "发货地址",
+    "aliases": [
+      "发货地址",
+      "sender_address"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=发货地址"
+  },
+  {
+    "columnName": "receiver_address",
+    "businessName": "收货地址",
+    "role": "OTHER",
+    "description": "收货地址",
+    "aliases": [
+      "收货地址",
+      "receiver_address"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=收货地址"
+  },
+  {
+    "columnName": "sender_mobile",
+    "businessName": "发件人手机号",
+    "role": "OTHER",
+    "description": "发件人手机号",
+    "aliases": [
+      "发件人手机号",
+      "sender_mobile"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=发件人手机号"
+  },
+  {
+    "columnName": "receiver_mobile",
+    "businessName": "收货人手机号",
+    "role": "OTHER",
+    "description": "收货人手机号",
+    "aliases": [
+      "收货人手机号",
+      "receiver_mobile"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=收货人手机号"
+  },
+  {
+    "columnName": "logistic_extra",
+    "businessName": "物流拓展属性",
+    "role": "OTHER",
+    "description": "物流拓展属性",
+    "aliases": [
+      "物流拓展属性",
+      "logistic_extra"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流拓展属性"
+  },
+  {
+    "columnName": "logistic_create_time",
+    "businessName": "物流创建时间",
+    "role": "TIME",
+    "description": "物流创建时间",
+    "aliases": [
+      "物流创建时间",
+      "logistic_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流创建时间"
+  },
+  {
+    "columnName": "logistic_modify_time",
+    "businessName": "物流更新时间",
+    "role": "TIME",
+    "description": "物流更新时间",
+    "aliases": [
+      "物流更新时间",
+      "logistic_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流更新时间"
+  },
+  {
+    "columnName": "discount_id",
+    "businessName": "优惠券编号",
+    "role": "KEY",
+    "description": "优惠券编号",
+    "aliases": [
+      "优惠券编号",
+      "discount_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券编号"
+  },
+  {
+    "columnName": "discount_type_code",
+    "businessName": "优惠类型code",
+    "role": "DIMENSION",
+    "description": "优惠类型code",
+    "aliases": [
+      "优惠类型code",
+      "discount_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠类型code"
+  },
+  {
+    "columnName": "discount_type_name",
+    "businessName": "优惠类型name",
+    "role": "DIMENSION",
+    "description": "优惠类型name",
+    "aliases": [
+      "优惠类型name",
+      "discount_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠类型name"
+  },
+  {
+    "columnName": "process_status_code",
+    "businessName": "使用状态code",
+    "role": "DIMENSION",
+    "description": "使用状态code",
+    "aliases": [
+      "使用状态code",
+      "process_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=使用状态code"
+  },
+  {
+    "columnName": "process_status_name",
+    "businessName": "使用状态name",
+    "role": "DIMENSION",
+    "description": "使用状态name",
+    "aliases": [
+      "使用状态name",
+      "process_status_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=使用状态name"
+  },
+  {
+    "columnName": "refund_discount_amt",
+    "businessName": "优惠金额",
+    "role": "METRIC",
+    "description": "优惠金额",
+    "aliases": [
+      "优惠金额",
+      "refund_discount_amt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(refund_discount_amt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠金额"
+  },
+  {
+    "columnName": "discount_extra",
+    "businessName": "优惠券拓展属性",
+    "role": "OTHER",
+    "description": "优惠券拓展属性",
+    "aliases": [
+      "优惠券拓展属性",
+      "discount_extra"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券拓展属性"
+  },
+  {
+    "columnName": "discount_create_time",
+    "businessName": "优惠券创建时间",
+    "role": "TIME",
+    "description": "优惠券创建时间",
+    "aliases": [
+      "优惠券创建时间",
+      "discount_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券创建时间"
+  },
+  {
+    "columnName": "discount_modify_time",
+    "businessName": "优惠券更新时间",
+    "role": "TIME",
+    "description": "优惠券更新时间",
+    "aliases": [
+      "优惠券更新时间",
+      "discount_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券更新时间"
+  },
+  {
+    "columnName": "spu_name",
+    "businessName": "spu名称",
+    "role": "DIMENSION",
+    "description": "spu名称",
+    "aliases": [
+      "spu名称",
+      "spu_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu名称"
+  },
+  {
+    "columnName": "level1_category_code",
+    "businessName": "一级类目code",
+    "role": "DIMENSION",
+    "description": "一级类目code",
+    "aliases": [
+      "一级类目code",
+      "level1_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=一级类目code"
+  },
+  {
+    "columnName": "level1_category_name",
+    "businessName": "一级类目name",
+    "role": "DIMENSION",
+    "description": "一级类目name",
+    "aliases": [
+      "一级类目name",
+      "level1_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=一级类目name"
+  },
+  {
+    "columnName": "level2_category_code",
+    "businessName": "二级类目code",
+    "role": "DIMENSION",
+    "description": "二级类目code",
+    "aliases": [
+      "二级类目code",
+      "level2_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=二级类目code"
+  },
+  {
+    "columnName": "level2_category_name",
+    "businessName": "二级类目name",
+    "role": "DIMENSION",
+    "description": "二级类目name",
+    "aliases": [
+      "二级类目name",
+      "level2_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=二级类目name"
+  },
+  {
+    "columnName": "level3_category_code",
+    "businessName": "三级类目code",
+    "role": "DIMENSION",
+    "description": "三级类目code",
+    "aliases": [
+      "三级类目code",
+      "level3_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=三级类目code"
+  },
+  {
+    "columnName": "level3_category_name",
+    "businessName": "三级类目name",
+    "role": "DIMENSION",
+    "description": "三级类目name",
+    "aliases": [
+      "三级类目name",
+      "level3_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=三级类目name"
+  },
+  {
+    "columnName": "brand_code",
+    "businessName": "品牌code",
+    "role": "DIMENSION",
+    "description": "品牌code",
+    "aliases": [
+      "品牌code",
+      "brand_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=品牌code"
+  },
+  {
+    "columnName": "brand_name",
+    "businessName": "品牌name",
+    "role": "DIMENSION",
+    "description": "品牌name",
+    "aliases": [
+      "品牌name",
+      "brand_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=品牌name"
+  },
+  {
+    "columnName": "fit_code",
+    "businessName": "适用人群code",
+    "role": "DIMENSION",
+    "description": "适用人群code",
+    "aliases": [
+      "适用人群code",
+      "fit_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=适用人群code"
+  },
+  {
+    "columnName": "fit_name",
+    "businessName": "适用人群name",
+    "role": "DIMENSION",
+    "description": "适用人群name",
+    "aliases": [
+      "适用人群name",
+      "fit_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=适用人群name"
+  },
+  {
+    "columnName": "spu_auth_price",
+    "businessName": "spu发售价格",
+    "role": "OTHER",
+    "description": "spu发售价格",
+    "aliases": [
+      "spu发售价格",
+      "spu_auth_price"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu发售价格"
+  },
+  {
+    "columnName": "spu_logo_url",
+    "businessName": "logo图",
+    "role": "OTHER",
+    "description": "logo图",
+    "aliases": [
+      "logo图",
+      "spu_logo_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=logo图"
+  },
+  {
+    "columnName": "spu_gif_url",
+    "businessName": "动图",
+    "role": "OTHER",
+    "description": "动图",
+    "aliases": [
+      "动图",
+      "spu_gif_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=动图"
+  },
+  {
+    "columnName": "spu_video_cover_url",
+    "businessName": "视频图",
+    "role": "OTHER",
+    "description": "视频图",
+    "aliases": [
+      "视频图",
+      "spu_video_cover_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=视频图"
+  },
+  {
+    "columnName": "spu_video_url",
+    "businessName": "视频URL",
+    "role": "OTHER",
+    "description": "视频URL",
+    "aliases": [
+      "视频URL",
+      "spu_video_url"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=视频URL"
+  },
+  {
+    "columnName": "article_id",
+    "businessName": "货号",
+    "role": "KEY",
+    "description": "货号",
+    "aliases": [
+      "货号",
+      "article_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=货号"
+  },
+  {
+    "columnName": "other_article_id",
+    "businessName": "其他货号",
+    "role": "KEY",
+    "description": "其他货号",
+    "aliases": [
+      "其他货号",
+      "other_article_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=其他货号"
+  },
+  {
+    "columnName": "spu_status_code",
+    "businessName": "状态code",
+    "role": "DIMENSION",
+    "description": "状态code",
+    "aliases": [
+      "状态code",
+      "spu_status_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=状态code"
+  },
+  {
+    "columnName": "spu_status_name",
+    "businessName": "状态名称",
+    "role": "DIMENSION",
+    "description": "状态名称",
+    "aliases": [
+      "状态名称",
+      "spu_status_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=状态名称"
+  },
+  {
+    "columnName": "spu_desc",
+    "businessName": "商品描述",
+    "role": "OTHER",
+    "description": "商品描述",
+    "aliases": [
+      "商品描述",
+      "spu_desc"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品描述"
+  },
+  {
+    "columnName": "is_self",
+    "businessName": "是否自营",
+    "role": "DIMENSION",
+    "description": "是否自营",
+    "aliases": [
+      "是否自营",
+      "is_self"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否自营"
+  },
+  {
+    "columnName": "spu_create_time",
+    "businessName": "spu创建时间",
+    "role": "TIME",
+    "description": "spu创建时间",
+    "aliases": [
+      "spu创建时间",
+      "spu_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu创建时间"
+  },
+  {
+    "columnName": "spu_modify_time",
+    "businessName": "spu更新时间",
+    "role": "TIME",
+    "description": "spu更新时间",
+    "aliases": [
+      "spu更新时间",
+      "spu_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu更新时间"
+  },
+  {
+    "columnName": "sku_size",
+    "businessName": "尺寸",
+    "role": "OTHER",
+    "description": "尺寸",
+    "aliases": [
+      "尺寸",
+      "sku_size"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=尺寸"
+  },
+  {
+    "columnName": "sku_color",
+    "businessName": "颜色",
+    "role": "OTHER",
+    "description": "颜色",
+    "aliases": [
+      "颜色",
+      "sku_color"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=颜色"
+  },
+  {
+    "columnName": "sku_spec",
+    "businessName": "规格",
+    "role": "OTHER",
+    "description": "规格",
+    "aliases": [
+      "规格",
+      "sku_spec"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=规格"
+  },
+  {
+    "columnName": "refund_desc",
+    "businessName": "描述",
+    "role": "OTHER",
+    "description": "描述",
+    "aliases": [
+      "描述",
+      "refund_desc"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=描述"
+  },
+  {
+    "columnName": "responsible_party_code",
+    "businessName": "责任方code",
+    "role": "DIMENSION",
+    "description": "责任方code",
+    "aliases": [
+      "责任方code",
+      "responsible_party_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=责任方code"
+  },
+  {
+    "columnName": "responsible_party_name",
+    "businessName": "责任方name",
+    "role": "DIMENSION",
+    "description": "责任方name",
+    "aliases": [
+      "责任方name",
+      "responsible_party_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=责任方name"
+  },
+  {
+    "columnName": "is_buyer_available",
+    "businessName": "买家是否可用",
+    "role": "DIMENSION",
+    "description": "买家是否可用",
+    "aliases": [
+      "买家是否可用",
+      "is_buyer_available"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=买家是否可用"
+  },
+  {
+    "columnName": "is_customer_available",
+    "businessName": "客服是否可用",
+    "role": "DIMENSION",
+    "description": "客服是否可用",
+    "aliases": [
+      "客服是否可用",
+      "is_customer_available"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=客服是否可用"
+  },
+  {
+    "columnName": "is_all_order_biz_type_available",
+    "businessName": "是否适用全部订单类型",
+    "role": "DIMENSION",
+    "description": "是否适用全部订单类型",
+    "aliases": [
+      "是否适用全部订单类型",
+      "is_all_order_biz_type_available"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否适用全部订单类型"
+  },
+  {
+    "columnName": "is_direct_refund",
+    "businessName": "是否直接退款",
+    "role": "DIMENSION",
+    "description": "是否直接退款",
+    "aliases": [
+      "是否直接退款",
+      "is_direct_refund"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否直接退款"
+  },
+  {
+    "columnName": "buyer_mobile",
+    "businessName": "买家手机号",
+    "role": "OTHER",
+    "description": "买家手机号",
+    "aliases": [
+      "买家手机号",
+      "buyer_mobile"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=买家手机号"
+  },
+  {
+    "columnName": "buyer_target_id",
+    "businessName": "收货人对应buyer_id",
+    "role": "KEY",
+    "description": "收货人对应buyer_id",
+    "aliases": [
+      "收货人对应buyer_id",
+      "buyer_target_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=收货人对应buyer_id"
+  },
+  {
+    "columnName": "logistic_amt",
+    "businessName": "物流金额",
+    "role": "METRIC",
+    "description": "物流金额",
+    "aliases": [
+      "物流金额",
+      "logistic_amt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(logistic_amt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流金额"
+  }
+]

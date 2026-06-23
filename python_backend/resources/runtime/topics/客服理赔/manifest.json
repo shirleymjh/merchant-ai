@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "dwm_cs_repay_detail_df",
+    "tableComment": "dwm-客服域-理赔全流程表-全量表",
+    "dataGrain": "订单/子订单明细粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "seller_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 6,
+    "ruleCount": 4
+  }
+]

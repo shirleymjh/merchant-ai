@@ -1,0 +1,11 @@
+[
+  {
+    "name": "merchant_order_by_user",
+    "leftTable": "dim_merchant_df",
+    "rightTable": "dwm_trade_order_detail_di",
+    "joinType": "LEFT",
+    "keys": [["merchant_id", "seller_id"]],
+    "grain": "merchant_sub_order_id",
+    "useCases": ["商家维表关联订单明细"]
+  }
+]

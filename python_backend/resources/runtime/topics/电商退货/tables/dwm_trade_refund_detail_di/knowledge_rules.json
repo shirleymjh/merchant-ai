@@ -1,0 +1,25 @@
+[ {
+  "title" : "时间范围过滤",
+  "content" : "涉及最近N天、昨天、上个月等时间表达时，必须优先使用 `pt` 做业务日期过滤。",
+  "alwaysApply" : true,
+  "keywords" : [ "时间", "最近", "pt" ],
+  "evidence" : "Topic Builder 从时间字段识别"
+}, {
+  "title" : "商家范围过滤",
+  "content" : "回答单个商家问题时，必须用 `seller_id` 过滤当前商家，避免查到全站数据。",
+  "alwaysApply" : true,
+  "keywords" : [ "商家", "过滤", "seller_id" ],
+  "evidence" : "Topic Builder 从 merchant_id/seller_id 字段识别"
+}, {
+  "title" : "明细查询优先使用明细表",
+  "content" : "用户问“明细、哪几单、列表、记录”时，应使用该明细表返回真实单据，不要用 ads 指标表兜底伪装明细。",
+  "alwaysApply" : true,
+  "keywords" : [ "明细", "哪几单", "列表", "记录" ],
+  "evidence" : "明细表命名规则"
+}, {
+  "title" : "退款明细口径",
+  "content" : "退款原因、退款状态、退款最高单据等问题应优先使用退款明细表；按商品归因时使用 sku_id/sku_title。",
+  "alwaysApply" : true,
+  "keywords" : [ "退款", "售后", "原因", "商品" ],
+  "evidence" : "退款表字段语义"
+} ]

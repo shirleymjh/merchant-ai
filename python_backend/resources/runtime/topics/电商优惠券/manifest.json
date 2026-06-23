@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "dwm_coupon_detail_di",
+    "tableComment": "dwm-优惠券域-明细表-增量表",
+    "dataGrain": "优惠券/津贴明细粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "seller_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 7,
+    "ruleCount": 5
+  }
+]

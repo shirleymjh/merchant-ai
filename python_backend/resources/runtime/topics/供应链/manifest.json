@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "dwm_scm_detail_di",
+    "tableComment": "dwm-供应链域-全流程明细表-增量表",
+    "dataGrain": "商品/SPU 全流程快照粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "merchant_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 8,
+    "ruleCount": 4
+  }
+]

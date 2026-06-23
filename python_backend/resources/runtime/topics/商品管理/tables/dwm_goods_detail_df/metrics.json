@@ -1,0 +1,96 @@
+[
+  {
+    "metricKey": "spu_auth_price",
+    "businessName": "发售价分",
+    "formula": "AVG(spu_auth_price)",
+    "unit": "分",
+    "description": "发售价分",
+    "sourceColumns": [
+      "spu_auth_price"
+    ],
+    "aliases": [
+      "发售价分",
+      "spu_auth_price"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=发售价分"
+  },
+  {
+    "metricKey": "goods_cnt",
+    "businessName": "商品数",
+    "formula": "COUNT(DISTINCT spu_id)",
+    "unit": "个",
+    "description": "按 SPU 去重统计商品数量",
+    "sourceColumns": [
+      "spu_id"
+    ],
+    "aliases": [
+      "商品数"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "goods_audit_pass_detail_cnt",
+    "businessName": "商品审核通过量",
+    "formula": "SUM(CASE WHEN is_audit_pass = 1 THEN 1 ELSE 0 END)",
+    "unit": "个",
+    "description": "按商品审核是否通过统计通过量",
+    "sourceColumns": [
+      "is_audit_pass"
+    ],
+    "aliases": [
+      "商品审核通过量",
+      "审核通过量",
+      "审核通过商品量",
+      "审核通过商品"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "goods_audit_reject_detail_cnt",
+    "businessName": "商品审核拒绝量",
+    "formula": "SUM(CASE WHEN is_audit_pass = 0 THEN 1 ELSE 0 END)",
+    "unit": "个",
+    "description": "按商品审核是否通过统计拒绝量",
+    "sourceColumns": [
+      "is_audit_pass"
+    ],
+    "aliases": [
+      "商品审核拒绝量",
+      "审核被拒",
+      "审核拒绝",
+      "被拒商品量",
+      "被拒SPU量",
+      "驳回商品量"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "goods_online_detail_cnt",
+    "businessName": "上架商品量",
+    "formula": "SUM(CASE WHEN spu_status_code = 1 OR spu_status_name = '上架' THEN 1 ELSE 0 END)",
+    "unit": "个",
+    "description": "按商品状态统计上架商品量",
+    "sourceColumns": [
+      "spu_status_code",
+      "spu_status_name"
+    ],
+    "aliases": [
+      "上架商品量",
+      "发布成功商品量",
+      "发布成功商品",
+      "发布成功",
+      "重新发布成功商品量",
+      "重新发布成功商品",
+      "重新发布成功",
+      "重新上架商品量",
+      "上架成功商品量",
+      "上架成功"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  }
+]

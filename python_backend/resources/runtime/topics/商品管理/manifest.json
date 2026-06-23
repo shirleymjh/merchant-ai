@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "dwm_goods_detail_df",
+    "tableComment": "dwm-商品系统-商品上新全流程-全量表",
+    "dataGrain": "商品/SPU 全流程快照粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "seller_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 5,
+    "ruleCount": 5
+  }
+]

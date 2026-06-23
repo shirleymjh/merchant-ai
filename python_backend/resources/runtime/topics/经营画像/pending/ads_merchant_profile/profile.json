@@ -1,0 +1,445 @@
+[ {
+  "columnName" : "merchant_id",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 1,
+  "sampleValues" : [ "100" ]
+}, {
+  "columnName" : "pt",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28", "2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04" ]
+}, {
+  "columnName" : "user_id",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "user_ads_merchant_profile_001", "user_ads_merchant_profile_002", "user_ads_merchant_profile_003", "user_ads_merchant_profile_004", "user_ads_merchant_profile_005", "user_ads_merchant_profile_006", "user_ads_merchant_profile_007", "user_ads_merchant_profile_008" ]
+}, {
+  "columnName" : "merchant_type_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "merchant_type_name_1", "merchant_type_name_2", "merchant_type_name_3", "merchant_type_name_4", "merchant_type_name_5", "merchant_type_name_6", "merchant_type_name_7", "merchant_type_name_8" ]
+}, {
+  "columnName" : "brand_type_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "brand_type_name_1", "brand_type_name_2", "brand_type_name_3", "brand_type_name_4", "brand_type_name_5", "brand_type_name_6", "brand_type_name_7", "brand_type_name_8" ]
+}, {
+  "columnName" : "balance_type_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "balance_type_name_1", "balance_type_name_2", "balance_type_name_3", "balance_type_name_4", "balance_type_name_5", "balance_type_name_6", "balance_type_name_7", "balance_type_name_8" ]
+}, {
+  "columnName" : "mobile",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "company_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "license_id",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "is_unconditional_refund",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 2,
+  "sampleValues" : [ "1", "0" ]
+}, {
+  "columnName" : "is_invoice",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 2,
+  "sampleValues" : [ "1", "0" ]
+}, {
+  "columnName" : "refund_mobile",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "currency",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "contact_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "contact_idcard",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "business_address",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "send_address",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "refnd_address",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "bank_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "bank_account",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "account_type_name",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "poundage_discount",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.6100", "12.7200", "13.8300", "14.9400", "16.0500", "17.1600", "18.2700", "19.3800" ]
+}, {
+  "columnName" : "deposit_amt",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "order_user_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "order_gmv_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "pay_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "pay_gmv_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "trade_success_level1_category_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "trade_success_level2_category_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "trade_success_level3_category_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "trade_success_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "pay_success_discount_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "pay_success_discount_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "trade_success_discount_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "trade_success_discount_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "cs_ticket_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "risk_complaint_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_repay_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "seller_repay_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "entry_audit_duration_hours_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "deposit_pay_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "entry_success_duration_hours_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "punish_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "appeal_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "appeal_success_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "scm_performance_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "return_success_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "return_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "fake_identify_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "check_unpass_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "goods_audit_reject_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "goods_online_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "goods_apply_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "trade_success_gmv_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "trade_success_user_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "avg_pay_order_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "order_close_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "seller_subsidy_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "platform_subsidy_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "ship_timeout_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "signed_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "delivery_timeout_order_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "pay_discount_rate_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.6100", "12.7200", "13.8300", "14.9400", "16.0500", "17.1600", "18.2700", "19.3800" ]
+}, {
+  "columnName" : "refund_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "return_success_amt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "seller_responsible_refund_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 1.0,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ]
+}, {
+  "columnName" : "direct_refund_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "refund_rate_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.6100", "12.7200", "13.8300", "14.9400", "16.0500", "17.1600", "18.2700", "19.3800" ]
+}, {
+  "columnName" : "ticket_reopen_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "ticket_reminder_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "ticket_close_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+}, {
+  "columnName" : "avg_ticket_score_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "11.61", "12.72", "13.83", "14.94", "16.05", "17.16", "18.27", "19.38" ]
+}, {
+  "columnName" : "goods_audit_pass_cnt_1d",
+  "sampleCount" : 20,
+  "nullRate" : 0.0,
+  "distinctSampleCount" : 8,
+  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+} ]

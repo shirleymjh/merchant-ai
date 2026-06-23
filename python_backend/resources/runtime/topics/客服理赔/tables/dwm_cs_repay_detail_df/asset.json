@@ -1,0 +1,1966 @@
+{
+  "topic": "客服理赔",
+  "questionCategory": "COMPENSATION",
+  "tableName": "dwm_cs_repay_detail_df",
+  "tableComment": "dwm-客服域-理赔全流程表-全量表",
+  "dataGrain": "订单/子订单明细粒度",
+  "timeColumn": "pt",
+  "merchantFilterColumn": "seller_id",
+  "status": "PUBLISHED",
+  "version": "v20260615180837",
+  "generatedAt": "2026-06-15T18:08:37",
+  "reviewedAt": "2026-06-15T18:08:37",
+  "reviewer": "codex",
+  "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
+  "manualNotes": "客服理赔全流程表，承载赔付单、赔付金额、审批状态、到账状态与赔付原因",
+  "schemaColumns": [
+    {
+      "columnName": "bill_id",
+      "dataType": "varchar(128)",
+      "comment": "赔付单号，PF190827160812345",
+      "nullable": false,
+      "keyType": "UNI"
+    },
+    {
+      "columnName": "pt",
+      "dataType": "date",
+      "comment": "业务日期",
+      "nullable": false,
+      "keyType": "UNI"
+    },
+    {
+      "columnName": "cause_id",
+      "dataType": "text",
+      "comment": "赔付原因",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "order_id",
+      "dataType": "text",
+      "comment": "订单号",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "is_return",
+      "dataType": "bigint",
+      "comment": "是否已退货 0否 1是",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "repay_amt",
+      "dataType": "bigint",
+      "comment": "支付金额",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "ticket_id",
+      "dataType": "text",
+      "comment": "工单号",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "buyer_id",
+      "dataType": "text",
+      "comment": "赔付买家id",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "buyer_name",
+      "dataType": "text",
+      "comment": "赔付买家用户名",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "seller_id",
+      "dataType": "text",
+      "comment": "赔付卖家用户id",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "seller_name",
+      "dataType": "text",
+      "comment": "赔付卖家用户名",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "content",
+      "dataType": "text",
+      "comment": "备注",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "reject_content",
+      "dataType": "text",
+      "comment": "驳回原因",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "repay_status_code",
+      "dataType": "bigint",
+      "comment": "状态code，1审批中，2已驳回，3审批完成, 4已取消",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "repay_status_name",
+      "dataType": "text",
+      "comment": "状态名称",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "creator_id",
+      "dataType": "text",
+      "comment": "建立人员",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "create_time",
+      "dataType": "text",
+      "comment": "系统时间",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "modifier_id",
+      "dataType": "text",
+      "comment": "修改人员",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "modify_time",
+      "dataType": "text",
+      "comment": "修改时间",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "pay_status_code",
+      "dataType": "bigint",
+      "comment": "到账状态code 1打款中 2打款失败 3打款成功",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "pay_status_name",
+      "dataType": "text",
+      "comment": "到账状态name",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "pay_way_code",
+      "dataType": "bigint",
+      "comment": "赔款方式code 1优惠券2现金3语兴好物币",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "pay_way_name",
+      "dataType": "text",
+      "comment": "赔款方式name",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "sub_order_id",
+      "dataType": "text",
+      "comment": "子订单号",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "express_id",
+      "dataType": "text",
+      "comment": "运单号",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "pay_account",
+      "dataType": "text",
+      "comment": "支付账户",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "process_id",
+      "dataType": "text",
+      "comment": "流程ID",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "reason_code",
+      "dataType": "bigint",
+      "comment": "赔付原因",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "coupon_type_code",
+      "dataType": "bigint",
+      "comment": "优惠券类型code 1满减券 2包邮券",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "coupon_type_name",
+      "dataType": "text",
+      "comment": "优惠券类型name",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "coupon_rule_a",
+      "dataType": "bigint",
+      "comment": "满多少元",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "coupon_rule_b",
+      "dataType": "bigint",
+      "comment": "减多少元",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "coupon_time_limit",
+      "dataType": "text",
+      "comment": "优惠券使用期限，格式：2019-08-25,2019-08-28",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "coupon_id",
+      "dataType": "text",
+      "comment": "优惠券id",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "activity_id",
+      "dataType": "text",
+      "comment": "活动id",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "level1_reason_code",
+      "dataType": "bigint",
+      "comment": "一级理赔理由code",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "level1_reason_name",
+      "dataType": "text",
+      "comment": "一级理赔理由name",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "level2_reason_code",
+      "dataType": "bigint",
+      "comment": "二级理赔理由id",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "level2_reason_name",
+      "dataType": "text",
+      "comment": "二级理赔理由name",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "level3_reason_code",
+      "dataType": "bigint",
+      "comment": "三级理赔理由id",
+      "nullable": true,
+      "keyType": ""
+    },
+    {
+      "columnName": "level3_reason_name",
+      "dataType": "text",
+      "comment": "三级理赔理由name",
+      "nullable": true,
+      "keyType": ""
+    }
+  ],
+  "profiles": [
+    {
+      "columnName": "bill_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "bill_id_001",
+        "bill_id_002",
+        "bill_id_003",
+        "bill_id_004",
+        "bill_id_005",
+        "bill_id_006",
+        "bill_id_007",
+        "bill_id_008"
+      ]
+    },
+    {
+      "columnName": "pt",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "2026-02-25",
+        "2026-02-26",
+        "2026-02-27",
+        "2026-02-28",
+        "2026-03-01",
+        "2026-03-02",
+        "2026-03-03",
+        "2026-03-04"
+      ]
+    },
+    {
+      "columnName": "cause_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "order_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "order_id_001",
+        "order_id_002",
+        "order_id_003",
+        "order_id_004",
+        "order_id_005",
+        "order_id_006",
+        "order_id_007",
+        "order_id_008"
+      ]
+    },
+    {
+      "columnName": "is_return",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "repay_amt",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "11.61",
+        "12.72",
+        "13.83",
+        "14.94",
+        "16.05",
+        "17.16",
+        "18.27",
+        "19.38"
+      ]
+    },
+    {
+      "columnName": "ticket_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "buyer_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "buyer_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "seller_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 1,
+      "sampleValues": [
+        "100"
+      ]
+    },
+    {
+      "columnName": "seller_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "content",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "reject_content",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "repay_status_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "repay_status_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "repay_status_name_1",
+        "repay_status_name_2",
+        "repay_status_name_3",
+        "repay_status_name_4",
+        "repay_status_name_5",
+        "repay_status_name_6",
+        "repay_status_name_7",
+        "repay_status_name_8"
+      ]
+    },
+    {
+      "columnName": "creator_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "create_time",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "2026-02-25T02:47:15",
+        "2026-02-26T18:33:57",
+        "2026-02-27T03:11:45",
+        "2026-02-28T10:03:31",
+        "2026-03-01T23:56:05",
+        "2026-03-02T22:52:55",
+        "2026-03-03T22:14:52",
+        "2026-03-04T11:01:16"
+      ]
+    },
+    {
+      "columnName": "modifier_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "modify_time",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "pay_status_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "pay_status_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "pay_way_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "pay_way_name",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "pay_way_name_1",
+        "pay_way_name_2",
+        "pay_way_name_3",
+        "pay_way_name_4",
+        "pay_way_name_5",
+        "pay_way_name_6",
+        "pay_way_name_7",
+        "pay_way_name_8"
+      ]
+    },
+    {
+      "columnName": "sub_order_id",
+      "sampleCount": 20,
+      "nullRate": 0,
+      "distinctSampleCount": 8,
+      "sampleValues": [
+        "sub_order_id_001",
+        "sub_order_id_002",
+        "sub_order_id_003",
+        "sub_order_id_004",
+        "sub_order_id_005",
+        "sub_order_id_006",
+        "sub_order_id_007",
+        "sub_order_id_008"
+      ]
+    },
+    {
+      "columnName": "express_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "pay_account",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "process_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "reason_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "coupon_type_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "coupon_type_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "coupon_rule_a",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "coupon_rule_b",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "coupon_time_limit",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "coupon_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "activity_id",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "level1_reason_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "level1_reason_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "level2_reason_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "level2_reason_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "level3_reason_code",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    },
+    {
+      "columnName": "level3_reason_name",
+      "sampleCount": 20,
+      "nullRate": 1,
+      "distinctSampleCount": 0,
+      "sampleValues": []
+    }
+  ],
+  "semanticColumns": [
+    {
+      "columnName": "bill_id",
+      "businessName": "赔付单号",
+      "role": "KEY",
+      "description": "赔付单号，PF190827160812345",
+      "aliases": [
+        "赔付单号",
+        "bill_id",
+        "赔付单号，PF190827160812345"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付单号，PF190827160812345; samples=[bill_id_001, bill_id_002, bill_id_003, bill_id_004, bill_id_005, bill_id_006, bill_id_007, bill_id_008]"
+    },
+    {
+      "columnName": "pt",
+      "businessName": "业务日期",
+      "role": "TIME",
+      "description": "业务日期",
+      "aliases": [
+        "业务日期",
+        "pt"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=业务日期; samples=[2026-02-25, 2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02, 2026-03-03, 2026-03-04]"
+    },
+    {
+      "columnName": "cause_id",
+      "businessName": "赔付原因",
+      "role": "KEY",
+      "description": "赔付原因",
+      "aliases": [
+        "赔付原因",
+        "cause_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付原因"
+    },
+    {
+      "columnName": "order_id",
+      "businessName": "订单号",
+      "role": "KEY",
+      "description": "订单号",
+      "aliases": [
+        "订单号",
+        "order_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=订单号; samples=[order_id_001, order_id_002, order_id_003, order_id_004, order_id_005, order_id_006, order_id_007, order_id_008]"
+    },
+    {
+      "columnName": "is_return",
+      "businessName": "是否已退货 0否 1是",
+      "role": "DIMENSION",
+      "description": "是否已退货 0否 1是",
+      "aliases": [
+        "是否已退货 0否 1是",
+        "is_return"
+      ],
+      "enumValues": [
+        "0=否",
+        "1=是"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=是否已退货 0否 1是"
+    },
+    {
+      "columnName": "repay_amt",
+      "businessName": "赔付金额",
+      "role": "METRIC",
+      "description": "赔付/理赔单支付金额",
+      "aliases": [
+        "赔付金额",
+        "理赔金额",
+        "赔付支付金额",
+        "支付金额",
+        "repay_amt",
+        "repay_amount",
+        "compensation_amount"
+      ],
+      "enumValues": [],
+      "metricFormula": "SUM(repay_amt)",
+      "confidence": 0.78,
+      "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "columnName": "ticket_id",
+      "businessName": "工单号",
+      "role": "KEY",
+      "description": "工单号",
+      "aliases": [
+        "工单号",
+        "ticket_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=工单号"
+    },
+    {
+      "columnName": "buyer_id",
+      "businessName": "赔付买家id",
+      "role": "KEY",
+      "description": "赔付买家id",
+      "aliases": [
+        "赔付买家id",
+        "buyer_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付买家id"
+    },
+    {
+      "columnName": "buyer_name",
+      "businessName": "赔付买家用户名",
+      "role": "DIMENSION",
+      "description": "赔付买家用户名",
+      "aliases": [
+        "赔付买家用户名",
+        "buyer_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付买家用户名"
+    },
+    {
+      "columnName": "seller_id",
+      "businessName": "赔付卖家用户id",
+      "role": "KEY",
+      "description": "赔付卖家用户id",
+      "aliases": [
+        "赔付卖家用户id",
+        "seller_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付卖家用户id; samples=[100]"
+    },
+    {
+      "columnName": "seller_name",
+      "businessName": "赔付卖家用户名",
+      "role": "DIMENSION",
+      "description": "赔付卖家用户名",
+      "aliases": [
+        "赔付卖家用户名",
+        "seller_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付卖家用户名"
+    },
+    {
+      "columnName": "content",
+      "businessName": "备注",
+      "role": "OTHER",
+      "description": "备注",
+      "aliases": [
+        "content"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=备注"
+    },
+    {
+      "columnName": "reject_content",
+      "businessName": "驳回原因",
+      "role": "DIMENSION",
+      "description": "驳回原因",
+      "aliases": [
+        "驳回原因",
+        "reject_content"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=驳回原因"
+    },
+    {
+      "columnName": "repay_status_code",
+      "businessName": "状态code",
+      "role": "DIMENSION",
+      "description": "状态code，1审批中，2已驳回，3审批完成, 4已取消",
+      "aliases": [
+        "状态code",
+        "repay_status_code",
+        "状态code，1审批中，2已驳回，3审批完成, 4已取消"
+      ],
+      "enumValues": [
+        "1=审批中",
+        "2=已驳回",
+        "3=审批完成",
+        "4=已取消"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=状态code，1审批中，2已驳回，3审批完成, 4已取消"
+    },
+    {
+      "columnName": "repay_status_name",
+      "businessName": "状态名称",
+      "role": "DIMENSION",
+      "description": "状态名称",
+      "aliases": [
+        "状态名称",
+        "repay_status_name"
+      ],
+      "enumValues": [
+        "repay_status_name_1",
+        "repay_status_name_2",
+        "repay_status_name_3",
+        "repay_status_name_4",
+        "repay_status_name_5",
+        "repay_status_name_6",
+        "repay_status_name_7",
+        "repay_status_name_8"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=状态名称; samples=[repay_status_name_1, repay_status_name_2, repay_status_name_3, repay_status_name_4, repay_status_name_5, repay_status_name_6, repay_status_name_7, repay_status_name_8]"
+    },
+    {
+      "columnName": "creator_id",
+      "businessName": "建立人员",
+      "role": "KEY",
+      "description": "建立人员",
+      "aliases": [
+        "建立人员",
+        "creator_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=建立人员"
+    },
+    {
+      "columnName": "create_time",
+      "businessName": "系统时间",
+      "role": "TIME",
+      "description": "系统时间",
+      "aliases": [
+        "系统时间",
+        "create_time"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=系统时间; samples=[2026-02-25T02:47:15, 2026-02-26T18:33:57, 2026-02-27T03:11:45, 2026-02-28T10:03:31, 2026-03-01T23:56:05, 2026-03-02T22:52:55, 2026-03-03T22:14:52, 2026-03-04T11:01:16]"
+    },
+    {
+      "columnName": "modifier_id",
+      "businessName": "修改人员",
+      "role": "KEY",
+      "description": "修改人员",
+      "aliases": [
+        "修改人员",
+        "modifier_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=修改人员"
+    },
+    {
+      "columnName": "modify_time",
+      "businessName": "修改时间",
+      "role": "TIME",
+      "description": "修改时间",
+      "aliases": [
+        "修改时间",
+        "modify_time"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=修改时间"
+    },
+    {
+      "columnName": "pay_status_code",
+      "businessName": "到账状态code 1打款中 2打款失败 3打款成功",
+      "role": "DIMENSION",
+      "description": "到账状态code 1打款中 2打款失败 3打款成功",
+      "aliases": [
+        "到账状态code 1打款中 2打款失败 3打款成功",
+        "pay_status_code"
+      ],
+      "enumValues": [
+        "1=打款中",
+        "2=打款失败",
+        "3=打款成功"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=到账状态code 1打款中 2打款失败 3打款成功"
+    },
+    {
+      "columnName": "pay_status_name",
+      "businessName": "到账状态name",
+      "role": "DIMENSION",
+      "description": "到账状态name",
+      "aliases": [
+        "到账状态name",
+        "pay_status_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=到账状态name"
+    },
+    {
+      "columnName": "pay_way_code",
+      "businessName": "赔款方式code 1优惠券2现金3语兴好物币",
+      "role": "DIMENSION",
+      "description": "赔款方式code 1优惠券2现金3语兴好物币",
+      "aliases": [
+        "赔款方式code 1优惠券2现金3语兴好物币",
+        "pay_way_code"
+      ],
+      "enumValues": [
+        "1=优惠券2现金3语兴好物币"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔款方式code 1优惠券2现金3语兴好物币"
+    },
+    {
+      "columnName": "pay_way_name",
+      "businessName": "赔款方式name",
+      "role": "DIMENSION",
+      "description": "赔款方式name",
+      "aliases": [
+        "赔款方式name",
+        "pay_way_name"
+      ],
+      "enumValues": [
+        "pay_way_name_1",
+        "pay_way_name_2",
+        "pay_way_name_3",
+        "pay_way_name_4",
+        "pay_way_name_5",
+        "pay_way_name_6",
+        "pay_way_name_7",
+        "pay_way_name_8"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔款方式name; samples=[pay_way_name_1, pay_way_name_2, pay_way_name_3, pay_way_name_4, pay_way_name_5, pay_way_name_6, pay_way_name_7, pay_way_name_8]"
+    },
+    {
+      "columnName": "sub_order_id",
+      "businessName": "子订单号",
+      "role": "KEY",
+      "description": "子订单号",
+      "aliases": [
+        "子订单号",
+        "sub_order_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=子订单号; samples=[sub_order_id_001, sub_order_id_002, sub_order_id_003, sub_order_id_004, sub_order_id_005, sub_order_id_006, sub_order_id_007, sub_order_id_008]"
+    },
+    {
+      "columnName": "express_id",
+      "businessName": "运单号",
+      "role": "KEY",
+      "description": "运单号",
+      "aliases": [
+        "运单号",
+        "express_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=运单号"
+    },
+    {
+      "columnName": "pay_account",
+      "businessName": "支付账户",
+      "role": "OTHER",
+      "description": "支付账户",
+      "aliases": [
+        "支付账户",
+        "pay_account"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=支付账户"
+    },
+    {
+      "columnName": "process_id",
+      "businessName": "流程ID",
+      "role": "KEY",
+      "description": "流程ID",
+      "aliases": [
+        "流程ID",
+        "process_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=流程ID"
+    },
+    {
+      "columnName": "reason_code",
+      "businessName": "赔付原因",
+      "role": "DIMENSION",
+      "description": "赔付原因",
+      "aliases": [
+        "赔付原因",
+        "reason_code"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=赔付原因"
+    },
+    {
+      "columnName": "coupon_type_code",
+      "businessName": "优惠券类型code 1满减券 2包邮券",
+      "role": "DIMENSION",
+      "description": "优惠券类型code 1满减券 2包邮券",
+      "aliases": [
+        "优惠券类型code 1满减券 2包邮券",
+        "coupon_type_code"
+      ],
+      "enumValues": [
+        "1=满减券",
+        "2=包邮券"
+      ],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=优惠券类型code 1满减券 2包邮券"
+    },
+    {
+      "columnName": "coupon_type_name",
+      "businessName": "优惠券类型name",
+      "role": "DIMENSION",
+      "description": "优惠券类型name",
+      "aliases": [
+        "优惠券类型name",
+        "coupon_type_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=优惠券类型name"
+    },
+    {
+      "columnName": "coupon_rule_a",
+      "businessName": "满多少元",
+      "role": "METRIC",
+      "description": "满多少元",
+      "aliases": [
+        "满多少元",
+        "coupon_rule_a"
+      ],
+      "enumValues": [],
+      "metricFormula": "SUM(coupon_rule_a)",
+      "confidence": 0.78,
+      "evidence": "schema comment=满多少元"
+    },
+    {
+      "columnName": "coupon_rule_b",
+      "businessName": "减多少元",
+      "role": "METRIC",
+      "description": "减多少元",
+      "aliases": [
+        "减多少元",
+        "coupon_rule_b"
+      ],
+      "enumValues": [],
+      "metricFormula": "SUM(coupon_rule_b)",
+      "confidence": 0.78,
+      "evidence": "schema comment=减多少元"
+    },
+    {
+      "columnName": "coupon_time_limit",
+      "businessName": "优惠券使用期限",
+      "role": "OTHER",
+      "description": "优惠券使用期限，格式：2019-08-25,2019-08-28",
+      "aliases": [
+        "优惠券使用期限",
+        "coupon_time_limit",
+        "优惠券使用期限，格式：2019-08-25,2019-08-28"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=优惠券使用期限，格式：2019-08-25,2019-08-28"
+    },
+    {
+      "columnName": "coupon_id",
+      "businessName": "优惠券id",
+      "role": "KEY",
+      "description": "优惠券id",
+      "aliases": [
+        "优惠券id",
+        "coupon_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=优惠券id"
+    },
+    {
+      "columnName": "activity_id",
+      "businessName": "活动id",
+      "role": "KEY",
+      "description": "活动id",
+      "aliases": [
+        "活动id",
+        "activity_id"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=活动id"
+    },
+    {
+      "columnName": "level1_reason_code",
+      "businessName": "一级理赔理由code",
+      "role": "DIMENSION",
+      "description": "一级理赔理由code",
+      "aliases": [
+        "一级理赔理由code",
+        "level1_reason_code"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=一级理赔理由code"
+    },
+    {
+      "columnName": "level1_reason_name",
+      "businessName": "一级理赔理由name",
+      "role": "DIMENSION",
+      "description": "一级理赔理由name",
+      "aliases": [
+        "一级理赔理由name",
+        "level1_reason_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=一级理赔理由name"
+    },
+    {
+      "columnName": "level2_reason_code",
+      "businessName": "二级理赔理由id",
+      "role": "DIMENSION",
+      "description": "二级理赔理由id",
+      "aliases": [
+        "二级理赔理由id",
+        "level2_reason_code"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=二级理赔理由id"
+    },
+    {
+      "columnName": "level2_reason_name",
+      "businessName": "二级理赔理由name",
+      "role": "DIMENSION",
+      "description": "二级理赔理由name",
+      "aliases": [
+        "二级理赔理由name",
+        "level2_reason_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=二级理赔理由name"
+    },
+    {
+      "columnName": "level3_reason_code",
+      "businessName": "三级理赔理由id",
+      "role": "DIMENSION",
+      "description": "三级理赔理由id",
+      "aliases": [
+        "三级理赔理由id",
+        "level3_reason_code"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=三级理赔理由id"
+    },
+    {
+      "columnName": "level3_reason_name",
+      "businessName": "三级理赔理由name",
+      "role": "DIMENSION",
+      "description": "三级理赔理由name",
+      "aliases": [
+        "三级理赔理由name",
+        "level3_reason_name"
+      ],
+      "enumValues": [],
+      "metricFormula": "",
+      "confidence": 0.78,
+      "evidence": "schema comment=三级理赔理由name"
+    }
+  ],
+  "metrics": [
+    {
+      "metricKey": "repay_amt",
+      "businessName": "赔付金额",
+      "formula": "SUM(repay_amt)",
+      "unit": "元",
+      "description": "赔付/理赔单支付金额",
+      "sourceColumns": [
+        "repay_amt"
+      ],
+      "aliases": [
+        "赔付金额",
+        "理赔金额",
+        "赔付支付金额",
+        "支付金额",
+        "repay_amt",
+        "repay_amount",
+        "compensation_amount"
+      ],
+      "confidence": 0.78,
+      "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    },
+    {
+      "metricKey": "coupon_rule_a",
+      "businessName": "满多少元",
+      "formula": "SUM(coupon_rule_a)",
+      "unit": "元",
+      "description": "满多少元",
+      "sourceColumns": [
+        "coupon_rule_a"
+      ],
+      "aliases": [
+        "满多少元",
+        "coupon_rule_a"
+      ],
+      "confidence": 0.78,
+      "evidence": "schema comment=满多少元"
+    },
+    {
+      "metricKey": "coupon_rule_b",
+      "businessName": "减多少元",
+      "formula": "SUM(coupon_rule_b)",
+      "unit": "元",
+      "description": "减多少元",
+      "sourceColumns": [
+        "coupon_rule_b"
+      ],
+      "aliases": [
+        "减多少元",
+        "coupon_rule_b"
+      ],
+      "confidence": 0.78,
+      "evidence": "schema comment=减多少元"
+    },
+    {
+      "metricKey": "repay_bill_cnt",
+      "businessName": "赔付单量",
+      "formula": "COUNT(DISTINCT bill_id)",
+      "unit": "单",
+      "description": "按赔付单号去重统计赔付单数量",
+      "sourceColumns": [
+        "bill_id"
+      ],
+      "aliases": [
+        "赔付单量",
+        "赔付订单量",
+        "赔付订单数",
+        "赔付单数",
+        "理赔单量",
+        "理赔订单量",
+        "赔付多",
+        "赔付也多",
+        "赔付量高",
+        "赔付较多",
+        "赔付高发",
+        "有没有赔付",
+        "是否赔付",
+        "有无赔付",
+        "有赔付订单",
+        "产生赔付",
+        "有产生赔付",
+        "或赔付",
+        "及赔付"
+      ],
+      "confidence": 0.82,
+      "evidence": "由 Topic Builder 基于字段组合自动生成"
+    },
+    {
+      "metricKey": "compensation_rate",
+      "businessName": "商品赔付率",
+      "formula": "赔付单量 / 订单量",
+      "unit": "%",
+      "description": "赔付单量与订单量的比值",
+      "sourceColumns": [
+        "repay_bill_cnt",
+        "order_detail_cnt"
+      ],
+      "aliases": [
+        "商品赔付率",
+        "赔付率",
+        "理赔率",
+        "compensation_rate",
+        "repay_rate"
+      ],
+      "confidence": 0.8,
+      "evidence": "由 Topic Builder 基于语义指标公式自动生成"
+    },
+    {
+      "metricKey": "repay_success_amt",
+      "businessName": "打款成功赔付金额",
+      "formula": "SUM(CASE WHEN pay_status_name = '打款成功' THEN repay_amt ELSE 0 END)",
+      "unit": "元",
+      "description": "只统计到账状态为打款成功的赔付金额",
+      "sourceColumns": [
+        "pay_status_name",
+        "repay_amt"
+      ],
+      "aliases": [
+        "打款成功赔付金额"
+      ],
+      "confidence": 0.82,
+      "evidence": "由 Topic Builder 基于字段组合自动生成"
+    }
+  ],
+  "terms": [
+    {
+      "term": "赔付单号",
+      "description": "赔付单号，PF190827160812345",
+      "aliases": [
+        "赔付单号",
+        "bill_id",
+        "赔付单号，PF190827160812345"
+      ],
+      "relatedColumns": [
+        "bill_id"
+      ],
+      "evidence": "来自字段 `bill_id` 的语义注释"
+    },
+    {
+      "term": "业务日期",
+      "description": "业务日期",
+      "aliases": [
+        "业务日期",
+        "pt"
+      ],
+      "relatedColumns": [
+        "pt"
+      ],
+      "evidence": "来自字段 `pt` 的语义注释"
+    },
+    {
+      "term": "赔付原因",
+      "description": "赔付原因",
+      "aliases": [
+        "赔付原因",
+        "cause_id",
+        "reason_code"
+      ],
+      "relatedColumns": [
+        "cause_id",
+        "reason_code"
+      ],
+      "evidence": "来自字段 `cause_id` 的语义注释"
+    },
+    {
+      "term": "订单号",
+      "description": "订单号",
+      "aliases": [
+        "订单号",
+        "order_id"
+      ],
+      "relatedColumns": [
+        "order_id"
+      ],
+      "evidence": "来自字段 `order_id` 的语义注释"
+    },
+    {
+      "term": "是否已退货 0否 1是",
+      "description": "是否已退货 0否 1是",
+      "aliases": [
+        "是否已退货 0否 1是",
+        "is_return"
+      ],
+      "relatedColumns": [
+        "is_return"
+      ],
+      "evidence": "来自字段 `is_return` 的语义注释"
+    },
+    {
+      "term": "支付金额",
+      "description": "支付金额",
+      "aliases": [
+        "支付金额",
+        "repay_amt"
+      ],
+      "relatedColumns": [
+        "repay_amt"
+      ],
+      "evidence": "来自字段 `repay_amt` 的语义注释"
+    },
+    {
+      "term": "工单号",
+      "description": "工单号",
+      "aliases": [
+        "工单号",
+        "ticket_id"
+      ],
+      "relatedColumns": [
+        "ticket_id"
+      ],
+      "evidence": "来自字段 `ticket_id` 的语义注释"
+    },
+    {
+      "term": "赔付买家id",
+      "description": "赔付买家id",
+      "aliases": [
+        "赔付买家id",
+        "buyer_id"
+      ],
+      "relatedColumns": [
+        "buyer_id"
+      ],
+      "evidence": "来自字段 `buyer_id` 的语义注释"
+    },
+    {
+      "term": "赔付买家用户名",
+      "description": "赔付买家用户名",
+      "aliases": [
+        "赔付买家用户名",
+        "buyer_name"
+      ],
+      "relatedColumns": [
+        "buyer_name"
+      ],
+      "evidence": "来自字段 `buyer_name` 的语义注释"
+    },
+    {
+      "term": "赔付卖家用户id",
+      "description": "赔付卖家用户id",
+      "aliases": [
+        "赔付卖家用户id",
+        "seller_id"
+      ],
+      "relatedColumns": [
+        "seller_id"
+      ],
+      "evidence": "来自字段 `seller_id` 的语义注释"
+    },
+    {
+      "term": "赔付卖家用户名",
+      "description": "赔付卖家用户名",
+      "aliases": [
+        "赔付卖家用户名",
+        "seller_name"
+      ],
+      "relatedColumns": [
+        "seller_name"
+      ],
+      "evidence": "来自字段 `seller_name` 的语义注释"
+    },
+    {
+      "term": "备注",
+      "description": "备注",
+      "aliases": [
+        "content"
+      ],
+      "relatedColumns": [
+        "content"
+      ],
+      "evidence": "来自字段 `content` 的语义注释"
+    },
+    {
+      "term": "驳回原因",
+      "description": "驳回原因",
+      "aliases": [
+        "驳回原因",
+        "reject_content"
+      ],
+      "relatedColumns": [
+        "reject_content"
+      ],
+      "evidence": "来自字段 `reject_content` 的语义注释"
+    },
+    {
+      "term": "状态code",
+      "description": "状态code，1审批中，2已驳回，3审批完成, 4已取消",
+      "aliases": [
+        "状态code",
+        "repay_status_code",
+        "状态code，1审批中，2已驳回，3审批完成, 4已取消"
+      ],
+      "relatedColumns": [
+        "repay_status_code"
+      ],
+      "evidence": "来自字段 `repay_status_code` 的语义注释"
+    },
+    {
+      "term": "状态名称",
+      "description": "状态名称",
+      "aliases": [
+        "状态名称",
+        "repay_status_name"
+      ],
+      "relatedColumns": [
+        "repay_status_name"
+      ],
+      "evidence": "来自字段 `repay_status_name` 的语义注释"
+    },
+    {
+      "term": "建立人员",
+      "description": "建立人员",
+      "aliases": [
+        "建立人员",
+        "creator_id"
+      ],
+      "relatedColumns": [
+        "creator_id"
+      ],
+      "evidence": "来自字段 `creator_id` 的语义注释"
+    },
+    {
+      "term": "系统时间",
+      "description": "系统时间",
+      "aliases": [
+        "系统时间",
+        "create_time"
+      ],
+      "relatedColumns": [
+        "create_time"
+      ],
+      "evidence": "来自字段 `create_time` 的语义注释"
+    },
+    {
+      "term": "修改人员",
+      "description": "修改人员",
+      "aliases": [
+        "修改人员",
+        "modifier_id"
+      ],
+      "relatedColumns": [
+        "modifier_id"
+      ],
+      "evidence": "来自字段 `modifier_id` 的语义注释"
+    },
+    {
+      "term": "修改时间",
+      "description": "修改时间",
+      "aliases": [
+        "修改时间",
+        "modify_time"
+      ],
+      "relatedColumns": [
+        "modify_time"
+      ],
+      "evidence": "来自字段 `modify_time` 的语义注释"
+    },
+    {
+      "term": "到账状态code 1打款中 2打款失败 3打款成功",
+      "description": "到账状态code 1打款中 2打款失败 3打款成功",
+      "aliases": [
+        "到账状态code 1打款中 2打款失败 3打款成功",
+        "pay_status_code"
+      ],
+      "relatedColumns": [
+        "pay_status_code"
+      ],
+      "evidence": "来自字段 `pay_status_code` 的语义注释"
+    },
+    {
+      "term": "到账状态name",
+      "description": "到账状态name",
+      "aliases": [
+        "到账状态name",
+        "pay_status_name"
+      ],
+      "relatedColumns": [
+        "pay_status_name"
+      ],
+      "evidence": "来自字段 `pay_status_name` 的语义注释"
+    },
+    {
+      "term": "赔款方式code 1优惠券2现金3语兴好物币",
+      "description": "赔款方式code 1优惠券2现金3语兴好物币",
+      "aliases": [
+        "赔款方式code 1优惠券2现金3语兴好物币",
+        "pay_way_code"
+      ],
+      "relatedColumns": [
+        "pay_way_code"
+      ],
+      "evidence": "来自字段 `pay_way_code` 的语义注释"
+    },
+    {
+      "term": "赔款方式name",
+      "description": "赔款方式name",
+      "aliases": [
+        "赔款方式name",
+        "pay_way_name"
+      ],
+      "relatedColumns": [
+        "pay_way_name"
+      ],
+      "evidence": "来自字段 `pay_way_name` 的语义注释"
+    },
+    {
+      "term": "子订单号",
+      "description": "子订单号",
+      "aliases": [
+        "子订单号",
+        "sub_order_id"
+      ],
+      "relatedColumns": [
+        "sub_order_id"
+      ],
+      "evidence": "来自字段 `sub_order_id` 的语义注释"
+    },
+    {
+      "term": "运单号",
+      "description": "运单号",
+      "aliases": [
+        "运单号",
+        "express_id"
+      ],
+      "relatedColumns": [
+        "express_id"
+      ],
+      "evidence": "来自字段 `express_id` 的语义注释"
+    },
+    {
+      "term": "支付账户",
+      "description": "支付账户",
+      "aliases": [
+        "支付账户",
+        "pay_account"
+      ],
+      "relatedColumns": [
+        "pay_account"
+      ],
+      "evidence": "来自字段 `pay_account` 的语义注释"
+    },
+    {
+      "term": "流程ID",
+      "description": "流程ID",
+      "aliases": [
+        "流程ID",
+        "process_id"
+      ],
+      "relatedColumns": [
+        "process_id"
+      ],
+      "evidence": "来自字段 `process_id` 的语义注释"
+    },
+    {
+      "term": "优惠券类型code 1满减券 2包邮券",
+      "description": "优惠券类型code 1满减券 2包邮券",
+      "aliases": [
+        "优惠券类型code 1满减券 2包邮券",
+        "coupon_type_code"
+      ],
+      "relatedColumns": [
+        "coupon_type_code"
+      ],
+      "evidence": "来自字段 `coupon_type_code` 的语义注释"
+    },
+    {
+      "term": "优惠券类型name",
+      "description": "优惠券类型name",
+      "aliases": [
+        "优惠券类型name",
+        "coupon_type_name"
+      ],
+      "relatedColumns": [
+        "coupon_type_name"
+      ],
+      "evidence": "来自字段 `coupon_type_name` 的语义注释"
+    },
+    {
+      "term": "满多少元",
+      "description": "满多少元",
+      "aliases": [
+        "满多少元",
+        "coupon_rule_a"
+      ],
+      "relatedColumns": [
+        "coupon_rule_a"
+      ],
+      "evidence": "来自字段 `coupon_rule_a` 的语义注释"
+    },
+    {
+      "term": "减多少元",
+      "description": "减多少元",
+      "aliases": [
+        "减多少元",
+        "coupon_rule_b"
+      ],
+      "relatedColumns": [
+        "coupon_rule_b"
+      ],
+      "evidence": "来自字段 `coupon_rule_b` 的语义注释"
+    },
+    {
+      "term": "优惠券使用期限",
+      "description": "优惠券使用期限，格式：2019-08-25,2019-08-28",
+      "aliases": [
+        "优惠券使用期限",
+        "coupon_time_limit",
+        "优惠券使用期限，格式：2019-08-25,2019-08-28"
+      ],
+      "relatedColumns": [
+        "coupon_time_limit"
+      ],
+      "evidence": "来自字段 `coupon_time_limit` 的语义注释"
+    },
+    {
+      "term": "优惠券id",
+      "description": "优惠券id",
+      "aliases": [
+        "优惠券id",
+        "coupon_id"
+      ],
+      "relatedColumns": [
+        "coupon_id"
+      ],
+      "evidence": "来自字段 `coupon_id` 的语义注释"
+    },
+    {
+      "term": "活动id",
+      "description": "活动id",
+      "aliases": [
+        "活动id",
+        "activity_id"
+      ],
+      "relatedColumns": [
+        "activity_id"
+      ],
+      "evidence": "来自字段 `activity_id` 的语义注释"
+    },
+    {
+      "term": "一级理赔理由code",
+      "description": "一级理赔理由code",
+      "aliases": [
+        "一级理赔理由code",
+        "level1_reason_code"
+      ],
+      "relatedColumns": [
+        "level1_reason_code"
+      ],
+      "evidence": "来自字段 `level1_reason_code` 的语义注释"
+    },
+    {
+      "term": "一级理赔理由name",
+      "description": "一级理赔理由name",
+      "aliases": [
+        "一级理赔理由name",
+        "level1_reason_name"
+      ],
+      "relatedColumns": [
+        "level1_reason_name"
+      ],
+      "evidence": "来自字段 `level1_reason_name` 的语义注释"
+    },
+    {
+      "term": "二级理赔理由id",
+      "description": "二级理赔理由id",
+      "aliases": [
+        "二级理赔理由id",
+        "level2_reason_code"
+      ],
+      "relatedColumns": [
+        "level2_reason_code"
+      ],
+      "evidence": "来自字段 `level2_reason_code` 的语义注释"
+    },
+    {
+      "term": "二级理赔理由name",
+      "description": "二级理赔理由name",
+      "aliases": [
+        "二级理赔理由name",
+        "level2_reason_name"
+      ],
+      "relatedColumns": [
+        "level2_reason_name"
+      ],
+      "evidence": "来自字段 `level2_reason_name` 的语义注释"
+    },
+    {
+      "term": "三级理赔理由id",
+      "description": "三级理赔理由id",
+      "aliases": [
+        "三级理赔理由id",
+        "level3_reason_code"
+      ],
+      "relatedColumns": [
+        "level3_reason_code"
+      ],
+      "evidence": "来自字段 `level3_reason_code` 的语义注释"
+    },
+    {
+      "term": "三级理赔理由name",
+      "description": "三级理赔理由name",
+      "aliases": [
+        "三级理赔理由name",
+        "level3_reason_name"
+      ],
+      "relatedColumns": [
+        "level3_reason_name"
+      ],
+      "evidence": "来自字段 `level3_reason_name` 的语义注释"
+    },
+    {
+      "term": "赔付",
+      "description": "客服理赔/补偿相关单据、金额和状态",
+      "aliases": [
+        "理赔",
+        "补偿",
+        "赔偿"
+      ],
+      "relatedColumns": [],
+      "evidence": "由表名/字段语义自动沉淀"
+    },
+    {
+      "term": "工单",
+      "description": "客服咨询、催单、关闭、评价等服务记录",
+      "aliases": [
+        "客服单",
+        "咨询单",
+        "催单"
+      ],
+      "relatedColumns": [],
+      "evidence": "由表名/字段语义自动沉淀"
+    }
+  ],
+  "knowledgeRules": [
+    {
+      "title": "时间范围过滤",
+      "content": "涉及最近N天、昨天、上个月等时间表达时，必须优先使用 `pt` 做业务日期过滤。",
+      "alwaysApply": true,
+      "keywords": [
+        "时间",
+        "最近",
+        "pt"
+      ],
+      "evidence": "Topic Builder 从时间字段识别"
+    },
+    {
+      "title": "商家范围过滤",
+      "content": "回答单个商家问题时，必须用 `seller_id` 过滤当前商家，避免查到全站数据。",
+      "alwaysApply": true,
+      "keywords": [
+        "商家",
+        "过滤",
+        "seller_id"
+      ],
+      "evidence": "Topic Builder 从 merchant_id/seller_id 字段识别"
+    },
+    {
+      "title": "明细查询优先使用明细表",
+      "content": "用户问“明细、哪几单、列表、记录”时，应使用该明细表返回真实单据，不要用 ads 指标表兜底伪装明细。",
+      "alwaysApply": true,
+      "keywords": [
+        "明细",
+        "哪几单",
+        "列表",
+        "记录"
+      ],
+      "evidence": "明细表命名规则"
+    },
+    {
+      "title": "赔付状态口径",
+      "content": "赔付审批状态看 `repay_status_name`，到账状态看 `pay_status_name`；分析实际打款成功金额时需限定 `pay_status_name = '打款成功'`。",
+      "alwaysApply": true,
+      "keywords": [
+        "赔付",
+        "理赔",
+        "打款成功",
+        "到账状态"
+      ],
+      "evidence": "赔付表状态字段语义"
+    }
+  ]
+}

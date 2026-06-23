@@ -1,0 +1,21 @@
+# 术语与同义词
+
+- 自增ID：自增ID，同义词=自增ID、appeal_id、申诉、商家申诉，关联字段=appeal_id
+- 创建时间：创建时间，同义词=创建时间、create_time，关联字段=create_time
+- 修改时间：修改时间，同义词=修改时间、modify_time，关联字段=modify_time
+- spu_id：spu_id，同义词=spu_id、商品，关联字段=spu_id
+- spu名称：spu名称，同义词=spu名称、spu_name、商品，关联字段=spu_name
+- 一级类目code：一级类目code，同义词=一级类目code、level1_category_code，关联字段=level1_category_code
+- 一级类目name：一级类目name，同义词=一级类目name、level1_category_name，关联字段=level1_category_name
+- 二级类目code：二级类目code，同义词=二级类目code、level2_category_code，关联字段=level2_category_code
+- 二级类目name：二级类目name，同义词=二级类目name、level2_category_name，关联字段=level2_category_name
+- 三级类目code：三级类目code，同义词=三级类目code、level3_category_code，关联字段=level3_category_code
+- 申诉文本：申诉文本，同义词=申诉文本、reason、申诉、商家申诉，关联字段=reason
+- 申诉图片：申诉图片，同义词=申诉图片、images_url、申诉、商家申诉，关联字段=images_url
+- 申诉状态code 1通过2驳回3取消：申诉状态code 1通过2驳回3取消，同义词=申诉状态code 1通过2驳回3取消、appeal_status_code、申诉、商家申诉，关联字段=appeal_status_code
+- 申诉状态name 1通过2驳回3取消：申诉状态name 1通过2驳回3取消，同义词=申诉状态name 1通过2驳回3取消、appeal_status_name、申诉、商家申诉，关联字段=appeal_status_name
+- 商家id：商家id，同义词=商家id、merchant_id，关联字段=merchant_id
+- 申诉类型code 1商品管理 2商家信息 3提现 4保证金 5供应链 6处罚：申诉类型code 1商品管理 2商家信息 3提现 4保证金 5供应链 6处罚，同义词=申诉类型code 1商品管理 2商家信息 3提现 4保证金 5供应链 6处罚、apply_type_code、保证金、押金、申诉、商家申诉、商品，关联字段=apply_type_code
+- 申诉类型name 1商品管理 2商家信息 3提现 4保证金 5供应链 6处罚：申诉类型name 1商品管理 2商家信息 3提现 4保证金 5供应链 6处罚，同义词=申诉类型name 1商品管理 2商家信息 3提现 4保证金 5供应链 6处罚、apply_type_name、保证金、押金、申诉、商家申诉、商品，关联字段=apply_type_name
+- 日期分区yyyyMMdd：日期分区yyyyMMdd，同义词=日期分区yyyyMMdd、pt，关联字段=pt
+- 申诉：商家针对商品、保证金、供应链、处罚等场景发起的申诉记录，同义词=商家申诉、处罚申诉

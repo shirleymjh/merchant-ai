@@ -1,0 +1,277 @@
+[ {
+  "columnName" : "coupon_id",
+  "dataType" : "varchar(128)",
+  "comment" : "券编号",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "user_id",
+  "dataType" : "varchar(128)",
+  "comment" : "用户id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "suit_owner_code",
+  "dataType" : "bigint",
+  "comment" : "适用方code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "suit_owner_name",
+  "dataType" : "varchar(255)",
+  "comment" : "适用方name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_id",
+  "dataType" : "varchar(128)",
+  "comment" : "优惠券模板编号",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_title",
+  "dataType" : "varchar(255)",
+  "comment" : "标题",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_id",
+  "dataType" : "varchar(128)",
+  "comment" : "活动id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_amt",
+  "dataType" : "bigint",
+  "comment" : "优惠金额",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "discount_way_code",
+  "dataType" : "bigint",
+  "comment" : "优惠方式code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "discount_way_name",
+  "dataType" : "varchar(128)",
+  "comment" : "优惠方式name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "found_type_code",
+  "dataType" : "bigint",
+  "comment" : "款项code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "found_type_name",
+  "dataType" : "varchar(128)",
+  "comment" : "款项name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_start_time",
+  "dataType" : "varchar(19)",
+  "comment" : "开始时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_expire_time",
+  "dataType" : "varchar(19)",
+  "comment" : "过期时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_send_status_code",
+  "dataType" : "bigint",
+  "comment" : "状态code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_send_status_name",
+  "dataType" : "bigint",
+  "comment" : "状态name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "threshold",
+  "dataType" : "bigint",
+  "comment" : "门槛",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "send_source_name",
+  "dataType" : "varchar(128)",
+  "comment" : "推送来源",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_content",
+  "dataType" : "varchar(1024)",
+  "comment" : "优惠券信息",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_create_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券创建时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_modify_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券更新时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_receive",
+  "dataType" : "bigint",
+  "comment" : "是否抢到优惠券",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "snap_create_time",
+  "dataType" : "varchar(19)",
+  "comment" : "抢券创建时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "snap_modify_time",
+  "dataType" : "varchar(19)",
+  "comment" : "抢券变更时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "coupon_refund_id",
+  "dataType" : "varchar(128)",
+  "comment" : "优惠券退回编号",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "refund_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券退回时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "allowance_amt",
+  "dataType" : "varchar(64)",
+  "comment" : "津贴金额",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_id",
+  "dataType" : "varchar(128)",
+  "comment" : "津贴商家id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_name",
+  "dataType" : "varchar(255)",
+  "comment" : "津贴商家name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "allowance_create_time",
+  "dataType" : "varchar(19)",
+  "comment" : "创建时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "allowance_modify_time",
+  "dataType" : "varchar(19)",
+  "comment" : "变更时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_createtor_id",
+  "dataType" : "varchar(128)",
+  "comment" : "优惠券创建人id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_createtor_name",
+  "dataType" : "varchar(255)",
+  "comment" : "优惠券创建人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_remark",
+  "dataType" : "varchar(1024)",
+  "comment" : "优惠券备注信息",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_voucher",
+  "dataType" : "bigint",
+  "comment" : "是否代金券",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_create_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券创建时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_modify_time",
+  "dataType" : "varchar(19)",
+  "comment" : "变更时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "template_valid_dur",
+  "dataType" : "bigint",
+  "comment" : "模板有效期间，天",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_name",
+  "dataType" : "varchar(255)",
+  "comment" : "优惠券活动name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_start_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券活动开始时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_expire_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券活动结束时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_createtor_id",
+  "dataType" : "varchar(128)",
+  "comment" : "优惠券活动创建人id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_createtor_name",
+  "dataType" : "varchar(255)",
+  "comment" : "优惠券活动创建人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_create_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券活动创建时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "activity_modify_time",
+  "dataType" : "varchar(19)",
+  "comment" : "优惠券活动变更时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "pt",
+  "dataType" : "date",
+  "comment" : "业务日期",
+  "nullable" : false,
+  "keyType" : ""
+} ]

@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "merchant_qa": "./merchant_ai/graph/workflow.py:graph"
+  },
+  "env": ".env"
+}

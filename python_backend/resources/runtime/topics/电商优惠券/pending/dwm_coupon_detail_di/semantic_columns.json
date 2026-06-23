@@ -1,0 +1,682 @@
+[
+  {
+    "columnName": "coupon_id",
+    "businessName": "券编号",
+    "role": "KEY",
+    "description": "券编号",
+    "aliases": [
+      "券编号",
+      "coupon_id",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=券编号; samples=[coupon_id_001, coupon_id_002, coupon_id_003, coupon_id_004, coupon_id_005, coupon_id_006, coupon_id_007, coupon_id_008]"
+  },
+  {
+    "columnName": "user_id",
+    "businessName": "用户id",
+    "role": "KEY",
+    "description": "用户id",
+    "aliases": [
+      "用户id",
+      "user_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=用户id; samples=[user_dwm_coupon_detail_di_001, user_dwm_coupon_detail_di_002, user_dwm_coupon_detail_di_003, user_dwm_coupon_detail_di_004, user_dwm_coupon_detail_di_005, user_dwm_coupon_detail_di_006, user_dwm_coupon_detail_di_007, user_dwm_coupon_detail_di_008]"
+  },
+  {
+    "columnName": "suit_owner_code",
+    "businessName": "适用方code",
+    "role": "DIMENSION",
+    "description": "适用方code",
+    "aliases": [
+      "适用方code",
+      "suit_owner_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=适用方code"
+  },
+  {
+    "columnName": "suit_owner_name",
+    "businessName": "适用方name",
+    "role": "DIMENSION",
+    "description": "适用方name",
+    "aliases": [
+      "适用方name",
+      "suit_owner_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=适用方name"
+  },
+  {
+    "columnName": "template_id",
+    "businessName": "优惠券模板编号",
+    "role": "KEY",
+    "description": "优惠券模板编号",
+    "aliases": [
+      "优惠券模板编号",
+      "template_id",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券模板编号"
+  },
+  {
+    "columnName": "template_title",
+    "businessName": "标题",
+    "role": "OTHER",
+    "description": "标题",
+    "aliases": [
+      "标题",
+      "template_title"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=标题; samples=[template_title_1, template_title_2, template_title_3, template_title_4, template_title_5, template_title_6, template_title_7, template_title_8]"
+  },
+  {
+    "columnName": "activity_id",
+    "businessName": "活动id",
+    "role": "KEY",
+    "description": "活动id",
+    "aliases": [
+      "活动id",
+      "activity_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=活动id"
+  },
+  {
+    "columnName": "coupon_amt",
+    "businessName": "优惠金额",
+    "role": "METRIC",
+    "description": "优惠金额",
+    "aliases": [
+      "优惠金额",
+      "coupon_amt",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(coupon_amt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "columnName": "discount_way_code",
+    "businessName": "优惠方式code",
+    "role": "DIMENSION",
+    "description": "优惠方式code",
+    "aliases": [
+      "优惠方式code",
+      "discount_way_code",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠方式code"
+  },
+  {
+    "columnName": "discount_way_name",
+    "businessName": "优惠方式name",
+    "role": "DIMENSION",
+    "description": "优惠方式name",
+    "aliases": [
+      "优惠方式name",
+      "discount_way_name",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠方式name"
+  },
+  {
+    "columnName": "found_type_code",
+    "businessName": "款项code",
+    "role": "DIMENSION",
+    "description": "款项code",
+    "aliases": [
+      "款项code",
+      "found_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=款项code"
+  },
+  {
+    "columnName": "found_type_name",
+    "businessName": "款项name",
+    "role": "DIMENSION",
+    "description": "款项name",
+    "aliases": [
+      "款项name",
+      "found_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=款项name"
+  },
+  {
+    "columnName": "coupon_start_time",
+    "businessName": "开始时间",
+    "role": "TIME",
+    "description": "开始时间",
+    "aliases": [
+      "开始时间",
+      "coupon_start_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=开始时间"
+  },
+  {
+    "columnName": "coupon_expire_time",
+    "businessName": "过期时间",
+    "role": "TIME",
+    "description": "过期时间",
+    "aliases": [
+      "过期时间",
+      "coupon_expire_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=过期时间"
+  },
+  {
+    "columnName": "coupon_send_status_code",
+    "businessName": "状态code",
+    "role": "DIMENSION",
+    "description": "状态code",
+    "aliases": [
+      "状态code",
+      "coupon_send_status_code",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=状态code"
+  },
+  {
+    "columnName": "coupon_send_status_name",
+    "businessName": "状态name",
+    "role": "DIMENSION",
+    "description": "状态name",
+    "aliases": [
+      "状态name",
+      "coupon_send_status_name",
+      "优惠券"
+    ],
+    "enumValues": [
+      "coupon_send_status_name_1",
+      "coupon_send_status_name_2",
+      "coupon_send_status_name_3",
+      "coupon_send_status_name_4",
+      "coupon_send_status_name_5",
+      "coupon_send_status_name_6",
+      "coupon_send_status_name_7",
+      "coupon_send_status_name_8"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=状态name; samples=[coupon_send_status_name_1, coupon_send_status_name_2, coupon_send_status_name_3, coupon_send_status_name_4, coupon_send_status_name_5, coupon_send_status_name_6, coupon_send_status_name_7, coupon_send_status_name_8]"
+  },
+  {
+    "columnName": "threshold",
+    "businessName": "门槛",
+    "role": "OTHER",
+    "description": "门槛",
+    "aliases": [
+      "门槛",
+      "threshold"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=门槛"
+  },
+  {
+    "columnName": "send_source_name",
+    "businessName": "推送来源",
+    "role": "DIMENSION",
+    "description": "推送来源",
+    "aliases": [
+      "推送来源",
+      "send_source_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=推送来源"
+  },
+  {
+    "columnName": "coupon_content",
+    "businessName": "优惠券信息",
+    "role": "OTHER",
+    "description": "优惠券信息",
+    "aliases": [
+      "优惠券信息",
+      "coupon_content",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券信息"
+  },
+  {
+    "columnName": "coupon_create_time",
+    "businessName": "优惠券创建时间",
+    "role": "TIME",
+    "description": "优惠券创建时间",
+    "aliases": [
+      "优惠券创建时间",
+      "coupon_create_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券创建时间; samples=[2026-02-25T14:05:31, 2026-02-26T17:03:08, 2026-02-27T22:22:57, 2026-02-28T14:35:18, 2026-03-01T22:10:10, 2026-03-02T18:59:58, 2026-03-03T02:33:13, 2026-03-04T10:58:35]"
+  },
+  {
+    "columnName": "coupon_modify_time",
+    "businessName": "优惠券更新时间",
+    "role": "TIME",
+    "description": "优惠券更新时间",
+    "aliases": [
+      "优惠券更新时间",
+      "coupon_modify_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券更新时间"
+  },
+  {
+    "columnName": "is_receive",
+    "businessName": "是否抢到优惠券",
+    "role": "DIMENSION",
+    "description": "是否抢到优惠券",
+    "aliases": [
+      "是否抢到优惠券",
+      "is_receive",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否抢到优惠券"
+  },
+  {
+    "columnName": "snap_create_time",
+    "businessName": "抢券创建时间",
+    "role": "TIME",
+    "description": "抢券创建时间",
+    "aliases": [
+      "抢券创建时间",
+      "snap_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=抢券创建时间"
+  },
+  {
+    "columnName": "snap_modify_time",
+    "businessName": "抢券变更时间",
+    "role": "TIME",
+    "description": "抢券变更时间",
+    "aliases": [
+      "抢券变更时间",
+      "snap_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=抢券变更时间"
+  },
+  {
+    "columnName": "coupon_refund_id",
+    "businessName": "优惠券退回编号",
+    "role": "KEY",
+    "description": "优惠券退回编号",
+    "aliases": [
+      "优惠券退回编号",
+      "coupon_refund_id",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券退回编号"
+  },
+  {
+    "columnName": "refund_time",
+    "businessName": "优惠券退回时间",
+    "role": "TIME",
+    "description": "优惠券退回时间",
+    "aliases": [
+      "优惠券退回时间",
+      "refund_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券退回时间"
+  },
+  {
+    "columnName": "allowance_amt",
+    "businessName": "津贴金额",
+    "role": "METRIC",
+    "description": "津贴金额",
+    "aliases": [
+      "津贴金额",
+      "allowance_amt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(CAST(allowance_amt AS DECIMAL(18,2)))",
+    "confidence": 0.78,
+    "evidence": "schema comment=津贴金额"
+  },
+  {
+    "columnName": "seller_id",
+    "businessName": "津贴商家id",
+    "role": "KEY",
+    "description": "津贴商家id",
+    "aliases": [
+      "津贴商家id",
+      "seller_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=津贴商家id; samples=[100]"
+  },
+  {
+    "columnName": "seller_name",
+    "businessName": "津贴商家name",
+    "role": "DIMENSION",
+    "description": "津贴商家name",
+    "aliases": [
+      "津贴商家name",
+      "seller_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=津贴商家name"
+  },
+  {
+    "columnName": "allowance_create_time",
+    "businessName": "创建时间",
+    "role": "TIME",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "allowance_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=创建时间"
+  },
+  {
+    "columnName": "allowance_modify_time",
+    "businessName": "变更时间",
+    "role": "TIME",
+    "description": "变更时间",
+    "aliases": [
+      "变更时间",
+      "allowance_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=变更时间"
+  },
+  {
+    "columnName": "template_createtor_id",
+    "businessName": "优惠券创建人id",
+    "role": "KEY",
+    "description": "优惠券创建人id",
+    "aliases": [
+      "优惠券创建人id",
+      "template_createtor_id",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券创建人id"
+  },
+  {
+    "columnName": "template_createtor_name",
+    "businessName": "优惠券创建人name",
+    "role": "DIMENSION",
+    "description": "优惠券创建人name",
+    "aliases": [
+      "优惠券创建人name",
+      "template_createtor_name",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券创建人name"
+  },
+  {
+    "columnName": "template_remark",
+    "businessName": "优惠券备注信息",
+    "role": "OTHER",
+    "description": "优惠券备注信息",
+    "aliases": [
+      "优惠券备注信息",
+      "template_remark",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券备注信息"
+  },
+  {
+    "columnName": "is_voucher",
+    "businessName": "是否代金券",
+    "role": "DIMENSION",
+    "description": "是否代金券",
+    "aliases": [
+      "是否代金券",
+      "is_voucher"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否代金券"
+  },
+  {
+    "columnName": "template_create_time",
+    "businessName": "优惠券创建时间",
+    "role": "TIME",
+    "description": "优惠券创建时间",
+    "aliases": [
+      "优惠券创建时间",
+      "template_create_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券创建时间"
+  },
+  {
+    "columnName": "template_modify_time",
+    "businessName": "变更时间",
+    "role": "TIME",
+    "description": "变更时间",
+    "aliases": [
+      "变更时间",
+      "template_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=变更时间"
+  },
+  {
+    "columnName": "template_valid_dur",
+    "businessName": "模板有效期间",
+    "role": "OTHER",
+    "description": "模板有效期间，天",
+    "aliases": [
+      "模板有效期间",
+      "template_valid_dur",
+      "模板有效期间，天"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=模板有效期间，天"
+  },
+  {
+    "columnName": "activity_name",
+    "businessName": "优惠券活动name",
+    "role": "DIMENSION",
+    "description": "优惠券活动name",
+    "aliases": [
+      "优惠券活动name",
+      "activity_name",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动name"
+  },
+  {
+    "columnName": "activity_start_time",
+    "businessName": "优惠券活动开始时间",
+    "role": "TIME",
+    "description": "优惠券活动开始时间",
+    "aliases": [
+      "优惠券活动开始时间",
+      "activity_start_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动开始时间"
+  },
+  {
+    "columnName": "activity_expire_time",
+    "businessName": "优惠券活动结束时间",
+    "role": "TIME",
+    "description": "优惠券活动结束时间",
+    "aliases": [
+      "优惠券活动结束时间",
+      "activity_expire_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动结束时间"
+  },
+  {
+    "columnName": "activity_createtor_id",
+    "businessName": "优惠券活动创建人id",
+    "role": "KEY",
+    "description": "优惠券活动创建人id",
+    "aliases": [
+      "优惠券活动创建人id",
+      "activity_createtor_id",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动创建人id"
+  },
+  {
+    "columnName": "activity_createtor_name",
+    "businessName": "优惠券活动创建人name",
+    "role": "DIMENSION",
+    "description": "优惠券活动创建人name",
+    "aliases": [
+      "优惠券活动创建人name",
+      "activity_createtor_name",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动创建人name"
+  },
+  {
+    "columnName": "activity_create_time",
+    "businessName": "优惠券活动创建时间",
+    "role": "TIME",
+    "description": "优惠券活动创建时间",
+    "aliases": [
+      "优惠券活动创建时间",
+      "activity_create_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动创建时间"
+  },
+  {
+    "columnName": "activity_modify_time",
+    "businessName": "优惠券活动变更时间",
+    "role": "TIME",
+    "description": "优惠券活动变更时间",
+    "aliases": [
+      "优惠券活动变更时间",
+      "activity_modify_time",
+      "优惠券"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=优惠券活动变更时间"
+  },
+  {
+    "columnName": "pt",
+    "businessName": "业务日期",
+    "role": "TIME",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=业务日期; samples=[2026-02-25, 2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02, 2026-03-03, 2026-03-04]"
+  }
+]

@@ -1,0 +1,1495 @@
+[
+  {
+    "term": "主订单号",
+    "description": "主订单号",
+    "aliases": [
+      "主订单号",
+      "order_id"
+    ],
+    "relatedColumns": [
+      "order_id"
+    ],
+    "evidence": "来自字段 `order_id` 的语义注释"
+  },
+  {
+    "term": "订单号",
+    "description": "订单号",
+    "aliases": [
+      "订单号",
+      "sub_order_id"
+    ],
+    "relatedColumns": [
+      "sub_order_id"
+    ],
+    "evidence": "来自字段 `sub_order_id` 的语义注释"
+  },
+  {
+    "term": "业务日期",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "relatedColumns": [
+      "pt"
+    ],
+    "evidence": "来自字段 `pt` 的语义注释"
+  },
+  {
+    "term": "购买渠道code",
+    "description": "购买渠道code，海外购，秒杀等",
+    "aliases": [
+      "购买渠道code",
+      "biz_channel_code",
+      "购买渠道code，海外购，秒杀等"
+    ],
+    "relatedColumns": [
+      "biz_channel_code"
+    ],
+    "evidence": "来自字段 `biz_channel_code` 的语义注释"
+  },
+  {
+    "term": "购买渠道名称",
+    "description": "购买渠道名称",
+    "aliases": [
+      "购买渠道名称",
+      "biz_channel_name"
+    ],
+    "relatedColumns": [
+      "biz_channel_name"
+    ],
+    "evidence": "来自字段 `biz_channel_name` 的语义注释"
+  },
+  {
+    "term": "垂直行业领域划分code",
+    "description": "垂直行业领域划分code,鞋子，数码等",
+    "aliases": [
+      "垂直行业领域划分code",
+      "biz_code",
+      "垂直行业领域划分code,鞋子，数码等"
+    ],
+    "relatedColumns": [
+      "biz_code"
+    ],
+    "evidence": "来自字段 `biz_code` 的语义注释"
+  },
+  {
+    "term": "垂直行业领域划分名称",
+    "description": "垂直行业领域划分名称,鞋子，数码等",
+    "aliases": [
+      "垂直行业领域划分名称",
+      "biz_name",
+      "垂直行业领域划分名称,鞋子，数码等"
+    ],
+    "relatedColumns": [
+      "biz_name"
+    ],
+    "evidence": "来自字段 `biz_name` 的语义注释"
+  },
+  {
+    "term": "子订单状态code",
+    "description": "子订单状态code",
+    "aliases": [
+      "子订单状态code",
+      "sub_order_status_code"
+    ],
+    "relatedColumns": [
+      "sub_order_status_code"
+    ],
+    "evidence": "来自字段 `sub_order_status_code` 的语义注释"
+  },
+  {
+    "term": "子订单状态名称",
+    "description": "子订单状态名称",
+    "aliases": [
+      "子订单状态名称",
+      "sub_order_status_name"
+    ],
+    "relatedColumns": [
+      "sub_order_status_name"
+    ],
+    "evidence": "来自字段 `sub_order_status_name` 的语义注释"
+  },
+  {
+    "term": "买家ID",
+    "description": "买家ID",
+    "aliases": [
+      "买家ID",
+      "buyer_id"
+    ],
+    "relatedColumns": [
+      "buyer_id"
+    ],
+    "evidence": "来自字段 `buyer_id` 的语义注释"
+  },
+  {
+    "term": "买家昵称",
+    "description": "买家昵称",
+    "aliases": [
+      "买家昵称",
+      "buyer_name"
+    ],
+    "relatedColumns": [
+      "buyer_name"
+    ],
+    "evidence": "来自字段 `buyer_name` 的语义注释"
+  },
+  {
+    "term": "卖家ID",
+    "description": "卖家ID",
+    "aliases": [
+      "卖家ID",
+      "seller_id"
+    ],
+    "relatedColumns": [
+      "seller_id"
+    ],
+    "evidence": "来自字段 `seller_id` 的语义注释"
+  },
+  {
+    "term": "卖家昵称",
+    "description": "卖家昵称",
+    "aliases": [
+      "卖家昵称",
+      "seller_name"
+    ],
+    "relatedColumns": [
+      "seller_name"
+    ],
+    "evidence": "来自字段 `seller_name` 的语义注释"
+  },
+  {
+    "term": "优惠金额",
+    "description": "优惠金额",
+    "aliases": [
+      "优惠金额",
+      "discount_amt"
+    ],
+    "relatedColumns": [
+      "discount_amt"
+    ],
+    "evidence": "来自字段 `discount_amt` 的语义注释"
+  },
+  {
+    "term": "库存编号",
+    "description": "库存编号",
+    "aliases": [
+      "库存编号",
+      "inventory_id"
+    ],
+    "relatedColumns": [
+      "inventory_id"
+    ],
+    "evidence": "来自字段 `inventory_id` 的语义注释"
+  },
+  {
+    "term": "spuId",
+    "description": "spuId",
+    "aliases": [
+      "spuId",
+      "spu_id"
+    ],
+    "relatedColumns": [
+      "spu_id"
+    ],
+    "evidence": "来自字段 `spu_id` 的语义注释"
+  },
+  {
+    "term": "skuId",
+    "description": "skuId",
+    "aliases": [
+      "skuId",
+      "sku_id"
+    ],
+    "relatedColumns": [
+      "sku_id"
+    ],
+    "evidence": "来自字段 `sku_id` 的语义注释"
+  },
+  {
+    "term": "sku名称",
+    "description": "sku名称",
+    "aliases": [
+      "sku名称",
+      "sku_name"
+    ],
+    "relatedColumns": [
+      "sku_name"
+    ],
+    "evidence": "来自字段 `sku_name` 的语义注释"
+  },
+  {
+    "term": "商品单价分",
+    "description": "商品单价分",
+    "aliases": [
+      "商品单价分",
+      "sku_price"
+    ],
+    "relatedColumns": [
+      "sku_price"
+    ],
+    "evidence": "来自字段 `sku_price` 的语义注释"
+  },
+  {
+    "term": "商品数量",
+    "description": "商品数量",
+    "aliases": [
+      "商品数量",
+      "sku_cnt"
+    ],
+    "relatedColumns": [
+      "sku_cnt"
+    ],
+    "evidence": "来自字段 `sku_cnt` 的语义注释"
+  },
+  {
+    "term": "买家留言",
+    "description": "买家留言",
+    "aliases": [
+      "买家留言",
+      "buyer_note"
+    ],
+    "relatedColumns": [
+      "buyer_note"
+    ],
+    "evidence": "来自字段 `buyer_note` 的语义注释"
+  },
+  {
+    "term": "商品信息JSON",
+    "description": "商品信息JSON",
+    "aliases": [
+      "商品信息JSON",
+      "item_json"
+    ],
+    "relatedColumns": [
+      "item_json"
+    ],
+    "evidence": "来自字段 `item_json` 的语义注释"
+  },
+  {
+    "term": "关闭类型",
+    "description": "关闭类型",
+    "aliases": [
+      "关闭类型",
+      "close_type_code"
+    ],
+    "relatedColumns": [
+      "close_type_code"
+    ],
+    "evidence": "来自字段 `close_type_code` 的语义注释"
+  },
+  {
+    "term": "关闭类型名称",
+    "description": "关闭类型名称",
+    "aliases": [
+      "关闭类型名称",
+      "close_type_name"
+    ],
+    "relatedColumns": [
+      "close_type_name"
+    ],
+    "evidence": "来自字段 `close_type_name` 的语义注释"
+  },
+  {
+    "term": "关闭时间",
+    "description": "关闭时间",
+    "aliases": [
+      "关闭时间",
+      "close_time"
+    ],
+    "relatedColumns": [
+      "close_time"
+    ],
+    "evidence": "来自字段 `close_time` 的语义注释"
+  },
+  {
+    "term": "拓展信息",
+    "description": "拓展信息",
+    "aliases": [
+      "拓展信息",
+      "extra"
+    ],
+    "relatedColumns": [
+      "extra"
+    ],
+    "evidence": "来自字段 `extra` 的语义注释"
+  },
+  {
+    "term": "商品总额分",
+    "description": "商品总额分",
+    "aliases": [
+      "商品总额分",
+      "product_amt"
+    ],
+    "relatedColumns": [
+      "product_amt"
+    ],
+    "evidence": "来自字段 `product_amt` 的语义注释"
+  },
+  {
+    "term": "运费金额分",
+    "description": "运费金额分",
+    "aliases": [
+      "运费金额分",
+      "freight_amt"
+    ],
+    "relatedColumns": [
+      "freight_amt"
+    ],
+    "evidence": "来自字段 `freight_amt` 的语义注释"
+  },
+  {
+    "term": "sku图片地址",
+    "description": "sku图片地址",
+    "aliases": [
+      "sku图片地址",
+      "sku_logo_url"
+    ],
+    "relatedColumns": [
+      "sku_logo_url"
+    ],
+    "evidence": "来自字段 `sku_logo_url` 的语义注释"
+  },
+  {
+    "term": "卖家留言",
+    "description": "卖家留言",
+    "aliases": [
+      "卖家留言",
+      "seller_note"
+    ],
+    "relatedColumns": [
+      "seller_note"
+    ],
+    "evidence": "来自字段 `seller_note` 的语义注释"
+  },
+  {
+    "term": "卖家发货地址",
+    "description": "卖家发货地址",
+    "aliases": [
+      "卖家发货地址",
+      "seller_address_info"
+    ],
+    "relatedColumns": [
+      "seller_address_info"
+    ],
+    "evidence": "来自字段 `seller_address_info` 的语义注释"
+  },
+  {
+    "term": "卖家寄回地址",
+    "description": "卖家寄回地址",
+    "aliases": [
+      "卖家寄回地址",
+      "seller_address_back"
+    ],
+    "relatedColumns": [
+      "seller_address_back"
+    ],
+    "evidence": "来自字段 `seller_address_back` 的语义注释"
+  },
+  {
+    "term": "商家信息",
+    "description": "商家信息",
+    "aliases": [
+      "商家信息",
+      "seller_info"
+    ],
+    "relatedColumns": [
+      "seller_info"
+    ],
+    "evidence": "来自字段 `seller_info` 的语义注释"
+  },
+  {
+    "term": "卖家发货截止时间",
+    "description": "卖家发货截止时间",
+    "aliases": [
+      "卖家发货截止时间",
+      "delivery_deadline_time"
+    ],
+    "relatedColumns": [
+      "delivery_deadline_time"
+    ],
+    "evidence": "来自字段 `delivery_deadline_time` 的语义注释"
+  },
+  {
+    "term": "区域",
+    "description": "区域",
+    "aliases": [
+      "区域",
+      "region"
+    ],
+    "relatedColumns": [
+      "region"
+    ],
+    "evidence": "来自字段 `region` 的语义注释"
+  },
+  {
+    "term": "子订单创建时间",
+    "description": "子订单创建时间",
+    "aliases": [
+      "子订单创建时间",
+      "sub_order_create_time"
+    ],
+    "relatedColumns": [
+      "sub_order_create_time"
+    ],
+    "evidence": "来自字段 `sub_order_create_time` 的语义注释"
+  },
+  {
+    "term": "子订单更新时间",
+    "description": "子订单更新时间",
+    "aliases": [
+      "子订单更新时间",
+      "sub_order_modify_time"
+    ],
+    "relatedColumns": [
+      "sub_order_modify_time"
+    ],
+    "evidence": "来自字段 `sub_order_modify_time` 的语义注释"
+  },
+  {
+    "term": "买家地址信息json",
+    "description": "买家地址信息json",
+    "aliases": [
+      "买家地址信息json",
+      "address_json"
+    ],
+    "relatedColumns": [
+      "address_json"
+    ],
+    "evidence": "来自字段 `address_json` 的语义注释"
+  },
+  {
+    "term": "买家地址",
+    "description": "买家地址-省code",
+    "aliases": [
+      "买家地址",
+      "address_province_code",
+      "买家地址-省code",
+      "address_province_name",
+      "买家地址-省名称",
+      "address_city_code",
+      "买家地址-市code",
+      "address_city_name",
+      "买家地址-市名称",
+      "address_district_code",
+      "买家地址-区code",
+      "address_district_name",
+      "买家地址-区名称",
+      "address_street_code",
+      "买家地址-街道code",
+      "address_street_name",
+      "买家地址-街道名称"
+    ],
+    "relatedColumns": [
+      "address_province_code",
+      "address_province_name",
+      "address_city_code",
+      "address_city_name",
+      "address_district_code",
+      "address_district_name",
+      "address_street_code",
+      "address_street_name"
+    ],
+    "evidence": "来自字段 `address_province_code` 的语义注释"
+  },
+  {
+    "term": "设备来源（平台",
+    "description": "设备来源（平台，安卓，ios）",
+    "aliases": [
+      "设备来源（平台",
+      "platform_name",
+      "设备来源（平台，安卓，ios）"
+    ],
+    "relatedColumns": [
+      "platform_name"
+    ],
+    "evidence": "来自字段 `platform_name` 的语义注释"
+  },
+  {
+    "term": "折扣id",
+    "description": "折扣id",
+    "aliases": [
+      "折扣id",
+      "discount_id"
+    ],
+    "relatedColumns": [
+      "discount_id"
+    ],
+    "evidence": "来自字段 `discount_id` 的语义注释"
+  },
+  {
+    "term": "优惠类型code",
+    "description": "优惠类型code",
+    "aliases": [
+      "优惠类型code",
+      "discount_type_code"
+    ],
+    "relatedColumns": [
+      "discount_type_code"
+    ],
+    "evidence": "来自字段 `discount_type_code` 的语义注释"
+  },
+  {
+    "term": "优惠类型name",
+    "description": "优惠类型name",
+    "aliases": [
+      "优惠类型name",
+      "discount_type_name"
+    ],
+    "relatedColumns": [
+      "discount_type_name"
+    ],
+    "evidence": "来自字段 `discount_type_name` 的语义注释"
+  },
+  {
+    "term": "优惠方式关联的id",
+    "description": "优惠方式关联的id，优惠券id,红包账号等",
+    "aliases": [
+      "优惠方式关联的id",
+      "discount_rel_id",
+      "优惠方式关联的id，优惠券id,红包账号等"
+    ],
+    "relatedColumns": [
+      "discount_rel_id"
+    ],
+    "evidence": "来自字段 `discount_rel_id` 的语义注释"
+  },
+  {
+    "term": "是否使用1是0否",
+    "description": "是否使用1是0否",
+    "aliases": [
+      "是否使用1是0否",
+      "is_use"
+    ],
+    "relatedColumns": [
+      "is_use"
+    ],
+    "evidence": "来自字段 `is_use` 的语义注释"
+  },
+  {
+    "term": "补贴信息json",
+    "description": "补贴信息json",
+    "aliases": [
+      "补贴信息json",
+      "subsidy_json"
+    ],
+    "relatedColumns": [
+      "subsidy_json"
+    ],
+    "evidence": "来自字段 `subsidy_json` 的语义注释"
+  },
+  {
+    "term": "平台补贴金额",
+    "description": "平台补贴金额",
+    "aliases": [
+      "平台补贴金额",
+      "platform_subsidy_amt"
+    ],
+    "relatedColumns": [
+      "platform_subsidy_amt"
+    ],
+    "evidence": "来自字段 `platform_subsidy_amt` 的语义注释"
+  },
+  {
+    "term": "商家补贴金额",
+    "description": "商家补贴金额",
+    "aliases": [
+      "商家补贴金额",
+      "seller_subsidy_amt"
+    ],
+    "relatedColumns": [
+      "seller_subsidy_amt"
+    ],
+    "evidence": "来自字段 `seller_subsidy_amt` 的语义注释"
+  },
+  {
+    "term": "折扣创建时间",
+    "description": "折扣创建时间",
+    "aliases": [
+      "折扣创建时间",
+      "discount_create_time"
+    ],
+    "relatedColumns": [
+      "discount_create_time"
+    ],
+    "evidence": "来自字段 `discount_create_time` 的语义注释"
+  },
+  {
+    "term": "折扣更新时间",
+    "description": "折扣更新时间",
+    "aliases": [
+      "折扣更新时间",
+      "discount_modify_time"
+    ],
+    "relatedColumns": [
+      "discount_modify_time"
+    ],
+    "evidence": "来自字段 `discount_modify_time` 的语义注释"
+  },
+  {
+    "term": "商家申诉状态code：0",
+    "description": "商家申诉状态code：0 - 未申诉，1 - 申诉中，2 - 通过，3 - 驳回",
+    "aliases": [
+      "商家申诉状态code：0",
+      "appeal_status_code",
+      "商家申诉状态code：0 - 未申诉，1 - 申诉中，2 - 通过，3 - 驳回"
+    ],
+    "relatedColumns": [
+      "appeal_status_code"
+    ],
+    "evidence": "来自字段 `appeal_status_code` 的语义注释"
+  },
+  {
+    "term": "商家申诉状态名称",
+    "description": "商家申诉状态名称",
+    "aliases": [
+      "商家申诉状态名称",
+      "appeal_status_name"
+    ],
+    "relatedColumns": [
+      "appeal_status_name"
+    ],
+    "evidence": "来自字段 `appeal_status_name` 的语义注释"
+  },
+  {
+    "term": "商家申诉创建时间",
+    "description": "商家申诉创建时间",
+    "aliases": [
+      "商家申诉创建时间",
+      "appeal_create_time"
+    ],
+    "relatedColumns": [
+      "appeal_create_time"
+    ],
+    "evidence": "来自字段 `appeal_create_time` 的语义注释"
+  },
+  {
+    "term": "商家申诉修改时间",
+    "description": "商家申诉修改时间",
+    "aliases": [
+      "商家申诉修改时间",
+      "appeal_modify_time"
+    ],
+    "relatedColumns": [
+      "appeal_modify_time"
+    ],
+    "evidence": "来自字段 `appeal_modify_time` 的语义注释"
+  },
+  {
+    "term": "支付号",
+    "description": "支付号",
+    "aliases": [
+      "支付号",
+      "pay_id"
+    ],
+    "relatedColumns": [
+      "pay_id"
+    ],
+    "evidence": "来自字段 `pay_id` 的语义注释"
+  },
+  {
+    "term": "支付方式code",
+    "description": "支付方式code，支付宝，微信，银行卡",
+    "aliases": [
+      "支付方式code",
+      "pay_tool_code",
+      "支付方式code，支付宝，微信，银行卡"
+    ],
+    "relatedColumns": [
+      "pay_tool_code"
+    ],
+    "evidence": "来自字段 `pay_tool_code` 的语义注释"
+  },
+  {
+    "term": "支付方式名称",
+    "description": "支付方式名称",
+    "aliases": [
+      "支付方式名称",
+      "pay_tool_name"
+    ],
+    "relatedColumns": [
+      "pay_tool_name"
+    ],
+    "evidence": "来自字段 `pay_tool_name` 的语义注释"
+  },
+  {
+    "term": "支付类型code",
+    "description": "支付类型code，定金，尾款",
+    "aliases": [
+      "支付类型code",
+      "pay_type_code",
+      "支付类型code，定金，尾款"
+    ],
+    "relatedColumns": [
+      "pay_type_code"
+    ],
+    "evidence": "来自字段 `pay_type_code` 的语义注释"
+  },
+  {
+    "term": "支付类型名称",
+    "description": "支付类型名称，定金，尾款",
+    "aliases": [
+      "支付类型名称",
+      "pay_type_name",
+      "支付类型名称，定金，尾款"
+    ],
+    "relatedColumns": [
+      "pay_type_name"
+    ],
+    "evidence": "来自字段 `pay_type_name` 的语义注释"
+  },
+  {
+    "term": "支付状态code",
+    "description": "支付状态code",
+    "aliases": [
+      "支付状态code",
+      "pay_status_code"
+    ],
+    "relatedColumns": [
+      "pay_status_code"
+    ],
+    "evidence": "来自字段 `pay_status_code` 的语义注释"
+  },
+  {
+    "term": "支付状态name",
+    "description": "支付状态name",
+    "aliases": [
+      "支付状态name",
+      "pay_status_name"
+    ],
+    "relatedColumns": [
+      "pay_status_name"
+    ],
+    "evidence": "来自字段 `pay_status_name` 的语义注释"
+  },
+  {
+    "term": "支付单流水号(支付服务生成)",
+    "description": "支付单流水号(支付服务生成)",
+    "aliases": [
+      "支付单流水号(支付服务生成)",
+      "out_pay_id"
+    ],
+    "relatedColumns": [
+      "out_pay_id"
+    ],
+    "evidence": "来自字段 `out_pay_id` 的语义注释"
+  },
+  {
+    "term": "支付金额",
+    "description": "支付金额，分",
+    "aliases": [
+      "支付金额",
+      "pay_amt",
+      "支付金额，分"
+    ],
+    "relatedColumns": [
+      "pay_amt"
+    ],
+    "evidence": "来自字段 `pay_amt` 的语义注释"
+  },
+  {
+    "term": "支付时间",
+    "description": "支付时间",
+    "aliases": [
+      "支付时间",
+      "pay_time"
+    ],
+    "relatedColumns": [
+      "pay_time"
+    ],
+    "evidence": "来自字段 `pay_time` 的语义注释"
+  },
+  {
+    "term": "支付时间段开始时间",
+    "description": "支付时间段开始时间",
+    "aliases": [
+      "支付时间段开始时间",
+      "pay_start_time"
+    ],
+    "relatedColumns": [
+      "pay_start_time"
+    ],
+    "evidence": "来自字段 `pay_start_time` 的语义注释"
+  },
+  {
+    "term": "支付时间段结束时间",
+    "description": "支付时间段结束时间",
+    "aliases": [
+      "支付时间段结束时间",
+      "pay_end_time"
+    ],
+    "relatedColumns": [
+      "pay_end_time"
+    ],
+    "evidence": "来自字段 `pay_end_time` 的语义注释"
+  },
+  {
+    "term": "拓展属性",
+    "description": "拓展属性",
+    "aliases": [
+      "拓展属性",
+      "pay_extra",
+      "logistic_extra"
+    ],
+    "relatedColumns": [
+      "pay_extra",
+      "logistic_extra"
+    ],
+    "evidence": "来自字段 `pay_extra` 的语义注释"
+  },
+  {
+    "term": "平台物流编号",
+    "description": "平台物流编号",
+    "aliases": [
+      "平台物流编号",
+      "logistic_id"
+    ],
+    "relatedColumns": [
+      "logistic_id"
+    ],
+    "evidence": "来自字段 `logistic_id` 的语义注释"
+  },
+  {
+    "term": "物流阶段code",
+    "description": "物流阶段code，卖家到仓库，仓库到买家",
+    "aliases": [
+      "物流阶段code",
+      "logistic_stage_code",
+      "物流阶段code，卖家到仓库，仓库到买家"
+    ],
+    "relatedColumns": [
+      "logistic_stage_code"
+    ],
+    "evidence": "来自字段 `logistic_stage_code` 的语义注释"
+  },
+  {
+    "term": "物流阶段name",
+    "description": "物流阶段name",
+    "aliases": [
+      "物流阶段name",
+      "logistic_stage_name"
+    ],
+    "relatedColumns": [
+      "logistic_stage_name"
+    ],
+    "evidence": "来自字段 `logistic_stage_name` 的语义注释"
+  },
+  {
+    "term": "承运方code",
+    "description": "承运方code",
+    "aliases": [
+      "承运方code",
+      "express_type_code"
+    ],
+    "relatedColumns": [
+      "express_type_code"
+    ],
+    "evidence": "来自字段 `express_type_code` 的语义注释"
+  },
+  {
+    "term": "承运方name",
+    "description": "承运方name",
+    "aliases": [
+      "承运方name",
+      "express_type_name"
+    ],
+    "relatedColumns": [
+      "express_type_name"
+    ],
+    "evidence": "来自字段 `express_type_name` 的语义注释"
+  },
+  {
+    "term": "三方物流编号",
+    "description": "三方物流编号",
+    "aliases": [
+      "三方物流编号",
+      "express_id"
+    ],
+    "relatedColumns": [
+      "express_id"
+    ],
+    "evidence": "来自字段 `express_id` 的语义注释"
+  },
+  {
+    "term": "物流状态code",
+    "description": "物流状态code",
+    "aliases": [
+      "物流状态code",
+      "express_status_code"
+    ],
+    "relatedColumns": [
+      "express_status_code"
+    ],
+    "evidence": "来自字段 `express_status_code` 的语义注释"
+  },
+  {
+    "term": "物流状态name",
+    "description": "物流状态name",
+    "aliases": [
+      "物流状态name",
+      "express_status_name"
+    ],
+    "relatedColumns": [
+      "express_status_name"
+    ],
+    "evidence": "来自字段 `express_status_name` 的语义注释"
+  },
+  {
+    "term": "发货地址",
+    "description": "发货地址",
+    "aliases": [
+      "发货地址",
+      "sender_address"
+    ],
+    "relatedColumns": [
+      "sender_address"
+    ],
+    "evidence": "来自字段 `sender_address` 的语义注释"
+  },
+  {
+    "term": "收货地址",
+    "description": "收货地址",
+    "aliases": [
+      "收货地址",
+      "receiver_address"
+    ],
+    "relatedColumns": [
+      "receiver_address"
+    ],
+    "evidence": "来自字段 `receiver_address` 的语义注释"
+  },
+  {
+    "term": "发件人手机号",
+    "description": "发件人手机号",
+    "aliases": [
+      "发件人手机号",
+      "sender_mobile"
+    ],
+    "relatedColumns": [
+      "sender_mobile"
+    ],
+    "evidence": "来自字段 `sender_mobile` 的语义注释"
+  },
+  {
+    "term": "收货人手机号",
+    "description": "收货人手机号",
+    "aliases": [
+      "收货人手机号",
+      "receiver_mobile"
+    ],
+    "relatedColumns": [
+      "receiver_mobile"
+    ],
+    "evidence": "来自字段 `receiver_mobile` 的语义注释"
+  },
+  {
+    "term": "创建时间",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "logistic_create_time"
+    ],
+    "relatedColumns": [
+      "logistic_create_time"
+    ],
+    "evidence": "来自字段 `logistic_create_time` 的语义注释"
+  },
+  {
+    "term": "更新时间",
+    "description": "更新时间",
+    "aliases": [
+      "更新时间",
+      "logistic_modify_time"
+    ],
+    "relatedColumns": [
+      "logistic_modify_time"
+    ],
+    "evidence": "来自字段 `logistic_modify_time` 的语义注释"
+  },
+  {
+    "term": "交接时间",
+    "description": "交接时间",
+    "aliases": [
+      "交接时间",
+      "handover_time"
+    ],
+    "relatedColumns": [
+      "handover_time"
+    ],
+    "evidence": "来自字段 `handover_time` 的语义注释"
+  },
+  {
+    "term": "揽收时间",
+    "description": "揽收时间",
+    "aliases": [
+      "揽收时间",
+      "received_time"
+    ],
+    "relatedColumns": [
+      "received_time"
+    ],
+    "evidence": "来自字段 `received_time` 的语义注释"
+  },
+  {
+    "term": "签收时间",
+    "description": "签收时间",
+    "aliases": [
+      "签收时间",
+      "signed_received_time"
+    ],
+    "relatedColumns": [
+      "signed_received_time"
+    ],
+    "evidence": "来自字段 `signed_received_time` 的语义注释"
+  },
+  {
+    "term": "签收异常",
+    "description": "签收异常-拒收时间",
+    "aliases": [
+      "签收异常",
+      "abnormal_rejection_time",
+      "签收异常-拒收时间",
+      "abnormal_lost_time",
+      "签收异常-丢件/废弃时间"
+    ],
+    "relatedColumns": [
+      "abnormal_rejection_time",
+      "abnormal_lost_time"
+    ],
+    "evidence": "来自字段 `abnormal_rejection_time` 的语义注释"
+  },
+  {
+    "term": "拒收回退/转寄时间",
+    "description": "拒收回退/转寄时间",
+    "aliases": [
+      "拒收回退/转寄时间",
+      "refuse_withdraw_time"
+    ],
+    "relatedColumns": [
+      "refuse_withdraw_time"
+    ],
+    "evidence": "来自字段 `refuse_withdraw_time` 的语义注释"
+  },
+  {
+    "term": "拒收回退/转寄",
+    "description": "拒收回退/转寄-签收时间",
+    "aliases": [
+      "拒收回退/转寄",
+      "refuse_withdraw_signed_time",
+      "拒收回退/转寄-签收时间"
+    ],
+    "relatedColumns": [
+      "refuse_withdraw_signed_time"
+    ],
+    "evidence": "来自字段 `refuse_withdraw_signed_time` 的语义注释"
+  },
+  {
+    "term": "等效揽收时间",
+    "description": "等效揽收时间",
+    "aliases": [
+      "等效揽收时间",
+      "equivalent_received_time"
+    ],
+    "relatedColumns": [
+      "equivalent_received_time"
+    ],
+    "evidence": "来自字段 `equivalent_received_time` 的语义注释"
+  },
+  {
+    "term": "发货时间",
+    "description": "发货时间",
+    "aliases": [
+      "发货时间",
+      "sendout_time"
+    ],
+    "relatedColumns": [
+      "sendout_time"
+    ],
+    "evidence": "来自字段 `sendout_time` 的语义注释"
+  },
+  {
+    "term": "运输时间",
+    "description": "运输时间",
+    "aliases": [
+      "运输时间",
+      "in_transit_time"
+    ],
+    "relatedColumns": [
+      "in_transit_time"
+    ],
+    "evidence": "来自字段 `in_transit_time` 的语义注释"
+  },
+  {
+    "term": "首次预计送达时间",
+    "description": "首次预计送达时间",
+    "aliases": [
+      "首次预计送达时间",
+      "first_expected_arrival_time"
+    ],
+    "relatedColumns": [
+      "first_expected_arrival_time"
+    ],
+    "evidence": "来自字段 `first_expected_arrival_time` 的语义注释"
+  },
+  {
+    "term": "预计送达时间",
+    "description": "预计送达时间",
+    "aliases": [
+      "预计送达时间",
+      "expected_arrival_time"
+    ],
+    "relatedColumns": [
+      "expected_arrival_time"
+    ],
+    "evidence": "来自字段 `expected_arrival_time` 的语义注释"
+  },
+  {
+    "term": "相对签收时间",
+    "description": "相对签收时间",
+    "aliases": [
+      "相对签收时间",
+      "relative_signed_received_time"
+    ],
+    "relatedColumns": [
+      "relative_signed_received_time"
+    ],
+    "evidence": "来自字段 `relative_signed_received_time` 的语义注释"
+  },
+  {
+    "term": "派送时间",
+    "description": "派送时间",
+    "aliases": [
+      "派送时间",
+      "delivery_time"
+    ],
+    "relatedColumns": [
+      "delivery_time"
+    ],
+    "evidence": "来自字段 `delivery_time` 的语义注释"
+  },
+  {
+    "term": "spu名称",
+    "description": "spu名称",
+    "aliases": [
+      "spu名称",
+      "spu_name"
+    ],
+    "relatedColumns": [
+      "spu_name"
+    ],
+    "evidence": "来自字段 `spu_name` 的语义注释"
+  },
+  {
+    "term": "一级类目code",
+    "description": "一级类目code",
+    "aliases": [
+      "一级类目code",
+      "level1_category_code"
+    ],
+    "relatedColumns": [
+      "level1_category_code"
+    ],
+    "evidence": "来自字段 `level1_category_code` 的语义注释"
+  },
+  {
+    "term": "一级类目name",
+    "description": "一级类目name",
+    "aliases": [
+      "一级类目name",
+      "level1_category_name"
+    ],
+    "relatedColumns": [
+      "level1_category_name"
+    ],
+    "evidence": "来自字段 `level1_category_name` 的语义注释"
+  },
+  {
+    "term": "二级类目code",
+    "description": "二级类目code",
+    "aliases": [
+      "二级类目code",
+      "level2_category_code"
+    ],
+    "relatedColumns": [
+      "level2_category_code"
+    ],
+    "evidence": "来自字段 `level2_category_code` 的语义注释"
+  },
+  {
+    "term": "二级类目name",
+    "description": "二级类目name",
+    "aliases": [
+      "二级类目name",
+      "level2_category_name"
+    ],
+    "relatedColumns": [
+      "level2_category_name"
+    ],
+    "evidence": "来自字段 `level2_category_name` 的语义注释"
+  },
+  {
+    "term": "三级类目code",
+    "description": "三级类目code",
+    "aliases": [
+      "三级类目code",
+      "level3_category_code"
+    ],
+    "relatedColumns": [
+      "level3_category_code"
+    ],
+    "evidence": "来自字段 `level3_category_code` 的语义注释"
+  },
+  {
+    "term": "三级类目name",
+    "description": "三级类目name",
+    "aliases": [
+      "三级类目name",
+      "level3_category_name"
+    ],
+    "relatedColumns": [
+      "level3_category_name"
+    ],
+    "evidence": "来自字段 `level3_category_name` 的语义注释"
+  },
+  {
+    "term": "品牌code",
+    "description": "品牌code",
+    "aliases": [
+      "品牌code",
+      "brand_code"
+    ],
+    "relatedColumns": [
+      "brand_code"
+    ],
+    "evidence": "来自字段 `brand_code` 的语义注释"
+  },
+  {
+    "term": "品牌name",
+    "description": "品牌name",
+    "aliases": [
+      "品牌name",
+      "brand_name"
+    ],
+    "relatedColumns": [
+      "brand_name"
+    ],
+    "evidence": "来自字段 `brand_name` 的语义注释"
+  },
+  {
+    "term": "适用人群code",
+    "description": "适用人群code",
+    "aliases": [
+      "适用人群code",
+      "fit_code"
+    ],
+    "relatedColumns": [
+      "fit_code"
+    ],
+    "evidence": "来自字段 `fit_code` 的语义注释"
+  },
+  {
+    "term": "适用人群name",
+    "description": "适用人群name",
+    "aliases": [
+      "适用人群name",
+      "fit_name"
+    ],
+    "relatedColumns": [
+      "fit_name"
+    ],
+    "evidence": "来自字段 `fit_name` 的语义注释"
+  },
+  {
+    "term": "spu发售价格",
+    "description": "spu发售价格",
+    "aliases": [
+      "spu发售价格",
+      "spu_auth_price"
+    ],
+    "relatedColumns": [
+      "spu_auth_price"
+    ],
+    "evidence": "来自字段 `spu_auth_price` 的语义注释"
+  },
+  {
+    "term": "logo图",
+    "description": "logo图",
+    "aliases": [
+      "logo图",
+      "spu_logo_url"
+    ],
+    "relatedColumns": [
+      "spu_logo_url"
+    ],
+    "evidence": "来自字段 `spu_logo_url` 的语义注释"
+  },
+  {
+    "term": "动图",
+    "description": "动图",
+    "aliases": [
+      "动图",
+      "spu_gif_url"
+    ],
+    "relatedColumns": [
+      "spu_gif_url"
+    ],
+    "evidence": "来自字段 `spu_gif_url` 的语义注释"
+  },
+  {
+    "term": "视频图",
+    "description": "视频图",
+    "aliases": [
+      "视频图",
+      "spu_video_cover_url",
+      "spu_video_url"
+    ],
+    "relatedColumns": [
+      "spu_video_cover_url",
+      "spu_video_url"
+    ],
+    "evidence": "来自字段 `spu_video_cover_url` 的语义注释"
+  },
+  {
+    "term": "货号",
+    "description": "货号",
+    "aliases": [
+      "货号",
+      "article_id"
+    ],
+    "relatedColumns": [
+      "article_id"
+    ],
+    "evidence": "来自字段 `article_id` 的语义注释"
+  },
+  {
+    "term": "其他货号",
+    "description": "其他货号",
+    "aliases": [
+      "其他货号",
+      "other_article_id"
+    ],
+    "relatedColumns": [
+      "other_article_id"
+    ],
+    "evidence": "来自字段 `other_article_id` 的语义注释"
+  },
+  {
+    "term": "状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "description": "状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+    "aliases": [
+      "状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+      "spu_status_code"
+    ],
+    "relatedColumns": [
+      "spu_status_code"
+    ],
+    "evidence": "来自字段 `spu_status_code` 的语义注释"
+  },
+  {
+    "term": "状态名称",
+    "description": "状态名称",
+    "aliases": [
+      "状态名称",
+      "spu_status_name"
+    ],
+    "relatedColumns": [
+      "spu_status_name"
+    ],
+    "evidence": "来自字段 `spu_status_name` 的语义注释"
+  },
+  {
+    "term": "商品描述",
+    "description": "商品描述",
+    "aliases": [
+      "商品描述",
+      "spu_desc"
+    ],
+    "relatedColumns": [
+      "spu_desc"
+    ],
+    "evidence": "来自字段 `spu_desc` 的语义注释"
+  },
+  {
+    "term": "是否自营 0.否 1.是",
+    "description": "是否自营 0.否 1.是",
+    "aliases": [
+      "是否自营 0.否 1.是",
+      "is_self"
+    ],
+    "relatedColumns": [
+      "is_self"
+    ],
+    "evidence": "来自字段 `is_self` 的语义注释"
+  },
+  {
+    "term": "spu创建时间",
+    "description": "spu创建时间",
+    "aliases": [
+      "spu创建时间",
+      "spu_create_time"
+    ],
+    "relatedColumns": [
+      "spu_create_time"
+    ],
+    "evidence": "来自字段 `spu_create_time` 的语义注释"
+  },
+  {
+    "term": "spu更新时间",
+    "description": "spu更新时间",
+    "aliases": [
+      "spu更新时间",
+      "spu_modify_time"
+    ],
+    "relatedColumns": [
+      "spu_modify_time"
+    ],
+    "evidence": "来自字段 `spu_modify_time` 的语义注释"
+  },
+  {
+    "term": "properties_json中常用的尺寸",
+    "description": "properties_json中常用的尺寸",
+    "aliases": [
+      "properties_json中常用的尺寸",
+      "sku_size"
+    ],
+    "relatedColumns": [
+      "sku_size"
+    ],
+    "evidence": "来自字段 `sku_size` 的语义注释"
+  },
+  {
+    "term": "properties_json中常用的颜色",
+    "description": "properties_json中常用的颜色",
+    "aliases": [
+      "properties_json中常用的颜色",
+      "sku_color"
+    ],
+    "relatedColumns": [
+      "sku_color"
+    ],
+    "evidence": "来自字段 `sku_color` 的语义注释"
+  },
+  {
+    "term": "properties_json中常用的规格",
+    "description": "properties_json中常用的规格",
+    "aliases": [
+      "properties_json中常用的规格",
+      "sku_spec"
+    ],
+    "relatedColumns": [
+      "sku_spec"
+    ],
+    "evidence": "来自字段 `sku_spec` 的语义注释"
+  },
+  {
+    "term": "GMV",
+    "description": "交易成交金额，优先使用语义层中的 GMV 指标字段或公式",
+    "aliases": [
+      "成交额",
+      "销售额",
+      "交易流水"
+    ],
+    "relatedColumns": [],
+    "evidence": "由表名/字段语义自动沉淀"
+  }
+]

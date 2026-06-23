@@ -1,0 +1,21 @@
+[
+  {
+    "name": "scm_order_by_spu_id",
+    "leftTable": "dwm_scm_detail_di",
+    "rightTable": "dwm_trade_order_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["spu_id", "spu_id"]],
+    "grain": "spu_id_sub_order_id",
+    "useCases": ["入库商品关联后续订单表现", "供应链入库表现回看成交"]
+  },
+  {
+    "name": "scm_refund_by_spu_name",
+    "leftTable": "dwm_scm_detail_di",
+    "rightTable": "dwm_trade_refund_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["spu_name", "spu_name"]],
+    "grain": "spu_refund_id",
+    "useCases": ["入库商品关联后续退款表现", "供应链入库表现回看售后"],
+    "cautions": ["退款明细当前无 spu_id 时，用 seller_id + spu_name 降级关联"]
+  }
+]

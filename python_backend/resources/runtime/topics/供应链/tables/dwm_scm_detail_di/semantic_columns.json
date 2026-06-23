@@ -1,0 +1,2146 @@
+[
+  {
+    "columnName": "inbound_id",
+    "businessName": "主键",
+    "role": "KEY",
+    "description": "主键",
+    "aliases": [
+      "主键",
+      "inbound_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=主键"
+  },
+  {
+    "columnName": "inbound_header_id",
+    "businessName": "主库单头表id",
+    "role": "KEY",
+    "description": "主库单头表id",
+    "aliases": [
+      "主库单头表id",
+      "inbound_header_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=主库单头表id"
+  },
+  {
+    "columnName": "inbound_express_id",
+    "businessName": "入库运单号",
+    "role": "KEY",
+    "description": "入库运单号",
+    "aliases": [
+      "入库运单号",
+      "inbound_express_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库运单号"
+  },
+  {
+    "columnName": "inbound_express_type_code",
+    "businessName": "物流商编号",
+    "role": "DIMENSION",
+    "description": "物流商编号",
+    "aliases": [
+      "物流商编号",
+      "inbound_express_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流商编号"
+  },
+  {
+    "columnName": "inbound_express_type_name",
+    "businessName": "物流商名称",
+    "role": "DIMENSION",
+    "description": "物流商名称",
+    "aliases": [
+      "物流商名称",
+      "inbound_express_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流商名称"
+  },
+  {
+    "columnName": "is_valid_status",
+    "businessName": "是否有效状态",
+    "role": "DIMENSION",
+    "description": "是否有效状态",
+    "aliases": [
+      "是否有效状态",
+      "is_valid_status"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否有效状态"
+  },
+  {
+    "columnName": "unique_id",
+    "businessName": "唯一码P码",
+    "role": "KEY",
+    "description": "唯一码P码",
+    "aliases": [
+      "唯一码P码",
+      "unique_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=唯一码P码"
+  },
+  {
+    "columnName": "inbound_status_code",
+    "businessName": "wms入库单状态code1已入库",
+    "role": "DIMENSION",
+    "description": "wms入库单状态code1已入库，2运输中，3快递接收中",
+    "aliases": [
+      "wms入库单状态code1已入库",
+      "inbound_status_code",
+      "wms入库单状态code1已入库，2运输中，3快递接收中"
+    ],
+    "enumValues": [
+      "2=运输中",
+      "3=快递接收中"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=wms入库单状态code1已入库，2运输中，3快递接收中"
+  },
+  {
+    "columnName": "inbound_status_name",
+    "businessName": "wms入库单状态name 1已入库",
+    "role": "DIMENSION",
+    "description": "wms入库单状态name 1已入库，2运输中，3快递接收中",
+    "aliases": [
+      "wms入库单状态name 1已入库",
+      "inbound_status_name",
+      "wms入库单状态name 1已入库，2运输中，3快递接收中"
+    ],
+    "enumValues": [
+      "1=已入库",
+      "2=运输中",
+      "3=快递接收中"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=wms入库单状态name 1已入库，2运输中，3快递接收中"
+  },
+  {
+    "columnName": "spu_id",
+    "businessName": "商品spuid",
+    "role": "KEY",
+    "description": "商品spuid",
+    "aliases": [
+      "商品spuid",
+      "spu_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品spuid"
+  },
+  {
+    "columnName": "sku_id",
+    "businessName": "商品skuid",
+    "role": "KEY",
+    "description": "商品skuid",
+    "aliases": [
+      "商品skuid",
+      "sku_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商品skuid"
+  },
+  {
+    "columnName": "spu_name",
+    "businessName": "spu名称",
+    "role": "DIMENSION",
+    "description": "spu名称",
+    "aliases": [
+      "spu名称",
+      "spu_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=spu名称"
+  },
+  {
+    "columnName": "level1_category_code",
+    "businessName": "一级类目code",
+    "role": "DIMENSION",
+    "description": "一级类目code",
+    "aliases": [
+      "一级类目code",
+      "level1_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=一级类目code"
+  },
+  {
+    "columnName": "level1_category_name",
+    "businessName": "一级类目name",
+    "role": "DIMENSION",
+    "description": "一级类目name",
+    "aliases": [
+      "一级类目name",
+      "level1_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=一级类目name"
+  },
+  {
+    "columnName": "level2_category_code",
+    "businessName": "二级类目code",
+    "role": "DIMENSION",
+    "description": "二级类目code",
+    "aliases": [
+      "二级类目code",
+      "level2_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=二级类目code"
+  },
+  {
+    "columnName": "level2_category_name",
+    "businessName": "二级类目name",
+    "role": "DIMENSION",
+    "description": "二级类目name",
+    "aliases": [
+      "二级类目name",
+      "level2_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=二级类目name"
+  },
+  {
+    "columnName": "level3_category_code",
+    "businessName": "三级类目code",
+    "role": "DIMENSION",
+    "description": "三级类目code",
+    "aliases": [
+      "三级类目code",
+      "level3_category_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=三级类目code"
+  },
+  {
+    "columnName": "level3_category_name",
+    "businessName": "三级类目name",
+    "role": "DIMENSION",
+    "description": "三级类目name",
+    "aliases": [
+      "三级类目name",
+      "level3_category_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=三级类目name"
+  },
+  {
+    "columnName": "brand_code",
+    "businessName": "品牌code",
+    "role": "DIMENSION",
+    "description": "品牌code",
+    "aliases": [
+      "品牌code",
+      "brand_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=品牌code"
+  },
+  {
+    "columnName": "brand_name",
+    "businessName": "品牌name",
+    "role": "DIMENSION",
+    "description": "品牌name",
+    "aliases": [
+      "品牌name",
+      "brand_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=品牌name"
+  },
+  {
+    "columnName": "article_id",
+    "businessName": "货号",
+    "role": "KEY",
+    "description": "货号",
+    "aliases": [
+      "货号",
+      "article_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=货号"
+  },
+  {
+    "columnName": "inbound_cnt",
+    "businessName": "入库数量",
+    "role": "METRIC",
+    "description": "入库数量",
+    "aliases": [
+      "入库数量",
+      "inbound_cnt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(inbound_cnt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库数量"
+  },
+  {
+    "columnName": "inbound_create_time",
+    "businessName": "入库创建时间",
+    "role": "TIME",
+    "description": "入库创建时间",
+    "aliases": [
+      "入库创建时间",
+      "inbound_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库创建时间"
+  },
+  {
+    "columnName": "inbound_modify_time",
+    "businessName": "入库变更时间",
+    "role": "TIME",
+    "description": "入库变更时间",
+    "aliases": [
+      "入库变更时间",
+      "inbound_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库变更时间"
+  },
+  {
+    "columnName": "inbound_receive_time",
+    "businessName": "入库接收时间",
+    "role": "TIME",
+    "description": "入库接收时间",
+    "aliases": [
+      "入库接收时间",
+      "inbound_receive_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库接收时间"
+  },
+  {
+    "columnName": "is_check",
+    "businessName": "是否需要查验 1 正常 0 免鉴别",
+    "role": "DIMENSION",
+    "description": "是否需要查验 1 正常 0 免鉴别",
+    "aliases": [
+      "是否需要查验 1 正常 0 免鉴别",
+      "is_check"
+    ],
+    "enumValues": [
+      "1=正常",
+      "0=免鉴别"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否需要查验 1 正常 0 免鉴别"
+  },
+  {
+    "columnName": "warehouse_id",
+    "businessName": "仓库id",
+    "role": "KEY",
+    "description": "仓库id",
+    "aliases": [
+      "仓库id",
+      "warehouse_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=仓库id"
+  },
+  {
+    "columnName": "warhouse_name",
+    "businessName": "仓库name",
+    "role": "DIMENSION",
+    "description": "仓库name",
+    "aliases": [
+      "仓库name",
+      "warhouse_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=仓库name"
+  },
+  {
+    "columnName": "online_time",
+    "businessName": "上架时间",
+    "role": "TIME",
+    "description": "上架时间",
+    "aliases": [
+      "上架时间",
+      "online_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=上架时间"
+  },
+  {
+    "columnName": "dispatch_bill_id",
+    "businessName": "发货单号",
+    "role": "KEY",
+    "description": "发货单号",
+    "aliases": [
+      "发货单号",
+      "dispatch_bill_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=发货单号"
+  },
+  {
+    "columnName": "seller_id",
+    "businessName": "卖家id",
+    "role": "KEY",
+    "description": "卖家id-个人卖家",
+    "aliases": [
+      "卖家id",
+      "seller_id",
+      "卖家id-个人卖家"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家id-个人卖家"
+  },
+  {
+    "columnName": "seller_name",
+    "businessName": "卖家姓名",
+    "role": "DIMENSION",
+    "description": "卖家姓名-个人卖家",
+    "aliases": [
+      "卖家姓名",
+      "seller_name",
+      "卖家姓名-个人卖家"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家姓名-个人卖家"
+  },
+  {
+    "columnName": "seller_nick_name",
+    "businessName": "卖家姓名",
+    "role": "DIMENSION",
+    "description": "卖家姓名-个人卖家",
+    "aliases": [
+      "卖家姓名",
+      "seller_nick_name",
+      "卖家姓名-个人卖家"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家姓名-个人卖家"
+  },
+  {
+    "columnName": "seller_address",
+    "businessName": "卖家地址",
+    "role": "OTHER",
+    "description": "卖家地址",
+    "aliases": [
+      "卖家地址",
+      "seller_address"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家地址"
+  },
+  {
+    "columnName": "deliver_time",
+    "businessName": "发货时间",
+    "role": "TIME",
+    "description": "发货时间",
+    "aliases": [
+      "发货时间",
+      "deliver_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=发货时间"
+  },
+  {
+    "columnName": "is_cross",
+    "businessName": "是否跨境1 是",
+    "role": "DIMENSION",
+    "description": "是否跨境1 是",
+    "aliases": [
+      "是否跨境1 是",
+      "is_cross"
+    ],
+    "enumValues": [
+      "1=是"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否跨境1 是"
+  },
+  {
+    "columnName": "is_express",
+    "businessName": "是否极速 1是",
+    "role": "DIMENSION",
+    "description": "是否极速 1是",
+    "aliases": [
+      "是否极速 1是",
+      "is_express"
+    ],
+    "enumValues": [
+      "1=是"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否极速 1是"
+  },
+  {
+    "columnName": "inbound_header_remark",
+    "businessName": "备注",
+    "role": "OTHER",
+    "description": "备注",
+    "aliases": [
+      "inbound_header_remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=备注"
+  },
+  {
+    "columnName": "expect_start_time",
+    "businessName": "预计到货时间",
+    "role": "TIME",
+    "description": "预计到货时间",
+    "aliases": [
+      "预计到货时间",
+      "expect_start_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=预计到货时间"
+  },
+  {
+    "columnName": "inbound_header_type_code",
+    "businessName": "入库单表头code1 销售入货单2退货入货单",
+    "role": "DIMENSION",
+    "description": "入库单表头code1 销售入货单2退货入货单",
+    "aliases": [
+      "入库单表头code1 销售入货单2退货入货单",
+      "inbound_header_type_code"
+    ],
+    "enumValues": [
+      "2=退货入货单"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库单表头code1 销售入货单2退货入货单"
+  },
+  {
+    "columnName": "inbound_header_type_name",
+    "businessName": "入库单表头name1 销售入货单2退货入货单",
+    "role": "DIMENSION",
+    "description": "入库单表头name1 销售入货单2退货入货单",
+    "aliases": [
+      "入库单表头name1 销售入货单2退货入货单",
+      "inbound_header_type_name"
+    ],
+    "enumValues": [
+      "2=退货入货单"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=入库单表头name1 销售入货单2退货入货单"
+  },
+  {
+    "columnName": "merchant_id",
+    "businessName": "商家id",
+    "role": "KEY",
+    "description": "商家id-企业卖家",
+    "aliases": [
+      "商家id",
+      "merchant_id",
+      "商家id-企业卖家"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商家id-企业卖家"
+  },
+  {
+    "columnName": "merchant_name",
+    "businessName": "商家名称",
+    "role": "DIMENSION",
+    "description": "商家名称-企业卖家",
+    "aliases": [
+      "商家名称",
+      "merchant_name",
+      "商家名称-企业卖家"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商家名称-企业卖家"
+  },
+  {
+    "columnName": "latest_inbound_time",
+    "businessName": "预计最晚到仓时间",
+    "role": "TIME",
+    "description": "预计最晚到仓时间",
+    "aliases": [
+      "预计最晚到仓时间",
+      "latest_inbound_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=预计最晚到仓时间"
+  },
+  {
+    "columnName": "sorting_id",
+    "businessName": "分拣id",
+    "role": "KEY",
+    "description": "分拣id",
+    "aliases": [
+      "分拣id",
+      "sorting_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣id"
+  },
+  {
+    "columnName": "sorting_operator_id",
+    "businessName": "分拣人ID",
+    "role": "KEY",
+    "description": "分拣人ID",
+    "aliases": [
+      "分拣人ID",
+      "sorting_operator_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣人ID"
+  },
+  {
+    "columnName": "sorting_operator_name",
+    "businessName": "分拣人名称",
+    "role": "DIMENSION",
+    "description": "分拣人名称",
+    "aliases": [
+      "分拣人名称",
+      "sorting_operator_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣人名称"
+  },
+  {
+    "columnName": "sorting_group_code",
+    "businessName": "供应商编码",
+    "role": "DIMENSION",
+    "description": "供应商编码-外包厂商",
+    "aliases": [
+      "供应商编码",
+      "sorting_group_code",
+      "供应商编码-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=供应商编码-外包厂商"
+  },
+  {
+    "columnName": "sorting_group_name",
+    "businessName": "供应商名称",
+    "role": "DIMENSION",
+    "description": "供应商名称-外包厂商",
+    "aliases": [
+      "供应商名称",
+      "sorting_group_name",
+      "供应商名称-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=供应商名称-外包厂商"
+  },
+  {
+    "columnName": "sorting_salary",
+    "businessName": "薪资",
+    "role": "OTHER",
+    "description": "薪资-每天",
+    "aliases": [
+      "薪资",
+      "sorting_salary",
+      "薪资-每天"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=薪资-每天"
+  },
+  {
+    "columnName": "sorting_attend_start_time",
+    "businessName": "考勤开始时间例如9:00",
+    "role": "TIME",
+    "description": "考勤开始时间例如9:00",
+    "aliases": [
+      "考勤开始时间例如9:00",
+      "sorting_attend_start_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=考勤开始时间例如9:00"
+  },
+  {
+    "columnName": "sorting_attend_end_time",
+    "businessName": "考勤结束时间例如18:00",
+    "role": "TIME",
+    "description": "考勤结束时间例如18:00",
+    "aliases": [
+      "考勤结束时间例如18:00",
+      "sorting_attend_end_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=考勤结束时间例如18:00"
+  },
+  {
+    "columnName": "sorting_attend_days",
+    "businessName": "每月要求出勤天数",
+    "role": "OTHER",
+    "description": "每月要求出勤天数，例如26",
+    "aliases": [
+      "每月要求出勤天数",
+      "sorting_attend_days",
+      "每月要求出勤天数，例如26"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=每月要求出勤天数，例如26"
+  },
+  {
+    "columnName": "sorting_source_code",
+    "businessName": "分拣来源1国内2海外",
+    "role": "DIMENSION",
+    "description": "分拣来源1国内2海外",
+    "aliases": [
+      "分拣来源1国内2海外",
+      "sorting_source_code"
+    ],
+    "enumValues": [
+      "1=国内",
+      "2=海外"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣来源1国内2海外"
+  },
+  {
+    "columnName": "sorting_source_name",
+    "businessName": "分拣来源1国内2海外",
+    "role": "DIMENSION",
+    "description": "分拣来源1国内2海外",
+    "aliases": [
+      "分拣来源1国内2海外",
+      "sorting_source_name"
+    ],
+    "enumValues": [
+      "1=国内",
+      "2=海外"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣来源1国内2海外"
+  },
+  {
+    "columnName": "sorting_status_code",
+    "businessName": "分拣状态code 1已接收2已完成",
+    "role": "DIMENSION",
+    "description": "分拣状态code 1已接收2已完成",
+    "aliases": [
+      "分拣状态code 1已接收2已完成",
+      "sorting_status_code"
+    ],
+    "enumValues": [
+      "1=已接收",
+      "2=已完成"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣状态code 1已接收2已完成"
+  },
+  {
+    "columnName": "sorting_status_name",
+    "businessName": "分拣状态name 1已接收2已完成",
+    "role": "DIMENSION",
+    "description": "分拣状态name 1已接收2已完成",
+    "aliases": [
+      "分拣状态name 1已接收2已完成",
+      "sorting_status_name"
+    ],
+    "enumValues": [
+      "1=已接收",
+      "2=已完成"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣状态name 1已接收2已完成"
+  },
+  {
+    "columnName": "sorting_remark",
+    "businessName": "分拣备注",
+    "role": "OTHER",
+    "description": "分拣备注",
+    "aliases": [
+      "分拣备注",
+      "sorting_remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣备注"
+  },
+  {
+    "columnName": "sorting_warhouse_id",
+    "businessName": "分拣仓库名",
+    "role": "KEY",
+    "description": "分拣仓库名",
+    "aliases": [
+      "分拣仓库名",
+      "sorting_warhouse_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣仓库名"
+  },
+  {
+    "columnName": "sorting_create_time",
+    "businessName": "分拣时间",
+    "role": "TIME",
+    "description": "分拣时间",
+    "aliases": [
+      "分拣时间",
+      "sorting_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣时间"
+  },
+  {
+    "columnName": "sorting_modify_time",
+    "businessName": "分拣完成时间",
+    "role": "TIME",
+    "description": "分拣完成时间",
+    "aliases": [
+      "分拣完成时间",
+      "sorting_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣完成时间"
+  },
+  {
+    "columnName": "sorting_station_id",
+    "businessName": "分拣工位",
+    "role": "KEY",
+    "description": "分拣工位",
+    "aliases": [
+      "分拣工位",
+      "sorting_station_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣工位"
+  },
+  {
+    "columnName": "sorting_production_line_code",
+    "businessName": "分拣生产产线code",
+    "role": "DIMENSION",
+    "description": "分拣生产产线code",
+    "aliases": [
+      "分拣生产产线code",
+      "sorting_production_line_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣生产产线code"
+  },
+  {
+    "columnName": "sorting_production_line_name",
+    "businessName": "分拣生产产线",
+    "role": "DIMENSION",
+    "description": "分拣生产产线",
+    "aliases": [
+      "分拣生产产线",
+      "sorting_production_line_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=分拣生产产线"
+  },
+  {
+    "columnName": "check_id",
+    "businessName": "质检id",
+    "role": "KEY",
+    "description": "质检id",
+    "aliases": [
+      "质检id",
+      "check_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=质检id"
+  },
+  {
+    "columnName": "check_task_id",
+    "businessName": "任务id",
+    "role": "KEY",
+    "description": "任务id",
+    "aliases": [
+      "任务id",
+      "check_task_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务id"
+  },
+  {
+    "columnName": "check_status_code",
+    "businessName": "质检状态：1：质检通过",
+    "role": "DIMENSION",
+    "description": "质检状态：1：质检通过；2：有瑕疵；3：质检不通过",
+    "aliases": [
+      "质检状态：1：质检通过",
+      "check_status_code",
+      "质检状态：1：质检通过；2：有瑕疵；3：质检不通过"
+    ],
+    "enumValues": [
+      "1=质检通过",
+      "2=有瑕疵",
+      "3=质检不通过"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=质检状态：1：质检通过；2：有瑕疵；3：质检不通过"
+  },
+  {
+    "columnName": "check_status_name",
+    "businessName": "质检状态name：1：质检通过",
+    "role": "DIMENSION",
+    "description": "质检状态name：1：质检通过；2：有瑕疵；3：质检不通过",
+    "aliases": [
+      "质检状态name：1：质检通过",
+      "check_status_name",
+      "质检状态name：1：质检通过；2：有瑕疵；3：质检不通过"
+    ],
+    "enumValues": [
+      "1=质检通过",
+      "2=有瑕疵",
+      "3=质检不通过"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=质检状态name：1：质检通过；2：有瑕疵；3：质检不通过"
+  },
+  {
+    "columnName": "unpass_type_code",
+    "businessName": "不通过方式code",
+    "role": "DIMENSION",
+    "description": "不通过方式code；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过）",
+    "aliases": [
+      "不通过方式code",
+      "unpass_type_code",
+      "不通过方式code；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过）"
+    ],
+    "enumValues": [
+      "1=无",
+      "2=普通操作",
+      "3=管理员不通过（已通过后操作不通过）"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=不通过方式code；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过）"
+  },
+  {
+    "columnName": "unpass_type_name",
+    "businessName": "不通过方式name",
+    "role": "DIMENSION",
+    "description": "不通过方式name；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过）",
+    "aliases": [
+      "不通过方式name",
+      "unpass_type_name",
+      "不通过方式name；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过）"
+    ],
+    "enumValues": [
+      "1=无",
+      "2=普通操作",
+      "3=管理员不通过（已通过后操作不通过）"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=不通过方式name；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过）"
+  },
+  {
+    "columnName": "check_operator_id",
+    "businessName": "审核人员",
+    "role": "KEY",
+    "description": "审核人员",
+    "aliases": [
+      "审核人员",
+      "check_operator_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=审核人员"
+  },
+  {
+    "columnName": "check_operator_name",
+    "businessName": "审核人员",
+    "role": "DIMENSION",
+    "description": "审核人员",
+    "aliases": [
+      "审核人员",
+      "check_operator_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=审核人员"
+  },
+  {
+    "columnName": "check_group_code",
+    "businessName": "供应商编码",
+    "role": "DIMENSION",
+    "description": "供应商编码-外包厂商",
+    "aliases": [
+      "供应商编码",
+      "check_group_code",
+      "供应商编码-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=供应商编码-外包厂商"
+  },
+  {
+    "columnName": "check_group_name",
+    "businessName": "供应商名称",
+    "role": "DIMENSION",
+    "description": "供应商名称-外包厂商",
+    "aliases": [
+      "供应商名称",
+      "check_group_name",
+      "供应商名称-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=供应商名称-外包厂商"
+  },
+  {
+    "columnName": "check_salary",
+    "businessName": "薪资",
+    "role": "OTHER",
+    "description": "薪资-每天",
+    "aliases": [
+      "薪资",
+      "check_salary",
+      "薪资-每天"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=薪资-每天"
+  },
+  {
+    "columnName": "check_attend_start_time",
+    "businessName": "考勤开始时间例如9:00",
+    "role": "TIME",
+    "description": "考勤开始时间例如9:00",
+    "aliases": [
+      "考勤开始时间例如9:00",
+      "check_attend_start_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=考勤开始时间例如9:00"
+  },
+  {
+    "columnName": "check_attend_end_time",
+    "businessName": "考勤结束时间例如18:00",
+    "role": "TIME",
+    "description": "考勤结束时间例如18:00",
+    "aliases": [
+      "考勤结束时间例如18:00",
+      "check_attend_end_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=考勤结束时间例如18:00"
+  },
+  {
+    "columnName": "check_attend_days",
+    "businessName": "每月要求出勤天数",
+    "role": "OTHER",
+    "description": "每月要求出勤天数，例如26",
+    "aliases": [
+      "每月要求出勤天数",
+      "check_attend_days",
+      "每月要求出勤天数，例如26"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=每月要求出勤天数，例如26"
+  },
+  {
+    "columnName": "check_create_time",
+    "businessName": "创建时间",
+    "role": "TIME",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "check_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=创建时间"
+  },
+  {
+    "columnName": "check_modify_time",
+    "businessName": "修改时间",
+    "role": "TIME",
+    "description": "修改时间",
+    "aliases": [
+      "修改时间",
+      "check_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=修改时间"
+  },
+  {
+    "columnName": "check_type_code",
+    "businessName": "质检类型 0常规质检 1二次质检（现货转寄存）",
+    "role": "DIMENSION",
+    "description": "质检类型 0常规质检 1二次质检（现货转寄存）",
+    "aliases": [
+      "质检类型 0常规质检 1二次质检（现货转寄存）",
+      "check_type_code"
+    ],
+    "enumValues": [
+      "0=常规质检",
+      "1=二次质检（现货转寄存）"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=质检类型 0常规质检 1二次质检（现货转寄存）"
+  },
+  {
+    "columnName": "check_type_name",
+    "businessName": "质检类型 0常规质检 1二次质检（现货转寄存）",
+    "role": "DIMENSION",
+    "description": "质检类型 0常规质检 1二次质检（现货转寄存）",
+    "aliases": [
+      "质检类型 0常规质检 1二次质检（现货转寄存）",
+      "check_type_name"
+    ],
+    "enumValues": [
+      "0=常规质检",
+      "1=二次质检（现货转寄存）"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=质检类型 0常规质检 1二次质检（现货转寄存）"
+  },
+  {
+    "columnName": "photo_cnt",
+    "businessName": "质检图片数量",
+    "role": "METRIC",
+    "description": "质检图片数量",
+    "aliases": [
+      "质检图片数量",
+      "photo_cnt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(photo_cnt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=质检图片数量"
+  },
+  {
+    "columnName": "check_cnt",
+    "businessName": "审核次数",
+    "role": "METRIC",
+    "description": "审核次数",
+    "aliases": [
+      "审核次数",
+      "check_cnt"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(check_cnt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=审核次数"
+  },
+  {
+    "columnName": "biz_type_code",
+    "businessName": "业务类型code 0:小仓库",
+    "role": "DIMENSION",
+    "description": "业务类型code 0:小仓库;1企业；2个人",
+    "aliases": [
+      "业务类型code 0:小仓库",
+      "biz_type_code",
+      "业务类型code 0:小仓库;1企业；2个人"
+    ],
+    "enumValues": [
+      "0=小仓库",
+      "1=企业",
+      "2=个人"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=业务类型code 0:小仓库;1企业；2个人"
+  },
+  {
+    "columnName": "biz_type_name",
+    "businessName": "业务类型name 0:小仓库",
+    "role": "DIMENSION",
+    "description": "业务类型name 0:小仓库;1企业；2个人",
+    "aliases": [
+      "业务类型name 0:小仓库",
+      "biz_type_name",
+      "业务类型name 0:小仓库;1企业；2个人"
+    ],
+    "enumValues": [
+      "0=小仓库",
+      "1=企业",
+      "2=个人"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=业务类型name 0:小仓库;1企业；2个人"
+  },
+  {
+    "columnName": "check_source_type_code",
+    "businessName": "来源类型  1:原有 2:新的（需要选择瑕疵选项）",
+    "role": "DIMENSION",
+    "description": "来源类型  1:原有 2:新的（需要选择瑕疵选项）",
+    "aliases": [
+      "来源类型  1:原有 2:新的（需要选择瑕疵选项）",
+      "check_source_type_code"
+    ],
+    "enumValues": [
+      "1=原有",
+      "2=新的（需要选择瑕疵选项）"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=来源类型  1:原有 2:新的（需要选择瑕疵选项）"
+  },
+  {
+    "columnName": "check_source_type_name",
+    "businessName": "来源类型  1:原有 2:新的（需要选择瑕疵选项）",
+    "role": "DIMENSION",
+    "description": "来源类型  1:原有 2:新的（需要选择瑕疵选项）",
+    "aliases": [
+      "来源类型  1:原有 2:新的（需要选择瑕疵选项）",
+      "check_source_type_name"
+    ],
+    "enumValues": [
+      "1=原有",
+      "2=新的（需要选择瑕疵选项）"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=来源类型  1:原有 2:新的（需要选择瑕疵选项）"
+  },
+  {
+    "columnName": "check_reason_id",
+    "businessName": "id",
+    "role": "KEY",
+    "description": "id",
+    "aliases": [
+      "id",
+      "check_reason_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=id"
+  },
+  {
+    "columnName": "check_reason_name",
+    "businessName": "原因类别名称",
+    "role": "DIMENSION",
+    "description": "原因类别名称",
+    "aliases": [
+      "原因类别名称",
+      "check_reason_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=原因类别名称"
+  },
+  {
+    "columnName": "apply_type_code",
+    "businessName": "原因适用类型",
+    "role": "DIMENSION",
+    "description": "原因适用类型；1：拒收；2：鉴定;3：质检",
+    "aliases": [
+      "原因适用类型",
+      "apply_type_code",
+      "原因适用类型；1：拒收；2：鉴定;3：质检"
+    ],
+    "enumValues": [
+      "1=拒收",
+      "2=鉴定",
+      "3=质检"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=原因适用类型；1：拒收；2：鉴定;3：质检"
+  },
+  {
+    "columnName": "apply_type_name",
+    "businessName": "原因适用类型",
+    "role": "DIMENSION",
+    "description": "原因适用类型；1：拒收；2：鉴定;3：质检",
+    "aliases": [
+      "原因适用类型",
+      "apply_type_name",
+      "原因适用类型；1：拒收；2：鉴定;3：质检"
+    ],
+    "enumValues": [
+      "1=拒收",
+      "2=鉴定",
+      "3=质检"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=原因适用类型；1：拒收；2：鉴定;3：质检"
+  },
+  {
+    "columnName": "first_check_task_id",
+    "businessName": "首次质检任务编号",
+    "role": "KEY",
+    "description": "首次质检任务编号",
+    "aliases": [
+      "首次质检任务编号",
+      "first_check_task_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检任务编号"
+  },
+  {
+    "columnName": "first_check_is_operate_pass",
+    "businessName": "首次质检结果",
+    "role": "METRIC",
+    "description": "首次质检结果,不通过=0,通过=1",
+    "aliases": [
+      "首次质检结果",
+      "first_check_is_operate_pass",
+      "首次质检结果,不通过=0,通过=1"
+    ],
+    "enumValues": [],
+    "metricFormula": "AVG(first_check_is_operate_pass)",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检结果,不通过=0,通过=1"
+  },
+  {
+    "columnName": "first_check_operate_remark",
+    "businessName": "首次质检备注",
+    "role": "OTHER",
+    "description": "首次质检备注",
+    "aliases": [
+      "首次质检备注",
+      "first_check_operate_remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检备注"
+  },
+  {
+    "columnName": "first_check_operator_id",
+    "businessName": "首次质检操作人id",
+    "role": "KEY",
+    "description": "首次质检操作人id",
+    "aliases": [
+      "首次质检操作人id",
+      "first_check_operator_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检操作人id"
+  },
+  {
+    "columnName": "first_check_operator_name",
+    "businessName": "首次质检操作人名称",
+    "role": "DIMENSION",
+    "description": "首次质检操作人名称",
+    "aliases": [
+      "首次质检操作人名称",
+      "first_check_operator_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检操作人名称"
+  },
+  {
+    "columnName": "first_check_group_code",
+    "businessName": "首次质检供应商编码",
+    "role": "DIMENSION",
+    "description": "首次质检供应商编码-外包厂商",
+    "aliases": [
+      "首次质检供应商编码",
+      "first_check_group_code",
+      "首次质检供应商编码-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检供应商编码-外包厂商"
+  },
+  {
+    "columnName": "first_check_group_name",
+    "businessName": "首次质检供应商名称",
+    "role": "DIMENSION",
+    "description": "首次质检供应商名称-外包厂商",
+    "aliases": [
+      "首次质检供应商名称",
+      "first_check_group_name",
+      "首次质检供应商名称-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检供应商名称-外包厂商"
+  },
+  {
+    "columnName": "first_check_reason_id",
+    "businessName": "首次质检原因id",
+    "role": "KEY",
+    "description": "首次质检原因id",
+    "aliases": [
+      "首次质检原因id",
+      "first_check_reason_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检原因id"
+  },
+  {
+    "columnName": "first_check_reason_name",
+    "businessName": "首次质检原因类别名称",
+    "role": "DIMENSION",
+    "description": "首次质检原因类别名称",
+    "aliases": [
+      "首次质检原因类别名称",
+      "first_check_reason_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检原因类别名称"
+  },
+  {
+    "columnName": "first_check_apply_type_code",
+    "businessName": "首次质检原因适用类型",
+    "role": "DIMENSION",
+    "description": "首次质检原因适用类型；1：拒收；2：鉴定;3：质检",
+    "aliases": [
+      "首次质检原因适用类型",
+      "first_check_apply_type_code",
+      "首次质检原因适用类型；1：拒收；2：鉴定;3：质检"
+    ],
+    "enumValues": [
+      "1=拒收",
+      "2=鉴定",
+      "3=质检"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检原因适用类型；1：拒收；2：鉴定;3：质检"
+  },
+  {
+    "columnName": "first_check_apply_type_name",
+    "businessName": "首次质检原因适用类型",
+    "role": "DIMENSION",
+    "description": "首次质检原因适用类型；1：拒收；2：鉴定;3：质检",
+    "aliases": [
+      "首次质检原因适用类型",
+      "first_check_apply_type_name",
+      "首次质检原因适用类型；1：拒收；2：鉴定;3：质检"
+    ],
+    "enumValues": [
+      "1=拒收",
+      "2=鉴定",
+      "3=质检"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检原因适用类型；1：拒收；2：鉴定;3：质检"
+  },
+  {
+    "columnName": "identify_id",
+    "businessName": "鉴定id",
+    "role": "KEY",
+    "description": "鉴定id",
+    "aliases": [
+      "鉴定id",
+      "identify_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定id"
+  },
+  {
+    "columnName": "identify_task_id",
+    "businessName": "任务id",
+    "role": "KEY",
+    "description": "任务id",
+    "aliases": [
+      "任务id",
+      "identify_task_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务id"
+  },
+  {
+    "columnName": "is_identify_online",
+    "businessName": "是否线上坚定",
+    "role": "DIMENSION",
+    "description": "是否线上坚定",
+    "aliases": [
+      "是否线上坚定",
+      "is_identify_online"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否线上坚定"
+  },
+  {
+    "columnName": "is_identify",
+    "businessName": "是否鉴定 0",
+    "role": "DIMENSION",
+    "description": "是否鉴定 0-未鉴定 1-已鉴定",
+    "aliases": [
+      "是否鉴定 0",
+      "is_identify",
+      "是否鉴定 0-未鉴定 1-已鉴定"
+    ],
+    "enumValues": [
+      "0=未鉴定",
+      "1=已鉴定"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=是否鉴定 0-未鉴定 1-已鉴定"
+  },
+  {
+    "columnName": "identify_result_code",
+    "businessName": "鉴定结果 0",
+    "role": "DIMENSION",
+    "description": "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起",
+    "aliases": [
+      "鉴定结果 0",
+      "identify_result_code",
+      "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+    ],
+    "enumValues": [
+      "0=初始状态",
+      "1=鉴定为真",
+      "2=鉴定为假",
+      "3=待补图",
+      "4=无法鉴定",
+      "5=已撤销",
+      "6=已挂起"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+  },
+  {
+    "columnName": "identify_result_name",
+    "businessName": "鉴定结果 0",
+    "role": "DIMENSION",
+    "description": "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起",
+    "aliases": [
+      "鉴定结果 0",
+      "identify_result_name",
+      "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+    ],
+    "enumValues": [
+      "0=初始状态",
+      "1=鉴定为真",
+      "2=鉴定为假",
+      "3=待补图",
+      "4=无法鉴定",
+      "5=已撤销",
+      "6=已挂起"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+  },
+  {
+    "columnName": "identifier_id",
+    "businessName": "鉴定师id",
+    "role": "KEY",
+    "description": "鉴定师id",
+    "aliases": [
+      "鉴定师id",
+      "identifier_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定师id"
+  },
+  {
+    "columnName": "identifier_name",
+    "businessName": "鉴定师name",
+    "role": "DIMENSION",
+    "description": "鉴定师name",
+    "aliases": [
+      "鉴定师name",
+      "identifier_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定师name"
+  },
+  {
+    "columnName": "identify_content",
+    "businessName": "鉴定原因",
+    "role": "DIMENSION",
+    "description": "鉴定原因",
+    "aliases": [
+      "鉴定原因",
+      "identify_content"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定原因"
+  },
+  {
+    "columnName": "photo_time",
+    "businessName": "拍照时间",
+    "role": "TIME",
+    "description": "拍照时间",
+    "aliases": [
+      "拍照时间",
+      "photo_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=拍照时间"
+  },
+  {
+    "columnName": "identify_create_time",
+    "businessName": "创建时间",
+    "role": "TIME",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "identify_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=创建时间"
+  },
+  {
+    "columnName": "identify_modify_time",
+    "businessName": "更新时间",
+    "role": "TIME",
+    "description": "更新时间",
+    "aliases": [
+      "更新时间",
+      "identify_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=更新时间"
+  },
+  {
+    "columnName": "first_identify_task_id",
+    "businessName": "任务编号",
+    "role": "KEY",
+    "description": "任务编号",
+    "aliases": [
+      "任务编号",
+      "first_identify_task_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=任务编号"
+  },
+  {
+    "columnName": "first_identify_pass_type_code",
+    "businessName": "鉴定结果 0",
+    "role": "DIMENSION",
+    "description": "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起",
+    "aliases": [
+      "鉴定结果 0",
+      "first_identify_pass_type_code",
+      "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+    ],
+    "enumValues": [
+      "0=初始状态",
+      "1=鉴定为真",
+      "2=鉴定为假",
+      "3=待补图",
+      "4=无法鉴定",
+      "5=已撤销",
+      "6=已挂起"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+  },
+  {
+    "columnName": "first_identify_pass_type_name",
+    "businessName": "鉴定结果 0",
+    "role": "DIMENSION",
+    "description": "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起",
+    "aliases": [
+      "鉴定结果 0",
+      "first_identify_pass_type_name",
+      "鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+    ],
+    "enumValues": [
+      "0=初始状态",
+      "1=鉴定为真",
+      "2=鉴定为假",
+      "3=待补图",
+      "4=无法鉴定",
+      "5=已撤销",
+      "6=已挂起"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起"
+  },
+  {
+    "columnName": "first_identify_operate_remark",
+    "businessName": "备注",
+    "role": "OTHER",
+    "description": "备注",
+    "aliases": [
+      "first_identify_operate_remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=备注"
+  },
+  {
+    "columnName": "first_identify_operator_id",
+    "businessName": "操作人id",
+    "role": "KEY",
+    "description": "操作人id",
+    "aliases": [
+      "操作人id",
+      "first_identify_operator_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人id"
+  },
+  {
+    "columnName": "first_identify_operator_name",
+    "businessName": "操作人名称",
+    "role": "DIMENSION",
+    "description": "操作人名称",
+    "aliases": [
+      "操作人名称",
+      "first_identify_operator_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=操作人名称"
+  },
+  {
+    "columnName": "outbound_id",
+    "businessName": "出库单id",
+    "role": "KEY",
+    "description": "出库单id",
+    "aliases": [
+      "出库单id",
+      "outbound_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单id"
+  },
+  {
+    "columnName": "outbound_type_code",
+    "businessName": "出库单据类型1揽货中2运输中3已签收",
+    "role": "DIMENSION",
+    "description": "出库单据类型1揽货中2运输中3已签收",
+    "aliases": [
+      "出库单据类型1揽货中2运输中3已签收",
+      "outbound_type_code"
+    ],
+    "enumValues": [
+      "1=揽货中",
+      "2=运输中",
+      "3=已签收"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单据类型1揽货中2运输中3已签收"
+  },
+  {
+    "columnName": "asoutbound_type_name",
+    "businessName": "出库单据类型1揽货中2运输中3已签收",
+    "role": "DIMENSION",
+    "description": "出库单据类型1揽货中2运输中3已签收",
+    "aliases": [
+      "出库单据类型1揽货中2运输中3已签收",
+      "asoutbound_type_name"
+    ],
+    "enumValues": [
+      "1=揽货中",
+      "2=运输中",
+      "3=已签收"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单据类型1揽货中2运输中3已签收"
+  },
+  {
+    "columnName": "outbound_create_time",
+    "businessName": "出库单明细创建时间",
+    "role": "TIME",
+    "description": "出库单明细创建时间",
+    "aliases": [
+      "出库单明细创建时间",
+      "outbound_create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单明细创建时间"
+  },
+  {
+    "columnName": "outbound_modify_time",
+    "businessName": "出库单明细变更时间",
+    "role": "TIME",
+    "description": "出库单明细变更时间",
+    "aliases": [
+      "出库单明细变更时间",
+      "outbound_modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单明细变更时间"
+  },
+  {
+    "columnName": "outbound_express_type_code",
+    "businessName": "出库单承运商类型",
+    "role": "DIMENSION",
+    "description": "出库单承运商类型",
+    "aliases": [
+      "出库单承运商类型",
+      "outbound_express_type_code"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单承运商类型"
+  },
+  {
+    "columnName": "outbound_express_type_name",
+    "businessName": "物流商名称",
+    "role": "DIMENSION",
+    "description": "物流商名称",
+    "aliases": [
+      "物流商名称",
+      "outbound_express_type_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=物流商名称"
+  },
+  {
+    "columnName": "outbound_express_id",
+    "businessName": "出库单运单号",
+    "role": "KEY",
+    "description": "出库单运单号",
+    "aliases": [
+      "出库单运单号",
+      "outbound_express_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库单运单号"
+  },
+  {
+    "columnName": "promise_type_code",
+    "businessName": "承诺类型:0:普通",
+    "role": "DIMENSION",
+    "description": "承诺类型:0:普通，1：次日达，2：当日达",
+    "aliases": [
+      "承诺类型:0:普通",
+      "promise_type_code",
+      "承诺类型:0:普通，1：次日达，2：当日达"
+    ],
+    "enumValues": [
+      "0=普通",
+      "1=次日达",
+      "2=当日达"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=承诺类型:0:普通，1：次日达，2：当日达"
+  },
+  {
+    "columnName": "promise_type_name",
+    "businessName": "承诺类型:0:普通",
+    "role": "DIMENSION",
+    "description": "承诺类型:0:普通，1：次日达，2：当日达",
+    "aliases": [
+      "承诺类型:0:普通",
+      "promise_type_name",
+      "承诺类型:0:普通，1：次日达，2：当日达"
+    ],
+    "enumValues": [
+      "0=普通",
+      "1=次日达",
+      "2=当日达"
+    ],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=承诺类型:0:普通，1：次日达，2：当日达"
+  },
+  {
+    "columnName": "outbound_latest_time",
+    "businessName": "最晚出库时间",
+    "role": "TIME",
+    "description": "最晚出库时间",
+    "aliases": [
+      "最晚出库时间",
+      "outbound_latest_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=最晚出库时间"
+  },
+  {
+    "columnName": "operator_id",
+    "businessName": "出库交接操作人",
+    "role": "KEY",
+    "description": "出库交接操作人",
+    "aliases": [
+      "出库交接操作人",
+      "operator_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库交接操作人"
+  },
+  {
+    "columnName": "operator_name",
+    "businessName": "出库交接操作人",
+    "role": "DIMENSION",
+    "description": "出库交接操作人",
+    "aliases": [
+      "出库交接操作人",
+      "operator_name"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=出库交接操作人"
+  },
+  {
+    "columnName": "outbound_group_code",
+    "businessName": "供应商编码",
+    "role": "DIMENSION",
+    "description": "供应商编码-外包厂商",
+    "aliases": [
+      "供应商编码",
+      "outbound_group_code",
+      "供应商编码-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=供应商编码-外包厂商"
+  },
+  {
+    "columnName": "outbound_group_name",
+    "businessName": "供应商名称",
+    "role": "DIMENSION",
+    "description": "供应商名称-外包厂商",
+    "aliases": [
+      "供应商名称",
+      "outbound_group_name",
+      "供应商名称-外包厂商"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=供应商名称-外包厂商"
+  },
+  {
+    "columnName": "outbound_salary",
+    "businessName": "薪资",
+    "role": "OTHER",
+    "description": "薪资-每天",
+    "aliases": [
+      "薪资",
+      "outbound_salary",
+      "薪资-每天"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=薪资-每天"
+  },
+  {
+    "columnName": "outbound_attend_start_time",
+    "businessName": "考勤开始时间例如9:00",
+    "role": "TIME",
+    "description": "考勤开始时间例如9:00",
+    "aliases": [
+      "考勤开始时间例如9:00",
+      "outbound_attend_start_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=考勤开始时间例如9:00"
+  },
+  {
+    "columnName": "outbound_attend_end_time",
+    "businessName": "考勤结束时间例如18:00",
+    "role": "TIME",
+    "description": "考勤结束时间例如18:00",
+    "aliases": [
+      "考勤结束时间例如18:00",
+      "outbound_attend_end_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=考勤结束时间例如18:00"
+  },
+  {
+    "columnName": "outbound_attend_days",
+    "businessName": "每月要求出勤天数",
+    "role": "OTHER",
+    "description": "每月要求出勤天数，例如26",
+    "aliases": [
+      "每月要求出勤天数",
+      "outbound_attend_days",
+      "每月要求出勤天数，例如26"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=每月要求出勤天数，例如26"
+  },
+  {
+    "columnName": "pt",
+    "businessName": "业务日期",
+    "role": "TIME",
+    "description": "业务日期",
+    "aliases": [
+      "业务日期",
+      "pt"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=业务日期"
+  }
+]

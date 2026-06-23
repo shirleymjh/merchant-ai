@@ -1,0 +1,58 @@
+# 术语与同义词
+
+- spu ID：spu ID，同义词=spu ID、spu_id、商品，关联字段=spu_id
+- 商品名称：商品名称，同义词=商品名称、spu_name、商品，关联字段=spu_name
+- spu发布人id：spu发布人id，同义词=spu发布人id、seller_id，关联字段=seller_id
+- spu发布人name：spu发布人name，同义词=spu发布人name、seller_name，关联字段=seller_name
+- spu来源code：spu来源code，同义词=spu来源code、source_type_code，关联字段=source_type_code
+- spu来源name 个人卖家 企业卖家：spu来源name 个人卖家 企业卖家，同义词=spu来源name 个人卖家 企业卖家、source_type_name，关联字段=source_type_name
+- 一级类目code：一级类目code，同义词=一级类目code、level1_category_code，关联字段=level1_category_code
+- 一级类目name：一级类目name，同义词=一级类目name、level1_category_name，关联字段=level1_category_name
+- 二级类目code：二级类目code，同义词=二级类目code、level2_category_code，关联字段=level2_category_code
+- 二级类目name：二级类目name，同义词=二级类目name、level2_category_name，关联字段=level2_category_name
+- 三级类目code：三级类目code，同义词=三级类目code、level3_category_code，关联字段=level3_category_code
+- 三级类目name：三级类目name，同义词=三级类目name、level3_category_name，关联字段=level3_category_name
+- 品牌code：品牌code，同义词=品牌code、brand_code，关联字段=brand_code
+- 品牌name：品牌name，同义词=品牌name、brand_name，关联字段=brand_name
+- 适用人群code：适用人群code，同义词=适用人群code、fit_code，关联字段=fit_code
+- 适用人群name：适用人群name，同义词=适用人群name、fit_name，关联字段=fit_name
+- 发售价分：发售价分，同义词=发售价分、spu_auth_price、商品，关联字段=spu_auth_price
+- logo图：logo图，同义词=logo图、spu_logo_url、商品，关联字段=spu_logo_url
+- 视频图：视频图，同义词=视频图、spu_video_url、商品，关联字段=spu_video_url
+- 货号：货号，同义词=货号、article_id，关联字段=article_id
+- 商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过：商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过，同义词=商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过、spu_status_code、商品，关联字段=spu_status_code
+- 商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过：商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过，同义词=商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过、spu_status_name、商品，关联字段=spu_status_name
+- 商品描述：商品描述，同义词=商品描述、spu_desc、商品，关联字段=spu_desc
+- 创建时间：创建时间，同义词=创建时间、spu_apply_create_time、商品，关联字段=spu_apply_create_time
+- 变更时间：变更时间，同义词=变更时间、spu_apply_modify_time、商品，关联字段=spu_apply_modify_time
+- 唯一ID：唯一ID，同义词=唯一ID、biz_id，关联字段=biz_id
+- 任务状态code。反馈问题：任务状态code。反馈问题；提交任务；，同义词=任务状态code。反馈问题、completion_operate_type_code、任务状态code。反馈问题；提交任务；、audit_operate_type_code，关联字段=completion_operate_type_code、audit_operate_type_code
+- 任务状态name。反馈问题：任务状态name。反馈问题；提交任务；，同义词=任务状态name。反馈问题、completion_operate_type_name、任务状态name。反馈问题；提交任务；、audit_operate_type_name，关联字段=completion_operate_type_name、audit_operate_type_name
+- 是否通过：是否通过，同义词=是否通过、is_completion_pass、is_audit_pass，关联字段=is_completion_pass、is_audit_pass
+- 备注：备注，同义词=备注、completion_remark、audit_remark，关联字段=completion_remark、audit_remark
+- 首次操作人：首次操作人，同义词=首次操作人、first_completion_operate_id、first_audit_operate_id，关联字段=first_completion_operate_id、first_audit_operate_id
+- 首次操作人name：首次操作人name，同义词=首次操作人name、first_completion_operate_name、first_audit_operate_name，关联字段=first_completion_operate_name、first_audit_operate_name
+- 最新操作人：最新操作人，同义词=最新操作人、completion_operate_id、audit_operate_id，关联字段=completion_operate_id、audit_operate_id
+- 最新操作人name：最新操作人name，同义词=最新操作人name、completion_operate_name、audit_operate_name，关联字段=completion_operate_name、audit_operate_name
+- 首次操作时间：首次操作时间，同义词=首次操作时间、first_completion_operate_time、first_audit_operate_time，关联字段=first_completion_operate_time、first_audit_operate_time
+- 操作时间：操作时间，同义词=操作时间、completion_operate_time、audit_operate_time，关联字段=completion_operate_time、audit_operate_time
+- 首次操作人供应商名称：首次操作人供应商名称，同义词=首次操作人供应商名称、first_audit_operate_supplier_name，关联字段=first_audit_operate_supplier_name
+- 最新操作人供应商名称：最新操作人供应商名称，同义词=最新操作人供应商名称、audit_operate_supplier_name，关联字段=audit_operate_supplier_name
+- 导入任务id：导入任务id，同义词=导入任务id、import_task_id，关联字段=import_task_id
+- excel存放路径：excel存放路径，同义词=excel存放路径、excel_url，关联字段=excel_url
+- 导入excel名称：导入excel名称，同义词=导入excel名称、excel_name，关联字段=excel_name
+- 导入状态：导入状态，同义词=导入状态、is_import_pass，关联字段=is_import_pass
+- 导入时间：导入时间，同义词=导入时间、import_time，关联字段=import_time
+- 操作人id：操作人id，同义词=操作人id、import_operate_id，关联字段=import_operate_id
+- 操作人name：操作人name，同义词=操作人name、import_operate_name，关联字段=import_operate_name
+- 是否风控审核通过：是否风控审核通过，同义词=是否风控审核通过、is_risk_audit_pass，关联字段=is_risk_audit_pass
+- 机审时间：机审时间，同义词=机审时间、machine_audit_time，关联字段=machine_audit_time
+- 机审是否转人工：机审是否转人工，同义词=机审是否转人工、is_manual，关联字段=is_manual
+- 首次risk最新审核人ID：首次risk最新审核人ID，同义词=首次risk最新审核人ID、first_risk_tag_user_id，关联字段=first_risk_tag_user_id
+- 首次risk最新审核人name：首次risk最新审核人name，同义词=首次risk最新审核人name、first_risk_tag_user_name，关联字段=first_risk_tag_user_name
+- risk最新审核人ID：risk最新审核人ID，同义词=risk最新审核人ID、risk_tag_user_id，关联字段=risk_tag_user_id
+- risk最新审核人名称：risk最新审核人名称，同义词=risk最新审核人名称、risk_tag_user_name，关联字段=risk_tag_user_name
+- risk最新审核人供应商：risk最新审核人供应商，同义词=risk最新审核人供应商、risk_operate_supplier_name，关联字段=risk_operate_supplier_name
+- 是否加白：是否加白，同义词=是否加白、is_white，关联字段=is_white
+- 业务日期：业务日期，同义词=业务日期、pt，关联字段=pt
+- 商品审核：商品上新、审核通过/拒绝、上架状态相关流程，同义词=商品拒绝、审核拒绝、商品上架

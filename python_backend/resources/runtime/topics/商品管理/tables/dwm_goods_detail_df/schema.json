@@ -1,0 +1,391 @@
+[ {
+  "columnName" : "spu_id",
+  "dataType" : "bigint",
+  "comment" : "spu ID",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_name",
+  "dataType" : "varchar(255)",
+  "comment" : "商品名称",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_id",
+  "dataType" : "varchar(128)",
+  "comment" : "spu发布人id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_name",
+  "dataType" : "varchar(255)",
+  "comment" : "spu发布人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "source_type_code",
+  "dataType" : "bigint",
+  "comment" : "spu来源code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "source_type_name",
+  "dataType" : "varchar(128)",
+  "comment" : "spu来源name 个人卖家 企业卖家",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_category_code",
+  "dataType" : "bigint",
+  "comment" : "一级类目code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_category_name",
+  "dataType" : "varchar(128)",
+  "comment" : "一级类目name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_category_code",
+  "dataType" : "bigint",
+  "comment" : "二级类目code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_category_name",
+  "dataType" : "varchar(128)",
+  "comment" : "二级类目name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_category_code",
+  "dataType" : "bigint",
+  "comment" : "三级类目code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_category_name",
+  "dataType" : "varchar(128)",
+  "comment" : "三级类目name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "brand_code",
+  "dataType" : "bigint",
+  "comment" : "品牌code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "brand_name",
+  "dataType" : "varchar(128)",
+  "comment" : "品牌name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "fit_code",
+  "dataType" : "varchar(128)",
+  "comment" : "适用人群code",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "fit_name",
+  "dataType" : "varchar(128)",
+  "comment" : "适用人群name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_auth_price",
+  "dataType" : "bigint",
+  "comment" : "发售价分",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_logo_url",
+  "dataType" : "varchar(1024)",
+  "comment" : "logo图",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_video_url",
+  "dataType" : "varchar(1024)",
+  "comment" : "视频图",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "article_id",
+  "dataType" : "varchar(128)",
+  "comment" : "货号",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_status_code",
+  "dataType" : "bigint",
+  "comment" : "商品状态code 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_status_name",
+  "dataType" : "varchar(128)",
+  "comment" : "商品状态name 0.下架 1.上架 2.待提交 3.待审核 4.审核通过",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_desc",
+  "dataType" : "varchar(2048)",
+  "comment" : "商品描述",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_apply_create_time",
+  "dataType" : "varchar(19)",
+  "comment" : "创建时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_apply_modify_time",
+  "dataType" : "varchar(19)",
+  "comment" : "变更时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "biz_id",
+  "dataType" : "varchar(128)",
+  "comment" : "唯一ID",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "completion_operate_type_code",
+  "dataType" : "varchar(128)",
+  "comment" : "任务状态code。反馈问题；提交任务；",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "completion_operate_type_name",
+  "dataType" : "varchar(128)",
+  "comment" : "任务状态name。反馈问题；提交任务；",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_completion_pass",
+  "dataType" : "bigint",
+  "comment" : "是否通过",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "completion_remark",
+  "dataType" : "varchar(1024)",
+  "comment" : "备注",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_completion_operate_id",
+  "dataType" : "varchar(128)",
+  "comment" : "首次操作人",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_completion_operate_name",
+  "dataType" : "varchar(255)",
+  "comment" : "首次操作人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "completion_operate_id",
+  "dataType" : "varchar(128)",
+  "comment" : "最新操作人",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "completion_operate_name",
+  "dataType" : "varchar(255)",
+  "comment" : "最新操作人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_completion_operate_time",
+  "dataType" : "varchar(19)",
+  "comment" : "首次操作时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "completion_operate_time",
+  "dataType" : "varchar(19)",
+  "comment" : "操作时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_operate_type_code",
+  "dataType" : "varchar(128)",
+  "comment" : "任务状态code。反馈问题；提交任务；",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_operate_type_name",
+  "dataType" : "varchar(128)",
+  "comment" : "任务状态name。反馈问题；提交任务；",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_audit_pass",
+  "dataType" : "bigint",
+  "comment" : "是否通过",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_remark",
+  "dataType" : "varchar(1024)",
+  "comment" : "备注",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_audit_operate_id",
+  "dataType" : "varchar(128)",
+  "comment" : "首次操作人",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_audit_operate_name",
+  "dataType" : "varchar(255)",
+  "comment" : "首次操作人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_audit_operate_supplier_name",
+  "dataType" : "varchar(255)",
+  "comment" : "首次操作人供应商名称",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_operate_id",
+  "dataType" : "varchar(128)",
+  "comment" : "最新操作人",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_operate_name",
+  "dataType" : "varchar(255)",
+  "comment" : "最新操作人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_operate_supplier_name",
+  "dataType" : "varchar(255)",
+  "comment" : "最新操作人供应商名称",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_audit_operate_time",
+  "dataType" : "varchar(19)",
+  "comment" : "首次操作时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "audit_operate_time",
+  "dataType" : "varchar(19)",
+  "comment" : "操作时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "import_task_id",
+  "dataType" : "varchar(128)",
+  "comment" : "导入任务id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "excel_url",
+  "dataType" : "varchar(1024)",
+  "comment" : "excel存放路径",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "excel_name",
+  "dataType" : "varchar(255)",
+  "comment" : "导入excel名称",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_import_pass",
+  "dataType" : "bigint",
+  "comment" : "导入状态",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "import_time",
+  "dataType" : "varchar(19)",
+  "comment" : "导入时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "import_operate_id",
+  "dataType" : "varchar(128)",
+  "comment" : "操作人id",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "import_operate_name",
+  "dataType" : "varchar(255)",
+  "comment" : "操作人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_risk_audit_pass",
+  "dataType" : "bigint",
+  "comment" : "是否风控审核通过",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "machine_audit_time",
+  "dataType" : "varchar(19)",
+  "comment" : "机审时间",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_manual",
+  "dataType" : "bigint",
+  "comment" : "机审是否转人工",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_risk_tag_user_id",
+  "dataType" : "varchar(128)",
+  "comment" : "首次risk最新审核人ID",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "first_risk_tag_user_name",
+  "dataType" : "varchar(255)",
+  "comment" : "首次risk最新审核人name",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "risk_tag_user_id",
+  "dataType" : "varchar(128)",
+  "comment" : "risk最新审核人ID",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "risk_tag_user_name",
+  "dataType" : "varchar(255)",
+  "comment" : "risk最新审核人名称",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "risk_operate_supplier_name",
+  "dataType" : "varchar(255)",
+  "comment" : "risk最新审核人供应商",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "is_white",
+  "dataType" : "varchar(32)",
+  "comment" : "是否加白",
+  "nullable" : false,
+  "keyType" : ""
+}, {
+  "columnName" : "pt",
+  "dataType" : "date",
+  "comment" : "业务日期",
+  "nullable" : false,
+  "keyType" : ""
+} ]

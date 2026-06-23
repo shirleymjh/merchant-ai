@@ -1,0 +1,115 @@
+# 术语与同义词
+
+- 主键：主键，同义词=主键、inbound_id、履约、供应链，关联字段=inbound_id
+- 主库单头表id：主库单头表id，同义词=主库单头表id、inbound_header_id、履约、供应链，关联字段=inbound_header_id
+- 入库运单号：入库运单号，同义词=入库运单号、inbound_express_id、履约、供应链，关联字段=inbound_express_id
+- 物流商编号：物流商编号，同义词=物流商编号、inbound_express_type_code、履约、供应链，关联字段=inbound_express_type_code
+- 物流商名称：物流商名称，同义词=物流商名称、inbound_express_type_name、履约、供应链、outbound_express_type_name，关联字段=inbound_express_type_name、outbound_express_type_name
+- 是否有效状态：是否有效状态，同义词=是否有效状态、is_valid_status，关联字段=is_valid_status
+- 唯一码P码：唯一码P码，同义词=唯一码P码、unique_id，关联字段=unique_id
+- wms入库单状态code1已入库：wms入库单状态code1已入库，2运输中，3快递接收中，同义词=wms入库单状态code1已入库、inbound_status_code、wms入库单状态code1已入库，2运输中，3快递接收中、履约、供应链，关联字段=inbound_status_code
+- wms入库单状态name 1已入库：wms入库单状态name 1已入库，2运输中，3快递接收中，同义词=wms入库单状态name 1已入库、inbound_status_name、wms入库单状态name 1已入库，2运输中，3快递接收中、履约、供应链，关联字段=inbound_status_name
+- 商品spuid：商品spuid，同义词=商品spuid、spu_id、商品，关联字段=spu_id
+- 商品skuid：商品skuid，同义词=商品skuid、sku_id、商品，关联字段=sku_id
+- spu名称：spu名称，同义词=spu名称、spu_name、商品，关联字段=spu_name
+- 一级类目code：一级类目code，同义词=一级类目code、level1_category_code，关联字段=level1_category_code
+- 一级类目name：一级类目name，同义词=一级类目name、level1_category_name，关联字段=level1_category_name
+- 二级类目code：二级类目code，同义词=二级类目code、level2_category_code，关联字段=level2_category_code
+- 二级类目name：二级类目name，同义词=二级类目name、level2_category_name，关联字段=level2_category_name
+- 三级类目code：三级类目code，同义词=三级类目code、level3_category_code，关联字段=level3_category_code
+- 三级类目name：三级类目name，同义词=三级类目name、level3_category_name，关联字段=level3_category_name
+- 品牌code：品牌code，同义词=品牌code、brand_code，关联字段=brand_code
+- 品牌name：品牌name，同义词=品牌name、brand_name，关联字段=brand_name
+- 货号：货号，同义词=货号、article_id，关联字段=article_id
+- 入库数量：入库数量，同义词=入库数量、inbound_cnt、履约、供应链，关联字段=inbound_cnt
+- 入库创建时间：入库创建时间，同义词=入库创建时间、inbound_create_time、履约、供应链，关联字段=inbound_create_time
+- 入库变更时间：入库变更时间，同义词=入库变更时间、inbound_modify_time、履约、供应链，关联字段=inbound_modify_time
+- 入库接收时间：入库接收时间，同义词=入库接收时间、inbound_receive_time、履约、供应链，关联字段=inbound_receive_time
+- 是否需要查验 1 正常 0 免鉴别：是否需要查验 1 正常 0 免鉴别，同义词=是否需要查验 1 正常 0 免鉴别、is_check，关联字段=is_check
+- 仓库id：仓库id，同义词=仓库id、warehouse_id，关联字段=warehouse_id
+- 仓库name：仓库name，同义词=仓库name、warhouse_name，关联字段=warhouse_name
+- 上架时间：上架时间，同义词=上架时间、online_time，关联字段=online_time
+- 发货单号：发货单号，同义词=发货单号、dispatch_bill_id，关联字段=dispatch_bill_id
+- 卖家id：卖家id-个人卖家，同义词=卖家id、seller_id、卖家id-个人卖家，关联字段=seller_id
+- 卖家姓名：卖家姓名-个人卖家，同义词=卖家姓名、seller_name、卖家姓名-个人卖家、seller_nick_name，关联字段=seller_name、seller_nick_name
+- 卖家地址：卖家地址，同义词=卖家地址、seller_address，关联字段=seller_address
+- 发货时间：发货时间，同义词=发货时间、deliver_time，关联字段=deliver_time
+- 是否跨境1 是：是否跨境1 是，同义词=是否跨境1 是、is_cross，关联字段=is_cross
+- 是否极速 1是：是否极速 1是，同义词=是否极速 1是、is_express，关联字段=is_express
+- 备注：备注，同义词=备注、inbound_header_remark、履约、供应链、first_identify_operate_remark，关联字段=inbound_header_remark、first_identify_operate_remark
+- 预计到货时间：预计到货时间，同义词=预计到货时间、expect_start_time，关联字段=expect_start_time
+- 入库单表头code1 销售入货单2退货入货单：入库单表头code1 销售入货单2退货入货单，同义词=入库单表头code1 销售入货单2退货入货单、inbound_header_type_code、履约、供应链，关联字段=inbound_header_type_code
+- 入库单表头name1 销售入货单2退货入货单：入库单表头name1 销售入货单2退货入货单，同义词=入库单表头name1 销售入货单2退货入货单、inbound_header_type_name、履约、供应链，关联字段=inbound_header_type_name
+- 商家id：商家id-企业卖家，同义词=商家id、merchant_id、商家id-企业卖家，关联字段=merchant_id
+- 商家名称：商家名称-企业卖家，同义词=商家名称、merchant_name、商家名称-企业卖家，关联字段=merchant_name
+- 预计最晚到仓时间：预计最晚到仓时间，同义词=预计最晚到仓时间、latest_inbound_time、履约、供应链，关联字段=latest_inbound_time
+- 分拣id：分拣id，同义词=分拣id、sorting_id，关联字段=sorting_id
+- 分拣人ID：分拣人ID，同义词=分拣人ID、sorting_operator_id，关联字段=sorting_operator_id
+- 分拣人名称：分拣人名称，同义词=分拣人名称、sorting_operator_name，关联字段=sorting_operator_name
+- 供应商编码：供应商编码-外包厂商，同义词=供应商编码、sorting_group_code、供应商编码-外包厂商、check_group_code、outbound_group_code、履约、供应链，关联字段=sorting_group_code、check_group_code、outbound_group_code
+- 供应商名称：供应商名称-外包厂商，同义词=供应商名称、sorting_group_name、供应商名称-外包厂商、check_group_name、outbound_group_name、履约、供应链，关联字段=sorting_group_name、check_group_name、outbound_group_name
+- 薪资：薪资-每天，同义词=薪资、sorting_salary、薪资-每天、check_salary、outbound_salary、履约、供应链，关联字段=sorting_salary、check_salary、outbound_salary
+- 考勤开始时间例如9:00：考勤开始时间例如9:00，同义词=考勤开始时间例如9:00、sorting_attend_start_time、check_attend_start_time、outbound_attend_start_time、履约、供应链，关联字段=sorting_attend_start_time、check_attend_start_time、outbound_attend_start_time
+- 考勤结束时间例如18:00：考勤结束时间例如18:00，同义词=考勤结束时间例如18:00、sorting_attend_end_time、check_attend_end_time、outbound_attend_end_time、履约、供应链，关联字段=sorting_attend_end_time、check_attend_end_time、outbound_attend_end_time
+- 每月要求出勤天数：每月要求出勤天数，例如26，同义词=每月要求出勤天数、sorting_attend_days、每月要求出勤天数，例如26、check_attend_days、outbound_attend_days、履约、供应链，关联字段=sorting_attend_days、check_attend_days、outbound_attend_days
+- 分拣来源1国内2海外：分拣来源1国内2海外，同义词=分拣来源1国内2海外、sorting_source_code、sorting_source_name，关联字段=sorting_source_code、sorting_source_name
+- 分拣状态code 1已接收2已完成：分拣状态code 1已接收2已完成，同义词=分拣状态code 1已接收2已完成、sorting_status_code，关联字段=sorting_status_code
+- 分拣状态name 1已接收2已完成：分拣状态name 1已接收2已完成，同义词=分拣状态name 1已接收2已完成、sorting_status_name，关联字段=sorting_status_name
+- 分拣备注：分拣备注，同义词=分拣备注、sorting_remark，关联字段=sorting_remark
+- 分拣仓库名：分拣仓库名，同义词=分拣仓库名、sorting_warhouse_id，关联字段=sorting_warhouse_id
+- 分拣时间：分拣时间，同义词=分拣时间、sorting_create_time，关联字段=sorting_create_time
+- 分拣完成时间：分拣完成时间，同义词=分拣完成时间、sorting_modify_time，关联字段=sorting_modify_time
+- 分拣工位：分拣工位，同义词=分拣工位、sorting_station_id，关联字段=sorting_station_id
+- 分拣生产产线code：分拣生产产线code，同义词=分拣生产产线code、sorting_production_line_code，关联字段=sorting_production_line_code
+- 分拣生产产线：分拣生产产线，同义词=分拣生产产线、sorting_production_line_name，关联字段=sorting_production_line_name
+- 质检id：质检id，同义词=质检id、check_id，关联字段=check_id
+- 任务id：任务id，同义词=任务id、check_task_id、identify_task_id，关联字段=check_task_id、identify_task_id
+- 质检状态：1：质检通过：质检状态：1：质检通过；2：有瑕疵；3：质检不通过，同义词=质检状态：1：质检通过、check_status_code、质检状态：1：质检通过；2：有瑕疵；3：质检不通过，关联字段=check_status_code
+- 质检状态name：1：质检通过：质检状态name：1：质检通过；2：有瑕疵；3：质检不通过，同义词=质检状态name：1：质检通过、check_status_name、质检状态name：1：质检通过；2：有瑕疵；3：质检不通过，关联字段=check_status_name
+- 不通过方式code：不通过方式code；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过），同义词=不通过方式code、unpass_type_code、不通过方式code；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过），关联字段=unpass_type_code
+- 不通过方式name：不通过方式name；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过），同义词=不通过方式name、unpass_type_name、不通过方式name；1：无；2：普通操作；3：管理员不通过（已通过后操作不通过），关联字段=unpass_type_name
+- 审核人员：审核人员，同义词=审核人员、check_operator_id、check_operator_name，关联字段=check_operator_id、check_operator_name
+- 创建时间：创建时间，同义词=创建时间、check_create_time、identify_create_time，关联字段=check_create_time、identify_create_time
+- 修改时间：修改时间，同义词=修改时间、check_modify_time，关联字段=check_modify_time
+- 质检类型 0常规质检 1二次质检（现货转寄存）：质检类型 0常规质检 1二次质检（现货转寄存），同义词=质检类型 0常规质检 1二次质检（现货转寄存）、check_type_code、check_type_name，关联字段=check_type_code、check_type_name
+- 质检图片数量：质检图片数量，同义词=质检图片数量、photo_cnt，关联字段=photo_cnt
+- 审核次数：审核次数，同义词=审核次数、check_cnt，关联字段=check_cnt
+- 业务类型code 0:小仓库：业务类型code 0:小仓库;1企业；2个人，同义词=业务类型code 0:小仓库、biz_type_code、业务类型code 0:小仓库;1企业；2个人，关联字段=biz_type_code
+- 业务类型name 0:小仓库：业务类型name 0:小仓库;1企业；2个人，同义词=业务类型name 0:小仓库、biz_type_name、业务类型name 0:小仓库;1企业；2个人，关联字段=biz_type_name
+- 来源类型  1:原有 2:新的（需要选择瑕疵选项）：来源类型  1:原有 2:新的（需要选择瑕疵选项），同义词=来源类型  1:原有 2:新的（需要选择瑕疵选项）、check_source_type_code、check_source_type_name，关联字段=check_source_type_code、check_source_type_name
+- id：id，同义词=id、check_reason_id，关联字段=check_reason_id
+- 原因类别名称：原因类别名称，同义词=原因类别名称、check_reason_name，关联字段=check_reason_name
+- 原因适用类型：原因适用类型；1：拒收；2：鉴定;3：质检，同义词=原因适用类型、apply_type_code、原因适用类型；1：拒收；2：鉴定;3：质检、apply_type_name，关联字段=apply_type_code、apply_type_name
+- 首次质检任务编号：首次质检任务编号，同义词=首次质检任务编号、first_check_task_id，关联字段=first_check_task_id
+- 首次质检结果：首次质检结果,不通过=0,通过=1，同义词=首次质检结果、first_check_is_operate_pass、首次质检结果,不通过=0,通过=1，关联字段=first_check_is_operate_pass
+- 首次质检备注：首次质检备注，同义词=首次质检备注、first_check_operate_remark，关联字段=first_check_operate_remark
+- 首次质检操作人id：首次质检操作人id，同义词=首次质检操作人id、first_check_operator_id，关联字段=first_check_operator_id
+- 首次质检操作人名称：首次质检操作人名称，同义词=首次质检操作人名称、first_check_operator_name，关联字段=first_check_operator_name
+- 首次质检供应商编码：首次质检供应商编码-外包厂商，同义词=首次质检供应商编码、first_check_group_code、首次质检供应商编码-外包厂商，关联字段=first_check_group_code
+- 首次质检供应商名称：首次质检供应商名称-外包厂商，同义词=首次质检供应商名称、first_check_group_name、首次质检供应商名称-外包厂商，关联字段=first_check_group_name
+- 首次质检原因id：首次质检原因id，同义词=首次质检原因id、first_check_reason_id，关联字段=first_check_reason_id
+- 首次质检原因类别名称：首次质检原因类别名称，同义词=首次质检原因类别名称、first_check_reason_name，关联字段=first_check_reason_name
+- 首次质检原因适用类型：首次质检原因适用类型；1：拒收；2：鉴定;3：质检，同义词=首次质检原因适用类型、first_check_apply_type_code、首次质检原因适用类型；1：拒收；2：鉴定;3：质检、first_check_apply_type_name，关联字段=first_check_apply_type_code、first_check_apply_type_name
+- 鉴定id：鉴定id，同义词=鉴定id、identify_id，关联字段=identify_id
+- 是否线上坚定：是否线上坚定，同义词=是否线上坚定、is_identify_online，关联字段=is_identify_online
+- 是否鉴定 0：是否鉴定 0-未鉴定 1-已鉴定，同义词=是否鉴定 0、is_identify、是否鉴定 0-未鉴定 1-已鉴定，关联字段=is_identify
+- 鉴定结果 0：鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起，同义词=鉴定结果 0、identify_result_code、鉴定结果 0-初始状态 1-鉴定为真 2-鉴定为假 3-待补图 4-无法鉴定 5-已撤销 6-已挂起、identify_result_name、first_identify_pass_type_code、first_identify_pass_type_name，关联字段=identify_result_code、identify_result_name、first_identify_pass_type_code、first_identify_pass_type_name
+- 鉴定师id：鉴定师id，同义词=鉴定师id、identifier_id，关联字段=identifier_id
+- 鉴定师name：鉴定师name，同义词=鉴定师name、identifier_name，关联字段=identifier_name
+- 鉴定原因：鉴定原因，同义词=鉴定原因、identify_content，关联字段=identify_content
+- 拍照时间：拍照时间，同义词=拍照时间、photo_time，关联字段=photo_time
+- 更新时间：更新时间，同义词=更新时间、identify_modify_time，关联字段=identify_modify_time
+- 任务编号：任务编号，同义词=任务编号、first_identify_task_id，关联字段=first_identify_task_id
+- 操作人id：操作人id，同义词=操作人id、first_identify_operator_id，关联字段=first_identify_operator_id
+- 操作人名称：操作人名称，同义词=操作人名称、first_identify_operator_name，关联字段=first_identify_operator_name
+- 出库单id：出库单id，同义词=出库单id、outbound_id、履约、供应链，关联字段=outbound_id
+- 出库单据类型1揽货中2运输中3已签收：出库单据类型1揽货中2运输中3已签收，同义词=出库单据类型1揽货中2运输中3已签收、outbound_type_code、履约、供应链、asoutbound_type_name，关联字段=outbound_type_code、asoutbound_type_name
+- 出库单明细创建时间：出库单明细创建时间，同义词=出库单明细创建时间、outbound_create_time、履约、供应链，关联字段=outbound_create_time
+- 出库单明细变更时间：出库单明细变更时间，同义词=出库单明细变更时间、outbound_modify_time、履约、供应链，关联字段=outbound_modify_time
+- 出库单承运商类型：出库单承运商类型，同义词=出库单承运商类型、outbound_express_type_code、履约、供应链，关联字段=outbound_express_type_code
+- 出库单运单号：出库单运单号，同义词=出库单运单号、outbound_express_id、履约、供应链，关联字段=outbound_express_id
+- 承诺类型:0:普通：承诺类型:0:普通，1：次日达，2：当日达，同义词=承诺类型:0:普通、promise_type_code、承诺类型:0:普通，1：次日达，2：当日达、promise_type_name，关联字段=promise_type_code、promise_type_name
+- 最晚出库时间：最晚出库时间，同义词=最晚出库时间、outbound_latest_time、履约、供应链，关联字段=outbound_latest_time
+- 出库交接操作人：出库交接操作人，同义词=出库交接操作人、operator_id、operator_name，关联字段=operator_id、operator_name
+- 业务日期：业务日期，同义词=业务日期、pt，关联字段=pt
+- 履约：供应链入库、质检、鉴定、出库和超时履约过程，同义词=供应链、发货超时、质检、鉴定

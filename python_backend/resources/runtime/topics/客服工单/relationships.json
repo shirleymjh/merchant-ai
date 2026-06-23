@@ -1,0 +1,20 @@
+[
+  {
+    "name": "order_ticket_by_sub_order",
+    "leftTable": "dwm_trade_order_detail_di",
+    "rightTable": "dwm_cs_ticket_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
+    "grain": "sub_order_id_ticket_id",
+    "useCases": ["工单关联订单", "催单工单定位订单"]
+  },
+  {
+    "name": "ticket_repay_by_ticket",
+    "leftTable": "dwm_cs_ticket_detail_di",
+    "rightTable": "dwm_cs_repay_detail_df",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["ticket_id", "ticket_id"]],
+    "grain": "ticket_id_bill_id",
+    "useCases": ["工单关联赔付", "赔付单回看工单状态"]
+  }
+]

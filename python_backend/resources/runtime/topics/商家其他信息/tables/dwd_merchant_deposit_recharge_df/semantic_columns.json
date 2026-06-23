@@ -1,0 +1,160 @@
+[
+  {
+    "columnName": "create_time",
+    "businessName": "创建时间",
+    "role": "TIME",
+    "description": "创建时间",
+    "aliases": [
+      "创建时间",
+      "create_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=创建时间; samples=[2026-02-25T15:31:41, 2026-02-26T10:35:30, 2026-02-27T04:53:35, 2026-02-28T02:47:03, 2026-03-01T03:57:26, 2026-03-02T15:48:06, 2026-03-03T19:55:26, 2026-03-04T07:46:55]"
+  },
+  {
+    "columnName": "modify_time",
+    "businessName": "修改时间",
+    "role": "TIME",
+    "description": "修改时间",
+    "aliases": [
+      "修改时间",
+      "modify_time"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=修改时间; samples=[2026-02-25T00:37:52, 2026-02-26T08:14:30, 2026-02-27T06:41:30, 2026-02-28T04:18:01, 2026-03-01T20:16:22, 2026-03-02T02:59:58, 2026-03-03T09:11:02, 2026-03-04T16:01:20]"
+  },
+  {
+    "columnName": "merchant_id",
+    "businessName": "商家id",
+    "role": "KEY",
+    "description": "商家id",
+    "aliases": [
+      "商家id",
+      "merchant_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=商家id; samples=[100]"
+  },
+  {
+    "columnName": "user_id",
+    "businessName": "用户id",
+    "role": "KEY",
+    "description": "用户id",
+    "aliases": [
+      "用户id",
+      "user_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=用户id"
+  },
+  {
+    "columnName": "deposit_recharge_id",
+    "businessName": "补缴单单号(充值申请号)",
+    "role": "KEY",
+    "description": "补缴单单号(充值申请号)",
+    "aliases": [
+      "补缴单单号(充值申请号)",
+      "deposit_recharge_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=补缴单单号(充值申请号); samples=[deposit_recharge_id_001, deposit_recharge_id_002, deposit_recharge_id_003, deposit_recharge_id_004, deposit_recharge_id_005, deposit_recharge_id_006, deposit_recharge_id_007, deposit_recharge_id_008]"
+  },
+  {
+    "columnName": "trans_id",
+    "businessName": "交易流水号",
+    "role": "KEY",
+    "description": "交易流水号",
+    "aliases": [
+      "交易流水号",
+      "trans_id"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=交易流水号; samples=[trans_id_001, trans_id_002, trans_id_003, trans_id_004, trans_id_005, trans_id_006, trans_id_007, trans_id_008]"
+  },
+  {
+    "columnName": "currency",
+    "businessName": "币种",
+    "role": "OTHER",
+    "description": "币种",
+    "aliases": [
+      "币种",
+      "currency"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=币种; samples=[CNY]"
+  },
+  {
+    "columnName": "deposit_recharge_amt",
+    "businessName": "金额",
+    "role": "METRIC",
+    "description": "金额, 通用单位元",
+    "aliases": [
+      "deposit_recharge_amt",
+      "金额, 通用单位元",
+      "保证金充值金额",
+      "保证金补缴金额",
+      "保证金缴纳金额",
+      "充值金额",
+      "补缴金额"
+    ],
+    "enumValues": [],
+    "metricFormula": "SUM(deposit_recharge_amt)",
+    "confidence": 0.78,
+    "evidence": "schema comment=金额, 通用单位元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "columnName": "trans_voucher",
+    "businessName": "交易流水凭证",
+    "role": "OTHER",
+    "description": "交易流水凭证",
+    "aliases": [
+      "交易流水凭证",
+      "trans_voucher"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=交易流水凭证"
+  },
+  {
+    "columnName": "remark",
+    "businessName": "备注",
+    "role": "OTHER",
+    "description": "备注",
+    "aliases": [
+      "remark"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=备注; samples=[remark_dwd_merchant_deposit_recharge_df_1, remark_dwd_merchant_deposit_recharge_df_2, remark_dwd_merchant_deposit_recharge_df_3, remark_dwd_merchant_deposit_recharge_df_4, remark_dwd_merchant_deposit_recharge_df_5, remark_dwd_merchant_deposit_recharge_df_6, remark_dwd_merchant_deposit_recharge_df_7, remark_dwd_merchant_deposit_recharge_df_8]"
+  },
+  {
+    "columnName": "pt",
+    "businessName": "日期分区yyyyMMdd",
+    "role": "TIME",
+    "description": "日期分区yyyyMMdd",
+    "aliases": [
+      "日期分区yyyyMMdd",
+      "pt"
+    ],
+    "enumValues": [],
+    "metricFormula": "",
+    "confidence": 0.78,
+    "evidence": "schema comment=日期分区yyyyMMdd; samples=[2026-02-25, 2026-02-26, 2026-02-27, 2026-02-28, 2026-03-01, 2026-03-02, 2026-03-03, 2026-03-04]"
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "name": "coupon_order_by_coupon_id",
+    "leftTable": "dwm_coupon_detail_di",
+    "rightTable": "dwm_trade_order_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["coupon_id", "discount_rel_id"]],
+    "grain": "coupon_sub_order_id",
+    "useCases": ["优惠券覆盖订单表现", "券活动关联下单商品"],
+    "cautions": ["订单表 discount_rel_id 表示优惠方式关联 id，优惠券场景下关联 coupon_id"]
+  },
+  {
+    "name": "coupon_refund_by_coupon_id",
+    "leftTable": "dwm_coupon_detail_di",
+    "rightTable": "dwm_trade_refund_detail_di",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["coupon_id", "discount_id"]],
+    "grain": "coupon_refund_id",
+    "useCases": ["优惠券覆盖订单回看退款表现", "券投入关联退款金额"],
+    "cautions": ["退款表 discount_id 为优惠券编号"]
+  }
+]

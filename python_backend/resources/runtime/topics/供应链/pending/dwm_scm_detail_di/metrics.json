@@ -1,0 +1,149 @@
+[
+  {
+    "metricKey": "inbound_cnt",
+    "businessName": "入库数量",
+    "formula": "SUM(inbound_cnt)",
+    "unit": "单",
+    "description": "入库数量",
+    "sourceColumns": [
+      "inbound_cnt"
+    ],
+    "aliases": [
+      "入库数量",
+      "入库量",
+      "供应链入库量",
+      "供应链入库数量",
+      "inbound_cnt"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=入库数量"
+  },
+  {
+    "metricKey": "photo_cnt",
+    "businessName": "质检图片数量",
+    "formula": "SUM(photo_cnt)",
+    "unit": "单",
+    "description": "质检图片数量",
+    "sourceColumns": [
+      "photo_cnt"
+    ],
+    "aliases": [
+      "质检图片数量",
+      "photo_cnt"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=质检图片数量"
+  },
+  {
+    "metricKey": "check_cnt",
+    "businessName": "审核次数",
+    "formula": "SUM(check_cnt)",
+    "unit": "单",
+    "description": "审核次数",
+    "sourceColumns": [
+      "check_cnt"
+    ],
+    "aliases": [
+      "审核次数",
+      "check_cnt"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=审核次数"
+  },
+  {
+    "metricKey": "first_check_is_operate_pass",
+    "businessName": "首次质检结果",
+    "formula": "AVG(first_check_is_operate_pass)",
+    "unit": "%",
+    "description": "首次质检结果,不通过=0,通过=1",
+    "sourceColumns": [
+      "first_check_is_operate_pass"
+    ],
+    "aliases": [
+      "首次质检结果",
+      "first_check_is_operate_pass",
+      "首次质检结果,不通过=0,通过=1"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=首次质检结果,不通过=0,通过=1"
+  },
+  {
+    "metricKey": "ship_timeout_detail_cnt",
+    "businessName": "发货超时单量",
+    "formula": "COUNT(DISTINCT CASE WHEN outbound_modify_time > outbound_latest_time THEN outbound_id END)",
+    "unit": "单",
+    "description": "出库变更时间晚于最晚出库时间的发货超时单量",
+    "sourceColumns": [
+      "outbound_id",
+      "outbound_modify_time",
+      "outbound_latest_time"
+    ],
+    "aliases": [
+      "发货超时单量"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "quality_check_cnt",
+    "businessName": "质检单量",
+    "formula": "COUNT(DISTINCT check_id)",
+    "unit": "单",
+    "description": "按质检 ID 去重统计质检单量",
+    "sourceColumns": [
+      "check_id"
+    ],
+    "aliases": [
+      "质检单量"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "scm_outbound_cnt",
+    "businessName": "出库量",
+    "formula": "COUNT(DISTINCT outbound_id)",
+    "unit": "单",
+    "description": "按出库 ID 去重统计出库单量",
+    "sourceColumns": [
+      "outbound_id"
+    ],
+    "aliases": [
+      "出库量"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "scm_identify_cnt",
+    "businessName": "鉴定量",
+    "formula": "SUM(CASE WHEN identify_result_name IS NULL OR identify_result_name = '' THEN 0 ELSE inbound_cnt END)",
+    "unit": "件",
+    "description": "按鉴定结果统计发生鉴定的入库数量",
+    "sourceColumns": [
+      "identify_result_name",
+      "inbound_cnt"
+    ],
+    "aliases": [
+      "鉴定量"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "fake_identify_detail_cnt",
+    "businessName": "鉴定为假货量",
+    "formula": "SUM(CASE WHEN identify_result_code = 2 OR identify_result_name = '鉴定为假' THEN 1 ELSE 0 END)",
+    "unit": "件",
+    "description": "按鉴定结果统计假货量",
+    "sourceColumns": [
+      "identify_result_code",
+      "identify_result_name"
+    ],
+    "aliases": [
+      "鉴定为假货量"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  }
+]

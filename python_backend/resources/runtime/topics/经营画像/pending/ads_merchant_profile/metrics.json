@@ -1,0 +1,897 @@
+[
+  {
+    "metricKey": "deposit_amt",
+    "businessName": "保证金余额元",
+    "formula": "SUM(deposit_amt)",
+    "unit": "元",
+    "description": "保证金余额元",
+    "sourceColumns": [
+      "deposit_amt"
+    ],
+    "aliases": [
+      "保证金余额元",
+      "deposit_amt"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=保证金余额元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "order_cnt_1d",
+    "businessName": "总订单量",
+    "formula": "SUM(order_cnt_1d)",
+    "unit": "单",
+    "description": "总订单量-最近1天",
+    "sourceColumns": [
+      "order_cnt_1d"
+    ],
+    "aliases": [
+      "总订单量",
+      "order_cnt_1d",
+      "总订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=总订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "order_user_cnt_1d",
+    "businessName": "下单用户量",
+    "formula": "SUM(order_user_cnt_1d)",
+    "unit": "单",
+    "description": "下单用户量-最近1天",
+    "sourceColumns": [
+      "order_user_cnt_1d"
+    ],
+    "aliases": [
+      "下单用户量",
+      "order_user_cnt_1d",
+      "下单用户量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=下单用户量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "order_gmv_amt_1d",
+    "businessName": "总gmv金额元",
+    "formula": "SUM(order_gmv_amt_1d)",
+    "unit": "元",
+    "description": "总gmv金额元-最近1天",
+    "sourceColumns": [
+      "order_gmv_amt_1d"
+    ],
+    "aliases": [
+      "总gmv金额元",
+      "order_gmv_amt_1d",
+      "总gmv金额元-最近1天",
+      "GMV",
+      "成交额",
+      "销售额",
+      "交易流水",
+      "总GMV"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=总gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "pay_order_cnt_1d",
+    "businessName": "支付订单量",
+    "formula": "SUM(pay_order_cnt_1d)",
+    "unit": "单",
+    "description": "支付订单量-最近1天",
+    "sourceColumns": [
+      "pay_order_cnt_1d"
+    ],
+    "aliases": [
+      "支付订单量",
+      "pay_order_cnt_1d",
+      "支付订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=支付订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "pay_gmv_amt_1d",
+    "businessName": "支付gmv金额元",
+    "formula": "SUM(pay_gmv_amt_1d)",
+    "unit": "元",
+    "description": "支付gmv金额元-最近1天",
+    "sourceColumns": [
+      "pay_gmv_amt_1d"
+    ],
+    "aliases": [
+      "支付gmv金额元",
+      "pay_gmv_amt_1d",
+      "支付gmv金额元-最近1天",
+      "支付GMV",
+      "支付成交额",
+      "支付销售额"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=支付gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "trade_success_order_cnt_1d",
+    "businessName": "交易成功订单量",
+    "formula": "SUM(trade_success_order_cnt_1d)",
+    "unit": "单",
+    "description": "交易成功订单量-最近1天",
+    "sourceColumns": [
+      "trade_success_order_cnt_1d"
+    ],
+    "aliases": [
+      "交易成功订单量",
+      "trade_success_order_cnt_1d",
+      "交易成功订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=交易成功订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "pay_success_discount_order_cnt_1d",
+    "businessName": "支付成功优惠单量",
+    "formula": "SUM(pay_success_discount_order_cnt_1d)",
+    "unit": "单",
+    "description": "支付成功优惠单量-最近1天",
+    "sourceColumns": [
+      "pay_success_discount_order_cnt_1d"
+    ],
+    "aliases": [
+      "支付成功优惠单量",
+      "pay_success_discount_order_cnt_1d",
+      "支付成功优惠单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=支付成功优惠单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "pay_success_discount_amt_1d",
+    "businessName": "支付成功优惠金额元",
+    "formula": "SUM(pay_success_discount_amt_1d)",
+    "unit": "元",
+    "description": "支付成功优惠金额元-最近1天",
+    "sourceColumns": [
+      "pay_success_discount_amt_1d"
+    ],
+    "aliases": [
+      "支付成功优惠金额元",
+      "pay_success_discount_amt_1d",
+      "支付成功优惠金额元-最近1天",
+      "支付成功优惠金额",
+      "支付优惠金额",
+      "支付优惠额"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=支付成功优惠金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "trade_success_discount_order_cnt_1d",
+    "businessName": "交易成功优惠单量",
+    "formula": "SUM(trade_success_discount_order_cnt_1d)",
+    "unit": "单",
+    "description": "交易成功优惠单量-最近1天",
+    "sourceColumns": [
+      "trade_success_discount_order_cnt_1d"
+    ],
+    "aliases": [
+      "交易成功优惠单量",
+      "trade_success_discount_order_cnt_1d",
+      "交易成功优惠单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=交易成功优惠单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "trade_success_discount_amt_1d",
+    "businessName": "交易成功优惠金额元",
+    "formula": "SUM(trade_success_discount_amt_1d)",
+    "unit": "元",
+    "description": "交易成功优惠金额元-最近1天",
+    "sourceColumns": [
+      "trade_success_discount_amt_1d"
+    ],
+    "aliases": [
+      "交易成功优惠金额元",
+      "trade_success_discount_amt_1d",
+      "交易成功优惠金额元-最近1天",
+      "交易成功优惠金额",
+      "成交优惠金额"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=交易成功优惠金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "cs_ticket_cnt_1d",
+    "businessName": "咨询工单量",
+    "formula": "SUM(cs_ticket_cnt_1d)",
+    "unit": "单",
+    "description": "咨询工单量-最近1天",
+    "sourceColumns": [
+      "cs_ticket_cnt_1d"
+    ],
+    "aliases": [
+      "咨询工单量",
+      "cs_ticket_cnt_1d",
+      "咨询工单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=咨询工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "risk_complaint_order_cnt_1d",
+    "businessName": "风控客诉订单量",
+    "formula": "SUM(risk_complaint_order_cnt_1d)",
+    "unit": "单",
+    "description": "风控客诉订单量-最近1天",
+    "sourceColumns": [
+      "risk_complaint_order_cnt_1d"
+    ],
+    "aliases": [
+      "风控客诉订单量",
+      "risk_complaint_order_cnt_1d",
+      "风控客诉订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=风控客诉订单量-最近1天"
+  },
+  {
+    "metricKey": "seller_repay_order_cnt_1d",
+    "businessName": "卖家赔付订单数",
+    "formula": "SUM(seller_repay_order_cnt_1d)",
+    "unit": "单",
+    "description": "卖家赔付订单数-最近1天",
+    "sourceColumns": [
+      "seller_repay_order_cnt_1d"
+    ],
+    "aliases": [
+      "卖家赔付订单数",
+      "seller_repay_order_cnt_1d",
+      "卖家赔付订单数-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家赔付订单数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "seller_repay_amt_1d",
+    "businessName": "卖家赔付金额元",
+    "formula": "SUM(seller_repay_amt_1d)",
+    "unit": "元",
+    "description": "卖家赔付金额元-最近1天",
+    "sourceColumns": [
+      "seller_repay_amt_1d"
+    ],
+    "aliases": [
+      "卖家赔付金额元",
+      "seller_repay_amt_1d",
+      "卖家赔付金额元-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家赔付金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "entry_audit_duration_hours_1d",
+    "businessName": "入驻审核平均时效小时",
+    "formula": "SUM(entry_audit_duration_hours_1d)",
+    "unit": "小时",
+    "description": "入驻审核平均时效小时-最近1天",
+    "sourceColumns": [
+      "entry_audit_duration_hours_1d"
+    ],
+    "aliases": [
+      "入驻审核平均时效小时",
+      "entry_audit_duration_hours_1d",
+      "入驻审核平均时效小时-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=入驻审核平均时效小时-最近1天"
+  },
+  {
+    "metricKey": "deposit_pay_cnt_1d",
+    "businessName": "缴纳保证金次数",
+    "formula": "SUM(deposit_pay_cnt_1d)",
+    "unit": "单",
+    "description": "缴纳保证金次数-最近1天",
+    "sourceColumns": [
+      "deposit_pay_cnt_1d"
+    ],
+    "aliases": [
+      "缴纳保证金次数",
+      "deposit_pay_cnt_1d",
+      "缴纳保证金次数-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=缴纳保证金次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "entry_success_duration_hours_1d",
+    "businessName": "入驻成功平均总时长小时",
+    "formula": "SUM(entry_success_duration_hours_1d)",
+    "unit": "小时",
+    "description": "入驻成功平均总时长小时-最近1天",
+    "sourceColumns": [
+      "entry_success_duration_hours_1d"
+    ],
+    "aliases": [
+      "入驻成功平均总时长小时",
+      "entry_success_duration_hours_1d",
+      "入驻成功平均总时长小时-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=入驻成功平均总时长小时-最近1天"
+  },
+  {
+    "metricKey": "punish_cnt_1d",
+    "businessName": "处罚次数",
+    "formula": "SUM(punish_cnt_1d)",
+    "unit": "单",
+    "description": "处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正",
+    "sourceColumns": [
+      "punish_cnt_1d"
+    ],
+    "aliases": [
+      "处罚次数",
+      "punish_cnt_1d",
+      "处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "appeal_cnt_1d",
+    "businessName": "申诉次数",
+    "formula": "SUM(appeal_cnt_1d)",
+    "unit": "单",
+    "description": "申诉次数-最近1天",
+    "sourceColumns": [
+      "appeal_cnt_1d"
+    ],
+    "aliases": [
+      "申诉次数",
+      "appeal_cnt_1d",
+      "申诉次数-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=申诉次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "appeal_success_cnt_1d",
+    "businessName": "申诉成功次数",
+    "formula": "SUM(appeal_success_cnt_1d)",
+    "unit": "单",
+    "description": "申诉成功次数-最近1天",
+    "sourceColumns": [
+      "appeal_success_cnt_1d"
+    ],
+    "aliases": [
+      "申诉成功次数",
+      "appeal_success_cnt_1d",
+      "申诉成功次数-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=申诉成功次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "scm_performance_cnt_1d",
+    "businessName": "供应链履约量",
+    "formula": "SUM(scm_performance_cnt_1d)",
+    "unit": "单",
+    "description": "供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计",
+    "sourceColumns": [
+      "scm_performance_cnt_1d"
+    ],
+    "aliases": [
+      "供应链履约量",
+      "scm_performance_cnt_1d",
+      "供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "return_success_cnt_1d",
+    "businessName": "退货成功量",
+    "formula": "SUM(return_success_cnt_1d)",
+    "unit": "单",
+    "description": "退货成功量-最近1天",
+    "sourceColumns": [
+      "return_success_cnt_1d"
+    ],
+    "aliases": [
+      "退货成功量",
+      "return_success_cnt_1d",
+      "退货成功量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=退货成功量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "return_cnt_1d",
+    "businessName": "退货量",
+    "formula": "SUM(return_cnt_1d)",
+    "unit": "单",
+    "description": "退货量-最近1天",
+    "sourceColumns": [
+      "return_cnt_1d"
+    ],
+    "aliases": [
+      "退货量",
+      "return_cnt_1d",
+      "退货量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=退货量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "fake_identify_cnt_1d",
+    "businessName": "鉴定为假货量",
+    "formula": "SUM(fake_identify_cnt_1d)",
+    "unit": "单",
+    "description": "鉴定为假货量-最近1天",
+    "sourceColumns": [
+      "fake_identify_cnt_1d"
+    ],
+    "aliases": [
+      "鉴定为假货量",
+      "fake_identify_cnt_1d",
+      "鉴定为假货量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=鉴定为假货量-最近1天"
+  },
+  {
+    "metricKey": "check_unpass_cnt_1d",
+    "businessName": "质检不通过量",
+    "formula": "SUM(check_unpass_cnt_1d)",
+    "unit": "单",
+    "description": "质检不通过量-最近1天",
+    "sourceColumns": [
+      "check_unpass_cnt_1d"
+    ],
+    "aliases": [
+      "质检不通过量",
+      "check_unpass_cnt_1d",
+      "质检不通过量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=质检不通过量-最近1天"
+  },
+  {
+    "metricKey": "goods_audit_reject_cnt_1d",
+    "businessName": "商品审核拒绝量",
+    "formula": "SUM(goods_audit_reject_cnt_1d)",
+    "unit": "单",
+    "description": "商品审核拒绝量-最近1天",
+    "sourceColumns": [
+      "goods_audit_reject_cnt_1d"
+    ],
+    "aliases": [
+      "商品审核拒绝量",
+      "goods_audit_reject_cnt_1d",
+      "商品审核拒绝量-最近1天",
+      "审核拒绝量",
+      "审核拒绝数",
+      "审核驳回量",
+      "审核驳回数",
+      "拒绝量",
+      "驳回量"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=商品审核拒绝量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "goods_online_cnt_1d",
+    "businessName": "上架商品量",
+    "formula": "SUM(goods_online_cnt_1d)",
+    "unit": "单",
+    "description": "上架商品量-最近1天",
+    "sourceColumns": [
+      "goods_online_cnt_1d"
+    ],
+    "aliases": [
+      "上架商品量",
+      "goods_online_cnt_1d",
+      "上架商品量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=上架商品量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "goods_apply_cnt_1d",
+    "businessName": "商品申请量",
+    "formula": "SUM(goods_apply_cnt_1d)",
+    "unit": "单",
+    "description": "商品申请量-最近1天",
+    "sourceColumns": [
+      "goods_apply_cnt_1d"
+    ],
+    "aliases": [
+      "商品申请量",
+      "goods_apply_cnt_1d",
+      "商品申请量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=商品申请量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "trade_success_gmv_amt_1d",
+    "businessName": "交易成功gmv金额元",
+    "formula": "SUM(trade_success_gmv_amt_1d)",
+    "unit": "元",
+    "description": "交易成功gmv金额元-最近1天",
+    "sourceColumns": [
+      "trade_success_gmv_amt_1d"
+    ],
+    "aliases": [
+      "交易成功gmv金额元",
+      "trade_success_gmv_amt_1d",
+      "交易成功gmv金额元-最近1天",
+      "交易成功GMV",
+      "交易成功成交额",
+      "交易成功销售额"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=交易成功gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "trade_success_user_cnt_1d",
+    "businessName": "交易成功用户量",
+    "formula": "SUM(trade_success_user_cnt_1d)",
+    "unit": "单",
+    "description": "交易成功用户量-最近1天",
+    "sourceColumns": [
+      "trade_success_user_cnt_1d"
+    ],
+    "aliases": [
+      "交易成功用户量",
+      "trade_success_user_cnt_1d",
+      "交易成功用户量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=交易成功用户量-最近1天"
+  },
+  {
+    "metricKey": "avg_pay_order_amt_1d",
+    "businessName": "支付成功客单价元",
+    "formula": "AVG(avg_pay_order_amt_1d)",
+    "unit": "元",
+    "description": "支付成功客单价元-最近1天",
+    "sourceColumns": [
+      "avg_pay_order_amt_1d"
+    ],
+    "aliases": [
+      "支付成功客单价元",
+      "avg_pay_order_amt_1d",
+      "支付成功客单价元-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=支付成功客单价元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "order_close_cnt_1d",
+    "businessName": "关闭订单量",
+    "formula": "SUM(order_close_cnt_1d)",
+    "unit": "单",
+    "description": "关闭订单量-最近1天",
+    "sourceColumns": [
+      "order_close_cnt_1d"
+    ],
+    "aliases": [
+      "关闭订单量",
+      "order_close_cnt_1d",
+      "关闭订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=关闭订单量-最近1天"
+  },
+  {
+    "metricKey": "seller_subsidy_amt_1d",
+    "businessName": "商家补贴金额元",
+    "formula": "SUM(seller_subsidy_amt_1d)",
+    "unit": "元",
+    "description": "商家补贴金额元-最近1天",
+    "sourceColumns": [
+      "seller_subsidy_amt_1d"
+    ],
+    "aliases": [
+      "商家补贴金额元",
+      "seller_subsidy_amt_1d",
+      "商家补贴金额元-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=商家补贴金额元-最近1天"
+  },
+  {
+    "metricKey": "platform_subsidy_amt_1d",
+    "businessName": "平台补贴金额元",
+    "formula": "SUM(platform_subsidy_amt_1d)",
+    "unit": "元",
+    "description": "平台补贴金额元-最近1天",
+    "sourceColumns": [
+      "platform_subsidy_amt_1d"
+    ],
+    "aliases": [
+      "平台补贴金额元",
+      "platform_subsidy_amt_1d",
+      "平台补贴金额元-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=平台补贴金额元-最近1天"
+  },
+  {
+    "metricKey": "ship_timeout_order_cnt_1d",
+    "businessName": "发货超时订单量",
+    "formula": "SUM(ship_timeout_order_cnt_1d)",
+    "unit": "单",
+    "description": "发货超时订单量-最近1天",
+    "sourceColumns": [
+      "ship_timeout_order_cnt_1d"
+    ],
+    "aliases": [
+      "发货超时订单量",
+      "ship_timeout_order_cnt_1d",
+      "发货超时订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=发货超时订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "signed_order_cnt_1d",
+    "businessName": "签收订单量",
+    "formula": "SUM(signed_order_cnt_1d)",
+    "unit": "单",
+    "description": "签收订单量-最近1天",
+    "sourceColumns": [
+      "signed_order_cnt_1d"
+    ],
+    "aliases": [
+      "签收订单量",
+      "signed_order_cnt_1d",
+      "签收订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=签收订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "delivery_timeout_order_cnt_1d",
+    "businessName": "签收超预计送达订单量",
+    "formula": "SUM(delivery_timeout_order_cnt_1d)",
+    "unit": "单",
+    "description": "签收超预计送达订单量-最近1天",
+    "sourceColumns": [
+      "delivery_timeout_order_cnt_1d"
+    ],
+    "aliases": [
+      "签收超预计送达订单量",
+      "delivery_timeout_order_cnt_1d",
+      "签收超预计送达订单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=签收超预计送达订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "pay_discount_rate_1d",
+    "businessName": "支付成功优惠金额占支付gmv比例",
+    "formula": "AVG(pay_discount_rate_1d)",
+    "unit": "%",
+    "description": "支付成功优惠金额占支付gmv比例-最近1天",
+    "sourceColumns": [
+      "pay_discount_rate_1d"
+    ],
+    "aliases": [
+      "支付成功优惠金额占支付gmv比例",
+      "pay_discount_rate_1d",
+      "支付成功优惠金额占支付gmv比例-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=支付成功优惠金额占支付gmv比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+  },
+  {
+    "metricKey": "refund_amt_1d",
+    "businessName": "退款金额元",
+    "formula": "SUM(refund_amt_1d)",
+    "unit": "元",
+    "description": "退款金额元-最近1天",
+    "sourceColumns": [
+      "refund_amt_1d"
+    ],
+    "aliases": [
+      "退款金额元",
+      "refund_amt_1d",
+      "退款金额元-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=退款金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "return_success_amt_1d",
+    "businessName": "退货成功金额元",
+    "formula": "SUM(return_success_amt_1d)",
+    "unit": "元",
+    "description": "退货成功金额元-最近1天",
+    "sourceColumns": [
+      "return_success_amt_1d"
+    ],
+    "aliases": [
+      "退货成功金额元",
+      "return_success_amt_1d",
+      "退货成功金额元-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=退货成功金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "seller_responsible_refund_cnt_1d",
+    "businessName": "卖家责任退货量",
+    "formula": "SUM(seller_responsible_refund_cnt_1d)",
+    "unit": "单",
+    "description": "卖家责任退货量-最近1天",
+    "sourceColumns": [
+      "seller_responsible_refund_cnt_1d"
+    ],
+    "aliases": [
+      "卖家责任退货量",
+      "seller_responsible_refund_cnt_1d",
+      "卖家责任退货量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=卖家责任退货量-最近1天"
+  },
+  {
+    "metricKey": "direct_refund_cnt_1d",
+    "businessName": "直接退款量",
+    "formula": "SUM(direct_refund_cnt_1d)",
+    "unit": "单",
+    "description": "直接退款量-最近1天",
+    "sourceColumns": [
+      "direct_refund_cnt_1d"
+    ],
+    "aliases": [
+      "直接退款量",
+      "direct_refund_cnt_1d",
+      "直接退款量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=直接退款量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "refund_rate_1d",
+    "businessName": "退货量占支付订单量比例",
+    "formula": "AVG(refund_rate_1d)",
+    "unit": "%",
+    "description": "退货量占支付订单量比例-最近1天",
+    "sourceColumns": [
+      "refund_rate_1d"
+    ],
+    "aliases": [
+      "退货量占支付订单量比例",
+      "退款率",
+      "退货率",
+      "售后率",
+      "整体退款率",
+      "店铺退款率",
+      "refund_rate",
+      "refund_rate_1d",
+      "退货量占支付订单量比例-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=退货量占支付订单量比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+  },
+  {
+    "metricKey": "ticket_reopen_cnt_1d",
+    "businessName": "工单二次开启量",
+    "formula": "SUM(ticket_reopen_cnt_1d)",
+    "unit": "单",
+    "description": "工单二次开启量-最近1天",
+    "sourceColumns": [
+      "ticket_reopen_cnt_1d"
+    ],
+    "aliases": [
+      "工单二次开启量",
+      "ticket_reopen_cnt_1d",
+      "工单二次开启量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=工单二次开启量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "ticket_reminder_cnt_1d",
+    "businessName": "催单工单量",
+    "formula": "SUM(ticket_reminder_cnt_1d)",
+    "unit": "单",
+    "description": "催单工单量-最近1天",
+    "sourceColumns": [
+      "ticket_reminder_cnt_1d"
+    ],
+    "aliases": [
+      "催单工单量",
+      "ticket_reminder_cnt_1d",
+      "催单工单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=催单工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "ticket_close_cnt_1d",
+    "businessName": "关闭工单量",
+    "formula": "SUM(ticket_close_cnt_1d)",
+    "unit": "单",
+    "description": "关闭工单量-最近1天",
+    "sourceColumns": [
+      "ticket_close_cnt_1d"
+    ],
+    "aliases": [
+      "关闭工单量",
+      "ticket_close_cnt_1d",
+      "关闭工单量-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=关闭工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "avg_ticket_score_1d",
+    "businessName": "平均工单评价分",
+    "formula": "AVG(avg_ticket_score_1d)",
+    "unit": "",
+    "description": "平均工单评价分-最近1天",
+    "sourceColumns": [
+      "avg_ticket_score_1d"
+    ],
+    "aliases": [
+      "平均工单评价分",
+      "avg_ticket_score_1d",
+      "平均工单评价分-最近1天"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=平均工单评价分-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+  },
+  {
+    "metricKey": "goods_audit_pass_cnt_1d",
+    "businessName": "商品审核通过量",
+    "formula": "SUM(goods_audit_pass_cnt_1d)",
+    "unit": "单",
+    "description": "商品审核通过量-最近1天",
+    "sourceColumns": [
+      "goods_audit_pass_cnt_1d"
+    ],
+    "aliases": [
+      "商品审核通过量",
+      "goods_audit_pass_cnt_1d",
+      "商品审核通过量-最近1天",
+      "审核通过量",
+      "审核通过数",
+      "通过量"
+    ],
+    "confidence": 0.78,
+    "evidence": "schema comment=商品审核通过量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "net_gmv_after_refund",
+    "businessName": "扣退款后 GMV",
+    "formula": "SUM(order_gmv_amt_1d) - SUM(refund_amt_1d)",
+    "unit": "元",
+    "description": "总 GMV 扣除退款金额后的经营净额，用于分析退款对成交表现的影响",
+    "sourceColumns": [
+      "order_gmv_amt_1d",
+      "refund_amt_1d"
+    ],
+    "aliases": [
+      "扣退款后 GMV"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  },
+  {
+    "metricKey": "return_rate_by_pay_order",
+    "businessName": "退货率",
+    "formula": "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+    "unit": "%",
+    "description": "退货量占支付订单量比例；若表内已有 refund_rate_1d，也可直接使用 AVG(refund_rate_1d)",
+    "sourceColumns": [
+      "return_cnt_1d",
+      "pay_order_cnt_1d"
+    ],
+    "aliases": [
+      "退货率"
+    ],
+    "confidence": 0.82,
+    "evidence": "由 Topic Builder 基于字段组合自动生成"
+  }
+]

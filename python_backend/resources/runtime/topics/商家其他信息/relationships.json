@@ -1,0 +1,12 @@
+[
+  {
+    "name": "deposit_profile_by_merchant_day",
+    "leftTable": "dwd_merchant_deposit_recharge_df",
+    "rightTable": "ads_merchant_profile",
+    "joinType": "LEFT",
+    "keys": [["merchant_id", "merchant_id"], ["pt", "pt"]],
+    "grain": "merchant_day",
+    "useCases": ["保证金充值金额与经营画像 GMV、退款、赔付、工单等日指标做趋势或相关性分析"],
+    "cautions": ["该关系只用于同一商家同一业务日期的趋势对齐；不要把保证金充值流水明细与订单明细直接当作订单级关系"]
+  }
+]

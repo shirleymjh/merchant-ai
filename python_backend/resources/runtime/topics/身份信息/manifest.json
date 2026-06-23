@@ -1,0 +1,21 @@
+[
+  {
+    "tableName": "dim_merchant_df",
+    "tableComment": "dim-商家域-商家信息表",
+    "dataGrain": "商家主体/资质快照粒度",
+    "timeColumn": "pt",
+    "merchantFilterColumn": "merchant_id",
+    "freshnessType": "OFFLINE",
+    "supportsDetail": true,
+    "supportsMetrics": true,
+    "preferredFor": [
+      "DETAIL",
+      "METRIC",
+      "TOPN",
+      "GROUP_AGG",
+      "RULE_REFERENCE"
+    ],
+    "metricCount": 5,
+    "ruleCount": 3
+  }
+]

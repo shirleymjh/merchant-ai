@@ -1,0 +1,499 @@
+[ {
+  "columnName" : "ticket_id",
+  "dataType" : "varchar(128)",
+  "comment" : "工单编号",
+  "nullable" : false,
+  "keyType" : "UNI"
+}, {
+  "columnName" : "pt",
+  "dataType" : "date",
+  "comment" : "业务日期",
+  "nullable" : false,
+  "keyType" : "UNI"
+}, {
+  "columnName" : "ticket_title",
+  "dataType" : "text",
+  "comment" : "工单标题",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "session_id",
+  "dataType" : "text",
+  "comment" : "会话id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "call_id",
+  "dataType" : "text",
+  "comment" : "通话id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_source_code",
+  "dataType" : "text",
+  "comment" : "末级来源id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "priority_code",
+  "dataType" : "bigint",
+  "comment" : "工单等级类型code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "priority_name",
+  "dataType" : "text",
+  "comment" : "工单等级类型name，普通、加急",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_type_code",
+  "dataType" : "text",
+  "comment" : "工单类型code，存储最后级别的分类id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "user_type_code",
+  "dataType" : "bigint",
+  "comment" : "客户身份，0买家、1卖家",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "user_type_name",
+  "dataType" : "text",
+  "comment" : "客户身份，买家、卖家",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "start_operator_id",
+  "dataType" : "text",
+  "comment" : "工单发起人",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "assignee_operator_id",
+  "dataType" : "text",
+  "comment" : "工单跟进人",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "assignee_group_id",
+  "dataType" : "text",
+  "comment" : "处理组id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "is_reopen",
+  "dataType" : "bigint",
+  "comment" : "是否二次开启 0否 1时",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "is_forward",
+  "dataType" : "bigint",
+  "comment" : "是否流转 0 否 1 是",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "responsible_type_code",
+  "dataType" : "bigint",
+  "comment" : "责任方code，1买家 2卖家 3客户",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "responsible_type_name",
+  "dataType" : "text",
+  "comment" : "责任方name，买家 卖家 客户",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "close_time",
+  "dataType" : "text",
+  "comment" : "工单完成时间",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "follow_time",
+  "dataType" : "text",
+  "comment" : "工单相应时间，第一次消息回复消息",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "chat_time",
+  "dataType" : "text",
+  "comment" : "工单会话",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "evaluate_time",
+  "dataType" : "text",
+  "comment" : "工单评价会话",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "cancel_time",
+  "dataType" : "text",
+  "comment" : "工单取消时间",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_status_code",
+  "dataType" : "bigint",
+  "comment" : "工单状态code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_status_name",
+  "dataType" : "text",
+  "comment" : "工单状态name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_id",
+  "dataType" : "text",
+  "comment" : "商品id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "is_reminder",
+  "dataType" : "bigint",
+  "comment" : "是否催单 0 否 1 是",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "reminder_cnt",
+  "dataType" : "bigint",
+  "comment" : "催单次数",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "evaluation_status_code",
+  "dataType" : "bigint",
+  "comment" : "评价状态code，0未邀评 1买家邀评 2卖家已邀评 3 卖家买家已邀评",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "evaluation_status_name",
+  "dataType" : "text",
+  "comment" : "评价状态name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_score",
+  "dataType" : "bigint",
+  "comment" : "工单评价分数",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_create_time",
+  "dataType" : "text",
+  "comment" : "工单创建时间",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_modify_time",
+  "dataType" : "text",
+  "comment" : "工单更新时间",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "order_id",
+  "dataType" : "text",
+  "comment" : "订单号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "sub_order_id",
+  "dataType" : "text",
+  "comment" : "子订单号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_id",
+  "dataType" : "text",
+  "comment" : "买家id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_name",
+  "dataType" : "text",
+  "comment" : "买家用户昵称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_real_name",
+  "dataType" : "text",
+  "comment" : "买家用户姓名",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_mobile",
+  "dataType" : "text",
+  "comment" : "买家用户手机",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_type_code",
+  "dataType" : "bigint",
+  "comment" : "商户类型code 0.个人vip商户 1.急速发货商户 2.企业商户 3.认证商户 4.跨境商家  5.个人普通商户",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_type_name",
+  "dataType" : "text",
+  "comment" : "商户类型name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_express_id",
+  "dataType" : "text",
+  "comment" : "卖家运单号，指卖家发往平台的运单",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_express_type_code",
+  "dataType" : "bigint",
+  "comment" : "卖家物流类型code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_express_type_name",
+  "dataType" : "text",
+  "comment" : "卖家物流类型name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_express_id",
+  "dataType" : "text",
+  "comment" : "买家运单号，指平台发往用户的运单",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_express_type_code",
+  "dataType" : "bigint",
+  "comment" : "买家物流类型code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "buyer_express_type_name",
+  "dataType" : "text",
+  "comment" : "买家物流类型name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_id",
+  "dataType" : "text",
+  "comment" : "卖家用户id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_name",
+  "dataType" : "text",
+  "comment" : "卖家用户昵称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_real_name",
+  "dataType" : "text",
+  "comment" : "卖家用户姓名",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "seller_mobile",
+  "dataType" : "text",
+  "comment" : "卖家联系方式",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "ticket_content",
+  "dataType" : "text",
+  "comment" : "留言信息，富文本",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "msg_content_list",
+  "dataType" : "text",
+  "comment" : "对话list",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "attachment_url_list",
+  "dataType" : "text",
+  "comment" : "附件list",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "check_result",
+  "dataType" : "text",
+  "comment" : "质检结果,通过、未通过",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "check_remark",
+  "dataType" : "text",
+  "comment" : "质检备注",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_source_code",
+  "dataType" : "bigint",
+  "comment" : "一级来源code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_source_name",
+  "dataType" : "text",
+  "comment" : "一级来源名称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_source_code",
+  "dataType" : "bigint",
+  "comment" : "二级来源code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_source_name",
+  "dataType" : "text",
+  "comment" : "二级来源名称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_source_code",
+  "dataType" : "bigint",
+  "comment" : "三级来源code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_source_name",
+  "dataType" : "text",
+  "comment" : "三级来源名称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_type_code",
+  "dataType" : "bigint",
+  "comment" : "工单一级类型id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_type_name",
+  "dataType" : "text",
+  "comment" : "工单一级类型",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_type_code",
+  "dataType" : "bigint",
+  "comment" : "工单二级类型id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_type_name",
+  "dataType" : "text",
+  "comment" : "工单二级类型",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_type_code",
+  "dataType" : "bigint",
+  "comment" : "工单三级类型id",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_type_name",
+  "dataType" : "text",
+  "comment" : "工单三级类型",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "operator_name",
+  "dataType" : "text",
+  "comment" : "工单操作人用户名",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "real_name",
+  "dataType" : "text",
+  "comment" : "真实姓名",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "email",
+  "dataType" : "text",
+  "comment" : "邮箱地址",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "mobile",
+  "dataType" : "text",
+  "comment" : "手机号",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "operator_type_code",
+  "dataType" : "bigint",
+  "comment" : "员工类型 1全渠道员工 2呼叫中心员工 3即时通讯员工 4工单员工 5外呼员工",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "operator_type_name",
+  "dataType" : "text",
+  "comment" : "员工类型 1全渠道员工 2呼叫中心员工 3即时通讯员工 4工单员工 5外呼员工",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "spu_name",
+  "dataType" : "text",
+  "comment" : "spu名称",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_category_code",
+  "dataType" : "bigint",
+  "comment" : "一级类目code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level1_category_name",
+  "dataType" : "text",
+  "comment" : "一级类目name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_category_code",
+  "dataType" : "bigint",
+  "comment" : "二级类目code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level2_category_name",
+  "dataType" : "text",
+  "comment" : "二级类目name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_category_code",
+  "dataType" : "bigint",
+  "comment" : "三级类目code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "level3_category_name",
+  "dataType" : "text",
+  "comment" : "三级类目name",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "brand_code",
+  "dataType" : "bigint",
+  "comment" : "品牌code",
+  "nullable" : true,
+  "keyType" : ""
+}, {
+  "columnName" : "brand_name",
+  "dataType" : "text",
+  "comment" : "品牌name",
+  "nullable" : true,
+  "keyType" : ""
+} ]
