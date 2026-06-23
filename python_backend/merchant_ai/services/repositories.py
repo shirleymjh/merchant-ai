@@ -11,8 +11,9 @@ from merchant_ai.models import MerchantInfo, PendingAnswer
 
 
 class DatabaseClient:
-    def __init__(self, jdbc_url: str, username: str, password: str):
+    def __init__(self, jdbc_url: str, username: str, password: str, read_timeout_seconds: int = 30):
         self.kwargs = jdbc_to_pymysql_kwargs(jdbc_url, username, password)
+        self.read_timeout_seconds = max(1, int(read_timeout_seconds or 30))
         self.available = True
 
     @contextmanager
@@ -25,8 +26,8 @@ class DatabaseClient:
             kwargs.pop("cursorclass_name", None)
             kwargs["cursorclass"] = DictCursor
             kwargs.setdefault("connect_timeout", 5)
-            kwargs.setdefault("read_timeout", 30)
-            kwargs.setdefault("write_timeout", 30)
+            kwargs.setdefault("read_timeout", self.read_timeout_seconds)
+            kwargs.setdefault("write_timeout", self.read_timeout_seconds)
             conn = pymysql.connect(**kwargs)
         except Exception as exc:
             self.available = False
@@ -59,7 +60,7 @@ class DatabaseClient:
 
 class DorisRepository:
     def __init__(self, settings: Settings):
-        self.db = DatabaseClient(settings.doris_jdbc_url, settings.doris_username, settings.doris_password)
+        self.db = DatabaseClient(settings.doris_jdbc_url, settings.doris_username, settings.doris_password, settings.doris_read_timeout_seconds)
 
     def query(self, sql: str, params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
         return self.db.query(sql, params)
@@ -80,7 +81,7 @@ class DorisRepository:
 class AnswerRepository:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.db = DatabaseClient(settings.answer_jdbc_url, settings.answer_username, settings.answer_password)
+        self.db = DatabaseClient(settings.answer_jdbc_url, settings.answer_username, settings.answer_password, settings.doris_read_timeout_seconds)
         self.available = True
         self.init_schema()
 

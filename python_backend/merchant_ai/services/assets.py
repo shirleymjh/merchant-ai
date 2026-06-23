@@ -25,7 +25,9 @@ class TopicAssetService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._table_asset_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._manifest_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._relationship_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._topic_names_cache: Optional[List[str]] = None
 
     @property
     def root(self) -> Path:
@@ -54,13 +56,20 @@ class TopicAssetService:
                 if file_path.is_file():
                     (target / file_path.name).write_bytes(file_path.read_bytes())
             self._table_asset_cache.pop((topic, table_name), None)
+            self._manifest_cache.pop(topic, None)
+            self._relationship_cache.pop(topic, None)
+            self._topic_names_cache = None
             return {"success": True, "status": "PUBLISHED", "topic": topic, "tableName": table_name}
         return {"success": True, "status": "REJECTED", "topic": topic, "tableName": table_name}
 
     def load_manifest(self, topic: str) -> List[Dict[str, Any]]:
+        if topic in self._manifest_cache:
+            return self._manifest_cache[topic]
         path = self.root / topic / "manifest.json"
         data = read_json(path)
-        return data if isinstance(data, list) else []
+        manifest = data if isinstance(data, list) else []
+        self._manifest_cache[topic] = manifest
+        return manifest
 
     def topic_names_for_categories(self, categories: Iterable[QuestionCategory]) -> List[str]:
         display_to_topic = {category_display(category): category for category in QuestionCategory}
@@ -74,9 +83,12 @@ class TopicAssetService:
         return names
 
     def all_topic_names(self) -> List[str]:
+        if self._topic_names_cache is not None:
+            return self._topic_names_cache
         if not self.root.exists():
             return []
-        return [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
+        self._topic_names_cache = [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
+        return self._topic_names_cache
 
     def table_asset_dir(self, topic: str, table: str) -> Path:
         return self.root / topic / "tables" / table
@@ -145,6 +157,10 @@ class SemanticCatalogService:
 
     def __init__(self, topic_assets: TopicAssetService):
         self.topic_assets = topic_assets
+        self._refs_cache: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]] = {}
+
+    def clear_cache(self) -> None:
+        self._refs_cache.clear()
 
     def ls(
         self,
@@ -326,8 +342,12 @@ class SemanticCatalogService:
         return self.topic_assets.all_topic_names()
 
     def _all_refs(self, topic_categories: Iterable[QuestionCategory] | None = None, topic: str = "") -> List[Dict[str, Any]]:
+        topics = tuple(self._topics(topic_categories, topic))
+        cache_key = (topic or "", topics)
+        if cache_key in self._refs_cache:
+            return self._refs_cache[cache_key]
         refs: List[Dict[str, Any]] = []
-        for topic_name in self._topics(topic_categories, topic):
+        for topic_name in topics:
             for manifest_item in self.topic_assets.load_manifest(topic_name):
                 table = str(manifest_item.get("tableName") or "")
                 if table:
@@ -335,6 +355,7 @@ class SemanticCatalogService:
             relationships = self.topic_assets.load_relationships(topic_name)
             if relationships:
                 refs.append(self.relationship_ref(topic_name, relationships))
+        self._refs_cache[cache_key] = refs
         return refs
 
     def _resolve_ref(self, ref_id: str, path: str) -> Dict[str, Any] | None:
@@ -664,6 +685,7 @@ class PlanningAssetPackBuilder:
         self.skill_loader = skill_loader or SkillLoader(topic_assets.settings)
         self.doris_repository = doris_repository
         self._all_metrics_by_key_cache: Optional[Dict[str, List[PlanningAssetEntry]]] = None
+        self._live_schema_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def compact(
         self,
@@ -1040,11 +1062,15 @@ class PlanningAssetPackBuilder:
             )
 
     def _live_schema(self, table: str) -> List[Dict[str, Any]]:
+        if table in self._live_schema_cache:
+            return self._live_schema_cache[table]
         if not self.doris_repository:
             return []
         try:
             rows = self.doris_repository.show_full_columns(table)
-            return rows if isinstance(rows, list) else []
+            live_schema = rows if isinstance(rows, list) else []
+            self._live_schema_cache[table] = live_schema
+            return live_schema
         except Exception:
             return []
 

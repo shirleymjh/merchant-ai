@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     )
     doris_username: str = Field("root", validation_alias="YSHOPPING_DORIS_USERNAME")
     doris_password: str = Field("", validation_alias="YSHOPPING_DORIS_PASSWORD")
+    doris_read_timeout_seconds: int = Field(30, validation_alias="YSHOPPING_DORIS_READ_TIMEOUT_SECONDS")
 
     answer_jdbc_url: str = Field(
         "jdbc:mysql://127.0.0.1:9030/yshopping?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai",

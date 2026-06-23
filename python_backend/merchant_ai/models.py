@@ -499,6 +499,7 @@ class NodePlanContract(APIModel):
     metric_column: str = ""
     metric_name: str = ""
     metric_formula: str = ""
+    metric_specs: List[Dict[str, Any]] = Field(default_factory=list)
     group_by_column: str = ""
     output_keys: List[str] = Field(default_factory=list)
     required_evidence: List[str] = Field(default_factory=list)
@@ -716,6 +717,7 @@ class QuestionIntent(APIModel):
     metric_column: str = ""
     metric_name: str = ""
     metric_formula: str = ""
+    metric_specs: List[Dict[str, Any]] = Field(default_factory=list)
     group_by_column: str = ""
     group_by_name: str = ""
     filter_column: str = ""

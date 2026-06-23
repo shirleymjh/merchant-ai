@@ -55,6 +55,9 @@ STRUCTURED_FALLBACK_ERROR_CODES = {
     "MISSING_PARTITION_FILTER",
     "INVALID_PARTITION_FILTER",
     "MISSING_OUTPUT_KEY",
+    "MEM_ALLOC_FAILED",
+    "TIMEOUT",
+    "SQL_SYNTAX",
     "DORIS_ERROR",
 }
 STRICT_STRUCTURED_FALLBACK_CODES = {
@@ -62,6 +65,7 @@ STRICT_STRUCTURED_FALLBACK_CODES = {
     "UNKNOWN_CONTRACT_COLUMN",
     "INVALID_PARTITION_FILTER",
 }
+RESOURCE_CONSTRAINED_DORIS_ERRORS = {"MEM_ALLOC_FAILED", "TIMEOUT"}
 
 
 class SqlValidationService:
@@ -330,6 +334,7 @@ class NodeWorkerExecutor:
         knowledge_context: str,
         question: str,
     ) -> AgentRunResult:
+        optimize_query_plan_for_execution(plan, asset_pack)
         result = AgentRunResult()
         executable = [intent for intent in plan.intents if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE]
         tasks_by_id = {intent.plan_task_id or "node_%s" % (index + 1): intent for index, intent in enumerate(executable)}
@@ -787,26 +792,28 @@ class NodeWorkerExecutor:
                 )
             except Exception as exc:
                 error_text = str(exc)
-                self.tool_failure_registry.record_failure("execute_sql", execute_args, classify_doris_error(error_text), error_text)
-                record_tool(tool_traces, intent, "execute_sql", "failed", trim_sql(sql), error_text[:240], classify_doris_error(error_text), round_index)
+                doris_error_code = classify_doris_error(error_text)
+                policy = doris_error_policy(doris_error_code)
+                self.tool_failure_registry.record_failure("execute_sql", execute_args, doris_error_code, error_text)
+                record_tool(tool_traces, intent, "execute_sql", "failed", trim_sql(sql), error_text[:240], doris_error_code, round_index)
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris 失败", action="query_doris", observation=error_text[:240]))
                 structured_attempt = self._structured_fallback_attempt(
                     sql,
-                    validation.model_copy(update={"valid": False, "error_code": "DORIS_ERROR", "message": error_text}),
+                    validation.model_copy(update={"valid": False, "error_code": doris_error_code, "message": error_text}),
                     intent,
                     asset_pack,
                     context,
                 )
-                if structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                if policy["structured_fallback"] and structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
                     repair_attempts.append(structured_attempt)
                     record_tool(
                         tool_traces,
                         intent,
                         "draft_structured_sql_fallback",
                         "success",
-                        classify_doris_error(error_text),
+                        doris_error_code,
                         trim_sql(structured_attempt.repaired_sql),
-                        classify_doris_error(error_text),
+                        doris_error_code,
                         round_index + 1,
                     )
                     trace.append(
@@ -819,7 +826,30 @@ class NodeWorkerExecutor:
                     )
                     sql = structured_attempt.repaired_sql
                     continue
-                if round_index >= self.settings.agent_sql_repair_rounds or not is_repairable_doris_error(error_text):
+                resource_attempt = self._resource_safe_fallback_attempt(sql, doris_error_code, error_text, intent, asset_pack, context)
+                if policy["resource_fallback"] and resource_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                    repair_attempts.append(resource_attempt)
+                    record_tool(
+                        tool_traces,
+                        intent,
+                        "draft_resource_safe_sql_fallback",
+                        "success",
+                        doris_error_code,
+                        trim_sql(resource_attempt.repaired_sql),
+                        doris_error_code,
+                        round_index + 1,
+                    )
+                    trace.append(
+                        ReActStep(
+                            round=4 + round_index * 3,
+                            reason="Doris 资源错误后改用资源保护 SQL",
+                            action="draft_resource_safe_sql_fallback",
+                            observation=error_text[:160],
+                        )
+                    )
+                    sql = resource_attempt.repaired_sql
+                    continue
+                if round_index >= self.settings.agent_sql_repair_rounds or not policy["llm_repair"]:
                     return AgentTaskResult(
                         success=False,
                         summary="Doris 查询失败: %s" % error_text[:200],
@@ -834,7 +864,7 @@ class NodeWorkerExecutor:
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
-                repaired = self._repair_sql(sql, validation.model_copy(update={"valid": False, "error_code": "DORIS_ERROR", "message": error_text}), intent, asset_pack, context)
+                repaired = self._repair_sql(sql, validation.model_copy(update={"valid": False, "error_code": doris_error_code, "message": error_text}), intent, asset_pack, context)
                 repair_attempts.append(repaired)
                 repair_summary = trim_sql(repaired.repaired_sql)
                 repair_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair"), None)
@@ -848,9 +878,9 @@ class NodeWorkerExecutor:
                     intent,
                     "repair_sql",
                     "success" if repaired.repaired_sql else "failed",
-                    classify_doris_error(error_text),
+                    doris_error_code,
                     repair_summary,
-                    classify_doris_error(error_text),
+                    doris_error_code,
                     round_index + 1,
                 )
                 if not repaired.repaired_sql:
@@ -977,6 +1007,7 @@ class NodeWorkerExecutor:
                     "只生成 SELECT/WITH 查询；禁止 DDL/DML；只能查询 nodePlanContract.preferredTable；不要 join 其他表；"
                     "只能使用 nodePlanContract.allowedColumns 里的真实字段；不要使用 contract 外字段或表。"
                     "必须使用 nodePlanContract.merchantFilterColumn 做商家过滤；"
+                    "如果 nodePlanContract.metricSpecs 不为空，SELECT 必须输出每个 metricSpec 的 metricName；公式只能使用 metricSpec.sourceColumns/metricFormula。"
                     "如果问题或 upstreamEntitySets 提供了 sub_order_id/spu_id/refund_id/ticket_id/bill_id，必须用这些分桶/主键过滤；"
                     "selectMustInclude 是强制 SELECT 输出列，必须逐个原样出现在 SELECT 中；"
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
@@ -1133,45 +1164,78 @@ class NodeWorkerExecutor:
             success=True,
         )
 
-    def _draft_structured_sql(self, intent: QuestionIntent, asset_pack: PlanningAssetPack, context: NodeExecutionContext) -> str:
+    def _resource_safe_fallback_attempt(
+        self,
+        sql: str,
+        error_code: str,
+        error_text: str,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        context: NodeExecutionContext,
+    ) -> SqlRepairAttempt | None:
+        if error_code not in RESOURCE_CONSTRAINED_DORIS_ERRORS:
+            return None
+        safe_sql = self._draft_structured_sql(intent, asset_pack, context, resource_safe=True)
+        if not safe_sql or equivalent_sql(sql, safe_sql):
+            return None
+        return SqlRepairAttempt(
+            task_id=intent.plan_task_id,
+            round=1,
+            original_sql=sql,
+            repaired_sql=safe_sql,
+            error_code=error_code,
+            error_message="Doris resource error; switched to resource-safe SQL: %s" % error_text[:180],
+            success=True,
+        )
+
+    def _draft_structured_sql(
+        self,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        context: NodeExecutionContext,
+        resource_safe: bool = False,
+    ) -> str:
         table = intent.preferred_table
         columns = set(asset_pack.known_columns(table))
         if not table or not columns:
             return ""
-        where = self._structured_where(intent, table, columns, context)
+        where = self._structured_where(intent, table, columns, context, entity_value_limit=50 if resource_safe else 200)
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
-            return self._draft_structured_aggregate_sql(intent, table, columns, where_sql)
-        select_columns = self._structured_detail_columns(intent, columns)
+            return self._draft_structured_aggregate_sql(intent, table, columns, where_sql, resource_safe=resource_safe)
+        select_columns = self._structured_detail_columns(intent, columns, resource_safe=resource_safe)
         return "SELECT %s FROM `%s`%s LIMIT %d" % (
             ", ".join(quote_identifier(column) for column in select_columns),
             table,
             where_sql,
-            min(max(intent.limit or 20, 1), 50),
+            structured_limit(intent.limit, detail=True, resource_safe=resource_safe),
         )
 
-    def _draft_structured_aggregate_sql(self, intent: QuestionIntent, table: str, columns: set, where_sql: str) -> str:
+    def _draft_structured_aggregate_sql(
+        self,
+        intent: QuestionIntent,
+        table: str,
+        columns: set,
+        where_sql: str,
+        resource_safe: bool = False,
+    ) -> str:
         group_columns = self._structured_group_columns(intent, columns)
         select_parts = [quote_identifier(column) for column in group_columns]
-        count_alias = count_alias_for_table(table)
-        select_parts.append("COUNT(*) AS `%s`" % count_alias)
-        order_expr = "`%s` DESC" % count_alias
-        metric_expr = compile_metric_formula(intent.metric_formula, columns)
-        if intent.metric_formula and not metric_expr:
+        metric_parts = structured_metric_select_parts(intent, table, columns)
+        if metric_parts is None:
             return ""
-        if metric_expr:
-            metric_alias = metric_alias_for_intent(intent, table)
-            select_parts.append("%s AS `%s`" % (metric_expr, metric_alias))
-            order_expr = "`%s` DESC" % metric_alias
-        elif intent.metric_column and intent.metric_column in columns:
-            metric_alias = metric_alias_for_intent(intent, table)
-            if is_count_metric_alias(metric_alias):
-                select_parts.append("COUNT(DISTINCT `%s`) AS `%s`" % (intent.metric_column, metric_alias))
-            else:
-                select_parts.append("SUM(`%s`) AS `%s`" % (intent.metric_column, metric_alias))
-            order_expr = "`%s` DESC" % metric_alias
-        for column in self._structured_context_columns(intent, columns, group_columns):
-            select_parts.append("MAX(`%s`) AS `%s`" % (column, column))
+        if metric_parts:
+            for index, (metric_expr, metric_alias) in enumerate(metric_parts):
+                select_parts.append("%s AS `%s`" % (metric_expr, metric_alias))
+                if index == 0:
+                    order_expr = "`%s` DESC" % metric_alias
+        else:
+            count_alias = count_alias_for_table(table)
+            select_parts.append("COUNT(*) AS `%s`" % count_alias)
+            order_expr = "`%s` DESC" % count_alias
+        if not resource_safe:
+            for column in self._structured_context_columns(intent, columns, group_columns):
+                select_parts.append("MAX(`%s`) AS `%s`" % (column, column))
         if not group_columns:
             return "SELECT %s FROM `%s`%s" % (", ".join(select_parts), table, where_sql)
         return "SELECT %s FROM `%s`%s GROUP BY %s ORDER BY %s LIMIT %d" % (
@@ -1180,14 +1244,23 @@ class NodeWorkerExecutor:
             where_sql,
             ", ".join(quote_identifier(column) for column in group_columns),
             order_expr,
-            min(max(intent.limit or 20, 1), 100),
+            structured_limit(intent.limit, detail=False, resource_safe=resource_safe),
         )
 
-    def _structured_detail_columns(self, intent: QuestionIntent, columns: set) -> List[str]:
+    def _structured_detail_columns(self, intent: QuestionIntent, columns: set, resource_safe: bool = False) -> List[str]:
         preferred = []
         for column in intent.output_keys + intent.required_evidence + [intent.filter_column, intent.group_by_column, intent.metric_column]:
             if column and column in columns and column not in preferred:
                 preferred.append(column)
+        for spec in metric_specs_for_intent(intent, intent.preferred_table):
+            for column in metric_spec_source_columns(spec, columns):
+                if column and column in columns and column not in preferred:
+                    preferred.append(column)
+        if resource_safe:
+            for column in ["seller_id", "merchant_id", "pt"]:
+                if column in columns and column not in preferred:
+                    preferred.append(column)
+            return preferred[:12] or sorted(columns)[:8]
         for column in ["seller_id", "merchant_id", "pt", "order_id", "sub_order_id", "spu_id", "spu_name", "refund_id", "ticket_id", "bill_id", "coupon_id", "pay_amt", "repay_amt"]:
             if column in columns and column not in preferred:
                 preferred.append(column)
@@ -1252,7 +1325,14 @@ class NodeWorkerExecutor:
                 keys = keys[:insert_at] + context_keys + keys[insert_at:]
         return keys
 
-    def _structured_where(self, intent: QuestionIntent, table: str, columns: set, context: NodeExecutionContext) -> List[str]:
+    def _structured_where(
+        self,
+        intent: QuestionIntent,
+        table: str,
+        columns: set,
+        context: NodeExecutionContext,
+        entity_value_limit: int = 200,
+    ) -> List[str]:
         where: List[str] = []
         if "seller_id" in columns:
             where.append("`seller_id` = %s" % sql_literal(context.merchant_id))
@@ -1265,10 +1345,10 @@ class NodeWorkerExecutor:
             for column, values in entity.column_values.items():
                 if not values or column not in columns or column in applied_entity_columns:
                     continue
-                where.append("`%s` IN (%s)" % (column, ", ".join(sql_literal(value) for value in values[:200])))
+                where.append("`%s` IN (%s)" % (column, ", ".join(sql_literal(value) for value in values[:entity_value_limit])))
                 applied_entity_columns.add(column)
             if entity.values and entity.join_key in columns and entity.join_key not in applied_entity_columns:
-                where.append("`%s` IN (%s)" % (entity.join_key, ", ".join(sql_literal(value) for value in entity.values[:200])))
+                where.append("`%s` IN (%s)" % (entity.join_key, ", ".join(sql_literal(value) for value in entity.values[:entity_value_limit])))
                 applied_entity_columns.add(entity.join_key)
         if "pt" in columns:
             if table == "dwm_goods_detail_df" and intent.task_role == TaskRole.DEPENDENT:
@@ -1435,6 +1515,8 @@ class NodeWorkerExecutor:
             selected = selected_output_names(parsed)
             required_outputs = [column for column in ([contract.group_by_column] + contract.output_keys) if column]
             missing = [column for column in required_outputs if column in allowed and column not in selected]
+            required_metric_aliases = [str(spec.get("metricName") or spec.get("metric_name") or "") for spec in contract.metric_specs]
+            missing.extend(alias for alias in required_metric_aliases if alias and alias not in selected)
             if missing:
                 return validation.model_copy(
                     update={
@@ -1461,6 +1543,10 @@ class NodeWorkerExecutor:
         for column in formula_columns(intent.metric_formula, set(table_columns)):
             if column not in allowed_columns:
                 allowed_columns.append(column)
+        for spec in metric_specs_for_intent(intent, table):
+            for column in metric_spec_source_columns(spec, set(table_columns)):
+                if column not in allowed_columns:
+                    allowed_columns.append(column)
         for entity in context.upstream_entity_sets:
             for column in entity.column_values:
                 if column in table_columns and column not in allowed_columns:
@@ -1481,6 +1567,7 @@ class NodeWorkerExecutor:
             metric_column=intent.metric_column,
             metric_name=intent.metric_name,
             metric_formula=intent.metric_formula,
+            metric_specs=metric_specs_for_intent(intent, table),
             group_by_column=intent.group_by_column,
             output_keys=intent.output_keys,
             required_evidence=intent.required_evidence,
@@ -1506,6 +1593,10 @@ class NodeWorkerExecutor:
         for item in intent.required_evidence + intent.output_keys + [intent.filter_column, intent.group_by_column, intent.metric_column]:
             if item and item in columns and item not in requested:
                 requested.append(item)
+        for spec in metric_specs_for_intent(intent, table):
+            for item in metric_spec_source_columns(spec, columns):
+                if item and item in columns and item not in requested:
+                    requested.append(item)
         for item in ["seller_id", "merchant_id", "pt", "sub_order_id", "order_id", "spu_id", "refund_id", "ticket_id", "bill_id"]:
             if item in columns and item not in requested:
                 requested.append(item)
@@ -1589,6 +1680,258 @@ def merge_query_bundles(bundles: List[QueryBundle]) -> QueryBundle:
         error=first_error,
         summary="合并 %s 个 NodeWorker 结果" % len(bundles),
     )
+
+
+def optimize_query_plan_for_execution(plan: QueryPlan, asset_pack: PlanningAssetPack) -> None:
+    """Merge structurally equivalent metric nodes before NodeWorker execution."""
+
+    if not plan or len(plan.intents) < 2:
+        return
+    intents_by_id = {intent.plan_task_id: intent for intent in plan.intents if intent.plan_task_id}
+    groups: Dict[Tuple[Any, ...], List[QuestionIntent]] = {}
+    for intent in plan.intents:
+        key = same_table_metric_merge_key(intent, asset_pack, intents_by_id)
+        if key:
+            groups.setdefault(key, []).append(intent)
+    task_id_map: Dict[str, str] = {}
+    removed_task_ids: Set[str] = set()
+    merge_notes: List[str] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        primary = primary_metric_intent(group)
+        primary_id = primary.plan_task_id
+        if not primary_id:
+            continue
+        ordered_group = [primary] + [intent for intent in group if intent is not primary]
+        merged_ids = [intent.plan_task_id for intent in group if intent.plan_task_id]
+        specs: List[Dict[str, Any]] = []
+        output_keys: List[str] = []
+        required_evidence: List[str] = []
+        knowledge_ref_ids: List[str] = []
+        depends_on_task_ids: List[str] = []
+        question_parts: List[str] = []
+        limit = int(primary.limit or 0)
+        for intent in ordered_group:
+            specs.extend(metric_specs_for_intent(intent, intent.preferred_table))
+            output_keys.extend(intent.output_keys)
+            required_evidence.extend(intent.required_evidence)
+            depends_on_task_ids.extend(intent.depends_on_task_ids)
+            for spec in metric_specs_for_intent(intent, intent.preferred_table):
+                required_evidence.extend([str(item) for item in spec.get("sourceColumns") or [] if item])
+                metric_name = str(spec.get("metricName") or "")
+                if metric_name:
+                    required_evidence.append(metric_name)
+            knowledge_ref_ids.extend(intent.knowledge_ref_ids)
+            if intent.question and intent.question not in question_parts:
+                question_parts.append(intent.question)
+            limit = max(limit, int(intent.limit or 0))
+        if primary.group_by_column and primary.group_by_column not in output_keys:
+            output_keys.insert(0, primary.group_by_column)
+        primary.metric_specs = dedupe_metric_specs(specs)
+        primary.output_keys = dedupe_strings(output_keys)
+        primary.required_evidence = dedupe_strings(required_evidence)
+        primary.knowledge_ref_ids = dedupe_strings(knowledge_ref_ids)
+        primary.depends_on_task_ids = dedupe_strings(dep for dep in depends_on_task_ids if dep not in merged_ids)
+        primary.sql_strategy = "structured_first"
+        if primary.answer_mode == AnswerMode.TOPN and primary.limit:
+            primary.limit = primary.limit
+        else:
+            primary.limit = limit or primary.limit
+        if len(question_parts) > 1:
+            primary.question = "；".join(question_parts)
+        for intent in group:
+            if intent is primary:
+                continue
+            if intent.plan_task_id:
+                task_id_map[intent.plan_task_id] = primary_id
+                removed_task_ids.add(intent.plan_task_id)
+        merge_notes.append("execution_optimizer.same_table_metric_merge:%s->%s" % ("+".join(merged_ids), primary_id))
+    if not removed_task_ids:
+        return
+    plan.intents = [intent for intent in plan.intents if intent.plan_task_id not in removed_task_ids]
+    rewrite_plan_dependencies(plan, task_id_map)
+    rewrite_evidence_contracts(plan, task_id_map)
+    plan.agent_trace.extend(merge_notes)
+    optimizer_notes = plan.compiler_trace if isinstance(plan.compiler_trace, list) else []
+    optimizer_notes.extend(merge_notes)
+    plan.compiler_trace = optimizer_notes
+
+
+def primary_metric_intent(group: List[QuestionIntent]) -> QuestionIntent:
+    for intent in group:
+        if intent.answer_mode == AnswerMode.TOPN and not intent.depends_on_task_ids:
+            return intent
+    for intent in group:
+        if not intent.depends_on_task_ids:
+            return intent
+    return group[0]
+
+
+def same_table_metric_merge_key(
+    intent: QuestionIntent,
+    asset_pack: PlanningAssetPack,
+    intents_by_id: Dict[str, QuestionIntent] | None = None,
+) -> Tuple[Any, ...] | None:
+    base_key = same_table_metric_base_key(intent, asset_pack)
+    if not base_key:
+        return None
+    dependency_key = tuple(sorted(intent.depends_on_task_ids))
+    if intents_by_id:
+        dependency_key = tuple(
+            sorted(
+                task_id
+                for task_id in intent.depends_on_task_ids
+                if same_table_metric_base_key(intents_by_id.get(task_id, QuestionIntent()), asset_pack) != base_key
+            )
+        )
+    role_key = enum_text(intent.task_role) if dependency_key else ""
+    return (*base_key, role_key, dependency_key)
+
+
+def same_table_metric_base_key(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> Tuple[Any, ...] | None:
+    if intent.intent_type != IntentType.VALID:
+        return None
+    if intent.answer_mode not in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
+        return None
+    if not intent.preferred_table or intent.sql:
+        return None
+    if not (intent.metric_column or intent.metric_formula or intent.metric_specs):
+        return None
+    columns = set(asset_pack.known_columns(intent.preferred_table))
+    if not columns:
+        return None
+    if intent.group_by_column and intent.group_by_column not in columns:
+        return None
+    return (
+        intent.preferred_table,
+        intent.group_by_column,
+        intent.filter_column,
+        str(intent.filter_value or ""),
+        int(intent.days or 0),
+    )
+
+
+def rewrite_plan_dependencies(plan: QueryPlan, task_id_map: Dict[str, str]) -> None:
+    for intent in plan.intents:
+        intent.depends_on_task_ids = dedupe_strings([task_id_map.get(task_id, task_id) for task_id in intent.depends_on_task_ids])
+    rewritten: List[Any] = []
+    seen: Set[Tuple[str, str, str, str, str]] = set()
+    for dep in plan.dependencies:
+        dep.anchor_task_id = task_id_map.get(dep.anchor_task_id, dep.anchor_task_id)
+        dep.dependent_task_id = task_id_map.get(dep.dependent_task_id, dep.dependent_task_id)
+        if dep.anchor_task_id == dep.dependent_task_id:
+            continue
+        key = (dep.anchor_task_id, dep.dependent_task_id, dep.join_key, dep.anchor_column, dep.dependent_column)
+        if key in seen:
+            continue
+        seen.add(key)
+        rewritten.append(dep)
+    plan.dependencies = rewritten
+
+
+def rewrite_evidence_contracts(plan: QueryPlan, task_id_map: Dict[str, str]) -> None:
+    for contract in plan.evidence_contracts:
+        if not isinstance(contract, dict):
+            continue
+        task_id = str(contract.get("taskId") or contract.get("task_id") or "")
+        if task_id in task_id_map:
+            contract["taskId"] = task_id_map[task_id]
+            contract["task_id"] = task_id_map[task_id]
+
+
+def metric_specs_for_intent(intent: QuestionIntent, table: str) -> List[Dict[str, Any]]:
+    if intent.metric_specs:
+        return [normalize_metric_spec(spec, intent, table) for spec in intent.metric_specs if isinstance(spec, dict)]
+    if not (intent.metric_column or intent.metric_formula or intent.metric_name):
+        return []
+    return [normalize_metric_spec({}, intent, table)]
+
+
+def normalize_metric_spec(spec: Dict[str, Any], intent: QuestionIntent, table: str) -> Dict[str, Any]:
+    metric_column = str(spec.get("metricColumn") or spec.get("metric_column") or intent.metric_column or "")
+    metric_formula = str(spec.get("metricFormula") or spec.get("metric_formula") or intent.metric_formula or "")
+    metric_name = str(spec.get("metricName") or spec.get("metric_name") or intent.metric_name or "")
+    if not metric_name:
+        metric_name = metric_alias_for_values(metric_column, table)
+    source_columns = [str(item) for item in spec.get("sourceColumns") or spec.get("source_columns") or [] if item]
+    return {
+        "metricName": metric_name,
+        "metricColumn": metric_column,
+        "metricFormula": metric_formula,
+        "sourceColumns": dedupe_strings(source_columns),
+        "sourceTaskId": str(spec.get("sourceTaskId") or spec.get("source_task_id") or intent.plan_task_id or ""),
+    }
+
+
+def dedupe_metric_specs(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for spec in specs:
+        normalized = normalize_metric_spec(spec, QuestionIntent(), "")
+        key = (
+            str(normalized.get("metricName") or ""),
+            str(normalized.get("metricColumn") or ""),
+            str(normalized.get("metricFormula") or ""),
+        )
+        if key in seen or not any(key):
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def structured_metric_select_parts(intent: QuestionIntent, table: str, columns: set) -> List[Tuple[str, str]] | None:
+    parts: List[Tuple[str, str]] = []
+    for spec in metric_specs_for_intent(intent, table):
+        metric_alias = str(spec.get("metricName") or "")
+        metric_formula = str(spec.get("metricFormula") or "")
+        metric_column = str(spec.get("metricColumn") or "")
+        metric_expr = compile_metric_formula(metric_formula, columns)
+        if metric_formula and not metric_expr:
+            return None
+        if metric_expr:
+            parts.append((metric_expr, metric_alias or "metric_value"))
+            continue
+        if metric_column and metric_column in columns:
+            alias = metric_alias or metric_alias_for_values(metric_column, table)
+            if is_count_metric_alias(alias):
+                parts.append(("COUNT(DISTINCT `%s`)" % metric_column, alias))
+            else:
+                parts.append(("SUM(`%s`)" % metric_column, alias))
+    return parts
+
+
+def metric_spec_source_columns(spec: Dict[str, Any], columns: set) -> List[str]:
+    found = [str(item) for item in spec.get("sourceColumns") or [] if str(item) in columns]
+    metric_column = str(spec.get("metricColumn") or "")
+    if metric_column and metric_column in columns and metric_column not in found:
+        found.append(metric_column)
+    for column in formula_columns(str(spec.get("metricFormula") or ""), columns):
+        if column not in found:
+            found.append(column)
+    return found
+
+
+def metric_alias_for_values(metric_column: str, table: str) -> str:
+    if metric_column == "pay_amt" and "refund" in table:
+        return "refund_related_pay_amt"
+    if metric_column == "pay_amt":
+        return "order_pay_amt"
+    if metric_column == "repay_amt":
+        return "repay_amt"
+    if metric_column:
+        return "sum_%s" % metric_column
+    return "metric_value"
+
+
+def dedupe_strings(values: List[str]) -> List[str]:
+    deduped: List[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in deduped:
+            deduped.append(text)
+    return deduped
 
 
 def record_tool(
@@ -1751,6 +2094,24 @@ def classify_doris_error(error_text: str) -> str:
     if "syntax" in lower or "parse" in lower:
         return "SQL_SYNTAX"
     return "DORIS_ERROR"
+
+
+def doris_error_policy(error_code: str) -> Dict[str, bool]:
+    code = error_code or "DORIS_ERROR"
+    if code in RESOURCE_CONSTRAINED_DORIS_ERRORS:
+        return {"structured_fallback": True, "resource_fallback": True, "llm_repair": False}
+    if code == "UNKNOWN_COLUMN":
+        return {"structured_fallback": True, "resource_fallback": False, "llm_repair": True}
+    if code == "SQL_SYNTAX":
+        return {"structured_fallback": True, "resource_fallback": False, "llm_repair": True}
+    return {"structured_fallback": True, "resource_fallback": False, "llm_repair": True}
+
+
+def structured_limit(limit: int, detail: bool, resource_safe: bool = False) -> int:
+    raw_limit = max(int(limit or 20), 1)
+    if resource_safe:
+        return min(raw_limit, 10 if detail else 20)
+    return min(raw_limit, 50 if detail else 100)
 
 
 def is_dependent_context_column(column: str) -> bool:
@@ -2075,17 +2436,7 @@ def split_join_tokens(value: str) -> List[str]:
 
 
 def is_repairable_doris_error(error_text: str) -> bool:
-    lower = (error_text or "").lower()
-    non_repairable = [
-        "mem_alloc_failed",
-        "sys memory",
-        "memory limit",
-        "low water mark",
-        "read timed out",
-        "connect timeout",
-        "lost connection",
-    ]
-    return not any(marker in lower for marker in non_repairable)
+    return doris_error_policy(classify_doris_error(error_text)).get("llm_repair", False)
 
 
 def table_access_hint(table: str, columns: set) -> Dict[str, Any]:

@@ -205,6 +205,7 @@ def build_topic_asset(request: TopicBuildRequest) -> Dict[str, Any]:
 def publish_topic_asset(topic: str, table_name: str, request: TopicReviewRequest) -> Dict[str, Any]:
     result = topic_assets.publish(topic, table_name, request.approved, request.reviewer, request.review_note)
     if request.approved and result.get("status") == "PUBLISHED":
+        workflow.recall_service.semantic_catalog.clear_cache()
         result["esUpsert"] = {"success": True, "mode": "local_recall", "topic": topic, "tableName": table_name}
     return result
 

@@ -27,10 +27,10 @@ class ToolRuntimePolicyRegistry:
             return ToolRuntimePolicy(
                 tool_name=tool_name,
                 timeout_seconds=max(1, self.settings.agent_node_timeout_seconds),
-                max_retries=1,
-                backoff_seconds=0.5,
-                retryable_errors=["TIMEOUT", "MEM_ALLOC_FAILED", "DORIS_ERROR"],
-                non_retryable_errors=["UNKNOWN_COLUMN", "PARSE_ERROR", "UNSAFE_SQL", "UNKNOWN_BASE_TABLE"],
+                max_retries=0,
+                backoff_seconds=0.0,
+                retryable_errors=[],
+                non_retryable_errors=["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT", "PARSE_ERROR", "UNSAFE_SQL", "UNKNOWN_BASE_TABLE"],
             )
         return ToolRuntimePolicy(tool_name=tool_name, timeout_seconds=max(1, self.settings.agent_node_timeout_seconds), max_retries=0)
 

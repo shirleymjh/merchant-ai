@@ -92,7 +92,7 @@ class AnswerComposeService:
     def summarize_analysis(self, question: str, plan: QueryPlan, run_result: AgentRunResult) -> str:
         if not self.llm.configured or not run_result or not run_result.merged_query_bundle.rows:
             return ""
-        if not any(word in question for word in ["为什么", "原因", "影响", "分析", "综合"]):
+        if not analysis_summary_required(plan):
             return ""
         analysis_prompt = self.prompt_assembler.render(
             "answer.analysis",
@@ -302,6 +302,21 @@ def markdown_table(rows: List[Dict[str, Any]], columns: List[str]) -> str:
 def format_cell(value: Any) -> str:
     text = str(value if value is not None else "")
     return text.replace("\n", " ")[:80]
+
+
+def analysis_summary_required(plan: QueryPlan) -> bool:
+    understanding = plan.question_understanding or {}
+    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
+    requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
+    return requires_explanation or (analysis_intent and analysis_intent != "none")
+
+
+def boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return bool(value)
 
 
 class DailyReportService:

@@ -46,6 +46,20 @@ class EvidenceVerifier:
                         reason=task_result.query_bundle.error or task_result.summary,
                     )
                 )
+            for repair in task_result.sql_repairs:
+                if repair.success and repair.error_code in {"MEM_ALLOC_FAILED", "TIMEOUT"} and "resource-safe" in repair.error_message:
+                    gaps.append(
+                        EvidenceGap(
+                            code="RESOURCE_DEGRADED_QUERY",
+                            task_id=task_result.task_id,
+                            evidence=task_result.query_bundle.sql[:240],
+                            reason="Doris %s 后使用资源保护 SQL 降级执行，结果可能只覆盖收敛后的行数或实体范围" % repair.error_code,
+                            severity="warning",
+                            disclosure_required=True,
+                            source="task",
+                            answer_instruction="说明该节点因 Doris 资源限制使用了降级 SQL，结论应按部分覆盖理解。",
+                        )
+                    )
             if task_result.entity_set and task_result.entity_set.truncated:
                 gaps.append(
                     EvidenceGap(
@@ -330,7 +344,7 @@ def missing_gap_code(columns: List[str]) -> str:
 
 
 def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
-    warning_codes = {"FIELD_AMBIGUOUS", "ENTITY_SET_TRUNCATED", "OPTIONAL_EVIDENCE_MISSING"}
+    warning_codes = {"FIELD_AMBIGUOUS", "ENTITY_SET_TRUNCATED", "OPTIONAL_EVIDENCE_MISSING", "RESOURCE_DEGRADED_QUERY"}
     info_codes: Set[str] = set()
     severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"
     instruction = gap.answer_instruction or answer_instruction_for_gap(gap)
@@ -363,6 +377,8 @@ def answer_instruction_for_gap(gap: EvidenceGap) -> str:
         return "说明下游节点因上游实体缺失或依赖键缺失未完整执行。"
     if gap.code in {"SQL_EXECUTION_FAILED", "UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT"}:
         return "说明该节点 SQL/执行失败，不能基于该节点输出业务结论。"
+    if gap.code == "RESOURCE_DEGRADED_QUERY":
+        return "说明该节点因 Doris 资源限制使用降级 SQL，结论只能按部分覆盖理解。"
     return "说明该证据缺口对回答范围的影响。"
 
 

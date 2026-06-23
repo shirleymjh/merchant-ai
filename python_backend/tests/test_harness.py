@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -31,6 +32,7 @@ from merchant_ai.models import (
     QuestionRoute,
     RelationshipEntry,
     RoutingDecision,
+    SqlRepairAttempt,
     TaskRole,
     ThreadData,
     ToolCallRequest,
@@ -1285,6 +1287,14 @@ def test_tool_call_executor_pairs_parallel_results_and_isolates_failures():
     assert registry.trace()["failures"]
 
 
+def test_execute_sql_runtime_policy_leaves_repair_to_node_worker():
+    settings = get_settings()
+    policy = ToolRuntimePolicyRegistry(settings).policy_for("execute_sql")
+    assert policy.max_retries == 0
+    assert "MEM_ALLOC_FAILED" in policy.non_retryable_errors
+    assert not policy.retryable_errors
+
+
 def test_planner_overrides_need_more_when_semantic_catalog_is_sufficient():
     question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量。"
     pack = profile_daily_pack()
@@ -1349,6 +1359,68 @@ def test_node_agent_llm_writes_plan_bound_sql_from_contract():
     assert result.sql_draft_decisions[0].source == "llm_plan_bound"
     assert result.node_plan_contracts[0].allowed_columns
     assert result.node_plan_critiques[0].valid
+
+
+def test_doris_mem_error_uses_resource_safe_fallback_without_llm_repair():
+    settings = get_settings()
+    settings.agent_sql_repair_rounds = 2
+    llm = GoodPlanBoundSqlLlm()
+    worker = NodeWorkerExecutor(llm, MemoryFailThenOkDoris(), SqlValidationService(), settings)
+    pack = profile_daily_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="最近30天GMV最高的前80天",
+                intent_type="VALID",
+                answer_mode="TOPN",
+                plan_task_id="anchor_gmv",
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="order_gmv_amt_1d",
+                metric_name="order_gmv_amt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=80,
+            )
+        ]
+    )
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前80天")
+    assert result.task_results[0].success
+    assert result.sql_repairs[0].error_code == "MEM_ALLOC_FAILED"
+    assert "LIMIT 20" in result.task_results[0].query_bundle.sql
+    assert any(item.tool_name == "draft_resource_safe_sql_fallback" for item in result.node_tool_traces)
+    assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
+    assert llm.calls == 1
+
+
+def test_doris_mem_error_does_not_call_llm_repair_when_no_safe_fallback():
+    settings = get_settings()
+    settings.agent_sql_repair_rounds = 2
+    llm = GoodPlanBoundSqlLlm()
+    worker = NodeWorkerExecutor(llm, AlwaysMemoryFailDoris(), SqlValidationService(), settings)
+    pack = profile_daily_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="最近30天GMV最高的前20天",
+                intent_type="VALID",
+                answer_mode="TOPN",
+                plan_task_id="anchor_gmv",
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="order_gmv_amt_1d",
+                metric_name="order_gmv_amt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=20,
+            )
+        ]
+    )
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前20天")
+    assert not result.task_results[0].success
+    assert "MEM_ALLOC_FAILED" in result.task_results[0].query_bundle.error
+    assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
+    assert llm.calls == 1
 
 
 def test_node_agent_rejects_contract_external_field_and_uses_structured_fallback():
@@ -1454,6 +1526,174 @@ def test_node_agent_invalid_partition_filter_uses_structured_fallback_without_ll
     assert any(item.tool_name == "draft_structured_sql_fallback" for item in result.node_tool_traces)
     assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
     assert llm.calls == 1
+
+
+def test_node_worker_merges_same_table_metric_nodes_before_execution():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(EmptySqlLlm(), FakeDoris(), SqlValidationService(), settings)
+    pack = profile_daily_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="GMV最高日期",
+                intent_type="VALID",
+                answer_mode="TOPN",
+                plan_task_id="anchor_gmv",
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="order_gmv_amt_1d",
+                metric_name="order_gmv_amt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=5,
+                sql_strategy="structured_first",
+            ),
+            QuestionIntent(
+                question="看退款金额",
+                intent_type="VALID",
+                answer_mode="GROUP_AGG",
+                plan_task_id="refund_metric",
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="refund_amt_1d",
+                metric_name="refund_amt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=5,
+                sql_strategy="structured_first",
+            ),
+            QuestionIntent(
+                question="看工单量",
+                intent_type="VALID",
+                answer_mode="GROUP_AGG",
+                plan_task_id="ticket_metric",
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="cs_ticket_cnt_1d",
+                metric_name="cs_ticket_cnt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=5,
+                sql_strategy="structured_first",
+            ),
+        ],
+        evidence_contracts=[
+            {"taskId": "refund_metric", "table": "ads_merchant_profile", "columns": ["refund_amt_1d"], "semanticLabel": "退款金额"}
+        ],
+    )
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天，同时看退款金额和工单量")
+    assert len(plan.intents) == 1
+    assert len(result.task_results) == 1
+    assert len(plan.intents[0].metric_specs) == 3
+    assert plan.evidence_contracts[0]["taskId"] == "anchor_gmv"
+    sql = result.task_results[0].query_bundle.sql
+    assert "SUM(`order_gmv_amt_1d`) AS `order_gmv_amt_1d`" in sql
+    assert "SUM(`refund_amt_1d`) AS `refund_amt_1d`" in sql
+    assert "SUM(`cs_ticket_cnt_1d`) AS `cs_ticket_cnt_1d`" in sql
+    assert "COUNT(*) AS `order_cnt`" not in sql
+    assert "LIMIT 5" in sql
+    assert any("same_table_metric_merge" in item for item in plan.agent_trace)
+
+
+def test_node_worker_same_table_merge_keeps_topn_anchor_when_not_first():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(EmptySqlLlm(), FakeDoris(), SqlValidationService(), settings)
+    pack = profile_daily_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="看退款金额",
+                intent_type="VALID",
+                answer_mode="GROUP_AGG",
+                plan_task_id="refund_metric",
+                task_role="DEPENDENT",
+                depends_on_task_ids=["anchor_gmv"],
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="refund_amt_1d",
+                metric_name="refund_amt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=20,
+                sql_strategy="structured_first",
+            ),
+            QuestionIntent(
+                question="GMV最高日期",
+                intent_type="VALID",
+                answer_mode="TOPN",
+                plan_task_id="anchor_gmv",
+                preferred_table="ads_merchant_profile",
+                group_by_column="pt",
+                metric_column="order_gmv_amt_1d",
+                metric_name="order_gmv_amt_1d",
+                output_keys=["seller_id", "pt"],
+                days=30,
+                limit=5,
+                sql_strategy="structured_first",
+            ),
+        ],
+    )
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天，同时看退款金额")
+    assert len(plan.intents) == 1
+    assert plan.intents[0].plan_task_id == "anchor_gmv"
+    sql = result.task_results[0].query_bundle.sql
+    assert "ORDER BY `order_gmv_amt_1d` DESC LIMIT 5" in sql
+
+
+def test_node_worker_executes_independent_ready_nodes_concurrently():
+    settings = get_settings()
+    settings.max_concurrent_sub_agents = 2
+    settings.agent_node_timeout_seconds = 5
+    worker = NodeWorkerExecutor(EmptySqlLlm(), SlowDoris(delay_seconds=0.25), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="table_a", columns=["seller_id"]),
+            PlanningAssetEntry(table="table_b", columns=["seller_id"]),
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="A",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_a",
+                preferred_table="table_a",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_a` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+            QuestionIntent(
+                question="B",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_b",
+                preferred_table="table_b",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_b` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+        ]
+    )
+    started = time.monotonic()
+    result = worker.execute_plan("100", plan, pack, "", "并发测试")
+    elapsed = time.monotonic() - started
+    assert [item.success for item in result.task_results] == [True, True]
+    assert elapsed < 0.45
+
+
+def test_asset_builder_caches_live_schema_lookup():
+    class CountingSchemaDoris:
+        def __init__(self):
+            self.calls = 0
+
+        def show_full_columns(self, table):
+            self.calls += 1
+            return [{"Field": "seller_id"}, {"Field": "pt"}]
+
+    repo = CountingSchemaDoris()
+    builder = PlanningAssetPackBuilder(TopicAssetService(get_settings()), doris_repository=repo)
+    assert builder._live_schema("some_table")
+    assert builder._live_schema("some_table")
+    assert repo.calls == 1
 
 
 def test_node_contract_critic_blocks_missing_metric_before_llm_sql():
@@ -2746,6 +2986,35 @@ def test_evidence_verifier_detects_ambiguous_refund_amount():
     assert any(gap.code == "FIELD_AMBIGUOUS" for gap in verified.gaps)
 
 
+def test_evidence_verifier_warns_on_resource_safe_sql_fallback():
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="anchor_gmv",
+                success=True,
+                query_bundle=QueryBundle(
+                    sql="SELECT `seller_id`, `pt`, SUM(`order_gmv_amt_1d`) AS `order_gmv_amt_1d` FROM `ads_merchant_profile` LIMIT 20",
+                    tables=["ads_merchant_profile"],
+                    rows=[{"seller_id": "100", "pt": "20260620", "order_gmv_amt_1d": 100}],
+                ),
+                sql_repairs=[
+                    SqlRepairAttempt(
+                        task_id="anchor_gmv",
+                        error_code="MEM_ALLOC_FAILED",
+                        error_message="Doris resource error; switched to resource-safe SQL",
+                        repaired_sql="SELECT `seller_id`, `pt`, SUM(`order_gmv_amt_1d`) AS `order_gmv_amt_1d` FROM `ads_merchant_profile` LIMIT 20",
+                        success=True,
+                    )
+                ],
+            )
+        ],
+        merged_query_bundle=QueryBundle(rows=[{"seller_id": "100", "pt": "20260620", "order_gmv_amt_1d": 100}]),
+    )
+    verified = EvidenceVerifier().verify("GMV Top 日期", QueryPlan(), run)
+    assert verified.passed
+    assert any(gap.code == "RESOURCE_DEGRADED_QUERY" and gap.severity == "warning" for gap in verified.gaps)
+
+
 def test_evidence_verifier_uses_structured_contracts_without_false_missing():
     plan = QueryPlan(
         evidence_contracts=[
@@ -3273,6 +3542,62 @@ def test_answer_guard_appends_required_metric_resolution_disclosure():
     answer = AnswerComposeService(FakeAnswerLlm()).compose("看退款金额", MerchantInfo(merchant_id="100"), plan, run, "")
     assert "证据门禁" in answer
     assert disclosure in answer
+
+
+def test_answer_analysis_summary_uses_structured_analysis_intent_not_question_terms():
+    class FakeAnalysisLlm:
+        configured = True
+        settings = get_settings()
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            self.calls += 1
+            return "分析摘要"
+
+    llm = FakeAnalysisLlm()
+    run = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            tables=["ads_merchant_profile"],
+            rows=[{"seller_id": "100", "pt": "20260620", "order_gmv_amt_1d": 100}],
+        )
+    )
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "anomaly_check",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [{"semanticLabel": "gmv_anomaly", "requiredLevel": "required"}],
+        }
+    )
+    summary = AnswerComposeService(llm).summarize_analysis("最近30天GMV是否正常？", plan, run)
+    assert summary == "分析摘要"
+    assert llm.calls == 1
+
+
+def test_answer_analysis_summary_skips_when_structured_intent_is_none():
+    class FakeAnalysisLlm:
+        configured = True
+        settings = get_settings()
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            self.calls += 1
+            return "不应该调用"
+
+    llm = FakeAnalysisLlm()
+    run = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            tables=["ads_merchant_profile"],
+            rows=[{"seller_id": "100", "pt": "20260620", "order_gmv_amt_1d": 100}],
+        )
+    )
+    plan = QueryPlan(question_understanding={"analysisIntent": "none", "requiresExplanation": False})
+    summary = AnswerComposeService(llm).summarize_analysis("帮我分析一下GMV Top5", plan, run)
+    assert summary == ""
+    assert llm.calls == 0
 
 
 def recall_bundle_empty():
@@ -4406,6 +4731,33 @@ class FakeSelfLoopPlannerLlm:
 class FakeDoris:
     def query(self, sql, params=None):
         return [{"seller_id": "100"}]
+
+
+class SlowDoris:
+    def __init__(self, delay_seconds=0.1):
+        self.delay_seconds = delay_seconds
+
+    def query(self, sql, params=None):
+        time.sleep(self.delay_seconds)
+        return [{"seller_id": "100"}]
+
+
+class MemoryFailThenOkDoris:
+    def __init__(self):
+        self.calls = 0
+        self.sqls = []
+
+    def query(self, sql, params=None):
+        self.calls += 1
+        self.sqls.append(sql)
+        if self.calls == 1:
+            raise RuntimeError("MEM_ALLOC_FAILED: query memory limit exceeded")
+        return [{"seller_id": "100", "pt": "20260620", "order_gmv_amt_1d": 100}]
+
+
+class AlwaysMemoryFailDoris:
+    def query(self, sql, params=None):
+        raise RuntimeError("MEM_ALLOC_FAILED: query memory limit exceeded")
 
 
 class FakeDorisWithFreshness:
