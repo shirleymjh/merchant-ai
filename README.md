@@ -1,4 +1,4 @@
-# yshopping Merchant AI
+#Merchant AI
 
 商家 AI 助手示例工程，包含 Python FastAPI + LangGraph 后端、Vue 前端、Doris 查询、MySQL 问答记录、规则/记忆沉淀，以及 `Main Agent ReAct Runtime + QueryGraph + NodeWorker` 的 Agent Harness 问答流程。
 
