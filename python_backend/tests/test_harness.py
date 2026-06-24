@@ -84,6 +84,7 @@ from merchant_ai.services.planning import (
     compile_query_graph_from_understanding,
     planner_prompt_stats,
     repair_dependency_key_production_gaps,
+    repair_more_specific_root_metric,
     ultra_compact_understanding_catalog,
 )
 from merchant_ai.services.prompts import PromptAssembler
@@ -1236,6 +1237,61 @@ def test_ultra_catalog_keeps_candidate_metric_coverage_per_involved_table():
         settings.agent_planner_seed_metric_limit,
         max(6, len(catalog["tables"]) * 2 + 2),
     )
+
+
+def test_ultra_catalog_preserves_recalled_metric_without_local_rescoring():
+    settings = get_settings()
+    question = "最近30天退款率最高的前10个商品，同时看下单数、退款金额和商品发布时间。"
+    recall = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
+                title="电商退货/dwm_trade_refund_detail_di/refund_rate metric",
+                content="商品退款率 退款率 退货率 refund_rate",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=151.0,
+                metadata={
+                    "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
+                    "metricKey": "refund_rate",
+                    "tableName": "dwm_trade_refund_detail_di",
+                    "businessName": "商品退货率",
+                    "formula": "退货量 / 订单量",
+                    "sourceColumns": ["refund_bill_cnt", "order_detail_cnt"],
+                    "aliases": ["商品退款率", "退款率", "退货率", "售后率"],
+                    "recallQuery": question,
+                },
+            ),
+            RecallItem(
+                doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt",
+                title="电商退货/dwm_trade_refund_detail_di/pay_amt metric",
+                content="退款金额 pay_amt",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=100.0,
+                metadata={
+                    "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt",
+                    "metricKey": "pay_amt",
+                    "tableName": "dwm_trade_refund_detail_di",
+                    "businessName": "退款金额",
+                    "formula": "SUM(pay_amt)",
+                    "sourceColumns": ["pay_amt"],
+                    "aliases": ["退款金额", "refund_amt"],
+                    "recallQuery": question,
+                },
+            ),
+        ]
+    )
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    pack = builder.compact(question, recall, [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS])
+
+    catalog = ultra_compact_understanding_catalog(pack, question)
+    metrics = {(item["table"], item["key"]): item for item in catalog["candidateMetrics"]}
+
+    assert ("dwm_trade_refund_detail_di", "refund_rate") in metrics
+    assert "退款率" in metrics[("dwm_trade_refund_detail_di", "refund_rate")]["matchedPhrases"]
 
 
 def test_planner_fast_path_uses_small_context_package():
@@ -5529,6 +5585,160 @@ def test_top_spu_entity_transfer_uses_business_key_not_seller_id():
     assert dependent_key == "spu_name"
 
 
+def test_compiler_projects_order_grain_repay_metric_to_product_grain():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_cs_repay_detail_df", columns=["seller_id", "sub_order_id", "bill_id", "pt"]),
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "spu_id", "spu_name", "pt"]),
+            PlanningAssetEntry(table="dwm_goods_detail_df", columns=["seller_id", "spu_id", "spu_name", "spu_apply_create_time", "pt"]),
+            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "spu_name", "refund_id", "pay_amt", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="repay_bill_cnt",
+                table="dwm_cs_repay_detail_df",
+                columns=["bill_id"],
+                metadata={"formula": "COUNT(DISTINCT bill_id)", "sourceColumns": ["bill_id"]},
+            ),
+            PlanningAssetEntry(
+                key="refund_bill_cnt",
+                table="dwm_trade_refund_detail_di",
+                columns=["refund_id"],
+                metadata={"formula": "COUNT(DISTINCT refund_id)", "sourceColumns": ["refund_id"]},
+            ),
+            PlanningAssetEntry(
+                key="pay_amt",
+                table="dwm_trade_refund_detail_di",
+                columns=["pay_amt"],
+                metadata={"formula": "SUM(pay_amt)", "sourceColumns": ["pay_amt"]},
+            ),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_repay_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_cs_repay_detail_df",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="goods_order_by_spu_id",
+                left_table="dwm_goods_detail_df",
+                right_table="dwm_trade_order_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "spu_id", "rightColumn": "spu_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="goods_refund_by_spu_name",
+                left_table="dwm_goods_detail_df",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "spu_name", "rightColumn": "spu_name"},
+                ],
+            ),
+        ],
+    )
+    understanding = {
+        "analysisGrain": "product",
+        "rankingObjective": {
+            "metricRef": "repay_bill_cnt",
+            "ownerTable": "dwm_cs_repay_detail_df",
+            "sourcePhrase": "赔付单量",
+            "groupByColumn": "spu_id",
+            "limit": 10,
+            "objectiveType": "ranking",
+        },
+        "requestedMeasures": [
+            {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款量"},
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
+        ],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "SPU 发布时间",
+                "requiredLevel": "required",
+                "suggestedDomains": ["goods"],
+                "suggestedTables": ["dwm_goods_detail_df"],
+                "suggestedFields": ["spu_apply_create_time"],
+            }
+        ],
+        "timeWindowDays": 60,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(
+        "找到最近60天赔付单量较高的商品，看下对应的退款量、退款金额和商品发布时间。",
+        understanding,
+        pack,
+    )
+
+    projection = next(
+        intent
+        for intent in plan.intents
+        if intent.answer_mode == AnswerMode.DERIVED
+        and intent.metric_name == "repay_bill_cnt"
+        and intent.group_by_column == "spu_id"
+        and intent.metric_resolution.get("computeStrategy") == "projection_group_aggregate"
+    )
+    goods = next(intent for intent in plan.intents if intent.preferred_table == "dwm_goods_detail_df")
+    deps_to_projection = {dep.anchor_task_id for dep in plan.dependencies if dep.dependent_task_id == projection.plan_task_id}
+    deps_to_goods = {dep.anchor_task_id for dep in plan.dependencies if dep.dependent_task_id == goods.plan_task_id}
+
+    assert deps_to_projection == {"anchor_repay", "order_bridge"}
+    assert projection.plan_task_id in deps_to_goods
+    assert any(item.startswith("PROJECT_ROOT_GROUP_BY:") for item in plan.compiler_trace)
+    assert QueryGraphValidator().validate("赔付单量较高的商品", plan, pack).valid
+
+
+def test_node_worker_projection_compute_groups_metric_rows_by_bridge_product():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
+    intent = QuestionIntent(
+        question="赔付单量较高的商品",
+        intent_type=IntentType.VALID,
+        answer_mode=AnswerMode.DERIVED,
+        plan_task_id="projected_repay_bill_cnt_by_spu_id",
+        task_role=TaskRole.DEPENDENT,
+        metric_name="repay_bill_cnt",
+        group_by_column="spu_id",
+        limit=10,
+        metric_resolution={
+            "computeStrategy": "projection_group_aggregate",
+            "metricKey": "repay_bill_cnt",
+            "sourceMetricTaskId": "anchor_repay",
+            "bridgeTaskId": "order_bridge",
+            "sourceJoinKey": "sub_order_id",
+            "bridgeJoinKey": "sub_order_id",
+            "groupByColumn": "spu_id",
+            "carryColumns": ["seller_id", "spu_id", "spu_name", "sub_order_id"],
+            "sourceMetricAliases": ["repay_bill_cnt"],
+        },
+    )
+
+    rows, error = worker._compute_derived_metric_rows(
+        intent,
+        NodeExecutionContext(
+            upstream_rows=[
+                {"__source_task_id": "anchor_repay", "sub_order_id": "sub_1", "repay_bill_cnt": 1},
+                {"__source_task_id": "anchor_repay", "sub_order_id": "sub_2", "repay_bill_cnt": 1},
+                {"__source_task_id": "anchor_repay", "sub_order_id": "sub_3", "repay_bill_cnt": 1},
+                {"__source_task_id": "order_bridge", "sub_order_id": "sub_1", "seller_id": "100", "spu_id": "spu_a", "spu_name": "A"},
+                {"__source_task_id": "order_bridge", "sub_order_id": "sub_2", "seller_id": "100", "spu_id": "spu_a", "spu_name": "A"},
+                {"__source_task_id": "order_bridge", "sub_order_id": "sub_3", "seller_id": "100", "spu_id": "spu_b", "spu_name": "B"},
+            ]
+        ),
+    )
+
+    assert not error
+    assert rows[0]["spu_id"] == "spu_a"
+    assert rows[0]["repay_bill_cnt"] == 2
+    assert rows[1]["spu_id"] == "spu_b"
+    assert rows[1]["repay_bill_cnt"] == 1
+
+
 def test_entity_transfer_never_falls_back_to_partition_key_only():
     dep = PlanDependency(
         anchor_task_id="repay_anchor",
@@ -6398,6 +6608,441 @@ def test_compiler_treats_same_table_event_scope_anchor_as_population_contract():
 
     assert any(intent.plan_task_id == "anchor_ticket_scope" for intent in plan.intents)
     assert not any(gap.code == "SCOPE_NOT_NARROWING" for gap in validation.gaps)
+
+
+def test_compiler_keeps_parallel_metrics_as_sibling_nodes_even_when_tables_are_related():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "sub_order_id", "order_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_refund_detail_di",
+                columns=["seller_id", "sub_order_id", "refund_id", "pay_amt", "pt"],
+            ),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                title="订单量",
+                metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+            ),
+            PlanningAssetEntry(
+                key="pay_amt",
+                table="dwm_trade_refund_detail_di",
+                columns=["pay_amt"],
+                title="退款金额",
+                metadata={"sourceColumns": ["pay_amt"], "formula": "SUM(pay_amt)"},
+            ),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            )
+        ],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "订单量",
+            "objectiveType": "metric_total",
+            "groupByColumn": "seller_id",
+            "order": "desc",
+            "limit": 1,
+        },
+        "requestedMeasures": [
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"}
+        ],
+        "scopeConstraints": [],
+        "filters": [],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("最近30天订单量和退款金额分别是多少", understanding, pack)
+    refund_node = next(intent for intent in plan.intents if intent.metric_name == "pay_amt")
+
+    assert refund_node.task_role == TaskRole.ANCHOR
+    assert refund_node.depends_on_task_ids == []
+    assert not any(dep.dependent_task_id == refund_node.plan_task_id for dep in plan.dependencies)
+    assert any(item.startswith("GRAPH_ROLE:%s:sibling_metric" % refund_node.plan_task_id) for item in plan.compiler_trace)
+    assert PlannerReflectionAgent().reflect("最近30天订单量和退款金额分别是多少", plan, pack).passed
+
+
+def test_compiler_keeps_top_entity_requested_metric_dependent():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "spu_id", "sub_order_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_refund_detail_di",
+                columns=["seller_id", "spu_id", "refund_id", "pt"],
+            ),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                title="下单量",
+                metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+            ),
+            PlanningAssetEntry(
+                key="refund_bill_cnt",
+                table="dwm_trade_refund_detail_di",
+                columns=["refund_id"],
+                title="退款量",
+                metadata={"sourceColumns": ["refund_id"], "formula": "COUNT(DISTINCT refund_id)"},
+            ),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_refund_by_spu",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "spu_id", "rightColumn": "spu_id"},
+                ],
+            )
+        ],
+    )
+    understanding = {
+        "analysisGrain": "product",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "下单量",
+            "objectiveType": "ranking",
+            "groupByColumn": "spu_id",
+            "order": "desc",
+            "limit": 3,
+        },
+        "requestedMeasures": [
+            {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款量"}
+        ],
+        "scopeConstraints": [],
+        "filters": [],
+        "timeWindowDays": 90,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("查询前三 SPU 下单量，同时看下退货量", understanding, pack)
+    refund_node = next(intent for intent in plan.intents if intent.metric_name == "refund_bill_cnt")
+
+    assert refund_node.task_role == TaskRole.DEPENDENT
+    assert refund_node.depends_on_task_ids
+    assert any(dep.dependent_task_id == refund_node.plan_task_id for dep in plan.dependencies)
+    assert any(item.startswith("GRAPH_ROLE:%s:dependent_metric" % refund_node.plan_task_id) for item in plan.compiler_trace)
+    assert PlannerReflectionAgent().reflect("查询前三 SPU 下单量，同时看下退货量", plan, pack).passed
+
+
+def test_planner_reflection_flags_sibling_metric_attached_as_dependency():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "pt"]),
+            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "pay_amt", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(key="order_detail_cnt", table="dwm_trade_order_detail_di", columns=["sub_order_id"]),
+            PlanningAssetEntry(key="pay_amt", table="dwm_trade_refund_detail_di", columns=["pay_amt"]),
+        ],
+    )
+    plan = QueryPlan(
+        question_understanding={
+            "rankingObjective": {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "订单量",
+            },
+            "requestedMeasures": [
+                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"}
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="anchor_order",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                group_by_column="seller_id",
+                output_keys=["seller_id"],
+            ),
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="refund_metric",
+                task_role=TaskRole.DEPENDENT,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="pay_amt",
+                group_by_column="seller_id",
+                output_keys=["seller_id"],
+                depends_on_task_ids=["anchor_order"],
+            ),
+        ],
+        dependencies=[
+            PlanDependency(
+                anchor_task_id="anchor_order",
+                dependent_task_id="refund_metric",
+                join_key="seller_id",
+                anchor_column="seller_id",
+                dependent_column="seller_id",
+                relation_type="LOOKUP",
+            )
+        ],
+        compiler_trace=[
+            "GRAPH_ROLE:anchor_order:primary_root:dwm_trade_order_detail_di.order_detail_cnt",
+            "GRAPH_ROLE:refund_metric:sibling_metric:dwm_trade_refund_detail_di.pay_amt",
+            "DEPENDENCY_SEMANTICS:refund_metric:parallel_evidence",
+        ],
+    )
+
+    reflection = PlannerReflectionAgent().reflect("最近30天订单量和退款金额分别是多少", plan, pack)
+    codes = {issue["code"] for issue in reflection.issues}
+
+    assert "SIBLING_METRIC_WRONGLY_DEPENDENT" in codes
+    assert "FAKE_DEPENDENCY" in codes
+    assert reflection.repair_reason == "ANCHOR_MISMATCH"
+
+
+def test_planner_reflection_flags_generic_root_when_recalled_measure_is_more_specific():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "pt"]),
+            PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "ship_timeout_order_cnt_1d", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(key="order_detail_cnt", table="dwm_trade_order_detail_di", columns=["sub_order_id"]),
+            PlanningAssetEntry(key="ship_timeout_order_cnt_1d", table="ads_merchant_profile", columns=["ship_timeout_order_cnt_1d"]),
+        ],
+    )
+    plan = QueryPlan(
+        question_understanding={
+            "rankingObjective": {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "订单量",
+            },
+            "requestedMeasures": [
+                {
+                    "metricRef": "ship_timeout_order_cnt_1d",
+                    "ownerTable": "ads_merchant_profile",
+                    "sourcePhrase": "发货超时订单量",
+                    "completionSource": "recalled_metric_evidence",
+                    "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+                }
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="anchor_order",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                output_keys=["seller_id"],
+            ),
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="ship_timeout_metric",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="ads_merchant_profile",
+                metric_name="ship_timeout_order_cnt_1d",
+                output_keys=["merchant_id"],
+            ),
+        ],
+        compiler_trace=[
+            "GRAPH_ROLE:anchor_order:primary_root:dwm_trade_order_detail_di.order_detail_cnt",
+            "GRAPH_ROLE:ship_timeout_metric:sibling_metric:ads_merchant_profile.ship_timeout_order_cnt_1d",
+            "DEPENDENCY_SEMANTICS:ship_timeout_metric:parallel_evidence",
+        ],
+    )
+
+    reflection = PlannerReflectionAgent().reflect("平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。", plan, pack)
+
+    assert any(issue["code"] == "ROOT_METRIC_NOT_MOST_SPECIFIC" for issue in reflection.issues)
+    assert reflection.repair_reason == "ANCHOR_MISMATCH"
+
+
+def test_repair_promotes_recalled_specific_metric_to_primary_root():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "pt"]),
+            PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "ship_timeout_order_cnt_1d", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(key="order_detail_cnt", table="dwm_trade_order_detail_di", columns=["sub_order_id"]),
+            PlanningAssetEntry(
+                key="ship_timeout_order_cnt_1d",
+                table="ads_merchant_profile",
+                columns=["ship_timeout_order_cnt_1d"],
+                metadata={
+                    "sourceColumns": ["ship_timeout_order_cnt_1d"],
+                    "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+                },
+            ),
+        ],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "订单量",
+            "objectiveType": "metric_total",
+        },
+        "requestedMeasures": [
+            {
+                "metricRef": "ship_timeout_order_cnt_1d",
+                "ownerTable": "ads_merchant_profile",
+                "sourcePhrase": "发货超时订单量",
+                "completionSource": "recalled_metric_evidence",
+                "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+            }
+        ],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "shipping_timeout_order_population",
+                "requiredLevel": "required",
+                "suggestedDomains": ["order"],
+                "suggestedMetricRefs": ["order_detail_cnt"],
+            }
+        ],
+        "timeWindowDays": 7,
+    }
+    plan = QueryPlan(
+        question_understanding=understanding,
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="anchor_order",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                output_keys=["seller_id"],
+            ),
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="ship_timeout_metric",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="ads_merchant_profile",
+                metric_name="ship_timeout_order_cnt_1d",
+                output_keys=["merchant_id"],
+            ),
+        ],
+        compiler_trace=[
+            "GRAPH_ROLE:anchor_order:primary_root:dwm_trade_order_detail_di.order_detail_cnt",
+            "GRAPH_ROLE:ship_timeout_metric:sibling_metric:ads_merchant_profile.ship_timeout_order_cnt_1d",
+            "DEPENDENCY_SEMANTICS:ship_timeout_metric:parallel_evidence",
+        ],
+    )
+
+    repaired = repair_more_specific_root_metric(
+        "平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。",
+        plan,
+        pack,
+        QuestionUnderstandingCompiler(),
+    )
+
+    ranking = repaired.question_understanding["rankingObjective"]
+    assert ranking["metricRef"] == "ship_timeout_order_cnt_1d"
+    assert ranking["ownerTable"] == "ads_merchant_profile"
+    assert not repaired.question_understanding.get("requestedMeasures")
+    assert repaired.question_understanding["requiredEvidenceIntents"][0]["suggestedMetricRefs"] == ["ship_timeout_order_cnt_1d"]
+    assert repaired.intents[0].metric_name == "ship_timeout_order_cnt_1d"
+    assert repaired.intents[0].preferred_table == "ads_merchant_profile"
+    assert any(item.startswith("REPAIR_PROMOTE_ROOT_METRIC:") for item in repaired.compiler_trace)
+    reflection = PlannerReflectionAgent().reflect(
+        "平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。",
+        repaired,
+        pack,
+    )
+    assert "ROOT_METRIC_NOT_MOST_SPECIFIC" not in {issue["code"] for issue in reflection.issues}
+
+
+def test_compiler_adds_parallel_rule_evidence_branch_for_rule_data_question():
+    question = "平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。"
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "pt", "ship_timeout_order_cnt_1d"])],
+        metrics=[
+            PlanningAssetEntry(
+                key="ship_timeout_order_cnt_1d",
+                table="ads_merchant_profile",
+                columns=["ship_timeout_order_cnt_1d"],
+                metadata={
+                    "sourceColumns": ["ship_timeout_order_cnt_1d"],
+                    "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+                },
+            )
+        ],
+        source_refs={
+            "rule:shipping_timeout": RecallItem(
+                doc_id="rule:shipping_timeout",
+                title="平台发货规则",
+                content="发货超时需要关注履约时效和物流信息。",
+                source_type="RULE",
+                answer_mode="RULE",
+                fusion_score=5.0,
+            )
+        },
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "overview",
+        "requiresExplanation": True,
+        "rankingObjective": {
+            "metricRef": "ship_timeout_order_cnt_1d",
+            "ownerTable": "ads_merchant_profile",
+            "sourcePhrase": "发货超时订单量",
+            "objectiveType": "metric_total",
+            "groupByColumn": "merchant_id",
+            "limit": 1,
+        },
+        "requestedMeasures": [],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "shipping_timeout_explanation",
+                "requiredLevel": "required",
+                "suggestedDomains": ["order"],
+            }
+        ],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    reflection = PlannerReflectionAgent().reflect(question, plan, pack)
+
+    data_intents = [intent for intent in plan.intents if intent.answer_mode != AnswerMode.RULE]
+    rule_intents = [intent for intent in plan.intents if intent.answer_mode == AnswerMode.RULE]
+    assert len(data_intents) == 1
+    assert data_intents[0].metric_name == "ship_timeout_order_cnt_1d"
+    assert len(rule_intents) == 1
+    assert rule_intents[0].knowledge_ref_ids == ["rule:shipping_timeout"]
+    assert not plan.dependencies
+    assert any(item.startswith("RULE_EVIDENCE_BRANCH:") for item in plan.compiler_trace)
+    assert "ANALYSIS_EVIDENCE_NOT_COVERED" not in {issue["code"] for issue in reflection.issues}
+    assert "MISSING_KNOWLEDGE_REF" not in {issue["code"] for issue in reflection.issues}
 
 
 def test_compiler_chains_multiple_scope_constraints_before_requested_measures():

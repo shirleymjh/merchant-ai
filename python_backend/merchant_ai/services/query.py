@@ -635,6 +635,8 @@ class NodeWorkerExecutor:
 
     def _compute_derived_metric_rows(self, intent: QuestionIntent, context: NodeExecutionContext) -> Tuple[List[Dict[str, Any]], str]:
         resolution = intent.metric_resolution or {}
+        if str(resolution.get("computeStrategy") or "") == "projection_group_aggregate":
+            return self._compute_projection_group_aggregate_rows(intent, context)
         components = [item for item in resolution.get("componentMetrics") or [] if isinstance(item, dict)]
         if len(components) < 2:
             return [], "DERIVED_METRIC_COMPONENTS_MISSING"
@@ -681,6 +683,70 @@ class NodeWorkerExecutor:
         if limit > 0:
             rows = rows[:limit]
         return rows, "" if rows else "DERIVED_METRIC_ZERO_ROWS"
+
+    def _compute_projection_group_aggregate_rows(self, intent: QuestionIntent, context: NodeExecutionContext) -> Tuple[List[Dict[str, Any]], str]:
+        resolution = intent.metric_resolution or {}
+        metric_task_id = str(resolution.get("sourceMetricTaskId") or "")
+        bridge_task_id = str(resolution.get("bridgeTaskId") or "")
+        source_join_key = str(resolution.get("sourceJoinKey") or "")
+        bridge_join_key = str(resolution.get("bridgeJoinKey") or source_join_key)
+        group_key = intent.group_by_column or str(resolution.get("groupByColumn") or "")
+        metric_name = intent.metric_name or str(resolution.get("metricKey") or "metric_value")
+        aliases = [
+            str(item)
+            for item in resolution.get("sourceMetricAliases") or []
+            if str(item or "")
+        ] or metric_alias_candidates(metric_name)
+        carry_columns = [
+            str(item)
+            for item in resolution.get("carryColumns") or []
+            if str(item or "")
+        ]
+        if not metric_task_id or not bridge_task_id or not source_join_key or not bridge_join_key or not group_key:
+            return [], "PROJECTION_AGGREGATE_CONTRACT_MISSING"
+        metric_rows = [
+            row for row in context.upstream_rows if str(row.get("__source_task_id") or "") == metric_task_id
+        ]
+        bridge_rows = [
+            row for row in context.upstream_rows if str(row.get("__source_task_id") or "") == bridge_task_id
+        ]
+        if not metric_rows or not bridge_rows:
+            return [], "PROJECTION_AGGREGATE_UPSTREAM_ROWS_MISSING"
+        bridge_by_join: Dict[Any, List[Dict[str, Any]]] = {}
+        for row in bridge_rows:
+            join_value = row.get(bridge_join_key)
+            if blank_entity_value(join_value):
+                continue
+            bridge_by_join.setdefault(join_value, []).append(row)
+        grouped: Dict[Any, Dict[str, Any]] = {}
+        for metric_row in metric_rows:
+            join_value = metric_row.get(source_join_key)
+            if blank_entity_value(join_value):
+                continue
+            metric_value = first_present_value(metric_row, aliases)
+            number = numeric_value(metric_value)
+            if number is None:
+                continue
+            for bridge_row in bridge_by_join.get(join_value, []):
+                group_value = bridge_row.get(group_key)
+                if blank_entity_value(group_value):
+                    continue
+                target = grouped.setdefault(group_value, {group_key: group_value})
+                target[metric_name] = float(target.get(metric_name) or 0) + number
+                for column in carry_columns:
+                    if column == group_key:
+                        continue
+                    value = bridge_row.get(column)
+                    if not blank_entity_value(value) and column not in target:
+                        target[column] = value
+        if not grouped:
+            return [], "PROJECTION_AGGREGATE_ZERO_ROWS"
+        rows = list(grouped.values())
+        rows.sort(key=lambda item: numeric_value(item.get(metric_name)) or 0, reverse=True)
+        limit = int(intent.limit or 0)
+        if limit > 0:
+            rows = rows[:limit]
+        return rows, "" if rows else "PROJECTION_AGGREGATE_ZERO_ROWS"
 
     def _write_node_artifacts(self, task_id: str, sql: str, rows: List[Dict[str, Any]]) -> List[str]:
         safe_task_id = task_id or "node"
