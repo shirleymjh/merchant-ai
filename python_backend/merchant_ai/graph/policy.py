@@ -104,7 +104,11 @@ class V2AgentPolicy:
             if self.has_task_results(state) and not state.get("evidence_graph_verified"):
                 return ["verify_evidence"], "evidence must be verified after execution before answer", True
             if self.has_executable_plan(state) and not state.get("sql_generated"):
-                return ["execute_graph"], "main agent budget exhausted but validated QueryGraph still needs NodeAgent execution", True
+                if self.has_validated_executable_plan(state):
+                    return ["execute_graph"], "main agent budget exhausted but validated QueryGraph still needs NodeAgent execution", True
+                if not state.get("query_graph_validated"):
+                    return ["validate_graph"], "main agent budget exhausted; validate QueryGraph before any NodeAgent execution", True
+                return ["answer_data"], "main agent budget exhausted with invalid QueryGraph; answer with structured planning gap", True
             if self.has_unresolved_planning_work(state) and not state.get("query_graph_validated"):
                 return ["validate_graph"], "main agent budget exhausted with unresolved planning work; produce structured gap before answer", True
             return ["answer_data"], "main agent action budget exhausted", True
@@ -164,7 +168,7 @@ class V2AgentPolicy:
             if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"], "validator found repairable graph gaps", False
             return ["answer_data"], "QueryGraph validation failed and cannot be repaired in budget", True
-        if self.has_executable_plan(state) and not state.get("sql_generated"):
+        if self.has_validated_executable_plan(state) and not state.get("sql_generated"):
             return ["execute_graph"], "validated QueryGraph is ready for NodeAgent execution", False
         if self.has_graph_repairable_execution_gap(state):
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
@@ -249,6 +253,12 @@ class V2AgentPolicy:
             if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE:
                 return True
         return False
+
+    def has_validated_executable_plan(self, state: AgentState) -> bool:
+        if not self.has_executable_plan(state) or not state.get("query_graph_validated"):
+            return False
+        validation = state.get("query_graph_validation_result")
+        return bool(validation and getattr(validation, "valid", False))
 
     def has_task_results(self, state: AgentState) -> bool:
         run_result = state.get("agent_run_result")

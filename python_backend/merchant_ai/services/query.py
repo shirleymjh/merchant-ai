@@ -1326,7 +1326,7 @@ class NodeWorkerExecutor:
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
                     "GROUP_AGG/TOPN 必须按 outputKeys 和 groupByColumn 分组并输出，不能丢失 coupon_id/spu_id/spu_name/sub_order_id/order_id/ticket_id/bill_id 等实体键；"
                     "如果表有 pt 且不是快照维表豁免，必须使用 nodePlanContract.days 生成时间窗过滤。"
-                    "pt 是 yyyyMMdd 分区字符串，时间窗必须写成 DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL N DAY), '%Y%m%d')。"
+                    "pt 是 Doris DATE 分区列，时间窗必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N DAY)，不要使用 DATE_FORMAT('%Y%m%d')。"
                     "没有倒排索引时不要假设索引存在；只选择 requiredColumns 中需要字段和过滤字段；明细 LIMIT <= 20。"
                     "不能修改 contract 里的指标、粒度、依赖或证据要求。"
                 ),
@@ -1672,7 +1672,7 @@ class NodeWorkerExecutor:
                 merchant_filter = "`seller_id` = %s" % sql_literal(context.merchant_id) if "seller_id" in columns else "1=1"
                 where.append("`pt` = (SELECT MAX(`pt`) FROM `%s` WHERE %s)" % (table, merchant_filter))
             elif not any("`pt`" in predicate for predicate in where):
-                where.append("`pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL %d DAY), '%%Y%%m%%d')" % max(intent.days or 7, 1))
+                where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % max(intent.days or 7, 1))
         return where
 
     def _repair_sql(
@@ -1786,7 +1786,7 @@ class NodeWorkerExecutor:
                 update={
                     "valid": False,
                     "error_code": "INVALID_PARTITION_FILTER",
-                    "message": "pt 是 yyyyMMdd 分区字段，DATE_SUB/CURRENT_DATE 过滤必须包在 DATE_FORMAT(..., '%Y%m%d') 中",
+                    "message": "pt 是 Doris DATE 分区列，时间窗必须直接使用 DATE_SUB/CURDATE DATE 比较，不能包成 DATE_FORMAT(..., '%Y%m%d') 字符串",
                 }
             )
         return validation
@@ -2432,9 +2432,9 @@ def contract_select_required_columns(contract: NodePlanContract) -> List[str]:
 
 def invalid_pt_date_filter(sql: str) -> bool:
     upper = (sql or "").upper()
-    if "PT" not in upper or "DATE_SUB" not in upper:
+    if "PT" not in upper:
         return False
-    return "DATE_FORMAT" not in upper
+    return "DATE_FORMAT" in upper and "%Y%M%D" in upper
 
 
 def contract_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List[EvidenceGap]:

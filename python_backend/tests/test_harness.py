@@ -4691,7 +4691,8 @@ def test_node_agent_invalid_partition_filter_uses_structured_fallback_without_ll
     result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天")
     assert result.task_results[0].success
     assert result.sql_repairs[0].error_code == "INVALID_PARTITION_FILTER"
-    assert "DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 30 DAY), '%Y%m%d')" in result.task_results[0].query_bundle.sql
+    assert "DATE_SUB(CURDATE(), INTERVAL 30 DAY)" in result.task_results[0].query_bundle.sql
+    assert "DATE_FORMAT" not in result.task_results[0].query_bundle.sql
     assert any(item.tool_name == "draft_structured_sql_fallback" for item in result.node_tool_traces)
     assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
     assert llm.calls == 1
@@ -5632,6 +5633,44 @@ def test_lead_policy_executes_validated_graph_even_when_main_budget_exhausted():
 
     assert decision.selected_action == "execute_graph"
     assert decision.selected_node == "execute_query_graph"
+    assert decision.budget_exhausted
+
+
+def test_lead_policy_does_not_execute_invalid_graph_when_main_budget_exhausted():
+    settings = get_settings()
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": True,
+        "query_graph_validated": True,
+        "react_round": settings.agent_main_rounds,
+        "sql_generated": False,
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="最近10天使用优惠券的订单中，有退货的订单占多少",
+                    intent_type="VALID",
+                    answer_mode="GROUP_AGG",
+                    plan_task_id="scope_event_ratio",
+                    preferred_table="dwm_trade_order_detail_di",
+                )
+            ]
+        ),
+        "query_graph_validation_result": GraphValidationResult(
+            valid=False,
+            gaps=[GraphValidationGap(code="CALCULATION_NUMERATOR_MISSING", evidence="有退货的订单")],
+            repairable=True,
+        ),
+        "agent_run_result": AgentRunResult(task_results=[]),
+    }
+
+    decision = V2AgentPolicy(settings).decide(state)
+
+    assert decision.selected_action == "answer_data"
+    assert decision.selected_node == "answer_analysis"
+    assert "execute_graph" not in decision.available_actions
     assert decision.budget_exhausted
 
 
@@ -8892,7 +8931,7 @@ class GoodPlanBoundSqlLlm:
         select_keys = [column for index, column in enumerate(select_keys) if column and column not in select_keys[:index]]
         sql = (
             "SELECT %s, SUM(`%s`) AS `%s` FROM `%s` "
-            "WHERE `%s` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL %d DAY), '%%Y%%m%%d') "
+            "WHERE `%s` = '100' AND `pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY) "
             "GROUP BY %s ORDER BY `%s` DESC LIMIT %d"
             % (
                 ", ".join("`%s`" % column for column in select_keys),
@@ -8922,7 +8961,7 @@ class BadContractColumnSqlLlm:
         return {
             "sql": (
                 "SELECT `seller_id`, `pt`, SUM(`refund_amt_1d`) AS `refund_amt_1d` FROM `ads_merchant_profile` "
-                "WHERE `seller_id` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 30 DAY), '%Y%m%d') "
+                "WHERE `seller_id` = '100' AND `pt` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) "
                 "GROUP BY `seller_id`, `pt` ORDER BY `refund_amt_1d` DESC LIMIT 5"
             )
         }
@@ -8941,7 +8980,7 @@ class MissingOutputKeySqlLlm:
         return {
             "sql": (
                 "SELECT `seller_id`, `spu_id`, SUM(`pay_amt`) AS `order_gmv` FROM `dwm_trade_order_detail_di` "
-                "WHERE `seller_id` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 30 DAY), '%Y%m%d') "
+                "WHERE `seller_id` = '100' AND `pt` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) "
                 "GROUP BY `seller_id`, `spu_id` ORDER BY `order_gmv` DESC LIMIT 5"
             )
         }
@@ -8961,7 +9000,7 @@ class MissingEntityKeyFilterSqlLlm:
             "sql": (
                 "SELECT `seller_id`, `spu_id`, `spu_name`, COUNT(DISTINCT `ticket_id`) AS `ticket_cnt` "
                 "FROM `dwm_cs_ticket_detail_di` "
-                "WHERE `seller_id` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 60 DAY), '%Y%m%d') "
+                "WHERE `seller_id` = '100' AND `pt` >= DATE_SUB(CURDATE(), INTERVAL 60 DAY) "
                 "GROUP BY `seller_id`, `spu_id`, `spu_name` ORDER BY `ticket_cnt` DESC LIMIT 10"
             )
         }
@@ -8980,7 +9019,7 @@ class InvalidPartitionSqlLlm:
         return {
             "sql": (
                 "SELECT `seller_id`, `pt`, SUM(`order_gmv_amt_1d`) AS `order_gmv_amt_1d` FROM `ads_merchant_profile` "
-                "WHERE `seller_id` = '100' AND `pt` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) "
+                "WHERE `seller_id` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 30 DAY), '%Y%m%d') "
                 "GROUP BY `seller_id`, `pt` ORDER BY `order_gmv_amt_1d` DESC LIMIT 5"
             )
         }

@@ -32,6 +32,7 @@ from merchant_ai.models import (
     ChatResponse,
     ClarificationRequest,
     ExtractedKeywords,
+    EvidenceGap,
     GraphValidationGap,
     GraphValidationResult,
     IntentSignals,
@@ -1339,6 +1340,57 @@ class MerchantQaWorkflow:
         increment_round(state)
         self.configure_artifact_roots(state)
         emit(state, "node.started", "EXECUTE_QUERY_GRAPH", {})
+        validation = state.get("query_graph_validation_result")
+        if state.get("query_graph_validated") and validation and not validation.valid:
+            gaps = [
+                EvidenceGap(
+                    code=gap.code,
+                    task_id=gap.task_id,
+                    evidence=gap.evidence,
+                    reason=gap.reason or "QueryGraph validation failed before SQL execution",
+                    severity="blocking",
+                    source="query_graph_validator",
+                    answer_instruction="不要执行 SQL；先补知识或修复 QueryGraph 后再回答。",
+                )
+                for gap in validation.gaps
+            ]
+            run_result = AgentRunResult(
+                merged_query_bundle=QueryBundle(
+                    failed=True,
+                    error="QueryGraph validation failed before SQL execution",
+                    summary="QueryGraph 未通过校验，NodeAgent 未执行 SQL",
+                ),
+                evidence_gaps=gaps,
+                partial_answer_reason="QUERY_GRAPH_VALIDATION_FAILED",
+                reflection_notes=["NodeAgent skipped because QueryGraph validation failed"],
+            )
+            state["agent_run_result"] = run_result
+            state["query_bundle"] = run_result.merged_query_bundle
+            state["query_bundles"] = []
+            state["node_tool_traces"] = []
+            state["freshness_reports"] = []
+            state["sql_generated"] = True
+            self.planner.artifact_store.write_json("node", "agent_run_result.json", run_result.model_dump(by_alias=True), preview_chars=0)
+            add_step(state, "Main Agent Tool execute_query_graph：QueryGraph 未通过校验，跳过 NodeWorker SQL 执行")
+            self.record_span(
+                state,
+                "action",
+                "execute_query_graph",
+                started,
+                status="failed",
+                error_code="QUERY_GRAPH_VALIDATION_FAILED",
+                metadata={"gaps": [gap.model_dump(by_alias=True) for gap in validation.gaps[:12]]},
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="skipped SQL because queryGraph valid=false gaps=%d" % len(validation.gaps),
+                error_code="QUERY_GRAPH_VALIDATION_FAILED",
+                artifact_paths=[str(Path(state["thread_data"].outputs_path) / "artifacts" / "node" / "agent_run_result.json")],
+            )
+            emit(state, "node.completed", "EXECUTE_QUERY_GRAPH", {"tasks": 0, "rows": 0, "skipped": True})
+            return state
         try:
             run_result = self.node_worker.execute_plan(
                 state["merchant"].merchant_id,
