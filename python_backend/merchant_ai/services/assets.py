@@ -1238,12 +1238,14 @@ class PlanningAssetPackBuilder:
                 if self._table_allowed_for_recalled_item(question, item, table, allow_profile=allow_profile):
                     recalled_tables.add(table)
         candidate_tables: List[Tuple[str, str, Dict[str, Any]]] = []
-        for topic in topics:
-            for manifest_item in self.topic_assets.load_manifest(topic):
-                table = str(manifest_item.get("tableName") or "")
-                if not table or not self._table_allowed_for_question(question, table, allow_profile=allow_profile):
-                    continue
-                candidate_tables.append((topic, table, manifest_item))
+        has_precise_recall_evidence = bool(explicit_tables or recalled_tables)
+        if not has_precise_recall_evidence:
+            for topic in topics:
+                for manifest_item in self.topic_assets.load_manifest(topic):
+                    table = str(manifest_item.get("tableName") or "")
+                    if not table or not self._table_allowed_for_question(question, table, allow_profile=allow_profile):
+                        continue
+                    candidate_tables.append((topic, table, manifest_item))
         existing_candidates = {table for _, table, _ in candidate_tables}
         for table in sorted(explicit_tables | recalled_tables):
             if not table or table in existing_candidates:
@@ -1300,6 +1302,10 @@ class PlanningAssetPackBuilder:
             "targeted_seed_tables:%s"
             % ",".join("%s=%s" % (item["table"], item["score"]) for item in score_preview[:limit])
         ]
+        if has_precise_recall_evidence:
+            traces.append("targeted_seed_source=recall_source_refs")
+        else:
+            traces.append("targeted_seed_source=topic_boundary")
         return set(selected), traces
 
     def _ensure_seed_topic_coverage(

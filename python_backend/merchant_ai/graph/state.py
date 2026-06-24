@@ -15,6 +15,7 @@ from merchant_ai.models import (
     FreshnessCheckResult,
     GraphValidationResult,
     IntentSignals,
+    KnowledgeBundle,
     KnowledgeRequest,
     MerchantInfo,
     MerchantRecentFocus,
@@ -74,6 +75,9 @@ class AgentState(TypedDict, total=False):
     extracted_keywords: Any
     plan: QueryPlan
     recall_bundle: RecallBundle
+    knowledge_bundle: KnowledgeBundle
+    recall_rounds: List[Any]
+    knowledge_request_lineage: Dict[str, Any]
     intent_signals: IntentSignals
     planning_asset_pack: PlanningAssetPack
     query_graph_validation_result: GraphValidationResult

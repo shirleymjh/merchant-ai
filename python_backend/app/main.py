@@ -22,6 +22,7 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.answer import DailyReportService, FeedbackService
 from merchant_ai.services.assets import TopicBuilderWorkflow
+from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService
 
@@ -35,6 +36,14 @@ doris_repository = workflow.node_worker.doris_repository
 daily_report_service = DailyReportService(doris_repository)
 feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store)
 topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
+recall_index_manager = RecallIndexManager(
+    settings,
+    workflow.recall_service,
+    cache_clearers=[
+        workflow.asset_builder.clear_cache,
+        workflow.node_worker.doris_repository.clear_cache,
+    ],
+)
 
 app = FastAPI(title="yshopping Merchant AI Python", version="0.1.0")
 app.add_middleware(
@@ -187,13 +196,11 @@ def compress_wiki(request: WikiCompressRequest) -> Dict[str, Any]:
 
 @app.post("/api/es/rebuild-recall-index")
 def rebuild_recall_index(merchant_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    docs = workflow.recall_service._load_documents()
+    result = recall_index_manager.rebuild(changed_only=True)
     return {
         "success": True,
         "merchantId": merchant_id or settings.merchant_id,
-        "mode": "local_recall",
-        "indexedDocuments": len(docs),
-        "message": "Python 版当前复用本地 wiki/runtime topic 召回；ES 配置可在该服务中继续扩展。",
+        **result,
     }
 
 
@@ -228,11 +235,10 @@ def build_topic_asset(request: TopicBuildRequest) -> Dict[str, Any]:
 def publish_topic_asset(topic: str, table_name: str, request: TopicReviewRequest) -> Dict[str, Any]:
     result = topic_assets.publish(topic, table_name, request.approved, request.reviewer, request.review_note)
     if request.approved and result.get("status") == "PUBLISHED":
-        workflow.recall_service.clear_cache()
-        workflow.asset_builder.clear_cache()
-        workflow.node_worker.doris_repository.clear_cache()
-        result["esUpsert"] = {"success": True, "mode": "local_recall", "topic": topic, "tableName": table_name}
-        result["cacheInvalidated"] = True
+        index_result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
+        result["recallIndex"] = index_result
+        result["esUpsert"] = index_result.get("es", {})
+        result["cacheInvalidated"] = bool(index_result.get("cacheInvalidated"))
     return result
 
 
@@ -258,7 +264,8 @@ def refresh_topic_table_incrementally(topic: str, table_name: str, request: Opti
 
 @app.post("/api/topics/{topic}/tables/{table_name}/es-upsert")
 def upsert_topic_table_recall_index(topic: str, table_name: str) -> Dict[str, Any]:
-    return {"success": True, "mode": "local_recall", "topic": topic, "tableName": table_name}
+    result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
+    return {"success": bool(result.get("success", True)), "topic": topic, "tableName": table_name, "recallIndex": result}
 
 
 @app.get("/api/topics/{topic}/assets")

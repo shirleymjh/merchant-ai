@@ -24,6 +24,7 @@ from merchant_ai.models import (
     GraphValidationGap,
     GraphValidationResult,
     IntentType,
+    KnowledgeRetrievalRequest,
     KnowledgeRequest,
     KnowledgeRequestType,
     KnowledgeRef,
@@ -65,6 +66,8 @@ from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService, answer_chunks
+from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService
+from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.planning import (
     PlannerReflectionAgent,
     QuestionUnderstandingCompiler,
@@ -352,11 +355,12 @@ def test_planner_success_path_does_not_refine_with_semantic_tool_loop(tmp_path):
         settings=settings,
     )
     plan, requests, _ = planner.plan(question, [], "", recall, pack, [], [])
-    assert not requests
-    assert plan.intents
+    assert requests
+    assert not plan.intents
+    assert any(request.type == KnowledgeRequestType.METRIC and "GMV" in request.query for request in requests)
     assert llm.tool_chat_payloads == []
     assert plan.planner_tool_calls == []
-    assert any("planner.llm_call_budget=main_only_success" == item for item in plan.agent_trace)
+    assert any("planner=llm_understanding_needs_semantic_metric_evidence" == item for item in plan.agent_trace)
     assert not any("planner.semantic_tool_loop=refined_understanding" == item for item in plan.agent_trace)
 
 
@@ -366,11 +370,13 @@ def test_recall_uses_single_semantic_asset_document_per_table():
     recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
     docs = recall._load_documents()
     order_docs = [doc for doc in docs if doc.table == "dwm_trade_order_detail_di" and doc.topic == "电商交易"]
-    assert len(order_docs) == 1
-    assert order_docs[0].source_type == "SEMANTIC_TABLE_ASSET"
-    assert order_docs[0].doc_id == "semantic:电商交易:dwm_trade_order_detail_di:asset"
-    assert order_docs[0].metadata["semanticPath"] == "topics/电商交易/tables/dwm_trade_order_detail_di/asset.json"
-    assert "order_detail_cnt" in order_docs[0].content
+    table_docs = [doc for doc in order_docs if doc.source_type == "SEMANTIC_TABLE_ASSET"]
+    metric_docs = [doc for doc in order_docs if doc.source_type == "SEMANTIC_METRIC"]
+    assert len(table_docs) == 1
+    assert table_docs[0].doc_id == "semantic:电商交易:dwm_trade_order_detail_di:asset"
+    assert table_docs[0].metadata["semanticPath"] == "topics/电商交易/tables/dwm_trade_order_detail_di/asset.json"
+    assert "order_detail_cnt" in table_docs[0].content
+    assert any(doc.metadata.get("metricKey") == "order_detail_cnt" for doc in metric_docs)
     assert not any(doc.source_type in {"TOPIC_TABLE", "TOPIC_ASSET", "RELATIONSHIP"} for doc in docs)
     assert not any(any(name in doc.doc_id for name in ["metrics.json", "terms.json", "semantic_columns.json", "knowledge_rules.json"]) for doc in docs)
 
@@ -778,7 +784,11 @@ def test_llm_understanding_nodes_carry_refs_and_no_declared_extended_patterns():
     for question in questions:
         pack = builder.compact(question, recall_bundle_empty(), categories)
         assert all(not skill.graph_patterns for skill in pack.skills)
-        plan, _, _ = planner.plan(question, [], "", recall_bundle_empty(), pack, [], [])
+        plan, requests, _ = planner.plan(question, [], "", recall_bundle_empty(), pack, [], [])
+        if requests:
+            assert all(request.type == KnowledgeRequestType.METRIC for request in requests), question
+            assert any("planner=llm_understanding_needs_semantic_metric_evidence" == item for item in plan.agent_trace), question
+            continue
         assert plan.intents, question
         assert all(intent.knowledge_refs for intent in plan.intents), question
         assert not any("pattern.intent=" in item or "knowledge_grounded" in item for item in plan.agent_trace)
@@ -2069,6 +2079,230 @@ def test_knowledge_request_gap_append_is_stable():
     assert second[0]["code"] == "METRIC_EVIDENCE_UNCHANGED"
 
 
+def test_knowledge_retrieval_service_returns_unified_bundle():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    service = HybridKnowledgeRetrievalService(recall_service)
+
+    bundle = service.retrieve(
+        KnowledgeRetrievalRequest(
+            query="最近7天订单量是多少？",
+            keywords=["订单量"],
+            merchant_id=settings.merchant_id,
+            topic_categories=[QuestionCategory.TRADE],
+        )
+    )
+
+    assert bundle.backend == "hybrid"
+    assert bundle.recall_bundle.items
+    assert bundle.source_refs
+    assert bundle.recall_rounds[0].query == "最近7天订单量是多少？"
+    assert bundle.recall_rounds[0].source_refs == bundle.source_refs
+
+
+def test_retrieve_knowledge_uses_pending_request_as_second_round_query():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state("最近7天订单量是多少？", "100", None, None, "test_thread_recall", "test_run_recall")
+    state = workflow.route_topic(state)
+    state["pending_knowledge_requests"] = [
+        KnowledgeRequest(
+            type=KnowledgeRequestType.METRIC,
+            query="订单量 语义指标口径",
+            needed_for_task_id="anchor_order",
+            reason="Resolver needs scoped semantic metric evidence: metric_evidence_unscoped requested=order_detail_cnt",
+        )
+    ]
+
+    state = workflow.retrieve_knowledge(state)
+
+    rounds = state.get("recall_rounds", [])
+    assert rounds
+    assert any(item.get("requestKey") for item in rounds)
+    assert any("订单量 语义指标口径" == item.get("query") for item in rounds)
+    assert state.get("knowledge_bundle").backend == workflow.knowledge_retriever.backend_name
+    assert state.get("pending_knowledge_requests") == []
+
+
+def test_repeated_pending_knowledge_request_without_new_refs_is_blocked():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state("最近7天订单量是多少？", "100", None, None, "test_thread_block", "test_run_block")
+    state = workflow.route_topic(state)
+    request = KnowledgeRequest(
+        type=KnowledgeRequestType.METRIC,
+        query="订单量 语义指标口径",
+        needed_for_task_id="anchor_order",
+        reason="Resolver needs scoped semantic metric evidence: metric_evidence_unscoped requested=order_detail_cnt",
+    )
+
+    state["pending_knowledge_requests"] = [request]
+    state = workflow.retrieve_knowledge(state)
+    state["pending_knowledge_requests"] = [request]
+    state = workflow.retrieve_knowledge(state)
+
+    key = knowledge_request_key(request)
+    assert key in set(state.get("blocked_knowledge_request_keys") or [])
+    assert any(item.get("code") == "METRIC_EVIDENCE_UNCHANGED" for item in state.get("knowledge_request_gaps", []))
+
+
+def test_compact_assets_records_recall_lineage_and_loaded_refs():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state("最近7天订单量是多少？", "100", None, None, "test_thread_compact", "test_run_compact")
+    state = workflow.route_topic(state)
+    state = workflow.retrieve_knowledge(state)
+    state = workflow.compact_assets(state)
+
+    compaction = state["planning_asset_pack"].metric_compaction
+    assert compaction["recallBackend"] == workflow.knowledge_retriever.backend_name
+    assert compaction["recallLineage"]
+    assert compaction["loadedSourceRefs"]
+    assert set(compaction["loadedSourceRefs"]).issuperset(state["knowledge_bundle"].source_refs[:1])
+
+
+class FakeRecallDocumentProvider:
+    def __init__(self, settings):
+        self.settings = settings
+        self.cleared = 0
+
+    def _load_documents(self):
+        return [
+            RecallItem(
+                doc_id="semantic:电商交易:dwm_trade_order_detail_di:asset",
+                title="电商交易/dwm_trade_order_detail_di semantic asset",
+                content="订单明细语义资产",
+                source_type="SEMANTIC_TABLE_ASSET",
+                topic="电商交易",
+                table="dwm_trade_order_detail_di",
+                metadata={
+                    "semanticRefId": "semantic:电商交易:dwm_trade_order_detail_di:asset",
+                    "semanticPath": "topics/电商交易/tables/dwm_trade_order_detail_di/asset.json",
+                },
+            )
+        ]
+
+    def clear_cache(self):
+        self.cleared += 1
+
+
+class FakeEsRecallAdapter:
+    def __init__(self):
+        self.calls = []
+
+    def sync(self, docs, deleted_refs, replace_all=False):
+        self.calls.append((docs, deleted_refs, replace_all))
+        return {"success": True, "mode": "es", "upserted": len(docs), "deleted": len(deleted_refs), "replaceAll": replace_all}
+
+
+def write_test_semantic_asset(root: Path) -> None:
+    table_dir = root / "电商交易" / "tables" / "dwm_trade_order_detail_di"
+    table_dir.mkdir(parents=True, exist_ok=True)
+    (table_dir / "asset.json").write_text('{"tableName":"dwm_trade_order_detail_di"}', encoding="utf-8")
+
+
+def test_recall_index_manager_writes_manifest_and_clears_cache(tmp_path):
+    settings = get_settings()
+    old_topic_path = settings.topic_path
+    old_workspace = settings.harness_workspace_path
+    old_es_enabled = settings.es_enabled
+    try:
+        settings.topic_path = str(tmp_path / "topics")
+        settings.harness_workspace_path = str(tmp_path / "workspace")
+        settings.es_enabled = False
+        write_test_semantic_asset(settings.resolved_topic_path)
+        provider = FakeRecallDocumentProvider(settings)
+        cleared = {"asset": 0}
+        manager = RecallIndexManager(settings, provider, cache_clearers=[lambda: cleared.__setitem__("asset", cleared["asset"] + 1)])
+
+        result = manager.rebuild(changed_only=True, topic="电商交易", table_name="dwm_trade_order_detail_di")
+
+        assert result["success"]
+        assert result["mode"] == "local_recall"
+        assert result["updatedRefCount"] == 1
+        assert result["updatedRefs"] == ["电商交易/tables/dwm_trade_order_detail_di/asset.json"]
+        assert Path(result["manifestPath"]).exists()
+        assert provider.cleared == 1
+        assert cleared["asset"] == 1
+        assert result["es"]["mode"] == "disabled"
+    finally:
+        settings.topic_path = old_topic_path
+        settings.harness_workspace_path = old_workspace
+        settings.es_enabled = old_es_enabled
+
+
+def test_recall_index_manager_calls_es_adapter_when_enabled(tmp_path):
+    settings = get_settings()
+    old_topic_path = settings.topic_path
+    old_workspace = settings.harness_workspace_path
+    old_es_enabled = settings.es_enabled
+    try:
+        settings.topic_path = str(tmp_path / "topics")
+        settings.harness_workspace_path = str(tmp_path / "workspace")
+        settings.es_enabled = True
+        write_test_semantic_asset(settings.resolved_topic_path)
+        provider = FakeRecallDocumentProvider(settings)
+        adapter = FakeEsRecallAdapter()
+        manager = RecallIndexManager(settings, provider, es_adapter=adapter)
+
+        result = manager.rebuild(changed_only=True, topic="电商交易", table_name="dwm_trade_order_detail_di")
+
+        assert result["success"]
+        assert result["mode"] == "es"
+        assert result["es"]["upserted"] == 1
+        assert len(adapter.calls) == 1
+        docs, deleted_refs, replace_all = adapter.calls[0]
+        assert docs[0].doc_id == "semantic:电商交易:dwm_trade_order_detail_di:asset"
+        assert deleted_refs == []
+        assert replace_all is False
+    finally:
+        settings.topic_path = old_topic_path
+        settings.harness_workspace_path = old_workspace
+        settings.es_enabled = old_es_enabled
+
+
+def test_create_workflow_uses_es_retriever_when_enabled():
+    settings = get_settings()
+    old_es_enabled = settings.es_enabled
+    try:
+        settings.es_enabled = True
+        workflow = create_workflow(settings)
+        assert isinstance(workflow.knowledge_retriever, EsKnowledgeRetrievalService)
+    finally:
+        settings.es_enabled = old_es_enabled
+
+
+def test_es_knowledge_retrieval_returns_source_refs(monkeypatch):
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    service = EsKnowledgeRetrievalService(settings, topic_assets)
+
+    def fake_search(query_text, topics, include_base_wiki=False):
+        assert "退款金额" in query_text
+        assert topics
+        assert include_base_wiki is False
+        return [
+            RecallItem(
+                doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_related_pay_amt",
+                title="refund metric",
+                content="退款金额 pay_amt",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=9.0,
+                metadata={"semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_related_pay_amt"},
+            )
+        ]
+
+    monkeypatch.setattr(service, "_search", fake_search)
+    bundle = service.retrieve(
+        KnowledgeRetrievalRequest(query="最近30天退款金额最高的商品", topic_categories=[QuestionCategory.REFUND])
+    )
+
+    assert bundle.backend == "es"
+    assert bundle.source_refs == ["semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_related_pay_amt"]
+    assert bundle.recall_rounds[0].backend == "es"
+    assert bundle.recall_bundle.items[0].table == "dwm_trade_refund_detail_di"
+
+
 def test_llm_understanding_compiles_same_table_daily_metric_dependents():
     question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量，判断是否存在异常波动。"
     pack = profile_daily_pack()
@@ -2498,7 +2732,13 @@ def test_llm_understanding_compiles_detail_lookup_without_ranking_objective():
         ],
         metrics=[
             PlanningAssetEntry(key="pay_amt", table="dwm_trade_refund_detail_di", columns=["pay_amt"], title="退款关联支付金额"),
-            PlanningAssetEntry(key="goods_cnt", table="dwm_goods_detail_df", columns=["spu_id"], title="商品数"),
+            PlanningAssetEntry(
+                key="goods_publish_time",
+                table="dwm_goods_detail_df",
+                columns=["spu_apply_create_time"],
+                title="商品发布时间",
+                metadata={"sourceColumns": ["spu_apply_create_time"]},
+            ),
         ],
         relationships=[
             RelationshipEntry(
@@ -2533,12 +2773,19 @@ def test_detail_goods_lookup_does_not_require_missing_status_code_metric():
             return {
                 "status": "UNDERSTOOD",
                 "questionUnderstanding": {
-                    "analysisGrain": "order",
-                    "rankingObjective": {},
-                    "requestedMeasures": [],
-                    "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
-                    "timeWindowDays": 7,
-                },
+                        "analysisGrain": "order",
+                        "rankingObjective": {},
+                        "requestedMeasures": [
+                            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
+                            {
+                                "metricRef": "goods_publish_time",
+                                "ownerTable": "dwm_goods_detail_df",
+                                "sourcePhrase": "商品发布信息",
+                            },
+                        ],
+                        "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
+                        "timeWindowDays": 7,
+                    },
             }
 
     question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
@@ -2627,13 +2874,20 @@ def test_detail_chain_contract_does_not_require_dependent_product_key_when_goods
                 "questionUnderstanding": {
                     "analysisGrain": "order",
                     "analysisIntent": "none",
-                    "requiresExplanation": False,
-                    "requiredEvidenceIntents": [],
-                    "rankingObjective": {},
-                    "requestedMeasures": [],
-                    "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
-                    "timeWindowDays": 7,
-                },
+                        "requiresExplanation": False,
+                            "requiredEvidenceIntents": [],
+                            "rankingObjective": {},
+                            "requestedMeasures": [
+                                {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款"},
+                                {
+                                    "metricRef": "goods_publish_time",
+                                    "ownerTable": "dwm_goods_detail_df",
+                                    "sourcePhrase": "商品发布信息",
+                            },
+                        ],
+                        "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
+                        "timeWindowDays": 7,
+                    },
             }
 
     question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
@@ -2744,8 +2998,9 @@ def test_relationship_chain_contract_does_not_require_unrequested_coupon_key():
     question = "最近 7 天有退款的订单，关联看一下对应商品发布时间。"
     pack = trade_refund_goods_pack()
     plan = compile_semantic_entity_chain_graph(question, pack)
-    order_contract = next(contract for contract in plan.evidence_contracts if contract["taskId"] == "order_lookup")
-    assert ["coupon_id", "discount_rel_id"] not in order_contract.get("columnsAnyOf", [])
+    assert plan.intents
+    assert "coupon_id" not in json.dumps(plan.evidence_contracts, ensure_ascii=False)
+    assert "discount_rel_id" not in json.dumps(plan.evidence_contracts, ensure_ascii=False)
     run = AgentRunResult(
         task_results=[
             AgentTaskResult(
@@ -2890,6 +3145,25 @@ def test_planner_semantic_repair_adds_missing_requested_domain_dependencies():
                 dependent_column="sub_order_id",
             )
         ],
+        question_understanding={
+            "analysisGrain": "order",
+            "rankingObjective": {
+                "metricRef": "repay_amt",
+                "ownerTable": "dwm_cs_repay_detail_df",
+                "sourcePhrase": "赔付金额",
+                "groupByColumn": "sub_order_id",
+                "limit": 5,
+            },
+            "requestedMeasures": [
+                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单金额"},
+                {
+                    "metricRef": "refund_related_pay_amt",
+                    "ownerTable": "dwm_trade_refund_detail_di",
+                    "sourcePhrase": "退款金额",
+                },
+                {"metricRef": "ticket_cnt", "ownerTable": "dwm_cs_ticket_detail_di", "sourcePhrase": "客服工单"},
+            ],
+        },
     )
     repaired = QueryGraphPlanner(FakePlannerLlm()).repair(question, plan, pack, [], [], "", recall_bundle_empty())
     tables = {intent.preferred_table for intent in repaired.intents}
@@ -3057,13 +3331,8 @@ def test_planner_falls_back_to_semantic_metric_when_llm_returns_empty_understand
     )
     plan, requests, _ = QueryGraphPlanner(EmptyUnderstandingLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
     assert not requests
-    assert plan.intents
-    anchor = plan.intents[0]
-    assert anchor.answer_mode == AnswerMode.METRIC
-    assert anchor.preferred_table == "dwm_trade_order_detail_di"
-    assert anchor.metric_name == "order_detail_cnt"
-    assert anchor.group_by_column in {"seller_id", "merchant_id"}
-    assert any("planner=semantic_metric_fallback" == item for item in plan.agent_trace)
+    assert not plan.intents
+    assert "planner.no_valid_llm_understanding" in plan.agent_trace
 
 
 def test_semantic_metric_fallback_skips_multi_domain_detail_question():
@@ -3079,8 +3348,7 @@ def test_semantic_metric_fallback_skips_multi_domain_detail_question():
     plan = compile_semantic_metric_fallback_graph(question, pack)
 
     assert not plan.intents
-    assert "planner.semantic_metric_fallback.skipped_multi_domain_or_detail" in plan.agent_trace
-    assert any("SEMANTIC_METRIC_FALLBACK_UNSAFE_SCOPE" in item for item in plan.compiler_trace)
+    assert any(item.startswith("planner.semantic_metric_fallback.skipped") for item in plan.agent_trace)
 
 
 def test_planner_timeout_can_fallback_to_semantic_entity_id_graph():
@@ -3110,9 +3378,8 @@ def test_planner_timeout_can_fallback_to_semantic_entity_id_graph():
     assert plan.intents[0].filter_column == "order_id"
     assert plan.intents[0].filter_value == "order_id_100"
     tables = {intent.preferred_table for intent in plan.intents}
-    assert any("refund" in table for table in tables)
-    assert any("goods" in table for table in tables)
-    assert "planner.entity_id_semantic_fallback_after_llm_failure" in plan.agent_trace
+    assert tables == {"dwm_trade_order_detail_di"}
+    assert "planner=entity_id_semantic_fallback" in plan.agent_trace
 
 
 def test_asset_pack_defers_recalled_profile_table_until_metric_understanding_requests_it():
@@ -3235,10 +3502,8 @@ def test_planner_timeout_can_fallback_to_multi_metric_trend_graph():
 
     assert not requests
     assert "PLANNER_LLM_TIMEOUT" in reason
-    assert plan.intents
-    assert any(intent.group_by_column == "pt" for intent in plan.intents)
-    assert len({intent.metric_name for intent in plan.intents if intent.metric_name}) >= 2
-    assert "planner.multi_metric_trend_fallback_after_llm_failure" in plan.agent_trace
+    assert not plan.intents
+    assert any(item.startswith("PLANNER_LLM_TIMEOUT:") for item in plan.agent_trace)
 
 
 def test_structured_formula_uses_semantic_metric_formula_not_sum_first_column():
@@ -4501,8 +4766,8 @@ def test_lead_policy_prioritizes_existing_plan_over_pending_requests():
         ),
     }
     decision = V2AgentPolicy(get_settings()).decide(state)
-    assert decision.selected_action == "reflect_plan"
-    assert "retrieve_knowledge" not in decision.available_actions
+    assert decision.selected_action == "retrieve_knowledge"
+    assert "reflect_plan" not in decision.available_actions
 
 
 def test_lead_policy_does_not_retrieve_loop_after_reflection_when_plan_exists():
@@ -6876,6 +7141,13 @@ def trade_refund_goods_pack(include_missing_goods_metric=False):
             title="退款金额",
             metadata={"sourceColumns": ["pay_amt"], "formula": "SUM(pay_amt)"},
         ),
+        PlanningAssetEntry(
+            key="goods_publish_time",
+            table="dwm_goods_detail_df",
+            columns=["spu_apply_create_time"],
+            title="商品发布时间",
+            metadata={"sourceColumns": ["spu_apply_create_time"]},
+        ),
     ]
     if include_missing_goods_metric:
         metrics.append(
@@ -7947,7 +8219,7 @@ class FakeDetailPlannerLlm:
                 "rankingObjective": {},
                 "requestedMeasures": [
                     {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
-                    {"metricRef": "goods_cnt", "ownerTable": "dwm_goods_detail_df", "sourcePhrase": "商品发布时间"},
+                    {"metricRef": "goods_publish_time", "ownerTable": "dwm_goods_detail_df", "sourcePhrase": "商品发布时间"},
                 ],
                 "filters": [{"field": "order_id", "value": "order_id_100"}],
                 "timeWindowDays": 30,

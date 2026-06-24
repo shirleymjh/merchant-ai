@@ -36,6 +36,8 @@ from merchant_ai.models import (
     GraphValidationResult,
     IntentSignals,
     IntentType,
+    KnowledgeBundle,
+    KnowledgeRetrievalRequest,
     KnowledgeRequest,
     KnowledgeRequestType,
     MerchantRecentFocus,
@@ -65,6 +67,7 @@ from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlan
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
+from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService
 from merchant_ai.services.tools import artifact_file_tool_schemas, lead_action_selection_tool, node_runtime_tool_schemas, semantic_file_tool_schemas
 
@@ -81,6 +84,7 @@ class MerchantQaWorkflow:
         topic_router: TopicRouterService,
         wiki_memory: WikiMemoryService,
         recall_service: HybridRecallService,
+        knowledge_retriever: KnowledgeRetrievalService,
         asset_builder: PlanningAssetPackBuilder,
         planner: QueryGraphPlanner,
         graph_validator: QueryGraphValidator,
@@ -98,6 +102,7 @@ class MerchantQaWorkflow:
         self.route_slot_extractor = RouteSlotExtractor()
         self.wiki_memory = wiki_memory
         self.recall_service = recall_service
+        self.knowledge_retriever = knowledge_retriever
         self.asset_builder = asset_builder
         self.semantic_catalog = getattr(recall_service, "semantic_catalog", SemanticCatalogService(asset_builder.topic_assets))
         self.planner = planner
@@ -189,6 +194,8 @@ class MerchantQaWorkflow:
             bounded_route_llm_trace={},
             plan=QueryPlan(),
             recall_bundle=RecallBundle(),
+            knowledge_bundle=KnowledgeBundle(),
+            recall_rounds=[],
             intent_signals=IntentSignals(),
             planning_asset_pack=PlanningAssetPack(),
             query_graph_validation_result=GraphValidationResult(),
@@ -196,6 +203,7 @@ class MerchantQaWorkflow:
             knowledge_request_attempts={},
             knowledge_request_fingerprints={},
             blocked_knowledge_request_keys=[],
+            knowledge_request_lineage={},
             knowledge_request_gaps=[],
             agent_run_result=AgentRunResult(),
             query_bundle=QueryBundle(),
@@ -620,42 +628,72 @@ class MerchantQaWorkflow:
         state["pending_knowledge_requests"] = active_pending_requests
         had_pending_requests = bool(active_pending_requests)
         base_topics = self._effective_topic_categories(state)
-        query_scopes = [(state["question"], base_topics)]
+        query_scopes: List[tuple[str, List[QuestionCategory], Optional[KnowledgeRequest]]] = [(state["question"], base_topics, None)]
         route_query = self.route_recall_query(state)
         if route_query and route_query != state["question"]:
-            query_scopes.insert(0, (route_query, base_topics))
+            query_scopes.insert(0, (route_query, base_topics, None))
         if active_pending_requests:
             query_scopes = [
-                (request.query, self._knowledge_request_topics(request, base_topics))
+                (
+                    request.query,
+                    self._knowledge_request_topics(request, base_topics),
+                    request.model_copy(update={"request_key": knowledge_request_key(request)}),
+                )
                 for request in active_pending_requests
                 if request.query
             ] or query_scopes
         merged = state.get("recall_bundle") or RecallBundle()
         all_items = {item.doc_id: item for item in merged.items}
+        existing_refs = set(all_items)
+        round_traces = list(state.get("recall_rounds") or [])
         expanded_topics = list(state.get("knowledge_expanded_topics") or [])
-        for query, query_topics in query_scopes[:5]:
+        knowledge_bundles: List[KnowledgeBundle] = []
+        for query, query_topics, request in query_scopes[:5]:
             expanded_topics = self._merge_topic_categories(expanded_topics, query_topics)
-            bundle = self.recall_service.recall(
-                query,
-                self.keyword_service.extract(query),
-                state.get("history_rows", []),
-                knowledge_context(state),
-                state["merchant"].merchant_id,
-                query_topics,
+            keywords = self.keyword_service.extract(query)
+            knowledge_bundle = self.knowledge_retriever.retrieve(
+                KnowledgeRetrievalRequest(
+                    query=query,
+                    keywords=keywords.keywords,
+                    history_rows=state.get("history_rows", []),
+                    knowledge_context=knowledge_context(state),
+                    merchant_id=state["merchant"].merchant_id,
+                    topic_categories=query_topics,
+                    knowledge_request=request,
+                    route_slots=(state.get("route_slots") or RouteSlots()).model_dump(by_alias=True),
+                    round=int(state.get("query_graph_retrieve_count") or 0),
+                )
             )
+            knowledge_bundles.append(knowledge_bundle)
+            for trace in knowledge_bundle.recall_rounds:
+                trace.new_refs = [ref for ref in trace.source_refs if ref not in existing_refs]
+                existing_refs.update(trace.source_refs)
+                round_traces.append(trace.model_dump(by_alias=True))
+            bundle = knowledge_bundle.recall_bundle
             for item in bundle.items:
                 current = all_items.get(item.doc_id)
                 if current is not None:
                     item = merge_recall_item_queries(current, item)
                 if current is None or item.fusion_score >= current.fusion_score or set((item.metadata or {}).get("recallQueries") or []) != set((current.metadata or {}).get("recallQueries") or []):
                     all_items[item.doc_id] = item
-        items = sorted(all_items.values(), key=lambda item: item.fusion_score, reverse=True)[:12]
+        lineage_items = list(all_items.values())
+        items = sorted(lineage_items, key=lambda item: item.fusion_score, reverse=True)[:12]
         state["recall_bundle"] = RecallBundle(
             items=items,
             top_score=items[0].fusion_score if items else 0.0,
             merged_context="\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items),
         )
-        self.update_knowledge_request_lineage(state, active_pending_requests, items)
+        backend = next((bundle.backend for bundle in knowledge_bundles if bundle.backend), "hybrid")
+        state["knowledge_bundle"] = KnowledgeBundle(
+            recall_bundle=state["recall_bundle"],
+            source_refs=sorted({item.doc_id for item in items if item.doc_id}),
+            recall_rounds=[],
+            backend=backend,
+            index_version=next((bundle.index_version for bundle in knowledge_bundles if bundle.index_version), ""),
+            semantic_source_hash=next((bundle.semantic_source_hash for bundle in knowledge_bundles if bundle.semantic_source_hash), ""),
+        )
+        state["recall_rounds"] = round_traces
+        self.update_knowledge_request_lineage(state, active_pending_requests, lineage_items)
         state["recall_context"] = state["recall_bundle"].merged_context
         state["knowledge_expanded_topics"] = expanded_topics
         state["pending_knowledge_requests"] = []
@@ -710,6 +748,7 @@ class MerchantQaWorkflow:
             return
         attempts = dict(state.get("knowledge_request_attempts") or {})
         fingerprints = dict(state.get("knowledge_request_fingerprints") or {})
+        lineage = dict(state.get("knowledge_request_lineage") or {})
         blocked = set(state.get("blocked_knowledge_request_keys") or [])
         unchanged_requests: List[KnowledgeRequest] = []
         for request in requests:
@@ -723,8 +762,15 @@ class MerchantQaWorkflow:
             else:
                 attempts[key] = 0
                 fingerprints[key] = fingerprint
+            lineage[key] = {
+                "request": request.model_dump(by_alias=True),
+                "attempts": attempts.get(key, 0),
+                "fingerprint": fingerprint,
+                "blocked": key in blocked,
+            }
         state["knowledge_request_attempts"] = attempts
         state["knowledge_request_fingerprints"] = fingerprints
+        state["knowledge_request_lineage"] = lineage
         state["blocked_knowledge_request_keys"] = sorted(blocked)
         if unchanged_requests:
             state["knowledge_request_gaps"] = append_knowledge_request_gaps(
@@ -928,6 +974,16 @@ class MerchantQaWorkflow:
             "riskLevel": slots.risk_level,
             "analysisSignals": slots.analysis_signals,
         }
+        knowledge_bundle = state.get("knowledge_bundle") or KnowledgeBundle()
+        pack.metric_compaction["recallLineage"] = list(state.get("recall_rounds") or [])
+        pack.metric_compaction["requestLineage"] = state.get("knowledge_request_lineage") or {}
+        pack.metric_compaction["loadedSourceRefs"] = sorted(pack.source_refs.keys())
+        pack.metric_compaction["recallBackend"] = knowledge_bundle.backend or "hybrid"
+        pack.metric_compaction["semanticSourceHash"] = (
+            knowledge_bundle.semantic_source_hash
+            or pack.metric_compaction.get("cache", {}).get("semanticSourceHash", "")
+        )
+        pack.metric_compaction["indexVersion"] = knowledge_bundle.index_version
         state["planning_asset_pack"] = pack
         state["planning_assets_compacted"] = True
         state["query_graph_validation_result"] = GraphValidationResult()
@@ -1732,6 +1788,12 @@ class MerchantQaWorkflow:
                     "routeDecisionTrace": state.get("route_decision_trace", []),
                     "boundedRouteLlmTrace": state.get("bounded_route_llm_trace", {}),
                     "intentSignals": state.get("intent_signals", IntentSignals()).model_dump(by_alias=True),
+                    "knowledgeRetrieval": {
+                        "backend": (state.get("knowledge_bundle") or KnowledgeBundle()).backend,
+                        "sourceRefs": (state.get("knowledge_bundle") or KnowledgeBundle()).source_refs,
+                        "rounds": state.get("recall_rounds", []),
+                        "requestLineage": state.get("knowledge_request_lineage", {}),
+                    },
                 },
                 "plannerReflection": state.get("planner_reflection", PlannerReflectionResult()).model_dump(by_alias=True),
                 "plannerRepairReason": state.get("planner_repair_reason", ""),
@@ -2437,6 +2499,11 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
     semantic_catalog = SemanticCatalogService(topic_assets)
     wiki_memory = WikiMemoryService(settings)
     recall_service = HybridRecallService(settings, topic_assets, wiki_memory)
+    knowledge_retriever: KnowledgeRetrievalService
+    if settings.es_enabled:
+        knowledge_retriever = EsKnowledgeRetrievalService(settings, topic_assets)
+    else:
+        knowledge_retriever = HybridKnowledgeRetrievalService(recall_service)
     skill_loader = SkillLoader(settings)
     asset_builder = PlanningAssetPackBuilder(topic_assets, skill_loader, doris_repository)
     return MerchantQaWorkflow(
@@ -2449,6 +2516,7 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
         topic_router=TopicRouterService(),
         wiki_memory=wiki_memory,
         recall_service=recall_service,
+        knowledge_retriever=knowledge_retriever,
         asset_builder=asset_builder,
         planner=QueryGraphPlanner(llm, semantic_catalog=semantic_catalog, settings=settings),
         graph_validator=QueryGraphValidator(),

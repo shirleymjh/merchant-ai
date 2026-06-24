@@ -385,6 +385,43 @@ class KnowledgeRequest(APIModel):
     query: str = ""
     needed_for_task_id: str = ""
     reason: str = ""
+    source_phrase: str = ""
+    expected_refs: List[str] = Field(default_factory=list)
+    round: int = 0
+    request_key: str = ""
+
+
+class KnowledgeRetrievalRequest(APIModel):
+    query: str = ""
+    keywords: List[str] = Field(default_factory=list)
+    history_rows: List[Dict[str, Any]] = Field(default_factory=list)
+    knowledge_context: str = ""
+    merchant_id: str = ""
+    topic_categories: List[QuestionCategory] = Field(default_factory=list)
+    knowledge_request: Optional[KnowledgeRequest] = None
+    route_slots: Dict[str, Any] = Field(default_factory=dict)
+    round: int = 0
+
+
+class RecallRoundTrace(APIModel):
+    request_key: str = ""
+    query: str = ""
+    topics: List[str] = Field(default_factory=list)
+    backend: str = "hybrid"
+    recall_queries: List[str] = Field(default_factory=list)
+    source_refs: List[str] = Field(default_factory=list)
+    new_refs: List[str] = Field(default_factory=list)
+    blocked_reason: str = ""
+    item_count: int = 0
+
+
+class KnowledgeBundle(APIModel):
+    recall_bundle: RecallBundle = Field(default_factory=RecallBundle)
+    source_refs: List[str] = Field(default_factory=list)
+    recall_rounds: List[RecallRoundTrace] = Field(default_factory=list)
+    backend: str = "hybrid"
+    index_version: str = ""
+    semantic_source_hash: str = ""
 
 
 class KnowledgeRef(APIModel):

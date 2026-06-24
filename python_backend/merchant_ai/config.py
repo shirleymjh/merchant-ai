@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     embedding_api_key: str = Field("", validation_alias="YSHOPPING_EMBEDDING_API_KEY")
     embedding_dims: int = Field(1536, validation_alias="YSHOPPING_EMBEDDING_DIMS")
 
-    es_enabled: bool = Field(False, validation_alias="YSHOPPING_ES_ENABLED")
-    es_base_url: str = Field("", validation_alias="YSHOPPING_ES_BASE_URL")
+    es_enabled: bool = Field(True, validation_alias="YSHOPPING_ES_ENABLED")
+    es_base_url: str = Field("http://127.0.0.1:9200", validation_alias="YSHOPPING_ES_BASE_URL")
     es_index: str = Field("merchant_ai_recall", validation_alias="YSHOPPING_ES_INDEX")
     es_api_key: str = Field("", validation_alias="YSHOPPING_ES_API_KEY")
     es_username: str = Field("", validation_alias="YSHOPPING_ES_USERNAME")

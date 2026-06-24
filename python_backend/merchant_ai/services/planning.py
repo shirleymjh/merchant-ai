@@ -178,11 +178,14 @@ class UnderstandingCoverageCritic:
         if not isinstance(understanding, dict):
             return UnderstandingCoverageResult({}, [], ["INVALID_UNDERSTANDING"], ["coverage_critic.skipped_invalid_understanding"])
         updated = deepcopy(understanding)
+        trace: List[str] = []
+        pruned = prune_unrequested_requested_measures(question, updated, asset_pack)
+        if pruned:
+            trace.extend("UNDERSTANDING_OVER_COVERAGE_PRUNED:%s" % item for item in pruned)
         existing = understanding_metric_identities(updated)
         coverage_text = understanding_coverage_text(question, updated)
         candidates = SemanticMetricIndex(asset_pack.metrics).candidates("", "", coverage_text)
         added: List[Dict[str, Any]] = []
-        trace: List[str] = []
         for candidate in candidates:
             metric = candidate.metric
             identity = (metric.table, metric.key)
@@ -259,6 +262,47 @@ class UnderstandingCoverageCritic:
         if not trace:
             trace.append("understanding_coverage_critic.no_missing_metrics")
         return UnderstandingCoverageResult(updated, added, issues, trace)
+
+
+def prune_unrequested_requested_measures(
+    question: str,
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> List[str]:
+    measures = understanding.get("requestedMeasures") or understanding.get("requested_measures") or []
+    if not isinstance(measures, list) or not measures:
+        return []
+    coverage_text = understanding_coverage_text(question, understanding)
+    metric_by_identity = {(metric.table, metric.key): metric for metric in asset_pack.metrics if metric.table and metric.key}
+    filtered: List[Dict[str, Any]] = []
+    pruned: List[str] = []
+    for measure in measures:
+        if not isinstance(measure, dict):
+            continue
+        metric_ref = str(measure.get("metricRef") or measure.get("metric_ref") or "")
+        owner_table = str(measure.get("ownerTable") or measure.get("owner_table") or "")
+        source_phrase = str(measure.get("sourcePhrase") or measure.get("source_phrase") or "")
+        metric = metric_by_identity.get((owner_table, metric_ref))
+        if requested_measure_supported_by_coverage(source_phrase, metric, coverage_text):
+            filtered.append(measure)
+            continue
+        pruned.append("%s.%s:%s" % (owner_table, metric_ref, source_phrase))
+    understanding["requestedMeasures"] = filtered
+    return pruned
+
+
+def requested_measure_supported_by_coverage(source_phrase: str, metric: Any, coverage_text: str) -> bool:
+    normalized_text = normalize_metric_match_text(coverage_text)
+    normalized_phrase = normalize_metric_match_text(source_phrase)
+    if len(normalized_phrase) >= 2 and normalized_phrase in normalized_text:
+        return True
+    if normalized_phrase and strong_metric_label_text_match(normalized_phrase, normalized_text):
+        return True
+    if metric is not None and semantic_metric_label_present(metric, coverage_text):
+        return True
+    if metric is None:
+        return not normalized_phrase
+    return False
 
 
 def understanding_metric_identities(understanding: Dict[str, Any]) -> set[Tuple[str, str]]:
@@ -616,7 +660,7 @@ class QueryGraphPlanner:
                         )
                     ]
                 return need_more_plan, requests, payload.get("reason", "")
-            if status != "INVALID":
+            if status != "INVALID" and payload_has_understanding(payload):
                 semantic_metric_plan = compile_semantic_metric_fallback_graph(question, asset_pack, payload)
                 if semantic_metric_plan.intents:
                     return semantic_metric_plan, semantic_metric_plan.knowledge_requests, payload.get("reason", "")
@@ -5367,9 +5411,7 @@ class SemanticMetricResolver:
     ) -> SemanticMetricResolution:
         requested = str(metric_ref or "").strip()
         phrase = str(source_phrase or "").strip()
-        if owner_table and owner_table not in self.asset_pack.known_tables():
-            request = self._metric_evidence_request(question, requested, owner_table, phrase, "owner_table_not_loaded")
-            return SemanticMetricResolution(requested, phrase, None, 0.0, "owner_table_not_loaded", "", knowledge_requests=[request])
+        owner_table_missing = bool(owner_table and owner_table not in self.asset_pack.known_tables())
         exact_candidate = self._local_exact_metric_candidate(requested, owner_table)
         scoped_candidates = self._recall_evidence_candidates(phrase=phrase, scoped_only=True)
         if scoped_candidates:
@@ -5427,6 +5469,18 @@ class SemanticMetricResolver:
                     "",
                     [item.payload() for item in phrase_candidates[:5]],
                 )
+        if owner_table_missing:
+            request = self._metric_evidence_request(question, requested, owner_table, phrase, "owner_table_not_loaded")
+            return SemanticMetricResolution(
+                requested,
+                phrase,
+                None,
+                0.0,
+                "owner_table_not_loaded",
+                "",
+                [item.payload() for item in unscoped_candidates[:5]],
+                knowledge_requests=[request],
+            )
         if exact_candidate:
             exact_metadata = getattr(exact_candidate.metric, "metadata", {}) or {}
             exact_level = str(exact_metadata.get("metricLevel") or exact_metadata.get("metric_level") or "").lower()
