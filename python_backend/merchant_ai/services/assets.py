@@ -2401,6 +2401,217 @@ class TopicBuilderWorkflow:
         return self.build(request)
 
 
+class SemanticAssetGovernanceService:
+    def __init__(self, settings: Settings, doris_repository: DorisRepository, topic_assets: TopicAssetService):
+        self.settings = settings
+        self.doris_repository = doris_repository
+        self.topic_assets = topic_assets
+
+    def preflight_publish(self, topic: str, table: str) -> Dict[str, Any]:
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        if not pending_dir.exists():
+            return {"success": False, "publishable": False, "status": "NOT_FOUND", "topic": topic, "tableName": table}
+        asset = self._load_asset_dir(pending_dir, topic, table)
+        semantic_schema = schema_columns(asset)
+        live_schema = self._live_schema(table)
+        builder = PlanningAssetPackBuilder(self.topic_assets, doris_repository=self.doris_repository)
+        version = builder._semantic_catalog_version(topic, table, semantic_schema, live_schema)
+        drift = (
+            builder._schema_drift_report(topic, table, semantic_schema, live_schema, version)
+            if live_schema
+            else SchemaDriftReport(
+                topic=topic,
+                table=table,
+                semantic_version=version.semantic_version,
+                schema_version=version.schema_version,
+                source_hash=version.source_hash,
+                semantic_column_count=len(column_name_set(semantic_schema)),
+            )
+        )
+        validation = validate_semantic_asset(asset, self.topic_assets.load_relationships(topic))
+        payload = {
+            "success": True,
+            "publishable": not validation["errors"],
+            "status": "PREFLIGHT_PASSED" if not validation["errors"] else "PREFLIGHT_FAILED",
+            "topic": topic,
+            "tableName": table,
+            "semanticCatalogVersion": version.model_dump(by_alias=True),
+            "schemaDriftReport": drift.model_dump(by_alias=True),
+            "validation": validation,
+        }
+        payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "preflight", version.semantic_version, payload))
+        return payload
+
+    def after_publish(self, topic: str, table: str, reviewer: str = "", review_note: str = "") -> Dict[str, Any]:
+        target_dir = self.topic_assets.table_asset_dir(topic, table)
+        asset = self._load_asset_dir(target_dir, topic, table)
+        semantic_schema = schema_columns(asset)
+        live_schema = self._live_schema(table)
+        builder = PlanningAssetPackBuilder(self.topic_assets, doris_repository=self.doris_repository)
+        version = builder._semantic_catalog_version(topic, table, semantic_schema, live_schema)
+        drift = (
+            builder._schema_drift_report(topic, table, semantic_schema, live_schema, version)
+            if live_schema
+            else SchemaDriftReport(
+                topic=topic,
+                table=table,
+                semantic_version=version.semantic_version,
+                schema_version=version.schema_version,
+                source_hash=version.source_hash,
+                semantic_column_count=len(column_name_set(semantic_schema)),
+            )
+        )
+        version_payload = {
+            **version.model_dump(by_alias=True),
+            "reviewer": reviewer,
+            "reviewNote": review_note,
+            "publishedAt": datetime.utcnow().isoformat() + "Z",
+        }
+        write_json(target_dir / "semantic_version.json", version_payload)
+        payload = {
+            "success": True,
+            "status": "GOVERNED_PUBLISHED",
+            "topic": topic,
+            "tableName": table,
+            "semanticCatalogVersion": version_payload,
+            "schemaDriftReport": drift.model_dump(by_alias=True),
+            "cachePolicy": "recall index manager clears recall, asset pack, live schema, and Doris query caches after publish",
+        }
+        payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "publish", version.semantic_version, payload))
+        return payload
+
+    def _load_asset_dir(self, directory: Path, topic: str, table: str) -> Dict[str, Any]:
+        asset = read_json(directory / "asset.json")
+        payload: Dict[str, Any] = asset if isinstance(asset, dict) else {}
+        payload.setdefault("topic", topic)
+        payload.setdefault("tableName", table)
+        for field, file_name in {
+            "schemaColumns": "schema.json",
+            "semanticColumns": "semantic_columns.json",
+            "metrics": "metrics.json",
+            "terms": "terms.json",
+            "knowledgeRules": "knowledge_rules.json",
+        }.items():
+            sidecar = read_json(directory / file_name)
+            if sidecar:
+                payload[field] = merge_semantic_layer_list(payload.get(field), sidecar, field)
+            else:
+                payload.setdefault(field, [])
+        return payload
+
+    def _live_schema(self, table: str) -> List[Dict[str, Any]]:
+        try:
+            live = self.doris_repository.show_full_columns(table)
+            return live if isinstance(live, list) else []
+        except Exception:
+            return []
+
+    def _write_governance_artifact(self, topic: str, table: str, stage: str, version: str, payload: Dict[str, Any]) -> Path:
+        path = self.settings.resolved_workspace_path / "semantic_governance" / topic / table / ("%s-%s.json" % (stage, version or "unknown"))
+        write_json(path, payload)
+        return path
+
+
+def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str, Any]]) -> Dict[str, Any]:
+    table = str(asset.get("tableName") or "")
+    schema = schema_columns(asset)
+    columns = column_name_set(schema)
+    metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
+    errors: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    seen_metrics: set[str] = set()
+    metric_keys: set[str] = {
+        str(metric.get("metricKey") or metric.get("key") or "").strip()
+        for metric in metrics
+        if isinstance(metric, dict) and str(metric.get("metricKey") or metric.get("key") or "").strip()
+    }
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        metric_key = str(metric.get("metricKey") or metric.get("key") or "").strip()
+        if not metric_key:
+            errors.append({"code": "MISSING_METRIC_KEY", "metric": metric})
+            continue
+        if metric_key in seen_metrics:
+            errors.append({"code": "DUPLICATE_METRIC_KEY", "metricKey": metric_key})
+        seen_metrics.add(metric_key)
+        for column in semantic_metric_source_columns(metric):
+            if column in metric_keys:
+                continue
+            if column not in columns:
+                if external_metric_dependency(metric, column):
+                    warnings.append({"code": "EXTERNAL_METRIC_DEPENDENCY", "metricKey": metric_key, "metricRef": column})
+                else:
+                    errors.append({"code": "METRIC_SOURCE_COLUMN_MISSING", "metricKey": metric_key, "column": column})
+        canonical = str(metric.get("canonicalMetricKey") or "").strip()
+        alias_of = str(metric.get("aliasOf") or "").strip()
+        if alias_of and alias_of not in metric_keys:
+            warnings.append({"code": "ALIAS_TARGET_NOT_IN_SAME_ASSET", "metricKey": metric_key, "aliasOf": alias_of})
+        if canonical and canonical != metric_key:
+            warnings.append({"code": "CANONICAL_METRIC_EXTERNAL_OR_ALIAS", "metricKey": metric_key, "canonicalMetricKey": canonical})
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            continue
+        left = str(relationship.get("leftTable") or relationship.get("left_table") or "")
+        right = str(relationship.get("rightTable") or relationship.get("right_table") or "")
+        if table not in {left, right}:
+            continue
+        for left_key, right_key in relationship_key_pairs(relationship):
+            key = left_key if table == left else right_key
+            if key and key not in columns:
+                errors.append({"code": "RELATIONSHIP_KEY_COLUMN_MISSING", "relationship": relationship.get("name") or relationship.get("relationshipId"), "column": key})
+    return {"errors": errors, "warnings": warnings, "errorCount": len(errors), "warningCount": len(warnings)}
+
+
+def schema_columns(asset: Dict[str, Any]) -> List[Dict[str, Any]]:
+    schema = asset.get("schemaColumns") or asset.get("schema") or []
+    return schema if isinstance(schema, list) else []
+
+
+def column_name_set(schema: List[Dict[str, Any]]) -> set[str]:
+    return {str(item.get("columnName") or item.get("Field") or item.get("name") or "").strip() for item in schema if isinstance(item, dict) and str(item.get("columnName") or item.get("Field") or item.get("name") or "").strip()}
+
+
+def semantic_metric_source_columns(metric: Dict[str, Any]) -> List[str]:
+    result: List[str] = []
+    for value in metric.get("sourceColumns") or metric.get("source_columns") or []:
+        text = str(value or "").strip().strip("`")
+        if text and text not in result:
+            result.append(text)
+    if result:
+        return result
+    formula = str(metric.get("formula") or metric.get("metricFormula") or "")
+    for token in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`|\\b([A-Za-z_][A-Za-z0-9_]*)\\b", formula):
+        text = (token[0] or token[1] or "").strip()
+        if text.lower() in {"sum", "count", "distinct", "avg", "min", "max", "case", "when", "then", "else", "end", "nullif"}:
+            continue
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def external_metric_dependency(metric: Dict[str, Any], ref: str) -> bool:
+    formula = str(metric.get("formula") or metric.get("metricFormula") or "")
+    unit = str(metric.get("unit") or "").strip()
+    return bool(unit == "%" or "/" in formula) and metric_shaped_reference(ref)
+
+
+def metric_shaped_reference(ref: str) -> bool:
+    text = str(ref or "").strip().lower()
+    return text.endswith(("_cnt", "_amt", "_rate", "_gmv")) or "gmv" in text
+
+
+def relationship_key_pairs(relationship: Dict[str, Any]) -> List[Tuple[str, str]]:
+    raw = relationship.get("keys") or relationship.get("joinKeys") or relationship.get("join_keys") or []
+    pairs: List[Tuple[str, str]] = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            pairs.append((str(item[0] or ""), str(item[1] or "")))
+        elif isinstance(item, dict):
+            pairs.append((str(item.get("left") or item.get("leftKey") or ""), str(item.get("right") or item.get("rightKey") or "")))
+    return pairs
+
+
 def read_json(path: Path) -> Any:
     try:
         if path.exists():

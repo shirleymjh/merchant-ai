@@ -601,8 +601,13 @@ class QueryGraphPlanner:
         trace: List[str],
         planner_context: Dict[str, Any] | None = None,
     ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
+        prior_understanding = (
+            planner_context.get("previousUnderstanding")
+            if isinstance(planner_context, dict) and isinstance(planner_context.get("previousUnderstanding"), dict)
+            else None
+        )
         if self.llm.configured:
-            payload = self._llm_understand(question, asset_pack, gaps, trace, planner_context=planner_context)
+            payload = self._llm_understand(question, asset_pack, gaps, trace, planner_context=planner_context, prior_understanding=prior_understanding)
             plan = self._plan_from_payload(question, payload, asset_pack)
             recovery_used = False
             if plan.intents:
@@ -626,6 +631,7 @@ class QueryGraphPlanner:
                     trace,
                     planner_context=planner_context,
                     use_tool_loop=True,
+                    prior_understanding=prior_understanding,
                 )
                 tool_plan = self._plan_from_payload(question, tool_payload, asset_pack)
                 if tool_plan.intents:
@@ -647,6 +653,7 @@ class QueryGraphPlanner:
                         trace,
                         force_catalog=True,
                         planner_context=planner_context,
+                        prior_understanding=prior_understanding,
                     )
                     forced_plan = self._plan_from_payload(question, forced_payload, asset_pack)
                     if forced_plan.intents:
@@ -856,6 +863,7 @@ class QueryGraphPlanner:
             compact_retry,
             planner_context,
             include_full_file_context=use_tool_loop,
+            prior_understanding=prior_understanding,
         )
         if prior_understanding:
             user_payload["previousUnderstanding"] = compact_previous_understanding(prior_understanding)
@@ -954,15 +962,18 @@ class QueryGraphPlanner:
         compact_retry: bool,
         planner_context: Dict[str, Any] | None,
         include_full_file_context: bool = False,
+        prior_understanding: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         catalog = ultra_compact_understanding_catalog(asset_pack, question, planner_context)
         prompt_tables = [str(item.get("table") or "") for item in catalog.get("tables") or [] if item.get("table")]
         table_limit = max(1, int(self.settings.agent_planner_seed_table_limit or 4))
+        repair_feedback = planner_repair_feedback_for_understanding(gaps, prior_understanding or {})
         payload = {
             "question": question,
             "semanticCatalog": catalog,
             "diagnosticContext": compact_planner_context(planner_context),
             "validationGaps": [gap.model_dump(by_alias=True) for gap in gaps],
+            "repairFeedback": repair_feedback,
             "trace": compact_planner_trace(trace, gaps, compact_retry),
             "plannerToolResults": [],
             "outputContract": {
@@ -971,6 +982,13 @@ class QueryGraphPlanner:
                 "metricRefRule": "rankingObjective/requestedMeasures.metricRef must come from semanticCatalog.candidateMetrics.key",
                 "ownerTableRule": "ownerTable must equal the selected metric table",
                 "scopeRule": "business population limits such as 'within a selected set' must be declared in scopeConstraints and compiled before ranking/measures",
+                "calculationRule": "when the user asks for proportion/percentage/占比/占多少, declare calculationIntents as event population divided by base population",
+                "populationRatioExamples": [
+                    "使用优惠券的订单中有退货占多少 => base=使用优惠券的订单,event=有退货的订单,denom=order_detail_cnt,numer=refund_bill_cnt",
+                    "有客服工单的订单后来发生赔付占多少 => base=有客服工单的订单,event=发生赔付的订单,denom=order_detail_cnt,numer=repay_bill_cnt",
+                    "订单里发货超时占比 => base=订单,event=发货超时的订单,denom=order_detail_cnt,numer=ship_timeout_order_cnt",
+                ],
+                "repairRule": "if repairFeedback is non-empty, fix questionUnderstanding according to it; do not repeat an invalid numerator/denominator pair",
                 "analysisRule": "analysisIntent none => requiresExplanation false and requiredEvidenceIntents []; otherwise include evidence intents",
             },
         }
@@ -1008,6 +1026,7 @@ class QueryGraphPlanner:
                 "maxRounds": self.settings.agent_planner_tool_rounds,
                 "instruction": (
                     "Call semantic_read/grep only when semanticCatalog lacks needed detail; call emit_question_understanding when ready. "
+                    "If repairFeedback exists, address it before emitting and do not repeat the invalid understanding. "
                     "If previousUnderstanding declares comparison_baseline or trend_context, inspect semantic files for the best metric owner table before emitting."
                 ),
                 "forceCatalog": force_catalog,
@@ -1159,6 +1178,7 @@ class QueryGraphPlanner:
                     include_layers=False,
                 ),
                 "gaps": [gap.model_dump(by_alias=True) for gap in gaps],
+                "repairFeedback": planner_repair_feedback_for_understanding(gaps, plan.question_understanding or {}),
                 "requiredSchema": {
                     "status": "UNDERSTOOD | NEED_MORE_KNOWLEDGE | INVALID",
                     "questionUnderstanding": {
@@ -1528,9 +1548,64 @@ def compact_planner_trace(trace: List[str], gaps: List[GraphValidationGap], comp
         return []
     if not gaps and not compact_retry:
         return []
-    markers = ("gap", "error", "invalid", "critic", "repair", "planner", "validation", "timeout", "provider")
+    markers = ("gap", "error", "invalid", "critic", "repair", "planner", "validation", "timeout", "provider", "calculation")
     selected = [item for item in trace if any(marker in str(item).lower() for marker in markers)]
     return selected[-3:]
+
+
+def planner_repair_feedback_for_understanding(gaps: List[GraphValidationGap], previous_understanding: Dict[str, Any]) -> Dict[str, Any]:
+    calculation_gaps = [
+        gap
+        for gap in gaps
+        if gap.code in {"CALCULATION_NUMERATOR_MISSING", "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR", "CALCULATION_NUMERATOR_NOT_EVENT_METRIC"}
+    ]
+    if not calculation_gaps:
+        return {}
+    previous_calculations = [
+        item
+        for item in previous_understanding.get("calculationIntents") or previous_understanding.get("calculation_intents") or []
+        if isinstance(item, dict)
+    ]
+    previous_ranking = previous_understanding.get("rankingObjective") or previous_understanding.get("ranking_objective") or {}
+    denominator_ref = ""
+    if isinstance(previous_ranking, dict):
+        denominator_ref = str(
+            previous_ranking.get("resolvedMetricRef")
+            or previous_ranking.get("metricRef")
+            or previous_ranking.get("metric_ref")
+            or ""
+        )
+    feedback_items: List[Dict[str, Any]] = []
+    for gap in calculation_gaps:
+        invalid = next(
+            (
+                item
+                for item in previous_calculations
+                if str(item.get("sourcePhrase") or item.get("source_phrase") or gap.evidence) == str(gap.evidence or "")
+            ),
+            previous_calculations[0] if previous_calculations else {},
+        )
+        numerator_ref = str(invalid.get("numeratorMetricRef") or invalid.get("numerator_metric_ref") or "")
+        invalid_denominator_ref = str(invalid.get("denominatorMetricRef") or invalid.get("denominator_metric_ref") or denominator_ref)
+        feedback_items.append(
+            {
+                "code": gap.code,
+                "sourcePhrase": gap.evidence,
+                "reason": gap.reason,
+                "invalidNumeratorMetricRef": numerator_ref,
+                "invalidDenominatorMetricRef": invalid_denominator_ref,
+                "instruction": (
+                    "Re-understand the ratio/proportion. numeratorMetricRef must be the event/subset being counted; "
+                    "denominatorMetricRef must be the base population. They must not resolve to the same canonical metric. "
+                    "Do not use an already-derived rate/ratio metric as the numerator. "
+                    "If semanticCatalog lacks the numerator metric, return NEED_MORE_KNOWLEDGE with a METRIC knowledge request instead of repeating the same pair."
+                ),
+            }
+        )
+    return {
+        "calculation": feedback_items,
+        "mustFixBeforePlanning": True,
+    }
 
 
 def payload_has_understanding(payload: Dict[str, Any]) -> bool:
@@ -2330,6 +2405,8 @@ def critic_issue_from_gap(gap: GraphValidationGap) -> Dict[str, Any]:
 
 
 def critic_actions_for_gap(code: str) -> List[str]:
+    if code in {"CALCULATION_NUMERATOR_MISSING", "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"}:
+        return ["retrieve_knowledge", "plan_graph"]
     if code in {"SCOPE_NOT_NARROWING", "OBJECTIVE_NOT_COMPILED"}:
         return ["plan_graph"]
     if code in {"SCOPE_NOT_COMPILED", "SCOPE_TARGET_NOT_COMPILED", "SCOPE_EDGE_MISSING"}:
@@ -2341,6 +2418,56 @@ def critic_actions_for_gap(code: str) -> List[str]:
     if code in {"REQUESTED_MEASURE_NOT_PLANNED"}:
         return ["retrieve_knowledge", "plan_graph"]
     return ["repair_graph"]
+
+
+def calculation_contract_gaps(plan: QueryPlan) -> List[GraphValidationGap]:
+    gaps: List[GraphValidationGap] = []
+    seen: set[str] = set()
+    for item in plan.compiler_trace:
+        text = str(item or "")
+        if text.startswith("CALCULATION_NUMERATOR_MISSING:"):
+            evidence = text.split(":", 1)[-1]
+            key = "CALCULATION_NUMERATOR_MISSING:%s" % evidence
+            if key in seen:
+                continue
+            seen.add(key)
+            gaps.append(
+                GraphValidationGap(
+                    code="CALCULATION_NUMERATOR_MISSING",
+                    evidence=evidence,
+                    task_id="scope_event_ratio",
+                    reason="calculationIntent requests a ratio/percentage but numerator event metric is not resolved from semantic evidence",
+                )
+            )
+        elif text.startswith("CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR:"):
+            evidence = text.split(":", 1)[-1]
+            key = "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR:%s" % evidence
+            if key in seen:
+                continue
+            seen.add(key)
+            gaps.append(
+                GraphValidationGap(
+                    code="CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR",
+                    evidence=evidence,
+                    task_id="scope_event_ratio",
+                    reason="calculation numerator and denominator resolve to the same canonical metric; refusing to generate a fake 100% ratio",
+                )
+            )
+        elif text.startswith("CALCULATION_NUMERATOR_NOT_EVENT_METRIC:"):
+            evidence = text.split(":", 1)[-1]
+            key = "CALCULATION_NUMERATOR_NOT_EVENT_METRIC:%s" % evidence
+            if key in seen:
+                continue
+            seen.add(key)
+            gaps.append(
+                GraphValidationGap(
+                    code="CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
+                    evidence=evidence,
+                    task_id="scope_event_ratio",
+                    reason="calculation numerator must be an event/subset metric, not an already-derived rate or ratio metric",
+                )
+            )
+    return gaps
 
 
 class QueryGraphValidator:
@@ -2451,7 +2578,9 @@ class QueryGraphValidator:
                     reason=request.reason or "QueryGraph has unresolved knowledge request",
                 )
             )
+        gaps.extend(calculation_contract_gaps(plan))
         gaps.extend(QueryGraphContractValidator().validate(plan, asset_pack))
+        gaps.extend(GraphSanityCheck().validate(plan))
         cycle = dependency_cycle(plan.dependencies)
         if cycle:
             gaps.append(
@@ -2465,13 +2594,9 @@ class QueryGraphValidator:
         requests = []
         if repairable:
             requests = [
-                KnowledgeRequest(
-                    type=knowledge_request_type_for_gap(gap),
-                    query="%s %s %s" % (question, gap.code, gap.evidence),
-                    needed_for_task_id=gap.task_id,
-                    reason=gap.reason,
-                )
+                knowledge_request_from_validation_gap(question, gap)
                 for gap in gaps[:8]
+                if gap.code != "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"
             ]
         return GraphValidationResult(valid=not gaps, gaps=gaps, repairable=repairable, recommended_knowledge_requests=requests)
 
@@ -2559,6 +2684,185 @@ class QueryGraphValidator:
             if wanted_tokens and all(token in relationship_tokens for token in wanted_tokens if token not in {"seller_id", "merchant_id"}):
                 return True
         return not asset_pack.relationships
+
+
+class GraphSanityCheck:
+    TECHNICAL_KEYS = {"seller_id", "merchant_id", "pt", "dt", "date", "biz_date"}
+
+    def validate(self, plan: QueryPlan) -> List[GraphValidationGap]:
+        if not plan.question_understanding:
+            return []
+        gaps: List[GraphValidationGap] = []
+        gaps.extend(self._root_metric_gaps(plan))
+        gaps.extend(self._dependency_entity_filter_gaps(plan))
+        target_gap = self._target_grain_gap(plan)
+        if target_gap:
+            gaps.append(target_gap)
+        return gaps
+
+    def _root_metric_gaps(self, plan: QueryPlan) -> List[GraphValidationGap]:
+        ranking = (plan.question_understanding or {}).get("rankingObjective") or (plan.question_understanding or {}).get("ranking_objective") or {}
+        if not isinstance(ranking, dict):
+            return []
+        metric_ref = str(ranking.get("resolvedMetricRef") or ranking.get("metricRef") or "").strip()
+        if not metric_ref:
+            return []
+        matching = [intent for intent in executable_graph_intents(plan) if intent_metric_key(intent) == metric_ref]
+        if not matching:
+            return []
+        rootish = [
+            intent
+            for intent in matching
+            if not intent.depends_on_task_ids
+            or intent.answer_mode == AnswerMode.DERIVED
+            or projection_compute_strategy(intent)
+            or intent_is_scope_constrained_root(plan, intent)
+        ]
+        if rootish:
+            return []
+        return [
+            GraphValidationGap(
+                code="ROOT_METRIC_NOT_ROOT",
+                evidence=metric_ref,
+                task_id=matching[0].plan_task_id,
+                reason="rankingObjective metric is only planned as a dependent node, not as an anchor/root metric",
+            )
+        ]
+
+    def _dependency_entity_filter_gaps(self, plan: QueryPlan) -> List[GraphValidationGap]:
+        gaps: List[GraphValidationGap] = []
+        requested = requested_measure_metric_refs(plan.question_understanding or {})
+        intent_by_task = {intent.plan_task_id: intent for intent in plan.intents if intent.plan_task_id}
+        for dep in plan.dependencies:
+            if dep.relation_type == "DERIVED_COMPONENT":
+                continue
+            if dependency_is_time_alignment(dep):
+                continue
+            if dependency_has_entity_filter(dep):
+                continue
+            dependent = intent_by_task.get(dep.dependent_task_id)
+            if dependent and intent_is_graph_helper(dependent):
+                continue
+            code = "SIBLING_METRIC_WRONGLY_DEPENDENT" if dependent and intent_metric_key(dependent) in requested else "DEPENDENCY_NOT_ENTITY_FILTER"
+            gaps.append(
+                GraphValidationGap(
+                    code=code,
+                    evidence="%s->%s:%s" % (dep.anchor_task_id, dep.dependent_task_id, dep.join_key or dep.anchor_column or dep.dependent_column),
+                    task_id=dep.dependent_task_id,
+                    reason="dependency edge does not carry a business entity key; tenant/time keys cannot narrow downstream evidence",
+                )
+            )
+        return gaps
+
+    def _target_grain_gap(self, plan: QueryPlan) -> GraphValidationGap | None:
+        ranking = (plan.question_understanding or {}).get("rankingObjective") or (plan.question_understanding or {}).get("ranking_objective") or {}
+        if not isinstance(ranking, dict):
+            return None
+        group_by = str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "").strip()
+        if not group_by or not graph_sanity_entity_key(group_by):
+            return None
+        for intent in executable_graph_intents(plan):
+            produced = set(intent.output_keys + intent.required_evidence)
+            produced.update(column for column in [intent.group_by_column, intent.filter_column, intent.metric_name] if column)
+            if group_by in produced:
+                return None
+        return GraphValidationGap(
+            code="TARGET_GRAIN_NOT_OUTPUT",
+            evidence=group_by,
+            reason="rankingObjective groupByColumn is not produced by any executable QueryGraph node",
+        )
+
+
+def executable_graph_intents(plan: QueryPlan) -> List[QuestionIntent]:
+    return [
+        intent
+        for intent in plan.intents
+        if intent.intent_type == IntentType.VALID and intent.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT, AnswerMode.INVALID}
+    ]
+
+
+def intent_metric_key(intent: QuestionIntent) -> str:
+    return str((intent.metric_resolution or {}).get("metricKey") or intent.metric_name or "").strip()
+
+
+def projection_compute_strategy(intent: QuestionIntent) -> bool:
+    return str((intent.metric_resolution or {}).get("computeStrategy") or "") == "projection_group_aggregate"
+
+
+def intent_is_scope_constrained_root(plan: QueryPlan, intent: QuestionIntent) -> bool:
+    if not (plan.question_understanding or {}).get("scopeConstraints") and not (plan.question_understanding or {}).get("scope_constraints"):
+        return False
+    ancestors = dependency_ancestors(plan.dependencies, intent.plan_task_id)
+    if not ancestors:
+        return False
+    return any(graph_task_is_scope_or_population(task_id) for task_id in ancestors)
+
+
+def dependency_ancestors(dependencies: List[PlanDependency], task_id: str) -> set[str]:
+    parents: Dict[str, List[str]] = {}
+    for dep in dependencies:
+        if dep.anchor_task_id and dep.dependent_task_id:
+            parents.setdefault(dep.dependent_task_id, []).append(dep.anchor_task_id)
+    seen: set[str] = set()
+    stack = list(parents.get(task_id, []))
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(parents.get(current, []))
+    return seen
+
+
+def graph_task_is_scope_or_population(task_id: str) -> bool:
+    text = str(task_id or "").lower()
+    return "scope" in text or "population" in text
+
+
+def intent_is_graph_helper(intent: QuestionIntent) -> bool:
+    task_id = str(intent.plan_task_id or "").lower()
+    return bool(
+        graph_task_is_scope_or_population(task_id)
+        or "bridge" in task_id
+        or "entity_expand" in task_id
+        or projection_compute_strategy(intent)
+    )
+
+
+def requested_measure_metric_refs(understanding: Dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for item in understanding.get("requestedMeasures") or understanding.get("requested_measures") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ["resolvedMetricRef", "metricRef"]:
+            value = str(item.get(key) or "").strip()
+            if value:
+                refs.add(value)
+    return refs
+
+
+def dependency_has_entity_filter(dep: PlanDependency) -> bool:
+    tokens = split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)
+    return any(graph_sanity_entity_key(token) for token in tokens)
+
+
+def dependency_is_time_alignment(dep: PlanDependency) -> bool:
+    tokens = [token.lower() for token in split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)]
+    if not tokens:
+        return False
+    non_empty = [token for token in tokens if token]
+    if not non_empty:
+        return False
+    return all(token in GraphSanityCheck.TECHNICAL_KEYS for token in non_empty) and any(
+        token in {"pt", "dt", "date", "biz_date"} for token in non_empty
+    )
+
+
+def graph_sanity_entity_key(column: str) -> bool:
+    text = str(column or "").strip().lower()
+    if not text or text in GraphSanityCheck.TECHNICAL_KEYS:
+        return False
+    return text == "spu_name" or text.endswith("_id") or text in {"order_no", "bill_no"}
 
 
 def dependency_cycle(dependencies: List[PlanDependency]) -> List[str]:
@@ -3752,11 +4056,456 @@ def finalize_compiled_query_plan(
     compiled = repair_missing_domain_dependencies(question, compiled, asset_pack)
     compiled = repair_dependency_key_production_gaps(question, compiled, asset_pack, [])
     compiled = repair_projected_root_group_by(question, compiled, understanding, asset_pack)
+    compiled = add_scope_event_ratio_compute(question, compiled, understanding, asset_pack)
     compiled = apply_required_evidence_intents(compiled, understanding, asset_pack)
     compiled = add_rule_evidence_branch(question, compiled, understanding, asset_pack)
     compiled.evidence_contracts = EvidenceContractBuilder().contracts_from_intents(compiled.intents)
     compiled.final_required_evidence = EvidenceContractBuilder().final_evidence_labels(compiled.intents)
     return compiled
+
+
+def add_scope_event_ratio_compute(
+    question: str,
+    plan: QueryPlan,
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> QueryPlan:
+    if not scope_constraints_from_understanding(understanding):
+        return plan
+    if not understanding_requests_ratio(question, understanding):
+        return plan
+    if any(
+        intent.answer_mode == AnswerMode.DERIVED
+        and str((intent.metric_resolution or {}).get("computeStrategy") or "") == "scope_event_ratio"
+        for intent in plan.intents
+    ):
+        return plan
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    if not isinstance(ranking, dict):
+        return plan
+    denominator_metric_ref = str(ranking.get("resolvedMetricRef") or ranking.get("metricRef") or ranking.get("metric_ref") or "")
+    denominator_table = str(ranking.get("resolvedOwnerTable") or ranking.get("ownerTable") or ranking.get("owner_table") or "")
+    denominator = next(
+        (
+            intent
+            for intent in plan.intents
+            if intent_metric_key(intent) == denominator_metric_ref
+            and (not denominator_table or intent.preferred_table == denominator_table)
+            and intent.depends_on_task_ids
+        ),
+        None,
+    )
+    if not denominator:
+        return plan
+    parent_task = (denominator.depends_on_task_ids or [""])[0]
+    parent = next((intent for intent in plan.intents if intent.plan_task_id == parent_task), None)
+    if not parent:
+        return plan
+    measures = [item for item in understanding.get("requestedMeasures") or understanding.get("requested_measures") or [] if isinstance(item, dict)]
+    numerator_metric, numerator_gap, numerator_metric_resolution = scope_ratio_numerator_metric(
+        question,
+        measures,
+        understanding,
+        asset_pack,
+        denominator_metric_ref,
+        denominator_table,
+    )
+    if numerator_gap:
+        knowledge_requests = list(plan.knowledge_requests)
+        if numerator_gap != "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR":
+            knowledge_requests = dedupe_knowledge_requests(
+                [
+                    *knowledge_requests,
+                    scope_ratio_numerator_knowledge_request(question, understanding, numerator_gap),
+                ]
+            )
+        return plan.model_copy(
+            update={
+                "compiler_trace": dedupe_strings(
+                    [
+                        *plan.compiler_trace,
+                        "%s:%s" % (numerator_gap, scope_ratio_source_phrase(question, understanding)),
+                    ]
+                ),
+                "knowledge_requests": knowledge_requests,
+            }
+        )
+    if not numerator_metric:
+        return plan
+    numerator = next(
+        (
+            intent
+            for intent in plan.intents
+            if intent_metric_key(intent) == numerator_metric.key and intent.preferred_table == numerator_metric.table
+        ),
+        None,
+    )
+    intents = list(plan.intents)
+    dependencies = list(plan.dependencies)
+    compiler_trace = list(plan.compiler_trace)
+    index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
+    group_by = denominator.group_by_column or "seller_id"
+    if group_by not in asset_pack.known_columns(numerator_metric.table):
+        group_by = shared_scope_ratio_group_key(denominator, numerator_metric, asset_pack)
+    if not group_by:
+        return plan
+    if not numerator:
+        task_id = unique_task_id("%s_%s_ratio_numerator" % (semantic_domain_for_metric(numerator_metric), numerator_metric.key), [intent.plan_task_id for intent in intents])
+        numerator_resolution = (
+            numerator_metric_resolution
+            if numerator_metric_resolution and numerator_metric_resolution.metric
+            else SemanticMetricResolution(
+                requested_metric_ref=numerator_metric.key,
+                source_phrase="event numerator for scoped ratio",
+                metric=numerator_metric,
+                confidence=1.0,
+                resolution_source="semantic_scope_ratio_numerator",
+                field_warning=semantic_metric_field_warning(numerator_metric),
+            )
+        )
+        numerator = compiled_metric_intent(
+            question=question,
+            metric=numerator_metric,
+            task_id=task_id,
+            role=TaskRole.DEPENDENT,
+            mode=AnswerMode.GROUP_AGG,
+            grain="merchant" if group_by in {"seller_id", "merchant_id"} else "",
+            group_by=group_by,
+            depends_on=[parent.plan_task_id],
+            limit=max(200, denominator.limit or infer_limit(question)),
+            asset_pack=asset_pack,
+            metric_resolution=numerator_resolution.payload(),
+        )
+        if not numerator:
+            return plan
+        intents.append(numerator)
+        attach_metric_dependency_from_parent(
+            question,
+            intents,
+            dependencies,
+            parent_task=parent.plan_task_id,
+            parent_table=parent.preferred_table,
+            metric_intent=numerator,
+            metric_table=numerator_metric.table,
+            grain="order",
+            asset_pack=asset_pack,
+            index=index,
+            compiler_trace=compiler_trace,
+        )
+    numerator_key = intent_metric_key(numerator)
+    denominator_key = intent_metric_key(denominator)
+    if not numerator_key or not denominator_key:
+        return plan
+    if same_metric_identity(numerator_metric.table, numerator_key, denominator.preferred_table, denominator_key, asset_pack):
+        return plan.model_copy(
+            update={
+                "compiler_trace": dedupe_strings(
+                    [
+                        *plan.compiler_trace,
+                        "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR:%s/%s" % (numerator_key, denominator_key),
+                    ]
+                ),
+            }
+        )
+    ratio_key = "%s_share_of_%s" % (numerator_key, denominator_key)
+    task_id = unique_task_id("derived_%s" % ratio_key, [intent.plan_task_id for intent in intents])
+    component_payloads = [
+        {
+            "taskId": numerator.plan_task_id,
+            "metricKey": numerator_key,
+            "ownerTable": numerator.preferred_table,
+            "sourceColumns": metric_source_columns_for_entry(numerator_metric),
+            "formula": numerator.metric_formula,
+            "semanticRefId": numerator_metric.source_ref_id,
+        },
+        {
+            "taskId": denominator.plan_task_id,
+            "metricKey": denominator_key,
+            "ownerTable": denominator.preferred_table,
+            "sourceColumns": metric_source_columns_for_intent(denominator),
+            "formula": denominator.metric_formula,
+            "semanticRefId": str((denominator.metric_resolution or {}).get("semanticRefId") or ""),
+        },
+    ]
+    derived_refs = dedupe_knowledge_refs(list(numerator.knowledge_refs) + list(denominator.knowledge_refs))
+    derived = QuestionIntent(
+        question=question,
+        intent_type=IntentType.VALID,
+        category=numerator.category,
+        answer_mode=AnswerMode.DERIVED,
+        plan_task_id=task_id,
+        task_role=TaskRole.DEPENDENT,
+        preferred_table="",
+        metric_name=ratio_key,
+        metric_formula="%s / %s" % (numerator_key, denominator_key),
+        group_by_column=group_by,
+        days=denominator.days,
+        limit=denominator.limit or 20,
+        required_evidence=dedupe_strings([group_by, ratio_key, numerator_key, denominator_key]),
+        output_keys=dedupe_strings([group_by, ratio_key, numerator_key, denominator_key]),
+        depends_on_task_ids=[numerator.plan_task_id, denominator.plan_task_id],
+        knowledge_refs=derived_refs,
+        knowledge_ref_ids=dedupe_strings([ref.ref_id for ref in derived_refs if ref.ref_id]),
+        analysis_source="metric_dag_compiler",
+        analysis_note="scope event ratio",
+        sql_strategy="derived_compute",
+        metric_resolution={
+            "requestedMetricRef": ratio_key,
+            "sourcePhrase": scope_ratio_source_phrase(question, understanding),
+            "metricKey": ratio_key,
+            "ownerTable": numerator.preferred_table,
+            "sourceColumns": [numerator_key, denominator_key],
+            "sourceMetricRefs": [numerator_key, denominator_key],
+            "formula": "%s / %s" % (numerator_key, denominator_key),
+            "unit": "%",
+            "displayName": scope_ratio_display_name(numerator, denominator),
+            "confidence": 1.0,
+            "resolutionSource": "semantic_scope_event_ratio",
+            "fieldWarning": "",
+            "derivedMetric": True,
+            "componentMetrics": component_payloads,
+            "componentMetricKeys": [numerator_key, denominator_key],
+            "groupByColumn": group_by,
+            "computeStrategy": "scope_event_ratio",
+        },
+    )
+    intents.append(derived)
+    for component in [numerator, denominator]:
+        add_dependency_if_valid(
+            dependencies,
+            PlanDependency(
+                anchor_task_id=component.plan_task_id,
+                dependent_task_id=derived.plan_task_id,
+                join_key=group_by,
+                anchor_column=group_by,
+                dependent_column=group_by,
+                relation_type="DERIVED_COMPONENT",
+            ),
+        )
+    compiler_trace.extend(
+        [
+            "SCOPE_EVENT_RATIO:%s:%s/%s" % (ratio_key, numerator_key, denominator_key),
+            "GRAPH_ROLE:%s:%s:%s" % (derived.plan_task_id, GRAPH_ROLE_DERIVED_COMPUTE, ratio_key),
+            "DEPENDENCY_SEMANTICS:%s:derived_component" % derived.plan_task_id,
+        ]
+    )
+    return sync_intent_dependencies(plan.model_copy(update={"intents": intents, "dependencies": dependencies, "compiler_trace": compiler_trace}))
+
+
+def understanding_requests_ratio(question: str, understanding: Dict[str, Any]) -> bool:
+    for item in understanding.get("calculationIntents") or understanding.get("calculation_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation") or "").lower()
+        if operation in {"ratio", "percentage", "proportion"}:
+            return True
+    text = " ".join(
+        [
+            question,
+            str((understanding.get("rankingObjective") or {}).get("sourcePhrase") or ""),
+            " ".join(str(item.get("sourcePhrase") or "") for item in understanding.get("requestedMeasures") or [] if isinstance(item, dict)),
+        ]
+    ).lower()
+    return any(token in text for token in ["ratio", "proportion", "percentage", "percent", "占比", "占多少", "比例"])
+
+
+def scope_ratio_numerator_metric(
+    question: str,
+    measures: List[Dict[str, Any]],
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+    denominator_metric_ref: str,
+    denominator_table: str,
+) -> Tuple[Any, str, SemanticMetricResolution | None]:
+    pending_gap = ""
+    resolver = SemanticMetricResolver(asset_pack)
+    for item in understanding.get("calculationIntents") or understanding.get("calculation_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        numerator_ref = str(item.get("numeratorMetricRef") or item.get("numerator_metric_ref") or "").strip()
+        resolution, gap = resolver.resolve_event_population_metric(
+            question=question,
+            understanding=understanding,
+            numerator_metric_ref=numerator_ref,
+            denominator_table=denominator_table,
+            denominator_metric_ref=denominator_metric_ref,
+        )
+        if gap:
+            pending_gap = gap
+            continue
+        metric = resolution.metric
+        if not metric:
+            pending_gap = "CALCULATION_NUMERATOR_MISSING"
+            continue
+        if same_metric_identity(metric.table, metric.key, denominator_table, denominator_metric_ref, asset_pack):
+            pending_gap = "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"
+            continue
+        if not metric_is_event_or_subset_metric(metric):
+            pending_gap = "CALCULATION_NUMERATOR_NOT_EVENT_METRIC"
+            continue
+        return metric, "", resolution
+    for measure in measures:
+        metric_ref = str(measure.get("resolvedMetricRef") or measure.get("metricRef") or measure.get("metric_ref") or "")
+        owner_table = str(measure.get("resolvedOwnerTable") or measure.get("ownerTable") or measure.get("owner_table") or "")
+        metric = metric_entry_by_ref(metric_ref, asset_pack, owner_table)
+        if not metric:
+            continue
+        if same_metric_identity(metric.table, metric.key, denominator_table, denominator_metric_ref, asset_pack):
+            continue
+        if metric_is_event_or_subset_metric(metric):
+            return metric, "", SemanticMetricResolution(
+                requested_metric_ref=metric.key,
+                source_phrase=str(measure.get("sourcePhrase") or measure.get("source_phrase") or ""),
+                metric=metric,
+                confidence=1.0,
+                resolution_source="semantic_metric_ref",
+                field_warning=semantic_metric_field_warning(metric),
+            )
+    return None, pending_gap or "CALCULATION_NUMERATOR_MISSING", None
+
+
+def same_metric_identity(left_table: str, left_key: str, right_table: str, right_key: str, asset_pack: PlanningAssetPack) -> bool:
+    left = metric_entry_by_ref(left_key, asset_pack, left_table) if left_key else None
+    right = metric_entry_by_ref(right_key, asset_pack, right_table) if right_key else None
+    left_identity = canonical_metric_identity(left) if left else (left_table, left_key)
+    right_identity = canonical_metric_identity(right) if right else (right_table, right_key)
+    return bool(left_identity[1] and right_identity[1] and left_identity == right_identity)
+
+
+def canonical_metric_identity(metric: Any) -> Tuple[str, str]:
+    metadata = getattr(metric, "metadata", {}) or {}
+    table = str(getattr(metric, "table", "") or "")
+    key = str(getattr(metric, "key", "") or "")
+    canonical = str(metadata.get("canonicalMetricKey") or metadata.get("canonical_metric_key") or "")
+    alias_of = str(metadata.get("aliasOf") or metadata.get("alias_of") or "")
+    return table, canonical or alias_of or key
+
+
+def metric_is_event_or_subset_metric(metric: Any) -> bool:
+    if metric_is_count_metric(metric):
+        return True
+    metadata = getattr(metric, "metadata", {}) or {}
+    if any(metadata.get(key) for key in ["populationScope", "population_scope", "scopeFilter", "scope_filter", "filterPredicate", "filter_predicate", "where"]):
+        return True
+    formula = metric_formula_for_entry(metric).lower()
+    return bool(re.search(r"\b(case\s+when|where|if\s*\()", formula, flags=re.IGNORECASE))
+
+
+def scope_ratio_numerator_knowledge_request(question: str, understanding: Dict[str, Any], reason: str) -> KnowledgeRequest:
+    source_phrase = scope_ratio_source_phrase(question, understanding)
+    denominator_ref = ""
+    invalid_numerator_ref = ""
+    calculation_phrases: List[str] = []
+    base_population_phrases: List[str] = []
+    event_population_phrases: List[str] = []
+    for item in understanding.get("calculationIntents") or understanding.get("calculation_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        calculation_phrases.append(str(item.get("sourcePhrase") or item.get("source_phrase") or ""))
+        base_population_phrases.append(str(item.get("basePopulationPhrase") or item.get("base_population_phrase") or ""))
+        event_population_phrases.append(str(item.get("eventPopulationPhrase") or item.get("event_population_phrase") or ""))
+        if not invalid_numerator_ref:
+            invalid_numerator_ref = str(item.get("numeratorMetricRef") or item.get("numerator_metric_ref") or "")
+        if not denominator_ref:
+            denominator_ref = str(item.get("denominatorMetricRef") or item.get("denominator_metric_ref") or "")
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    if isinstance(ranking, dict) and not denominator_ref:
+        denominator_ref = str(ranking.get("resolvedMetricRef") or ranking.get("metricRef") or ranking.get("metric_ref") or "")
+    scope_phrases = [
+        str(item.get("sourcePhrase") or item.get("source_phrase") or "")
+        for item in understanding.get("scopeConstraints") or understanding.get("scope_constraints") or []
+        if isinstance(item, dict)
+    ]
+    measure_phrases = [
+        str(item.get("sourcePhrase") or item.get("source_phrase") or "")
+        for item in understanding.get("requestedMeasures") or understanding.get("requested_measures") or []
+        if isinstance(item, dict)
+    ]
+    query = " ".join(
+        item
+        for item in [
+            question,
+            source_phrase,
+            *calculation_phrases,
+            *base_population_phrases,
+            *event_population_phrases,
+            *scope_phrases,
+            *measure_phrases,
+            "invalid numerator=%s" % invalid_numerator_ref if invalid_numerator_ref else "",
+            "denominator=%s" % denominator_ref if denominator_ref else "",
+            "expected numerator role=event subset metric",
+            "calculation numerator event subset metric definition",
+        ]
+        if item
+    )
+    return KnowledgeRequest(
+        type=KnowledgeRequestType.METRIC,
+        query=query or question,
+        needed_for_task_id="scope_event_ratio",
+        reason=reason,
+        source_phrase=source_phrase,
+    )
+
+
+def event_count_metric_for_table(table: str, asset_pack: PlanningAssetPack) -> Any:
+    candidates = [metric for metric in asset_pack.metrics if metric.table == table and metric_is_count_metric(metric)]
+    if not candidates:
+        return None
+    canonical = [metric for metric in candidates if str((metric.metadata or {}).get("canonicalMetricKey") or (metric.metadata or {}).get("canonical_metric_key") or "") == metric.key]
+    if canonical:
+        return canonical[0]
+    return sorted(candidates, key=lambda metric: (0 if "cnt" in metric.key.lower() else 1, metric.key))[0]
+
+
+def metric_is_count_metric(metric: Any) -> bool:
+    formula = metric_formula_for_entry(metric).lower()
+    if "count(" in formula or "count distinct" in formula:
+        return True
+    key = str(getattr(metric, "key", "") or "").lower()
+    return key.endswith("_cnt") or key.endswith("_count")
+
+
+def shared_scope_ratio_group_key(denominator: QuestionIntent, numerator_metric: Any, asset_pack: PlanningAssetPack) -> str:
+    numerator_columns = set(asset_pack.known_columns(numerator_metric.table))
+    for candidate in [denominator.group_by_column, *denominator.output_keys, *denominator.required_evidence, "seller_id", "merchant_id"]:
+        if candidate and candidate in numerator_columns:
+            return candidate
+    return ""
+
+
+def metric_source_columns_for_intent(intent: QuestionIntent) -> List[str]:
+    resolution = intent.metric_resolution or {}
+    return [str(item) for item in resolution.get("sourceColumns") or resolution.get("source_columns") or [intent.metric_column] if item]
+
+
+def scope_ratio_source_phrase(question: str, understanding: Dict[str, Any]) -> str:
+    event_phrase = calculation_event_population_phrase(understanding)
+    if event_phrase:
+        return event_phrase
+    for item in understanding.get("calculationIntents") or understanding.get("calculation_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ["sourcePhrase", "source_phrase"]:
+            if item.get(key):
+                return str(item.get(key))
+    return question
+
+
+def calculation_event_population_phrase(understanding: Dict[str, Any]) -> str:
+    for item in understanding.get("calculationIntents") or understanding.get("calculation_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ["eventPopulationPhrase", "event_population_phrase"]:
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def scope_ratio_display_name(numerator: QuestionIntent, denominator: QuestionIntent) -> str:
+    numerator_name = str((numerator.metric_resolution or {}).get("displayName") or numerator.metric_name or "分子指标")
+    denominator_name = str((denominator.metric_resolution or {}).get("displayName") or denominator.metric_name or "分母指标")
+    return "%s占%s比例" % (numerator_name, denominator_name)
 
 
 def repair_projected_root_group_by(
@@ -6106,6 +6855,79 @@ class SemanticMetricResolver:
             knowledge_requests=[self._metric_evidence_request(question, requested, owner_table, phrase, reason)],
         )
 
+    def resolve_event_population_metric(
+        self,
+        question: str,
+        understanding: Dict[str, Any],
+        numerator_metric_ref: str,
+        denominator_table: str,
+        denominator_metric_ref: str,
+    ) -> Tuple[SemanticMetricResolution, str]:
+        event_phrase = calculation_event_population_phrase(understanding) or scope_ratio_source_phrase(question, understanding)
+        requested = str(numerator_metric_ref or "").strip()
+        resolution = self.resolve(
+            question=question,
+            metric_ref=requested,
+            owner_table="",
+            source_phrase=event_phrase,
+            allow_phrase_override=True,
+        )
+        metric = resolution.metric
+        if metric:
+            if same_metric_identity(metric.table, metric.key, denominator_table, denominator_metric_ref, self.asset_pack):
+                return resolution, "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"
+            if not metric_is_event_or_subset_metric(metric):
+                component = self._event_component_from_derived_metric(metric, denominator_table, denominator_metric_ref)
+                if component:
+                    return (
+                        SemanticMetricResolution(
+                            requested,
+                            event_phrase,
+                            component,
+                            0.94,
+                            "semantic_event_component_from_derived_metric",
+                            semantic_metric_field_warning(component),
+                            [
+                                *resolution.candidate_evidence[:3],
+                                {
+                                    "metricKey": component.key,
+                                    "ownerTable": component.table,
+                                    "displayName": component.title,
+                                    "resolutionReason": "event component of %s" % metric.key,
+                                    "semanticRefId": component.source_ref_id,
+                                },
+                            ],
+                        ),
+                        "",
+                    )
+                return resolution, "CALCULATION_NUMERATOR_NOT_EVENT_METRIC"
+            return resolution, ""
+        request = scope_ratio_numerator_knowledge_request(question, understanding, "CALCULATION_NUMERATOR_MISSING")
+        existing = list(resolution.knowledge_requests or [])
+        if not any(item.query == request.query and item.reason == request.reason for item in existing):
+            existing.append(request)
+        return (
+            SemanticMetricResolution(
+                requested,
+                event_phrase,
+                None,
+                0.0,
+                "CALCULATION_NUMERATOR_MISSING",
+                "",
+                resolution.candidate_evidence,
+                knowledge_requests=existing,
+            ),
+            "CALCULATION_NUMERATOR_MISSING",
+        )
+
+    def _event_component_from_derived_metric(self, metric: Any, denominator_table: str, denominator_metric_ref: str) -> Any:
+        for component in derived_metric_components(metric, self.asset_pack):
+            if same_metric_identity(component.table, component.key, denominator_table, denominator_metric_ref, self.asset_pack):
+                continue
+            if metric_is_event_or_subset_metric(component):
+                return component
+        return None
+
     def _recall_evidence_candidates(self, phrase: str = "", scoped_only: bool = False) -> List[Any]:
         evidence_by_identity = self._recall_metric_evidence_by_identity()
         metrics_by_identity = {(metric.table, metric.key): metric for metric in self._candidate_metrics("")}
@@ -7241,7 +8063,7 @@ def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPa
             and intent.intent_type == IntentType.VALID
             and intent_has_metric_ref(intent, requested_metric, requested_owner)
         ]
-        if objective_tasks and not any(root_metric_task_is_aligned(intent, scope_tasks) for intent in objective_tasks):
+        if objective_tasks and not any(root_metric_task_is_aligned(intent, scope_tasks, plan.dependencies) for intent in objective_tasks):
             first = objective_tasks[0]
             issues.append(
                 {
@@ -7286,6 +8108,8 @@ def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPa
         if dep.relation_type == "DERIVED_COMPONENT" or semantics in {"entity_filter", "scope_filter", "derived_component"}:
             continue
         tokens = split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)
+        if dependency_is_time_alignment(dep):
+            continue
         meaningful = [token for token in tokens if token and token not in {"seller_id", "merchant_id"}]
         if not meaningful:
             issues.append(
@@ -7316,10 +8140,13 @@ def graph_role_trace_maps(plan: QueryPlan) -> Tuple[Dict[str, str], Dict[str, st
     return role_by_task, semantics_by_task
 
 
-def root_metric_task_is_aligned(intent: QuestionIntent, scope_tasks: set[str]) -> bool:
+def root_metric_task_is_aligned(intent: QuestionIntent, scope_tasks: set[str], dependencies: List[PlanDependency]) -> bool:
     if not intent.depends_on_task_ids:
         return True
-    return all(parent in scope_tasks for parent in intent.depends_on_task_ids)
+    if any(parent in scope_tasks for parent in intent.depends_on_task_ids):
+        return True
+    ancestors = dependency_ancestors(dependencies, intent.plan_task_id)
+    return bool(ancestors & scope_tasks)
 
 
 def more_specific_requested_measure_than_ranking(ranking: Dict[str, Any], understanding: Dict[str, Any]) -> Dict[str, Any]:
@@ -7791,7 +8618,14 @@ def planner_repair_reason_for_issue(code: str) -> str:
         "SCOPE_EDGE_MISSING",
     }:
         return "MISSING_EDGE"
-    if code in {"METRIC_RESOLUTION_NEEDED", "REQUESTED_MEASURE_NOT_PLANNED", "METRIC_RESOLUTION_LOW_CONFIDENCE"}:
+    if code in {
+        "METRIC_RESOLUTION_NEEDED",
+        "REQUESTED_MEASURE_NOT_PLANNED",
+        "METRIC_RESOLUTION_LOW_CONFIDENCE",
+        "CALCULATION_NUMERATOR_MISSING",
+        "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR",
+        "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
+    }:
         return "METRIC_RESOLUTION_NEEDED" if code != "METRIC_RESOLUTION_LOW_CONFIDENCE" else "METRIC_RESOLUTION_LOW_CONFIDENCE"
     if code in {"MISSING_ANALYSIS_EVIDENCE_CONTRACT", "ANALYSIS_EVIDENCE_NOT_COVERED"}:
         return "ANALYSIS_EVIDENCE_NOT_COVERED"
@@ -8009,11 +8843,34 @@ def missing_metric_dependencies(intent: QuestionIntent, asset_pack: PlanningAsse
 
 
 def knowledge_request_type_for_gap(gap: GraphValidationGap) -> KnowledgeRequestType:
+    if gap.code == "PENDING_KNOWLEDGE_REQUEST" and str(gap.reason or "").startswith("CALCULATION_NUMERATOR_"):
+        return KnowledgeRequestType.METRIC
     if gap.code == "MISSING_RELATIONSHIP":
         return KnowledgeRequestType.RELATIONSHIP
-    if gap.code == "MISSING_METRIC_DEPENDENCY":
+    if gap.code in {
+        "MISSING_METRIC_DEPENDENCY",
+        "CALCULATION_NUMERATOR_MISSING",
+        "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR",
+        "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
+    }:
         return KnowledgeRequestType.METRIC
     return KnowledgeRequestType.FIELD
+
+
+def knowledge_request_from_validation_gap(question: str, gap: GraphValidationGap) -> KnowledgeRequest:
+    if gap.code == "PENDING_KNOWLEDGE_REQUEST":
+        return KnowledgeRequest(
+            type=knowledge_request_type_for_gap(gap),
+            query=gap.evidence or question,
+            needed_for_task_id=gap.task_id,
+            reason=gap.reason,
+        )
+    return KnowledgeRequest(
+        type=knowledge_request_type_for_gap(gap),
+        query="%s %s %s" % (question, gap.code, gap.evidence),
+        needed_for_task_id=gap.task_id,
+        reason=gap.reason,
+    )
 
 
 def metric_formula_columns(formula: str, available_columns: set) -> List[str]:

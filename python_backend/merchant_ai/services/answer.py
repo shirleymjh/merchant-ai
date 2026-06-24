@@ -457,6 +457,7 @@ def merge_visible_task_rows(base_item: Any, other_items: List[Any]) -> List[Dict
 
 
 def first_matching_row(base: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    base_has_entity = any(summary_business_entity_key(key) for key in base)
     for key in ["spu_id", "spu_name", "order_id", "sub_order_id", "refund_id", "ticket_id", "bill_id"]:
         base_value = normalized_cell(base.get(key))
         if not base_value:
@@ -464,7 +465,14 @@ def first_matching_row(base: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict
         for row in rows:
             if normalized_cell(row.get(key)) == base_value:
                 return row
+    if not base_has_entity and len(rows) == 1:
+        return rows[0]
     return None
+
+
+def summary_business_entity_key(column: str) -> bool:
+    text = str(column or "").strip().lower()
+    return text in {"spu_id", "spu_name", "order_id", "sub_order_id", "refund_id", "ticket_id", "bill_id"}
 
 
 def normalized_cell(value: Any) -> str:

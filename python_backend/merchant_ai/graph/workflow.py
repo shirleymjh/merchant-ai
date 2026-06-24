@@ -384,6 +384,7 @@ class MerchantQaWorkflow:
         state["_next_action"] = decision.selected_node
         state["available_actions"] = self.policy.available_actions(state)
         state["agent_decision_reason"] = decision.reason
+        self.ensure_terminal_planning_gap(state, decision)
         state.setdefault("lead_decisions", []).append(decision)
         selected = self.policy.registry.get(decision.selected_action)
         state.setdefault("action_history", []).append(
@@ -412,6 +413,31 @@ class MerchantQaWorkflow:
         self.record_span(state, "action", "policy", started)
         self.finish_run_step(state, step, "success", output_summary="%s->%s" % (decision.selected_action, decision.selected_node))
         return state
+
+    def ensure_terminal_planning_gap(self, state: AgentState, decision: Any) -> None:
+        if getattr(decision, "selected_action", "") not in {"answer_data", "answer"}:
+            return
+        if state.get("chat_bi_completed"):
+            return
+        plan = state.get("plan") or QueryPlan()
+        validation = state.get("query_graph_validation_result") or GraphValidationResult()
+        run_result = state.get("agent_run_result")
+        has_task_results = bool(getattr(run_result, "task_results", None))
+        if plan.intents or validation.gaps or has_task_results:
+            return
+        reason = str(getattr(decision, "reason", "") or "LeadAgent selected answer without executable QueryGraph")
+        gap_code = "AGENT_DECISION_EXHAUSTED" if getattr(decision, "budget_exhausted", False) else "MISSING_QUERY_GRAPH"
+        state["query_graph_validation_result"] = GraphValidationResult(
+            valid=False,
+            repairable=False,
+            gaps=[
+                GraphValidationGap(
+                    code=gap_code,
+                    reason=reason,
+                )
+            ],
+        )
+        state["query_graph_validated"] = True
 
     def route_topic(self, state: AgentState) -> AgentState:
         started = now_ms()
@@ -1028,9 +1054,12 @@ class MerchantQaWorkflow:
             knowledge_context(state),
             state["recall_bundle"],
             state["planning_asset_pack"],
-            state["query_graph_validation_result"].gaps,
+            state["query_graph_validation_result"].gaps or state.get("last_query_graph_validation_gaps", []),
             state.get("thinking_steps", []),
-            {"openDiagnostic": self.open_diagnostic_debug(state)},
+            {
+                "openDiagnostic": self.open_diagnostic_debug(state),
+                "previousUnderstanding": (state.get("plan") or QueryPlan()).question_understanding,
+            },
         )
         state["plan"] = plan
         self.planner.artifact_store.write_json("planner", "query_graph.json", plan.model_dump(by_alias=True), preview_chars=0)
@@ -1209,6 +1238,7 @@ class MerchantQaWorkflow:
         result = self.graph_validator.validate(state["question"], state["plan"], state["planning_asset_pack"])
         state["query_graph_validation_result"] = result
         state["query_graph_validated"] = True
+        state["last_query_graph_validation_gaps"] = [] if result.valid else list(result.gaps)
         state["pending_knowledge_requests"] = filter_blocked_knowledge_requests(
             state,
             result.recommended_knowledge_requests,
@@ -1758,7 +1788,7 @@ class MerchantQaWorkflow:
             debug_trace={
                 "displayPolicy": state["plan"].display_policy,
                 "displayTitle": state["plan"].display_title,
-                "agentTrace": state["plan"].agent_trace,
+                "agentTrace": state["plan"].agent_trace or legacy_agent_trace_from_actions(state),
                 "harness": {
                     "mode": self.settings.agent_mode,
                     "actions": self.policy.registry.public_action_ids(),
@@ -2329,6 +2359,26 @@ def metric_resolutions_for_debug(plan: QueryPlan) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def legacy_agent_trace_from_actions(state: AgentState) -> List[str]:
+    traces: List[str] = []
+    for item in state.get("action_history", []) or []:
+        action = str(getattr(item, "action", "") or "")
+        node = str(getattr(item, "node", "") or "")
+        status = str(getattr(item, "status", "") or "")
+        reason = str(getattr(item, "reason", "") or "")
+        if not action and not node:
+            continue
+        label = action or node
+        if node and node != action:
+            label = "%s:%s" % (label, node)
+        if status:
+            label = "%s:%s" % (label, status)
+        if reason:
+            label = "%s - %s" % (label, reason)
+        traces.append(label)
+    return traces
 
 
 def answer_guard_debug(run_result: AgentRunResult) -> Dict[str, Any]:

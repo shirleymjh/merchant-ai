@@ -145,6 +145,29 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             ),
             "rankingObjective": ranking_schema,
             "requestedMeasures": array_property("additional requested metrics", measure_schema),
+            "calculationIntents": array_property(
+                "explicit derived calculations requested by the user, such as percentage/proportion/ratio between a scoped denominator and an event numerator",
+                object_schema(
+                    {
+                        "operation": string_property("calculation operation", ["ratio", "percentage", "difference", "comparison"]),
+                        "sourcePhrase": string_property("exact phrase from the user expressing this calculation"),
+                        "basePopulationPhrase": string_property(
+                            "base population phrase for ratio/percentage, e.g. '使用优惠券的订单' in '使用优惠券的订单中，有退货的订单占多少'"
+                        ),
+                        "eventPopulationPhrase": string_property(
+                            "event/subset population phrase for ratio/percentage numerator, e.g. '有退货的订单' in '使用优惠券的订单中，有退货的订单占多少'"
+                        ),
+                        "numeratorMetricRef": string_property(
+                            "semantic metric key for the event/subset numerator; for ratio/percentage it must not equal denominatorMetricRef"
+                        ),
+                        "denominatorMetricRef": string_property(
+                            "semantic metric key for the base population denominator; for ratio/percentage it must not equal numeratorMetricRef"
+                        ),
+                        "groupByColumn": string_property("grain/group key for the calculation"),
+                    },
+                    required=["operation", "sourcePhrase"],
+                ),
+            ),
             "scopeConstraints": array_property(
                 "bounded entity sets that must constrain the graph before ranking/measures, e.g. orders from a campaign, refunded orders, newly published products",
                 scope_schema,
@@ -159,6 +182,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "requiredEvidenceIntents",
             "rankingObjective",
             "requestedMeasures",
+            "calculationIntents",
             "scopeConstraints",
             "filters",
             "timeWindowDays",

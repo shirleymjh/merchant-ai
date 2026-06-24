@@ -21,7 +21,7 @@ from merchant_ai.models import (
     WikiCompressRequest,
 )
 from merchant_ai.services.answer import DailyReportService, FeedbackService
-from merchant_ai.services.assets import TopicBuilderWorkflow
+from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicBuilderWorkflow
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService
@@ -36,6 +36,7 @@ doris_repository = workflow.node_worker.doris_repository
 daily_report_service = DailyReportService(doris_repository)
 feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store)
 topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
+semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
 recall_index_manager = RecallIndexManager(
     settings,
     workflow.recall_service,
@@ -233,8 +234,21 @@ def build_topic_asset(request: TopicBuildRequest) -> Dict[str, Any]:
 
 @app.post("/api/topics/{topic}/tables/{table_name}/publish")
 def publish_topic_asset(topic: str, table_name: str, request: TopicReviewRequest) -> Dict[str, Any]:
+    preflight = semantic_governance.preflight_publish(topic, table_name) if request.approved else {}
+    if request.approved and not preflight.get("publishable", False):
+        return {
+            "success": False,
+            "status": "PREFLIGHT_FAILED",
+            "topic": topic,
+            "tableName": table_name,
+            "preflight": preflight,
+        }
     result = topic_assets.publish(topic, table_name, request.approved, request.reviewer, request.review_note)
+    if preflight:
+        result["preflight"] = preflight
     if request.approved and result.get("status") == "PUBLISHED":
+        governance_result = semantic_governance.after_publish(topic, table_name, request.reviewer, request.review_note)
+        result["semanticGovernance"] = governance_result
         index_result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
         result["recallIndex"] = index_result
         result["esUpsert"] = index_result.get("es", {})

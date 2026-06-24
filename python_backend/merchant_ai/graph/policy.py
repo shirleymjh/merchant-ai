@@ -101,8 +101,12 @@ class V2AgentPolicy:
         if route and route.route == QuestionRoute.INVALID:
             return ["ask_human"], "question is outside supported business scope", False
         if int(state.get("react_round") or 0) >= self.max_main_actions:
-            if state.get("agent_run_result") and not state.get("evidence_graph_verified"):
+            if self.has_task_results(state) and not state.get("evidence_graph_verified"):
                 return ["verify_evidence"], "evidence must be verified after execution before answer", True
+            if self.has_executable_plan(state) and not state.get("sql_generated"):
+                return ["execute_graph"], "main agent budget exhausted but validated QueryGraph still needs NodeAgent execution", True
+            if self.has_unresolved_planning_work(state) and not state.get("query_graph_validated"):
+                return ["validate_graph"], "main agent budget exhausted with unresolved planning work; produce structured gap before answer", True
             return ["answer_data"], "main agent action budget exhausted", True
         if not state.get("topic_routed"):
             return ["route_topic"], "topic has not been routed", False
@@ -115,45 +119,30 @@ class V2AgentPolicy:
         if not state.get("planning_assets_compacted"):
             return ["compact_assets"], "planning asset pack has not been compacted", False
         plan = state.get("plan")
-        if (
-            (not plan or not plan.intents)
-            and state.get("pending_knowledge_requests")
-            and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions
-        ):
-            return ["retrieve_knowledge", "compact_assets", "answer_data"], "planner requested more semantic knowledge", False
+        if self.has_pending_knowledge_requests(state):
+            if int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
+                return ["retrieve_knowledge", "compact_assets", "plan_graph", "repair_graph", "answer_data"], self.pending_knowledge_reason(state), False
+            if not state.get("query_graph_validated"):
+                return ["validate_graph"], "knowledge request budget exhausted; validate current graph as structured gap", True
         if (not plan or not plan.intents) and state.get("planner_provider_error"):
             if not state.get("query_graph_validated"):
                 return ["validate_graph"], "Planner provider failed; validate empty graph as structured gap", True
             return ["answer_data"], "Planner provider failed; answer with structured planning gap", True
         if (not plan or not plan.intents) and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
             return ["plan_graph", "retrieve_knowledge"], "QueryGraph has not been planned", False
-        if (
-            plan
-            and plan.intents
-            and state.get("pending_knowledge_requests")
-            and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions
-        ):
-            return ["retrieve_knowledge", "compact_assets", "plan_graph"], "Resolver requested scoped semantic metric evidence", False
         if plan and plan.intents and not state.get("query_graph_reflected"):
             return ["reflect_plan", "validate_graph"], "QueryGraph needs planner reflection before validation", False
         reflection = normalize_reflection(state.get("planner_reflection"))
         if reflection and not reflection.passed:
-            if (
-                reflection.repair_reason == "ANCHOR_MISMATCH"
-                and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions
-            ):
-                return ["plan_graph", "repair_graph", "answer_data"], "planner reflection found anchor mismatch; rerun LLM understanding", False
-            if (
-                reflection.repair_reason == "ANALYSIS_CONTRACT_MISSING"
-                and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions
-            ):
-                return ["plan_graph", "repair_graph", "answer_data"], "planner reflection found missing analysis evidence contract; rerun LLM understanding", False
-            if (
-                reflection.repair_reason == "MISSING_REQUIRED_EVIDENCE"
-                and not reflection.suggested_knowledge_requests
-                and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions
-            ):
-                return ["plan_graph", "repair_graph", "answer_data"], "planner reflection found uncovered analysis evidence; rerun LLM understanding", False
+            repair_actions = self.repair_request_actions(reflection)
+            if "semantic_read" in repair_actions and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
+                return ["retrieve_knowledge", "compact_assets", "repair_graph", "plan_graph", "answer_data"], self.repair_decision_reason(reflection, "retrieve_knowledge"), False
+            if "re_understand" in repair_actions and self.can_reunderstand(state):
+                return ["plan_graph", "repair_graph", "answer_data"], self.repair_decision_reason(reflection, "plan_graph"), False
+            if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
+                return ["repair_graph", "retrieve_knowledge", "answer_data"], self.repair_decision_reason(reflection, "repair_graph"), False
+            if "answer_with_gap" in repair_actions:
+                return ["answer_data"], self.repair_decision_reason(reflection, "answer_data"), True
             has_blocking_issue = any(str(issue.get("severity") or "") == "error" for issue in reflection.issues)
             if (
                 reflection.suggested_knowledge_requests
@@ -168,10 +157,10 @@ class V2AgentPolicy:
             return ["validate_graph"], "QueryGraph has not been validated", False
         validation = state.get("query_graph_validation_result")
         if validation and not validation.valid:
-            if self.validation_requires_reunderstand(validation) and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
+            if self.validation_requires_knowledge(validation) and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
+                return ["retrieve_knowledge", "compact_assets", "repair_graph", "answer_data"], "validator requested missing semantic knowledge before graph repair", False
+            if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
                 return ["plan_graph", "answer_data"], "validator found contract mismatch; rerun LLM understanding", False
-            if validation.recommended_knowledge_requests and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
-                return ["retrieve_knowledge", "repair_graph", "answer_data"], "validator requested more semantic knowledge", False
             if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"], "validator found repairable graph gaps", False
             return ["answer_data"], "QueryGraph validation failed and cannot be repaired in budget", True
@@ -183,7 +172,7 @@ class V2AgentPolicy:
             return ["answer_data"], "graph-repairable execution gaps remain but repair budget is exhausted", True
         if not state.get("sql_repair_reviewed") and self.has_sql_failure(state):
             return ["repair_sql", "verify_evidence"], "one or more node SQL executions failed", False
-        if state.get("agent_run_result") and not state.get("evidence_graph_verified"):
+        if self.has_task_results(state) and not state.get("evidence_graph_verified"):
             return ["verify_evidence"], "evidence has not been verified", False
         if self.has_graph_repairable_execution_gap(state):
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
@@ -193,6 +182,65 @@ class V2AgentPolicy:
             return ["answer_data"], "ready to compose BI answer", False
         return ["cache_answer"], "answer is complete and can be cached", False
 
+    def has_unresolved_planning_work(self, state: AgentState) -> bool:
+        plan = state.get("plan")
+        validation = state.get("query_graph_validation_result")
+        return bool(
+            self.has_pending_knowledge_requests(state)
+            or state.get("planner_repair_requests")
+            or (plan and getattr(plan, "knowledge_requests", None))
+            or not (plan and plan.intents)
+            or (validation and getattr(validation, "gaps", None) and not validation.valid)
+        )
+
+    def has_pending_knowledge_requests(self, state: AgentState) -> bool:
+        return bool(state.get("pending_knowledge_requests"))
+
+    def pending_knowledge_reason(self, state: AgentState) -> str:
+        requests = state.get("pending_knowledge_requests") or []
+        first = requests[0] if requests else None
+        reason = str(getattr(first, "reason", "") or getattr(first, "type", "") or "")
+        query = str(getattr(first, "query", "") or "")
+        suffix = (": %s" % query[:120]) if query else ""
+        return "LeadAgent observed pending KnowledgeRequest%s; retrieve before planning/repair (%s)" % (suffix, reason)
+
+    def repair_request_actions(self, reflection: PlannerReflectionResult) -> set[str]:
+        actions = {str(item.action or "") for item in reflection.repair_requests if getattr(item, "action", "")}
+        if reflection.repair_reason and not actions:
+            fallback = {
+                "ANCHOR_MISMATCH": "re_understand",
+                "METRIC_RESOLUTION_LOW_CONFIDENCE": "re_understand",
+                "ANALYSIS_EVIDENCE_NOT_COVERED": "re_understand",
+                "MISSING_DOMAIN": "semantic_read",
+                "METRIC_RESOLUTION_NEEDED": "semantic_read",
+                "FRESHNESS_GAP": "semantic_read",
+                "MISSING_EDGE": "graph_repair",
+                "SCHEMA_DRIFT": "answer_with_gap",
+            }
+            action = fallback.get(reflection.repair_reason)
+            if action:
+                actions.add(action)
+        return actions
+
+    def can_reunderstand(self, state: AgentState) -> bool:
+        attempts = int(state.get("query_graph_plan_attempts") or 0)
+        # First planning pass is the normal understanding attempt. Critic-driven
+        # re-understand is a repair action and gets its own bounded allowance.
+        return attempts < (self.max_plan_actions + self.max_graph_repair_actions)
+
+    def repair_decision_reason(self, reflection: PlannerReflectionResult, selected: str) -> str:
+        actions = sorted(self.repair_request_actions(reflection))
+        issue_codes = [
+            str(issue.get("code") or "")
+            for issue in reflection.issues[:6]
+            if isinstance(issue, dict) and issue.get("code")
+        ]
+        return "PlannerCritic produced repairRequests actions=%s issues=%s; LeadAgent selects %s" % (
+            actions,
+            issue_codes,
+            selected,
+        )
+
     def has_executable_plan(self, state: AgentState) -> bool:
         plan = state.get("plan")
         if not plan:
@@ -201,6 +249,10 @@ class V2AgentPolicy:
             if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE:
                 return True
         return False
+
+    def has_task_results(self, state: AgentState) -> bool:
+        run_result = state.get("agent_run_result")
+        return bool(run_result and getattr(run_result, "task_results", None))
 
     def has_rule_answer_plan(self, state: AgentState) -> bool:
         if state.get("chat_bi_completed"):
@@ -245,7 +297,27 @@ class V2AgentPolicy:
 
     def validation_requires_reunderstand(self, validation: object) -> bool:
         codes = {str(gap.code) for gap in getattr(validation, "gaps", [])}
-        return bool(codes & {"SCOPE_NOT_NARROWING", "OBJECTIVE_NOT_COMPILED"})
+        return bool(codes & {"SCOPE_NOT_NARROWING", "OBJECTIVE_NOT_COMPILED", "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"})
+
+    def validation_requires_knowledge(self, validation: object) -> bool:
+        codes = {str(gap.code) for gap in getattr(validation, "gaps", [])}
+        if codes and codes <= {"CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"}:
+            return False
+        if getattr(validation, "recommended_knowledge_requests", None):
+            return True
+        return bool(
+            codes
+            & {
+                "PENDING_KNOWLEDGE_REQUEST",
+                "MISSING_FIELD",
+                "MISSING_TABLE",
+                "MISSING_RELATIONSHIP",
+                "MISSING_METRIC_DEPENDENCY",
+                "REQUESTED_MEASURE_NOT_PLANNED",
+                "METRIC_RESOLUTION_NEEDED",
+                "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
+            }
+        )
 
 
 def normalize_reflection(value: object) -> Optional[PlannerReflectionResult]:
