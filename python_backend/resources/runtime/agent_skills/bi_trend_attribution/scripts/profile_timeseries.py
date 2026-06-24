@@ -22,7 +22,7 @@ def main() -> None:
 def build_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     rows = [row for row in payload.get("dataRows") or [] if isinstance(row, dict)]
     date_key = first_present_key(rows, ["pt", "date", "dt", "biz_date"])
-    metric_keys = numeric_metric_keys(rows, exclude={date_key, "seller_id", "merchant_id"})
+    metric_keys = numeric_metric_keys(rows, payload, exclude={date_key, "seller_id", "merchant_id"})
     metrics = [metric_profile(rows, date_key, key) for key in metric_keys[:6]]
     metrics = [item for item in metrics if item]
     findings = build_findings(metrics)
@@ -90,9 +90,10 @@ def build_findings(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     findings = []
     for item in metrics:
         metric = item.get("metric") or "metric"
+        has_date = bool((item.get("max") or {}).get("date") or (item.get("min") or {}).get("date"))
         delta = decimal_value(item.get("delta"))
         max_vs_avg = decimal_value(item.get("maxVsAvgPct"))
-        if delta is not None and delta != 0:
+        if has_date and delta is not None and delta != 0:
             direction = "上升" if delta > 0 else "下降"
             findings.append(
                 {
@@ -159,16 +160,45 @@ def render_answer(payload: Dict[str, Any], metrics: List[Dict[str, Any]], findin
     return "\n".join(lines)
 
 
-def numeric_metric_keys(rows: List[Dict[str, Any]], exclude: set[str]) -> List[str]:
+def numeric_metric_keys(rows: List[Dict[str, Any]], payload: Dict[str, Any], exclude: set[str]) -> List[str]:
+    disclosed = disclosed_metric_keys(payload)
     keys: List[str] = []
     for row in rows[:40]:
         for key, value in row.items():
             name = str(key)
             if name in exclude or name in keys:
                 continue
+            if entity_or_code_key(name):
+                continue
+            if disclosed and name not in disclosed and not metric_shaped_key(name):
+                continue
             if decimal_value(value) is not None:
                 keys.append(name)
     return keys
+
+
+def disclosed_metric_keys(payload: Dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in payload.get("metricDisclosures") or []:
+        if not isinstance(item, dict):
+            continue
+        for field in ["metricKey", "requestedMetricRef"]:
+            value = str(item.get(field) or "").strip()
+            if value:
+                keys.add(value)
+    return keys
+
+
+def entity_or_code_key(name: str) -> bool:
+    text = str(name or "").strip().lower()
+    if not text:
+        return True
+    return text == "id" or text.endswith("_id") or text.endswith("_code") or text.endswith("_no")
+
+
+def metric_shaped_key(name: str) -> bool:
+    text = str(name or "").strip().lower()
+    return text.endswith(("_cnt", "_amt", "_rate", "_gmv")) or "gmv" in text
 
 
 def first_present_key(rows: List[Dict[str, Any]], candidates: List[str]) -> str:

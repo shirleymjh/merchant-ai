@@ -60,7 +60,14 @@ from merchant_ai.services.assets import (
     WikiMemoryService,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
-from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_data_package, compact_rule_evidence, plan_requires_rule_evidence
+from merchant_ai.services.answer import (
+    AnswerComposeService,
+    analysis_summary_required,
+    answer_data_package,
+    compact_rule_evidence,
+    plan_requires_rule_evidence,
+    task_evidence_sections,
+)
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
@@ -1867,6 +1874,200 @@ def test_product_overview_does_not_trigger_trend_analysis_summary():
     )
 
     assert not analysis_summary_required(plan)
+
+
+def test_product_risk_ranking_lookup_does_not_trigger_trend_analysis_summary():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "product",
+            "analysisIntent": "risk_ranking",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [
+                {"semanticLabel": "refund_evidence", "suggestedMetricRefs": ["refund_bill_cnt", "pay_amt"]},
+                {"semanticLabel": "goods_publish_time", "suggestedFields": ["spu_apply_create_time"]},
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                question="找到最近60天赔付单量较高的商品，看下对应的退款量、退款金额和商品发布时间。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.COMPENSATION,
+                metric_name="repay_bill_cnt",
+                group_by_column="spu_id",
+                output_keys=["seller_id", "spu_id", "spu_name"],
+            ),
+            QuestionIntent(
+                question="找到最近60天赔付单量较高的商品，看下对应的退款量、退款金额和商品发布时间。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.REFUND,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="pay_amt",
+                group_by_column="spu_name",
+            ),
+            QuestionIntent(
+                question="找到最近60天赔付单量较高的商品，看下对应的退款量、退款金额和商品发布时间。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.GOODS,
+                preferred_table="dwm_goods_detail_df",
+                output_keys=["seller_id", "spu_id", "spu_name", "spu_apply_create_time"],
+            ),
+        ],
+    )
+
+    assert not analysis_summary_required(plan)
+
+
+def test_trend_skill_ignores_entity_identifier_columns():
+    import importlib.util
+
+    script = Path("resources/runtime/agent_skills/bi_trend_attribution/scripts/profile_timeseries.py")
+    spec = importlib.util.spec_from_file_location("profile_timeseries_for_test", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    profile = module.build_profile(
+        {
+            "dataRows": [
+                {"spu_id": "1", "spu_name": "A", "repay_bill_cnt": 2, "pay_amt": "10.00"},
+                {"spu_id": "2", "spu_name": "B", "repay_bill_cnt": 1, "pay_amt": "5.00"},
+            ],
+            "metricDisclosures": [
+                {"metricKey": "repay_bill_cnt"},
+                {"metricKey": "pay_amt"},
+            ],
+        }
+    )
+
+    assert "spu_id" not in profile["metricKeys"]
+    assert set(profile["metricKeys"]) == {"repay_bill_cnt", "pay_amt"}
+    assert not any("spu_id" in (finding.get("title") or "") for finding in profile["findings"])
+
+
+def test_task_evidence_sections_prioritize_user_facing_nodes():
+    plan = QueryPlan(
+        question_understanding={
+            "rankingObjective": {"metricRef": "repay_bill_cnt", "resolvedMetricRef": "repay_bill_cnt", "groupByColumn": "spu_id"},
+            "requestedMeasures": [
+                {"metricRef": "refund_bill_cnt", "resolvedMetricRef": "refund_bill_cnt"},
+                {"metricRef": "pay_amt", "resolvedMetricRef": "pay_amt"},
+            ],
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "goods_publish_time",
+                    "suggestedTables": ["dwm_goods_detail_df"],
+                    "suggestedFields": ["spu_apply_create_time"],
+                }
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                plan_task_id="anchor_repay",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.TOPN,
+                category=QuestionCategory.COMPENSATION,
+                preferred_table="dwm_cs_repay_detail_df",
+                metric_name="repay_bill_cnt",
+                group_by_column="sub_order_id",
+                metric_resolution={"metricKey": "repay_bill_cnt", "sourcePhrase": "赔付单量"},
+            ),
+            QuestionIntent(
+                plan_task_id="component_order_order_detail_cnt",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                group_by_column="sub_order_id",
+                metric_resolution={"metricKey": "order_detail_cnt", "sourcePhrase": "semantic formula dependency for compensation_rate"},
+            ),
+            QuestionIntent(
+                plan_task_id="order_bridge",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.TRADE,
+                preferred_table="dwm_trade_order_detail_di",
+                output_keys=["seller_id", "sub_order_id", "order_id", "spu_id", "spu_name"],
+            ),
+            QuestionIntent(
+                plan_task_id="projected_repay_bill_cnt_by_spu_id",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.COMPENSATION,
+                metric_name="repay_bill_cnt",
+                group_by_column="spu_id",
+                output_keys=["spu_id", "repay_bill_cnt", "spu_name"],
+                metric_resolution={
+                    "metricKey": "repay_bill_cnt",
+                    "sourcePhrase": "赔付单量",
+                    "computeStrategy": "projection_group_aggregate",
+                    "sourceMetricTaskId": "anchor_repay",
+                    "bridgeTaskId": "order_bridge",
+                },
+                depends_on_task_ids=["anchor_repay", "order_bridge"],
+            ),
+            QuestionIntent(
+                plan_task_id="goods_bridge",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.GOODS,
+                preferred_table="dwm_goods_detail_df",
+                output_keys=["seller_id", "spu_id", "spu_name", "spu_apply_create_time"],
+            ),
+            QuestionIntent(
+                plan_task_id="refund_lookup",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.REFUND,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="refund_bill_cnt",
+                group_by_column="spu_name",
+                metric_resolution={"metricKey": "refund_bill_cnt", "sourcePhrase": "退款量"},
+            ),
+            QuestionIntent(
+                plan_task_id="refund_lookup_2",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.REFUND,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="pay_amt",
+                group_by_column="spu_name",
+                metric_resolution={"metricKey": "pay_amt", "sourcePhrase": "退款金额"},
+            ),
+        ],
+    )
+
+    def result(task_id: str, table: str, row: dict) -> AgentTaskResult:
+        return AgentTaskResult(
+            task_id=task_id,
+            success=True,
+            query_bundle=QueryBundle(tables=[table] if table else [], rows=[row], original_row_count=1),
+        )
+
+    run = AgentRunResult(
+        task_results=[
+            result("anchor_repay", "dwm_cs_repay_detail_df", {"sub_order_id": "sub_1", "repay_bill_cnt": 1}),
+            result("component_order_order_detail_cnt", "dwm_trade_order_detail_di", {"sub_order_id": "sub_1", "order_detail_cnt": 1}),
+            result("order_bridge", "dwm_trade_order_detail_di", {"sub_order_id": "sub_1", "spu_id": "spu_1", "spu_name": "A"}),
+            result("projected_repay_bill_cnt_by_spu_id", "", {"spu_id": "spu_1", "spu_name": "A", "repay_bill_cnt": 1}),
+            result("goods_bridge", "dwm_goods_detail_df", {"spu_id": "spu_1", "spu_name": "A", "spu_apply_create_time": "2026-05-01"}),
+            result("refund_lookup", "dwm_trade_refund_detail_di", {"spu_name": "A", "refund_bill_cnt": 2}),
+            result("refund_lookup_2", "dwm_trade_refund_detail_di", {"spu_name": "A", "pay_amt": "88.00"}),
+        ],
+    )
+
+    section = task_evidence_sections(plan, run)
+
+    assert "projected_repay_bill_cnt_by_spu_id" in section
+    assert "goods_bridge" in section
+    assert "refund_lookup" in section
+    assert "refund_lookup_2" in section
+    assert "anchor_repay" not in section
+    assert "order_bridge" not in section
+    assert "component_order_order_detail_cnt" not in section
 
 
 def test_rule_evidence_only_appends_when_plan_requires_rules():

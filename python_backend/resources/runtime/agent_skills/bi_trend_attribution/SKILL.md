@@ -13,8 +13,12 @@ should I prioritize" questions after QueryGraph execution has produced evidence.
 
 Use this skill only when the Planner-produced `questionUnderstanding` declares:
 
-- `analysisIntent` is not `none`, or
-- `requiresExplanation` is true.
+- `analysisIntent` is `trend_check`, `anomaly_check`, `diagnosis`, or `comparison`, or
+- `requiresExplanation` is true and the required evidence intents describe trend, anomaly, diagnosis, attribution, or comparison evidence.
+
+Do not use this skill for plain entity ranking / lookup questions such as "top
+products and show refund amount / publish time". Those should be answered as
+ranked evidence tables unless a separate analysis skill is selected.
 
 Do not activate from raw question keywords. The Lead/Answer agent should decide
 from structured question understanding.

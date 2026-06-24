@@ -407,8 +407,13 @@ def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
     if len(succeeded) <= 1:
         return ""
     intent_by_task = {intent.plan_task_id: intent for intent in plan.intents}
+    ordered = sorted(succeeded, key=lambda item: task_evidence_priority(intent_by_task.get(item.task_id), item, plan))
+    support_ids = support_task_ids_for_answer(plan)
+    visible = [item for item in ordered if answer_visible_task(intent_by_task.get(item.task_id), item, plan, support_ids)]
+    if not visible:
+        visible = ordered
     lines = ["分节点证据："]
-    for item in succeeded[:5]:
+    for item in visible[:6]:
         bundle = item.query_bundle
         if not bundle.rows:
             lines.append("- %s：执行成功但返回 0 行。" % item.task_id)
@@ -426,6 +431,122 @@ def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
     return "\n".join(lines)
 
 
+def support_task_ids_for_answer(plan: QueryPlan) -> set[str]:
+    support: set[str] = set()
+    for intent in plan.intents:
+        task_id = intent.plan_task_id
+        if not task_id:
+            continue
+        resolution = intent.metric_resolution or {}
+        if task_id.startswith("component_") or str(resolution.get("sourcePhrase") or "").startswith("semantic formula dependency"):
+            support.add(task_id)
+        if str(resolution.get("computeStrategy") or "") == "projection_group_aggregate":
+            for key in ["sourceMetricTaskId", "bridgeTaskId"]:
+                value = str(resolution.get(key) or "").strip()
+                if value:
+                    support.add(value)
+    return support
+
+
+def answer_visible_task(intent: QuestionIntent | None, item: Any, plan: QueryPlan, support_ids: set[str]) -> bool:
+    task_id = str(getattr(item, "task_id", "") or "")
+    if task_id in support_ids:
+        return False
+    if not intent:
+        return True
+    resolution = intent.metric_resolution or {}
+    source_phrase = str(resolution.get("sourcePhrase") or "").strip()
+    metric_key = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+    if metric_key and source_phrase and not source_phrase_in_question(source_phrase, intent.question):
+        refs = required_evidence_refs(plan.question_understanding or {})
+        ranking_refs = ranking_metric_refs(plan.question_understanding or {})
+        if metric_key not in refs["metrics"] and metric_key not in ranking_refs:
+            return False
+    return True
+
+
+def source_phrase_in_question(source_phrase: str, question: str) -> bool:
+    phrase = str(source_phrase or "").strip().lower()
+    text = str(question or "").strip().lower()
+    if not phrase or not text:
+        return True
+    return phrase in text
+
+
+def task_evidence_priority(intent: QuestionIntent | None, item: Any, plan: QueryPlan) -> int:
+    score = 100
+    task_id = str(getattr(item, "task_id", "") or "")
+    if not intent:
+        return score
+    resolution = intent.metric_resolution or {}
+    source_phrase = str(resolution.get("sourcePhrase") or "").strip().lower()
+    requested_metrics = question_understanding_metric_refs(plan.question_understanding or {})
+    required_refs = required_evidence_refs(plan.question_understanding or {})
+    metric_key = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+    if str(resolution.get("computeStrategy") or "") == "projection_group_aggregate":
+        score -= 60
+    if metric_key and metric_key in requested_metrics:
+        score -= 45
+    if metric_key and metric_key in required_refs["metrics"]:
+        score -= 35
+    if intent.preferred_table and intent.preferred_table in required_refs["tables"]:
+        score -= 30
+    if set(intent.output_keys or []) & required_refs["fields"]:
+        score -= 30
+    if intent.answer_mode == AnswerMode.DERIVED:
+        score -= 15
+    if task_id.startswith("component_") or source_phrase.startswith("semantic formula dependency"):
+        score += 70
+    if "bridge" in task_id and not (set(intent.output_keys or []) & required_refs["fields"]) and not metric_key:
+        score += 45
+    return score
+
+
+def ranking_metric_refs(understanding: Dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    if not isinstance(ranking, dict):
+        return refs
+    for key in ["resolvedMetricRef", "metricRef"]:
+        value = str(ranking.get(key) or "").strip()
+        if value:
+            refs.add(value)
+    return refs
+
+
+def question_understanding_metric_refs(understanding: Dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    refs.update(ranking_metric_refs(understanding))
+    for item in understanding.get("requestedMeasures") or understanding.get("requested_measures") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ["resolvedMetricRef", "metricRef"]:
+            value = str(item.get(key) or "").strip()
+            if value:
+                refs.add(value)
+    return refs
+
+
+def required_evidence_refs(understanding: Dict[str, Any]) -> Dict[str, set[str]]:
+    refs = {"metrics": set(), "tables": set(), "fields": set()}
+    for item in understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        for key, target in [
+            ("suggestedMetricRefs", "metrics"),
+            ("suggested_metric_refs", "metrics"),
+            ("suggestedTables", "tables"),
+            ("suggested_tables", "tables"),
+            ("suggestedFields", "fields"),
+            ("suggested_fields", "fields"),
+        ]:
+            values = item.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            refs[target].update(str(value).strip() for value in values if str(value or "").strip())
+    return refs
+
+
 def format_cell(value: Any) -> str:
     text = str(value if value is not None else "")
     return text.replace("\n", " ")[:80]
@@ -436,6 +557,8 @@ def analysis_summary_required(plan: QueryPlan) -> bool:
     analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
     requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
     if rule_evidence_only_analysis(understanding, analysis_intent):
+        return False
+    if entity_ranking_answer_only(plan, analysis_intent):
         return False
     if analysis_intent == "overview" and single_metric_overview(plan):
         return False
@@ -468,6 +591,28 @@ def single_metric_overview(plan: QueryPlan) -> bool:
         return False
     group_by = (intent.group_by_column or "").strip()
     return group_by in {"", "merchant_id", "seller_id"}
+
+
+def entity_ranking_answer_only(plan: QueryPlan, analysis_intent: str) -> bool:
+    if analysis_intent not in {"risk_ranking", "ranking", "topn"}:
+        return False
+    executable = [intent for intent in plan.intents if intent.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT, AnswerMode.INVALID}]
+    if not executable:
+        return False
+    if any(intent.answer_mode in {AnswerMode.GROUP_AGG, AnswerMode.TOPN, AnswerMode.DERIVED} and entity_like_column(intent.group_by_column) for intent in executable):
+        return True
+    return any(intent.answer_mode == AnswerMode.DETAIL and entity_like_output_keys(intent.output_keys) for intent in executable)
+
+
+def entity_like_output_keys(output_keys: List[str]) -> bool:
+    return any(entity_like_column(key) for key in output_keys or [])
+
+
+def entity_like_column(column: str | None) -> bool:
+    text = str(column or "").strip().lower()
+    if not text:
+        return False
+    return text == "spu_name" or text.endswith("_id") or text in {"id", "order_no", "bill_no"}
 
 
 def rule_evidence_only_analysis(understanding: Dict[str, Any], analysis_intent: str) -> bool:
