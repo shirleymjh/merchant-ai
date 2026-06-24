@@ -66,6 +66,7 @@ from merchant_ai.services.answer import (
     answer_data_package,
     compact_rule_evidence,
     plan_requires_rule_evidence,
+    business_summary_table,
     task_evidence_sections,
 )
 from merchant_ai.services.context import ContextManager
@@ -1972,7 +1973,7 @@ def test_task_evidence_sections_prioritize_user_facing_nodes():
                 preferred_table="dwm_cs_repay_detail_df",
                 metric_name="repay_bill_cnt",
                 group_by_column="sub_order_id",
-                metric_resolution={"metricKey": "repay_bill_cnt", "sourcePhrase": "赔付单量"},
+                metric_resolution={"metricKey": "repay_bill_cnt", "sourcePhrase": "赔付单量", "displayName": "赔付单量"},
             ),
             QuestionIntent(
                 plan_task_id="component_order_order_detail_cnt",
@@ -2003,6 +2004,7 @@ def test_task_evidence_sections_prioritize_user_facing_nodes():
                 metric_resolution={
                     "metricKey": "repay_bill_cnt",
                     "sourcePhrase": "赔付单量",
+                    "displayName": "赔付单量",
                     "computeStrategy": "projection_group_aggregate",
                     "sourceMetricTaskId": "anchor_repay",
                     "bridgeTaskId": "order_bridge",
@@ -2025,7 +2027,7 @@ def test_task_evidence_sections_prioritize_user_facing_nodes():
                 preferred_table="dwm_trade_refund_detail_di",
                 metric_name="refund_bill_cnt",
                 group_by_column="spu_name",
-                metric_resolution={"metricKey": "refund_bill_cnt", "sourcePhrase": "退款量"},
+                metric_resolution={"metricKey": "refund_bill_cnt", "sourcePhrase": "退款量", "displayName": "退款量"},
             ),
             QuestionIntent(
                 plan_task_id="refund_lookup_2",
@@ -2035,7 +2037,7 @@ def test_task_evidence_sections_prioritize_user_facing_nodes():
                 preferred_table="dwm_trade_refund_detail_di",
                 metric_name="pay_amt",
                 group_by_column="spu_name",
-                metric_resolution={"metricKey": "pay_amt", "sourcePhrase": "退款金额"},
+                metric_resolution={"metricKey": "pay_amt", "sourcePhrase": "退款金额", "displayName": "退款金额"},
             ),
         ],
     )
@@ -2060,14 +2062,17 @@ def test_task_evidence_sections_prioritize_user_facing_nodes():
     )
 
     section = task_evidence_sections(plan, run)
+    summary = business_summary_table(plan, run)
 
-    assert "projected_repay_bill_cnt_by_spu_id" in section
-    assert "goods_bridge" in section
-    assert "refund_lookup" in section
-    assert "refund_lookup_2" in section
+    assert "赔付单量（按 spu_id 汇总）" in section
+    assert "商品发布时间" in section
+    assert "退款量" in section
+    assert "退款金额" in section
     assert "anchor_repay" not in section
     assert "order_bridge" not in section
     assert "component_order_order_detail_cnt" not in section
+    assert "| SPU ID | 商品 | 赔付单量 | 退款量 | 退款金额 | 商品发布时间 |" in summary
+    assert "| spu_1 | A | 1 | 2 | 88.00 | 2026-05-01 |" in summary
 
 
 def test_rule_evidence_only_appends_when_plan_requires_rules():

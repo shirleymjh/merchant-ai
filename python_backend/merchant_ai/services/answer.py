@@ -327,6 +327,11 @@ class AnswerComposeService:
                 lines.append("")
                 lines.append("口径：%s" % "；".join(formulas))
         if multi_node_success and run_result:
+            summary_table = business_summary_table(plan, run_result)
+            if summary_table:
+                lines.append("")
+                lines.append("结果摘要：")
+                lines.append(summary_table)
             section = task_evidence_sections(plan, run_result)
             if section:
                 lines.append("")
@@ -393,13 +398,180 @@ def dedupe_strings(items: List[str]) -> List[str]:
     return result
 
 
-def markdown_table(rows: List[Dict[str, Any]], columns: List[str]) -> str:
-    header = "| %s |" % " | ".join(columns)
+def markdown_table(rows: List[Dict[str, Any]], columns: List[str], labels: Dict[str, str] | None = None) -> str:
+    labels = labels or {}
+    header = "| %s |" % " | ".join(labels.get(column, column) for column in columns)
     divider = "| %s |" % " | ".join("---" for _ in columns)
     body = []
     for row in rows:
         body.append("| %s |" % " | ".join(format_cell(row.get(column, "")) for column in columns))
     return "\n".join([header, divider] + body)
+
+
+def business_summary_table(plan: QueryPlan, run_result: AgentRunResult) -> str:
+    succeeded = [item for item in run_result.task_results if not item.query_bundle.failed and item.query_bundle.rows]
+    if len(succeeded) <= 1:
+        return ""
+    intent_by_task = {intent.plan_task_id: intent for intent in plan.intents}
+    ordered = sorted(succeeded, key=lambda item: task_evidence_priority(intent_by_task.get(item.task_id), item, plan))
+    support_ids = support_task_ids_for_answer(plan)
+    visible = [item for item in ordered if answer_visible_task(intent_by_task.get(item.task_id), item, plan, support_ids)]
+    if len(visible) <= 1:
+        return ""
+    base = first_entity_summary_task(visible, intent_by_task)
+    if not base:
+        return ""
+    merged_rows = merge_visible_task_rows(base, [item for item in visible if item.task_id != base.task_id])
+    if not merged_rows:
+        return ""
+    columns = business_summary_columns(plan, merged_rows)
+    if not columns:
+        return ""
+    labels = answer_column_labels(plan)
+    return markdown_table(merged_rows[:8], columns, labels)
+
+
+def first_entity_summary_task(items: List[Any], intent_by_task: Dict[str, QuestionIntent]) -> Any | None:
+    for item in items:
+        intent = intent_by_task.get(item.task_id)
+        if intent and intent.answer_mode in {AnswerMode.DERIVED, AnswerMode.TOPN, AnswerMode.GROUP_AGG} and entity_like_column(intent.group_by_column):
+            return item
+    for item in items:
+        if any(entity_like_column(key) for key in (item.query_bundle.rows[0].keys() if item.query_bundle.rows else [])):
+            return item
+    return items[0] if items else None
+
+
+def merge_visible_task_rows(base_item: Any, other_items: List[Any]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = [dict(row) for row in base_item.query_bundle.rows[:20]]
+    for item in other_items:
+        rows = item.query_bundle.rows or []
+        for target in merged:
+            match = first_matching_row(target, rows)
+            if not match:
+                continue
+            for key, value in match.items():
+                if key not in target or target.get(key) in (None, ""):
+                    target[key] = value
+    return merged
+
+
+def first_matching_row(base: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    for key in ["spu_id", "spu_name", "order_id", "sub_order_id", "refund_id", "ticket_id", "bill_id"]:
+        base_value = normalized_cell(base.get(key))
+        if not base_value:
+            continue
+        for row in rows:
+            if normalized_cell(row.get(key)) == base_value:
+                return row
+    return None
+
+
+def normalized_cell(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def business_summary_columns(plan: QueryPlan, rows: List[Dict[str, Any]]) -> List[str]:
+    available = set()
+    for row in rows[:8]:
+        available.update(str(key) for key in row.keys())
+    preferred: List[str] = []
+    entity_column_list = primary_summary_entity_columns(plan)
+    entity_columns = set(entity_column_list)
+    for column in entity_column_list:
+        if column in available:
+            preferred.append(column)
+    for intent in plan.intents:
+        resolution = intent.metric_resolution or {}
+        for column in [resolution.get("metricKey"), intent.metric_name]:
+            if column and column in available and column not in preferred:
+                preferred.append(column)
+    for intent in plan.intents:
+        resolution = intent.metric_resolution or {}
+        for column in [resolution.get("metricKey"), *(resolution.get("sourceColumns") or [])]:
+            text = str(column or "").strip()
+            if text and text in available and text not in preferred and summary_column_allowed(text, entity_columns):
+                preferred.append(text)
+    for column in ["refund_bill_cnt", "pay_amt", "repay_bill_cnt", "order_detail_cnt"]:
+        if column in available and column not in preferred:
+            preferred.append(column)
+    for intent in plan.intents:
+        for column in [intent.group_by_column] + intent.output_keys:
+            if column and column in available and column not in preferred and summary_column_allowed(column, entity_columns):
+                preferred.append(column)
+    for column in ["spu_apply_create_time"]:
+        if column in available and column not in preferred:
+            preferred.append(column)
+    for column in rows[0].keys():
+        text = str(column)
+        if text not in preferred and summary_column_allowed(text, entity_columns):
+            preferred.append(text)
+        if len(preferred) >= 10:
+            break
+    return preferred[:10]
+
+
+def summary_column_allowed(column: str, entity_columns: set[str]) -> bool:
+    text = str(column or "").strip()
+    if not text:
+        return False
+    if text in {"seller_id", "merchant_id"}:
+        return False
+    if text == "pt" and "pt" not in entity_columns:
+        return False
+    if entity_like_column(text) and text not in entity_columns:
+        return False
+    return True
+
+
+def primary_summary_entity_columns(plan: QueryPlan) -> List[str]:
+    understanding = plan.question_understanding or {}
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    group_by = str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "").strip() if isinstance(ranking, dict) else ""
+    if not group_by:
+        for intent in plan.intents:
+            resolution = intent.metric_resolution or {}
+            if str(resolution.get("computeStrategy") or "") == "projection_group_aggregate" and entity_like_column(intent.group_by_column):
+                group_by = intent.group_by_column
+                break
+    for intent in plan.intents:
+        if not group_by and intent.answer_mode in {AnswerMode.DERIVED, AnswerMode.TOPN, AnswerMode.GROUP_AGG} and entity_like_column(intent.group_by_column):
+            group_by = intent.group_by_column
+            break
+    if group_by in {"spu_id", "spu_name"}:
+        return ["spu_id", "spu_name"]
+    if group_by == "order_id":
+        return ["order_id", "sub_order_id"]
+    if group_by == "sub_order_id":
+        return ["sub_order_id", "order_id"]
+    if group_by in {"refund_id", "ticket_id", "bill_id"}:
+        return [group_by, "order_id", "sub_order_id"]
+    return ["spu_id", "spu_name", "order_id", "sub_order_id", "refund_id", "ticket_id", "bill_id", "pt"]
+
+
+def answer_column_labels(plan: QueryPlan) -> Dict[str, str]:
+    labels: Dict[str, str] = {
+        "spu_id": "SPU ID",
+        "spu_name": "商品",
+        "order_id": "订单号",
+        "sub_order_id": "子订单号",
+        "refund_id": "退款单号",
+        "ticket_id": "工单号",
+        "bill_id": "赔付单号",
+        "pt": "日期",
+        "spu_apply_create_time": "商品发布时间",
+        "pay_amt": "退款金额",
+        "refund_bill_cnt": "退款单量",
+        "repay_bill_cnt": "赔付单量",
+        "order_detail_cnt": "下单数",
+    }
+    for intent in plan.intents:
+        resolution = intent.metric_resolution or {}
+        metric = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+        display = str(resolution.get("displayName") or "").strip()
+        if metric and display:
+            labels[metric] = display
+    return labels
 
 
 def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
@@ -418,17 +590,39 @@ def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
         if not bundle.rows:
             lines.append("- %s：执行成功但返回 0 行。" % item.task_id)
             continue
-        tables = "、".join(bundle.tables) if bundle.tables else (intent_by_task.get(item.task_id, QuestionIntent()).preferred_table or "")
-        lines.append("- %s（%s）：%s 行。" % (item.task_id, tables or "unknown_table", bundle.effective_row_count()))
         intent = intent_by_task.get(item.task_id)
+        title = task_evidence_title(intent, item)
+        tables = "、".join(bundle.tables) if bundle.tables else (intent.preferred_table if intent else "")
+        location = tables or ("派生计算" if intent and intent.answer_mode == AnswerMode.DERIVED else "unknown_table")
+        lines.append("- %s（%s）：%s 行。" % (title, location, bundle.effective_row_count()))
         section_plan = QueryPlan(intents=[intent]) if intent else plan
         columns = fallback_display_columns(section_plan, bundle.rows)
         if columns:
-            lines.append(markdown_table(bundle.rows[:4], columns))
+            lines.append(markdown_table(bundle.rows[:4], columns, answer_column_labels(section_plan)))
     failed = [item for item in run_result.task_results if item.query_bundle.failed]
     for item in failed[:3]:
         lines.append("- %s：执行失败，%s" % (item.task_id, (item.query_bundle.error or item.summary)[:160]))
     return "\n".join(lines)
+
+
+def task_evidence_title(intent: QuestionIntent | None, item: Any) -> str:
+    if not intent:
+        return str(getattr(item, "task_id", "") or "查询结果")
+    resolution = intent.metric_resolution or {}
+    display = str(resolution.get("displayName") or "").strip()
+    metric = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+    if str(resolution.get("computeStrategy") or "") == "projection_group_aggregate":
+        group = intent.group_by_column or "entity"
+        return "%s（按 %s 汇总）" % (display or metric or "派生指标", group)
+    if display:
+        return display
+    if intent.preferred_table == "dwm_goods_detail_df" and "spu_apply_create_time" in (intent.output_keys or []):
+        return "商品发布时间"
+    if metric:
+        return metric
+    if intent.preferred_table:
+        return intent.preferred_table
+    return str(getattr(item, "task_id", "") or "查询结果")
 
 
 def support_task_ids_for_answer(plan: QueryPlan) -> set[str]:
