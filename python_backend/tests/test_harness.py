@@ -1,19 +1,27 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 
 import pytest
 
 from merchant_ai.config import get_settings
 from merchant_ai.graph.policy import V2AgentPolicy
-from merchant_ai.graph.workflow import create_workflow
+from merchant_ai.graph.workflow import (
+    append_knowledge_request_gaps,
+    create_workflow,
+    dedupe_workflow_knowledge_requests,
+    knowledge_request_key,
+)
 from merchant_ai.models import (
     AgentRunResult,
     AgentTaskResult,
     AnswerMode,
     ChatContext,
+    ChatResponse,
     EntitySet,
     EvidenceGap,
+    GraphValidationGap,
     GraphValidationResult,
     IntentType,
     KnowledgeRequest,
@@ -30,7 +38,10 @@ from merchant_ai.models import (
     QuestionCategory,
     QuestionIntent,
     QuestionRoute,
+    RunCreateRequest,
     RelationshipEntry,
+    RecallItem,
+    RecallBundle,
     RoutingDecision,
     SqlRepairAttempt,
     TaskRole,
@@ -48,22 +59,41 @@ from merchant_ai.services.assets import (
     WikiMemoryService,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
-from merchant_ai.services.answer import AnswerComposeService
+from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_data_package, compact_rule_evidence, plan_requires_rule_evidence
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
+from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService, answer_chunks
 from merchant_ai.services.planning import (
     PlannerReflectionAgent,
     QuestionUnderstandingCompiler,
     QueryGraphPlanner,
     QueryGraphValidator,
+    SemanticRelationshipGraphIndex,
     SemanticMetricResolver,
+    UnderstandingCoverageCritic,
+    anchor_mismatch_issue,
     compact_understanding_catalog,
+    compact_openai_tool_schema,
+    compile_semantic_entity_chain_graph,
+    compile_semantic_metric_fallback_graph,
+    compile_query_graph_from_understanding,
+    planner_prompt_stats,
+    repair_dependency_key_production_gaps,
     ultra_compact_understanding_catalog,
 )
 from merchant_ai.services.prompts import PromptAssembler
-from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, choose_entity_transfer_key, table_access_hint
-from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, TopicRouterService
+from merchant_ai.services.query import (
+    NodeWorkerExecutor,
+    SqlValidationService,
+    choose_entity_transfer_key,
+    entity_set_from_rows,
+    multi_entity_transfer_values,
+    table_access_hint,
+)
+from merchant_ai.services.repositories import DorisRepository
+from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry
 from merchant_ai.services.tools import (
     artifact_file_tool_schemas,
@@ -142,6 +172,7 @@ def test_tool_schemas_define_runtime_call_format():
     assert "analysisIntent" in understanding_schema["required"]
     assert "requiresExplanation" in understanding_schema["required"]
     assert "requiredEvidenceIntents" in understanding_schema["required"]
+    assert "scopeConstraints" in understanding_schema["required"]
 
 
 def test_skill_loader_selects_domain_skills():
@@ -169,6 +200,8 @@ def test_semantic_table_asset_is_the_canonical_runtime_source():
     assert topic_assets.load_table_terms("电商交易", "dwm_trade_order_detail_di") == asset["terms"]
     assert topic_assets.load_table_semantic_columns("电商交易", "dwm_trade_order_detail_di") == asset["semanticColumns"]
     assert topic_assets.load_table_knowledge_rules("电商交易", "dwm_trade_order_detail_di") == asset["knowledgeRules"]
+    pay_amt_metric = next(item for item in asset["metrics"] if item["metricKey"] == "pay_amt")
+    assert {"销售额", "成交额", "交易成交金额"} <= set(pay_amt_metric["aliases"])
 
 
 def test_semantic_catalog_exposes_filesystem_context_tools():
@@ -226,8 +259,37 @@ def test_planner_semantic_tool_loop_loads_ref_then_emits_understanding(tmp_path)
     assert any(call["name"] == "semantic_read" for call in plan.planner_tool_calls)
     assert "semantic:电商交易:dwm_trade_order_detail_di:asset" in plan.planner_loaded_refs
     assert plan.planner_context_files
+    assert len(planner.llm.fast_calls) == 1
     assert any("planner.semantic_tool_loop=enabled" == item for item in plan.agent_trace)
     assert any("planner.semantic_tool_loop=on_demand" == item for item in plan.agent_trace)
+
+
+def test_planner_limits_need_more_to_one_recovery_call():
+    class NeedMoreTwiceLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def __init__(self):
+            self.calls = 0
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            self.calls += 1
+            return {
+                "status": "NEED_MORE_KNOWLEDGE",
+                "reason": "need more despite loaded semantic assets",
+                "knowledgeRequests": [{"type": "TABLE", "query": "refund goods"}],
+            }
+
+    question = "最近 7 天有退款的订单，关联看一下对应商品发布时间。"
+    pack = trade_refund_goods_pack()
+    llm = NeedMoreTwiceLlm()
+    plan, requests, _ = QueryGraphPlanner(llm).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert llm.calls == 2
+    assert requests
+    assert not plan.intents
+    assert any("planner.need_more_fail_closed" == item for item in plan.agent_trace)
+    assert any("planner.llm_call_budget=recovery_exhausted" == item for item in plan.agent_trace)
 
 
 def test_planner_fast_path_skips_semantic_tool_loop_when_understood(tmp_path):
@@ -264,7 +326,7 @@ def test_planner_fast_path_skips_semantic_tool_loop_when_understood(tmp_path):
     assert not any("planner.semantic_tool_loop" in item for item in plan.agent_trace)
 
 
-def test_planner_refines_analysis_understanding_with_semantic_tool_loop(tmp_path):
+def test_planner_success_path_does_not_refine_with_semantic_tool_loop(tmp_path):
     settings = get_settings()
     settings.agent_planner_tool_rounds = 3
     topic_assets = TopicAssetService(settings)
@@ -292,12 +354,10 @@ def test_planner_refines_analysis_understanding_with_semantic_tool_loop(tmp_path
     plan, requests, _ = planner.plan(question, [], "", recall, pack, [], [])
     assert not requests
     assert plan.intents
-    assert plan.intents[0].preferred_table == "ads_merchant_profile"
-    assert plan.question_understanding["rankingObjective"]["metricRef"] == "order_gmv_amt_1d"
-    assert "ads_merchant_profile" in pack.known_tables()
-    assert any(call["name"] == "semantic_grep" for call in plan.planner_tool_calls)
-    assert any("previousUnderstanding" in payload for payload in llm.tool_chat_payloads)
-    assert any("planner.semantic_tool_loop=refined_understanding" == item for item in plan.agent_trace)
+    assert llm.tool_chat_payloads == []
+    assert plan.planner_tool_calls == []
+    assert any("planner.llm_call_budget=main_only_success" == item for item in plan.agent_trace)
+    assert not any("planner.semantic_tool_loop=refined_understanding" == item for item in plan.agent_trace)
 
 
 def test_recall_uses_single_semantic_asset_document_per_table():
@@ -328,6 +388,136 @@ def test_planning_asset_pack_refs_point_to_unified_semantic_catalog():
     assert all((entry.source_ref_id or "").startswith("semantic:") for entry in asset_entries)
 
 
+def test_compact_assets_does_not_seed_profile_from_recalled_table_asset_for_detail_question():
+    settings = get_settings()
+    recall = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="semantic:电商交易:ads_merchant_profile:asset",
+                title="店铺经营画像",
+                content="ads_merchant_profile order_gmv_amt_1d refund_rate_1d",
+                source_type="SEMANTIC_TABLE_ASSET",
+                topic="电商交易",
+                table="ads_merchant_profile",
+                fusion_score=9.9,
+                metadata={"tableName": "ads_merchant_profile"},
+            )
+        ]
+    )
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+
+    pack = builder.compact(
+        "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额。",
+        recall,
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+
+    assert "ads_merchant_profile" not in pack.known_tables()
+    catalog = ultra_compact_understanding_catalog(pack, "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额。")
+    assert "ads_merchant_profile" not in {item["table"] for item in catalog["tables"]}
+
+
+def test_asset_pack_filters_metrics_referencing_missing_live_columns():
+    class DriftedGoodsDoris:
+        def show_full_columns(self, table):
+            if table == "dwm_goods_detail_df":
+                return [
+                    {"Field": "seller_id"},
+                    {"Field": "spu_id"},
+                    {"Field": "spu_name"},
+                    {"Field": "spu_create_time"},
+                    {"Field": "pt"},
+                ]
+            return []
+
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings), doris_repository=DriftedGoodsDoris())
+
+    pack = builder.compact("最近30天上架商品量和商品发布时间", recall_bundle_empty(), [QuestionCategory.GOODS])
+
+    assert "spu_status_code" in pack.missing_live_columns.get("dwm_goods_detail_df", [])
+    assert "goods_online_detail_cnt" not in {metric.key for metric in pack.metrics}
+    assert pack.metric_compaction.get("schemaFilteredMetricCounts", {}).get("dwm_goods_detail_df", 0) >= 1
+
+
+def test_relationship_graph_scores_entity_path_above_merchant_hub():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_cs_repay_detail_df", columns=["seller_id", "sub_order_id", "bill_id", "pt"]),
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "order_id", "pt"]),
+            PlanningAssetEntry(table="ads_merchant_profile", columns=["seller_id", "pt"]),
+            PlanningAssetEntry(table="dwd_merchant_deposit_recharge_df", columns=["seller_id", "pt", "pay_amt"]),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="repay_profile_by_seller",
+                left_table="dwm_cs_repay_detail_df",
+                right_table="ads_merchant_profile",
+                join_keys=[{"leftColumn": "seller_id", "rightColumn": "seller_id"}],
+            ),
+            RelationshipEntry(
+                relationship_id="profile_deposit_by_seller",
+                left_table="ads_merchant_profile",
+                right_table="dwd_merchant_deposit_recharge_df",
+                join_keys=[{"leftColumn": "seller_id", "rightColumn": "seller_id"}],
+            ),
+            RelationshipEntry(
+                relationship_id="repay_order_by_sub_order",
+                left_table="dwm_cs_repay_detail_df",
+                right_table="dwm_trade_order_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+        ],
+    )
+
+    path = SemanticRelationshipGraphIndex(pack).edge_path(
+        "dwm_cs_repay_detail_df",
+        "dwm_trade_order_detail_di",
+        analysis_grain="order",
+    )
+
+    assert [edge.relationship_id for edge in path] == ["repay_order_by_sub_order"]
+
+
+def test_metric_resolver_treats_owner_table_as_scope_not_bonus():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "pay_amt", "pt"]),
+            PlanningAssetEntry(table="dwd_merchant_deposit_recharge_df", columns=["seller_id", "pay_amt", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_pay_amt",
+                table="dwm_trade_order_detail_di",
+                title="订单金额",
+                aliases=["pay_amt", "订单金额"],
+                columns=["pay_amt"],
+            ),
+            PlanningAssetEntry(
+                key="deposit_recharge_amt",
+                table="dwd_merchant_deposit_recharge_df",
+                title="保证金充值金额",
+                aliases=["pay_amt", "充值金额"],
+                columns=["pay_amt"],
+            ),
+        ],
+    )
+
+    resolved = SemanticMetricResolver(pack).resolve(
+        question="最近60天赔付金额最高订单，关联看订单金额",
+        metric_ref="pay_amt",
+        owner_table="dwm_trade_order_detail_di",
+        source_phrase="订单金额",
+    )
+
+    assert resolved.metric is not None
+    assert resolved.metric.table == "dwm_trade_order_detail_di"
+    assert resolved.metric.key == "order_pay_amt"
+
+
 def test_lead_policy_has_no_standalone_load_skills_action():
     policy = V2AgentPolicy(get_settings())
     assert "load_skills" not in policy.registry.public_action_ids()
@@ -351,7 +541,7 @@ def test_asset_pack_does_not_auto_expand_tables_from_relationship_closure():
     assert "dwm_trade_refund_detail_di" in tables
     assert "dwm_goods_detail_df" in tables
     assert "dwm_trade_order_detail_di" not in tables
-    assert pack.relationship_closure == []
+    assert not any("relationship_bridge_table" in item for item in pack.relationship_closure)
 
 
 def test_asset_pack_expands_metric_formula_dependency_tables_when_metric_requested():
@@ -369,6 +559,93 @@ def test_asset_pack_expands_metric_formula_dependency_tables_when_metric_request
     assert "order_detail_cnt" in metric_keys
     assert any(item == "metric_dependency:refund_rate->order_detail_cnt:dwm_trade_order_detail_di" for item in pack.relationship_closure)
     assert {"coupon_order_by_coupon_id", "order_refund_by_sub_order"} <= relationships
+
+
+def test_appeal_success_rate_is_semantic_derived_metric():
+    settings = get_settings()
+    question = "最近60天申诉成功率和退款率是否有关"
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.MERCHANT_OTHER, QuestionCategory.REFUND],
+    )
+    metric_keys = {metric.key for metric in pack.metrics}
+    assert {"appeal_success_rate", "appeal_pass_cnt", "appeal_cnt"} <= metric_keys
+
+    resolution = SemanticMetricResolver(pack).resolve(
+        question,
+        "appeal_success_rate",
+        "dwd_merchant_appeal_detail_df",
+        "申诉成功率",
+    )
+    assert resolution.metric
+    assert resolution.metric.key == "appeal_success_rate"
+    assert resolution.metric.columns == ["appeal_pass_cnt", "appeal_cnt"]
+
+    plan = compile_query_graph_from_understanding(
+        question,
+        {
+            "analysisGrain": "day",
+            "analysisIntent": "trend_check",
+            "rankingObjective": {
+                "metricRef": "appeal_success_rate",
+                "ownerTable": "dwd_merchant_appeal_detail_df",
+                "sourcePhrase": "申诉成功率",
+                "groupByColumn": "pt",
+                "objectiveType": "trend_anchor",
+                "limit": 60,
+            },
+            "timeWindowDays": 60,
+        },
+        pack,
+    )
+    compiled_metrics = {intent.metric_name for intent in plan.intents}
+    assert {"appeal_success_rate", "appeal_pass_cnt", "appeal_cnt"} <= compiled_metrics
+    assert any("DERIVED_METRIC:appeal_success_rate" in item for item in plan.compiler_trace)
+
+
+def test_understanding_coverage_critic_completes_missing_parallel_metric():
+    settings = get_settings()
+    question = "最近60天申诉成功率和退款率是否有关"
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.MERCHANT_OTHER, QuestionCategory.REFUND],
+    )
+    understanding = {
+        "analysisGrain": "day",
+        "analysisIntent": "comparison",
+        "rankingObjective": {
+            "metricRef": "refund_rate",
+            "ownerTable": "dwm_trade_refund_detail_di",
+            "sourcePhrase": "退款率",
+            "groupByColumn": "pt",
+            "objectiveType": "trend_anchor",
+            "limit": 60,
+        },
+        "requestedMeasures": [
+            {"metricRef": "refund_rate", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款率"}
+        ],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "correlation_timeseries",
+                "reason": "需要按天对齐最近60天的申诉成功率与退款率时间序列，以判断二者是否同向变化或存在相关性",
+                "requiredLevel": "required",
+                "suggestedMetricRefs": ["refund_rate"],
+            }
+        ],
+        "timeWindowDays": 60,
+    }
+    result = UnderstandingCoverageCritic().complete(question, understanding, pack)
+    added = {(item["ownerTable"], item["metricRef"]) for item in result.added_measures}
+    assert ("dwd_merchant_appeal_detail_df", "appeal_success_rate") in added
+
+    plan = compile_query_graph_from_understanding(question, result.understanding, pack)
+    compiled_metrics = {intent.metric_name for intent in plan.intents}
+    assert {"refund_rate", "appeal_success_rate", "appeal_pass_cnt", "appeal_cnt"} <= compiled_metrics
+    assert any("REQUESTED_MEASURE_APPENDED:dwd_merchant_appeal_detail_df:appeal_success_rate" in item for item in plan.compiler_trace)
 
 
 def test_sql_validator_allows_cte_and_rejects_unknown_real_table():
@@ -580,14 +857,157 @@ def test_llm_understanding_compiler_skips_relationship_missing_live_join_key():
         PlanningAssetEntry(key="order_detail_cnt", table="dwm_trade_order_detail_di", columns=["sub_order_id"], title="下单数"),
         PlanningAssetEntry(key="refund_bill_cnt", table="dwm_trade_refund_detail_di", columns=["pay_amt"], title="退款量"),
     ]
-    plan, _, _ = QueryGraphPlanner(FakeCaseUnderstandingLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    plan = compile_query_graph_from_understanding(
+        question,
+        {
+            "analysisGrain": "product",
+            "rankingObjective": {
+                "metricRef": "inbound_cnt",
+                "ownerTable": "dwm_scm_detail_di",
+                "sourcePhrase": "入库量",
+                "groupByColumn": "spu_id",
+                "limit": 10,
+                "order": "desc",
+            },
+            "requestedMeasures": [
+                {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "下单表现"},
+                {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款表现"},
+            ],
+            "timeWindowDays": 45,
+        },
+        pack,
+    )
     task_table = {intent.plan_task_id: intent.preferred_table for intent in plan.intents}
     refund_task_ids = {task_id for task_id, table in task_table.items() if table == "dwm_trade_refund_detail_di"}
     assert refund_task_ids
+    bridge = next(intent for intent in plan.intents if intent.preferred_table == "dwm_trade_order_detail_di" and intent.answer_mode == AnswerMode.DETAIL)
+    assert "sub_order_id" in bridge.output_keys
     for dep in plan.dependencies:
         if dep.dependent_task_id in refund_task_ids:
+            assert dep.anchor_task_id == bridge.plan_task_id
             assert task_table[dep.anchor_task_id] == "dwm_trade_order_detail_di"
             assert dep.anchor_column == "seller_id+sub_order_id"
+    assert any("INSERT_ENTITY_BRIDGE" in item for item in plan.compiler_trace)
+    assert QueryGraphValidator().validate(question, plan, pack).valid
+
+
+def test_compiler_ignores_metric_objective_declared_as_scope_constraint():
+    question = "上个月销售额最高的前3个商品，以及这些商品最近7天退款量是多少？"
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "spu_id", "product_amt", "pt"]),
+            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "sub_order_id", "spu_name", "refund_id", "pt"]),
+            PlanningAssetEntry(table="dwm_goods_detail_df", columns=["seller_id", "spu_id", "spu_apply_create_time", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(key="product_amt", table="dwm_trade_order_detail_di", columns=["product_amt"], title="销售额", aliases=["销售额", "GMV"]),
+            PlanningAssetEntry(key="refund_bill_cnt", table="dwm_trade_refund_detail_di", columns=["refund_id"], title="退款量"),
+            PlanningAssetEntry(key="goods_cnt", table="dwm_goods_detail_df", columns=["spu_id"], title="商品数"),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="order_goods_by_spu",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_goods_detail_df",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "spu_id", "rightColumn": "spu_id"},
+                ],
+            ),
+        ],
+    )
+    plan = compile_query_graph_from_understanding(
+        question,
+        {
+            "analysisGrain": "product",
+            "rankingObjective": {
+                "metricRef": "product_amt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "上个月销售额最高的前3个商品",
+                "objectiveType": "ranking",
+                "groupByColumn": "spu_id",
+                "limit": 3,
+                "order": "desc",
+            },
+            "requestedMeasures": [
+                {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "这些商品最近7天退款量"}
+            ],
+            "scopeConstraints": [
+                {
+                    "sourcePhrase": "上个月销售额最高的前3个商品",
+                    "ownerTable": "dwm_trade_order_detail_di",
+                    "metricRef": "product_amt",
+                    "entityGrain": "product",
+                    "targetDomain": "refund",
+                    "required": True,
+                },
+                {
+                    "sourcePhrase": "这些商品最近7天退款量",
+                    "ownerTable": "dwm_trade_refund_detail_di",
+                    "metricRef": "refund_bill_cnt",
+                    "entityGrain": "product",
+                    "targetDomain": "refund",
+                    "required": True,
+                },
+            ],
+            "timeWindowDays": 7,
+        },
+        pack,
+    )
+    result = QueryGraphValidator().validate(question, plan, pack)
+    assert result.valid
+    assert not any(intent.plan_task_id.endswith("_scope") for intent in plan.intents)
+    assert any(item.startswith("SCOPE_SKIPPED_NOT_POPULATION:ranking_objective") for item in plan.compiler_trace)
+    assert any(item.startswith("SCOPE_SKIPPED_NOT_POPULATION:requested_measure") for item in plan.compiler_trace)
+    bridge = next(intent for intent in plan.intents if intent.preferred_table == "dwm_trade_order_detail_di" and intent.answer_mode == AnswerMode.DETAIL)
+    assert "sub_order_id" in bridge.output_keys
+
+
+def test_compiler_canonicalizes_day_grain_to_pt():
+    question = "最近30天保证金充值流水、申诉次数和处罚次数分别是多少，有没有异常？"
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwd_merchant_deposit_recharge_df", columns=["merchant_id", "deposit_recharge_id", "deposit_recharge_amt", "create_time", "pt"]),
+            PlanningAssetEntry(table="dwd_merchant_appeal_detail_df", columns=["merchant_id", "appeal_id", "create_time", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(key="deposit_recharge_cnt", table="dwd_merchant_deposit_recharge_df", columns=["deposit_recharge_id"], title="保证金充值流水"),
+            PlanningAssetEntry(key="deposit_recharge_amt", table="dwd_merchant_deposit_recharge_df", columns=["deposit_recharge_amt"], title="保证金充值金额"),
+            PlanningAssetEntry(key="appeal_cnt", table="dwd_merchant_appeal_detail_df", columns=["appeal_id"], title="申诉次数"),
+        ],
+    )
+    plan = compile_query_graph_from_understanding(
+        question,
+        {
+            "analysisGrain": "day",
+            "analysisIntent": "anomaly_check",
+            "rankingObjective": {
+                "metricRef": "deposit_recharge_cnt",
+                "ownerTable": "dwd_merchant_deposit_recharge_df",
+                "sourcePhrase": "保证金充值流水",
+                "objectiveType": "trend_anchor",
+                "groupByColumn": "create_time",
+                "limit": 30,
+            },
+            "requestedMeasures": [
+                {"metricRef": "appeal_cnt", "ownerTable": "dwd_merchant_appeal_detail_df", "sourcePhrase": "申诉次数", "groupByColumn": "create_time"},
+                {"metricRef": "deposit_recharge_amt", "ownerTable": "dwd_merchant_deposit_recharge_df", "sourcePhrase": "保证金充值金额", "groupByColumn": "create_time"},
+            ],
+            "timeWindowDays": 30,
+        },
+        pack,
+    )
+    assert QueryGraphValidator().validate(question, plan, pack).valid
+    assert {intent.group_by_column for intent in plan.intents if intent.answer_mode == AnswerMode.GROUP_AGG} == {"pt"}
 
 
 def test_query_graph_planner_uses_llm_understanding_not_knowledge_grounded_anchor():
@@ -748,6 +1168,185 @@ def test_understanding_catalog_limits_initial_tables_after_topic_routing():
     assert relationship_tables <= tables
 
 
+def test_asset_pack_uses_keyword_targeted_topk_tables_for_multi_domain_question():
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    question = "最近60天赔付金额最高的前5个订单，关联看订单金额、退款金额、退款状态和对应客服工单情况。"
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [
+            QuestionCategory.COMPENSATION,
+            QuestionCategory.TRADE,
+            QuestionCategory.REFUND,
+            QuestionCategory.CS_TICKET,
+            QuestionCategory.GOODS,
+            QuestionCategory.SCM,
+        ],
+    )
+    tables = set(pack.known_tables())
+    assert tables == {
+        "dwm_cs_repay_detail_df",
+        "dwm_trade_order_detail_di",
+        "dwm_trade_refund_detail_di",
+        "dwm_cs_ticket_detail_di",
+    }
+    assert "ads_merchant_profile" not in tables
+    assert "dwm_goods_detail_df" not in tables
+    assert any("targeted_seed_tables:" in item for item in pack.relationship_closure)
+
+    catalog = ultra_compact_understanding_catalog(pack, question)
+    metrics = {(item["table"], item["key"]): item for item in catalog["candidateMetrics"]}
+    assert ("dwm_cs_repay_detail_df", "repay_amt") in metrics
+    assert "赔付金额" in metrics[("dwm_cs_repay_detail_df", "repay_amt")]["matchedPhrases"]
+
+
+def test_ultra_catalog_keeps_candidate_metric_coverage_per_involved_table():
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    question = "最近45天供应链入库量前10的商品，后续下单表现和退款表现怎么样。"
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [
+            QuestionCategory.SCM,
+            QuestionCategory.TRADE,
+            QuestionCategory.REFUND,
+            QuestionCategory.GOODS,
+        ],
+    )
+
+    catalog = ultra_compact_understanding_catalog(pack, question)
+    metrics = {(item["table"], item["key"]) for item in catalog["candidateMetrics"]}
+
+    assert ("dwm_scm_detail_di", "scm_inbound_total_cnt") in metrics
+    assert ("dwm_trade_order_detail_di", "order_detail_cnt") in metrics
+    assert ("dwm_trade_refund_detail_di", "refund_bill_cnt") in metrics
+    assert len(catalog["candidateMetrics"]) <= min(
+        settings.agent_planner_seed_metric_limit,
+        max(6, len(catalog["tables"]) * 2 + 2),
+    )
+
+
+def test_planner_fast_path_uses_small_context_package():
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    planner = QueryGraphPlanner(FakeCaseUnderstandingLlm(), settings=settings)
+    payload = planner._understanding_payload(question, pack, [], [], False, False, None)
+    user_prompt = json.dumps(payload, ensure_ascii=False)
+    compact_schema = compact_openai_tool_schema(question_understanding_tool(False).openai_schema())
+    full_schema = question_understanding_tool(False).openai_schema()
+    stats = planner_prompt_stats("system", user_prompt, compact_schema)
+    assert "semanticFileContext" not in payload
+    assert "semanticManifest" not in payload
+    assert len(payload["semanticCatalog"]["tables"]) <= settings.agent_planner_seed_table_limit
+    assert len(user_prompt) < settings.agent_planner_prompt_budget_chars
+    assert stats["toolSchemaChars"] < len(json.dumps(full_schema, ensure_ascii=False))
+    tool_payload = planner._understanding_payload(question, pack, [], [], False, False, None, include_full_file_context=True)
+    file_context = tool_payload["semanticFileContext"]
+    assert file_context["mode"] == "filesystem_as_context"
+    assert len(file_context["refs"]) <= settings.agent_planner_seed_table_limit
+    assert any("layers" in ref for ref in file_context["refs"])
+
+
+def test_ultra_catalog_keeps_cross_domain_metric_refs_without_expanding_tables():
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量，判断是否存在异常波动。"
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [
+            QuestionCategory.TRADE,
+            QuestionCategory.REFUND,
+            QuestionCategory.CS_TICKET,
+            QuestionCategory.COMPENSATION,
+        ],
+    )
+    catalog = ultra_compact_understanding_catalog(pack, question)
+    table_names = {item["table"] for item in catalog["tables"]}
+    metric_tables = {item["table"] for item in catalog["candidateMetrics"]}
+    metric_keys = {item["key"] for item in catalog["candidateMetrics"]}
+    assert 1 <= len(table_names) <= settings.agent_planner_seed_table_limit
+    assert "dwm_cs_repay_detail_df" in metric_tables
+    assert {"repay_amt", "ticket_cnt", "pay_amt"} & metric_keys
+
+
+def test_successful_planner_fast_path_does_not_call_recovery_llm():
+    class CountingFastPlannerLlm(FakeCaseUnderstandingLlm):
+        def __init__(self):
+            self.calls = 0
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            self.calls += 1
+            return super().json_chat(system_prompt, user_prompt, fallback)
+
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    question = "最近 7 天下单最多的前 5 个 SPU，同时看它们的退款量和退款金额。"
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    llm = CountingFastPlannerLlm()
+    plan, requests, _ = QueryGraphPlanner(llm, settings=settings).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert plan.intents
+    assert not requests
+    assert llm.calls == 1
+    assert plan.planner_prompt_stats["schemaMode"] == "compact_tool_schema"
+
+
+def test_planner_reflection_uses_resolved_metric_for_anchor_check():
+    question = "最近30天GMV最高的前5天。"
+    plan = QueryPlan(
+        question_understanding={
+            "rankingObjective": {
+                "metricRef": "pay_amt",
+                "ownerTable": "dwm_trade_order_detail_di",
+            }
+        },
+        intents=[
+            QuestionIntent(
+                question=question,
+                answer_mode="TOPN",
+                plan_task_id="anchor_profile",
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_column="order_gmv_amt_1d",
+                group_by_column="pt",
+                output_keys=["merchant_id", "pt"],
+                metric_resolution={
+                    "requestedMetricRef": "pay_amt",
+                    "metricKey": "order_gmv_amt_1d",
+                    "ownerTable": "ads_merchant_profile",
+                },
+            )
+        ],
+    )
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "pt", "order_gmv_amt_1d"])],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_gmv_amt_1d",
+                table="ads_merchant_profile",
+                columns=["order_gmv_amt_1d"],
+                title="GMV",
+            )
+        ],
+    )
+
+    reflection = PlannerReflectionAgent().reflect(question, plan, pack)
+
+    assert not any(issue.get("code") == "ANCHOR_MISMATCH" for issue in reflection.issues)
+
+
 def test_asset_pack_trims_metrics_before_planner_prompt():
     settings = get_settings()
     builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
@@ -758,8 +1357,8 @@ def test_asset_pack_trims_metrics_before_planner_prompt():
         [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.CS_TICKET, QuestionCategory.COMPENSATION],
     )
     metric_keys = {metric.key for metric in pack.metrics}
-    assert len(pack.metrics) <= 24
-    assert pack.metric_compaction["before"] > pack.metric_compaction["after"]
+    assert len(pack.metrics) <= settings.agent_planner_seed_metric_limit
+    assert pack.metric_compaction["targetedSeed"]["tables"]
     assert "ads_merchant_profile" not in pack.known_tables()
     assert "refund_rate_1d" not in metric_keys
     builder.expand_for_question_understanding(
@@ -792,6 +1391,143 @@ def test_first_step_topic_router_covers_trade_refund_goods_for_top_spu_refund_qu
     assert "不表示 anchor" in topic.reason
 
 
+def test_first_step_topic_router_covers_coupon_activity_synonym():
+    question = "最近30天券活动投入最高的活动，带来的支付订单数怎么样？"
+    keywords = KeywordExtractService().extract(question)
+    topic = TopicRouterService().route(question, keywords)
+
+    assert QuestionCategory.COUPON in set(topic.candidate_topics)
+    assert QuestionCategory.TRADE in set(topic.candidate_topics)
+
+
+def test_route_slots_extract_object_refs_without_entity_pollution():
+    question = "查询子订单 sub_order_id_100 和订单 order_id_200 的退款情况，并看 spu_id_300 商品。"
+    keywords = KeywordExtractService().extract(question)
+    slots = RouteSlotExtractor().extract(question, keywords)
+
+    refs = {(item.ref_type, item.value) for item in slots.object_refs}
+    assert ("sub_order_id", "sub_order_id_100") in refs
+    assert ("order_id", "order_id_200") in refs
+    assert ("spu_id", "spu_id_300") in refs
+    assert ("order_id", "order_id_100") not in refs
+    assert {item.topic for item in slots.topic_candidates} >= {QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS}
+
+
+def test_route_slots_extract_time_operation_risk_and_weak_analysis_hint():
+    read_slots = RouteSlotExtractor().extract(
+        "昨天平台规则里处罚和保证金有什么风险？看下趋势。",
+        KeywordExtractService().extract("昨天平台规则里处罚和保证金有什么风险？看下趋势。"),
+    )
+    assert read_slots.time_window.days == 1
+    assert read_slots.time_window.needs_freshness_check
+    assert read_slots.operation == "read"
+    assert read_slots.risk_level == "rule_sensitive"
+    assert read_slots.analysis_signals == ["weak_analysis_hint"]
+
+    write_slots = RouteSlotExtractor().extract("删除最近30天订单数据", KeywordExtractService().extract("删除最近30天订单数据"))
+    assert write_slots.operation == "write_requested"
+    assert write_slots.risk_level == "high_risk"
+
+    compensation_slots = RouteSlotExtractor().extract(
+        "最近30天赔付金额最高的订单有哪些？",
+        KeywordExtractService().extract("最近30天赔付金额最高的订单有哪些？"),
+    )
+    assert compensation_slots.risk_level == "normal"
+    assert QuestionCategory.COMPENSATION in {item.topic for item in compensation_slots.topic_candidates}
+
+
+def test_route_topic_blocks_write_operation_before_retrieval():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state("删除最近30天订单数据", "100", ChatContext(), None, "write_thread", "write_run")
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+
+    assert state["route_slots"].operation == "write_requested"
+    assert state["human_clarification_required"]
+    assert state["human_clarification_type"] == "write_operation"
+    assert workflow.policy.decide(state).selected_action == "ask_human"
+
+
+def test_bounded_route_llm_can_only_filter_allowed_topics(tmp_path):
+    class FilteringRouteLlm:
+        configured = True
+        last_error = ""
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None, timeout_seconds=None):
+            return {"topics": ["TRADE", "UNKNOWN", "COUPON"], "confidence": 0.91, "reason": "keep trade only"}
+
+    settings = get_settings().model_copy(update={"route_llm_mode": "always", "harness_workspace_path": str(tmp_path)})
+    workflow = create_workflow(settings)
+    workflow.planner.llm = FilteringRouteLlm()
+    state = workflow._initial_state("最近7天订单和退款情况", "100", ChatContext(), None, "route_llm_thread", "route_llm_run")
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+
+    assert state["bounded_route_llm_trace"]["status"] == "applied"
+    assert state["topic_routing_decision"].candidate_topics == [QuestionCategory.TRADE]
+    assert "COUPON" not in [getattr(item, "value", str(item)) for item in state["topic_routing_decision"].candidate_topics]
+
+
+def test_bounded_route_llm_timeout_keeps_deterministic_route(tmp_path):
+    class TimeoutRouteLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 8 seconds"
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None, timeout_seconds=None):
+            return {}
+
+    settings = get_settings().model_copy(update={"route_llm_mode": "always", "harness_workspace_path": str(tmp_path)})
+    workflow = create_workflow(settings)
+    workflow.planner.llm = TimeoutRouteLlm()
+    state = workflow._initial_state("最近7天订单和退款情况", "100", ChatContext(), None, "route_timeout_thread", "route_timeout_run")
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+
+    assert state["bounded_route_llm_trace"]["errorCode"] == "ROUTE_LLM_TIMEOUT"
+    assert "ROUTE_LLM_TIMEOUT" in state["route_slots"].route_warnings
+    assert {QuestionCategory.TRADE, QuestionCategory.REFUND} <= set(state["topic_routing_decision"].candidate_topics)
+
+
+def test_compact_assets_filters_weak_tables_inside_broad_merchant_topic():
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+
+    deposit_pack = builder.compact(
+        "最近60天保证金充值金额变化和GMV变化是否同步？",
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.MERCHANT_OTHER],
+    )
+    assert "dwd_merchant_deposit_recharge_df" in deposit_pack.known_tables()
+    assert "dwd_merchant_appeal_detail_df" not in deposit_pack.known_tables()
+
+    appeal_pack = builder.compact(
+        "最近30天申诉成功的订单多吗？关联看有没有退款。",
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.MERCHANT_OTHER],
+    )
+    assert "dwd_merchant_appeal_detail_df" in appeal_pack.known_tables()
+    assert "dwd_merchant_deposit_recharge_df" not in appeal_pack.known_tables()
+
+
+def test_route_analysis_hint_does_not_become_final_analysis_intent():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state(
+        "最近30天签收订单数和订单金额走势怎么样？",
+        "100",
+        ChatContext(),
+        None,
+        "intent_signal_thread",
+        "intent_signal_run",
+    )
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    state = workflow.retrieve_knowledge(state)
+
+    assert not state["intent_signals"].has_analysis_intent
+    assert "route_analysis_hint_present" in state["intent_signals"].observations
+    assert "analysis_intent_signal_present" not in state["intent_signals"].observations
+
+
 def test_first_step_topic_router_does_not_invent_topics_for_store_diagnosis():
     question = "当前店铺最近 90 天整体经营情况怎么样，帮我总结风险和机会。"
     keywords = KeywordExtractService().extract(question)
@@ -802,6 +1538,303 @@ def test_first_step_topic_router_does_not_invent_topics_for_store_diagnosis():
     assert not topic.clarification_required
     assert "开放 scope" in topic.reason
     assert QuestionCategory.PLATFORM_RULE not in topic.candidate_topics
+
+
+def test_platform_rule_question_uses_recall_then_rule_answer_plan(monkeypatch):
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state("平台规则里商家发货超时会怎么处罚？", "100", ChatContext(), None, "", "")
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    assert QuestionCategory.PLATFORM_RULE in state["topic_routing_decision"].recall_topics()
+
+    state = workflow.retrieve_knowledge(state)
+
+    assert state["data_discovered"]
+    assert state["recall_bundle"].items
+    assert any("rule" in (item.answer_mode or "").lower() for item in state["recall_bundle"].items[:6])
+    assert state["intent_signals"].has_rule_evidence
+    assert not state["intent_signals"].has_data_intent
+    assert state["intent_signals"].suggested_actions == ["answer_rule"]
+    assert state["rule_recall_ready"]
+    assert state["rule_recall_refs"]
+    assert state["rule_recall_context"]
+    assert not state["plan"].intents
+    decision = workflow.policy.decide(state)
+    assert decision.selected_action == "answer_rule"
+    assert decision.selected_node == "answer_rule"
+
+    monkeypatch.setattr(workflow.answer_service, "compose", lambda *args, **kwargs: "规则召回答案")
+    state = workflow.answer_rule(state)
+    assert state["plan"].intents
+    assert state["plan"].intents[0].answer_mode == AnswerMode.RULE
+    assert state["plan"].intents[0].analysis_source == "rule_recall"
+    assert state["plan"].intents[0].knowledge_ref_ids
+    assert state["query_graph_validation_result"].valid
+    assert not state["query_graph_validation_result"].repairable
+    assert state["chat_bi_completed"]
+
+
+def test_rule_recall_does_not_short_circuit_bi_entity_lookup():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state(
+        "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。",
+        "100",
+        ChatContext(),
+        None,
+        "",
+        "",
+    )
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    state = workflow.retrieve_knowledge(state)
+
+    assert state["recall_bundle"].items
+    assert not state["intent_signals"].has_rule_evidence
+    assert state["intent_signals"].has_data_intent
+    assert not state["rule_recall_ready"]
+    decision = workflow.policy.decide(state)
+    assert decision.selected_action != "answer_rule"
+
+
+def test_rule_recall_is_retained_as_evidence_for_mixed_rule_bi_question():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state(
+        "平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。",
+        "100",
+        ChatContext(),
+        None,
+        "",
+        "",
+    )
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    state = workflow.retrieve_knowledge(state)
+
+    assert state["recall_bundle"].items
+    assert state["intent_signals"].has_rule_evidence
+    assert state["intent_signals"].has_data_intent
+    assert "compact_assets" in state["intent_signals"].suggested_actions
+    assert state["rule_recall_refs"]
+    assert state["rule_recall_context"]
+    assert not state["rule_recall_ready"]
+    decision = workflow.policy.decide(state)
+    assert decision.selected_action != "answer_rule"
+    assert decision.selected_action == "compact_assets"
+
+
+def test_intent_signals_support_implicit_rule_question_after_recall():
+    workflow = create_workflow(get_settings())
+    state = workflow._initial_state(
+        "商家发货超时会怎么处罚？",
+        "100",
+        ChatContext(),
+        None,
+        "",
+        "",
+    )
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    state = workflow.retrieve_knowledge(state)
+
+    assert state["intent_signals"].has_rule_evidence
+    assert not state["intent_signals"].has_data_intent
+    assert state["rule_recall_ready"]
+    assert workflow.policy.decide(state).selected_action == "answer_rule"
+
+
+def test_answer_compose_merges_rule_evidence_with_bi_data():
+    settings = get_settings().model_copy(update={"llm_api_key": ""})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "none",
+            "requiresExplanation": False,
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "platform_rule_shipping_timeout",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["rule", "governance"],
+                }
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                question="平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                preferred_table="ads_merchant_profile",
+                metric_name="ship_timeout_order_cnt_1d",
+            )
+        ]
+    )
+    bundle = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[{"pt": "2026-06-20", "ship_timeout_order_cnt_1d": 3, "merchant_id": "100"}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="ship_timeout_metric", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+    rule_context = """
+召回规则片段 [BASE_WIKI] yshopping 平台商家规则
+- 商家发货时应确保订单状态、发货时效、物流单号和承运信息一致，避免虚假发货、超时发货或单号无轨迹。
+- 若用户咨询“发货规则”“超时发货怎么办”，应重点回答发货时效、物流信息准确性和异常订单排查路径。
+"""
+
+    answer = service.compose("平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。", MerchantInfo(merchant_id="100"), plan, run, "", rule_context=rule_context)
+
+    assert "已按当前口径查询到 1 行数据" in answer
+    assert "规则依据" in answer
+    assert "发货时效" in answer
+    assert compact_rule_evidence("发货超时要注意什么", rule_context)
+
+
+def test_rule_only_evidence_intent_does_not_trigger_bi_analysis_summary():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "overview",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "platform_rule_shipping_timeout",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["rule", "governance"],
+                }
+            ],
+        }
+    )
+
+    assert not analysis_summary_required(plan)
+
+
+def test_single_metric_rule_overview_does_not_trigger_bi_analysis_summary():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "overview",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "business_rule_context",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["profile", "order"],
+                },
+                {
+                    "semanticLabel": "recent_timeout_volume",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["profile"],
+                    "suggestedMetricRefs": ["ship_timeout_order_cnt_1d"],
+                },
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                question="平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                preferred_table="ads_merchant_profile",
+                metric_name="ship_timeout_order_cnt_1d",
+                group_by_column="merchant_id",
+            )
+        ],
+    )
+
+    assert not analysis_summary_required(plan)
+
+
+def test_rule_data_anomaly_question_still_triggers_bi_analysis_summary():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "anomaly_check",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "business_rule_context",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["rule", "governance"],
+                },
+                {
+                    "semanticLabel": "metric_anomaly_signal",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["profile"],
+                    "suggestedMetricRefs": ["ship_timeout_order_cnt_1d"],
+                },
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                question="平台规则说发货超时要注意什么，同时分析最近7天发货超时订单量是否异常。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                preferred_table="ads_merchant_profile",
+                metric_name="ship_timeout_order_cnt_1d",
+                group_by_column="merchant_id",
+            )
+        ],
+    )
+
+    assert analysis_summary_required(plan)
+
+
+def test_product_overview_does_not_trigger_trend_analysis_summary():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "product",
+            "analysisIntent": "overview",
+            "requiresExplanation": True,
+        },
+        intents=[
+            QuestionIntent(
+                question="最近45天供应链入库量前10的商品，后续下单表现和退款表现怎么样。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.TOPN,
+                category=QuestionCategory.SCM,
+                preferred_table="dwm_scm_detail_di",
+                metric_name="scm_inbound_total_cnt",
+                group_by_column="spu_id",
+            )
+        ],
+    )
+
+    assert not analysis_summary_required(plan)
+
+
+def test_rule_evidence_only_appends_when_plan_requires_rules():
+    product_plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "product",
+            "analysisIntent": "overview",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "top_inbound_goods_order_performance",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["scm", "trade", "refund"],
+                }
+            ],
+        }
+    )
+    rule_plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "merchant",
+            "analysisIntent": "overview",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "platform_rule_shipping_timeout",
+                    "requiredLevel": "required",
+                    "suggestedDomains": ["rule"],
+                }
+            ],
+        }
+    )
+
+    assert not plan_requires_rule_evidence(product_plan)
+    assert plan_requires_rule_evidence(rule_plan)
 
 
 def test_first_step_rejects_bare_analysis_without_business_subject():
@@ -977,6 +2010,65 @@ def test_knowledge_request_relationship_scope_expands_by_table_path():
     assert QuestionCategory.CS_TICKET in topics
 
 
+def test_semantic_metric_resolver_accepts_exact_detail_metric_without_recall_loop():
+    settings = get_settings()
+    question = "最近7天订单量是多少？"
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE],
+    )
+
+    resolution = SemanticMetricResolver(pack).resolve(
+        question,
+        "order_detail_cnt",
+        "dwm_trade_order_detail_di",
+        "订单量",
+    )
+
+    assert resolution.metric
+    assert resolution.metric.key == "order_detail_cnt"
+    assert resolution.metric.table == "dwm_trade_order_detail_di"
+    assert resolution.resolution_source == "semantic_metric_ref"
+    assert not resolution.knowledge_requests
+
+
+def test_knowledge_requests_dedupe_by_stable_key_and_preserve_task_scope():
+    first = KnowledgeRequest(
+        type=KnowledgeRequestType.METRIC,
+        query="订单量 语义指标口径",
+        needed_for_task_id="anchor_order",
+        reason="Resolver needs scoped semantic metric evidence: metric_evidence_unscoped requested=order_detail_cnt",
+    )
+    duplicate = KnowledgeRequest(
+        type=KnowledgeRequestType.METRIC,
+        query="订单量   语义指标口径",
+        needed_for_task_id="anchor_order",
+        reason="Resolver needs scoped semantic metric evidence: metric_evidence_unscoped requested=other",
+    )
+    other_task = duplicate.model_copy(update={"needed_for_task_id": "dependent_order"})
+
+    deduped = dedupe_workflow_knowledge_requests([first, duplicate, other_task])
+
+    assert len(deduped) == 2
+    assert knowledge_request_key(first) == knowledge_request_key(duplicate)
+    assert knowledge_request_key(first) != knowledge_request_key(other_task)
+
+
+def test_knowledge_request_gap_append_is_stable():
+    request = KnowledgeRequest(
+        type=KnowledgeRequestType.METRIC,
+        query="GMV 语义指标口径",
+        reason="Resolver needs scoped semantic metric evidence: metric_evidence_unscoped requested=pay_amt",
+    )
+
+    first = append_knowledge_request_gaps([], [request], "METRIC_EVIDENCE_UNCHANGED")
+    second = append_knowledge_request_gaps(first, [request], "METRIC_EVIDENCE_UNCHANGED")
+
+    assert len(second) == 1
+    assert second[0]["code"] == "METRIC_EVIDENCE_UNCHANGED"
+
+
 def test_llm_understanding_compiles_same_table_daily_metric_dependents():
     question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量，判断是否存在异常波动。"
     pack = profile_daily_pack()
@@ -996,22 +2088,345 @@ def test_llm_understanding_compiles_same_table_daily_metric_dependents():
 
 def test_llm_understanding_compiler_adds_formula_dependency_measure_nodes():
     settings = get_settings()
-    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    topic_assets = TopicAssetService(settings)
+    builder = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings))
     question = "最近45天优惠券金额投入最高的商品，退款率是否偏高？"
+    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall = recall_service.recall(
+        question,
+        KeywordExtractService().extract(question),
+        [],
+        "",
+        "100",
+        [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    pack = builder.compact(
+        question,
+        recall,
+        [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    plan, requests, _ = QueryGraphPlanner(FakeCouponRefundRatePlannerLlm()).plan(question, [], "", recall, pack, [], [])
+    if requests:
+        scoped_recall = recall_service.recall(
+            requests[0].query,
+            KeywordExtractService().extract(requests[0].query),
+            [],
+            "",
+            "100",
+            [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+        )
+        merged_recall = RecallBundle(items=merge_recall_items_for_test(recall.items, scoped_recall.items))
+        pack = builder.compact(
+            question,
+            merged_recall,
+            [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+        )
+        plan, requests, _ = QueryGraphPlanner(FakeCouponRefundRatePlannerLlm()).plan(question, [], "", merged_recall, pack, [], [])
+    assert not requests
+    metrics_by_task = {intent.plan_task_id: intent.metric_name for intent in plan.intents}
+    assert metrics_by_task["anchor_coupon"] == "coupon_total_amt"
+    assert "refund_rate" in metrics_by_task.values()
+    assert "order_detail_cnt" in metrics_by_task.values()
+    derived = next(intent for intent in plan.intents if intent.metric_name == "refund_rate")
+    assert derived.answer_mode == AnswerMode.DERIVED
+    assert derived.preferred_table == ""
+    assert any("DERIVED_REQUESTED_METRIC:refund_rate" in item for item in plan.compiler_trace)
+    validation = QueryGraphValidator().validate(question, plan, pack)
+    assert validation.valid, [(gap.code, gap.evidence) for gap in validation.gaps]
+
+
+def test_llm_understanding_compiler_applies_scope_constraints_before_metrics():
+    class CouponOrderRefundRatioLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "UNDERSTOOD",
+                "reason": "coupon-used order scope with refund numerator",
+                "questionUnderstanding": {
+                    "analysisGrain": "order",
+                    "analysisIntent": "none",
+                    "requiresExplanation": False,
+                    "requiredEvidenceIntents": [],
+                    "rankingObjective": {
+                        "metricRef": "order_detail_cnt",
+                        "sourcePhrase": "有使用优惠券的订单",
+                        "ownerTable": "dwm_trade_order_detail_di",
+                        "objectiveType": "metric_total",
+                        "groupByColumn": "seller_id",
+                        "order": "desc",
+                        "limit": 1,
+                    },
+                    "requestedMeasures": [
+                        {"metricRef": "refund_bill_cnt", "sourcePhrase": "有退货的订单", "ownerTable": "dwm_trade_refund_detail_di"}
+                    ],
+                    "scopeConstraints": [
+                        {
+                            "scopeId": "coupon_used_orders",
+                            "sourcePhrase": "有使用优惠券的订单",
+                            "ownerTable": "dwm_coupon_detail_di",
+                            "metricRef": "coupon_amt",
+                            "entityGrain": "order",
+                            "targetDomain": "order",
+                            "required": True,
+                        }
+                    ],
+                    "filters": [],
+                    "timeWindowDays": 10,
+                },
+            }
+
+    settings = get_settings()
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    question = "最近10天有使用优惠券的订单有退货的订单占多少。"
     pack = builder.compact(
         question,
         recall_bundle_empty(),
-        [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.COUPON],
     )
-    plan, requests, _ = QueryGraphPlanner(FakeCouponRefundRatePlannerLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    plan, requests, _ = QueryGraphPlanner(CouponOrderRefundRatioLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+
     assert not requests
-    metrics_by_task = {intent.plan_task_id: intent.metric_name for intent in plan.intents}
-    assert metrics_by_task["anchor_coupon"] == "coupon_amt"
-    assert "refund_rate" in metrics_by_task.values()
-    assert "order_detail_cnt" in metrics_by_task.values()
-    assert any("FORMULA_DEP_METRICS:order_detail_cnt" == item for item in plan.compiler_trace)
+    task_tables = {intent.plan_task_id: intent.preferred_table for intent in plan.intents}
+    assert task_tables["anchor_coupon_scope"] == "dwm_coupon_detail_di"
+    assert task_tables["order_scope"] == "dwm_trade_order_detail_di"
+    assert "order_lookup" in task_tables
+    assert "refund_lookup" in task_tables
+    order_scope = next(intent for intent in plan.intents if intent.plan_task_id == "order_scope")
+    assert {"discount_rel_id", "sub_order_id"} <= set(order_scope.output_keys)
+    assert any(dep.anchor_task_id == "anchor_coupon_scope" and dep.dependent_task_id == "order_scope" for dep in plan.dependencies)
+    assert any(dep.anchor_task_id == "order_scope" and dep.dependent_task_id == "order_lookup" for dep in plan.dependencies)
+    assert any(dep.anchor_task_id == "order_scope" and dep.dependent_task_id == "refund_lookup" for dep in plan.dependencies)
+    assert any(item.startswith("SCOPE_CONSTRAINT:") for item in plan.compiler_trace)
     validation = QueryGraphValidator().validate(question, plan, pack)
     assert validation.valid, [(gap.code, gap.evidence) for gap in validation.gaps]
+
+
+def test_query_graph_contract_validator_rejects_same_table_scope_without_filter_or_subset_metric():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "sub_order_id", "order_id", "pt"],
+            )
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                metadata={"metricKey": "order_detail_cnt", "formula": "COUNT(DISTINCT sub_order_id)"},
+            )
+        ],
+    )
+    plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "order",
+            "rankingObjective": {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "某业务集合里的订单",
+            },
+            "requestedMeasures": [],
+            "scopeConstraints": [
+                {
+                    "scopeId": "same_table_fake_scope",
+                    "sourcePhrase": "某业务集合里的订单",
+                    "ownerTable": "dwm_trade_order_detail_di",
+                    "metricRef": "order_detail_cnt",
+                    "entityGrain": "order",
+                    "targetDomain": "order",
+                    "required": True,
+                }
+            ],
+            "filters": [],
+        },
+        intents=[
+            QuestionIntent(
+                question="某业务集合里的订单占比",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                task_role=TaskRole.ANCHOR,
+                plan_task_id="anchor_order",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                metric_column="sub_order_id",
+                output_keys=["seller_id", "sub_order_id"],
+                metric_resolution={
+                    "requestedMetricRef": "order_detail_cnt",
+                    "metricKey": "order_detail_cnt",
+                    "ownerTable": "dwm_trade_order_detail_di",
+                },
+            )
+        ],
+    )
+
+    validation = QueryGraphValidator().validate("某业务集合里的订单占比", plan, pack)
+    assert not validation.valid
+    assert any(gap.code == "SCOPE_NOT_NARROWING" for gap in validation.gaps)
+
+
+def test_compiler_ignores_scope_that_duplicates_ranking_objective():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_scm_detail_di",
+                columns=["seller_id", "spu_id", "inbound_cnt", "pt"],
+            )
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="scm_inbound_total_cnt",
+                table="dwm_scm_detail_di",
+                columns=["inbound_cnt"],
+                title="入库数量",
+                metadata={"metricKey": "scm_inbound_total_cnt", "formula": "SUM(inbound_cnt)", "sourceColumns": ["inbound_cnt"]},
+            )
+        ],
+    )
+    understanding = {
+        "analysisGrain": "product",
+        "rankingObjective": {
+            "metricRef": "scm_inbound_total_cnt",
+            "ownerTable": "dwm_scm_detail_di",
+            "groupByColumn": "spu_id",
+            "limit": 10,
+        },
+        "requestedMeasures": [],
+        "scopeConstraints": [
+            {
+                "scopeId": "top10_inbound_products",
+                "sourcePhrase": "供应链入库量前10商品",
+                "ownerTable": "dwm_scm_detail_di",
+                "metricRef": "scm_inbound_total_cnt",
+                "entityGrain": "product",
+                "targetDomain": "scm",
+                "required": True,
+            }
+        ],
+        "filters": [],
+    }
+
+    plan = compile_query_graph_from_understanding("供应链入库量前10商品", understanding, pack)
+    task_ids = {intent.plan_task_id for intent in plan.intents}
+    assert "anchor_scm_scope" not in task_ids
+    assert "anchor_scm" in task_ids
+    validation = QueryGraphValidator().validate("供应链入库量前10商品", plan, pack)
+    assert not any(gap.code == "SCOPE_NOT_NARROWING" for gap in validation.gaps)
+
+
+def test_planner_critic_accepts_scope_anchor_before_ranking_metric_node():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "order",
+            "rankingObjective": {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "优惠券订单数",
+            },
+            "requestedMeasures": [],
+            "scopeConstraints": [
+                {
+                    "scopeId": "coupon_used_orders",
+                    "sourcePhrase": "使用优惠券的订单中",
+                    "ownerTable": "dwm_coupon_detail_di",
+                    "metricRef": "coupon_total_amt",
+                    "entityGrain": "order",
+                    "targetDomain": "order",
+                    "required": True,
+                }
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                question="最近10天使用优惠券的订单中，有退货的订单占多少",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                task_role=TaskRole.ANCHOR,
+                plan_task_id="anchor_coupon_scope",
+                preferred_table="dwm_coupon_detail_di",
+                output_keys=["seller_id", "coupon_id"],
+            ),
+            QuestionIntent(
+                question="最近10天使用优惠券的订单中，有退货的订单占多少",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                task_role=TaskRole.DEPENDENT,
+                plan_task_id="order_lookup",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                metric_column="sub_order_id",
+                metric_resolution={
+                    "requestedMetricRef": "order_detail_cnt",
+                    "metricKey": "order_detail_cnt",
+                    "ownerTable": "dwm_trade_order_detail_di",
+                },
+            ),
+        ],
+    )
+
+    assert anchor_mismatch_issue(plan) == {}
+
+
+def test_query_graph_validator_rejects_dependency_key_not_produced_by_detail_node():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "refund_id", "sub_order_id", "discount_id", "pt"]),
+            PlanningAssetEntry(table="dwm_coupon_detail_di", columns=["seller_id", "coupon_id", "coupon_amt", "pt"]),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="coupon_refund_by_coupon_id",
+                left_table="dwm_coupon_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "coupon_id", "rightColumn": "discount_id"},
+                ],
+            )
+        ],
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="优惠券退款",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                task_role=TaskRole.ANCHOR,
+                plan_task_id="refund_entity_expand",
+                preferred_table="dwm_trade_refund_detail_di",
+                output_keys=["seller_id", "refund_id", "sub_order_id"],
+            ),
+            QuestionIntent(
+                question="优惠券退款",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                task_role=TaskRole.DEPENDENT,
+                plan_task_id="coupon_lookup",
+                preferred_table="dwm_coupon_detail_di",
+                metric_name="coupon_amt",
+                metric_column="coupon_amt",
+                group_by_column="coupon_id",
+                output_keys=["seller_id", "coupon_id"],
+                depends_on_task_ids=["refund_entity_expand"],
+            ),
+        ],
+        dependencies=[
+            PlanDependency(
+                anchor_task_id="refund_entity_expand",
+                dependent_task_id="coupon_lookup",
+                join_key="coupon_id",
+                anchor_column="seller_id+discount_id",
+                dependent_column="seller_id+coupon_id",
+            )
+        ],
+    )
+
+    validation = QueryGraphValidator().validate("优惠券退款", plan, pack)
+    assert not validation.valid
+    assert any(gap.code == "DEPENDENCY_KEY_NOT_PRODUCED" and gap.evidence == "discount_id" for gap in validation.gaps)
 
 
 def test_llm_understanding_compiles_deposit_gmv_day_relation_from_semantic_layer():
@@ -1068,11 +2483,9 @@ def test_planner_passes_compact_diagnostic_context_to_llm():
     assert plan.intents
     assert llm.payloads[0]["diagnosticContext"]["intent"] == "STORE_HEALTH_DIAGNOSIS"
     assert llm.payloads[0]["diagnosticContext"]["goal"] == "综合经营健康度"
-    file_context = llm.payloads[0]["semanticFileContext"]
-    assert file_context["mode"] == "filesystem_as_context"
-    assert "semantic_read" in file_context["tools"]
-    assert "semantic_write" in file_context["tools"]
-    assert any(str(ref["path"]).endswith("/asset.json") for ref in file_context["refs"])
+    assert "semanticFileContext" not in llm.payloads[0]
+    assert "semanticManifest" not in llm.payloads[0]
+    assert llm.payloads[0]["semanticCatalog"]["tables"]
 
 
 def test_llm_understanding_compiles_detail_lookup_without_ranking_objective():
@@ -1108,8 +2521,301 @@ def test_llm_understanding_compiles_detail_lookup_without_ranking_objective():
     assert {"dwm_trade_order_detail_di", "dwm_trade_refund_detail_di", "dwm_goods_detail_df"} <= tables
     assert plan.intents[0].filter_column == "order_id"
     assert plan.intents[0].filter_value == "order_id_100"
-    assert plan.intents[0].answer_mode == "DETAIL"
+
+
+def test_detail_goods_lookup_does_not_require_missing_status_code_metric():
+    class DetailSubOrderLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "UNDERSTOOD",
+                "questionUnderstanding": {
+                    "analysisGrain": "order",
+                    "rankingObjective": {},
+                    "requestedMeasures": [],
+                    "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
+                    "timeWindowDays": 7,
+                },
+            }
+
+    question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
+    pack = trade_refund_goods_pack(include_missing_goods_metric=True)
+    plan, requests, _ = QueryGraphPlanner(DetailSubOrderLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert not requests
+    goods = next(intent for intent in plan.intents if intent.preferred_table == "dwm_goods_detail_df")
+    assert goods.answer_mode == AnswerMode.DETAIL
+    assert not goods.metric_name
+    assert "spu_status_code" not in goods.required_evidence
     assert QueryGraphValidator().validate(question, plan, pack).valid
+
+
+def test_topn_anchor_uses_entity_expansion_for_unproduced_refund_key():
+    class TopSpuLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "UNDERSTOOD",
+                "questionUnderstanding": {
+                    "analysisGrain": "product",
+                    "rankingObjective": {
+                        "metricRef": "order_detail_cnt",
+                        "ownerTable": "dwm_trade_order_detail_di",
+                        "sourcePhrase": "下单最多的前 5 个 SPU",
+                        "groupByColumn": "spu_id",
+                        "limit": 5,
+                        "order": "desc",
+                    },
+                    "requestedMeasures": [
+                        {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款量"},
+                        {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
+                    ],
+                    "timeWindowDays": 7,
+                },
+            }
+
+    question = "最近 7 天下单最多的前 5 个 SPU，同时看它们的退款量和退款金额。"
+    pack = trade_refund_goods_pack()
+    plan, requests, _ = QueryGraphPlanner(TopSpuLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert not requests
+    anchor = next(intent for intent in plan.intents if intent.plan_task_id == "anchor_order")
+    assert "sub_order_id" not in anchor.output_keys
+    assert any(intent.plan_task_id == "order_entity_expand" for intent in plan.intents)
+    assert any(dep.anchor_task_id == "order_entity_expand" and dep.dependent_task_id.startswith("refund_lookup") for dep in plan.dependencies)
+    assert QueryGraphValidator().validate(question, plan, pack).valid
+
+
+def test_need_more_planner_fails_closed_instead_of_semantic_entity_chain():
+    class NeedMoreLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "NEED_MORE_KNOWLEDGE",
+                "reason": "need more despite loaded semantic assets",
+                "knowledgeRequests": [{"type": "TABLE", "query": "refund goods"}],
+            }
+
+    question = "最近 7 天有退款的订单，关联看一下对应商品发布时间。"
+    pack = trade_refund_goods_pack()
+    plan, requests, _ = QueryGraphPlanner(NeedMoreLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert requests
+    assert not plan.intents
+    assert any("planner.need_more_fail_closed" in item for item in plan.agent_trace)
+    assert not any("semantic_entity_chain_fallback" in item for item in plan.agent_trace)
+    validation = QueryGraphValidator().validate(question, plan, pack)
+    assert not validation.valid
+    assert any(gap.code == "MISSING_QUERY_GRAPH" for gap in validation.gaps)
+
+
+def test_detail_chain_contract_does_not_require_dependent_product_key_when_goods_node_covers_it():
+    class DetailSubOrderLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "UNDERSTOOD",
+                "questionUnderstanding": {
+                    "analysisGrain": "order",
+                    "analysisIntent": "none",
+                    "requiresExplanation": False,
+                    "requiredEvidenceIntents": [],
+                    "rankingObjective": {},
+                    "requestedMeasures": [],
+                    "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
+                    "timeWindowDays": 7,
+                },
+            }
+
+    question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
+    pack = trade_refund_goods_pack()
+    plan, requests, _ = QueryGraphPlanner(DetailSubOrderLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert not requests
+    refund_contract = next(contract for contract in plan.evidence_contracts if contract["taskId"] == "refund_lookup")
+    assert ["spu_id", "spu_name"] not in refund_contract.get("columnsAnyOf", [])
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="anchor_order",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_order_detail_di"],
+                    rows=[
+                        {
+                            "seller_id": "100",
+                            "sub_order_id": "sub_order_id_100",
+                            "order_id": "order_id_100",
+                            "spu_id": "spu_id_100",
+                            "spu_name": "商品A",
+                            "discount_rel_id": "",
+                            "pt": "20260620",
+                            "pay_amt": 100,
+                        }
+                    ],
+                ),
+            ),
+            AgentTaskResult(
+                task_id="refund_lookup",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_refund_detail_di"],
+                    rows=[{"seller_id": "100", "sub_order_id": "sub_order_id_100", "order_id": "order_id_100", "refund_bill_cnt": 1}],
+                ),
+            ),
+            AgentTaskResult(
+                task_id="goods_lookup",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_goods_detail_df"],
+                    rows=[
+                        {
+                            "seller_id": "100",
+                            "spu_id": "spu_id_100",
+                            "spu_name": "商品A",
+                            "spu_apply_create_time": "2026-06-01 10:00:00",
+                            "spu_status_name": "已发布",
+                            "pt": "20260620",
+                        }
+                    ],
+                ),
+            ),
+        ],
+        merged_query_bundle=QueryBundle(
+            tables=["dwm_trade_order_detail_di", "dwm_trade_refund_detail_di", "dwm_goods_detail_df"],
+            rows=[
+                {"seller_id": "100", "sub_order_id": "sub_order_id_100", "spu_id": "spu_id_100", "spu_apply_create_time": "2026-06-01 10:00:00"},
+                {"seller_id": "100", "sub_order_id": "sub_order_id_100", "refund_bill_cnt": 1},
+            ],
+        ),
+    )
+    verified = EvidenceVerifier().verify(question, plan, run)
+    assert verified.passed
+    assert not any(gap.code == "MISSING_ENTITY_KEY" for gap in verified.gaps)
+
+
+def test_detail_lookup_metric_resolution_does_not_bind_missing_formula_columns():
+    class DetailSubOrderWithGoodsMetricLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "UNDERSTOOD",
+                "questionUnderstanding": {
+                    "analysisGrain": "order",
+                    "analysisIntent": "none",
+                    "requiresExplanation": False,
+                    "requiredEvidenceIntents": [],
+                    "rankingObjective": {},
+                    "requestedMeasures": [
+                        {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单"},
+                        {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款"},
+                        {"metricRef": "goods_online_detail_cnt", "ownerTable": "dwm_goods_detail_df", "sourcePhrase": "商品发布信息"},
+                    ],
+                    "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
+                    "timeWindowDays": 7,
+                },
+            }
+
+    question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
+    pack = trade_refund_goods_pack(include_missing_goods_metric=True)
+    plan, requests, _ = QueryGraphPlanner(DetailSubOrderWithGoodsMetricLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert not requests
+    goods = next(intent for intent in plan.intents if intent.plan_task_id == "goods_lookup")
+    assert goods.answer_mode == AnswerMode.DETAIL
+    assert goods.metric_name == ""
+    assert goods.metric_column == ""
+    assert goods.metric_formula == ""
+    assert "spu_apply_create_time" in goods.required_evidence
+    assert QueryGraphValidator().validate(question, plan, pack).valid
+
+
+def test_relationship_chain_contract_does_not_require_unrequested_coupon_key():
+    question = "最近 7 天有退款的订单，关联看一下对应商品发布时间。"
+    pack = trade_refund_goods_pack()
+    plan = compile_semantic_entity_chain_graph(question, pack)
+    order_contract = next(contract for contract in plan.evidence_contracts if contract["taskId"] == "order_lookup")
+    assert ["coupon_id", "discount_rel_id"] not in order_contract.get("columnsAnyOf", [])
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="anchor_refund",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_refund_detail_di"],
+                    rows=[
+                        {
+                            "seller_id": "100",
+                            "sub_order_id": "sub_order_id_100",
+                            "order_id": "order_id_100",
+                            "spu_name": "商品A",
+                            "refund_id": "refund_id_100",
+                            "pt": "20260620",
+                            "refund_status_name": "退款成功",
+                            "refund_create_time": "2026-06-20 10:00:00",
+                            "pay_amt": 10,
+                        }
+                    ],
+                ),
+            ),
+            AgentTaskResult(
+                task_id="order_lookup",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_order_detail_di"],
+                    rows=[
+                        {
+                            "seller_id": "100",
+                            "sub_order_id": "sub_order_id_100",
+                            "order_id": "order_id_100",
+                            "spu_id": "spu_id_100",
+                            "spu_name": "商品A",
+                            "pt": "20260620",
+                            "pay_amt": 100,
+                            "order_detail_cnt": 1,
+                        }
+                    ],
+                ),
+            ),
+            AgentTaskResult(
+                task_id="goods_lookup",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_goods_detail_df"],
+                    rows=[
+                        {
+                            "seller_id": "100",
+                            "spu_id": "spu_id_100",
+                            "spu_name": "商品A",
+                            "spu_apply_create_time": "2026-06-01 10:00:00",
+                            "spu_status_name": "已发布",
+                            "pt": "20260620",
+                        }
+                    ],
+                ),
+            ),
+        ],
+        merged_query_bundle=QueryBundle(
+            tables=["dwm_trade_refund_detail_di", "dwm_trade_order_detail_di", "dwm_goods_detail_df"],
+            rows=[
+                {"seller_id": "100", "sub_order_id": "sub_order_id_100", "refund_id": "refund_id_100", "order_detail_cnt": 1},
+                {"seller_id": "100", "spu_id": "spu_id_100", "spu_apply_create_time": "2026-06-01 10:00:00"},
+            ],
+        ),
+    )
+    verified = EvidenceVerifier().verify(question, plan, run)
+    assert verified.passed
+    assert not any(gap.code == "MISSING_ENTITY_KEY" for gap in verified.gaps)
 
 
 def test_planner_semantic_repair_adds_missing_requested_domain_dependencies():
@@ -1261,6 +2967,32 @@ def test_tool_failure_registry_blocks_repeated_identical_failures():
     assert "repeated identical failure" in blocked.reason
 
 
+def test_entity_transfer_does_not_mix_order_id_into_sub_order_id_dependency():
+    dep = PlanDependency(
+        anchor_task_id="order_detail",
+        dependent_task_id="refund_lookup",
+        join_key="seller_id+sub_order_id",
+        anchor_column="seller_id+sub_order_id",
+        dependent_column="seller_id+sub_order_id",
+    )
+    parent_result = AgentTaskResult(
+        task_id="order_detail",
+        success=True,
+        query_bundle=QueryBundle(rows=[]),
+        entity_set=EntitySet(
+            task_id="order_detail",
+            join_key="order_id",
+            values=["order_id_100"],
+            column_values={"order_id": ["order_id_100"], "sub_order_id": ["sub_order_id_100"]},
+        ),
+    )
+
+    values = multi_entity_transfer_values(dep, [], parent_result, {"seller_id", "sub_order_id"}, 200)
+
+    assert values == {"sub_order_id": ["sub_order_id_100"]}
+    assert "order_id" not in values
+
+
 def test_tool_call_executor_pairs_parallel_results_and_isolates_failures():
     settings = get_settings()
     registry = ToolFailureRegistry()
@@ -1306,6 +3038,209 @@ def test_planner_overrides_need_more_when_semantic_catalog_is_sufficient():
     assert any("planner.need_more_overridden_by_semantic_catalog" in item for item in plan.agent_trace)
 
 
+def test_planner_falls_back_to_semantic_metric_when_llm_returns_empty_understanding():
+    class EmptyUnderstandingLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {}
+
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近7天订单量呢"
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE],
+    )
+    plan, requests, _ = QueryGraphPlanner(EmptyUnderstandingLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+    assert not requests
+    assert plan.intents
+    anchor = plan.intents[0]
+    assert anchor.answer_mode == AnswerMode.METRIC
+    assert anchor.preferred_table == "dwm_trade_order_detail_di"
+    assert anchor.metric_name == "order_detail_cnt"
+    assert anchor.group_by_column in {"seller_id", "merchant_id"}
+    assert any("planner=semantic_metric_fallback" == item for item in plan.agent_trace)
+
+
+def test_semantic_metric_fallback_skips_multi_domain_detail_question():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近30天退款状态为处理中或异常的订单，关联看商品发布时间和订单金额。"
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+
+    plan = compile_semantic_metric_fallback_graph(question, pack)
+
+    assert not plan.intents
+    assert "planner.semantic_metric_fallback.skipped_multi_domain_or_detail" in plan.agent_trace
+    assert any("SEMANTIC_METRIC_FALLBACK_UNSAFE_SCOPE" in item for item in plan.compiler_trace)
+
+
+def test_planner_timeout_can_fallback_to_semantic_entity_id_graph():
+    class TimeoutLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 20 seconds"
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {}
+
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。"
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+
+    plan, requests, reason = QueryGraphPlanner(TimeoutLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
+
+    assert not requests
+    assert "PLANNER_LLM_TIMEOUT" in reason
+    assert plan.intents
+    assert plan.intents[0].preferred_table == "dwm_trade_order_detail_di"
+    assert plan.intents[0].filter_column == "order_id"
+    assert plan.intents[0].filter_value == "order_id_100"
+    tables = {intent.preferred_table for intent in plan.intents}
+    assert any("refund" in table for table in tables)
+    assert any("goods" in table for table in tables)
+    assert "planner.entity_id_semantic_fallback_after_llm_failure" in plan.agent_trace
+
+
+def test_asset_pack_defers_recalled_profile_table_until_metric_understanding_requests_it():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近30天GMV和退款金额走势是否正常？"
+    keywords = KeywordExtractService().extract(question)
+    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+        question,
+        keywords,
+        [],
+        "",
+        "100",
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+
+    builder = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings))
+    pack = builder.compact(
+        question,
+        recall,
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+
+    assert "ads_merchant_profile" not in pack.known_tables()
+
+    traces = builder.expand_for_question_understanding(
+        pack,
+        {
+            "rankingObjective": {
+                "metricRef": "order_gmv_amt_1d",
+                "ownerTable": "ads_merchant_profile",
+                "sourcePhrase": "GMV",
+            },
+            "requestedMeasures": [
+                {"metricRef": "refund_amt_1d", "ownerTable": "ads_merchant_profile", "sourcePhrase": "退款金额"},
+            ],
+        },
+    )
+
+    assert any("metric_request_table:order_gmv_amt_1d->ads_merchant_profile" in item for item in traces)
+    assert "ads_merchant_profile" in pack.known_tables()
+    assert any(metric.table == "ads_merchant_profile" and metric.key == "order_gmv_amt_1d" for metric in pack.metrics)
+
+
+def test_asset_pack_expands_profile_from_recalled_metric_phrase_when_llm_metric_ref_is_wrong():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近7天优惠金额、优惠订单量和 GMV 分别是多少？"
+    keywords = KeywordExtractService().extract(question)
+    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+        question,
+        keywords,
+        [],
+        "",
+        "100",
+        [QuestionCategory.TRADE, QuestionCategory.COUPON],
+    )
+
+    builder = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings))
+    pack = builder.compact(
+        question,
+        recall,
+        [QuestionCategory.TRADE, QuestionCategory.COUPON],
+    )
+
+    assert "ads_merchant_profile" not in pack.known_tables()
+
+    understanding = {
+        "analysisGrain": "merchant",
+        "rankingObjective": {
+            "metricRef": "pay_amt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "GMV",
+            "groupByColumn": "seller_id",
+        },
+        "requestedMeasures": [
+            {"metricRef": "discount_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "优惠金额"},
+        ],
+        "timeWindowDays": 7,
+    }
+    traces = builder.expand_for_question_understanding(pack, understanding)
+    assert any("metric_request_table:pay_amt->ads_merchant_profile" in item for item in traces)
+    assert "ads_merchant_profile" in pack.known_tables()
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    assert plan.intents
+    assert plan.intents[0].preferred_table == "ads_merchant_profile"
+    assert plan.intents[0].metric_name == "order_gmv_amt_1d"
+    assert plan.intents[0].metric_resolution.get("resolutionSource") == "semantic_recall_evidence"
+
+
+def test_planner_timeout_can_fallback_to_multi_metric_trend_graph():
+    class TimeoutLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 20 seconds"
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {}
+
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近30天GMV和退款金额走势是否正常？"
+    keywords = KeywordExtractService().extract(question)
+    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+        question,
+        keywords,
+        [],
+        "",
+        "100",
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        question,
+        recall,
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+
+    plan, requests, reason = QueryGraphPlanner(TimeoutLlm()).plan(question, [], "", recall, pack, [], [])
+
+    assert not requests
+    assert "PLANNER_LLM_TIMEOUT" in reason
+    assert plan.intents
+    assert any(intent.group_by_column == "pt" for intent in plan.intents)
+    assert len({intent.metric_name for intent in plan.intents if intent.metric_name}) >= 2
+    assert "planner.multi_metric_trend_fallback_after_llm_failure" in plan.agent_trace
+
+
 def test_structured_formula_uses_semantic_metric_formula_not_sum_first_column():
     settings = get_settings()
     worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
@@ -1330,6 +3265,203 @@ def test_structured_formula_uses_semantic_metric_formula_not_sum_first_column():
     assert SqlValidationService().validate(sql, pack).valid
 
 
+def test_simple_metric_node_uses_structured_fast_path_without_llm_sql():
+    settings = get_settings()
+    llm = FakeLlm()
+    worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "pt", "sub_order_id"],
+            )
+        ]
+    )
+    intent = QuestionIntent(
+        question="最近7天订单量呢",
+        intent_type="VALID",
+        answer_mode=AnswerMode.METRIC,
+        plan_task_id="anchor_order",
+        task_role=TaskRole.ANCHOR,
+        preferred_table="dwm_trade_order_detail_di",
+        sql_strategy="llm_plan_bound_first",
+        group_by_column="seller_id",
+        metric_column="sub_order_id",
+        metric_name="order_detail_cnt",
+        metric_formula="COUNT(DISTINCT `sub_order_id`)",
+        output_keys=["seller_id"],
+        required_evidence=["seller_id", "sub_order_id"],
+        days=7,
+        limit=1,
+    )
+    sql = worker._draft_sql(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+    decision = worker._last_sql_draft_decisions[intent.plan_task_id]
+    assert llm.calls == 0
+    assert decision.source == "structured_fast_path"
+    assert "COUNT(DISTINCT `sub_order_id`) AS `order_detail_cnt`" in sql
+    assert "`seller_id` = '100'" in sql
+    assert "`pt` >=" in sql
+    assert SqlValidationService().validate(sql, pack).valid
+
+
+def test_topn_anchor_uses_structured_fast_path_without_llm_sql():
+    settings = get_settings()
+    llm = FakeLlm()
+    worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "pt", "spu_id", "spu_name", "sub_order_id"],
+            )
+        ]
+    )
+    intent = QuestionIntent(
+        question="最近7天下单最多的前3个SPU",
+        intent_type="VALID",
+        answer_mode=AnswerMode.TOPN,
+        plan_task_id="anchor_order",
+        task_role=TaskRole.ANCHOR,
+        preferred_table="dwm_trade_order_detail_di",
+        sql_strategy="llm_plan_bound_first",
+        group_by_column="spu_id",
+        metric_column="sub_order_id",
+        metric_name="order_detail_cnt",
+        metric_formula="COUNT(DISTINCT `sub_order_id`)",
+        output_keys=["seller_id", "spu_id", "spu_name"],
+        required_evidence=["seller_id", "spu_id", "sub_order_id"],
+        days=7,
+        limit=3,
+    )
+    sql = worker._draft_sql(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+    decision = worker._last_sql_draft_decisions[intent.plan_task_id]
+    assert llm.calls == 0
+    assert decision.source == "structured_fast_path"
+    assert "GROUP BY" in sql
+    assert "COUNT(DISTINCT `sub_order_id`) AS `order_detail_cnt`" in sql
+
+
+def test_trend_objective_compiles_to_group_agg():
+    class TrendUnderstandingLlm:
+        configured = True
+        last_error = ""
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "status": "UNDERSTOOD",
+                "questionUnderstanding": {
+                    "analysisGrain": "day",
+                    "analysisIntent": "trend_check",
+                    "requiresExplanation": True,
+                    "requiredEvidenceIntents": [
+                        {
+                            "semanticLabel": "trend_context",
+                            "reason": "需要按天查看趋势",
+                            "requiredLevel": "required",
+                            "suggestedMetricRefs": ["order_detail_cnt"],
+                            "suggestedDomains": ["trade"],
+                        }
+                    ],
+                    "rankingObjective": {
+                        "metricRef": "order_detail_cnt",
+                        "sourcePhrase": "订单量走势",
+                        "ownerTable": "dwm_trade_order_detail_di",
+                        "objectiveType": "trend_anchor",
+                        "groupByColumn": "pt",
+                        "order": "desc",
+                        "limit": 30,
+                    },
+                    "requestedMeasures": [],
+                    "filters": [],
+                    "timeWindowDays": 30,
+                },
+            }
+
+    plan, requests, _ = QueryGraphPlanner(TrendUnderstandingLlm()).plan(
+        "最近30天订单量走势是否正常？",
+        [],
+        "",
+        recall_bundle_empty(),
+        trade_refund_goods_pack(),
+        [],
+        [],
+    )
+    assert not requests
+    assert plan.intents
+    assert plan.intents[0].answer_mode == AnswerMode.GROUP_AGG
+    assert plan.intents[0].group_by_column == "pt"
+
+
+def test_formula_reconciliation_prunes_missing_or_branch_without_hardcoding():
+    formula = "SUM(CASE WHEN spu_status_code = 1 OR spu_status_name = '上架' THEN 1 ELSE 0 END)"
+    reconciled = reconcile_metric_formula_for_schema(
+        formula,
+        ["spu_status_code", "spu_status_name"],
+        {"spu_status_name"},
+        "goods_online_detail_cnt",
+        "dwm_goods_detail_df",
+    )
+    assert reconciled.formula
+    assert "spu_status_name" in reconciled.formula
+    assert "spu_status_code" not in reconciled.formula
+    assert reconciled.rewritten
+    assert reconciled.missing_source_columns == ["spu_status_code"]
+    assert compile_metric_formula(formula, {"spu_status_name"}) == reconciled.formula
+
+
+def test_goods_online_metric_uses_live_schema_reconciled_formula_for_aggregate():
+    understanding = {
+        "analysisGrain": "product",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "goods_online_detail_cnt",
+            "ownerTable": "dwm_goods_detail_df",
+            "sourcePhrase": "发布成功商品数",
+            "groupByColumn": "spu_name",
+            "limit": 10,
+        },
+        "requestedMeasures": [],
+        "filters": [],
+        "timeWindowDays": 30,
+    }
+    pack = trade_refund_goods_pack(include_missing_goods_metric=True)
+    plan = QuestionUnderstandingCompiler().compile("最近30天发布成功商品数最高的商品", understanding, pack)
+    assert plan.intents
+    intent = plan.intents[0]
+    assert intent.metric_name == "goods_online_detail_cnt"
+    assert intent.metric_column == "spu_status_name"
+    assert "spu_status_code" not in intent.metric_formula
+    assert "spu_status_name" in intent.metric_formula
+    assert intent.metric_resolution["droppedSourceColumns"] == ["spu_status_code"]
+    assert QueryGraphValidator().validate("最近30天发布成功商品数最高的商品", plan, pack).valid
+
+
+def test_structured_sql_uses_reconciled_goods_formula():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
+    pack = trade_refund_goods_pack(include_missing_goods_metric=True)
+    intent = QuestionIntent(
+        question="发布成功商品数",
+        intent_type="VALID",
+        answer_mode="GROUP_AGG",
+        plan_task_id="goods_online",
+        preferred_table="dwm_goods_detail_df",
+        sql_strategy="structured_first",
+        group_by_column="spu_name",
+        metric_column="spu_status_name",
+        metric_name="goods_online_detail_cnt",
+        metric_formula="SUM(CASE WHEN spu_status_name = '上架' THEN 1 ELSE 0 END)",
+        output_keys=["seller_id", "spu_name"],
+        required_evidence=["spu_name", "spu_status_name"],
+    )
+    sql = worker._draft_sql(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+    assert "spu_status_name" in sql
+    assert "spu_status_code" not in sql
+    assert SqlValidationService().validate(sql, pack).valid
+
+
 def test_node_agent_llm_writes_plan_bound_sql_from_contract():
     settings = get_settings()
     worker = NodeWorkerExecutor(GoodPlanBoundSqlLlm(), FakeDoris(), SqlValidationService(), settings)
@@ -1342,6 +3474,7 @@ def test_node_agent_llm_writes_plan_bound_sql_from_contract():
                 answer_mode="TOPN",
                 plan_task_id="anchor_gmv",
                 preferred_table="ads_merchant_profile",
+                sql_strategy="llm_first_debug",
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
@@ -1361,6 +3494,102 @@ def test_node_agent_llm_writes_plan_bound_sql_from_contract():
     assert result.node_plan_critiques[0].valid
 
 
+def test_detail_node_uses_structured_fast_path_before_llm():
+    settings = get_settings()
+    llm = FakeLlm()
+    worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
+    pack = trade_refund_goods_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="查询子订单明细",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="anchor_order",
+                preferred_table="dwm_trade_order_detail_di",
+                filter_column="sub_order_id",
+                filter_value="sub_order_id_100",
+                output_keys=["seller_id", "sub_order_id", "order_id", "spu_id", "spu_name", "pt"],
+                required_evidence=["seller_id", "sub_order_id", "order_id", "spu_id", "spu_name", "pt"],
+                days=7,
+                limit=20,
+            )
+        ]
+    )
+    result = worker.execute_plan("100", plan, pack, "", "查询子订单明细")
+    assert result.task_results[0].success
+    assert llm.calls == 0
+    assert result.sql_draft_decisions[0].source == "structured_fast_path"
+    assert any(item.tool_name == "draft_structured_sql_fast_path" for item in result.node_tool_traces)
+
+
+def test_dependent_structured_sql_filters_only_relationship_keys():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
+    pack = trade_refund_goods_pack()
+    parent = AgentTaskResult(
+        task_id="anchor_order",
+        success=True,
+        query_bundle=QueryBundle(
+            tables=["dwm_trade_order_detail_di"],
+            rows=[
+                {
+                    "seller_id": "100",
+                    "sub_order_id": "sub_order_id_100",
+                    "order_id": "order_id_100",
+                    "spu_id": "spu_id_100",
+                    "spu_name": "order_spu_name",
+                    "pt": "2026-06-19",
+                }
+            ],
+        ),
+        entity_set=EntitySet(
+            task_id="anchor_order",
+            join_key="sub_order_id",
+            values=["sub_order_id_100"],
+            column_values={
+                "sub_order_id": ["sub_order_id_100"],
+                "order_id": ["order_id_100"],
+                "spu_name": ["order_spu_name"],
+                "pt": ["2026-06-19"],
+            },
+        ),
+    )
+    intent = QuestionIntent(
+        question="查退款",
+        intent_type="VALID",
+        answer_mode=AnswerMode.GROUP_AGG,
+        plan_task_id="refund_lookup",
+        task_role=TaskRole.DEPENDENT,
+        preferred_table="dwm_trade_refund_detail_di",
+        group_by_column="sub_order_id",
+        metric_column="refund_id",
+        metric_name="refund_bill_cnt",
+        output_keys=["seller_id", "sub_order_id", "order_id"],
+        required_evidence=["sub_order_id", "order_id", "refund_id", "refund_status_name", "spu_name", "pt"],
+        depends_on_task_ids=["anchor_order"],
+        days=7,
+    )
+    plan = QueryPlan(
+        intents=[intent],
+        dependencies=[
+            PlanDependency(
+                anchor_task_id="anchor_order",
+                dependent_task_id="refund_lookup",
+                join_key="sub_order_id",
+                anchor_column="seller_id+sub_order_id",
+                dependent_column="seller_id+sub_order_id",
+            )
+        ],
+    )
+    context = worker._node_context("refund_lookup", intent, {"anchor_order": parent}, plan, "100", "查退款", pack)
+    sql = worker._draft_structured_sql(intent, pack, context)
+    assert "`sub_order_id` IN ('sub_order_id_100')" in sql
+    assert "`spu_name` IN" not in sql
+    assert "`order_id` IN" not in sql
+    assert "`pt` IN" not in sql
+
+
 def test_doris_mem_error_uses_resource_safe_fallback_without_llm_repair():
     settings = get_settings()
     settings.agent_sql_repair_rounds = 2
@@ -1375,6 +3604,7 @@ def test_doris_mem_error_uses_resource_safe_fallback_without_llm_repair():
                 answer_mode="TOPN",
                 plan_task_id="anchor_gmv",
                 preferred_table="ads_merchant_profile",
+                sql_strategy="llm_first_debug",
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
@@ -1407,6 +3637,7 @@ def test_doris_mem_error_does_not_call_llm_repair_when_no_safe_fallback():
                 answer_mode="TOPN",
                 plan_task_id="anchor_gmv",
                 preferred_table="ads_merchant_profile",
+                sql_strategy="llm_first_debug",
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
@@ -1437,6 +3668,7 @@ def test_node_agent_rejects_contract_external_field_and_uses_structured_fallback
                 answer_mode="TOPN",
                 plan_task_id="anchor_gmv",
                 preferred_table="ads_merchant_profile",
+                sql_strategy="llm_first_debug",
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
@@ -1478,6 +3710,7 @@ def test_node_agent_missing_output_key_uses_structured_fallback_without_llm_repa
                 answer_mode="TOPN",
                 plan_task_id="anchor_order",
                 preferred_table="dwm_trade_order_detail_di",
+                sql_strategy="llm_first_debug",
                 group_by_column="spu_id",
                 metric_column="pay_amt",
                 metric_name="order_gmv",
@@ -1510,6 +3743,7 @@ def test_node_agent_invalid_partition_filter_uses_structured_fallback_without_ll
                 answer_mode="TOPN",
                 plan_task_id="anchor_gmv",
                 preferred_table="ads_merchant_profile",
+                sql_strategy="llm_first_debug",
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
@@ -1526,6 +3760,107 @@ def test_node_agent_invalid_partition_filter_uses_structured_fallback_without_ll
     assert any(item.tool_name == "draft_structured_sql_fallback" for item in result.node_tool_traces)
     assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
     assert llm.calls == 1
+
+
+def test_entity_dimension_topn_structured_sql_filters_blank_group_key():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_cs_ticket_detail_di",
+                columns=["seller_id", "pt", "spu_id", "spu_name", "ticket_id"],
+            )
+        ]
+    )
+    intent = QuestionIntent(
+        question="客服工单量最高商品",
+        intent_type="VALID",
+        answer_mode=AnswerMode.TOPN,
+        plan_task_id="anchor_ticket",
+        task_role=TaskRole.ANCHOR,
+        preferred_table="dwm_cs_ticket_detail_di",
+        sql_strategy="structured_first",
+        group_by_column="spu_id",
+        metric_column="ticket_id",
+        metric_name="ticket_cnt",
+        metric_formula="COUNT(DISTINCT `ticket_id`)",
+        output_keys=["seller_id", "spu_id", "spu_name"],
+        days=60,
+        limit=10,
+    )
+
+    sql = worker._draft_sql(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+
+    assert "`spu_id` IS NOT NULL" in sql
+    assert "`spu_id` != ''" in sql
+    assert "GROUP BY `seller_id`, `spu_id`, `spu_name`" in sql
+
+
+def test_node_agent_missing_entity_key_filter_uses_structured_fallback():
+    settings = get_settings()
+    settings.agent_sql_repair_rounds = 1
+    llm = MissingEntityKeyFilterSqlLlm()
+    worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_cs_ticket_detail_di",
+                columns=["seller_id", "pt", "spu_id", "spu_name", "ticket_id"],
+            )
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="最近60天客服工单量最高的前10个商品",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.TOPN,
+                plan_task_id="anchor_ticket",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_cs_ticket_detail_di",
+                sql_strategy="llm_first_debug",
+                group_by_column="spu_id",
+                metric_column="ticket_id",
+                metric_name="ticket_cnt",
+                metric_formula="COUNT(DISTINCT `ticket_id`)",
+                output_keys=["seller_id", "spu_id", "spu_name"],
+                required_evidence=["seller_id", "spu_id", "spu_name", "ticket_id"],
+                days=60,
+                limit=10,
+            )
+        ]
+    )
+
+    result = worker.execute_plan("100", plan, pack, "", "最近60天客服工单量最高的前10个商品")
+
+    assert result.task_results[0].success
+    assert result.sql_repairs[0].error_code == "MISSING_ENTITY_KEY_FILTER"
+    assert "`spu_id` IS NOT NULL" in result.task_results[0].query_bundle.sql
+    assert "`spu_id` != ''" in result.task_results[0].query_bundle.sql
+    assert any(item.tool_name == "draft_structured_sql_fallback" for item in result.node_tool_traces)
+    assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
+    assert llm.calls == 1
+
+
+def test_entity_set_from_rows_ignores_blank_entity_values():
+    intent = QuestionIntent(
+        answer_mode=AnswerMode.TOPN,
+        plan_task_id="anchor_ticket",
+        group_by_column="spu_id",
+    )
+    rows = [
+        {"spu_id": None, "spu_name": None, "ticket_id": "ticket_1"},
+        {"spu_id": "", "spu_name": "", "ticket_id": "ticket_2"},
+        {"spu_id": "   ", "spu_name": "   ", "ticket_id": "ticket_3"},
+        {"spu_id": "spu_id_001", "spu_name": "商品A", "ticket_id": "ticket_4"},
+    ]
+
+    entity_set = entity_set_from_rows("anchor_ticket", intent, rows, 200)
+
+    assert entity_set.values == ["spu_id_001"]
+    assert entity_set.column_values["spu_id"] == ["spu_id_001"]
+    assert entity_set.column_values["spu_name"] == ["商品A"]
 
 
 def test_node_worker_merges_same_table_metric_nodes_before_execution():
@@ -1593,6 +3928,9 @@ def test_node_worker_merges_same_table_metric_nodes_before_execution():
     assert "COUNT(*) AS `order_cnt`" not in sql
     assert "LIMIT 5" in sql
     assert any("same_table_metric_merge" in item for item in plan.agent_trace)
+    package = answer_data_package("最近30天GMV最高的前5天，同时看退款金额和工单量", plan, result)
+    disclosed = {item.get("metricKey") for item in package["metricDisclosures"]}
+    assert {"order_gmv_amt_1d", "refund_amt_1d", "cs_ticket_cnt_1d"} <= disclosed
 
 
 def test_node_worker_same_table_merge_keeps_topn_anchor_when_not_first():
@@ -1761,6 +4099,7 @@ def test_node_agent_empty_llm_sql_falls_back_to_structured_sql():
         answer_mode="GROUP_AGG",
         plan_task_id="gmv_trend",
         preferred_table="ads_merchant_profile",
+        sql_strategy="llm_first_debug",
         group_by_column="pt",
         metric_column="order_gmv_amt_1d",
         metric_name="order_gmv_amt_1d",
@@ -1809,10 +4148,10 @@ def test_query_graph_enrichment_removes_self_loop_dependencies_and_syncs_intents
     dependency_pairs = {(dep.anchor_task_id, dep.dependent_task_id) for dep in plan.dependencies}
     assert ("anchor_ticket", "ticket_entity_expand") in dependency_pairs
     assert ("ticket_entity_expand", "refund_lookup") in dependency_pairs
-    assert ("anchor_ticket", "repay_lookup") in dependency_pairs
+    assert ("ticket_entity_expand", "repay_lookup") in dependency_pairs
     depends_by_task = {intent.plan_task_id: intent.depends_on_task_ids for intent in plan.intents}
     assert depends_by_task["refund_lookup"] == ["ticket_entity_expand"]
-    assert depends_by_task["repay_lookup"] == ["anchor_ticket"]
+    assert depends_by_task["repay_lookup"] == ["ticket_entity_expand"]
 
 
 def test_query_graph_validator_rejects_dependency_key_missing_from_node_schema():
@@ -1868,6 +4207,69 @@ def test_query_graph_validator_rejects_dependency_key_missing_from_node_schema()
     result = QueryGraphValidator().validate("供应链退款", plan, pack)
     assert any(gap.code == "DEPENDENCY_KEY_NOT_IN_SCHEMA" for gap in result.gaps)
     assert result.repairable
+
+
+def test_relationship_graph_repair_inserts_bridge_for_aggregate_parent_missing_key():
+    question = "最近45天供应链入库量前10的商品，后续下单表现和退款表现怎么样。"
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "spu_id", "spu_name", "sub_order_id", "pt"]),
+            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "sub_order_id", "refund_id", "pt"]),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            )
+        ],
+    )
+    broken = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="order_lookup",
+                task_role="DEPENDENT",
+                preferred_table="dwm_trade_order_detail_di",
+                group_by_column="spu_id",
+                output_keys=["seller_id", "spu_id", "spu_name"],
+                depends_on_task_ids=["anchor_scm"],
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="refund_lookup",
+                task_role="DEPENDENT",
+                preferred_table="dwm_trade_refund_detail_di",
+                group_by_column="sub_order_id",
+                output_keys=["seller_id", "sub_order_id"],
+                depends_on_task_ids=["order_lookup"],
+            ),
+        ],
+        dependencies=[
+            PlanDependency(
+                anchor_task_id="order_lookup",
+                dependent_task_id="refund_lookup",
+                join_key="sub_order_id",
+                anchor_column="seller_id+sub_order_id",
+                dependent_column="seller_id+sub_order_id",
+            )
+        ],
+    )
+    repaired = repair_dependency_key_production_gaps(question, broken, pack, [])
+    bridge = next(intent for intent in repaired.intents if intent.answer_mode == AnswerMode.DETAIL)
+    assert bridge.preferred_table == "dwm_trade_order_detail_di"
+    assert "sub_order_id" in bridge.output_keys
+    assert any(dep.anchor_task_id == "order_lookup" and dep.dependent_task_id == bridge.plan_task_id for dep in repaired.dependencies)
+    assert any(dep.anchor_task_id == bridge.plan_task_id and dep.dependent_task_id == "refund_lookup" for dep in repaired.dependencies)
+    assert QueryGraphValidator().validate(question, repaired, pack).valid
 
 
 def test_query_graph_validator_rejects_dependency_cycles():
@@ -2007,6 +4409,70 @@ def test_lead_policy_does_not_retry_plan_after_provider_timeout():
     decision = V2AgentPolicy(get_settings()).decide(state)
     assert decision.selected_action == "validate_graph"
     assert "plan_graph" not in decision.available_actions
+    assert decision.budget_exhausted
+
+
+def test_lead_policy_reunderstands_contract_mismatch_from_validator():
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "skills_loaded": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": True,
+        "query_graph_validated": True,
+        "react_round": 5,
+        "query_graph_plan_attempts": 0,
+        "query_graph_retrieve_count": 0,
+        "query_graph_repair_attempts": 0,
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="有优惠券的订单有退款占多少",
+                    intent_type="VALID",
+                    answer_mode="GROUP_AGG",
+                    plan_task_id="anchor_order",
+                    preferred_table="dwm_trade_order_detail_di",
+                )
+            ]
+        ),
+        "planner_reflection": PlannerReflectionResult(passed=True),
+        "query_graph_validation_result": GraphValidationResult(
+            valid=False,
+            gaps=[GraphValidationGap(code="SCOPE_NOT_NARROWING", evidence="dwm_trade_order_detail_di")],
+            repairable=True,
+        ),
+    }
+
+    decision = V2AgentPolicy(get_settings()).decide(state)
+    assert decision.selected_action == "plan_graph"
+    assert "repair_graph" not in decision.available_actions
+
+
+def test_lead_policy_verifies_evidence_even_when_main_budget_exhausted():
+    settings = get_settings()
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "react_round": settings.agent_main_rounds,
+        "evidence_graph_verified": False,
+        "agent_run_result": AgentRunResult(
+            task_results=[
+                AgentTaskResult(
+                    task_id="anchor_order",
+                    success=True,
+                    query_bundle=QueryBundle(rows=[{"seller_id": "100", "order_cnt": 1}]),
+                )
+            ]
+        ),
+    }
+
+    decision = V2AgentPolicy(settings).decide(state)
+
+    assert decision.selected_action == "verify_evidence"
+    assert decision.selected_node == "verify_evidence_graph"
     assert decision.budget_exhausted
 
 
@@ -2185,6 +4651,13 @@ def test_planner_reflection_detects_missing_domain_and_missing_refs():
             )
         ],
         evidence_contracts=[{"taskId": "anchor_order", "table": "dwm_trade_order_detail_di", "columns": ["sub_order_id"]}],
+        question_understanding={
+            "analysisGrain": "order",
+            "rankingObjective": {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di"},
+            "requestedMeasures": [{"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款"}],
+            "scopeConstraints": [],
+            "filters": [],
+        },
     )
     reflection = PlannerReflectionAgent().reflect("最近7天订单退款情况", plan, pack)
     codes = {issue["code"] for issue in reflection.issues}
@@ -2975,13 +5448,34 @@ def test_node_worker_repairs_validation_failure():
 
 def test_evidence_verifier_detects_ambiguous_refund_amount():
     run = AgentRunResult(
-        merged_query_bundle=QueryBundle(
-            tables=["dwm_trade_refund_detail_di"],
-            rows=[{"refund_related_pay_amt_raw": "121.50"}],
-            original_row_count=1,
-        )
+        task_results=[
+            AgentTaskResult(
+                task_id="refund_top",
+                success=True,
+                query_bundle=QueryBundle(tables=["dwm_trade_refund_detail_di"], rows=[{"refund_related_pay_amt_raw": "121.50"}]),
+            )
+        ],
+        merged_query_bundle=QueryBundle(tables=["dwm_trade_refund_detail_di"], rows=[{"refund_related_pay_amt_raw": "121.50"}], original_row_count=1),
     )
-    verified = EvidenceVerifier().verify("看退款金额", QueryPlan(final_required_evidence=["refund_related_pay_amt_raw"]), run)
+    plan = QueryPlan(
+        evidence_contracts=[
+            {
+                "taskId": "refund_top",
+                "table": "dwm_trade_refund_detail_di",
+                "columns": ["refund_related_pay_amt_raw"],
+                "semanticLabel": "refund_metric",
+                "requiredLevel": "required",
+                "metricResolution": {
+                    "requestedMetricRef": "refund_amt",
+                    "metricKey": "",
+                    "ownerTable": "dwm_trade_refund_detail_di",
+                    "confidence": 0,
+                    "resolutionSource": "unresolved",
+                },
+            }
+        ],
+    )
+    verified = EvidenceVerifier().verify("看售后金额", plan, run)
     assert verified.passed
     assert any(gap.code == "FIELD_AMBIGUOUS" for gap in verified.gaps)
 
@@ -3149,11 +5643,62 @@ def test_semantic_metric_resolver_uses_runtime_semantic_asset_aliases():
     assert resolution.confidence >= 0.7
 
 
+def test_hybrid_recall_returns_semantic_metric_evidence():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近45天优惠券金额投入最高的商品，退款率是否偏高？"
+    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+        question,
+        KeywordExtractService().extract(question),
+        [],
+        "",
+        "100",
+        [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+
+    metric_hits = [item for item in recall.items if str(item.source_type).upper() == "SEMANTIC_METRIC"]
+
+    assert metric_hits
+    assert any(item.metadata.get("metricKey") == "coupon_total_amt" for item in metric_hits)
+
+
+def test_semantic_metric_resolver_uses_recalled_metric_evidence_for_bad_llm_ref():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近45天优惠券金额投入最高的商品，退款率是否偏高？"
+    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall = recall_service.recall(
+        question,
+        KeywordExtractService().extract(question),
+        [],
+        "",
+        "100",
+        [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        question,
+        recall,
+        [QuestionCategory.COUPON, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+
+    resolution = SemanticMetricResolver(pack).resolve(
+        question,
+        "coupon_amt",
+        "dwm_coupon_detail_di",
+        "优惠券金额投入",
+    )
+
+    assert resolution.metric.key == "coupon_total_amt"
+    assert resolution.resolution_source == "semantic_recall_evidence"
+    assert resolution.confidence >= 0.9
+    assert resolution.candidate_evidence[0]["recallEvidence"]["metricKey"] == "coupon_total_amt"
+
+
 def test_semantic_metric_index_prefers_source_phrase_over_bad_llm_metric_ref():
     settings = get_settings()
     builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
     index = SemanticMetricIndex(builder._all_metric_entries())
-    gmv = index.resolve("pay_amt", "dwm_trade_order_detail_di", "GMV最高的前5天")
+    gmv = index.resolve("pay_amt", "dwm_trade_order_detail_di", "GMV")
     assert gmv
     assert gmv.metric.table == "ads_merchant_profile"
     assert gmv.metric.key == "order_gmv_amt_1d"
@@ -3166,13 +5711,603 @@ def test_semantic_metric_index_prefers_source_phrase_over_bad_llm_metric_ref():
     assert refund.resolution_reason == "semantic_metric_ref"
 
 
-def test_compiler_corrects_metric_semantic_mismatch_from_source_phrase():
+def test_semantic_metric_resolver_keeps_exact_refs_for_broad_detail_phrase():
     settings = get_settings()
-    question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量，判断是否存在异常波动。"
+    question = "查询退款单 refund_id_100 的退款明细，并关联订单和商品信息。"
     builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
     pack = builder.compact(
         question,
         recall_bundle_empty(),
+        [QuestionCategory.REFUND, QuestionCategory.TRADE, QuestionCategory.GOODS],
+    )
+    resolver = SemanticMetricResolver(pack)
+
+    pay_amt = resolver.resolve(question, "pay_amt", "dwm_trade_refund_detail_di", "退款明细")
+    sku_count = resolver.resolve(question, "sku_count", "dwm_trade_refund_detail_di", "退款明细")
+
+    assert pay_amt.metric
+    assert pay_amt.metric.key == "pay_amt"
+    assert pay_amt.resolution_source == "semantic_metric_ref"
+    assert sku_count.metric
+    assert sku_count.metric.key == "sku_count"
+    assert sku_count.resolution_source == "semantic_metric_ref"
+
+
+def test_compiler_refund_detail_preserves_requested_metrics_and_valid_dependencies():
+    settings = get_settings()
+    question = "查询退款单 refund_id_100 的退款明细，并关联订单和商品信息。"
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.REFUND, QuestionCategory.TRADE, QuestionCategory.GOODS],
+    )
+    understanding = {
+        "analysisGrain": "refund",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "refund_bill_cnt",
+            "ownerTable": "dwm_trade_refund_detail_di",
+            "sourcePhrase": "退款明细",
+            "objectiveType": "detail_anchor",
+            "groupByColumn": "refund_id",
+            "limit": 100,
+        },
+        "requestedMeasures": [
+            {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单信息"},
+            {"metricRef": "goods_cnt", "ownerTable": "dwm_goods_detail_df", "sourcePhrase": "商品信息"},
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+            {"metricRef": "sku_count", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+        ],
+        "filters": [{"field": "refund_id", "value": "refund_id_100"}],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    result = QueryGraphValidator().validate(question, plan, pack)
+    metric_pairs = {(intent.preferred_table, intent.metric_name) for intent in plan.intents if intent.metric_name}
+
+    assert result.valid
+    assert ("dwm_trade_refund_detail_di", "pay_amt") in metric_pairs
+    assert ("dwm_trade_refund_detail_di", "sku_count") in metric_pairs
+    assert not any(gap.code == "REQUESTED_MEASURE_NOT_PLANNED" for gap in result.gaps)
+    assert not any(gap.code == "DEPENDENCY_KEY_NOT_PRODUCED" for gap in result.gaps)
+
+
+def test_compiler_scope_phrase_does_not_override_explicit_order_anchor_metric():
+    settings = get_settings()
+    question = "最近20天优惠券活动订单的退款率和GMV表现怎么样？"
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.COUPON, QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+    understanding = {
+        "analysisGrain": "product",
+        "analysisIntent": "comparison",
+        "requiresExplanation": True,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "最近20天优惠券活动订单表现",
+            "groupByColumn": "spu_name",
+            "limit": 10,
+        },
+        "requestedMeasures": [
+            {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款量"},
+            {"metricRef": "discount_amt", "ownerTable": "dwm_coupon_detail_di", "sourcePhrase": "券金额投入"},
+            {"metricRef": "refund_rate", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款率"},
+        ],
+        "scopeConstraints": [
+            {
+                "scopeId": "coupon_activity_orders",
+                "sourcePhrase": "优惠券活动订单",
+                "ownerTable": "dwm_coupon_detail_di",
+                "metricRef": "coupon_amt",
+                "entityGrain": "order",
+                "targetDomain": "trade",
+                "required": True,
+            }
+        ],
+        "timeWindowDays": 20,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    assert plan.knowledge_requests
+    recall_service = HybridRecallService(settings, TopicAssetService(settings), WikiMemoryService(settings))
+    scoped_items = []
+    for request in plan.knowledge_requests:
+        scoped_recall = recall_service.recall(
+            request.query,
+            KeywordExtractService().extract(request.query),
+            [],
+            "",
+            "100",
+            [QuestionCategory.COUPON, QuestionCategory.TRADE, QuestionCategory.REFUND],
+        )
+        scoped_items.extend(scoped_recall.items)
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        RecallBundle(items=scoped_items),
+        [QuestionCategory.COUPON, QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    result = QueryGraphValidator().validate(question, plan, pack)
+
+    order_anchor = next(intent for intent in plan.intents if intent.plan_task_id == "order_lookup")
+    assert order_anchor.preferred_table == "dwm_trade_order_detail_di"
+    assert order_anchor.metric_name == "order_detail_cnt"
+    assert plan.question_understanding["rankingObjective"]["resolvedMetricRef"] == "order_detail_cnt"
+    assert any(
+        item.get("metricRef") == "discount_amt" and item.get("resolvedMetricRef") in {"coupon_amt", "coupon_total_amt"}
+        for item in plan.question_understanding.get("requestedMeasures", [])
+    )
+    assert result.valid
+
+
+def test_compiler_finalizes_required_evidence_domains_as_query_nodes():
+    settings = get_settings()
+    question = "最近30天退款率最高的前10个商品，同时看下单数、退款金额和商品发布时间，帮我判断哪些是高风险新品。"
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    understanding = {
+        "analysisGrain": "product",
+        "analysisIntent": "risk_ranking",
+        "requiresExplanation": True,
+        "rankingObjective": {
+            "metricRef": "refund_rate",
+            "ownerTable": "dwm_trade_refund_detail_di",
+            "sourcePhrase": "退款率最高的前10个商品",
+            "groupByColumn": "spu_id",
+            "limit": 10,
+        },
+        "requestedMeasures": [
+            {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "下单数"},
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
+        ],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "new_product_identification",
+                "reason": "需要商品发布时间判断新品",
+                "requiredLevel": "required",
+                "suggestedDomains": ["goods"],
+            }
+        ],
+        "scopeConstraints": [],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    result = QueryGraphValidator().validate(question, plan, pack)
+    reflection = PlannerReflectionAgent().reflect(question, plan, pack)
+
+    assert result.valid
+    assert any(intent.preferred_table == "dwm_goods_detail_df" for intent in plan.intents)
+    assert any(item.startswith("EVIDENCE_DOMAIN_REPAIR:") and "goods" in item for item in plan.compiler_trace)
+    assert "DOMAIN_COVERAGE_GAP" not in {issue["code"] for issue in reflection.issues}
+
+
+def test_compiler_binds_required_evidence_suggested_fields_to_matching_nodes():
+    settings = get_settings()
+    question = "查询订单 order_id_100 的订单明细，并查看退款金额，再看下对应 SPU 什么时候发布的。"
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    understanding = {
+        "analysisGrain": "order",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "订单明细",
+            "objectiveType": "detail_anchor",
+            "groupByColumn": "order_id",
+            "limit": 20,
+        },
+        "requestedMeasures": [
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"}
+        ],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "商品发布时间",
+                "requiredLevel": "required",
+                "suggestedDomains": ["goods"],
+                "suggestedTables": ["dwm_goods_detail_df"],
+                "suggestedFields": ["spu_apply_create_time"],
+            }
+        ],
+        "filters": [{"field": "order_id", "value": "order_id_100"}],
+        "timeWindowDays": 90,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    goods_node = next(intent for intent in plan.intents if intent.preferred_table == "dwm_goods_detail_df")
+
+    assert "spu_apply_create_time" in goods_node.output_keys
+    assert "spu_apply_create_time" in goods_node.required_evidence
+    assert QueryGraphValidator().validate(question, plan, pack).valid
+
+
+def test_query_graph_validator_rejects_missing_required_field_evidence():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_goods_detail_df",
+                columns=["seller_id", "spu_id", "spu_apply_create_time", "pt"],
+            )
+        ]
+    )
+    plan = QueryPlan(
+        question_understanding={
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": "商品发布时间",
+                    "requiredLevel": "required",
+                    "suggestedTables": ["dwm_goods_detail_df"],
+                    "suggestedFields": ["spu_apply_create_time"],
+                }
+            ]
+        },
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                plan_task_id="goods_lookup",
+                preferred_table="dwm_goods_detail_df",
+                output_keys=["seller_id", "spu_id"],
+            )
+        ],
+    )
+
+    validation = QueryGraphValidator().validate("商品发布时间", plan, pack)
+
+    assert not validation.valid
+    assert any(gap.code == "MISSING_REQUIRED_FIELD_EVIDENCE" for gap in validation.gaps)
+
+
+def test_query_graph_validator_rejects_pending_knowledge_requests():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "order_id", "pt"],
+            )
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="order_metric",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_amt",
+                metric_column="order_id",
+                output_keys=["seller_id"],
+            )
+        ],
+        knowledge_requests=[
+            KnowledgeRequest(
+                type=KnowledgeRequestType.METRIC,
+                query="订单金额 语义指标口径 公式 来源字段",
+                needed_for_task_id="order_metric",
+                reason="metric evidence unresolved",
+            )
+        ],
+    )
+
+    validation = QueryGraphValidator().validate("订单金额", plan, pack)
+
+    assert not validation.valid
+    assert any(gap.code == "PENDING_KNOWLEDGE_REQUEST" for gap in validation.gaps)
+
+
+def test_coverage_critic_adds_recalled_metric_evidence_for_ship_timeout_order_count():
+    question = "平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。"
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "order_id", "pt"]),
+            PlanningAssetEntry(table="ads_merchant_profile", columns=["seller_id", "pt", "ship_timeout_order_cnt_1d"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["order_id"],
+                title="订单量",
+                metadata={"metricKey": "order_detail_cnt", "sourceColumns": ["order_id"]},
+            )
+        ],
+        metric_compaction={
+            "recalledMetricEvidence": [
+                {
+                    "ownerTable": "ads_merchant_profile",
+                    "metricKey": "ship_timeout_order_cnt_1d",
+                    "businessName": "发货超时订单量",
+                    "aliases": ["发货超时订单数", "超时发货订单量"],
+                    "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+                    "sourceColumns": ["ship_timeout_order_cnt_1d"],
+                    "formula": "SUM(ship_timeout_order_cnt_1d)",
+                }
+            ]
+        },
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "订单量",
+        },
+        "requestedMeasures": [],
+        "requiredEvidenceIntents": [],
+    }
+
+    result = UnderstandingCoverageCritic().complete(question, understanding, pack)
+
+    assert {
+        "metricRef": "ship_timeout_order_cnt_1d",
+        "ownerTable": "ads_merchant_profile",
+        "sourcePhrase": "发货超时订单量",
+        "completionSource": "recalled_metric_evidence",
+        "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+    } in result.understanding["requestedMeasures"]
+    assert any(item.startswith("UNDERSTANDING_RECALLED_METRIC_COMPLETION:") for item in result.trace)
+
+
+def test_compiler_treats_same_table_event_scope_anchor_as_population_contract():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_cs_ticket_detail_di",
+                columns=["seller_id", "ticket_id", "sub_order_id", "order_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "sub_order_id", "order_id", "pt"],
+            ),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="ticket_cnt",
+                table="dwm_cs_ticket_detail_di",
+                columns=["ticket_id"],
+                title="工单量",
+                metadata={"sourceColumns": ["ticket_id"], "formula": "COUNT(DISTINCT ticket_id)"},
+            ),
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                title="下单数",
+                metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+            ),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_ticket_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_cs_ticket_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            )
+        ],
+    )
+    understanding = {
+        "analysisGrain": "order",
+        "analysisIntent": "comparison",
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "有客服工单的订单",
+            "groupByColumn": "sub_order_id",
+            "limit": 100,
+        },
+        "requestedMeasures": [
+            {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单数"}
+        ],
+        "scopeConstraints": [
+            {
+                "scopeId": "orders_with_ticket",
+                "sourcePhrase": "有客服工单的订单",
+                "ownerTable": "dwm_cs_ticket_detail_di",
+                "metricRef": "ticket_cnt",
+                "entityGrain": "order",
+                "targetDomain": "ticket",
+                "required": True,
+            }
+        ],
+        "filters": [],
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("最近30天有客服工单的订单里，哪些后来发生了退款或赔付？", understanding, pack)
+    validation = QueryGraphValidator().validate("最近30天有客服工单的订单里，哪些后来发生了退款或赔付？", plan, pack)
+
+    assert any(intent.plan_task_id == "anchor_ticket_scope" for intent in plan.intents)
+    assert not any(gap.code == "SCOPE_NOT_NARROWING" for gap in validation.gaps)
+
+
+def test_compiler_chains_multiple_scope_constraints_before_requested_measures():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_cs_ticket_detail_di",
+                columns=["seller_id", "ticket_id", "sub_order_id", "order_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "sub_order_id", "order_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_refund_detail_di",
+                columns=["seller_id", "refund_id", "sub_order_id", "order_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_cs_repay_detail_df",
+                columns=["seller_id", "bill_id", "sub_order_id", "order_id", "pt"],
+            ),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="ticket_cnt",
+                table="dwm_cs_ticket_detail_di",
+                columns=["ticket_id"],
+                title="工单量",
+                metadata={"sourceColumns": ["ticket_id"], "formula": "COUNT(DISTINCT ticket_id)"},
+            ),
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                title="订单量",
+                metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+            ),
+            PlanningAssetEntry(
+                key="refund_bill_cnt",
+                table="dwm_trade_refund_detail_di",
+                columns=["refund_id"],
+                title="退款量",
+                metadata={"sourceColumns": ["refund_id"], "formula": "COUNT(DISTINCT refund_id)"},
+            ),
+            PlanningAssetEntry(
+                key="repay_bill_cnt",
+                table="dwm_cs_repay_detail_df",
+                columns=["bill_id"],
+                title="赔付单量",
+                metadata={"sourceColumns": ["bill_id"], "formula": "COUNT(DISTINCT bill_id)"},
+            ),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_ticket_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_cs_ticket_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="order_repay_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_cs_repay_detail_df",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+        ],
+    )
+    understanding = {
+        "analysisGrain": "order",
+        "analysisIntent": "none",
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "这些订单",
+            "groupByColumn": "seller_id",
+            "objectiveType": "metric_total",
+            "limit": 1,
+        },
+        "requestedMeasures": [
+            {"metricRef": "repay_bill_cnt", "ownerTable": "dwm_cs_repay_detail_df", "sourcePhrase": "是否发生赔付"}
+        ],
+        "scopeConstraints": [
+            {
+                "scopeId": "ticket_orders",
+                "sourcePhrase": "客服工单里",
+                "ownerTable": "dwm_cs_ticket_detail_di",
+                "metricRef": "ticket_cnt",
+                "entityGrain": "order",
+                "targetDomain": "ticket",
+                "required": True,
+            },
+            {
+                "scopeId": "refund_orders",
+                "sourcePhrase": "涉及退款",
+                "ownerTable": "dwm_trade_refund_detail_di",
+                "metricRef": "refund_bill_cnt",
+                "entityGrain": "order",
+                "targetDomain": "refund",
+                "required": True,
+            },
+        ],
+        "filters": [],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(
+        "最近30天客服工单里涉及退款的订单，同时看这些订单是否发生了赔付。",
+        understanding,
+        pack,
+    )
+    validation = QueryGraphValidator().validate(
+        "最近30天客服工单里涉及退款的订单，同时看这些订单是否发生了赔付。",
+        plan,
+        pack,
+    )
+
+    task_ids = {intent.plan_task_id for intent in plan.intents}
+    assert "anchor_ticket_scope" in task_ids
+    assert "refund_scope" in task_ids
+    assert dependency_path_exists_for_test(plan.dependencies, "anchor_ticket_scope", "refund_scope")
+    repay = next(intent for intent in plan.intents if intent.metric_name == "repay_bill_cnt")
+    assert dependency_path_exists_for_test(plan.dependencies, "refund_scope", repay.plan_task_id)
+    assert not any(gap.code == "SCOPE_NOT_NARROWING" for gap in validation.gaps)
+    assert validation.valid, [(gap.code, gap.evidence) for gap in validation.gaps]
+
+
+def dependency_path_exists_for_test(dependencies: list[PlanDependency], source: str, target: str) -> bool:
+    adjacency: dict[str, list[str]] = {}
+    for dep in dependencies:
+        adjacency.setdefault(dep.anchor_task_id, []).append(dep.dependent_task_id)
+    pending = list(adjacency.get(source, []))
+    seen: set[str] = set()
+    while pending:
+        task = pending.pop()
+        if task == target:
+            return True
+        if task in seen:
+            continue
+        seen.add(task)
+        pending.extend(adjacency.get(task, []))
+    return False
+
+
+def test_compiler_corrects_metric_semantic_mismatch_from_source_phrase():
+    settings = get_settings()
+    question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量，判断是否存在异常波动。"
+    topic_assets = TopicAssetService(settings)
+    builder = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings))
+    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall = recall_service.recall(
+        question,
+        KeywordExtractService().extract(question),
+        [],
+        "",
+        "100",
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.CS_TICKET, QuestionCategory.COMPENSATION],
+    )
+    pack = builder.compact(
+        question,
+        recall,
         [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.CS_TICKET, QuestionCategory.COMPENSATION],
     )
     understanding = {
@@ -3181,7 +6316,7 @@ def test_compiler_corrects_metric_semantic_mismatch_from_source_phrase():
         "rankingObjective": {
             "metricRef": "pay_amt",
             "ownerTable": "dwm_trade_order_detail_di",
-            "sourcePhrase": "GMV最高的前5天",
+            "sourcePhrase": "GMV",
             "groupByColumn": "pt",
             "order": "desc",
             "limit": 5,
@@ -3197,11 +6332,49 @@ def test_compiler_corrects_metric_semantic_mismatch_from_source_phrase():
 
     plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
     assert plan.intents
+    assert not plan.knowledge_requests
     assert plan.intents[0].preferred_table == "ads_merchant_profile"
     assert plan.intents[0].metric_name == "order_gmv_amt_1d"
-    assert plan.intents[0].metric_resolution["resolutionSource"] == "semantic_phrase_override"
-    assert plan.intents[0].metric_resolution["candidateScores"][0]["metricKey"] == "order_gmv_amt_1d"
+    assert plan.intents[0].metric_resolution["resolutionSource"] == "semantic_recall_evidence"
+    assert plan.intents[0].metric_resolution["metricEvidenceCandidates"][0]["metricKey"] == "order_gmv_amt_1d"
     assert any(item.startswith("METRIC_SEMANTIC_MISMATCH:") for item in plan.compiler_trace)
+
+
+def test_compiler_binds_status_filter_to_matching_node_table():
+    settings = get_settings()
+    question = "最近30天退款状态为处理中或异常的订单，关联看商品发布时间和订单金额。"
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    understanding = {
+        "analysisGrain": "order",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "requiredEvidenceIntents": [],
+        "rankingObjective": {
+            "metricRef": "refund_bill_cnt",
+            "ownerTable": "dwm_trade_refund_detail_di",
+            "sourcePhrase": "退款状态为处理中或异常的订单",
+            "objectiveType": "detail_anchor",
+            "groupByColumn": "sub_order_id",
+            "order": "desc",
+            "limit": 100,
+        },
+        "requestedMeasures": [],
+        "filters": [{"field": "refund_status_name", "value": "处理中,异常"}],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+
+    assert plan.intents
+    anchor = plan.intents[0]
+    assert anchor.filter_column == "refund_status_name"
+    assert anchor.filter_value == "处理中,异常"
+    assert "refund_status_name" in anchor.required_evidence
+    assert any(item.startswith("FILTER_BOUND:anchor_refund:refund_status_name=") for item in plan.compiler_trace)
 
 
 def test_semantic_metric_resolver_reads_compacted_out_table_metadata_metric():
@@ -3551,9 +6724,11 @@ def test_answer_analysis_summary_uses_structured_analysis_intent_not_question_te
 
         def __init__(self):
             self.calls = 0
+            self.payload = {}
 
         def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
             self.calls += 1
+            self.payload = json.loads(user_prompt)
             return "分析摘要"
 
     llm = FakeAnalysisLlm()
@@ -3571,8 +6746,8 @@ def test_answer_analysis_summary_uses_structured_analysis_intent_not_question_te
         }
     )
     summary = AnswerComposeService(llm).summarize_analysis("最近30天GMV是否正常？", plan, run)
-    assert summary == "分析摘要"
-    assert llm.calls == 1
+    assert summary.startswith("分析结论")
+    assert llm.calls == 0
 
 
 def test_answer_analysis_summary_skips_when_structured_intent_is_none():
@@ -3600,10 +6775,177 @@ def test_answer_analysis_summary_skips_when_structured_intent_is_none():
     assert llm.calls == 0
 
 
+def test_answer_compose_skips_llm_for_plain_query_with_rows():
+    class FakeAnswerLlm:
+        configured = True
+        settings = get_settings()
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            self.calls += 1
+            return "不应该调用"
+
+    llm = FakeAnswerLlm()
+    run = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            tables=["dwm_trade_refund_detail_di"],
+            rows=[{"seller_id": "100", "spu_name": "A", "pay_amt": 12.3}],
+        ),
+        task_results=[
+            AgentTaskResult(
+                task_id="refund_top",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_refund_detail_di"],
+                    rows=[{"seller_id": "100", "spu_name": "A", "pay_amt": 12.3}],
+                ),
+            )
+        ],
+    )
+    plan = QueryPlan(
+        question_understanding={"analysisIntent": "none", "requiresExplanation": False},
+        intents=[
+            QuestionIntent(
+                question="最近30天退款金额最高的商品",
+                intent_type="VALID",
+                answer_mode=AnswerMode.TOPN,
+                category=QuestionCategory.REFUND,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="pay_amt",
+                metric_column="pay_amt",
+                group_by_column="spu_name",
+            )
+        ],
+    )
+    answer = AnswerComposeService(llm).compose("最近30天退款金额最高的商品", MerchantInfo(merchant_id="100"), plan, run, "")
+    assert "已按当前口径查询到" in answer
+    assert llm.calls == 0
+
+
 def recall_bundle_empty():
     from merchant_ai.models import RecallBundle
 
     return RecallBundle()
+
+
+def merge_recall_items_for_test(*groups):
+    by_id = {}
+    for group in groups:
+        for item in group:
+            current = by_id.get(item.doc_id)
+            if current is None:
+                by_id[item.doc_id] = item
+                continue
+            current_queries = list((current.metadata or {}).get("recallQueries") or [])
+            item_queries = list((item.metadata or {}).get("recallQueries") or [])
+            merged_queries = []
+            for query in current_queries + item_queries:
+                if query and query not in merged_queries:
+                    merged_queries.append(query)
+            base = item if item.fusion_score >= current.fusion_score else current
+            metadata = {**(current.metadata or {}), **(item.metadata or {})}
+            if merged_queries:
+                metadata["recallQueries"] = merged_queries
+                metadata["recallQuery"] = merged_queries[-1]
+            by_id[item.doc_id] = base.model_copy(update={"fusion_score": max(current.fusion_score, item.fusion_score), "metadata": metadata})
+    return list(by_id.values())
+
+
+def trade_refund_goods_pack(include_missing_goods_metric=False):
+    metrics = [
+        PlanningAssetEntry(
+            key="order_detail_cnt",
+            table="dwm_trade_order_detail_di",
+            columns=["sub_order_id"],
+            title="下单数",
+            metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+        ),
+        PlanningAssetEntry(
+            key="refund_bill_cnt",
+            table="dwm_trade_refund_detail_di",
+            columns=["refund_id"],
+            title="退款量",
+            metadata={"sourceColumns": ["refund_id"], "formula": "COUNT(DISTINCT refund_id)"},
+        ),
+        PlanningAssetEntry(
+            key="pay_amt",
+            table="dwm_trade_refund_detail_di",
+            columns=["pay_amt"],
+            title="退款金额",
+            metadata={"sourceColumns": ["pay_amt"], "formula": "SUM(pay_amt)"},
+        ),
+    ]
+    if include_missing_goods_metric:
+        metrics.append(
+            PlanningAssetEntry(
+                key="goods_online_detail_cnt",
+                table="dwm_goods_detail_df",
+                columns=["spu_status_code", "spu_status_name"],
+                title="上架商品量",
+                metadata={
+                    "sourceColumns": ["spu_status_code", "spu_status_name"],
+                    "formula": "SUM(CASE WHEN spu_status_code = 1 OR spu_status_name = '上架' THEN 1 ELSE 0 END)",
+                },
+            )
+        )
+    return PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "pt", "spu_id", "spu_name", "sub_order_id", "order_id", "discount_rel_id", "pay_amt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_refund_detail_di",
+                columns=[
+                    "seller_id",
+                    "pt",
+                    "spu_name",
+                    "sub_order_id",
+                    "order_id",
+                    "refund_id",
+                    "pay_amt",
+                    "refund_status_name",
+                    "refund_create_time",
+                ],
+            ),
+            PlanningAssetEntry(
+                table="dwm_goods_detail_df",
+                columns=["seller_id", "pt", "spu_id", "spu_name", "spu_apply_create_time", "spu_status_name"],
+            ),
+        ],
+        metrics=metrics,
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="order_goods_by_spu_id",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_goods_detail_df",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "spu_id", "rightColumn": "spu_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="goods_refund_by_spu_name",
+                left_table="dwm_goods_detail_df",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "spu_name", "rightColumn": "spu_name"},
+                ],
+            ),
+        ],
+    )
 
 
 def profile_daily_pack():
@@ -3758,6 +7100,26 @@ class MissingOutputKeySqlLlm:
                 "SELECT `seller_id`, `spu_id`, SUM(`pay_amt`) AS `order_gmv` FROM `dwm_trade_order_detail_di` "
                 "WHERE `seller_id` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 30 DAY), '%Y%m%d') "
                 "GROUP BY `seller_id`, `spu_id` ORDER BY `order_gmv` DESC LIMIT 5"
+            )
+        }
+
+
+class MissingEntityKeyFilterSqlLlm:
+    configured = True
+    last_error = ""
+    error_events = []
+
+    def __init__(self):
+        self.calls = 0
+
+    def json_chat(self, system_prompt, user_prompt, fallback=None):
+        self.calls += 1
+        return {
+            "sql": (
+                "SELECT `seller_id`, `spu_id`, `spu_name`, COUNT(DISTINCT `ticket_id`) AS `ticket_cnt` "
+                "FROM `dwm_cs_ticket_detail_di` "
+                "WHERE `seller_id` = '100' AND `pt` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 60 DAY), '%Y%m%d') "
+                "GROUP BY `seller_id`, `spu_id`, `spu_name` ORDER BY `ticket_cnt` DESC LIMIT 10"
             )
         }
 
@@ -4044,7 +7406,7 @@ class RefiningAnalysisPlannerLlm:
                 ],
                 "rankingObjective": {
                     "metricRef": "pay_amt",
-                    "sourcePhrase": "GMV最高的前5天",
+                    "sourcePhrase": "GMV",
                     "ownerTable": "dwm_trade_order_detail_di",
                     "groupByColumn": "pt",
                     "order": "desc",
@@ -4102,7 +7464,7 @@ class RefiningAnalysisPlannerLlm:
                             ],
                             "rankingObjective": {
                                 "metricRef": "order_gmv_amt_1d",
-                                "sourcePhrase": "GMV最高的前5天",
+                                "sourcePhrase": "GMV",
                                 "ownerTable": "ads_merchant_profile",
                                 "groupByColumn": "pt",
                                 "order": "desc",
@@ -4412,7 +7774,7 @@ class FakeDailyProfilePlannerLlm:
                 "analysisGrain": "day",
                 "rankingObjective": {
                     "metricRef": "order_gmv_amt_1d",
-                    "sourcePhrase": "GMV最高的前5天",
+                    "sourcePhrase": "GMV",
                     "ownerTable": "ads_merchant_profile",
                     "groupByColumn": "pt",
                     "order": "desc",
@@ -4452,7 +7814,7 @@ class FakeCouponRefundRatePlannerLlm:
                 ],
                 "rankingObjective": {
                     "metricRef": "coupon_amt",
-                    "sourcePhrase": "优惠券金额投入最高",
+                    "sourcePhrase": "优惠券金额投入",
                     "ownerTable": "dwm_coupon_detail_di",
                     "groupByColumn": "coupon_id",
                     "order": "desc",
@@ -4609,6 +7971,7 @@ class ToolCallingAsyncModel:
     def __init__(self):
         self.bound_tools = []
         self.tool_choice = ""
+        self.calls = 0
 
     def bind_tools(self, tools, tool_choice=None):
         self.bound_tools = tools
@@ -4616,6 +7979,7 @@ class ToolCallingAsyncModel:
         return self
 
     async def ainvoke(self, messages):
+        self.calls += 1
         return FakeToolMessage()
 
 
@@ -4726,6 +8090,315 @@ class FakeSelfLoopPlannerLlm:
                 "finalRequiredEvidence": ["ticket_cnt", "refund_bill_cnt", "repay_amt"],
             },
         }
+
+
+def test_file_run_event_store_persists_run_events_and_trace(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    manager = AgentRunManager(settings)
+    thread = manager.create_thread("100", "电商交易", ChatContext(topic="电商交易"))
+    run = manager.create_run(thread.thread_id, "100", "最近7天GMV")
+    manager.append_event(
+        run.run_id,
+        thread.thread_id,
+        "run.step.completed",
+        "PLAN_QUERY_GRAPH",
+        {"stepId": "step_1", "toolCallId": "tool_1", "status": "success"},
+    )
+    response = ChatResponse(
+        id="qa_1",
+        answer="ok",
+        debug_trace={
+            "harness": {
+                "performance": {"totalDurationMs": 12},
+                "traceReplay": {"version": "v2", "path": "/tmp/trace_replay.json"},
+            }
+        },
+    )
+    manager.complete_run(run.run_id, response)
+
+    reloaded = AgentRunManager(settings)
+    loaded = reloaded.get_run(run.run_id)
+    events = reloaded.events(run.run_id)
+    trace = reloaded.trace(run.run_id)
+
+    assert loaded is not None
+    assert loaded.status == "COMPLETED"
+    assert loaded.performance_summary["totalDurationMs"] == 12
+    assert loaded.final_answer_hash
+    assert any(event.step_id == "step_1" and event.tool_call_id == "tool_1" for event in events)
+    assert trace is not None
+    assert trace["harness"]["traceReplay"]["version"] == "v2"
+
+
+def test_stream_service_emits_answer_delta_events(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    manager = AgentRunManager(settings)
+
+    def run_chat(message, merchant_id, context, listener, thread_id, run_id):
+        listener("node.completed", "ANSWER_ANALYSIS", {"answerReady": True})
+        return ChatResponse(id="qa_1", answer="abcdefghi", debug_trace={"harness": {"performance": {"totalDurationMs": 1}}})
+
+    service = AgentRunStreamService(manager, run_chat, "100")
+    events = list(service.stream(RunCreateRequest(message="最近7天订单量", merchant_id="100")))
+    joined = "\n".join(events)
+    assert "answer.delta" in joined
+    assert "answer.completed" in joined
+    assert '"event": "done"' in joined
+    assert answer_chunks("abcdefghi", 4) == ["abcd", "efgh", "i"]
+    run_id = next(event.run_id for events_for_run in manager.run_events.values() for event in events_for_run if event.event_type == "answer.delta")
+    stored_types = [event.event_type for event in manager.events(run_id)]
+    assert "answer.delta" in stored_types
+    assert "answer.completed" in stored_types
+
+
+def test_analysis_skill_runner_generates_evidence_bound_summary(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "llm_api_key": ""})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "anomaly_check",
+            "requiresExplanation": True,
+            "analysisGrain": "day",
+        },
+        intents=[
+            QuestionIntent(
+                question="最近30天GMV和退款金额走势是否正常？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_formula="SUM(order_gmv_amt_1d)",
+                group_by_column="pt",
+                metric_resolution={
+                    "metricKey": "order_gmv_amt_1d",
+                    "ownerTable": "ads_merchant_profile",
+                    "formula": "SUM(order_gmv_amt_1d)",
+                },
+            )
+        ],
+    )
+    rows = [
+        {"pt": "2026-06-01", "order_gmv_amt_1d": "100", "pay_amt": "10", "merchant_id": "100"},
+        {"pt": "2026-06-02", "order_gmv_amt_1d": "180", "pay_amt": "20", "merchant_id": "100"},
+        {"pt": "2026-06-03", "order_gmv_amt_1d": "420", "pay_amt": "90", "merchant_id": "100"},
+    ]
+    run = AgentRunResult(
+        merged_query_bundle=QueryBundle(tables=["ads_merchant_profile"], rows=rows, original_row_count=len(rows)),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    answer = service.summarize_analysis("最近30天GMV和退款金额走势是否正常？", plan, run, str(tmp_path))
+    assert "分析结论" in answer
+    assert "关键证据" in answer
+    assert "order_gmv_amt_1d" in answer
+    trace = service.last_analysis_skill_trace
+    assert trace["activated"]
+    assert trace["metadata"]["name"] == "bi_trend_attribution"
+    assert Path(trace["inputArtifact"]).exists()
+    assert Path(trace["outputArtifact"]).exists()
+
+
+def test_context_package_keeps_minimal_refs_not_full_debug_trace(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    outputs = tmp_path / "threads" / "thread_1" / "outputs"
+    outputs.mkdir(parents=True)
+    (outputs / "trace_replay.json").write_text("{}", encoding="utf-8")
+    state = {
+        "question": "最近7天订单退款情况",
+        "requested_merchant_id": "100",
+        "thread_id": "thread_1",
+        "run_id": "run_1",
+        "thread_data": ThreadData(thread_id="thread_1", run_id="run_1", outputs_path=str(outputs)),
+        "planning_asset_pack": PlanningAssetPack(
+            tables=[PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "pt"])],
+            metrics=[PlanningAssetEntry(key="order_cnt", table="dwm_trade_order_detail_di")],
+        ),
+        "agent_run_result": AgentRunResult(),
+        "debugTrace": {"large": "should_not_be_copied"},
+    }
+
+    ContextManager(settings).refresh_state(state, "compact_assets")
+    package = state["context_packages"][-1]
+    payload = package.model_dump(by_alias=True)
+
+    assert package.agent == "PlannerAgent"
+    assert package.allowed_tables == ["dwm_trade_order_detail_di"]
+    assert package.artifact_refs
+    assert "debugTrace" not in json.dumps(payload, ensure_ascii=False)
+    assert package.offload_reason
+
+
+def test_schema_drift_report_identifies_missing_extra_and_type_changes(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    semantic_schema = [
+        {"columnName": "seller_id", "type": "bigint"},
+        {"columnName": "order_amt", "type": "decimal(18,2)"},
+        {"columnName": "semantic_only", "type": "varchar"},
+    ]
+    live_schema = [
+        {"Field": "seller_id", "Type": "bigint"},
+        {"Field": "order_amt", "Type": "double"},
+        {"Field": "live_only", "Type": "varchar"},
+    ]
+    version = builder._semantic_catalog_version("电商交易", "fake_table", semantic_schema, live_schema)
+    report = builder._schema_drift_report("电商交易", "fake_table", semantic_schema, live_schema, version)
+
+    assert report.semantic_version.startswith("semantic-")
+    assert report.schema_version.startswith("schema-")
+    assert report.missing_live_columns == ["semantic_only"]
+    assert report.extra_live_columns == ["live_only"]
+    assert report.type_changed_columns == [{"column": "order_amt", "semanticType": "decimal", "liveType": "double"}]
+
+
+def test_planner_reflection_emits_structured_repair_requests():
+    reflection = PlannerReflectionAgent().reflect("最近7天订单退款情况", QueryPlan(), PlanningAssetPack())
+
+    assert not reflection.passed
+    assert reflection.repair_reason
+    assert reflection.repair_requests
+    assert reflection.repair_requests[0].stage == "planner_reflection"
+    assert reflection.repair_requests[0].action in {"semantic_read", "re_understand", "graph_repair"}
+
+
+def test_doris_repository_caches_repeated_selects(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "cache_doris_select_ttl_seconds": 60,
+            "cache_memory_max_entries": 8,
+        }
+    )
+    repo = DorisRepository(settings)
+
+    class CountingDb:
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, sql, params=None):
+            self.calls += 1
+            return [{"seller_id": "100", "calls": self.calls}]
+
+    repo.db = CountingDb()
+    first = repo.query("SELECT * FROM `fake_table` WHERE `seller_id` = %s", ["100"])
+    assert not repo.last_cache_hit
+    second = repo.query("SELECT   * FROM `fake_table` WHERE `seller_id` = %s", ["100"])
+
+    assert second == first
+    assert repo.last_cache_hit
+    assert repo.db.calls == 1
+    assert repo.cache_trace()["hits"] == 1
+
+
+def test_hybrid_recall_caches_by_question_and_topics(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "cache_recall_ttl_seconds": 60,
+            "cache_memory_max_entries": 8,
+        }
+    )
+    recall = HybridRecallService(settings, TopicAssetService(settings), WikiMemoryService(settings))
+    keywords = type("Keywords", (), {"keywords": ["订单", "退款"]})()
+
+    first = recall.recall("最近7天订单退款", keywords, [], "", "100", [QuestionCategory.TRADE, QuestionCategory.REFUND])
+    second = recall.recall("最近7天订单退款", keywords, [], "", "100", [QuestionCategory.TRADE, QuestionCategory.REFUND])
+
+    assert len(second.items) == len(first.items)
+    assert recall.cache_trace()["recall"]["hits"] == 1
+
+
+def test_asset_pack_cache_returns_deep_copy(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "cache_asset_pack_ttl_seconds": 60,
+            "cache_memory_max_entries": 8,
+        }
+    )
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    recall = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="semantic:test",
+                title="订单表",
+                content="订单",
+                source_type="SEMANTIC_TABLE_ASSET",
+                topic="电商交易",
+                table="dwm_trade_order_detail_di",
+                fusion_score=10,
+            )
+        ]
+    )
+
+    first = builder.compact("最近7天订单", recall, [QuestionCategory.TRADE])
+    first.tables.append(PlanningAssetEntry(table="mutated_table"))
+    second = builder.compact("最近7天订单", recall, [QuestionCategory.TRADE])
+
+    assert "mutated_table" not in second.known_tables()
+    assert builder.cache_trace()["assetPack"]["hits"] == 1
+
+
+def test_llm_client_caches_successful_chat_response(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "cache_llm_ttl_seconds": 60,
+            "cache_memory_max_entries": 8,
+            "llm_api_key": "fake-key",
+        }
+    )
+    llm = LlmClient(settings)
+
+    class Result:
+        content = "cached answer"
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            return Result()
+
+    fake = FakeModel()
+    llm._model = fake
+
+    first = llm.chat("system", "user")
+    second = llm.chat("system", "user")
+
+    assert first == second == "cached answer"
+    assert fake.calls == 1
+    assert llm.last_cache_hit
+    assert llm.cache_trace()["hits"] == 1
+
+
+def test_llm_client_caches_tool_json_chat_response(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "cache_llm_ttl_seconds": 60,
+            "cache_memory_max_entries": 8,
+            "llm_api_key": "fake-key",
+        }
+    )
+    llm = LlmClient(settings)
+    model = ToolCallingAsyncModel()
+    llm._model = model
+    schema = sql_draft_tool().openai_schema()
+
+    first = llm.tool_json_chat("system", "user", schema, {})
+    second = llm.tool_json_chat("system", "user", schema, {})
+
+    assert first == second == {"sql": "SELECT 1", "reason": "unit test"}
+    assert model.calls == 1
+    assert llm.last_cache_hit
+    assert llm.cache_trace()["hits"] == 1
 
 
 class FakeDoris:

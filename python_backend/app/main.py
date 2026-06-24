@@ -28,7 +28,7 @@ from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService
 settings = get_settings()
 workflow = create_workflow(settings)
 
-run_manager = AgentRunManager()
+run_manager = AgentRunManager(settings)
 stream_service = AgentRunStreamService(run_manager, workflow.run, settings.merchant_id)
 topic_assets = workflow.recall_service.topic_assets
 doris_repository = workflow.node_worker.doris_repository
@@ -53,8 +53,20 @@ def health() -> Dict[str, Any]:
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest) -> Dict[str, Any]:
-    response = await workflow.run_async(request.message, request.merchant_id or settings.merchant_id, request.context)
-    return response.model_dump(by_alias=True)
+    merchant_id = request.merchant_id or settings.merchant_id
+    thread = run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
+    run = run_manager.create_run(thread.thread_id, merchant_id, request.message)
+
+    def listener(event_type: str, node: str, payload: Dict[str, Any]) -> None:
+        run_manager.append_event(run.run_id, thread.thread_id, event_type, node, payload)
+
+    try:
+        response = await workflow.run_async(request.message, merchant_id, request.context, listener, thread.thread_id, run.run_id)
+        run_manager.complete_run(run.run_id, response)
+        return response.model_dump(by_alias=True)
+    except Exception as exc:
+        run_manager.fail_run(run.run_id, str(exc))
+        raise
 
 
 @app.post("/api/chat/stream")
@@ -97,6 +109,17 @@ def get_run_events(thread_id: str, run_id: str) -> Dict[str, Any]:
         "threadId": thread_id,
         "events": jsonable_encoder(run_manager.events(run_id), by_alias=True),
     }
+
+
+@app.get("/api/threads/{thread_id}/runs/{run_id}/trace")
+def get_run_trace(thread_id: str, run_id: str) -> Dict[str, Any]:
+    run = run_manager.get_run(run_id)
+    if not run or run.thread_id != thread_id:
+        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+    trace = run_manager.trace(run_id)
+    if trace is None:
+        return {"success": False, "message": "trace not found", "threadId": thread_id, "runId": run_id}
+    return {"success": True, "runId": run_id, "threadId": thread_id, "trace": trace}
 
 
 @app.post("/api/threads/{thread_id}/runs/{run_id}/cancel")
@@ -205,8 +228,11 @@ def build_topic_asset(request: TopicBuildRequest) -> Dict[str, Any]:
 def publish_topic_asset(topic: str, table_name: str, request: TopicReviewRequest) -> Dict[str, Any]:
     result = topic_assets.publish(topic, table_name, request.approved, request.reviewer, request.review_note)
     if request.approved and result.get("status") == "PUBLISHED":
-        workflow.recall_service.semantic_catalog.clear_cache()
+        workflow.recall_service.clear_cache()
+        workflow.asset_builder.clear_cache()
+        workflow.node_worker.doris_repository.clear_cache()
         result["esUpsert"] = {"success": True, "mode": "local_recall", "topic": topic, "tableName": table_name}
+        result["cacheInvalidated"] = True
     return result
 
 

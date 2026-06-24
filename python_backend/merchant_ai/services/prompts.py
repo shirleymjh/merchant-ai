@@ -152,13 +152,20 @@ def default_prompt_registry() -> PromptRegistry:
             description="Understand a BI question into semantic-layer bounded questionUnderstanding.",
             template=(
                 "你是商家 BI 问题理解器。只输出 JSON。\n"
-                "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、rankingObjective、requestedMeasures、filters、timeWindowDays。\n"
+                "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、rankingObjective、requestedMeasures、scopeConstraints、filters、timeWindowDays。\n"
                 "同时必须声明 analysisIntent、requiresExplanation、requiredEvidenceIntents：简单查询/排行用 none/false/[]；需要诊断、原因解释、异常判断、风险判断、经营总结时，由你声明所需证据意图。\n"
                 "只要 analysisIntent 不是 none，requiredEvidenceIntents 必须至少 1 条；comparison/trend_check/anomaly_check/risk_ranking/overview/diagnosis 都不能返回空 evidence intents。\n"
                 "不要依赖代码关键词补规则；如果需要解释型证据，把证据需求写进 requiredEvidenceIntents，再由语义层编译和 Critic 校验。\n"
                 "metricRef 必须来自 semanticCatalog.candidateMetrics.key；ownerTable 必须使用对应 metric 的 table。\n"
+                "sourcePhrase 必须只填写用户原话中的指标/业务对象原词，不要包含排序词、Top/前N、最高/最低、时间窗或分析动作。例如“GMV最高的前5天”的 sourcePhrase 只写“GMV”。\n"
+                "rankingObjective.objectiveType 用来表达主指标用途：求一个商家总量/指标值用 metric_total；Top/最高/最多/前N 用 ranking；走势用 trend_anchor；明细实体过滤用 detail_anchor。\n"
                 "如果用户问 Top/最高/最多/前N，rankingObjective 必须是被排序的主指标；其他指标放 requestedMeasures。\n"
+                "如果用户只问“某指标是多少/怎么样/当前值”，不要伪造成 Top 排名；选择对应 metricRef，objectiveType=metric_total，groupByColumn 使用 seller_id/merchant_id 这类商家粒度字段。\n"
                 "如果用户问具体订单/子订单/商品/退款/工单明细，rankingObjective 可以为空，但 filters 必须写出实体字段和值。\n"
+                "如果用户问题包含状态、阶段、处理进度、成功/失败/异常/处理中等限定，filters 必须写出对应 semanticCatalog/live schema 里的状态字段和值；多个状态值用逗号分隔。\n"
+                "如果用户表达“在某业务集合中/某业务对象带来的/使用某业务对象的/基于某集合”的限定，必须写入 scopeConstraints；scopeConstraints 表示后续 rankingObjective 和 requestedMeasures 都必须先受这个实体集合约束，不能只把它当作普通 requestedMeasure。scopeConstraints.ownerTable 必须是产生限定集合的来源业务对象表；如果目标集合是订单但来源是活动/券/商品/退款等，不要把 ownerTable 简单重复成订单表，除非你同时给出真实 filter。\n"
+                "如果用户要从一个业务集合关联查看另一个业务域的证据，例如订单集合回填退款/商品/工单/赔付，且 semanticCatalog 已提供相关表、指标或 relationships，不要空泛返回 NEED_MORE_KNOWLEDGE；应输出 UNDERSTOOD。没有显式排序时，rankingObjective 可以选择定义 anchor 集合的最小可执行指标或留空，requestedMeasures 放需要补证据的指标，filters 只写用户明确给出的实体值。\n"
+                "关系链的 join key 不需要你猜，后续编译器会从 semanticCatalog.relationships 选择；你只需要准确声明分析粒度、主集合和需要补充的业务域/指标。\n"
                 "选择 rankingObjective 时要贴合用户排序短语，问题只说 GMV 时优先选直接 GMV 指标，不要选优惠率、占比或扣退款后派生指标。\n"
                 "如果输入含 diagnosticContext 且 semanticCatalog 有候选指标，优先围绕 diagnosticContext.intent/goal 选择可执行的 overview/risk_ranking/comparison 理解，不要空泛返回 NEED_MORE_KNOWLEDGE。\n"
                 "如果用户问走势、相关、匹配、同步上升或异常波动，analysisGrain 通常为 day；选择一个主时间序列指标做 rankingObjective，其余序列指标放 requestedMeasures。\n"
@@ -175,7 +182,7 @@ def default_prompt_registry() -> PromptRegistry:
             template=(
                 "你是商家 BI 问题重新理解 agent。只输出 JSON。\n"
                 "不要直接输出 QueryGraph 或 SQL，只输出 questionUnderstanding。\n"
-                "如果 critic 指出分析证据契约缺失或未覆盖，必须重新声明 analysisIntent、requiresExplanation、requiredEvidenceIntents，并把所需指标放入 requestedMeasures 或 knowledgeRequests。\n"
+                "如果 critic 指出 scope 未落地、分析证据契约缺失或未覆盖，必须重新声明 scopeConstraints、analysisIntent、requiresExplanation、requiredEvidenceIntents，并把所需指标放入 requestedMeasures 或 knowledgeRequests。\n"
                 "修复必须限制在 semanticCatalog 内，metricRef 必须来自 candidateMetrics.key。"
             ),
         )
@@ -192,6 +199,7 @@ def default_prompt_registry() -> PromptRegistry:
                 "SELECT 必须原样包含 nodePlanContract.outputKeys 的每个字段，以及 nodePlanContract.groupByColumn；这些字段即使只是用于 dependent 传递，也必须出现在 SELECT 结果中，不能只放在 WHERE 或 GROUP BY。\n"
                 "如果 nodePlanContract.metricSpecs 不为空，SELECT 必须输出每个 metricSpec.metricName；这些指标已经由 Planner/Compiler 确定，不能少查、不能改名、不能自行替换口径。\n"
                 "GROUP_AGG/TOPN 查询必须让所有非聚合 SELECT 字段同时出现在 GROUP BY 中，尤其不能丢 seller_id、pt、spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、coupon_id。\n"
+                "当 GROUP_AGG/TOPN 的 groupByColumn 是实体键（如 spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、refund_id、coupon_id）时，必须在 WHERE 里过滤 NULL 和空字符串，避免产生空实体桶。\n"
                 "dependent node 用 upstreamEntitySets 做 IN 过滤。必须按 merchant_id/seller_id 过滤商家。\n"
                 "pt 是 yyyyMMdd 分区字符串，时间窗必须写成 DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL N DAY), '%Y%m%d')。"
             ),

@@ -69,22 +69,6 @@ class EvidenceVerifier:
                         reason="上游实体超过本轮最大传递数量，dependent 结果可能只覆盖部分实体",
                     )
                 )
-        if "退款金额" in question and "refund_related_pay_amt_raw" in covered and "refund_amt" not in covered and not metric_resolution_confirmed(plan):
-            gaps.append(
-                EvidenceGap(
-                    code="FIELD_AMBIGUOUS",
-                    evidence="refund_related_pay_amt_raw",
-                    reason="资产未提供独立退款金额字段，pay_amt 只能作为退款关联支付金额原始值",
-                )
-            )
-        if "退款金额" in question and "pay_amt" in covered and "refund_amt" not in covered and not metric_resolution_confirmed(plan):
-            gaps.append(
-                EvidenceGap(
-                    code="FIELD_AMBIGUOUS",
-                    evidence="pay_amt",
-                    reason="资产未提供独立退款金额字段，pay_amt 只能作为退款关联支付金额原始值",
-                )
-            )
         gaps = [classify_evidence_gap(gap) for gap in gaps]
         blocking_gaps = [gap for gap in gaps if gap.severity == "blocking"]
         warning_gaps = [gap for gap in gaps if gap.severity == "warning"]

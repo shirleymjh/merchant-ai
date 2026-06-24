@@ -99,6 +99,8 @@
   },
   {
     "metricKey": "pay_amt",
+    "canonicalMetricKey": "pay_amt",
+    "metricLevel": "physical",
     "businessName": "订单支付金额",
     "formula": "SUM(pay_amt)",
     "unit": "元",
@@ -108,8 +110,13 @@
     ],
     "aliases": [
       "订单支付金额",
+      "订单金额",
       "交易支付金额",
-      "pay_amt"
+      "pay_amt",
+      "销售额",
+      "成交额",
+      "交易成交金额",
+      "销售金额"
     ],
     "confidence": 0.78,
     "evidence": "schema comment=支付金额，分; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"

@@ -4145,6 +4145,9 @@
   "metrics": [
     {
       "metricKey": "inbound_cnt",
+      "canonicalMetricKey": "scm_inbound_total_cnt",
+      "aliasOf": "scm_inbound_total_cnt",
+      "metricLevel": "physical",
       "businessName": "入库数量",
       "formula": "SUM(inbound_cnt)",
       "unit": "单",
@@ -4210,6 +4213,8 @@
     },
     {
       "metricKey": "scm_inbound_total_cnt",
+      "canonicalMetricKey": "scm_inbound_total_cnt",
+      "metricLevel": "business",
       "businessName": "入库数量",
       "formula": "SUM(inbound_cnt)",
       "unit": "件",

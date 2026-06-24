@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 from merchant_ai.models import (
     ExtractedKeywords,
     QuestionCategory,
     QuestionRoute,
     RecallBundle,
+    RouteObjectRef,
+    RouteSlots,
+    RouteTimeWindow,
+    RouteTopicCandidate,
     RoutingDecision,
     TOPIC_TO_CATEGORY,
     TopicRoutingDecision,
@@ -39,7 +43,7 @@ BUSINESS_KEYWORDS: Dict[QuestionCategory, List[str]] = {
     QuestionCategory.REFUND: ["退款", "退货", "售后", "退款率", "退货率", "refund", "refund_rate", "refund_bill_cnt"],
     QuestionCategory.CS_TICKET: ["工单", "客服", "催单", "二次开启", "评价分", "ticket", "cs_ticket"],
     QuestionCategory.COMPENSATION: ["赔付", "赔款", "理赔", "补偿", "repay", "compensation"],
-    QuestionCategory.COUPON: ["优惠", "优惠券", "折扣", "补贴", "coupon"],
+    QuestionCategory.COUPON: ["优惠", "优惠券", "券", "券活动", "折扣", "补贴", "coupon", "activity"],
     QuestionCategory.GOODS: ["商品", "审核", "上架", "spu", "sku", "类目", "资质", "新发布", "goods"],
     QuestionCategory.SCM: ["供应链", "履约", "入库", "质检", "鉴定", "出库", "仓库", "scm"],
     QuestionCategory.MERCHANT_OTHER: ["保证金", "申诉", "处罚", "费率", "结算"],
@@ -47,7 +51,30 @@ BUSINESS_KEYWORDS: Dict[QuestionCategory, List[str]] = {
     QuestionCategory.PLATFORM_RULE: ["规则", "处罚规则", "平台规则", "要求", "标准"],
 }
 
-ACTION_KEYWORDS = ["为什么", "原因", "影响", "分析", "对比", "环比", "同比", "同时", "分别", "并且", "综合", "关联", "对应"]
+ACTION_KEYWORDS = [
+    "为什么",
+    "原因",
+    "影响",
+    "分析",
+    "对比",
+    "环比",
+    "同比",
+    "同时",
+    "分别",
+    "并且",
+    "综合",
+    "关联",
+    "对应",
+    "趋势",
+    "走势",
+    "变化",
+    "同步",
+    "上升",
+    "下降",
+    "波动",
+    "异常",
+    "风险",
+]
 TIME_PATTERNS = [
     re.compile(r"(最近|近|过去|前)?\s*\d{1,3}\s*[天日]"),
     re.compile(r"(最近|近|过去|前)?\s*\d{1,2}\s*(周|星期|礼拜)"),
@@ -156,8 +183,171 @@ class QuestionRoutingService:
         return sum(1 for words in BUSINESS_KEYWORDS.values() if any(word.lower() in question.lower() for word in words))
 
 
+class RouteSlotExtractor:
+    OBJECT_PATTERNS = [
+        ("sub_order_id", re.compile(r"(?<![A-Za-z0-9_])sub_order_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("order_id", re.compile(r"(?<![A-Za-z0-9_])order_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("spu_id", re.compile(r"(?<![A-Za-z0-9_])spu_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("sku_id", re.compile(r"(?<![A-Za-z0-9_])sku_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("refund_id", re.compile(r"(?<![A-Za-z0-9_])refund_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("ticket_id", re.compile(r"(?<![A-Za-z0-9_])ticket_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("bill_id", re.compile(r"(?<![A-Za-z0-9_])bill_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+        ("coupon_id", re.compile(r"(?<![A-Za-z0-9_])coupon_id[_:=：-]+[A-Za-z0-9_-]+", re.I)),
+    ]
+    OBJECT_TOPICS = {
+        "order_id": [QuestionCategory.TRADE],
+        "sub_order_id": [QuestionCategory.TRADE],
+        "spu_id": [QuestionCategory.GOODS, QuestionCategory.TRADE],
+        "sku_id": [QuestionCategory.GOODS, QuestionCategory.TRADE],
+        "refund_id": [QuestionCategory.REFUND],
+        "ticket_id": [QuestionCategory.CS_TICKET],
+        "bill_id": [QuestionCategory.COMPENSATION],
+        "coupon_id": [QuestionCategory.COUPON],
+    }
+    WRITE_TERMS = ["删除", "修改", "更新", "创建", "重建", "写入", "导入", "新增", "truncate", "drop", "insert", "update", "delete"]
+    RISK_TERMS = ["平台规则", "规则", "处罚", "罚", "资质", "营业执照", "保证金", "敏感"]
+
+    def extract(self, question: str, keywords: ExtractedKeywords) -> RouteSlots:
+        text = question or ""
+        object_refs = self._object_refs(text)
+        time_window = self._time_window(text, keywords)
+        operation = "write_requested" if any(term.lower() in text.lower() for term in self.WRITE_TERMS) else "read"
+        analysis_signals = self._analysis_signals(keywords)
+        topic_candidates = self._topic_candidates(text, object_refs)
+        warnings: List[str] = []
+        risk_level = self._risk_level(text, operation)
+        if operation == "write_requested":
+            warnings.append("WRITE_OPERATION_REQUESTED")
+        if not topic_candidates:
+            warnings.append("NO_EXPLICIT_TOPIC")
+        if len(topic_candidates) >= 5:
+            warnings.append("BROAD_TOPIC_SET")
+        confidence = self._confidence(topic_candidates, object_refs, time_window, warnings)
+        return RouteSlots(
+            object_refs=object_refs,
+            time_window=time_window,
+            operation=operation,
+            risk_level=risk_level,
+            topic_candidates=topic_candidates,
+            analysis_signals=analysis_signals,
+            route_confidence=confidence,
+            route_warnings=warnings,
+        )
+
+    def _object_refs(self, text: str) -> List[RouteObjectRef]:
+        refs: List[RouteObjectRef] = []
+        seen: Set[tuple[str, str]] = set()
+        for ref_type, pattern in self.OBJECT_PATTERNS:
+            for match in pattern.finditer(text):
+                raw = match.group(0)
+                value = raw.replace("：", "_").replace(":", "_").replace("=", "_").replace("-", "_")
+                if ref_type == "order_id" and value.lower().startswith("sub_order_id"):
+                    continue
+                identity = (ref_type, value.lower())
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                refs.append(RouteObjectRef(ref_type=ref_type, value=value, raw=raw, confidence=0.95))
+        return refs
+
+    def _time_window(self, text: str, keywords: ExtractedKeywords) -> RouteTimeWindow:
+        raw = (keywords.time_keywords[0] if keywords and keywords.time_keywords else "") or self._first_time_expression(text)
+        days = extract_days(text, default=0)
+        return RouteTimeWindow(days=days, raw=raw, needs_freshness_check=days > 0 and days <= 2)
+
+    def _first_time_expression(self, text: str) -> str:
+        for pattern in TIME_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(0).strip()
+        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月", "这个月"]:
+            if word in text:
+                return word
+        return ""
+
+    def _analysis_signals(self, keywords: ExtractedKeywords) -> List[str]:
+        if keywords and keywords.action_keywords:
+            return ["weak_analysis_hint"]
+        return []
+
+    def _topic_candidates(self, text: str, object_refs: List[RouteObjectRef]) -> List[RouteTopicCandidate]:
+        by_topic: Dict[QuestionCategory, Dict[str, object]] = {}
+        lowered = text.lower()
+        for category, words in BUSINESS_KEYWORDS.items():
+            evidence = [word for word in words if word.lower() in lowered]
+            if not evidence:
+                continue
+            by_topic[category] = {"score": len(evidence), "evidence": evidence[:8]}
+        for ref in object_refs:
+            for category in self.OBJECT_TOPICS.get(ref.ref_type, []):
+                payload = by_topic.setdefault(category, {"score": 0, "evidence": []})
+                payload["score"] = int(payload.get("score") or 0) + 2
+                evidence = list(payload.get("evidence") or [])
+                if ref.ref_type not in evidence:
+                    evidence.append(ref.ref_type)
+                payload["evidence"] = evidence[:8]
+        ordered = []
+        for category in topic_domain_order():
+            payload = by_topic.get(category)
+            if not payload:
+                continue
+            ordered.append(
+                RouteTopicCandidate(
+                    topic=category,
+                    score=int(payload.get("score") or 0),
+                    evidence=[str(item) for item in payload.get("evidence") or []],
+                )
+            )
+        return ordered
+
+    def _risk_level(self, text: str, operation: str) -> str:
+        if operation == "write_requested":
+            return "high_risk"
+        if any(term in text for term in self.RISK_TERMS):
+            return "rule_sensitive"
+        return "normal"
+
+    def _confidence(
+        self,
+        topic_candidates: List[RouteTopicCandidate],
+        object_refs: List[RouteObjectRef],
+        time_window: RouteTimeWindow,
+        warnings: List[str],
+    ) -> float:
+        top_score = max([item.score for item in topic_candidates] or [0])
+        confidence = 0.35 + 0.08 * min(top_score, 5) + 0.06 * min(len(topic_candidates), 4)
+        if object_refs:
+            confidence += 0.08
+        if time_window.days:
+            confidence += 0.04
+        if warnings:
+            confidence -= 0.08
+        return max(0.0, min(0.95, round(confidence, 2)))
+
+
+def topic_domain_order() -> List[QuestionCategory]:
+    return [
+        QuestionCategory.TRADE,
+        QuestionCategory.REFUND,
+        QuestionCategory.GOODS,
+        QuestionCategory.CS_TICKET,
+        QuestionCategory.COMPENSATION,
+        QuestionCategory.COUPON,
+        QuestionCategory.SCM,
+        QuestionCategory.MERCHANT_OTHER,
+        QuestionCategory.IDENTITY,
+        QuestionCategory.PLATFORM_RULE,
+    ]
+
+
 class TopicRouterService:
-    def route(self, question: str, keywords: ExtractedKeywords, context_topic: str = "") -> TopicRoutingDecision:
+    def route(
+        self,
+        question: str,
+        keywords: ExtractedKeywords,
+        context_topic: str = "",
+        route_slots: Optional[RouteSlots] = None,
+    ) -> TopicRoutingDecision:
         text = question or ""
         if context_topic and context_topic in TOPIC_TO_CATEGORY:
             primary = TOPIC_TO_CATEGORY[context_topic]
@@ -171,6 +361,13 @@ class TopicRouterService:
         scores: Dict[QuestionCategory, int] = {}
         for category, words in BUSINESS_KEYWORDS.items():
             scores[category] = sum(1 for word in words if word.lower() in text.lower())
+        if route_slots:
+            for candidate in route_slots.topic_candidates:
+                try:
+                    category = QuestionCategory(candidate.topic)
+                except Exception:
+                    continue
+                scores[category] = max(scores.get(category, 0), int(candidate.score or 0))
         candidates = self._explicit_topics(scores)
         if not candidates:
             return TopicRoutingDecision(
@@ -190,19 +387,7 @@ class TopicRouterService:
         )
 
     def _explicit_topics(self, scores: Dict[QuestionCategory, int]) -> List[QuestionCategory]:
-        domain_order = [
-            QuestionCategory.TRADE,
-            QuestionCategory.REFUND,
-            QuestionCategory.GOODS,
-            QuestionCategory.CS_TICKET,
-            QuestionCategory.COMPENSATION,
-            QuestionCategory.COUPON,
-            QuestionCategory.SCM,
-            QuestionCategory.MERCHANT_OTHER,
-            QuestionCategory.IDENTITY,
-            QuestionCategory.PLATFORM_RULE,
-        ]
-        return [category for category in domain_order if scores.get(category, 0) > 0]
+        return [category for category in topic_domain_order() if scores.get(category, 0) > 0]
 
 
 def extract_days(question: str, default: int = 7) -> int:

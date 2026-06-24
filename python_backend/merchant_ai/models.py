@@ -83,6 +83,7 @@ class AnswerMode(str, Enum):
     DETAIL = "DETAIL"
     TOPN = "TOPN"
     GROUP_AGG = "GROUP_AGG"
+    DERIVED = "DERIVED"
     RULE = "RULE"
     IDENTITY = "IDENTITY"
     CHAT = "CHAT"
@@ -314,6 +315,36 @@ class TopicRoutingDecision(APIModel):
         return "、".join(topics) if topics else "未知"
 
 
+class RouteObjectRef(APIModel):
+    ref_type: str = ""
+    value: str = ""
+    raw: str = ""
+    confidence: float = 0.0
+
+
+class RouteTimeWindow(APIModel):
+    days: int = 0
+    raw: str = ""
+    needs_freshness_check: bool = False
+
+
+class RouteTopicCandidate(APIModel):
+    topic: QuestionCategory = QuestionCategory.UNKNOWN
+    score: int = 0
+    evidence: List[str] = Field(default_factory=list)
+
+
+class RouteSlots(APIModel):
+    object_refs: List[RouteObjectRef] = Field(default_factory=list)
+    time_window: RouteTimeWindow = Field(default_factory=RouteTimeWindow)
+    operation: str = "read"
+    risk_level: str = "normal"
+    topic_candidates: List[RouteTopicCandidate] = Field(default_factory=list)
+    analysis_signals: List[str] = Field(default_factory=list)
+    route_confidence: float = 0.0
+    route_warnings: List[str] = Field(default_factory=list)
+
+
 class RecallItem(APIModel):
     doc_id: str = ""
     title: str = ""
@@ -333,6 +364,20 @@ class RecallBundle(APIModel):
 
     def has_strong_match(self) -> bool:
         return self.top_score >= 4.0 or any(item.fusion_score >= 4.0 for item in self.items)
+
+
+class IntentSignals(APIModel):
+    has_rule_evidence: bool = False
+    rule_evidence_refs: List[str] = Field(default_factory=list)
+    rule_evidence_count: int = 0
+    has_data_intent: bool = False
+    data_topics: List[QuestionCategory] = Field(default_factory=list)
+    has_analysis_intent: bool = False
+    open_diagnostic_intent: str = ""
+    rule_confidence: float = 0.0
+    data_confidence: float = 0.0
+    suggested_actions: List[str] = Field(default_factory=list)
+    observations: List[str] = Field(default_factory=list)
 
 
 class KnowledgeRequest(APIModel):
@@ -393,6 +438,7 @@ class PlannerReflectionResult(APIModel):
     suggested_knowledge_requests: List[KnowledgeRequest] = Field(default_factory=list)
     repair_hints: List[str] = Field(default_factory=list)
     repair_reason: str = ""
+    repair_requests: List["PlannerRepairRequest"] = Field(default_factory=list)
 
 
 class NodeToolResult(APIModel):
@@ -409,6 +455,7 @@ class NodeToolCall(APIModel):
     output_summary: str = ""
     error_type: str = ""
     repair_round: int = 0
+    duration_ms: int = 0
 
 
 class SourceRef(APIModel):
@@ -417,6 +464,18 @@ class SourceRef(APIModel):
     title: str = ""
     locator: str = ""
     reason: str = ""
+
+
+class ArtifactRef(APIModel):
+    artifact_id: str = ""
+    namespace: str = ""
+    path: str = ""
+    relative_path: str = ""
+    title: str = ""
+    reason: str = ""
+    bytes: int = 0
+    estimated_chars: int = 0
+    sha256: str = ""
 
 
 class ImportantFact(APIModel):
@@ -434,6 +493,110 @@ class ContextSnapshot(APIModel):
     source_refs: List[SourceRef] = Field(default_factory=list)
     token_budget: int = 0
     truncated: bool = False
+
+
+class ContextPackage(APIModel):
+    package_id: str = ""
+    run_id: str = ""
+    thread_id: str = ""
+    stage: str = ""
+    agent: str = ""
+    task_id: str = ""
+    question: str = ""
+    merchant_id: str = ""
+    goal: str = ""
+    constraints: List[str] = Field(default_factory=list)
+    protected_facts: List[ImportantFact] = Field(default_factory=list)
+    source_refs: List[SourceRef] = Field(default_factory=list)
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    allowed_tables: List[str] = Field(default_factory=list)
+    allowed_metrics: List[str] = Field(default_factory=list)
+    evidence_gaps: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: str = ""
+    inline_budget_chars: int = 0
+    input_chars: int = 0
+    offload_reason: str = ""
+
+
+class TraceSpan(APIModel):
+    span_id: str = ""
+    parent_span_id: str = ""
+    run_id: str = ""
+    step_id: str = ""
+    kind: str = ""
+    name: str = ""
+    status: str = ""
+    start_time: datetime = Field(default_factory=datetime.now)
+    end_time: Optional[datetime] = None
+    duration_ms: int = 0
+    model: str = ""
+    provider: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    estimated_prompt_chars: int = 0
+    estimated_completion_chars: int = 0
+    sql_hash: str = ""
+    table: str = ""
+    row_count: int = 0
+    error_code: str = ""
+    error_message: str = ""
+    retry_or_fallback_count: int = 0
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RunStep(APIModel):
+    step_id: str = ""
+    run_id: str = ""
+    action_id: str = ""
+    agent: str = ""
+    node: str = ""
+    status: str = ""
+    reason: str = ""
+    start_time: datetime = Field(default_factory=datetime.now)
+    end_time: Optional[datetime] = None
+    duration_ms: int = 0
+    input_summary: str = ""
+    output_summary: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+
+
+class SemanticCatalogVersion(APIModel):
+    semantic_version: str = ""
+    schema_version: str = ""
+    topic: str = ""
+    table: str = ""
+    source_hash: str = ""
+    published_at: str = ""
+    live_schema_checked_at: str = ""
+
+
+class SchemaDriftReport(APIModel):
+    topic: str = ""
+    table: str = ""
+    semantic_version: str = ""
+    schema_version: str = ""
+    source_hash: str = ""
+    live_schema_checked_at: str = ""
+    missing_live_columns: List[str] = Field(default_factory=list)
+    extra_live_columns: List[str] = Field(default_factory=list)
+    type_changed_columns: List[Dict[str, Any]] = Field(default_factory=list)
+    live_column_count: int = 0
+    semantic_column_count: int = 0
+
+
+class PlannerRepairRequest(APIModel):
+    reason: str = ""
+    stage: str = ""
+    action: str = ""
+    query: str = ""
+    task_id: str = ""
+    evidence: str = ""
+    repair_hints: List[str] = Field(default_factory=list)
+    knowledge_requests: List[KnowledgeRequest] = Field(default_factory=list)
+    source: str = ""
 
 
 class ToolRuntimePolicy(APIModel):
@@ -603,6 +766,8 @@ class PlanningAssetPack(APIModel):
     relationship_closure: List[str] = Field(default_factory=list)
     skill_semantic_gaps: List[Dict[str, Any]] = Field(default_factory=list)
     metric_compaction: Dict[str, Any] = Field(default_factory=dict)
+    semantic_catalog_version: Dict[str, SemanticCatalogVersion] = Field(default_factory=dict)
+    schema_drift_reports: List[SchemaDriftReport] = Field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (self.tables or self.fields or self.metrics or self.relationships or self.rules or self.terms)
@@ -740,6 +905,7 @@ class QuestionIntent(APIModel):
 class QueryPlan(APIModel):
     intents: List[QuestionIntent] = Field(default_factory=list)
     dependencies: List[PlanDependency] = Field(default_factory=list)
+    knowledge_requests: List[KnowledgeRequest] = Field(default_factory=list)
     evidence_contracts: List[Dict[str, Any]] = Field(default_factory=list)
     clarification_needs: List[str] = Field(default_factory=list)
     final_required_evidence: List[str] = Field(default_factory=list)
@@ -751,6 +917,7 @@ class QueryPlan(APIModel):
     planner_tool_results: List[Dict[str, Any]] = Field(default_factory=list)
     planner_loaded_refs: List[str] = Field(default_factory=list)
     planner_context_files: List[Dict[str, Any]] = Field(default_factory=list)
+    planner_prompt_stats: Dict[str, Any] = Field(default_factory=dict)
     display_policy: DisplayPolicy = DisplayPolicy.DEFAULT
     display_title: str = ""
 
@@ -777,6 +944,9 @@ class QueryBundle(APIModel):
     summary: str = ""
     offloaded_files: List[str] = Field(default_factory=list)
     original_row_count: int = 0
+    duration_ms: int = 0
+    cache_hit: bool = False
+    cache_key: str = ""
 
     def effective_row_count(self) -> int:
         return self.original_row_count or len(self.rows)
@@ -879,6 +1049,9 @@ class AgentRunEventRecord(APIModel):
     thread_id: str
     event_type: str
     node: str = ""
+    step_id: str = ""
+    tool_call_id: str = ""
+    parent_id: str = ""
     payload: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.now)
 
@@ -891,5 +1064,10 @@ class AgentRunRecord(APIModel):
     status: AgentRunStatus = AgentRunStatus.CREATED
     answer: Optional[ChatResponse] = None
     error: str = ""
+    start_time: datetime = Field(default_factory=datetime.now)
+    end_time: Optional[datetime] = None
+    final_answer_hash: str = ""
+    performance_summary: Dict[str, Any] = Field(default_factory=dict)
+    trace_path: str = ""
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)

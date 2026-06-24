@@ -21,6 +21,7 @@
 - 处罚次数：SUM(punish_cnt_1d)，单位=单，来源字段=punish_cnt_1d，同义词=处罚次数、punish_cnt_1d、处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正
 - 申诉次数：SUM(appeal_cnt_1d)，单位=单，来源字段=appeal_cnt_1d，同义词=申诉次数、appeal_cnt_1d、申诉次数-最近1天
 - 申诉成功次数：SUM(appeal_success_cnt_1d)，单位=单，来源字段=appeal_success_cnt_1d，同义词=申诉成功次数、appeal_success_cnt_1d、申诉成功次数-最近1天
+- 申诉成功率：SUM(appeal_success_cnt_1d) / NULLIF(SUM(appeal_cnt_1d), 0)，单位=%，来源指标=appeal_success_cnt_1d、appeal_cnt_1d，来源字段=appeal_success_cnt_1d、appeal_cnt_1d，同义词=申诉成功率、申诉通过率、appeal_success_rate、appeal_success_rate_1d
 - 供应链履约量：SUM(scm_performance_cnt_1d)，单位=单，来源字段=scm_performance_cnt_1d，同义词=供应链履约量、scm_performance_cnt_1d、供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计
 - 退货成功量：SUM(return_success_cnt_1d)，单位=单，来源字段=return_success_cnt_1d，同义词=退货成功量、return_success_cnt_1d、退货成功量-最近1天
 - 退货量：SUM(return_cnt_1d)，单位=单，来源字段=return_cnt_1d，同义词=退货量、return_cnt_1d、退货量-最近1天

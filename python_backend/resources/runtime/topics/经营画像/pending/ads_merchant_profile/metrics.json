@@ -51,6 +51,8 @@
   },
   {
     "metricKey": "order_gmv_amt_1d",
+    "canonicalMetricKey": "order_gmv_amt_1d",
+    "metricLevel": "business",
     "businessName": "总gmv金额元",
     "formula": "SUM(order_gmv_amt_1d)",
     "unit": "元",
@@ -90,6 +92,9 @@
   },
   {
     "metricKey": "pay_gmv_amt_1d",
+    "canonicalMetricKey": "order_gmv_amt_1d",
+    "aliasOf": "order_gmv_amt_1d",
+    "metricLevel": "business_variant",
     "businessName": "支付gmv金额元",
     "formula": "SUM(pay_gmv_amt_1d)",
     "unit": "元",
@@ -512,6 +517,9 @@
   },
   {
     "metricKey": "trade_success_gmv_amt_1d",
+    "canonicalMetricKey": "order_gmv_amt_1d",
+    "aliasOf": "order_gmv_amt_1d",
+    "metricLevel": "business_variant",
     "businessName": "交易成功gmv金额元",
     "formula": "SUM(trade_success_gmv_amt_1d)",
     "unit": "元",
@@ -864,6 +872,8 @@
   },
   {
     "metricKey": "net_gmv_after_refund",
+    "canonicalMetricKey": "net_gmv_after_refund",
+    "metricLevel": "derived",
     "businessName": "扣退款后 GMV",
     "formula": "SUM(order_gmv_amt_1d) - SUM(refund_amt_1d)",
     "unit": "元",

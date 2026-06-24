@@ -58,6 +58,7 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
         response = client.post("/api/chat", json={"message": question, "merchantId": merchant_id}, timeout=240)
         body = response.json()
         debug = body.get("debugTrace") or {}
+        harness_debug = debug.get("harness") or {}
         queue.put(
             {
                 "case": case_index,
@@ -69,10 +70,12 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
                 "topic": body.get("categoryName", ""),
                 "assetPack": debug.get("planningAssetPack", {}),
                 "harness": {
-                    "actions": (debug.get("harness") or {}).get("actions", []),
-                    "actionHistory": (debug.get("harness") or {}).get("actionHistory", []),
-                    "leadDecisions": (debug.get("harness") or {}).get("leadDecisions", []),
-                    "decisionReason": (debug.get("harness") or {}).get("decisionReason", ""),
+                    "actions": harness_debug.get("actions", []),
+                    "actionHistory": harness_debug.get("actionHistory", []),
+                    "leadDecisions": harness_debug.get("leadDecisions", []),
+                    "decisionReason": harness_debug.get("decisionReason", ""),
+                    "performance": harness_debug.get("performance", {}),
+                    "traceReplay": harness_debug.get("traceReplay", {}),
                 },
                 "plannerReflection": debug.get("plannerReflection", {}),
                 "queryGraph": {
@@ -90,6 +93,8 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
                 "evidenceGaps": debug.get("evidenceGaps", []),
                 "verifiedEvidence": debug.get("verifiedEvidence", {}),
                 "partialAnswerReason": debug.get("partialAnswerReason", ""),
+                "performance": harness_debug.get("performance", {}),
+                "traceReplay": harness_debug.get("traceReplay", {}),
             }
         )
     except Exception as exc:
@@ -160,8 +165,38 @@ def main() -> int:
             flush=True,
         )
     output.write_text(json.dumps(results, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    print(json.dumps({"success": True, "cases": len(results), "output": str(output)}, ensure_ascii=False))
+    print(json.dumps({"success": True, "cases": len(results), "output": str(output), "performanceSummary": summarize_performance(results)}, ensure_ascii=False))
     return 0
+
+
+def summarize_performance(results: list[dict[str, Any]]) -> dict[str, Any]:
+    slow_cases = sorted(
+        [
+            {
+                "case": item.get("case"),
+                "elapsedSeconds": item.get("elapsedSeconds", 0),
+                "question": str(item.get("question") or "")[:80],
+                "totalDurationMs": ((item.get("performance") or {}).get("totalDurationMs") or 0),
+            }
+            for item in results
+        ],
+        key=lambda item: float(item.get("elapsedSeconds") or 0),
+        reverse=True,
+    )[:8]
+    timeout_count = 0
+    sql_errors = 0
+    row_count = 0
+    for item in results:
+        perf = item.get("performance") or {}
+        timeout_count += int(((perf.get("llm") or {}).get("timeouts") or 0))
+        sql_errors += int(((perf.get("sql") or {}).get("errors") or 0))
+        row_count += int(((perf.get("sql") or {}).get("rows") or 0))
+    return {
+        "slowCases": slow_cases,
+        "llmTimeouts": timeout_count,
+        "sqlErrors": sql_errors,
+        "sqlRows": row_count,
+    }
 
 
 if __name__ == "__main__":

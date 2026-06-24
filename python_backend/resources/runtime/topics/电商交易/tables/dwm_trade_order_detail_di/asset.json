@@ -3822,6 +3822,8 @@
   "metrics": [
     {
       "metricKey": "order_detail_cnt",
+      "canonicalMetricKey": "order_detail_cnt",
+      "metricLevel": "business",
       "businessName": "下单数",
       "formula": "COUNT(DISTINCT sub_order_id)",
       "unit": "单",
@@ -3945,6 +3947,8 @@
     },
     {
       "metricKey": "pay_amt",
+      "canonicalMetricKey": "pay_amt",
+      "metricLevel": "physical",
       "businessName": "支付金额",
       "formula": "SUM(pay_amt)",
       "unit": "元",

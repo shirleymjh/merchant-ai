@@ -3918,6 +3918,8 @@
     },
     {
       "metricKey": "pay_amt",
+      "canonicalMetricKey": "pay_amt",
+      "metricLevel": "physical",
       "businessName": "支付金额",
       "formula": "SUM(pay_amt)",
       "unit": "元",

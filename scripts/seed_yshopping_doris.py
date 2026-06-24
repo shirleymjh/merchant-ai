@@ -235,13 +235,18 @@ def row_from_map(table: str, columns: list[dict[str, str]], values: dict, row_in
 
 def product_for_index(index: int) -> dict:
     raw = PRODUCT_CATALOG[index % len(PRODUCT_CATALOG)]
+    # The repo DDL models dwm_goods_detail_df.spu_id as BIGINT, while order/scm
+    # tables expose it as text/varchar. Keep seed data cross-table comparable by
+    # using the numeric business id everywhere instead of prefixed demo strings.
+    spu_id = str(trailing_number(raw[0]))
+    sku_id = str(trailing_number(raw[2]))
     return {
-        "spu_id": raw[0],
+        "spu_id": spu_id,
         "spu_name": raw[1],
-        "sku_id": raw[2],
+        "sku_id": sku_id,
         "sku_name": raw[3],
         "price": raw[4],
-        "seq": trailing_number(raw[0]),
+        "seq": int(spu_id or 0),
     }
 
 
@@ -321,6 +326,7 @@ def build_orders(base_date: date, rng: random.Random) -> list[dict]:
         amount = money(max(9, product["price"] * qty - discount))
         status = rng.choices(statuses, weights=[58, 18, 12, 8, 4], k=1)[0]
         paid = status != "交易关闭"
+        coupon_id = id_value("coupon_id", seq) if paid and discount > 0 else ""
         order = add_common_aliases({
             "pt": pt,
             "order_id": id_value("order_id", seq),
@@ -337,11 +343,19 @@ def build_orders(base_date: date, rng: random.Random) -> list[dict]:
             "sku_name": product["sku_name"],
             "sku_cnt": qty,
             "quantity": qty,
+            "discount_amt": discount,
+            "discount_id": coupon_id,
+            "discount_rel_id": coupon_id,
+            "discount_type_code": 1 if coupon_id else 0,
+            "discount_type_name": "优惠券" if coupon_id else "",
+            "is_use": 1 if coupon_id else 0,
             "pay_amt": amount if paid else 0,
             "pay_status_name": "支付成功" if paid else "未支付",
             "address_city_name": rng.choices(cities, weights=[38, 14, 9, 8, 7, 7, 7, 5, 5], k=1)[0],
             "receiver_city_name": rng.choices(cities, weights=[38, 14, 9, 8, 7, 7, 7, 5, 5], k=1)[0],
             "sub_order_create_time": datetime_string(pt, rng.randrange(8, 23), rng.randrange(0, 60), rng.randrange(0, 60)),
+            "discount_create_time": datetime_string(pt, rng.randrange(8, 23), rng.randrange(0, 60), rng.randrange(0, 60)),
+            "discount_modify_time": datetime_string(pt, rng.randrange(8, 23), rng.randrange(0, 60), rng.randrange(0, 60)),
         })
         orders.append(order)
         seq += 1
@@ -411,6 +425,7 @@ def build_refunds(base_date: date, orders: list[dict], rng: random.Random) -> li
             "refund_status_name": status,
             "refund_reason": reason,
             "refund_amt": amount,
+            "discount_id": order.get("discount_rel_id") or order.get("discount_id") or "",
             "refund_create_time": refund_time,
         }))
     return refunds
@@ -520,25 +535,66 @@ def build_coupons(base_date: date, orders: list[dict], rng: random.Random) -> li
     buyers = sorted({order["buyer_id"] for order in orders})
     rows = []
     templates = [("满200减20券", 20, 200), ("满300减30券", 30, 300), ("老客复购10元券", 10, 99), ("夏季包邮券", 8, 59)]
-    for index in range(1, 91):
-        pt = base_date - timedelta(days=rng.randrange(0, 90))
+    used_coupon_orders = [
+        order
+        for order in orders
+        if order.get("discount_rel_id") and order.get("pay_amt", 0) > 0
+    ]
+    used_coupon_orders = sorted(used_coupon_orders, key=lambda item: (str(item.get("pt")), str(item.get("sub_order_id"))))
+    for index, order in enumerate(used_coupon_orders, start=1):
+        order_pt = datetime.strptime(str(order["pt"])[:10], "%Y-%m-%d").date()
+        pt = max(base_date - timedelta(days=90), order_pt - timedelta(days=rng.randrange(0, 3)))
         title, amt, threshold = rng.choice(templates)
         rows.append({
             "pt": pt,
-            "coupon_id": id_value("coupon_id", index),
-            "user_id": rng.choice(buyers),
+            "coupon_id": order["discount_rel_id"],
+            "user_id": order["buyer_id"],
             "seller_id": "100",
             "seller_name": "杭州云尚优选商贸有限公司",
             "template_id": id_value("template_id", (index % 8) + 1),
             "template_title": title,
             "activity_id": id_value("activity_id", (index % 5) + 1),
             "activity_name": "夏季焕新活动" if index % 2 else "老客复购活动",
+            "coupon_amt": order.get("discount_amt") or amt,
+            "threshold": threshold,
+            "discount_way_code": 1,
+            "discount_way_name": "满减",
+            "coupon_send_status_code": 2,
+            "coupon_send_status_name": "已核销",
+            "is_receive": 1,
+            "is_voucher": 0,
+            "coupon_create_time": datetime_string(pt, rng.randrange(8, 22), rng.randrange(0, 60)),
+            "coupon_modify_time": datetime_string(order_pt, rng.randrange(8, 22), rng.randrange(0, 60)),
+            "snap_create_time": datetime_string(pt, rng.randrange(8, 22), rng.randrange(0, 60)),
+            "snap_modify_time": datetime_string(order_pt, rng.randrange(8, 22), rng.randrange(0, 60)),
+            "template_create_time": datetime_string(pt - timedelta(days=7), 10, 0),
+            "template_modify_time": datetime_string(pt - timedelta(days=1), 10, 0),
+            "activity_start_time": datetime_string(pt - timedelta(days=3), 0, 0),
+            "activity_expire_time": datetime_string(min(base_date, pt + timedelta(days=14)), 23, 59, 59),
+            "activity_create_time": datetime_string(pt - timedelta(days=5), 10, 0),
+            "activity_modify_time": datetime_string(pt - timedelta(days=1), 10, 0),
+            "coupon_content": f"{title}，满{threshold}减{amt}",
+        })
+    next_index = len(rows) + 1
+    while len(rows) < 90:
+        pt = base_date - timedelta(days=rng.randrange(0, 90))
+        title, amt, threshold = rng.choice(templates)
+        rows.append({
+            "pt": pt,
+            "coupon_id": id_value("coupon_id", 1000 + next_index),
+            "user_id": rng.choice(buyers),
+            "seller_id": "100",
+            "seller_name": "杭州云尚优选商贸有限公司",
+            "template_id": id_value("template_id", (next_index % 8) + 1),
+            "template_title": title,
+            "activity_id": id_value("activity_id", (next_index % 5) + 1),
+            "activity_name": "夏季焕新活动" if next_index % 2 else "老客复购活动",
             "coupon_amt": amt,
             "threshold": threshold,
             "discount_way_code": 1,
             "discount_way_name": "满减",
-            "coupon_send_status_code": rng.choice([1, 2, 3]),
-            "coupon_send_status_name": rng.choice(["已领取", "已核销", "已过期"]),
+            "coupon_send_status_code": rng.choice([1, 3]),
+            "coupon_send_status_name": rng.choice(["已领取", "已过期"]),
             "is_receive": 1,
             "is_voucher": 0,
             "coupon_create_time": datetime_string(pt, rng.randrange(8, 22), rng.randrange(0, 60)),
@@ -547,6 +603,7 @@ def build_coupons(base_date: date, orders: list[dict], rng: random.Random) -> li
             "activity_expire_time": datetime_string(min(base_date, pt + timedelta(days=14)), 23, 59, 59),
             "coupon_content": f"{title}，满{threshold}减{amt}",
         })
+        next_index += 1
     return rows
 
 

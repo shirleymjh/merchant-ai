@@ -8,31 +8,48 @@ from merchant_ai.models import (
     AgentActionTrace,
     AgentDecision,
     AgentRunResult,
+    ContextPackage,
     ChatContext,
     CircuitBreakerState,
     ContextSnapshot,
     FreshnessCheckResult,
     GraphValidationResult,
+    IntentSignals,
     KnowledgeRequest,
     MerchantInfo,
     MerchantRecentFocus,
     NodeToolCall,
+    PlannerRepairRequest,
     PlanningAssetPack,
     PlannerReflectionResult,
     QueryBundle,
     QueryPlan,
     QuestionCategory,
     RecallBundle,
+    RouteSlots,
     RoutingDecision,
     ThreadData,
     ToolCallExecutionResult,
     ToolFailureRecord,
     ToolRuntimePolicy,
+    RunStep,
+    TraceSpan,
     TopicRoutingDecision,
 )
 
 
 GraphEventListener = Callable[[str, str, Dict[str, Any]], None]
+_EVENT_LISTENERS: Dict[str, GraphEventListener] = {}
+
+
+def register_event_listener(run_id: str, listener: Optional[GraphEventListener]) -> None:
+    if run_id and listener:
+        _EVENT_LISTENERS[run_id] = listener
+
+
+def unregister_event_listener(run_id: str) -> None:
+    if run_id:
+        _EVENT_LISTENERS.pop(run_id, None)
 
 
 class AgentState(TypedDict, total=False):
@@ -51,12 +68,20 @@ class AgentState(TypedDict, total=False):
     recent_focus: MerchantRecentFocus
     routing_decision: RoutingDecision
     topic_routing_decision: TopicRoutingDecision
+    route_slots: RouteSlots
+    route_decision_trace: List[Dict[str, Any]]
+    bounded_route_llm_trace: Dict[str, Any]
     extracted_keywords: Any
     plan: QueryPlan
     recall_bundle: RecallBundle
+    intent_signals: IntentSignals
     planning_asset_pack: PlanningAssetPack
     query_graph_validation_result: GraphValidationResult
     pending_knowledge_requests: List[KnowledgeRequest]
+    knowledge_request_attempts: Dict[str, int]
+    knowledge_request_fingerprints: Dict[str, str]
+    blocked_knowledge_request_keys: List[str]
+    knowledge_request_gaps: List[Dict[str, Any]]
     agent_run_result: AgentRunResult
     query_bundle: QueryBundle
     query_bundles: List[QueryBundle]
@@ -68,6 +93,10 @@ class AgentState(TypedDict, total=False):
     node_tool_traces: List[NodeToolCall]
     freshness_reports: List[FreshnessCheckResult]
     context_snapshots: List[ContextSnapshot]
+    context_packages: List[ContextPackage]
+    run_steps: List[RunStep]
+    trace_spans: List[TraceSpan]
+    planner_repair_requests: List[PlannerRepairRequest]
     tool_failures: List[ToolFailureRecord]
     circuit_breakers: List[CircuitBreakerState]
     tool_runtime_policies: List[ToolRuntimePolicy]
@@ -91,6 +120,8 @@ class AgentState(TypedDict, total=False):
 
     answer: str
     analysis_summary: str
+    analysis_skill_trace: Dict[str, Any]
+    answer_used_llm: bool
     suggestions: List[str]
     thinking_steps: List[str]
     history_rows: List[Dict[str, Any]]
@@ -102,6 +133,9 @@ class AgentState(TypedDict, total=False):
     planning_assets_compacted: bool
     skills_loaded: bool
     loaded_skills: List[str]
+    rule_recall_ready: bool
+    rule_recall_refs: List[str]
+    rule_recall_context: str
     query_graph_validated: bool
     query_graph_reflected: bool
     sql_repair_reviewed: bool
@@ -126,7 +160,7 @@ class AgentState(TypedDict, total=False):
 
 
 def emit(state: AgentState, event_type: str, node: str, payload: Dict[str, Any]) -> None:
-    listener = state.get("event_listener")
+    listener = _EVENT_LISTENERS.get(str(state.get("run_id") or "")) or state.get("event_listener")
     if listener:
         listener(event_type, node, payload)
 

@@ -3255,6 +3255,8 @@
     },
     {
       "metricKey": "pay_amt",
+      "canonicalMetricKey": "pay_amt",
+      "metricLevel": "business",
       "businessName": "退款金额",
       "formula": "SUM(pay_amt)",
       "unit": "元",

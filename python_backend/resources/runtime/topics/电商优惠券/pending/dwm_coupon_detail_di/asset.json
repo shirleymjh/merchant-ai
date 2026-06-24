@@ -1411,6 +1411,9 @@
   "metrics": [
     {
       "metricKey": "coupon_amt",
+      "canonicalMetricKey": "coupon_total_amt",
+      "aliasOf": "coupon_total_amt",
+      "metricLevel": "physical",
       "businessName": "优惠金额",
       "formula": "SUM(coupon_amt)",
       "unit": "元",
@@ -1474,6 +1477,8 @@
     },
     {
       "metricKey": "coupon_total_amt",
+      "canonicalMetricKey": "coupon_total_amt",
+      "metricLevel": "business",
       "businessName": "优惠券金额",
       "formula": "SUM(coupon_amt)",
       "unit": "元",

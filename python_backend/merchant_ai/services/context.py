@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
-from merchant_ai.models import ContextSnapshot, ImportantFact, SourceRef
+from merchant_ai.models import ArtifactRef, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
 
 
 class ImportantFactExtractor:
@@ -73,7 +74,11 @@ class ContextManager:
         state.setdefault("context_snapshots", []).append(snapshot.model_dump(by_alias=True))
         state["context_snapshots"] = state["context_snapshots"][-8:]
         state["summary_context"] = self.summary_context(state["context_snapshots"])
+        package = self.package(state, stage=stage, agent=self.agent_for_stage(stage), snapshot=snapshot)
+        state.setdefault("context_packages", []).append(package)
+        state["context_packages"] = state["context_packages"][-12:]
         self.persist_snapshot(state, snapshot)
+        self.persist_package(state, package)
         return snapshot
 
     def snapshot(self, state: Dict[str, Any], stage: str) -> ContextSnapshot:
@@ -125,3 +130,107 @@ class ContextManager:
             path.write_text(json.dumps(snapshot.model_dump(by_alias=True), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
         except Exception:
             return
+
+    def package(
+        self,
+        state: Dict[str, Any],
+        stage: str,
+        agent: str,
+        snapshot: Optional[ContextSnapshot] = None,
+        task_id: str = "",
+        artifact_refs: Optional[List[ArtifactRef]] = None,
+        allowed_tables: Optional[List[str]] = None,
+        allowed_metrics: Optional[List[str]] = None,
+    ) -> ContextPackage:
+        snapshot = snapshot or self.snapshot(state, stage)
+        pack = state.get("planning_asset_pack")
+        if allowed_tables is None and pack is not None and hasattr(pack, "known_tables"):
+            allowed_tables = pack.known_tables()[:12]
+        if allowed_metrics is None and pack is not None:
+            allowed_metrics = [getattr(item, "key", "") for item in getattr(pack, "metrics", [])[:24] if getattr(item, "key", "")]
+        run_result = state.get("agent_run_result")
+        gaps = []
+        if run_result is not None:
+            for gap in getattr(run_result, "evidence_gaps", [])[:12]:
+                gaps.append(gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap)
+        question = str(state.get("question") or "")
+        summary = snapshot.summary[:4000]
+        input_chars = len(question) + len(summary) + sum(len(str(fact.value)) for fact in snapshot.protected_facts)
+        return ContextPackage(
+            package_id="ctx_" + uuid.uuid4().hex,
+            run_id=str(state.get("run_id") or ""),
+            thread_id=str(state.get("thread_id") or ""),
+            stage=stage,
+            agent=agent,
+            task_id=task_id,
+            question=question,
+            merchant_id=str(state.get("requested_merchant_id") or ""),
+            goal=question[:500],
+            constraints=[
+                "single-node SQL must stay within node plan contract",
+                "answer agent may use verified evidence only",
+                "large objects are referenced by artifact path",
+            ],
+            protected_facts=snapshot.protected_facts[:18],
+            source_refs=snapshot.source_refs[:12],
+            artifact_refs=artifact_refs or self.artifact_refs(state),
+            allowed_tables=allowed_tables or [],
+            allowed_metrics=allowed_metrics or [],
+            evidence_gaps=gaps,
+            summary=summary,
+            inline_budget_chars=int(getattr(self.settings, "context_file_inline_max_chars", 0) or 0),
+            input_chars=input_chars,
+            offload_reason="large rows/tool results stay in workspace artifacts; context package keeps refs only",
+        )
+
+    def artifact_refs(self, state: Dict[str, Any]) -> List[ArtifactRef]:
+        refs: List[ArtifactRef] = []
+        thread_data = state.get("thread_data")
+        outputs_path = getattr(thread_data, "outputs_path", "") if thread_data is not None else ""
+        if not outputs_path:
+            return refs
+        for relative in [
+            "trace_replay.json",
+            "context_snapshot.json",
+            "artifacts/planner/planning_asset_pack.json",
+            "artifacts/planner/query_graph.json",
+            "artifacts/node/agent_run_result.json",
+        ]:
+            path = Path(outputs_path) / relative
+            if path.exists():
+                refs.append(
+                    ArtifactRef(
+                        artifact_id="artifact_" + uuid.uuid4().hex,
+                        namespace=relative.split("/", 1)[0] if "/" in relative else "trace",
+                        path=str(path),
+                        relative_path=relative,
+                        title=path.name,
+                        reason="recoverable context artifact",
+                        bytes=path.stat().st_size,
+                        estimated_chars=path.stat().st_size,
+                    )
+                )
+        return refs
+
+    def persist_package(self, state: Dict[str, Any], package: ContextPackage) -> None:
+        thread_data = state.get("thread_data")
+        outputs_path = getattr(thread_data, "outputs_path", "") if thread_data is not None else ""
+        if not outputs_path:
+            return
+        try:
+            path = Path(outputs_path) / "context_packages" / ("%s.json" % package.stage)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(package.model_dump(by_alias=True), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+        except Exception:
+            return
+
+    def agent_for_stage(self, stage: str) -> str:
+        if stage in {"plan_query_graph", "compact_assets"}:
+            return "PlannerAgent"
+        if stage in {"execute_query_graph"}:
+            return "NodeAgent"
+        if stage in {"verify_evidence_graph"}:
+            return "EvidenceVerifierAgent"
+        if stage in {"cache_answer", "answer_analysis"}:
+            return "AnswerAgent"
+        return "LeadAgent"

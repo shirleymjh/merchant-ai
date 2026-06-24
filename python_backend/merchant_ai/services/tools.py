@@ -68,6 +68,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "metricRef": string_property("candidate metric key used for sorting; empty for detail lookup"),
             "sourcePhrase": string_property("exact source phrase from the user question"),
             "ownerTable": string_property("metric owner table from semanticCatalog"),
+            "objectiveType": string_property("metric objective type", ["metric_total", "ranking", "trend_anchor", "detail_anchor"]),
             "groupByColumn": string_property("grain column such as spu_id, sub_order_id, order_id or pt"),
             "order": string_property("sort direction", ["desc", "asc"]),
             "limit": integer_property("top N limit", 1),
@@ -82,10 +83,41 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
         },
         required=["metricRef", "ownerTable"],
     )
+    scope_schema = object_schema(
+        {
+            "scopeId": string_property("stable id for this bounded entity set, e.g. coupon_order_scope"),
+            "sourcePhrase": string_property("exact source phrase that limits the population, e.g. orders brought by a campaign"),
+            "ownerTable": string_property("semanticCatalog table that defines the bounded population"),
+            "metricRef": string_property("optional candidate metric key that describes the scope source"),
+            "entityGrain": string_property("entity grain produced by the scope", ["merchant", "product", "order", "day", "ticket", "refund", "coupon", "unknown"]),
+            "targetDomain": string_property("optional semantic domain that the scope should constrain, e.g. order/refund/product/coupon"),
+            "required": boolean_property("true when this scope must be applied before computing rankingObjective/requestedMeasures"),
+        },
+        required=["sourcePhrase", "ownerTable", "entityGrain"],
+    )
     filter_schema = object_schema(
         {
-            "field": string_property("entity field", ["order_id", "sub_order_id", "spu_id", "refund_id", "ticket_id", "bill_id", "coupon_id"]),
-            "value": string_property("entity value from the user question"),
+            "field": string_property(
+                "filter field from semanticCatalog/live schema",
+                [
+                    "order_id",
+                    "sub_order_id",
+                    "spu_id",
+                    "refund_id",
+                    "ticket_id",
+                    "bill_id",
+                    "coupon_id",
+                    "refund_status_name",
+                    "refund_amt_status_name",
+                    "process_status_name",
+                    "pay_status_name",
+                    "sub_order_status_name",
+                    "spu_status_name",
+                    "ticket_status_name",
+                    "repay_status_name",
+                ],
+            ),
+            "value": string_property("entity or status value from the user question; use comma-separated values for OR/IN filters"),
         },
         required=["field", "value"],
     )
@@ -101,7 +133,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
     )
     understanding_schema = object_schema(
         {
-            "analysisGrain": string_property("analysis grain", ["product", "order", "day", "ticket", "refund", "coupon", "unknown"]),
+            "analysisGrain": string_property("analysis grain", ["merchant", "product", "order", "day", "ticket", "refund", "coupon", "unknown"]),
             "analysisIntent": string_property(
                 "analysis intent declared by the LLM understanding stage",
                 ["none", "diagnosis", "trend_check", "risk_ranking", "overview", "comparison", "anomaly_check"],
@@ -113,6 +145,10 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             ),
             "rankingObjective": ranking_schema,
             "requestedMeasures": array_property("additional requested metrics", measure_schema),
+            "scopeConstraints": array_property(
+                "bounded entity sets that must constrain the graph before ranking/measures, e.g. orders from a campaign, refunded orders, newly published products",
+                scope_schema,
+            ),
             "filters": array_property("explicit entity filters", filter_schema),
             "timeWindowDays": integer_property("requested time window in days", 1),
         },
@@ -123,6 +159,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "requiredEvidenceIntents",
             "rankingObjective",
             "requestedMeasures",
+            "scopeConstraints",
             "filters",
             "timeWindowDays",
         ],

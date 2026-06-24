@@ -2687,6 +2687,8 @@
     },
     {
       "metricKey": "order_gmv_amt_1d",
+      "canonicalMetricKey": "order_gmv_amt_1d",
+      "metricLevel": "business",
       "businessName": "总gmv金额元",
       "formula": "SUM(order_gmv_amt_1d)",
       "unit": "元",
@@ -2728,6 +2730,9 @@
     },
     {
       "metricKey": "pay_gmv_amt_1d",
+      "canonicalMetricKey": "order_gmv_amt_1d",
+      "aliasOf": "order_gmv_amt_1d",
+      "metricLevel": "business_variant",
       "businessName": "支付gmv金额元",
       "formula": "SUM(pay_gmv_amt_1d)",
       "unit": "元",
@@ -3017,6 +3022,25 @@
       "evidence": "schema comment=申诉成功次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
     },
     {
+      "metricKey": "appeal_success_rate_1d",
+      "businessName": "申诉成功率",
+      "formula": "SUM(appeal_success_cnt_1d) / NULLIF(SUM(appeal_cnt_1d), 0)",
+      "unit": "%",
+      "description": "申诉成功次数占申诉次数的比例",
+      "sourceColumns": [
+        "appeal_success_cnt_1d",
+        "appeal_cnt_1d"
+      ],
+      "aliases": [
+        "申诉成功率",
+        "申诉通过率",
+        "appeal_success_rate",
+        "appeal_success_rate_1d"
+      ],
+      "confidence": 0.9,
+      "evidence": "语义层派生指标：申诉成功次数 / 申诉次数"
+    },
+    {
       "metricKey": "scm_performance_cnt_1d",
       "businessName": "供应链履约量",
       "formula": "SUM(scm_performance_cnt_1d)",
@@ -3162,6 +3186,9 @@
     },
     {
       "metricKey": "trade_success_gmv_amt_1d",
+      "canonicalMetricKey": "order_gmv_amt_1d",
+      "aliasOf": "order_gmv_amt_1d",
+      "metricLevel": "business_variant",
       "businessName": "交易成功gmv金额元",
       "formula": "SUM(trade_success_gmv_amt_1d)",
       "unit": "元",
@@ -3517,6 +3544,8 @@
     },
     {
       "metricKey": "net_gmv_after_refund",
+      "canonicalMetricKey": "net_gmv_after_refund",
+      "metricLevel": "derived",
       "businessName": "扣退款后 GMV",
       "formula": "SUM(order_gmv_amt_1d) - SUM(refund_amt_1d)",
       "unit": "元",

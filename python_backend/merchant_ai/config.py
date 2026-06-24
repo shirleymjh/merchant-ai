@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict
@@ -28,7 +29,9 @@ class Settings(BaseSettings):
     llm_model: str = Field("gpt-5.2", validation_alias="YSHOPPING_LLM_MODEL")
     llm_api_key: str = Field("", validation_alias="YSHOPPING_LLM_API_KEY")
     llm_request_timeout_seconds: int = Field(20, validation_alias="YSHOPPING_LLM_REQUEST_TIMEOUT_SECONDS")
+    llm_planner_timeout_seconds: int = Field(50, validation_alias="YSHOPPING_LLM_PLANNER_TIMEOUT_SECONDS")
     llm_answer_timeout_seconds: int = Field(30, validation_alias="YSHOPPING_LLM_ANSWER_TIMEOUT_SECONDS")
+    llm_analysis_timeout_seconds: int = Field(20, validation_alias="YSHOPPING_LLM_ANALYSIS_TIMEOUT_SECONDS")
     llm_max_tokens: int = Field(2048, validation_alias="YSHOPPING_LLM_MAX_TOKENS")
 
     embedding_base_url: str = Field("https://api.openai.com/v1", validation_alias="YSHOPPING_EMBEDDING_BASE_URL")
@@ -72,11 +75,24 @@ class Settings(BaseSettings):
     agent_trace_replay_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_TRACE_REPLAY_ENABLED")
     agent_main_rounds: int = Field(18, validation_alias="YSHOPPING_AGENT_MAIN_ROUNDS")
     agent_retrieve_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_RETRIEVE_ROUNDS")
-    agent_plan_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_PLAN_ROUNDS")
+    agent_plan_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_PLAN_ROUNDS")
     agent_graph_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_GRAPH_REPAIR_ROUNDS")
     agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
+    agent_planner_seed_table_limit: int = Field(4, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_TABLE_LIMIT")
+    agent_planner_seed_metric_limit: int = Field(14, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_METRIC_LIMIT")
+    agent_asset_field_entry_limit: int = Field(240, validation_alias="YSHOPPING_AGENT_ASSET_FIELD_ENTRY_LIMIT")
+    agent_planner_prompt_budget_chars: int = Field(14000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
+    route_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_ROUTE_LLM_MODE")
     context_file_inline_max_chars: int = Field(12000, validation_alias="YSHOPPING_AGENT_CONTEXT_FILE_INLINE_MAX_CHARS")
     context_artifact_inline_max_rows: int = Field(20, validation_alias="YSHOPPING_AGENT_CONTEXT_ARTIFACT_INLINE_MAX_ROWS")
+
+    cache_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_CACHE_ENABLED")
+    cache_memory_max_entries: int = Field(512, validation_alias="YSHOPPING_AGENT_CACHE_MEMORY_MAX_ENTRIES")
+    cache_doris_select_ttl_seconds: int = Field(60, validation_alias="YSHOPPING_AGENT_CACHE_DORIS_SELECT_TTL_SECONDS")
+    cache_recall_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_RECALL_TTL_SECONDS")
+    cache_asset_pack_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_ASSET_PACK_TTL_SECONDS")
+    cache_llm_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_LLM_TTL_SECONDS")
+    python_executable: str = Field(default_factory=lambda: sys.executable, validation_alias="YSHOPPING_PYTHON_EXECUTABLE")
 
     wiki_path: str = Field("", validation_alias="YSHOPPING_WIKI_PATH")
     topic_path: str = Field("", validation_alias="YSHOPPING_TOPIC_PATH")

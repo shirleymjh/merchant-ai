@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import re
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -36,7 +36,12 @@ from merchant_ai.models import (
     TaskRole,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.formulas import (
+    compile_metric_formula as compile_reconciled_metric_formula,
+    formula_columns as reconciled_formula_columns,
+)
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.planning import EvidenceContractBuilder
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import DorisRepository
 from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry
@@ -55,6 +60,7 @@ STRUCTURED_FALLBACK_ERROR_CODES = {
     "MISSING_PARTITION_FILTER",
     "INVALID_PARTITION_FILTER",
     "MISSING_OUTPUT_KEY",
+    "MISSING_ENTITY_KEY_FILTER",
     "MEM_ALLOC_FAILED",
     "TIMEOUT",
     "SQL_SYNTAX",
@@ -64,6 +70,7 @@ STRICT_STRUCTURED_FALLBACK_CODES = {
     "MISSING_OUTPUT_KEY",
     "UNKNOWN_CONTRACT_COLUMN",
     "INVALID_PARTITION_FILTER",
+    "MISSING_ENTITY_KEY_FILTER",
 }
 RESOURCE_CONSTRAINED_DORIS_ERRORS = {"MEM_ALLOC_FAILED", "TIMEOUT"}
 
@@ -461,24 +468,34 @@ class NodeWorkerExecutor:
             parent_result = completed.get(dep.anchor_task_id)
             if not parent_result:
                 continue
-            rows = parent_result.query_bundle.rows
-            upstream_rows.extend(rows)
+            rows = self._task_rows_for_context(parent_result, include_artifacts=intent.answer_mode == AnswerMode.DERIVED)
+            if intent.answer_mode == AnswerMode.DERIVED:
+                upstream_rows.extend([dict(row, __source_task_id=dep.anchor_task_id) for row in rows])
+            else:
+                upstream_rows.extend(rows)
             key, dependent_key = choose_entity_transfer_key(dep, rows, parent_result, dependent_columns)
             column_values = multi_entity_transfer_values(dep, rows, parent_result, dependent_columns, self.settings.agent_max_entity_values)
             values = list(column_values.get(dependent_key, [])) if dependent_key else []
             if not values and key:
                 for row in rows:
-                    if key in row and row.get(key) not in values:
-                        values.append(row.get(key))
+                    value = row.get(key)
+                    if key in row and not blank_entity_value(value) and value not in values:
+                        values.append(value)
+            allowed_dependent_keys = dependency_allowed_dependent_entity_keys(dep, dependent_columns)
             if parent_result.entity_set and parent_result.entity_set.values:
                 if parent_result.entity_set.join_key in dependent_columns:
-                    dependent_key = parent_result.entity_set.join_key
-                    merged_values = list(values)
-                    for value in parent_result.entity_set.values:
-                        if value not in merged_values:
-                            merged_values.append(value)
-                    values = merged_values
-                    column_values[dependent_key] = merged_values[: self.settings.agent_max_entity_values]
+                    if allowed_dependent_keys and parent_result.entity_set.join_key not in allowed_dependent_keys:
+                        pass
+                    elif dependent_key and parent_result.entity_set.join_key != dependent_key:
+                        pass
+                    else:
+                        dependent_key = parent_result.entity_set.join_key
+                        merged_values = list(values)
+                        for value in parent_result.entity_set.values:
+                            if not blank_entity_value(value) and value not in merged_values:
+                                merged_values.append(value)
+                        values = merged_values
+                        column_values[dependent_key] = merged_values[: self.settings.agent_max_entity_values]
             truncated = len(values) > self.settings.agent_max_entity_values
             truncated = truncated or any(len(items) > self.settings.agent_max_entity_values for items in column_values.values())
             missing_reason = ""
@@ -495,8 +512,12 @@ class NodeWorkerExecutor:
                 EntitySet(
                     task_id=dep.anchor_task_id,
                     join_key=dependent_key,
-                    values=values[: self.settings.agent_max_entity_values],
-                    column_values={column: items[: self.settings.agent_max_entity_values] for column, items in column_values.items() if items},
+                    values=[value for value in values if not blank_entity_value(value)][: self.settings.agent_max_entity_values],
+                    column_values={
+                        column: [value for value in items if not blank_entity_value(value)][: self.settings.agent_max_entity_values]
+                        for column, items in column_values.items()
+                        if any(not blank_entity_value(value) for value in items)
+                    },
                     truncated=truncated,
                     source_row_count=len(rows),
                     source_key=key,
@@ -508,8 +529,22 @@ class NodeWorkerExecutor:
             merchant_id=merchant_id,
             question=question or intent.question,
             upstream_entity_sets=entity_sets,
-            upstream_rows=upstream_rows[: self.settings.tool_result_preview_rows],
+            upstream_rows=upstream_rows if intent.answer_mode == AnswerMode.DERIVED else upstream_rows[: self.settings.tool_result_preview_rows],
         )
+
+    def _task_rows_for_context(self, task_result: AgentTaskResult, include_artifacts: bool = False) -> List[Dict[str, Any]]:
+        if not include_artifacts:
+            return list(task_result.query_bundle.rows)
+        for path in task_result.query_bundle.offloaded_files:
+            if not str(path).endswith("_rows.json"):
+                continue
+            try:
+                payload = json.loads(self.artifact_store.read(str(path), max_chars=20_000_000).get("content") or "[]")
+            except Exception:
+                continue
+            if isinstance(payload, list):
+                return [row for row in payload if isinstance(row, dict)]
+        return list(task_result.query_bundle.rows)
 
     def execute_node(
         self,
@@ -518,7 +553,134 @@ class NodeWorkerExecutor:
         knowledge_context: str,
         context: NodeExecutionContext,
     ) -> AgentTaskResult:
+        if intent.answer_mode == AnswerMode.DERIVED:
+            return self._execute_derived_node(intent, asset_pack, context)
         return self.node_agent.execute(intent, asset_pack, knowledge_context, context)
+
+    def _execute_derived_node(
+        self,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        context: NodeExecutionContext,
+    ) -> AgentTaskResult:
+        tool_traces: List[NodeToolCall] = []
+        profile = NodeTaskProfile(
+            task_id=intent.plan_task_id,
+            task_kind="DERIVED_METRIC",
+            sql_strategy="derived_compute",
+            selected_tools=["load_component_results", "compute_derived_metric", "summarize_node_result"],
+            reason="compute semantic metric from upstream component metrics",
+            risk_controls=["semantic_metric_contract", "upstream_component_evidence"],
+            contract_status="passed",
+            sql_draft_source="derived_compute",
+        )
+        record_tool(
+            tool_traces,
+            intent,
+            "load_component_results",
+            "success" if context.upstream_rows else "failed",
+            "upstreamRows=%s" % len(context.upstream_rows),
+            "componentMetrics=%s" % ",".join(str(item.get("metricKey") or "") for item in (intent.metric_resolution or {}).get("componentMetrics") or []),
+        )
+        rows, error = self._compute_derived_metric_rows(intent, context)
+        if error:
+            record_tool(tool_traces, intent, "compute_derived_metric", "failed", intent.metric_name, error, "DERIVED_METRIC_FAILED")
+            return AgentTaskResult(
+                task_id=intent.plan_task_id,
+                success=False,
+                summary=error,
+                query_bundle=QueryBundle(tables=[], failed=True, error=error, summary=error),
+                react_trace=[ReActStep(round=1, reason=error, action="compute_derived_metric.failed", observation=intent.metric_name)],
+                node_tool_traces=tool_traces,
+                node_task_profile=profile,
+            )
+        artifact_paths = self._write_node_artifacts(intent.plan_task_id, "-- derived semantic metric: %s" % intent.metric_name, rows)
+        preview_rows = rows[: max(0, self.settings.context_artifact_inline_max_rows)]
+        entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+        record_tool(
+            tool_traces,
+            intent,
+            "compute_derived_metric",
+            "success",
+            intent.metric_formula,
+            "rows=%s metric=%s" % (len(rows), intent.metric_name),
+        )
+        record_tool(
+            tool_traces,
+            intent,
+            "summarize_node_result",
+            "success",
+            "rows=%s" % len(rows),
+            "entityKey=%s values=%s artifacts=%s" % (entity_set.join_key, len(entity_set.values), len(artifact_paths)),
+        )
+        return AgentTaskResult(
+            task_id=intent.plan_task_id,
+            success=True,
+            summary="计算派生指标返回 %s 行" % len(rows),
+            query_bundle=QueryBundle(
+                tables=[],
+                rows=preview_rows,
+                original_row_count=len(rows),
+                summary="计算派生指标返回 %s 行" % len(rows),
+                offloaded_files=artifact_paths,
+            ),
+            react_trace=[
+                ReActStep(round=1, reason="读取组件指标结果", action="load_component_results", observation="rows=%s" % len(context.upstream_rows)),
+                ReActStep(round=2, reason="按语义层公式计算派生指标", action="compute_derived_metric", observation="rows=%s" % len(rows)),
+            ],
+            entity_set=entity_set,
+            node_tool_traces=tool_traces,
+            node_task_profile=profile,
+        )
+
+    def _compute_derived_metric_rows(self, intent: QuestionIntent, context: NodeExecutionContext) -> Tuple[List[Dict[str, Any]], str]:
+        resolution = intent.metric_resolution or {}
+        components = [item for item in resolution.get("componentMetrics") or [] if isinstance(item, dict)]
+        if len(components) < 2:
+            return [], "DERIVED_METRIC_COMPONENTS_MISSING"
+        group_key = intent.group_by_column or str(resolution.get("groupByColumn") or "")
+        if not group_key:
+            return [], "DERIVED_METRIC_GROUP_KEY_MISSING"
+        component_keys = [str(item.get("metricKey") or "") for item in components if item.get("metricKey")]
+        grouped: Dict[Any, Dict[str, Any]] = {}
+        for row in context.upstream_rows:
+            group_value = row.get(group_key)
+            if blank_entity_value(group_value):
+                continue
+            target = grouped.setdefault(group_value, {group_key: group_value})
+            for metric_key in component_keys:
+                value = row.get(metric_key)
+                if value is None:
+                    value = first_present_value(row, metric_alias_candidates(metric_key))
+                number = numeric_value(value)
+                if number is None:
+                    continue
+                target[metric_key] = float(target.get(metric_key) or 0) + number
+        if not grouped:
+            return [], "DERIVED_METRIC_NO_JOINED_COMPONENT_ROWS"
+        metric_name = intent.metric_name or "derived_metric"
+        unit = str(resolution.get("unit") or "")
+        rows: List[Dict[str, Any]] = []
+        numerator_key = component_keys[0]
+        denominator_key = component_keys[1]
+        for values in grouped.values():
+            if any(key not in values for key in component_keys[:2]):
+                continue
+            numerator = numeric_value(values.get(numerator_key))
+            denominator = numeric_value(values.get(denominator_key))
+            if numerator is None or denominator in {None, 0}:
+                continue
+            derived = numerator / denominator
+            if unit == "%":
+                derived *= 100
+            row = dict(values)
+            row[metric_name] = round(derived, 6)
+            rows.append(row)
+        rows.sort(key=lambda item: numeric_value(item.get(metric_name)) or 0, reverse=True)
+        limit = int(intent.limit or 0)
+        if limit > 0:
+            rows = rows[:limit]
+        return rows, "" if rows else "DERIVED_METRIC_ZERO_ROWS"
 
     def _write_node_artifacts(self, task_id: str, sql: str, rows: List[Dict[str, Any]]) -> List[str]:
         safe_task_id = task_id or "node"
@@ -546,7 +708,9 @@ class NodeWorkerExecutor:
         )
         self._record_schema_tools(tool_traces, intent, asset_pack)
         contract = self._node_plan_contract(intent, asset_pack, context)
+        critique_started = time.perf_counter()
         critique = self.node_plan_critic.review(contract)
+        critique_duration_ms = int((time.perf_counter() - critique_started) * 1000)
         node_task_profile.contract_status = "passed" if critique.valid else "failed"
         node_task_profile.contract_critique_reason = critique.message or critique.code
         record_tool(
@@ -557,6 +721,7 @@ class NodeWorkerExecutor:
             contract.preferred_table,
             critique.message or "contract passed",
             critique.code,
+            duration_ms=critique_duration_ms,
         )
         trace: List[ReActStep] = [
             ReActStep(round=1, reason="根据 QueryGraph node 生成 SQL", action="sql_draft.plan", observation=intent.preferred_table)
@@ -585,7 +750,9 @@ class NodeWorkerExecutor:
                 node_plan_contract=contract,
                 node_plan_critique=critique,
             )
+        freshness_started = time.perf_counter()
         freshness = self._check_freshness(intent, asset_pack, context)
+        freshness_duration_ms = int((time.perf_counter() - freshness_started) * 1000)
         record_tool(
             tool_traces,
             intent,
@@ -594,11 +761,16 @@ class NodeWorkerExecutor:
             intent.preferred_table,
             freshness.reason or freshness.max_pt or freshness.status,
             freshness.status if freshness.status not in {"AVAILABLE", "SKIPPED", "NO_PT_COLUMN"} else "",
+            duration_ms=freshness_duration_ms,
         )
         draft_tool = self._draft_tool_name(intent)
+        draft_started = time.perf_counter()
         sql = self._draft_sql(intent, asset_pack, knowledge_context, context, contract)
+        draft_duration_ms = int((time.perf_counter() - draft_started) * 1000)
         draft_decision = self._last_sql_draft_decisions.pop(intent.plan_task_id, SqlDraftDecision(task_id=intent.plan_task_id))
         node_task_profile.sql_draft_source = draft_decision.source
+        if draft_decision.source == "structured_fast_path":
+            draft_tool = "draft_structured_sql_fast_path"
         draft_summary = trim_sql(sql)
         draft_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "draft"), None)
         if draft_prompt:
@@ -606,7 +778,16 @@ class NodeWorkerExecutor:
         draft_tool_schema = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "draft_tool"), None)
         if draft_tool_schema:
             draft_summary = append_tool_schema_marker(draft_summary, draft_tool_schema)
-        record_tool(tool_traces, intent, draft_tool, "success" if sql else "failed", intent.preferred_table, draft_summary, "SQL_EMPTY" if not sql else "")
+        record_tool(
+            tool_traces,
+            intent,
+            draft_tool,
+            "success" if sql else "failed",
+            intent.preferred_table,
+            draft_summary,
+            "SQL_EMPTY" if not sql else "",
+            duration_ms=draft_duration_ms,
+        )
         if draft_decision.structured_fallback_used:
             record_tool(
                 tool_traces,
@@ -620,9 +801,11 @@ class NodeWorkerExecutor:
         validation_results: List[SqlValidationResult] = []
         repair_attempts: List[SqlRepairAttempt] = []
         for round_index in range(self.settings.agent_sql_repair_rounds + 1):
+            validation_started = time.perf_counter()
             validation = self.validator.validate(sql, asset_pack)
             validation = self._node_scope_validation(validation, intent, sql, asset_pack)
             validation = self._contract_scope_validation(validation, intent, sql, contract)
+            validation_duration_ms = int((time.perf_counter() - validation_started) * 1000)
             validation_results.append(validation)
             record_tool(
                 tool_traces,
@@ -633,6 +816,7 @@ class NodeWorkerExecutor:
                 validation.message,
                 validation.error_code,
                 round_index,
+                duration_ms=validation_duration_ms,
             )
             trace.append(
                 ReActStep(
@@ -696,7 +880,9 @@ class NodeWorkerExecutor:
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
+                repair_started = time.perf_counter()
                 repaired = self._repair_sql(sql, validation, intent, asset_pack, context)
+                repair_duration_ms = int((time.perf_counter() - repair_started) * 1000)
                 repair_attempts.append(repaired)
                 repair_summary = trim_sql(repaired.repaired_sql)
                 repair_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair"), None)
@@ -714,6 +900,7 @@ class NodeWorkerExecutor:
                     repair_summary,
                     validation.error_code,
                     round_index + 1,
+                    duration_ms=repair_duration_ms,
                 )
                 if not repaired.repaired_sql:
                     return AgentTaskResult(
@@ -753,9 +940,23 @@ class NodeWorkerExecutor:
                     sql_draft_decision=draft_decision,
                 )
             try:
+                query_started = time.perf_counter()
                 rows = self.doris_repository.query(sql)
+                query_duration_ms = int((time.perf_counter() - query_started) * 1000)
+                cache_hit = bool(getattr(self.doris_repository, "last_cache_hit", False))
+                cache_key = str(getattr(self.doris_repository, "last_cache_key", "") or "")
                 self.tool_failure_registry.record_success("execute_sql", execute_args)
-                record_tool(tool_traces, intent, "execute_sql", "success", trim_sql(sql), "rows=%s" % len(rows), "", round_index)
+                record_tool(
+                    tool_traces,
+                    intent,
+                    "execute_sql",
+                    "success",
+                    trim_sql(sql),
+                    "rows=%s durationMs=%s cacheHit=%s" % (len(rows), query_duration_ms, cache_hit),
+                    "",
+                    round_index,
+                    duration_ms=query_duration_ms,
+                )
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris", action="query_doris", observation="rows=%s" % len(rows)))
                 entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
                 artifact_paths = self._write_node_artifacts(intent.plan_task_id, sql, rows)
@@ -778,6 +979,9 @@ class NodeWorkerExecutor:
                         original_row_count=len(rows),
                         summary="返回 %s 行" % len(rows),
                         offloaded_files=artifact_paths,
+                        duration_ms=query_duration_ms,
+                        cache_hit=cache_hit,
+                        cache_key=cache_key,
                     ),
                     react_trace=trace,
                     sql_repairs=repair_attempts,
@@ -791,6 +995,7 @@ class NodeWorkerExecutor:
                     sql_draft_decision=draft_decision,
                 )
             except Exception as exc:
+                query_duration_ms = int((time.perf_counter() - query_started) * 1000) if "query_started" in locals() else 0
                 error_text = str(exc)
                 doris_error_code = classify_doris_error(error_text)
                 policy = doris_error_policy(doris_error_code)
@@ -853,7 +1058,7 @@ class NodeWorkerExecutor:
                     return AgentTaskResult(
                         success=False,
                         summary="Doris 查询失败: %s" % error_text[:200],
-                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=error_text),
+                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=error_text, duration_ms=query_duration_ms),
                         react_trace=trace,
                         sql_repairs=repair_attempts,
                         validation_results=validation_results,
@@ -864,7 +1069,9 @@ class NodeWorkerExecutor:
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
+                repair_started = time.perf_counter()
                 repaired = self._repair_sql(sql, validation.model_copy(update={"valid": False, "error_code": doris_error_code, "message": error_text}), intent, asset_pack, context)
+                repair_duration_ms = int((time.perf_counter() - repair_started) * 1000)
                 repair_attempts.append(repaired)
                 repair_summary = trim_sql(repaired.repaired_sql)
                 repair_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair"), None)
@@ -882,12 +1089,13 @@ class NodeWorkerExecutor:
                     repair_summary,
                     doris_error_code,
                     round_index + 1,
+                    duration_ms=repair_duration_ms,
                 )
                 if not repaired.repaired_sql:
                     return AgentTaskResult(
                         success=False,
                         summary="Doris 查询失败: %s" % error_text[:200],
-                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=error_text),
+                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=error_text, duration_ms=query_duration_ms),
                         react_trace=trace,
                         sql_repairs=repair_attempts,
                         validation_results=validation_results,
@@ -929,6 +1137,13 @@ class NodeWorkerExecutor:
             decision.reason = "intent.sql_strategy=structured_first"
             self._last_sql_draft_decisions[intent.plan_task_id] = decision
             if structured_sql:
+                return structured_sql
+        if self._use_structured_fast_path(intent, contract, context):
+            structured_sql = self._draft_structured_sql(intent, asset_pack, context)
+            if structured_sql:
+                decision.source = "structured_fast_path"
+                decision.reason = "low-risk node contract can be compiled deterministically"
+                self._last_sql_draft_decisions[intent.plan_task_id] = decision
                 return structured_sql
         sql = ""
         if self.llm.configured:
@@ -986,6 +1201,38 @@ class NodeWorkerExecutor:
         decision.reason = "fallback to deterministic single-table SQL builder"
         self._last_sql_draft_decisions[intent.plan_task_id] = decision
         return self._draft_structured_sql(intent, asset_pack, context)
+
+    def _use_structured_fast_path(
+        self,
+        intent: QuestionIntent,
+        contract: NodePlanContract,
+        context: NodeExecutionContext,
+    ) -> bool:
+        if intent.sql or intent.sql_strategy in {"structured_first", "llm_first_debug"}:
+            return False
+        if intent.answer_mode == AnswerMode.DETAIL:
+            return bool(intent.output_keys or intent.required_evidence or intent.filter_column)
+        if (
+            intent.answer_mode == AnswerMode.METRIC
+            and intent.task_role != TaskRole.DEPENDENT
+            and not context.upstream_entity_sets
+            and (intent.metric_formula or intent.metric_column or intent.metric_specs)
+        ):
+            return True
+        if (
+            intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG}
+            and intent.task_role != TaskRole.DEPENDENT
+            and not context.upstream_entity_sets
+            and intent.group_by_column
+            and (intent.metric_formula or intent.metric_column or intent.metric_specs)
+        ):
+            return True
+        if intent.task_role == TaskRole.DEPENDENT and context.upstream_entity_sets:
+            return intent.answer_mode in {AnswerMode.GROUP_AGG, AnswerMode.METRIC, AnswerMode.TOPN}
+        resolution_source = str((intent.metric_resolution or {}).get("resolutionSource") or "")
+        if "schema_reconciled" in resolution_source:
+            return True
+        return False
 
     def _node_llm_payload(
         self,
@@ -1340,6 +1587,10 @@ class NodeWorkerExecutor:
             where.append("`merchant_id` = %s" % sql_literal(context.merchant_id))
         if intent.filter_column and intent.filter_column in columns and intent.filter_value:
             where.append(filter_predicate(intent.filter_column, intent.filter_value))
+        if aggregate_entity_key_requires_non_empty_filter(intent, columns):
+            column = intent.group_by_column
+            where.append("`%s` IS NOT NULL" % column)
+            where.append("`%s` != ''" % column)
         applied_entity_columns: set[str] = set()
         for entity in context.upstream_entity_sets:
             for column, values in entity.column_values.items():
@@ -1490,6 +1741,8 @@ class NodeWorkerExecutor:
         allowed = set(contract.allowed_columns)
         if allowed:
             select_aliases = {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}
+            cte_names = {cte.alias for cte in parsed.find_all(exp.CTE) if cte.alias}
+            metric_aliases = contract_metric_aliases(contract)
             unknown_contract_columns: List[str] = []
             for column in parsed.find_all(exp.Column):
                 column_name = column.name
@@ -1498,6 +1751,8 @@ class NodeWorkerExecutor:
                 if column_name.lower() in SQL_BUILTIN_IDENTIFIERS:
                     continue
                 if is_select_alias_reference(column, select_aliases):
+                    continue
+                if column_name in metric_aliases and (cte_names or is_select_alias_reference(column, select_aliases)):
                     continue
                 if column_name not in allowed:
                     unknown_contract_columns.append(column_name)
@@ -1515,7 +1770,7 @@ class NodeWorkerExecutor:
             selected = selected_output_names(parsed)
             required_outputs = [column for column in ([contract.group_by_column] + contract.output_keys) if column]
             missing = [column for column in required_outputs if column in allowed and column not in selected]
-            required_metric_aliases = [str(spec.get("metricName") or spec.get("metric_name") or "") for spec in contract.metric_specs]
+            required_metric_aliases = list(contract_metric_aliases(contract))
             missing.extend(alias for alias in required_metric_aliases if alias and alias not in selected)
             if missing:
                 return validation.model_copy(
@@ -1523,6 +1778,14 @@ class NodeWorkerExecutor:
                         "valid": False,
                         "error_code": "MISSING_OUTPUT_KEY",
                         "message": "聚合 SQL 缺少 contract 要求输出字段: %s" % sorted(set(missing)),
+                    }
+                )
+            if aggregate_entity_key_requires_non_empty_filter(intent, allowed) and not has_non_empty_filter(sql, contract.group_by_column):
+                return validation.model_copy(
+                    update={
+                        "valid": False,
+                        "error_code": "MISSING_ENTITY_KEY_FILTER",
+                        "message": "实体维度 TOPN/GROUP_AGG 必须过滤空 groupByColumn，避免空实体桶影响排名和依赖传递",
                     }
                 )
         return validation
@@ -1540,6 +1803,7 @@ class NodeWorkerExecutor:
         table_columns = asset_pack.known_columns(table)
         required_columns = self._node_required_columns(intent, asset_pack).get(table, [])
         allowed_columns = list(required_columns)
+        contract_output_keys = self._node_contract_output_keys(intent, set(table_columns))
         for column in formula_columns(intent.metric_formula, set(table_columns)):
             if column not in allowed_columns:
                 allowed_columns.append(column)
@@ -1569,7 +1833,7 @@ class NodeWorkerExecutor:
             metric_formula=intent.metric_formula,
             metric_specs=metric_specs_for_intent(intent, table),
             group_by_column=intent.group_by_column,
-            output_keys=intent.output_keys,
+            output_keys=contract_output_keys,
             required_evidence=intent.required_evidence,
             days=int(intent.days or 0),
             limit=int(intent.limit or 0),
@@ -1581,6 +1845,15 @@ class NodeWorkerExecutor:
             upstream_entity_sets=[item.model_dump(by_alias=True) for item in context.upstream_entity_sets],
             metric_resolution=intent.metric_resolution,
         )
+
+    def _node_contract_output_keys(self, intent: QuestionIntent, columns: set) -> List[str]:
+        if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
+            keys: List[str] = []
+            for column in [intent.group_by_column] + self._aggregate_output_group_keys(intent):
+                if column and column in columns and column not in keys:
+                    keys.append(column)
+            return keys
+        return [column for column in intent.output_keys if column and column in columns]
 
     def _node_asset_tables(self, intent: QuestionIntent, asset_pack: PlanningAssetPack) -> Dict[str, List[str]]:
         names = self._node_table_names(intent, asset_pack)
@@ -1597,7 +1870,22 @@ class NodeWorkerExecutor:
             for item in metric_spec_source_columns(spec, columns):
                 if item and item in columns and item not in requested:
                     requested.append(item)
-        for item in ["seller_id", "merchant_id", "pt", "sub_order_id", "order_id", "spu_id", "refund_id", "ticket_id", "bill_id"]:
+        for item in [
+            "seller_id",
+            "merchant_id",
+            "pt",
+            "sub_order_id",
+            "order_id",
+            "spu_id",
+            "spu_name",
+            "refund_id",
+            "ticket_id",
+            "bill_id",
+            "coupon_id",
+            "discount_rel_id",
+            "pay_amt",
+            "repay_amt",
+        ]:
             if item in columns and item not in requested:
                 requested.append(item)
         if not requested:
@@ -1679,6 +1967,8 @@ def merge_query_bundles(bundles: List[QueryBundle]) -> QueryBundle:
         failed=bool(bundles) and not any(not item.failed for item in bundles),
         error=first_error,
         summary="合并 %s 个 NodeWorker 结果" % len(bundles),
+        duration_ms=sum(int(bundle.duration_ms or 0) for bundle in bundles),
+        cache_hit=any(bundle.cache_hit for bundle in bundles),
     )
 
 
@@ -1751,7 +2041,8 @@ def optimize_query_plan_for_execution(plan: QueryPlan, asset_pack: PlanningAsset
         return
     plan.intents = [intent for intent in plan.intents if intent.plan_task_id not in removed_task_ids]
     rewrite_plan_dependencies(plan, task_id_map)
-    rewrite_evidence_contracts(plan, task_id_map)
+    plan.evidence_contracts = EvidenceContractBuilder().contracts_from_intents(plan.intents)
+    plan.final_required_evidence = EvidenceContractBuilder().final_evidence_labels(plan.intents)
     plan.agent_trace.extend(merge_notes)
     optimizer_notes = plan.compiler_trace if isinstance(plan.compiler_trace, list) else []
     optimizer_notes.extend(merge_notes)
@@ -1854,7 +2145,15 @@ def normalize_metric_spec(spec: Dict[str, Any], intent: QuestionIntent, table: s
     metric_name = str(spec.get("metricName") or spec.get("metric_name") or intent.metric_name or "")
     if not metric_name:
         metric_name = metric_alias_for_values(metric_column, table)
-    source_columns = [str(item) for item in spec.get("sourceColumns") or spec.get("source_columns") or [] if item]
+    source_columns = [
+        str(item)
+        for item in spec.get("sourceColumns")
+        or spec.get("source_columns")
+        or (intent.metric_resolution or {}).get("sourceColumns")
+        or (intent.metric_resolution or {}).get("source_columns")
+        or []
+        if item
+    ]
     return {
         "metricName": metric_name,
         "metricColumn": metric_column,
@@ -1925,6 +2224,40 @@ def metric_alias_for_values(metric_column: str, table: str) -> str:
     return "metric_value"
 
 
+def metric_alias_candidates(metric_key: str) -> List[str]:
+    text = str(metric_key or "")
+    aliases = {
+        "order_detail_cnt": ["order_detail_cnt", "order_cnt", "sub_order_cnt", "cnt", "count"],
+        "refund_bill_cnt": ["refund_bill_cnt", "refund_cnt", "cnt", "count"],
+        "ticket_bill_cnt": ["ticket_bill_cnt", "ticket_cnt", "cnt", "count"],
+        "repay_bill_cnt": ["repay_bill_cnt", "repay_cnt", "cnt", "count"],
+    }
+    return dedupe_strings([text] + aliases.get(text, []))
+
+
+def first_present_value(row: Dict[str, Any], aliases: List[str]) -> Any:
+    for alias in aliases:
+        if alias in row:
+            return row.get(alias)
+    return None
+
+
+def numeric_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def dedupe_strings(values: List[str]) -> List[str]:
     deduped: List[str] = []
     for value in values:
@@ -1943,6 +2276,7 @@ def record_tool(
     output_summary: str = "",
     error_type: str = "",
     repair_round: int = 0,
+    duration_ms: int = 0,
 ) -> None:
     traces.append(
         NodeToolCall(
@@ -1953,6 +2287,7 @@ def record_tool(
             output_summary=str(output_summary or "")[:360],
             error_type=str(error_type or "")[:120],
             repair_round=repair_round,
+            duration_ms=max(0, int(duration_ms or 0)),
         )
     )
 
@@ -1966,17 +2301,7 @@ def enum_text(value: Any) -> str:
 
 
 def formula_columns(formula: str, known_columns: Set[str]) -> List[str]:
-    if not formula:
-        return []
-    found: List[str] = []
-    for token in re.findall(r"`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*)\b", formula):
-        name = token[0] or token[1]
-        upper = name.upper()
-        if upper in {"SUM", "AVG", "COUNT", "MIN", "MAX", "CASE", "WHEN", "THEN", "ELSE", "END", "NULLIF", "IFNULL"}:
-            continue
-        if name in known_columns and name not in found:
-            found.append(name)
-    return found
+    return reconciled_formula_columns(formula, known_columns)
 
 
 def metric_resolution_aliases(resolution: Dict[str, Any]) -> Set[str]:
@@ -1987,8 +2312,29 @@ def metric_resolution_aliases(resolution: Dict[str, Any]) -> Set[str]:
             aliases.add(str(value))
     for column in resolution.get("sourceColumns") or []:
         if column:
-            aliases.add(str(column))
+                aliases.add(str(column))
     return aliases
+
+
+def contract_metric_aliases(contract: NodePlanContract) -> Set[str]:
+    aliases: Set[str] = set()
+    for spec in contract.metric_specs:
+        metric_name = str(spec.get("metricName") or spec.get("metric_name") or "")
+        if metric_name:
+            aliases.add(metric_name)
+            continue
+        metric_column = str(spec.get("metricColumn") or spec.get("metric_column") or "")
+        if metric_column:
+            aliases.add(metric_alias_for_values(metric_column, contract.preferred_table))
+    if contract.metric_name:
+        aliases.add(contract.metric_name)
+    elif contract.metric_column:
+        aliases.add(metric_alias_for_values(contract.metric_column, contract.preferred_table))
+    resolution = contract.metric_resolution or {}
+    metric_key = str(resolution.get("metricKey") or resolution.get("metric_key") or "")
+    if metric_key:
+        aliases.add(metric_key)
+    return {alias for alias in aliases if alias}
 
 
 def selected_output_names(parsed: exp.Expression) -> Set[str]:
@@ -2099,7 +2445,7 @@ def classify_doris_error(error_text: str) -> str:
 def doris_error_policy(error_code: str) -> Dict[str, bool]:
     code = error_code or "DORIS_ERROR"
     if code in RESOURCE_CONSTRAINED_DORIS_ERRORS:
-        return {"structured_fallback": True, "resource_fallback": True, "llm_repair": False}
+        return {"structured_fallback": False, "resource_fallback": True, "llm_repair": False}
     if code == "UNKNOWN_COLUMN":
         return {"structured_fallback": True, "resource_fallback": False, "llm_repair": True}
     if code == "SQL_SYNTAX":
@@ -2204,40 +2550,7 @@ FORMULA_ALLOWED_TOKENS = {
 
 
 def compile_metric_formula(formula: str, columns: set) -> str:
-    text = str(formula or "").strip()
-    if not text:
-        return ""
-    lowered = text.lower()
-    forbidden = [";", "--", "/*", "*/", " select ", " from ", " join ", " union ", " insert ", " update ", " delete ", " drop ", " create "]
-    if any(marker in " %s " % lowered for marker in forbidden):
-        return ""
-    segments = re.split(r"('(?:''|[^'])*')", text)
-    compiled_segments: List[str] = []
-    for index, segment in enumerate(segments):
-        if index % 2 == 1:
-            compiled_segments.append(segment)
-            continue
-        tokens = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?", segment)
-        for token in tokens:
-            if token in columns:
-                continue
-            if token.upper() in FORMULA_ALLOWED_TOKENS:
-                continue
-            return ""
-
-        def replace_identifier(match: re.Match[str]) -> str:
-            token = match.group(1)
-            if token in columns:
-                return "`%s`" % token
-            return token
-
-        compiled_segments.append(re.sub(r"`?([A-Za-z_][A-Za-z0-9_]*)`?", replace_identifier, segment))
-    compiled = "".join(compiled_segments)
-    try:
-        sqlglot.parse_one("SELECT %s AS metric_value FROM x" % compiled, read="doris")
-    except Exception:
-        return ""
-    return compiled
+    return compile_reconciled_metric_formula(formula, columns)
 
 
 def metric_alias_for_intent(intent: QuestionIntent, table: str) -> str:
@@ -2270,13 +2583,13 @@ def entity_set_from_rows(task_id: str, intent: QuestionIntent, rows: List[Dict[s
     column_values: Dict[str, List[Any]] = {}
     for row in rows:
         value = row.get(key)
-        if value is not None and value not in values:
+        if not blank_entity_value(value) and value not in values:
             values.append(value)
         for column in ["sub_order_id", "order_id", "spu_id", "spu_name", "ticket_id", "refund_id", "bill_id", "coupon_id", "discount_rel_id", "pt"]:
             if column not in row:
                 continue
             candidate_value = row.get(column)
-            if candidate_value is None:
+            if blank_entity_value(candidate_value):
                 continue
             items = column_values.setdefault(column, [])
             if candidate_value not in items:
@@ -2300,6 +2613,52 @@ def upstream_missing_reason(entity_sets: List[EntitySet]) -> str:
         if reason in reasons:
             return reason
     return "UPSTREAM_ENTITY_MISSING"
+
+
+def aggregate_entity_key_requires_non_empty_filter(intent: QuestionIntent, columns: set) -> bool:
+    if intent.answer_mode not in {AnswerMode.TOPN, AnswerMode.GROUP_AGG}:
+        return False
+    column = intent.group_by_column or ""
+    if not column or column not in columns:
+        return False
+    return column in entity_dimension_columns()
+
+
+def entity_dimension_columns() -> set[str]:
+    return {
+        "sub_order_id",
+        "order_id",
+        "spu_id",
+        "spu_name",
+        "ticket_id",
+        "bill_id",
+        "refund_id",
+        "coupon_id",
+        "discount_rel_id",
+    }
+
+
+def has_non_empty_filter(sql: str, column: str) -> bool:
+    if not sql or not column:
+        return False
+    normalized = " ".join((sql or "").replace("`", "").lower().split())
+    col = column.lower()
+    has_not_null = "%s is not null" % col in normalized
+    has_not_empty = (
+        "%s != ''" % col in normalized
+        or "%s <> ''" % col in normalized
+        or "length(%s) > 0" % col in normalized
+        or "char_length(%s) > 0" % col in normalized
+    )
+    return has_not_null and has_not_empty
+
+
+def blank_entity_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
 
 
 def aggregate_group_key_allowed(intent: QuestionIntent, column: str) -> bool:
@@ -2375,10 +2734,17 @@ def multi_entity_transfer_values(
     max_values: int,
 ) -> Dict[str, List[Any]]:
     column_values: Dict[str, List[Any]] = {}
-    if not rows:
-        return dict(parent_result.entity_set.column_values) if parent_result.entity_set else {}
-    row_keys = set(rows[0].keys())
     pairs = paired_join_tokens(dep.anchor_column, dep.dependent_column) + paired_join_tokens(dep.join_key, dep.join_key)
+    allowed_dependent_keys = dependency_allowed_dependent_entity_keys(dep, dependent_columns)
+    if not rows:
+        if not parent_result.entity_set:
+            return {}
+        return {
+            column: values[:max_values]
+            for column, values in parent_result.entity_set.column_values.items()
+            if column in allowed_dependent_keys and any(not blank_entity_value(value) for value in values)
+        }
+    row_keys = set(rows[0].keys())
     for key, dep_key in pairs:
         if key in {"seller_id", "merchant_id"} or dep_key in {"seller_id", "merchant_id"}:
             continue
@@ -2387,29 +2753,37 @@ def multi_entity_transfer_values(
         values = column_values.setdefault(dep_key, [])
         for row in rows:
             value = row.get(key)
-            if value is not None and value not in values:
+            if not blank_entity_value(value) and value not in values:
                 values.append(value)
     if parent_result.entity_set:
         for column, values in parent_result.entity_set.column_values.items():
             if column in dependent_columns and column not in {"seller_id", "merchant_id"}:
+                if allowed_dependent_keys and column not in allowed_dependent_keys:
+                    continue
                 target_values = column_values.setdefault(column, [])
                 for value in values:
-                    if value is not None and value not in target_values:
+                    if not blank_entity_value(value) and value not in target_values:
                         target_values.append(value)
         if parent_result.entity_set.join_key in dependent_columns and parent_result.entity_set.join_key not in {"seller_id", "merchant_id"}:
-            target_values = column_values.setdefault(parent_result.entity_set.join_key, [])
-            for value in parent_result.entity_set.values:
-                if value is not None and value not in target_values:
-                    target_values.append(value)
-    for key in ["sub_order_id", "order_id", "spu_id", "spu_name", "ticket_id", "refund_id", "bill_id", "coupon_id", "discount_rel_id", "pt"]:
-        if key not in row_keys or key not in dependent_columns:
-            continue
-        values = column_values.setdefault(key, [])
-        for row in rows:
-            value = row.get(key)
-            if value is not None and value not in values:
-                values.append(value)
-    return {column: values[:max_values] for column, values in column_values.items() if values}
+            if not allowed_dependent_keys or parent_result.entity_set.join_key in allowed_dependent_keys:
+                target_values = column_values.setdefault(parent_result.entity_set.join_key, [])
+                for value in parent_result.entity_set.values:
+                    if not blank_entity_value(value) and value not in target_values:
+                        target_values.append(value)
+    return {
+        column: [value for value in values if not blank_entity_value(value)][:max_values]
+        for column, values in column_values.items()
+        if any(not blank_entity_value(value) for value in values)
+    }
+
+
+def dependency_allowed_dependent_entity_keys(dep: Any, dependent_columns: set) -> set[str]:
+    pairs = paired_join_tokens(dep.anchor_column, dep.dependent_column) + paired_join_tokens(dep.join_key, dep.join_key)
+    return {
+        dep_key
+        for key, dep_key in pairs
+        if key not in {"seller_id", "merchant_id"} and dep_key not in {"seller_id", "merchant_id"} and dep_key in dependent_columns
+    }
 
 
 def paired_join_tokens(anchor_value: str, dependent_value: str) -> List[Tuple[str, str]]:

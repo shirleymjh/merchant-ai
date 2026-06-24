@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings, jdbc_to_pymysql_kwargs
 from merchant_ai.models import MerchantInfo, PendingAnswer
+from merchant_ai.services.cache import TTLCache, stable_cache_key
 
 
 class DatabaseClient:
@@ -60,10 +62,33 @@ class DatabaseClient:
 
 class DorisRepository:
     def __init__(self, settings: Settings):
+        self.settings = settings
         self.db = DatabaseClient(settings.doris_jdbc_url, settings.doris_username, settings.doris_password, settings.doris_read_timeout_seconds)
+        self.query_cache = TTLCache(
+            "doris_select",
+            settings.cache_memory_max_entries,
+            settings.cache_doris_select_ttl_seconds if settings.cache_enabled else 0,
+        )
+        self.last_cache_hit = False
+        self.last_cache_key = ""
 
     def query(self, sql: str, params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
-        return self.db.query(sql, params)
+        self.last_cache_hit = False
+        self.last_cache_key = ""
+        params_list = list(params or [])
+        cacheable = self._cacheable_query(sql)
+        cache_key = stable_cache_key("doris", {"sql": normalize_sql_for_cache(sql), "params": params_list}) if cacheable else ""
+        if cache_key:
+            cached = self.query_cache.get(cache_key)
+            if cached is not None:
+                self.last_cache_hit = True
+                self.last_cache_key = cache_key
+                return cached
+        rows = self.db.query(sql, params_list or None)
+        if cache_key:
+            self.query_cache.set(cache_key, rows)
+            self.last_cache_key = cache_key
+        return rows
 
     def query_one(self, sql: str, params: Optional[Iterable[Any]] = None) -> Dict[str, Any]:
         rows = self.query(sql, params)
@@ -76,6 +101,30 @@ class DorisRepository:
     def sample_rows(self, table_name: str, merchant_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         safe_table = safe_identifier(table_name)
         return self.query("SELECT * FROM `%s` LIMIT %s" % (safe_table, max(1, min(limit, 100))))
+
+    def clear_cache(self) -> None:
+        self.query_cache.clear()
+
+    def cache_trace(self) -> Dict[str, Any]:
+        trace = self.query_cache.trace()
+        trace["lastCacheHit"] = self.last_cache_hit
+        trace["lastCacheKey"] = self.last_cache_key
+        return trace
+
+    def _cacheable_query(self, sql: str) -> bool:
+        text = str(sql or "").strip().lower()
+        if not text:
+            return False
+        if not (text.startswith("select") or text.startswith("show ")):
+            return False
+        if ";" in text.rstrip(";"):
+            return False
+        volatile = [" rand(", " random(", " now(", " current_timestamp", " uuid("]
+        return not any(token in " " + text for token in volatile)
+
+
+def normalize_sql_for_cache(sql: str) -> str:
+    return re.sub(r"\s+", " ", str(sql or "").strip())
 
 
 class AnswerRepository:

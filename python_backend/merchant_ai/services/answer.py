@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List
 
 from merchant_ai.models import (
@@ -26,6 +29,8 @@ class AnswerComposeService:
     def __init__(self, llm: LlmClient):
         self.llm = llm
         self.prompt_assembler = PromptAssembler()
+        self.last_prompt_chars = 0
+        self.last_analysis_skill_trace: Dict[str, Any] = {}
 
     def compose(
         self,
@@ -35,6 +40,8 @@ class AnswerComposeService:
         run_result: AgentRunResult,
         knowledge_context: str,
         analysis_summary: str = "",
+        allow_llm: bool = True,
+        rule_context: str = "",
     ) -> str:
         if not plan.intents:
             return self._no_execution_answer(plan)
@@ -45,37 +52,27 @@ class AnswerComposeService:
             return "这个问题还缺少业务对象或查询范围，请补充要看的指标、时间范围或业务域。"
         if primary.answer_mode == AnswerMode.RULE:
             return self._compose_rule_answer(question, knowledge_context)
+        effective_rule_context = rule_context if plan_requires_rule_evidence(plan) else ""
         if analysis_summary:
-            return analysis_summary
+            return self._apply_answer_guard(self._append_rule_evidence(analysis_summary, question, effective_rule_context), run_result)
         bundle = run_result.merged_query_bundle if run_result else QueryBundle()
         if primary.intent_type == "VALID" and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT} and (not run_result or not run_result.task_results):
             return self._no_execution_answer(plan)
         if run_result and run_result.task_results and all(result.query_bundle.failed for result in run_result.task_results):
             return self._apply_answer_guard(
-                self.append_business_advice(self._execution_failure_answer(run_result), plan.intents, bundle),
+                self._append_rule_evidence(self.append_business_advice(self._execution_failure_answer(run_result), plan.intents, bundle), question, effective_rule_context),
                 run_result,
             )
-        if self.llm.configured and bundle.rows:
-            prompt = json.dumps(
-                {
-                    "question": question,
-                    "merchant": merchant.model_dump(by_alias=True),
-                    "plan": plan.model_dump(by_alias=True),
-                    "tables": bundle.tables,
-                    "rows": bundle.rows[:80],
-                    "evidenceCheck": run_result.evidence_check.model_dump(by_alias=True) if run_result else {},
-                    "verifiedEvidence": run_result.verified_evidence.model_dump(by_alias=True) if run_result else {},
-                    "evidenceGaps": [gap.model_dump(by_alias=True) for gap in run_result.evidence_gaps] if run_result else [],
-                },
-                ensure_ascii=False,
-                default=str,
-            )
+        if allow_llm and self.llm.configured and bundle.rows and analysis_summary_required(plan):
+            prompt = json.dumps(answer_data_package(question, plan, run_result, rule_context), ensure_ascii=False, default=str)
+            self.last_prompt_chars = len(prompt)
             answer_prompt = self.prompt_assembler.render(
                 "answer.bi",
                 sections={
-                    "answer_context_policy": "AnswerAgent 只读取 verified evidence、rows preview、evidence gaps 和 plan；不要补造未执行事实。",
+                    "answer_context_policy": "AnswerAgent 只读取 question、dataRows、metricDisclosures、evidenceGaps；不要读取或推断 QueryGraph。",
                 },
             )
+            self.last_prompt_chars += len(answer_prompt.system_prompt)
             answer = self.llm.chat(
                 answer_prompt.system_prompt,
                 prompt,
@@ -83,36 +80,126 @@ class AnswerComposeService:
                 timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
             )
             if answer:
-                return self._apply_answer_guard(self.append_business_advice(answer, plan.intents, bundle), run_result)
+                return self._apply_answer_guard(
+                    self._append_rule_evidence(self.append_business_advice(answer, plan.intents, bundle), question, effective_rule_context),
+                    run_result,
+                )
         return self._apply_answer_guard(
-            self.append_business_advice(self._fallback_data_answer(question, plan, bundle, run_result), plan.intents, bundle),
+            self._append_rule_evidence(
+                self.append_business_advice(self._fallback_data_answer(question, plan, bundle, run_result), plan.intents, bundle),
+                question,
+                effective_rule_context,
+            ),
             run_result,
         )
 
-    def summarize_analysis(self, question: str, plan: QueryPlan, run_result: AgentRunResult) -> str:
-        if not self.llm.configured or not run_result or not run_result.merged_query_bundle.rows:
+    def summarize_analysis(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        outputs_path: str = "",
+        rule_context: str = "",
+    ) -> str:
+        self.last_analysis_skill_trace = {}
+        if not run_result or not run_result.merged_query_bundle.rows:
             return ""
         if not analysis_summary_required(plan):
             return ""
+        skill_answer = self.run_analysis_skill(question, plan, run_result, outputs_path, rule_context)
+        if skill_answer:
+            return skill_answer
+        if not self.llm.configured:
+            return ""
         analysis_prompt = self.prompt_assembler.render(
             "answer.analysis",
-            sections={"analysis_policy": "只能基于 evidence 判断趋势、异常和原因假设；不能把缺失证据当事实。"},
+            sections={"analysis_policy": "只能基于 compact evidence 判断趋势、异常和原因假设；不能把缺失证据当事实。"},
         )
-        return self.llm.chat(
+        prompt = json.dumps(
+            answer_data_package(question, plan, run_result, rule_context),
+            ensure_ascii=False,
+            default=str,
+        )
+        self.last_prompt_chars = len(analysis_prompt.system_prompt) + len(prompt)
+        self.last_analysis_skill_trace["llmFallbackAttempted"] = True
+        answer = self.llm.chat(
             analysis_prompt.system_prompt,
-            json.dumps(
-                {
-                    "question": question,
-                    "plan": plan.model_dump(by_alias=True),
-                    "rows": run_result.merged_query_bundle.rows[:80],
-                    "evidenceCheck": run_result.evidence_check.model_dump(by_alias=True),
-                },
-                ensure_ascii=False,
-                default=str,
-            ),
+            prompt,
             "",
-            timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
+            timeout_seconds=self.llm.settings.llm_analysis_timeout_seconds,
         )
+        self.last_analysis_skill_trace["llmFallbackUsed"] = bool(answer)
+        return answer
+
+    def run_analysis_skill(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        outputs_path: str = "",
+        rule_context: str = "",
+    ) -> str:
+        skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / "bi_trend_attribution"
+        skill_file = skill_dir / "SKILL.md"
+        script = skill_dir / "scripts" / "profile_timeseries.py"
+        trace: Dict[str, Any] = {
+            "skillName": "bi_trend_attribution",
+            "matchedBy": "questionUnderstanding.analysisIntent",
+            "activated": False,
+            "skillPath": str(skill_file),
+            "scriptPath": str(script),
+        }
+        self.last_analysis_skill_trace = trace
+        if not skill_file.exists() or not script.exists():
+            trace["error"] = "skill package missing"
+            return ""
+        skill_meta = load_skill_frontmatter(skill_file)
+        trace["metadata"] = skill_meta
+        artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
+        target = artifact_root / "artifacts" / "analysis_skills" / "bi_trend_attribution"
+        target.mkdir(parents=True, exist_ok=True)
+        input_path = target / "skill_input.json"
+        output_path = target / "skill_output.json"
+        payload = answer_data_package(question, plan, run_result, rule_context)
+        payload["questionUnderstanding"] = plan.question_understanding
+        payload["skillMetadata"] = skill_meta
+        input_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        trace.update(
+            {
+                "activated": True,
+                "inputArtifact": str(input_path),
+                "outputArtifact": str(output_path),
+                "inputRows": len(payload.get("dataRows") or []),
+            }
+        )
+        try:
+            completed = subprocess.run(
+                [self.llm.settings.python_executable, str(script), "--input", str(input_path), "--output", str(output_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            trace["error"] = str(exc)
+            return ""
+        trace["returnCode"] = completed.returncode
+        trace["stderr"] = completed.stderr[-1000:]
+        if completed.returncode != 0 or not output_path.exists():
+            trace["error"] = completed.stderr[-1000:] or "skill script failed"
+            return ""
+        try:
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            trace["error"] = "invalid skill output: %s" % exc
+            return ""
+        trace["outputRows"] = result.get("rowCount", 0)
+        trace["findings"] = result.get("findings", [])[:6]
+        trace["caveats"] = result.get("caveats", [])[:6]
+        answer = str(result.get("answerMarkdown") or "").strip()
+        if not answer:
+            trace["error"] = "empty skill answer"
+        return answer
 
     def append_business_advice(self, answer: str, intents: List[QuestionIntent], bundle: QueryBundle) -> str:
         if not answer:
@@ -207,6 +294,16 @@ class AnswerComposeService:
             return "我找到了相关规则片段，但当前未配置 LLM，先给出可核对的知识来源：\n\n%s" % knowledge_context[:1200]
         return "当前没有命中足够的规则知识，请补充具体规则场景或让运营完善知识库。"
 
+    def _append_rule_evidence(self, answer: str, question: str, rule_context: str) -> str:
+        evidence = compact_rule_evidence(question, rule_context)
+        if not evidence:
+            return answer
+        if "规则依据" in answer:
+            return answer
+        lines = ["规则依据："]
+        lines.extend("- %s" % item for item in evidence[:5])
+        return answer.rstrip() + "\n\n" + "\n".join(lines)
+
     def _fallback_data_answer(self, question: str, plan: QueryPlan, bundle: QueryBundle, run_result: AgentRunResult | None = None) -> str:
         if bundle.failed:
             return "这次查询没有成功执行：%s。已保留执行轨迹，建议检查数据表、字段或 SQL 口径。" % bundle.error
@@ -218,8 +315,9 @@ class AnswerComposeService:
         gaps = run_result.evidence_gaps if run_result else []
         if gaps:
             lines.append("- 证据状态：%s" % "；".join("%s:%s" % (gap.code, gap.reason[:80]) for gap in gaps[:4]))
+        multi_node_success = bool(run_result and len([item for item in run_result.task_results if not item.query_bundle.failed]) > 1)
         columns = fallback_display_columns(plan, bundle.rows)
-        if columns:
+        if columns and not multi_node_success:
             lines.append("")
             lines.append(markdown_table(bundle.rows[:8], columns))
         derived = run_result.verified_evidence.derived_evidence if run_result and run_result.verified_evidence else []
@@ -228,6 +326,11 @@ class AnswerComposeService:
             if formulas:
                 lines.append("")
                 lines.append("口径：%s" % "；".join(formulas))
+        if multi_node_success and run_result:
+            section = task_evidence_sections(plan, run_result)
+            if section:
+                lines.append("")
+                lines.append(section)
         return "\n".join(lines)
 
     def _execution_failure_answer(self, run_result: AgentRunResult) -> str:
@@ -299,6 +402,30 @@ def markdown_table(rows: List[Dict[str, Any]], columns: List[str]) -> str:
     return "\n".join([header, divider] + body)
 
 
+def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
+    succeeded = [item for item in run_result.task_results if not item.query_bundle.failed]
+    if len(succeeded) <= 1:
+        return ""
+    intent_by_task = {intent.plan_task_id: intent for intent in plan.intents}
+    lines = ["分节点证据："]
+    for item in succeeded[:5]:
+        bundle = item.query_bundle
+        if not bundle.rows:
+            lines.append("- %s：执行成功但返回 0 行。" % item.task_id)
+            continue
+        tables = "、".join(bundle.tables) if bundle.tables else (intent_by_task.get(item.task_id, QuestionIntent()).preferred_table or "")
+        lines.append("- %s（%s）：%s 行。" % (item.task_id, tables or "unknown_table", bundle.effective_row_count()))
+        intent = intent_by_task.get(item.task_id)
+        section_plan = QueryPlan(intents=[intent]) if intent else plan
+        columns = fallback_display_columns(section_plan, bundle.rows)
+        if columns:
+            lines.append(markdown_table(bundle.rows[:4], columns))
+    failed = [item for item in run_result.task_results if item.query_bundle.failed]
+    for item in failed[:3]:
+        lines.append("- %s：执行失败，%s" % (item.task_id, (item.query_bundle.error or item.summary)[:160]))
+    return "\n".join(lines)
+
+
 def format_cell(value: Any) -> str:
     text = str(value if value is not None else "")
     return text.replace("\n", " ")[:80]
@@ -308,7 +435,59 @@ def analysis_summary_required(plan: QueryPlan) -> bool:
     understanding = plan.question_understanding or {}
     analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
     requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
+    if rule_evidence_only_analysis(understanding, analysis_intent):
+        return False
+    if analysis_intent == "overview" and single_metric_overview(plan):
+        return False
+    grain = str(understanding.get("analysisGrain") or understanding.get("analysis_grain") or "").strip().lower()
+    if analysis_intent == "overview":
+        return requires_explanation and grain in {"merchant", "day"}
     return requires_explanation or (analysis_intent and analysis_intent != "none")
+
+
+def plan_requires_rule_evidence(plan: QueryPlan) -> bool:
+    if any(intent.answer_mode == AnswerMode.RULE for intent in plan.intents):
+        return True
+    understanding = plan.question_understanding or {}
+    for item in understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("semanticLabel") or item.get("semantic_label") or "").lower()
+        domains = {str(domain or "").lower() for domain in item.get("suggestedDomains") or item.get("suggested_domains") or []}
+        if "rule" in label or "规则" in label or domains & {"rule", "rules", "governance", "platform_rule"}:
+            return True
+    return False
+
+
+def single_metric_overview(plan: QueryPlan) -> bool:
+    executable = [intent for intent in plan.intents if intent.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT, AnswerMode.INVALID}]
+    if len(executable) != 1:
+        return False
+    intent = executable[0]
+    if intent.answer_mode != AnswerMode.METRIC:
+        return False
+    group_by = (intent.group_by_column or "").strip()
+    return group_by in {"", "merchant_id", "seller_id"}
+
+
+def rule_evidence_only_analysis(understanding: Dict[str, Any], analysis_intent: str) -> bool:
+    evidence_items = understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []
+    if not evidence_items:
+        return False
+    rule_tokens = {"rule", "rules", "policy", "governance", "platform", "规则", "治理", "平台"}
+    has_rule_item = False
+    non_rule_items = 0
+    for item in evidence_items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("semanticLabel") or item.get("semantic_label") or "").lower()
+        domains = [str(domain).lower() for domain in (item.get("suggestedDomains") or item.get("suggested_domains") or [])]
+        text = " ".join([label, *domains])
+        is_rule = any(token in text for token in rule_tokens)
+        has_rule_item = has_rule_item or is_rule
+        if not is_rule:
+            non_rule_items += 1
+    return has_rule_item and non_rule_items == 0 and analysis_intent in {"none", "overview", "diagnosis"}
 
 
 def boolish(value: Any) -> bool:
@@ -317,6 +496,176 @@ def boolish(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return bool(value)
+
+
+def answer_data_package(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    rule_context: str = "",
+) -> Dict[str, Any]:
+    if not run_result:
+        return {
+            "question": question,
+            "dataRows": [],
+            "metricDisclosures": [],
+            "evidenceGaps": [],
+            "ruleEvidence": compact_rule_evidence(question, rule_context),
+        }
+    verified = run_result.verified_evidence
+    return {
+        "question": question,
+        "tables": run_result.merged_query_bundle.tables,
+        "rowCount": run_result.merged_query_bundle.effective_row_count(),
+        "dataRows": run_result.merged_query_bundle.rows[:40],
+        "metricDisclosures": metric_disclosures(plan, verified),
+        "evidenceGaps": compact_evidence_gaps(run_result.evidence_gaps),
+        "ruleEvidence": compact_rule_evidence(question, rule_context),
+    }
+
+
+def compact_rule_evidence(question: str, rule_context: str, max_items: int = 5) -> List[str]:
+    context = (rule_context or "").strip()
+    if not context:
+        return []
+    candidates: List[str] = []
+    for raw_line in context.splitlines():
+        line = re.sub(r"\s+", " ", raw_line.strip())
+        if not line:
+            continue
+        if line.startswith(("{", "[", "}")):
+            continue
+        if '"topic"' in line or '"tableName"' in line or '"columnName"' in line:
+            continue
+        if line.startswith("#") or line.startswith("召回规则片段"):
+            continue
+        line = re.sub(r"^[-*]\s*", "", line)
+        if len(line) < 8 or "常见测试问法" in line:
+            continue
+        candidates.append(line)
+    if not candidates:
+        return [context[:240]]
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda item: (_rule_line_score(question, item[1]), -item[0]),
+        reverse=True,
+    )
+    selected: List[str] = []
+    for _, line in ranked:
+        if line in selected:
+            continue
+        selected.append(line[:180])
+        if len(selected) >= max_items:
+            break
+    return selected
+
+
+def _rule_line_score(question: str, line: str) -> int:
+    normalized = re.sub(r"\s+", "", question or "")
+    grams: set[str] = set()
+    for size in (2, 3, 4):
+        grams.update(normalized[index : index + size] for index in range(max(0, len(normalized) - size + 1)))
+    score = sum(size for gram in grams if gram and gram in line for size in [len(gram)])
+    if any(char in line for char in normalized):
+        score += 1
+    return score
+
+
+def metric_disclosures(plan: QueryPlan, verified: Any) -> List[Dict[str, Any]]:
+    disclosures: List[Dict[str, Any]] = []
+    for intent in plan.intents:
+        if intent.metric_specs:
+            for spec in intent.metric_specs:
+                if not isinstance(spec, dict):
+                    continue
+                disclosures.append(
+                    {
+                        "metricKey": spec.get("metricName") or spec.get("metric_key") or spec.get("metricColumn"),
+                        "ownerTable": intent.preferred_table,
+                        "formula": spec.get("metricFormula") or spec.get("formula"),
+                        "sourceColumns": spec.get("sourceColumns") or ([spec.get("metricColumn")] if spec.get("metricColumn") else []),
+                    }
+                )
+            continue
+        resolution = intent.metric_resolution or {}
+        if resolution:
+            disclosures.append(
+                {
+                    key: resolution.get(key)
+                    for key in [
+                        "requestedMetricRef",
+                        "metricKey",
+                        "ownerTable",
+                        "sourceColumns",
+                        "formula",
+                        "displayName",
+                        "fieldWarning",
+                    ]
+                    if resolution.get(key) not in (None, "", [])
+                }
+            )
+        elif intent.metric_formula or intent.metric_name:
+            disclosures.append(
+                {
+                    "metricKey": intent.metric_name or intent.metric_column,
+                    "ownerTable": intent.preferred_table,
+                    "formula": intent.metric_formula,
+                    "sourceColumns": [intent.metric_column] if intent.metric_column else [],
+                }
+            )
+    for item in getattr(verified, "derived_evidence", [])[:8]:
+        if isinstance(item, dict):
+            disclosures.append(
+                {
+                    key: item.get(key)
+                    for key in ["metric", "formula", "sourceColumns", "fieldWarning"]
+                    if item.get(key) not in (None, "", [])
+                }
+            )
+    return [item for item in dedupe_dicts(disclosures) if item]
+
+
+def compact_evidence_gaps(gaps: List[Any]) -> List[Dict[str, Any]]:
+    compacted: List[Dict[str, Any]] = []
+    for gap in gaps[:8]:
+        compacted.append(
+            {
+                "code": gap.code,
+                "taskId": gap.task_id,
+                "evidence": gap.evidence,
+                "reason": gap.reason,
+                "answerInstruction": gap.answer_instruction,
+            }
+        )
+    return compacted
+
+
+def dedupe_dicts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def load_skill_frontmatter(path: Path) -> Dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    meta: Dict[str, Any] = {}
+    for line in parts[1].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip()] = value.strip().strip('"')
+    return meta
 
 
 class DailyReportService:

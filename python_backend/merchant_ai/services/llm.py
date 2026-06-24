@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
+from merchant_ai.services.cache import TTLCache, stable_cache_key
 
 
 class LlmClient:
@@ -14,44 +15,70 @@ class LlmClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._model = None
+        self._models_by_timeout: Dict[int, Any] = {}
         self.last_error = ""
         self.error_events: List[str] = []
+        self.response_cache = TTLCache(
+            "llm_response",
+            settings.cache_memory_max_entries,
+            settings.cache_llm_ttl_seconds if settings.cache_enabled else 0,
+        )
+        self.last_cache_hit = False
+        self.last_cache_key = ""
 
     @property
     def configured(self) -> bool:
         return bool(self.settings.openai_api_key)
 
-    def _chat_model(self):
-        if self._model is not None:
+    def _chat_model(self, timeout_seconds: Optional[int] = None):
+        effective_timeout = max(1, int(timeout_seconds or self.settings.llm_request_timeout_seconds or 1))
+        if timeout_seconds is None and self._model is not None:
             return self._model
+        if timeout_seconds is not None and effective_timeout in self._models_by_timeout:
+            return self._models_by_timeout[effective_timeout]
         if not self.configured:
             return None
         try:
             from langchain_openai import ChatOpenAI
 
-            self._model = ChatOpenAI(
+            model = ChatOpenAI(
                 model=self.settings.openai_model,
                 api_key=self.settings.openai_api_key,
                 base_url=self.settings.openai_base_url.rstrip("/"),
                 temperature=0,
-                timeout=self.settings.llm_request_timeout_seconds,
+                timeout=effective_timeout,
                 max_tokens=self.settings.llm_max_tokens,
             )
+            if timeout_seconds is None:
+                self._model = model
+            else:
+                self._models_by_timeout[effective_timeout] = model
         except Exception:
             self.record_error("provider_error: failed to initialize chat model")
-            self._model = None
-        return self._model
+            if timeout_seconds is None:
+                self._model = None
+            return None
+        return model
 
     def record_error(self, error: str) -> None:
         self.last_error = error
         self.error_events.append(error)
 
     def chat(self, system_prompt: str, user_prompt: str, fallback: str = "", timeout_seconds: Optional[int] = None) -> str:
-        model = self._chat_model()
+        model = self._chat_model(timeout_seconds)
         if model is None:
             return fallback
+        cache_key = self._cache_key("chat", system_prompt, user_prompt, timeout_seconds=timeout_seconds)
+        cached = self.response_cache.get(cache_key)
+        if isinstance(cached, str):
+            self.last_error = ""
+            self.last_cache_hit = True
+            self.last_cache_key = cache_key
+            return cached
         try:
             self.last_error = ""
+            self.last_cache_hit = False
+            self.last_cache_key = cache_key
             from langchain_core.messages import HumanMessage, SystemMessage
 
             result = self._invoke_with_timeout(model, [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)], timeout_seconds)
@@ -59,8 +86,12 @@ class LlmClient:
                 return fallback
             content = getattr(result, "content", "")
             if isinstance(content, list):
-                return "\n".join(str(part) for part in content) or fallback
-            return str(content or fallback)
+                text = "\n".join(str(part) for part in content) or fallback
+            else:
+                text = str(content or fallback)
+            if text and text != fallback:
+                self.response_cache.set(cache_key, text)
+            return text
         except Exception as exc:
             self.record_error("provider_error: %s" % str(exc)[:300])
             return fallback
@@ -74,21 +105,33 @@ class LlmClient:
         timeout_seconds: Optional[int] = None,
         tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
-        model = self._chat_model()
+        model = self._chat_model(timeout_seconds)
         if model is None:
             return fallback or {"content": "", "toolCalls": []}
+        cache_key = self._cache_key("tool_chat", system_prompt, user_prompt, tools=tools, timeout_seconds=timeout_seconds, tool_choice=tool_choice)
+        cached = self.response_cache.get(cache_key)
+        if isinstance(cached, dict):
+            self.last_error = ""
+            self.last_cache_hit = True
+            self.last_cache_key = cache_key
+            return cached
         try:
             self.last_error = ""
+            self.last_cache_hit = False
+            self.last_cache_key = cache_key
             from langchain_core.messages import HumanMessage, SystemMessage
 
             tool_model = self._bind_tools(model, tools, tool_choice)
             result = self._invoke_with_timeout(tool_model, [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)], timeout_seconds)
             if result is None:
                 return fallback or {"content": "", "toolCalls": []}
-            return {
+            payload = {
                 "content": self._message_content(result),
                 "toolCalls": self._normalize_tool_calls(result),
             }
+            if payload.get("content") or payload.get("toolCalls"):
+                self.response_cache.set(cache_key, payload)
+            return payload
         except Exception as exc:
             self.record_error("provider_error: %s" % str(exc)[:300])
             return fallback or {"content": "", "toolCalls": []}
@@ -213,6 +256,35 @@ class LlmClient:
             except json.JSONDecodeError as exc:
                 self.record_error("json_parse_error: %s" % str(exc)[:300])
                 return {}
+
+    def _cache_key(
+        self,
+        kind: str,
+        system_prompt: str,
+        user_prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        timeout_seconds: Optional[int] = None,
+        tool_choice: Optional[str] = None,
+    ) -> str:
+        return stable_cache_key(
+            "llm",
+            {
+                "kind": kind,
+                "model": self.settings.openai_model,
+                "baseUrl": self.settings.openai_base_url,
+                "system": system_prompt,
+                "user": user_prompt,
+                "tools": tools or [],
+                "toolChoice": tool_choice or "",
+                "timeoutSeconds": timeout_seconds or self.settings.llm_request_timeout_seconds,
+            },
+        )
+
+    def cache_trace(self) -> Dict[str, Any]:
+        trace = self.response_cache.trace()
+        trace["lastCacheHit"] = self.last_cache_hit
+        trace["lastCacheKey"] = self.last_cache_key
+        return trace
 
 
 def tool_call_fingerprint(item: Dict[str, Any]) -> str:
