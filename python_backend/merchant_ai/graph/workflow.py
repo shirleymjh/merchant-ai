@@ -64,7 +64,7 @@ from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.observability import append_span, artifact_ref_from_path, now_ms, performance_summary, start_step, finish_step
-from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlanner, QueryGraphValidator
+from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlanner, QueryGraphValidator, semantic_workspace_manifest_from_asset_pack
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
@@ -1783,6 +1783,7 @@ class MerchantQaWorkflow:
                 "analysisSkill": state.get("analysis_skill_trace", {}),
                 "nodeToolTraces": [item.model_dump(by_alias=True) for item in state.get("node_tool_traces", [])],
                 "nodeTaskProfiles": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_task_profiles],
+                "nodeExecutionBatches": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_execution_batches],
                 "nodePlanContracts": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_plan_contracts],
                 "nodePlanCritiques": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_plan_critiques],
                 "sqlDraftDecisions": [item.model_dump(by_alias=True) for item in state["agent_run_result"].sql_draft_decisions],
@@ -1939,6 +1940,7 @@ class MerchantQaWorkflow:
                 key: value.model_dump(by_alias=True) for key, value in pack.semantic_catalog_version.items()
             },
             "schemaDriftReports": [item.model_dump(by_alias=True) for item in pack.schema_drift_reports],
+            "semanticWorkspace": semantic_workspace_manifest_from_asset_pack(pack, limit=12),
             "semanticFileContext": self.semantic_catalog.context_manifest(
                 pack.source_refs,
                 allowed_tables=pack.known_tables(),
@@ -2022,9 +2024,16 @@ class MerchantQaWorkflow:
         add_step(state, "Context Manager：刷新上下文快照 stage=%s protectedFacts=%d" % (stage, len(snapshot.protected_facts)))
 
     def sync_tool_runtime_state(self, state: AgentState) -> None:
-        failure_trace = {}
+        failure_trace = {"failures": [], "circuits": []}
+        registries = []
         if hasattr(self.node_worker, "tool_failure_registry"):
-            failure_trace = self.node_worker.tool_failure_registry.trace()
+            registries.append(self.node_worker.tool_failure_registry)
+        if hasattr(self.planner, "tool_failure_registry"):
+            registries.append(self.planner.tool_failure_registry)
+        for registry in registries:
+            trace = registry.trace()
+            failure_trace["failures"].extend(trace.get("failures", []))
+            failure_trace["circuits"].extend(trace.get("circuits", []))
         state["tool_failures"] = failure_trace.get("failures", [])
         state["circuit_breakers"] = failure_trace.get("circuits", [])
         if hasattr(self.node_worker, "tool_runtime_policies"):
@@ -2060,24 +2069,47 @@ class MerchantQaWorkflow:
         policies = state.get("tool_runtime_policies", [])
         failures = state.get("tool_failures", [])
         circuits = state.get("circuit_breakers", [])
+        runtime_traces = {}
         if hasattr(self.node_worker, "tool_runtime_policies"):
             policies = self.node_worker.tool_runtime_policies.trace()
-        if hasattr(self.node_worker, "tool_failure_registry"):
-            failure_trace = self.node_worker.tool_failure_registry.trace()
-            failures = failure_trace.get("failures", failures)
-            circuits = failure_trace.get("circuits", circuits)
+        for name, owner in [("node", self.node_worker), ("planner", self.planner)]:
+            if hasattr(owner, "tool_runtime_service"):
+                runtime_traces[name] = owner.tool_runtime_service.trace()
+        merged_alerts = []
+        merged_metrics = []
+        merged_rate_limits: Dict[str, Any] = {}
+        merged_load_balancer: Dict[str, Any] = {}
+        for name, trace in runtime_traces.items():
+            merged_alerts.extend(trace.get("alerts", []))
+            for item in trace.get("metrics", {}).get("tools", []):
+                next_item = dict(item)
+                next_item["runtime"] = name
+                merged_metrics.append(next_item)
+            merged_rate_limits[name] = trace.get("rateLimits", {})
+            merged_load_balancer[name] = trace.get("loadBalancer", {})
+        self.sync_tool_runtime_state(state)
+        failures = state.get("tool_failures", failures)
+        circuits = state.get("circuit_breakers", circuits)
         return {
             "policies": policies,
             "failures": failures,
             "circuits": circuits,
+            "metrics": {"tools": merged_metrics},
+            "rateLimits": merged_rate_limits,
+            "loadBalancer": merged_load_balancer,
+            "alerts": merged_alerts,
             "parallelism": {
                 "maxConcurrentNodeAgents": self.settings.max_concurrent_sub_agents,
+                "maxConcurrentToolCalls": self.settings.tool_max_concurrency,
                 "resultPairing": "tool_call id",
                 "failureIsolation": True,
             },
             "circuitBreaker": {
                 "repeatedIdenticalFailureBlocks": True,
                 "toolFailureThresholdBlocksTool": True,
+                "repeatThreshold": self.settings.tool_failure_repeat_threshold,
+                "circuitThreshold": self.settings.tool_circuit_threshold,
+                "cooldownSeconds": self.settings.tool_circuit_cooldown_seconds,
             },
         }
 

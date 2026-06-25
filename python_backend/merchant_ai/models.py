@@ -533,6 +533,14 @@ class ContextSnapshot(APIModel):
     truncated: bool = False
 
 
+class ContextDelta(APIModel):
+    context_hash: str = ""
+    unchanged_refs: List[str] = Field(default_factory=list)
+    changed_refs: List[str] = Field(default_factory=list)
+    inline_chars: int = 0
+    artifact_refs: List[str] = Field(default_factory=list)
+
+
 class ContextPackage(APIModel):
     package_id: str = ""
     run_id: str = ""
@@ -554,6 +562,8 @@ class ContextPackage(APIModel):
     inline_budget_chars: int = 0
     input_chars: int = 0
     offload_reason: str = ""
+    context_hash: str = ""
+    context_delta: ContextDelta = Field(default_factory=ContextDelta)
 
 
 class TraceSpan(APIModel):
@@ -646,6 +656,49 @@ class ToolRuntimePolicy(APIModel):
     non_retryable_errors: List[str] = Field(default_factory=list)
 
 
+class ToolCachePolicy(APIModel):
+    enabled: bool = False
+    namespace: str = ""
+    ttl_seconds: int = 0
+    key_fields: List[str] = Field(default_factory=list)
+
+
+class LoadBalancerTarget(APIModel):
+    name: str = ""
+    endpoint: str = ""
+    weight: int = 1
+    healthy: bool = True
+
+
+class ToolRuntimeMetrics(APIModel):
+    tool_name: str = ""
+    calls: int = 0
+    successes: int = 0
+    failures: int = 0
+    timeouts: int = 0
+    rate_limited: int = 0
+    circuit_blocked: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    retries: int = 0
+    total_duration_ms: int = 0
+    p95_duration_ms: int = 0
+    p99_duration_ms: int = 0
+    last_error_type: str = ""
+    last_target: str = ""
+
+
+class RuntimeAlert(APIModel):
+    alert_id: str = ""
+    severity: str = "warning"
+    code: str = ""
+    message: str = ""
+    tool_name: str = ""
+    value: float = 0.0
+    threshold: float = 0.0
+    created_at: str = ""
+
+
 class ToolFailureRecord(APIModel):
     fingerprint: str = ""
     tool_name: str = ""
@@ -660,6 +713,8 @@ class CircuitBreakerState(APIModel):
     open: bool = False
     failure_count: int = 0
     reason: str = ""
+    opened_at_ms: int = 0
+    open_until_ms: int = 0
 
 
 class ToolCallRequest(APIModel):
@@ -676,6 +731,11 @@ class ToolCallExecutionResult(APIModel):
     error_type: str = ""
     error_message: str = ""
     duration_ms: int = 0
+    attempts: int = 0
+    cache_hit: bool = False
+    cache_key: str = ""
+    rate_limited: bool = False
+    target: str = ""
 
 
 class FreshnessCheckResult(APIModel):
@@ -749,6 +809,18 @@ class NodeTaskProfile(APIModel):
     contract_status: str = ""
     sql_draft_source: str = ""
     contract_critique_reason: str = ""
+
+
+class NodeExecutionBatch(APIModel):
+    batch_id: str = ""
+    ready_task_ids: List[str] = Field(default_factory=list)
+    submitted_task_ids: List[str] = Field(default_factory=list)
+    completed_task_ids: List[str] = Field(default_factory=list)
+    timed_out_task_ids: List[str] = Field(default_factory=list)
+    blocked_task_ids: List[str] = Field(default_factory=list)
+    max_concurrency: int = 0
+    timeout_seconds: int = 0
+    duration_ms: int = 0
 
 
 class SkillManifest(APIModel):
@@ -1051,6 +1123,7 @@ class AgentRunResult(APIModel):
     node_plan_contracts: List[NodePlanContract] = Field(default_factory=list)
     node_plan_critiques: List[NodePlanCritiqueResult] = Field(default_factory=list)
     sql_draft_decisions: List[SqlDraftDecision] = Field(default_factory=list)
+    node_execution_batches: List[NodeExecutionBatch] = Field(default_factory=list)
 
 
 class PendingAnswer(APIModel):

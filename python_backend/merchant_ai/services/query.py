@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlglot
@@ -20,6 +20,7 @@ from merchant_ai.models import (
     FreshnessCheckResult,
     IntentType,
     NodeAgentContext,
+    NodeExecutionBatch,
     NodeExecutionContext,
     NodePlanContract,
     NodePlanCritiqueResult,
@@ -44,7 +45,7 @@ from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.planning import EvidenceContractBuilder
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import DorisRepository
-from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry
+from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import node_runtime_tool_schemas, sql_draft_tool, sql_repair_tool
 
 
@@ -325,7 +326,16 @@ class NodeWorkerExecutor:
         self.prompt_assembler = PromptAssembler()
         self._prompt_traces_by_task: Dict[str, Dict[str, Any]] = {}
         self.tool_runtime_policies = ToolRuntimePolicyRegistry(settings)
-        self.tool_failure_registry = ToolFailureRegistry()
+        self.tool_failure_registry = ToolFailureRegistry(
+            repeat_threshold=settings.tool_failure_repeat_threshold,
+            circuit_threshold=settings.tool_circuit_threshold,
+            cooldown_seconds=settings.tool_circuit_cooldown_seconds,
+        )
+        self.tool_runtime_service = ToolRuntimeService(
+            settings,
+            policy_registry=self.tool_runtime_policies,
+            failure_registry=self.tool_failure_registry,
+        )
         self.artifact_store = WorkspaceArtifactStore(settings)
         self.node_plan_critic = NodePlanCritic()
         self._last_sql_draft_decisions: Dict[str, SqlDraftDecision] = {}
@@ -356,7 +366,8 @@ class NodeWorkerExecutor:
             ]
             if not ready_ids:
                 ready_ids = list(pending.keys())
-            batch_results = self._execute_ready_batch(ready_ids, pending, completed, plan, merchant_id, asset_pack, question, knowledge_context)
+            batch_results, batch_trace = self._execute_ready_batch(ready_ids, pending, completed, plan, merchant_id, asset_pack, question, knowledge_context)
+            result.node_execution_batches.append(batch_trace)
             for task_id, task_result in batch_results.items():
                 completed[task_id] = task_result
                 pending.pop(task_id, None)
@@ -403,41 +414,63 @@ class NodeWorkerExecutor:
         asset_pack: PlanningAssetPack,
         question: str,
         knowledge_context: str,
-    ) -> Dict[str, AgentTaskResult]:
+    ) -> tuple[Dict[str, AgentTaskResult], NodeExecutionBatch]:
+        started = time.perf_counter()
         max_workers = max(1, min(self.settings.max_concurrent_sub_agents, len(ready_ids)))
         results: Dict[str, AgentTaskResult] = {}
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        futures = {}
-        try:
-            for task_id in ready_ids:
-                context = self._node_context(task_id, pending[task_id], completed, plan, merchant_id, question, asset_pack)
-                futures[executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)] = task_id
+        batch = NodeExecutionBatch(
+            batch_id="batch_%03d" % (len(ready_ids) + int(time.time() * 1000) % 1000),
+            ready_task_ids=list(ready_ids),
+            max_concurrency=max_workers,
+            timeout_seconds=max(1, self.settings.agent_node_timeout_seconds),
+        )
+        for start in range(0, len(ready_ids), max_workers):
+            chunk_ids = ready_ids[start : start + max_workers]
+            chunk_futures = {}
+            executor = ThreadPoolExecutor(max_workers=max_workers)
             try:
-                completed_futures = as_completed(
-                    futures,
-                    timeout=max(self.settings.agent_node_timeout_seconds, 1) * max(1, len(futures)),
-                )
-                for future in completed_futures:
-                    task_id = futures[future]
+                for task_id in chunk_ids:
+                    node_args = {"taskId": task_id, "table": pending[task_id].preferred_table}
+                    blocked = self.tool_failure_registry.should_block("node_agent", node_args)
+                    if blocked:
+                        batch.blocked_task_ids.append(task_id)
+                        results[task_id] = failed_result(task_id, pending[task_id], "node_agent blocked by circuit breaker: %s" % blocked.reason)
+                        continue
+                    context = self._node_context(task_id, pending[task_id], completed, plan, merchant_id, question, asset_pack)
+                    future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
+                    chunk_futures[future] = task_id
+                    batch.submitted_task_ids.append(task_id)
+                if not chunk_futures:
+                    continue
+                done, not_done = wait(chunk_futures, timeout=max(self.settings.agent_node_timeout_seconds, 1))
+                for future in done:
+                    task_id = chunk_futures[future]
                     node_args = {"taskId": task_id, "table": pending[task_id].preferred_table}
                     try:
                         task_result = future.result(timeout=0)
                         self.tool_failure_registry.record_success("node_agent", node_args)
-                    except TimeoutError:
-                        self.tool_failure_registry.record_failure("node_agent", node_args, "TIMEOUT", "node execution timed out")
-                        task_result = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
+                        batch.completed_task_ids.append(task_id)
                     except Exception as exc:
                         self.tool_failure_registry.record_failure("node_agent", node_args, "ERROR", str(exc))
                         task_result = failed_result(task_id, pending[task_id], "NodeWorker 执行异常: %s" % str(exc)[:200])
                     task_result.task_id = task_id
                     results[task_id] = task_result
-            except TimeoutError:
-                pass
-        finally:
-            for future in futures:
-                if not future.done():
+                for future in not_done:
+                    task_id = chunk_futures[future]
+                    self.tool_failure_registry.record_failure(
+                        "node_agent",
+                        {"taskId": task_id, "table": pending[task_id].preferred_table},
+                        "TIMEOUT",
+                        "node execution timed out",
+                    )
+                    batch.timed_out_task_ids.append(task_id)
+                    results[task_id] = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
                     future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            finally:
+                for future in chunk_futures:
+                    if not future.done():
+                        future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
         for task_id in ready_ids:
             if task_id not in results:
                 self.tool_failure_registry.record_failure(
@@ -447,7 +480,11 @@ class NodeWorkerExecutor:
                     "node execution timed out",
                 )
                 results[task_id] = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
-        return results
+                batch.timed_out_task_ids.append(task_id)
+        batch.completed_task_ids = list(dict.fromkeys(batch.completed_task_ids))
+        batch.timed_out_task_ids = list(dict.fromkeys(batch.timed_out_task_ids))
+        batch.duration_ms = int((time.perf_counter() - started) * 1000)
+        return results, batch
 
     def _node_context(
         self,
@@ -986,14 +1023,67 @@ class NodeWorkerExecutor:
                 sql = repaired.repaired_sql
                 continue
             execute_args = {"taskId": intent.plan_task_id, "table": intent.preferred_table, "sql": trim_sql(sql, 1000)}
-            blocked = self.tool_failure_registry.should_block("execute_sql", execute_args)
-            if blocked:
-                message = "execute_sql blocked by circuit breaker: %s" % blocked.reason
-                record_tool(tool_traces, intent, "execute_sql", "blocked", trim_sql(sql), message, "CIRCUIT_OPEN", round_index)
-                trace.append(ReActStep(round=3 + round_index * 3, reason="工具熔断阻断 Doris 执行", action="query_doris.blocked", observation=message))
+            query_started = time.perf_counter()
+            runtime_result = self.tool_runtime_service.execute(
+                "execute_sql",
+                execute_args,
+                lambda _args: {
+                    "rows": self.doris_repository.query(sql),
+                    "cacheHit": bool(getattr(self.doris_repository, "last_cache_hit", False)),
+                    "cacheKey": str(getattr(self.doris_repository, "last_cache_key", "") or ""),
+                },
+                call_id=intent.plan_task_id or "execute_sql",
+                target_kind="doris",
+            )
+            query_duration_ms = runtime_result.duration_ms or int((time.perf_counter() - query_started) * 1000)
+            if runtime_result.status != "success":
+                message = runtime_result.error_message or "Doris 查询失败"
+                error_type = runtime_result.error_type or "SQL_EXECUTION_FAILED"
+                if error_type == "TIMEOUT" and "超时" not in message:
+                    message = "Doris 查询超时: %s" % message
+                record_tool(tool_traces, intent, "execute_sql", runtime_result.status or "failed", trim_sql(sql), message, error_type, round_index, duration_ms=query_duration_ms)
+                trace.append(ReActStep(round=3 + round_index * 3, reason="Doris 执行失败", action="query_doris.failed", observation="%s: %s" % (error_type, message[:200])))
+                if error_type not in {"CIRCUIT_OPEN", "RATE_LIMITED", "TIMEOUT"}:
+                    policy = doris_error_policy(error_type)
+                    structured_attempt = self._structured_fallback_attempt(
+                        sql,
+                        validation.model_copy(update={"valid": False, "error_code": error_type, "message": message}),
+                        intent,
+                        asset_pack,
+                        context,
+                    )
+                    if policy["structured_fallback"] and structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                        repair_attempts.append(structured_attempt)
+                        record_tool(
+                            tool_traces,
+                            intent,
+                            "draft_structured_sql_fallback",
+                            "success",
+                            error_type,
+                            trim_sql(structured_attempt.repaired_sql),
+                            error_type,
+                            round_index + 1,
+                        )
+                        sql = structured_attempt.repaired_sql
+                        continue
+                    resource_attempt = self._resource_safe_fallback_attempt(sql, error_type, message, intent, asset_pack, context)
+                    if policy["resource_fallback"] and resource_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                        repair_attempts.append(resource_attempt)
+                        record_tool(
+                            tool_traces,
+                            intent,
+                            "draft_resource_safe_sql_fallback",
+                            "success",
+                            error_type,
+                            trim_sql(resource_attempt.repaired_sql),
+                            error_type,
+                            round_index + 1,
+                        )
+                        sql = resource_attempt.repaired_sql
+                        continue
                 return AgentTaskResult(
                     success=False,
-                    summary=message,
+                    summary="%s: %s" % (error_type, message[:200]),
                     query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=message),
                     react_trace=trace,
                     sql_repairs=repair_attempts,
@@ -1006,12 +1096,9 @@ class NodeWorkerExecutor:
                     sql_draft_decision=draft_decision,
                 )
             try:
-                query_started = time.perf_counter()
-                rows = self.doris_repository.query(sql)
-                query_duration_ms = int((time.perf_counter() - query_started) * 1000)
-                cache_hit = bool(getattr(self.doris_repository, "last_cache_hit", False))
-                cache_key = str(getattr(self.doris_repository, "last_cache_key", "") or "")
-                self.tool_failure_registry.record_success("execute_sql", execute_args)
+                rows = list(runtime_result.result.get("rows") or [])
+                cache_hit = bool(runtime_result.result.get("cacheHit") or getattr(self.doris_repository, "last_cache_hit", False))
+                cache_key = str(runtime_result.result.get("cacheKey") or getattr(self.doris_repository, "last_cache_key", "") or "")
                 record_tool(
                     tool_traces,
                     intent,

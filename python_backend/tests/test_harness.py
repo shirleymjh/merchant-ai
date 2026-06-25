@@ -50,6 +50,8 @@ from merchant_ai.models import (
     TaskRole,
     ThreadData,
     ToolCallRequest,
+    ToolCachePolicy,
+    LoadBalancerTarget,
     VerifiedEvidence,
 )
 from merchant_ai.services.assets import (
@@ -101,6 +103,7 @@ from merchant_ai.services.planning import (
     repair_dependency_key_production_gaps,
     repair_more_specific_root_metric,
     scope_ratio_numerator_knowledge_request,
+    semantic_workspace_manifest_from_asset_pack,
     ultra_compact_understanding_catalog,
 )
 from merchant_ai.services.prompts import PromptAssembler
@@ -114,7 +117,13 @@ from merchant_ai.services.query import (
 )
 from merchant_ai.services.repositories import DorisRepository
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService
-from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry
+from merchant_ai.services.tool_runtime import (
+    RoundRobinLoadBalancer,
+    ToolCallExecutor,
+    ToolFailureRegistry,
+    ToolRuntimePolicyRegistry,
+    ToolRuntimeService,
+)
 from merchant_ai.services.tools import (
     artifact_file_tool_schemas,
     lead_action_selection_tool,
@@ -276,12 +285,29 @@ def test_planner_semantic_tool_loop_loads_ref_then_emits_understanding(tmp_path)
     plan, requests, _ = planner.plan(question, [], "", recall, pack, [], [])
     assert not requests
     assert plan.intents
+    assert any(call["name"] == "semantic_ls" for call in plan.planner_tool_calls)
     assert any(call["name"] == "semantic_read" for call in plan.planner_tool_calls)
+    assert "semantic:电商交易:manifest" in plan.planner_loaded_refs
     assert "semantic:电商交易:dwm_trade_order_detail_di:asset" in plan.planner_loaded_refs
     assert plan.planner_context_files
     assert len(planner.llm.fast_calls) == 1
+    assert planner.llm.calls[0]["semanticWorkspace"]["mode"] == "filesystem_as_context"
+    assert "semanticManifest" not in planner.llm.calls[0]
     assert any("planner.semantic_tool_loop=enabled" == item for item in plan.agent_trace)
     assert any("planner.semantic_tool_loop=on_demand" == item for item in plan.agent_trace)
+
+
+def test_semantic_catalog_lists_topic_manifest_before_detail_refs():
+    settings = get_settings()
+    catalog = SemanticCatalogService(TopicAssetService(settings))
+    refs = catalog.ls(topic="电商交易", limit=5)
+    assert refs
+    assert refs[0]["kind"] == "TOPIC_MANIFEST"
+    assert refs[0]["refId"] == "semantic:电商交易:manifest"
+    read = catalog.read(ref_id="semantic:电商交易:manifest", max_chars=2000)
+    assert read["success"]
+    assert read["kind"] == "TOPIC_MANIFEST"
+    assert "tables" in read["content"]
 
 
 def test_planner_limits_need_more_to_one_recovery_call():
@@ -1389,10 +1415,14 @@ def test_planner_fast_path_uses_small_context_package():
     assert len(user_prompt) < settings.agent_planner_prompt_budget_chars
     assert stats["toolSchemaChars"] < len(json.dumps(full_schema, ensure_ascii=False))
     tool_payload = planner._understanding_payload(question, pack, [], [], False, False, None, include_full_file_context=True)
-    file_context = tool_payload["semanticFileContext"]
-    assert file_context["mode"] == "filesystem_as_context"
-    assert len(file_context["refs"]) <= settings.agent_planner_seed_table_limit
-    assert any("layers" in ref for ref in file_context["refs"])
+    workspace = tool_payload["semanticWorkspace"]
+    assert workspace["mode"] == "filesystem_as_context"
+    assert "semanticManifest" not in tool_payload
+    assert workspace["manifestRefs"]
+    assert len(workspace["tableRefs"]) <= settings.agent_planner_seed_table_limit
+    assert tool_payload["semanticFileContext"] == workspace
+    generated_workspace = semantic_workspace_manifest_from_asset_pack(pack, limit=settings.agent_planner_seed_table_limit)
+    assert generated_workspace["tools"]
 
 
 def test_ultra_catalog_keeps_cross_domain_metric_refs_without_expanding_tables():
@@ -4305,6 +4335,17 @@ def test_tool_failure_registry_blocks_repeated_identical_failures():
     assert "repeated identical failure" in blocked.reason
 
 
+def test_tool_failure_registry_releases_tool_after_cooldown():
+    registry = ToolFailureRegistry(repeat_threshold=5, circuit_threshold=1, cooldown_seconds=1)
+    args = {"taskId": "anchor", "sql": "SELECT * FROM x"}
+    registry.record_failure("execute_sql", args, "TIMEOUT", "slow")
+    blocked = registry.should_block("execute_sql", {"taskId": "other"})
+    assert blocked is not None
+    assert blocked.open
+    blocked.open_until_ms = 1
+    assert registry.should_block("execute_sql", {"taskId": "other"}) is None
+
+
 def test_entity_transfer_does_not_mix_order_id_into_sub_order_id_dependency():
     dep = PlanDependency(
         anchor_task_id="order_detail",
@@ -4353,7 +4394,7 @@ def test_tool_call_executor_pairs_parallel_results_and_isolates_failures():
     assert results[0].status == "success"
     assert results[0].result == {"value": 7}
     assert results[1].status == "failed"
-    assert results[1].error_type == "ERROR"
+    assert results[1].error_type == "INVALID_ARGUMENT"
     assert registry.trace()["failures"]
 
 
@@ -4363,6 +4404,78 @@ def test_execute_sql_runtime_policy_leaves_repair_to_node_worker():
     assert policy.max_retries == 0
     assert "MEM_ALLOC_FAILED" in policy.non_retryable_errors
     assert not policy.retryable_errors
+
+
+def test_tool_runtime_service_caches_successful_result():
+    settings = get_settings().model_copy(update={"cache_enabled": True, "semantic_cache_ttl_seconds": 60})
+    runtime = ToolRuntimeService(settings)
+    calls = {"count": 0}
+
+    def handler(args):
+        calls["count"] += 1
+        return {"value": args["value"], "count": calls["count"]}
+
+    policy = ToolCachePolicy(enabled=True, namespace="semantic_test", ttl_seconds=60)
+    first = runtime.execute("semantic_read", {"value": 7, "semanticVersion": "v1"}, handler, cache_policy=policy)
+    second = runtime.execute("semantic_read", {"value": 7, "semanticVersion": "v1"}, handler, cache_policy=policy)
+
+    assert first.status == "success"
+    assert second.status == "success"
+    assert second.cache_hit
+    assert second.result["count"] == 1
+    assert calls["count"] == 1
+    metrics = runtime.trace()["metrics"]["tools"][0]
+    assert metrics["cacheHits"] == 1
+
+
+def test_tool_runtime_service_rate_limit_blocks_without_calling_handler():
+    settings = get_settings().model_copy(update={"tool_rate_limit_enabled": True, "tool_default_qps": 1})
+    runtime = ToolRuntimeService(settings)
+    calls = {"count": 0}
+
+    def handler(args):
+        calls["count"] += 1
+        return {"ok": True}
+
+    first = runtime.execute("execute_sql", {"sql": "SELECT 1"}, handler, target_kind="doris")
+    second = runtime.execute("execute_sql", {"sql": "SELECT 2"}, handler, target_kind="doris")
+
+    assert first.status == "success"
+    assert second.status == "blocked"
+    assert second.error_type == "RATE_LIMITED"
+    assert calls["count"] == 1
+
+
+def test_round_robin_load_balancer_cycles_targets():
+    balancer = RoundRobinLoadBalancer(
+        {
+            "llm": [
+                LoadBalancerTarget(name="a", endpoint="http://a"),
+                LoadBalancerTarget(name="b", endpoint="http://b"),
+            ]
+        }
+    )
+
+    assert [balancer.select("llm").name for _ in range(4)] == ["a", "b", "a", "b"]
+
+
+def test_context_package_has_stable_hash_for_same_refs(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    manager = ContextManager(settings)
+    state = {
+        "run_id": "run_1",
+        "thread_id": "thread_1",
+        "question": "最近7天订单量是多少",
+        "requested_merchant_id": "100",
+        "planning_asset_pack": PlanningAssetPack(),
+    }
+
+    first = manager.package(state, "planner", "PlannerAgent")
+    second = manager.package(state, "planner", "PlannerAgent")
+
+    assert first.context_hash
+    assert first.context_hash == second.context_hash
+    assert first.context_delta.context_hash == first.context_hash
 
 
 def test_planner_overrides_need_more_when_semantic_catalog_is_sufficient():
@@ -5346,6 +5459,59 @@ def test_node_worker_executes_independent_ready_nodes_concurrently():
     elapsed = time.monotonic() - started
     assert [item.success for item in result.task_results] == [True, True]
     assert elapsed < 0.45
+    assert result.node_execution_batches
+    assert set(result.node_execution_batches[0].submitted_task_ids) == {"node_a", "node_b"}
+    assert result.node_execution_batches[0].max_concurrency == 2
+
+
+def test_node_worker_isolates_slow_parallel_node_timeout():
+    class TableDelayDoris:
+        def query(self, sql, params=None):
+            if "table_b" in sql:
+                time.sleep(1.25)
+            return [{"seller_id": "100"}]
+
+    settings = get_settings()
+    settings.max_concurrent_sub_agents = 2
+    settings.agent_node_timeout_seconds = 1
+    worker = NodeWorkerExecutor(EmptySqlLlm(), TableDelayDoris(), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="table_a", columns=["seller_id"]),
+            PlanningAssetEntry(table="table_b", columns=["seller_id"]),
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="A",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_a",
+                preferred_table="table_a",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_a` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+            QuestionIntent(
+                question="B",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_b",
+                preferred_table="table_b",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_b` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+        ]
+    )
+
+    result = worker.execute_plan("100", plan, pack, "", "慢节点隔离")
+    by_id = {item.task_id: item for item in result.task_results}
+
+    assert by_id["node_a"].success
+    assert not by_id["node_b"].success
+    assert "超时" in by_id["node_b"].summary
+    assert result.node_execution_batches[0].completed_task_ids == ["node_a"]
+    assert result.node_execution_batches[0].timed_out_task_ids == ["node_b"]
 
 
 def test_asset_builder_caches_live_schema_lookup():
@@ -9870,6 +10036,22 @@ class SemanticToolLoopPlannerLlm:
         payload = json.loads(user_prompt)
         self.calls.append(payload)
         if len(self.calls) == 1:
+            return {
+                "content": "",
+                "toolCalls": [
+                    {
+                        "id": "call_ls_trade",
+                        "name": "semantic_ls",
+                        "args": {
+                            "topic": "电商交易",
+                            "query": "下单最多 SPU 订单指标",
+                            "limit": 5,
+                            "reason": "inspect semantic workspace manifest before reading detail assets",
+                        },
+                    }
+                ],
+            }
+        if len(self.calls) == 2:
             return {
                 "content": "",
                 "toolCalls": [

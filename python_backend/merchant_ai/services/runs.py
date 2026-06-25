@@ -346,6 +346,9 @@ class AgentRunStreamService:
             thread = self.run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
             thread_id = thread.thread_id
         run = self.run_manager.create_run(thread_id, merchant_id, request.message)
+        started_payload = {"runId": run.run_id, "threadId": thread_id, "merchantId": merchant_id}
+        self.run_manager.append_event(run.run_id, thread_id, "run.started", "RUN_STREAM", started_payload)
+        q.put({"event": "run.started", "node": "RUN_STREAM", "payload": started_payload})
 
         def listener(event_type: str, node: str, payload: Dict[str, Any]) -> None:
             self.run_manager.append_event(run.run_id, thread_id, event_type, node, payload)
@@ -444,6 +447,7 @@ class AgentAsyncRunService:
         if self.run_manager.is_canceled(run_id):
             return
         self.run_manager.mark_run_running(run_id)
+        self.run_manager.append_event(run_id, thread_id, "run.started", "ASYNC_RUN_SERVICE", {"merchantId": merchant_id})
 
         def listener(event_type: str, node: str, payload: Dict[str, Any]) -> None:
             if not self.run_manager.is_canceled(run_id):

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
-from merchant_ai.models import ArtifactRef, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
+from merchant_ai.models import ArtifactRef, ContextDelta, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
 
 
 class ImportantFactExtractor:
@@ -156,6 +157,18 @@ class ContextManager:
         question = str(state.get("question") or "")
         summary = snapshot.summary[:4000]
         input_chars = len(question) + len(summary) + sum(len(str(fact.value)) for fact in snapshot.protected_facts)
+        artifact_refs = artifact_refs or self.artifact_refs(state)
+        hash_payload = {
+            "stage": stage,
+            "agent": agent,
+            "taskId": task_id,
+            "question": question,
+            "tables": allowed_tables or [],
+            "metrics": allowed_metrics or [],
+            "sourceRefs": [ref.locator or ref.path or ref.title for ref in snapshot.source_refs[:12]],
+            "artifactRefs": [ref.relative_path or ref.path for ref in artifact_refs],
+        }
+        context_hash = hashlib.sha256(json.dumps(hash_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
         return ContextPackage(
             package_id="ctx_" + uuid.uuid4().hex,
             run_id=str(state.get("run_id") or ""),
@@ -173,7 +186,7 @@ class ContextManager:
             ],
             protected_facts=snapshot.protected_facts[:18],
             source_refs=snapshot.source_refs[:12],
-            artifact_refs=artifact_refs or self.artifact_refs(state),
+            artifact_refs=artifact_refs,
             allowed_tables=allowed_tables or [],
             allowed_metrics=allowed_metrics or [],
             evidence_gaps=gaps,
@@ -181,6 +194,13 @@ class ContextManager:
             inline_budget_chars=int(getattr(self.settings, "context_file_inline_max_chars", 0) or 0),
             input_chars=input_chars,
             offload_reason="large rows/tool results stay in workspace artifacts; context package keeps refs only",
+            context_hash=context_hash,
+            context_delta=ContextDelta(
+                context_hash=context_hash,
+                changed_refs=[ref.relative_path or ref.path for ref in artifact_refs],
+                inline_chars=input_chars,
+                artifact_refs=[ref.relative_path or ref.path for ref in artifact_refs],
+            ),
         )
 
     def artifact_refs(self, state: Dict[str, Any]) -> List[ArtifactRef]:

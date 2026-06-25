@@ -7,7 +7,7 @@
     "businessName": "优惠券金额",
     "formula": "SUM(coupon_amt)",
     "unit": "元",
-    "description": "优惠券面额金额",
+    "description": "优惠券金额投入，按优惠券明细表 coupon_amt 聚合；可用于回答券金额投入、优惠券投入、优惠投入等问题",
     "sourceColumns": [
       "coupon_amt"
     ],
@@ -15,6 +15,12 @@
       "优惠券金额",
       "优惠券面额",
       "券面额",
+      "券金额",
+      "券金额投入",
+      "优惠券金额投入",
+      "优惠券投入",
+      "优惠投入",
+      "券投入",
       "coupon_amt"
     ],
     "confidence": 0.78,

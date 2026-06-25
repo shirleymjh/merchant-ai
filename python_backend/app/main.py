@@ -129,6 +129,44 @@ def runs_dashboard(
     return {"success": True, "dashboard": jsonable_encoder(dashboard, by_alias=True)}
 
 
+def _runtime_trace() -> Dict[str, Any]:
+    traces: Dict[str, Any] = {}
+    for name, owner in [("planner", workflow.planner), ("node", workflow.node_worker)]:
+        service = getattr(owner, "tool_runtime_service", None)
+        if service is not None:
+            traces[name] = service.trace()
+    metrics = []
+    alerts = []
+    rate_limits: Dict[str, Any] = {}
+    load_balancer: Dict[str, Any] = {}
+    for name, trace in traces.items():
+        for item in trace.get("metrics", {}).get("tools", []):
+            next_item = dict(item)
+            next_item["runtime"] = name
+            metrics.append(next_item)
+        alerts.extend(trace.get("alerts", []))
+        rate_limits[name] = trace.get("rateLimits", {})
+        load_balancer[name] = trace.get("loadBalancer", {})
+    return {
+        "metrics": {"tools": metrics},
+        "alerts": alerts,
+        "rateLimits": rate_limits,
+        "loadBalancer": load_balancer,
+    }
+
+
+@app.get("/api/runtime/metrics")
+def runtime_metrics() -> Dict[str, Any]:
+    trace = _runtime_trace()
+    return {"success": True, "metrics": jsonable_encoder(trace["metrics"], by_alias=True), "rateLimits": trace["rateLimits"], "loadBalancer": trace["loadBalancer"]}
+
+
+@app.get("/api/runtime/alerts")
+def runtime_alerts() -> Dict[str, Any]:
+    trace = _runtime_trace()
+    return {"success": True, "alerts": jsonable_encoder(trace["alerts"], by_alias=True)}
+
+
 @app.get("/ops/runs", response_class=HTMLResponse)
 def ops_runs_dashboard() -> HTMLResponse:
     return HTMLResponse(RUNS_DASHBOARD_HTML)

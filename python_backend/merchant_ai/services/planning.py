@@ -26,6 +26,7 @@ from merchant_ai.models import (
     RecallBundle,
     TaskRole,
     ToolCallRequest,
+    ToolCachePolicy,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.assets import (
@@ -44,7 +45,7 @@ from merchant_ai.services.formulas import (
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.routing import extract_days
-from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry
+from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import artifact_file_tool_definitions, question_understanding_tool, semantic_file_tool_definitions
 
 
@@ -722,12 +723,21 @@ class QueryGraphPlanner:
         self.compiler = QuestionUnderstandingCompiler()
         self.coverage_critic = UnderstandingCoverageCritic()
         self.prompt_assembler = PromptAssembler()
-        self.tool_failure_registry = ToolFailureRegistry()
+        self.tool_failure_registry = ToolFailureRegistry(
+            repeat_threshold=self.settings.tool_failure_repeat_threshold,
+            circuit_threshold=self.settings.tool_circuit_threshold,
+            cooldown_seconds=self.settings.tool_circuit_cooldown_seconds,
+        )
         self.tool_runtime_policies = ToolRuntimePolicyRegistry(self.settings)
         self.tool_executor = ToolCallExecutor(
             self.tool_runtime_policies,
             self.tool_failure_registry,
-            max_concurrency=max(1, self.settings.max_concurrent_sub_agents),
+            max_concurrency=max(1, self.settings.tool_max_concurrency),
+        )
+        self.tool_runtime_service = ToolRuntimeService(
+            self.settings,
+            policy_registry=self.tool_runtime_policies,
+            failure_registry=self.tool_failure_registry,
         )
 
     def with_artifact_root(self, root: str) -> None:
@@ -1210,13 +1220,12 @@ class QueryGraphPlanner:
             },
         }
         if include_full_file_context:
-            payload["semanticManifest"] = semantic_manifest_from_asset_pack(asset_pack, table_names=prompt_tables, limit=table_limit)
-            payload["semanticFileContext"] = semantic_file_context_from_asset_pack(
+            payload["semanticWorkspace"] = semantic_workspace_manifest_from_asset_pack(
                 asset_pack,
                 table_names=prompt_tables,
-                limit=8,
-                include_layers=True,
+                limit=table_limit,
             )
+            payload["semanticFileContext"] = payload["semanticWorkspace"]
         return payload
 
     def _llm_understand_with_semantic_tools(
@@ -1242,7 +1251,9 @@ class QueryGraphPlanner:
                 "round": round_index + 1,
                 "maxRounds": self.settings.agent_planner_tool_rounds,
                 "instruction": (
-                    "Call semantic_read/grep only when semanticCatalog lacks needed detail; call emit_question_understanding when ready. "
+                    "Use FileSystem-as-Context: start from semanticWorkspace manifests, call semantic_ls/semantic_grep to locate refs, "
+                    "then semantic_read only the exact table/metric/relationship/rule file needed; call emit_question_understanding when ready. "
+                    "Do not ask the system to preload full semantic assets. "
                     "If repairFeedback exists, address it before emitting and do not repeat the invalid understanding. "
                     "If previousUnderstanding declares comparison_baseline or trend_context, inspect semantic files for the best metric owner table before emitting."
                 ),
@@ -1264,13 +1275,23 @@ class QueryGraphPlanner:
                 break
             semantic_calls = [call for call in calls if call.name.startswith("semantic_") or call.name.startswith("artifact_")]
             if semantic_calls:
-                results = self.tool_executor.execute(semantic_calls, self._semantic_tool_handlers())
+                cache_policies = {
+                    "semantic_ls": ToolCachePolicy(enabled=True, namespace="semantic_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                    "semantic_read": ToolCachePolicy(enabled=True, namespace="semantic_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                    "semantic_grep": ToolCachePolicy(enabled=True, namespace="semantic_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                    "artifact_ls": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                    "artifact_read": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                    "artifact_grep": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                }
+                results = self.tool_runtime_service.execute_many(semantic_calls, self._semantic_tool_handlers(), cache_policies=cache_policies)
                 serialized_results = []
                 for item in results:
                     payload = item.model_dump(by_alias=True)
                     payload["round"] = round_index + 1
                     if item.result.get("refId"):
                         loaded_refs.append(str(item.result.get("refId")))
+                    for ref_id in semantic_ref_ids_from_tool_result(item.result):
+                        loaded_refs.append(ref_id)
                     result_artifact = self.artifact_store.write_json(
                         "planner/tool_results",
                         "%s_%s_round_%d.json" % (item.name, item.id or "call", round_index + 1),
@@ -1733,6 +1754,27 @@ def attach_planner_tool_trace(plan: QueryPlan, payload: Dict[str, Any]) -> None:
     plan.planner_tool_results = list(payload.get("_plannerToolResults") or [])
     plan.planner_loaded_refs = [str(item) for item in payload.get("_plannerLoadedRefs") or []]
     plan.planner_context_files = list(payload.get("_plannerContextFiles") or [])
+
+
+def semantic_ref_ids_from_tool_result(result: Dict[str, Any]) -> List[str]:
+    refs: List[str] = []
+    if not isinstance(result, dict):
+        return refs
+    for key in ["refId", "ref_id"]:
+        value = str(result.get(key) or "")
+        if value.startswith("semantic:"):
+            refs.append(value)
+    for container_key in ["items", "hits", "refs"]:
+        items = result.get(container_key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("refId") or item.get("ref_id") or "")
+            if value.startswith("semantic:"):
+                refs.append(value)
+    return sorted(set(refs))
 
 
 def compact_openai_tool_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -3475,6 +3517,42 @@ def semantic_manifest_from_asset_pack(
     }
 
 
+def semantic_workspace_manifest_from_asset_pack(
+    asset_pack: PlanningAssetPack,
+    limit: int = 12,
+    table_names: List[str] | None = None,
+) -> Dict[str, Any]:
+    table_manifest = semantic_manifest_from_asset_pack(asset_pack, limit=limit, table_names=table_names)
+    topics = sorted({str(item.get("topic") or "") for item in table_manifest.get("tables") or [] if item.get("topic")})
+    manifest_refs = [
+        {
+            "refId": "semantic:%s:manifest" % topic,
+            "path": "topics/%s/manifest.json" % topic,
+            "kind": "TOPIC_MANIFEST",
+            "topic": topic,
+            "title": "%s/manifest" % topic,
+        }
+        for topic in topics
+    ]
+    return {
+        "mode": "filesystem_as_context",
+        "policy": "Initial context is a semantic workspace index, not full schema. Use semantic_ls/grep/read to progressively load only needed details.",
+        "progressiveDisclosure": [
+            "topic manifest -> table and metric summary",
+            "table asset -> fields, metrics, keys, filters and warnings",
+            "relationships/rules -> only when graph edges, formulas or business evidence needs them",
+            "artifacts -> query graph, SQL, rows and evidence reports by path",
+        ],
+        "tools": ["semantic_ls", "semantic_grep", "semantic_read", "artifact_ls", "artifact_grep", "artifact_read", "artifact_write"],
+        "roots": ["topics/<topic>/manifest.json", "topics/<topic>/tables/<table>/asset.json", "topics/<topic>/relationships.json"],
+        "manifestRefs": manifest_refs,
+        "tableRefs": table_manifest.get("tables", [])[:limit],
+        "relationshipPathHints": table_manifest.get("relationshipsPathHints", []),
+        "loadPolicy": "Read manifests before table assets unless a sourceRefId already identifies the exact table/relationship needed.",
+        "offloadPolicy": "Large tool results stay in artifacts; keep previews and paths in prompt.",
+    }
+
+
 def semantic_file_context_from_asset_pack(
     asset_pack: PlanningAssetPack,
     limit: int = 12,
@@ -3543,7 +3621,7 @@ def semantic_file_context_from_asset_pack(
                 refs[-1]["layers"] = {}
     return {
         "mode": "filesystem_as_context",
-        "policy": "Use semanticCatalog for first-pass understanding; when evidence is missing, request semantic_ls/read/grep instead of guessing fields.",
+        "policy": "Start from manifest refs; when evidence is missing, request semantic_ls/read/grep instead of guessing fields.",
         "tools": ["semantic_ls", "semantic_read", "semantic_grep", "semantic_write"],
         "refs": refs[:limit],
     }

@@ -168,6 +168,7 @@ class SemanticCatalogService:
     current planning step.
     """
 
+    MANIFEST_KIND = "TOPIC_MANIFEST"
     TABLE_KIND = "TABLE_ASSET"
     RELATIONSHIP_KIND = "RELATIONSHIPS"
     OFFLOAD_THRESHOLD_CHARS = 20_000
@@ -190,6 +191,9 @@ class SemanticCatalogService:
         refs: List[Dict[str, Any]] = []
         terms = question_match_terms(query) if query else []
         for topic_name in topics:
+            manifest_ref = self.manifest_ref(topic_name)
+            if not terms or score_document(terms, manifest_ref["searchText"]) > 0:
+                refs.append(manifest_ref)
             for manifest_item in self.topic_assets.load_manifest(topic_name):
                 table = str(manifest_item.get("tableName") or "")
                 if not table:
@@ -301,9 +305,58 @@ class SemanticCatalogService:
             )
         return {
             "mode": "filesystem_as_context",
-            "policy": "list semantic refs first; read/grep only refs needed for the current step; offload large files by path",
+            "policy": "start from topic manifests; read/grep only table, metric, relationship, or rule files needed for the current step; offload large files by path",
+            "progressiveDisclosure": [
+                "1. topic manifest: available tables, high-level metrics and rule summaries",
+                "2. table asset: fields, metric formulas, keys, partition and merchant filters",
+                "3. relationship/rule files: only when graph edges, formulas or business policy evidence is missing",
+                "4. workspace artifacts: read query graphs, SQL, rows or evidence reports by path when needed",
+            ],
             "roots": ["topics/<topic>/manifest.json", "topics/<topic>/tables/<table>/asset.json", "topics/<topic>/relationships.json"],
             "refs": refs[:limit],
+        }
+
+    def manifest_ref(self, topic: str) -> Dict[str, Any]:
+        manifest = self.topic_assets.load_manifest(topic)
+        compact_tables: List[Dict[str, Any]] = []
+        search_parts: List[str] = [topic]
+        for item in manifest:
+            table = str(item.get("tableName") or "")
+            title = str(item.get("tableComment") or item.get("title") or table)
+            metrics = item.get("metrics") if isinstance(item.get("metrics"), list) else []
+            fields = item.get("fields") if isinstance(item.get("fields"), list) else []
+            compact_tables.append(
+                {
+                    "tableName": table,
+                    "title": title,
+                    "dataGrain": item.get("dataGrain") or item.get("grain") or "",
+                    "primaryKeys": item.get("primaryKeys") or item.get("entityKeys") or [],
+                    "metricHints": metrics[:8],
+                    "fieldHints": fields[:8],
+                }
+            )
+            search_parts.extend([table, title, json.dumps(metrics[:8], ensure_ascii=False), json.dumps(fields[:8], ensure_ascii=False)])
+        content_payload = {
+            "topic": topic,
+            "layer": "manifest",
+            "policy": "Use this manifest to choose which table asset or relationship file to read next. Do not infer formulas from manifest hints alone.",
+            "tables": compact_tables,
+            "relationshipPath": semantic_relationship_path(topic),
+        }
+        content = json.dumps(content_payload, ensure_ascii=False, indent=2)
+        return {
+            "refId": semantic_manifest_ref_id(topic),
+            "kind": self.MANIFEST_KIND,
+            "topic": topic,
+            "table": "",
+            "path": semantic_manifest_path(topic),
+            "title": "%s/manifest" % topic,
+            "summary": "%d table manifests under topic %s" % (len(compact_tables), topic),
+            "layers": {"tables": len(compact_tables), "layer": "manifest"},
+            "estimatedChars": len(content),
+            "offloadRecommended": len(content) > self.OFFLOAD_THRESHOLD_CHARS,
+            "content": content,
+            "searchText": "\n".join(search_parts),
         }
 
     def table_ref(self, topic: str, table: str, asset: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -365,6 +418,7 @@ class SemanticCatalogService:
             return self._refs_cache[cache_key]
         refs: List[Dict[str, Any]] = []
         for topic_name in topics:
+            refs.append(self.manifest_ref(topic_name))
             for manifest_item in self.topic_assets.load_manifest(topic_name):
                 table = str(manifest_item.get("tableName") or "")
                 if table:
@@ -2007,8 +2061,16 @@ def semantic_table_ref_id(topic: str, table: str) -> str:
     return "semantic:%s:%s:asset" % (topic, table)
 
 
+def semantic_manifest_ref_id(topic: str) -> str:
+    return "semantic:%s:manifest" % topic
+
+
 def semantic_relationship_ref_id(topic: str) -> str:
     return "semantic:%s:relationships" % topic
+
+
+def semantic_manifest_path(topic: str) -> str:
+    return "topics/%s/manifest.json" % topic
 
 
 def semantic_table_path(topic: str, table: str) -> str:
