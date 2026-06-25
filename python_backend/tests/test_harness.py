@@ -239,12 +239,48 @@ def test_semantic_catalog_exposes_filesystem_context_tools():
     refs = catalog.ls(topic="电商交易", query="dwm_trade_order_detail_di", limit=5)
     order_ref = next(ref for ref in refs if ref["table"] == "dwm_trade_order_detail_di")
     assert order_ref["path"] == "topics/电商交易/tables/dwm_trade_order_detail_di/asset.json"
+    assert order_ref["merchantUri"].startswith("merchant://topic/电商交易/table/dwm_trade_order_detail_di")
+    assert order_ref["contextLayer"] == "L2"
     assert order_ref["layers"]["metrics"] > 0
     content = catalog.read(ref_id=order_ref["refId"], max_chars=800)
     assert content["success"]
+    assert content["merchantUri"] == order_ref["merchantUri"]
+    assert content["contextLayer"] == "L2"
     assert "dwm_trade_order_detail_di" in content["content"]
     hits = catalog.grep("order_detail_cnt", topic="电商交易", limit=5)
     assert any(hit["refId"] == order_ref["refId"] for hit in hits)
+
+
+def test_semantic_workspace_manifest_uses_layered_context_uris():
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        "最近7天订单量是多少",
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE],
+    )
+
+    workspace = semantic_workspace_manifest_from_asset_pack(pack, limit=4)
+
+    assert workspace["uriScheme"] == "merchant://"
+    assert {"L0", "L1", "L2"} <= set(workspace["layers"])
+    assert workspace["manifestRefs"]
+    assert workspace["manifestRefs"][0]["merchantUri"].startswith("merchant://topic/")
+    assert workspace["tableRefs"]
+    assert workspace["tableRefs"][0]["merchantUri"].startswith("merchant://topic/")
+
+
+def test_artifact_store_returns_context_uri(tmp_path):
+    settings = get_settings()
+    store = WorkspaceArtifactStore(settings, tmp_path)
+
+    artifact = store.write_json("planner", "query_graph.json", {"ok": True}, preview_chars=0)
+    listed = store.ls("planner", limit=5)
+    read_back = store.read(artifact["relativePath"])
+
+    assert artifact["merchantUri"].startswith("merchant://artifact/planner/")
+    assert listed[0]["merchantUri"].startswith("merchant://artifact/")
+    assert read_back["merchantUri"].startswith("merchant://artifact/")
 
 
 def test_semantic_file_tool_schemas_are_runtime_injected():
@@ -8368,6 +8404,57 @@ def test_coverage_critic_adds_recalled_metric_evidence_for_ship_timeout_order_co
         "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
     } in result.understanding["requestedMeasures"]
     assert any(item.startswith("UNDERSTANDING_RECALLED_METRIC_COMPLETION:") for item in result.trace)
+
+
+def test_coverage_critic_prunes_requested_measure_that_duplicates_ranking_metric():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "pt", "order_cnt_1d"]),
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "pt", "sub_order_id"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_cnt_1d",
+                table="ads_merchant_profile",
+                columns=["order_cnt_1d"],
+                title="总订单量",
+                aliases=["订单量"],
+                metadata={"metricKey": "order_cnt_1d", "sourceColumns": ["order_cnt_1d"]},
+            ),
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                title="订单量",
+                aliases=["下单数"],
+                metadata={"metricKey": "order_detail_cnt", "sourceColumns": ["sub_order_id"]},
+            ),
+        ],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "order_cnt_1d",
+            "ownerTable": "ads_merchant_profile",
+            "sourcePhrase": "总订单量",
+            "objectiveType": "metric_total",
+        },
+        "requestedMeasures": [
+            {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "订单量",
+            }
+        ],
+        "requiredEvidenceIntents": [],
+    }
+
+    result = UnderstandingCoverageCritic().complete("最近7天总订单量是多少？", understanding, pack)
+
+    assert result.understanding["requestedMeasures"] == []
+    assert any(item.startswith("UNDERSTANDING_OVER_COVERAGE_PRUNED:") for item in result.trace)
 
 
 def test_compiler_treats_same_table_event_scope_anchor_as_population_contract():

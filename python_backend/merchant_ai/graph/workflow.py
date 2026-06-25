@@ -61,6 +61,7 @@ from merchant_ai.services.answer import AnswerComposeService, analysis_summary_r
 from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService, WikiMemoryService
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.context import ContextManager
+from merchant_ai.services.context_filesystem import add_context_uri, context_lineage_record, merchant_uri_for_artifact, merchant_uri_for_semantic_ref
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.observability import append_span, artifact_ref_from_path, now_ms, performance_summary, start_step, finish_step
@@ -1762,6 +1763,7 @@ class MerchantQaWorkflow:
                 "toolCalling": self.tool_calling_debug(state),
                 "contextSnapshots": state.get("context_snapshots", []),
                 "contextManagement": self.context_management_debug(state),
+                "contextLineage": self.context_lineage_debug(state),
                 "toolRuntime": self.tool_runtime_debug(state),
                 "cache": self.cache_debug(),
                 "openDiagnostic": self.open_diagnostic_debug(state),
@@ -1872,6 +1874,7 @@ class MerchantQaWorkflow:
                     },
                     "toolCalling": self.tool_calling_debug(state),
                     "contextManagement": self.context_management_debug(state),
+                    "contextLineage": self.context_lineage_debug(state),
                     "toolRuntime": self.tool_runtime_debug(state),
                     "cache": self.cache_debug(),
                     "openDiagnostic": self.open_diagnostic_debug(state),
@@ -1946,6 +1949,80 @@ class MerchantQaWorkflow:
                 allowed_tables=pack.known_tables(),
                 allowed_relationship_topics=relationship_topics_from_pack(pack),
             ),
+        }
+
+    def context_lineage_debug(self, state: AgentState) -> Dict[str, Any]:
+        pack = state.get("planning_asset_pack") or PlanningAssetPack()
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for ref_id, item in list(pack.source_refs.items())[:40]:
+            metadata = item.metadata or {}
+            semantic_ref_id = str(metadata.get("semanticRefId") or ref_id or item.doc_id or "")
+            semantic_path = str(metadata.get("semanticPath") or "")
+            if semantic_ref_id:
+                source = add_context_uri(
+                    {
+                        "refId": semantic_ref_id,
+                        "path": semantic_path,
+                        "kind": metadata.get("semanticKind") or item.source_type,
+                        "topic": item.topic,
+                        "table": item.table,
+                        "title": item.title,
+                    },
+                    ref_id=semantic_ref_id,
+                    topic=item.topic,
+                    table=item.table,
+                    kind=str(metadata.get("semanticKind") or item.source_type),
+                    path=semantic_path,
+                )
+                key = source.get("merchantUri") or semantic_ref_id
+                if key not in seen:
+                    seen.add(key)
+                    records.append(context_lineage_record("knowledge_retrieval", source, "load_source_ref"))
+        plan = state.get("plan") or QueryPlan()
+        for intent in plan.intents[:40]:
+            resolution = intent.metric_resolution or {}
+            fallback_ref_id = intent.knowledge_ref_ids[0] if intent.knowledge_ref_ids else ""
+            semantic_ref_id = str(resolution.get("semanticRefId") or fallback_ref_id or "")
+            if semantic_ref_id:
+                source = {
+                    "merchantUri": merchant_uri_for_semantic_ref(
+                        semantic_ref_id,
+                        topic=str(resolution.get("topic") or ""),
+                        table=intent.preferred_table,
+                        kind="METRIC",
+                        key=intent.metric_name or intent.metric_column,
+                    ),
+                    "refId": semantic_ref_id,
+                    "path": "",
+                    "contextLayer": "L1",
+                    "kind": "METRIC",
+                    "title": intent.metric_name or intent.metric_column or intent.plan_task_id,
+                }
+                key = source["merchantUri"]
+                if key not in seen:
+                    seen.add(key)
+                    records.append(context_lineage_record("metric_resolution", source, "bind_metric"))
+        thread_data = state.get("thread_data")
+        outputs_path = getattr(thread_data, "outputs_path", "") if thread_data is not None else ""
+        for artifact in self.artifact_manifest(state)[:40]:
+            uri = artifact.get("merchantUri") or merchant_uri_for_artifact(artifact.get("relativePath") or artifact.get("path") or "", namespace=artifact.get("namespace") or "")
+            source = {
+                "merchantUri": uri,
+                "path": artifact.get("relativePath") or artifact.get("path") or "",
+                "contextLayer": "L2",
+                "kind": artifact.get("namespace") or "artifact",
+                "title": artifact.get("title") or artifact.get("relativePath") or "",
+            }
+            key = uri or source["path"]
+            if key and key not in seen:
+                seen.add(key)
+                records.append(context_lineage_record("artifact", source, "offload"))
+        return {
+            "uriScheme": "merchant://",
+            "records": records[:80],
+            "recordCount": len(records),
+            "workspace": outputs_path,
         }
 
     def artifact_manifest(self, state: AgentState) -> List[Dict[str, Any]]:

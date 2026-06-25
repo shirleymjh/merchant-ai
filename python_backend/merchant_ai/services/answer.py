@@ -1060,11 +1060,71 @@ def answer_data_package(
         "question": question,
         "tables": run_result.merged_query_bundle.tables,
         "rowCount": run_result.merged_query_bundle.effective_row_count(),
-        "dataRows": run_result.merged_query_bundle.rows[:40],
+        "dataRows": answer_data_rows(plan, run_result),
         "metricDisclosures": metric_disclosures(plan, verified),
         "evidenceGaps": compact_evidence_gaps(run_result.evidence_gaps),
         "ruleEvidence": compact_rule_evidence(question, rule_context),
     }
+
+
+def answer_data_rows(plan: QueryPlan, run_result: AgentRunResult) -> List[Dict[str, Any]]:
+    if not run_result:
+        return []
+    if task_metric_rows_better_for_answer(plan, run_result):
+        rows = prioritized_task_metric_rows(plan, run_result)
+        if rows:
+            return rows[:40]
+    return run_result.merged_query_bundle.rows[:40]
+
+
+def task_metric_rows_better_for_answer(plan: QueryPlan, run_result: AgentRunResult) -> bool:
+    visible = visible_successful_tasks(plan, run_result)
+    metric_tasks = []
+    for item in visible:
+        intent = intent_by_task_id(plan).get(item.task_id)
+        if not intent:
+            continue
+        resolution = intent.metric_resolution or {}
+        metric_key = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+        if metric_key and intent.answer_mode in {AnswerMode.GROUP_AGG, AnswerMode.TOPN, AnswerMode.DERIVED}:
+            metric_tasks.append(intent)
+    if len(metric_tasks) < 2:
+        return False
+    group_columns = {str(intent.group_by_column or "").strip() for intent in metric_tasks}
+    return group_columns <= {"", "pt", "merchant_id", "seller_id"} or "pt" in group_columns
+
+
+def prioritized_task_metric_rows(plan: QueryPlan, run_result: AgentRunResult) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in visible_successful_tasks(plan, run_result):
+        intent = intent_by_task_id(plan).get(item.task_id)
+        if not intent or not item.query_bundle.rows:
+            continue
+        resolution = intent.metric_resolution or {}
+        metric_key = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+        display = str(resolution.get("displayName") or metric_key or item.task_id).strip()
+        if not metric_key and intent.answer_mode != AnswerMode.DERIVED:
+            continue
+        for row in item.query_bundle.rows[:8]:
+            enriched = dict(row)
+            enriched.setdefault("__taskId", item.task_id)
+            enriched.setdefault("__metricKey", metric_key)
+            enriched.setdefault("__metricName", display)
+            rows.append(enriched)
+    return rows
+
+
+def visible_successful_tasks(plan: QueryPlan, run_result: AgentRunResult) -> List[Any]:
+    intent_map = intent_by_task_id(plan)
+    succeeded = [item for item in run_result.task_results if not item.query_bundle.failed and item.query_bundle.rows]
+    ordered = sorted(succeeded, key=lambda item: task_evidence_priority(intent_map.get(item.task_id), item, plan))
+    support_ids = support_task_ids_for_answer(plan)
+    visible = [item for item in ordered if answer_visible_task(intent_map.get(item.task_id), item, plan, support_ids)]
+    return visible or ordered
+
+
+def intent_by_task_id(plan: QueryPlan) -> Dict[str, QuestionIntent]:
+    return {intent.plan_task_id: intent for intent in plan.intents if intent.plan_task_id}
 
 
 def compact_rule_evidence(question: str, rule_context: str, max_items: int = 5) -> List[str]:

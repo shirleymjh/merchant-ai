@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from merchant_ai.models import ArtifactRef, RunStep, TraceSpan
+from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 
 
 PHASE_BY_NODE = {
@@ -65,6 +66,8 @@ def artifact_ref_from_path(path: str, namespace: str = "", reason: str = "") -> 
         bytes=size,
         estimated_chars=size,
         sha256=digest,
+        merchant_uri=merchant_uri_for_artifact(file_path.name, namespace=namespace),
+        context_layer="L2",
     )
 
 
@@ -203,4 +206,3 @@ def performance_summary(state: Dict[str, Any]) -> Dict[str, Any]:
             for span in slow_spans
         ],
     }
-

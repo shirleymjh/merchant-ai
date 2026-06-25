@@ -21,6 +21,7 @@ from merchant_ai.models import (
     ChatResponse,
     RunCreateRequest,
 )
+from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 from merchant_ai.services.checkpoints import checkpoint_ref_for_run
 
 
@@ -534,4 +535,6 @@ def artifact_ref_from_path(path: str, namespace: str = "", reason: str = "") -> 
         reason=reason,
         bytes=size,
         estimated_chars=size,
+        merchant_uri=merchant_uri_for_artifact(target.name, namespace=namespace),
+        context_layer="L2",
     )

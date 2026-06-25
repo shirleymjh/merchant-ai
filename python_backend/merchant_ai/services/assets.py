@@ -23,6 +23,7 @@ from merchant_ai.models import (
     category_display,
 )
 from merchant_ai.services.cache import TTLCache, stable_cache_key
+from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.repositories import DorisRepository, write_json
 
 
@@ -217,7 +218,7 @@ class SemanticCatalogService:
         content = ref["content"]
         start = max(0, offset)
         end = min(len(content), start + max(1, max_chars))
-        return {
+        return add_context_uri({
             "success": True,
             "refId": ref["refId"],
             "path": ref["path"],
@@ -229,7 +230,7 @@ class SemanticCatalogService:
             "nextContentOffsetChars": end if end < len(content) else None,
             "truncated": end < len(content),
             "estimatedChars": len(content),
-        }
+        }, ref_id=ref["refId"], topic=ref["topic"], table=ref.get("table", ""), kind=ref["kind"], path=ref["path"])
 
     def grep(
         self,
@@ -292,7 +293,7 @@ class SemanticCatalogService:
             if not item.table and item.source_type == "SEMANTIC_RELATIONSHIP" and relationship_topic_filter and item.topic not in relationship_topic_filter:
                 continue
             refs.append(
-                {
+                add_context_uri({
                     "refId": ref_id,
                     "path": semantic_path,
                     "kind": metadata.get("semanticKind") or item.source_type,
@@ -301,11 +302,17 @@ class SemanticCatalogService:
                     "title": item.title,
                     "estimatedChars": metadata.get("estimatedChars", len(item.content or "")),
                     "offloadRecommended": bool(metadata.get("offloadRecommended")),
-                }
+                }, ref_id=ref_id, topic=item.topic, table=item.table, kind=str(metadata.get("semanticKind") or item.source_type), path=semantic_path)
             )
         return {
             "mode": "filesystem_as_context",
+            "uriScheme": "merchant://",
             "policy": "start from topic manifests; read/grep only table, metric, relationship, or rule files needed for the current step; offload large files by path",
+            "layers": {
+                "L0": "topic/table/metric summaries for routing and quick relevance checks",
+                "L1": "table, metric, relationship and rule overviews for planning and rerank",
+                "L2": "full schema, metric formulas, rules, rows or artifacts loaded only on demand",
+            },
             "progressiveDisclosure": [
                 "1. topic manifest: available tables, high-level metrics and rule summaries",
                 "2. table asset: fields, metric formulas, keys, partition and merchant filters",
@@ -344,7 +351,7 @@ class SemanticCatalogService:
             "relationshipPath": semantic_relationship_path(topic),
         }
         content = json.dumps(content_payload, ensure_ascii=False, indent=2)
-        return {
+        return add_context_uri({
             "refId": semantic_manifest_ref_id(topic),
             "kind": self.MANIFEST_KIND,
             "topic": topic,
@@ -357,7 +364,7 @@ class SemanticCatalogService:
             "offloadRecommended": len(content) > self.OFFLOAD_THRESHOLD_CHARS,
             "content": content,
             "searchText": "\n".join(search_parts),
-        }
+        }, ref_id=semantic_manifest_ref_id(topic), topic=topic, kind=self.MANIFEST_KIND, path=semantic_manifest_path(topic))
 
     def table_ref(self, topic: str, table: str, asset: Dict[str, Any] | None = None) -> Dict[str, Any]:
         asset = asset or self.topic_assets.load_table_asset(topic, table)
@@ -369,7 +376,7 @@ class SemanticCatalogService:
             "terms": len(asset.get("terms") or []),
             "knowledgeRules": len(asset.get("knowledgeRules") or []),
         }
-        return {
+        return add_context_uri({
             "refId": semantic_table_ref_id(topic, table),
             "kind": self.TABLE_KIND,
             "topic": topic,
@@ -382,12 +389,12 @@ class SemanticCatalogService:
             "offloadRecommended": len(content) > self.OFFLOAD_THRESHOLD_CHARS,
             "content": content,
             "searchText": compact_semantic_asset_for_recall(asset),
-        }
+        }, ref_id=semantic_table_ref_id(topic, table), topic=topic, table=table, kind=self.TABLE_KIND, path=semantic_table_path(topic, table))
 
     def relationship_ref(self, topic: str, relationships: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
         relationships = relationships if relationships is not None else self.topic_assets.load_relationships(topic)
         content = json.dumps(relationships, ensure_ascii=False, indent=2)
-        return {
+        return add_context_uri({
             "refId": semantic_relationship_ref_id(topic),
             "kind": self.RELATIONSHIP_KIND,
             "topic": topic,
@@ -400,7 +407,7 @@ class SemanticCatalogService:
             "offloadRecommended": len(content) > self.OFFLOAD_THRESHOLD_CHARS,
             "content": content,
             "searchText": json.dumps(relationships, ensure_ascii=False),
-        }
+        }, ref_id=semantic_relationship_ref_id(topic), topic=topic, kind=self.RELATIONSHIP_KIND, path=semantic_relationship_path(topic))
 
     def _topics(self, topic_categories: Iterable[QuestionCategory] | None, topic: str) -> List[str]:
         if topic:
@@ -451,6 +458,8 @@ class SemanticCatalogService:
             "layers": ref["layers"],
             "estimatedChars": ref["estimatedChars"],
             "offloadRecommended": ref["offloadRecommended"],
+            "merchantUri": ref.get("merchantUri", ""),
+            "contextLayer": ref.get("contextLayer", ""),
         }
 
 
@@ -678,6 +687,8 @@ class HybridRecallService:
                             "semanticKind": ref["kind"],
                             "semanticRefId": ref["refId"],
                             "semanticPath": ref["path"],
+                            "merchantUri": ref.get("merchantUri", ""),
+                            "contextLayer": ref.get("contextLayer", ""),
                             "tableName": table,
                             "topic": topic,
                             "layers": ref["layers"],
@@ -715,6 +726,8 @@ class HybridRecallService:
                                 "formula": metric.get("formula") or metric.get("metricFormula") or "",
                                 "sourceColumns": metric.get("sourceColumns") or [],
                                 "aliases": metric.get("aliases") or [],
+                                "merchantUri": merchant_uri_for_semantic_ref(semantic_ref_id, topic=topic, table=table, kind="METRIC", key=metric_key),
+                                "contextLayer": "L1",
                             },
                         )
                     )
@@ -733,6 +746,8 @@ class HybridRecallService:
                             "semanticKind": ref["kind"],
                             "semanticRefId": ref["refId"],
                             "semanticPath": ref["path"],
+                            "merchantUri": ref.get("merchantUri", ""),
+                            "contextLayer": ref.get("contextLayer", ""),
                             "topic": topic,
                             "layers": ref["layers"],
                             "estimatedChars": ref["estimatedChars"],
@@ -761,6 +776,8 @@ class HybridRecallService:
                                 "semanticSource": "relationships.json",
                                 "semanticKind": "RELATIONSHIP",
                                 "semanticRefId": rel_ref_id,
+                                "merchantUri": merchant_uri_for_semantic_ref(rel_ref_id, topic=topic, table=left, kind="RELATIONSHIP", key=rel_name),
+                                "contextLayer": "L1",
                                 "relationshipId": rel_name,
                                 "leftTable": left,
                                 "rightTable": right,

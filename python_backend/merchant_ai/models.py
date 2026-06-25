@@ -502,6 +502,8 @@ class SourceRef(APIModel):
     title: str = ""
     locator: str = ""
     reason: str = ""
+    merchant_uri: str = ""
+    context_layer: str = ""
 
 
 class ArtifactRef(APIModel):
@@ -514,6 +516,8 @@ class ArtifactRef(APIModel):
     bytes: int = 0
     estimated_chars: int = 0
     sha256: str = ""
+    merchant_uri: str = ""
+    context_layer: str = "L2"
 
 
 class ImportantFact(APIModel):

@@ -313,9 +313,15 @@ def es_hit_to_recall_item(hit: dict[str, object], query_text: str) -> RecallItem
     metadata = dict(source.get("metadata") or {})
     semantic_ref_id = str(source.get("semantic_ref_id") or metadata.get("semanticRefId") or source.get("doc_id") or hit.get("_id") or "")
     semantic_path = str(source.get("semantic_path") or metadata.get("semanticPath") or "")
+    merchant_uri = str(source.get("merchant_uri") or metadata.get("merchantUri") or "")
+    context_layer = str(source.get("context_layer") or metadata.get("contextLayer") or "")
     metadata["semanticRefId"] = semantic_ref_id
     if semantic_path:
         metadata["semanticPath"] = semantic_path
+    if merchant_uri:
+        metadata["merchantUri"] = merchant_uri
+    if context_layer:
+        metadata["contextLayer"] = context_layer
     metadata["recallQuery"] = query_text
     metadata["recallQueries"] = [query_text] if query_text else []
     metadata["esScore"] = float(hit.get("_score") or 0.0)
@@ -352,6 +358,7 @@ def semantic_hash_for_items(items: list[RecallItem]) -> str:
             "docId": item.doc_id,
             "sourceType": item.source_type,
             "semanticRefId": str((item.metadata or {}).get("semanticRefId") or ""),
+            "merchantUri": str((item.metadata or {}).get("merchantUri") or ""),
             "sourcePath": str((item.metadata or {}).get("sourcePath") or ""),
         }
         for item in items

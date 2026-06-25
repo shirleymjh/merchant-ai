@@ -45,6 +45,7 @@ from merchant_ai.services.formulas import (
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.routing import extract_days
+from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import artifact_file_tool_definitions, question_understanding_tool, semantic_file_tool_definitions
 
@@ -204,6 +205,9 @@ class UnderstandingCoverageCritic:
         pruned = prune_unrequested_requested_measures(question, updated, asset_pack)
         if pruned:
             trace.extend("UNDERSTANDING_OVER_COVERAGE_PRUNED:%s" % item for item in pruned)
+        if simple_metric_understanding_is_complete(question, updated, asset_pack):
+            trace.append("understanding_coverage_critic.simple_metric_complete")
+            return UnderstandingCoverageResult(updated, [], [], trace)
         existing = understanding_metric_identities(updated)
         coverage_text = understanding_coverage_text(question, updated)
         candidates = SemanticMetricIndex(asset_pack.metrics).candidates("", "", coverage_text)
@@ -301,6 +305,37 @@ class UnderstandingCoverageCritic:
         return UnderstandingCoverageResult(updated, added, issues, trace)
 
 
+def simple_metric_understanding_is_complete(question: str, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> bool:
+    """Do not add auxiliary context nodes when a simple metric query is already covered."""
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    if not isinstance(ranking, dict):
+        return False
+    metric_ref = str(ranking.get("metricRef") or ranking.get("metric_ref") or "").strip()
+    owner_table = str(ranking.get("ownerTable") or ranking.get("owner_table") or "").strip()
+    if not metric_ref or not owner_table:
+        return False
+    if understanding.get("requestedMeasures") or understanding.get("requested_measures"):
+        return False
+    if understanding.get("scopeConstraints") or understanding.get("scope_constraints"):
+        return False
+    if understanding.get("calculationIntents") or understanding.get("calculation_intents"):
+        return False
+    if understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents"):
+        return False
+    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
+    if analysis_intent not in {"", "none"}:
+        return False
+    if boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation"))):
+        return False
+    objective_type = str(ranking.get("objectiveType") or ranking.get("objective_type") or "").strip().lower()
+    if objective_type and objective_type not in {"metric_total", "metric", "aggregate", "group_agg"}:
+        return False
+    coverage_text = understanding_coverage_text(question, understanding)
+    if recalled_metric_evidence_completion_candidates(asset_pack, coverage_text, understanding):
+        return False
+    return True
+
+
 def prune_unrequested_requested_measures(
     question: str,
     understanding: Dict[str, Any],
@@ -310,6 +345,17 @@ def prune_unrequested_requested_measures(
     if not isinstance(measures, list) or not measures:
         return []
     metric_by_identity = {(metric.table, metric.key): metric for metric in asset_pack.metrics if metric.table and metric.key}
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    ranking_metric = None
+    ranking_source_phrase = ""
+    if isinstance(ranking, dict):
+        ranking_metric = metric_by_identity.get(
+            (
+                str(ranking.get("ownerTable") or ranking.get("owner_table") or ""),
+                str(ranking.get("metricRef") or ranking.get("metric_ref") or ""),
+            )
+        )
+        ranking_source_phrase = str(ranking.get("sourcePhrase") or ranking.get("source_phrase") or "")
     filtered: List[Dict[str, Any]] = []
     pruned: List[str] = []
     for measure in measures:
@@ -319,6 +365,9 @@ def prune_unrequested_requested_measures(
         owner_table = str(measure.get("ownerTable") or measure.get("owner_table") or "")
         source_phrase = str(measure.get("sourcePhrase") or measure.get("source_phrase") or "")
         metric = metric_by_identity.get((owner_table, metric_ref))
+        if requested_measure_duplicates_ranking(source_phrase, metric, ranking_source_phrase, ranking_metric):
+            pruned.append("%s.%s:%s" % (owner_table, metric_ref, source_phrase))
+            continue
         if not measure.get("completionSource") and not measure.get("completion_source"):
             if owner_table in set(asset_pack.known_tables()) or requested_measure_supported_by_coverage(source_phrase, metric, question):
                 filtered.append(measure)
@@ -334,6 +383,22 @@ def prune_unrequested_requested_measures(
         pruned.append("%s.%s:%s" % (owner_table, metric_ref, source_phrase))
     understanding["requestedMeasures"] = filtered
     return pruned
+
+
+def requested_measure_duplicates_ranking(source_phrase: str, metric: Any, ranking_source_phrase: str, ranking_metric: Any) -> bool:
+    if metric is None or ranking_metric is None:
+        return False
+    if getattr(metric, "table", "") == getattr(ranking_metric, "table", "") and getattr(metric, "key", "") == getattr(ranking_metric, "key", ""):
+        return True
+    phrase = normalize_metric_match_text(source_phrase)
+    ranking_phrase = normalize_metric_match_text(ranking_source_phrase)
+    if not phrase or not ranking_phrase:
+        return False
+    if phrase not in ranking_phrase and ranking_phrase not in phrase:
+        return False
+    metric_labels = {normalize_metric_match_text(label) for label in metric_label_texts(metric) if normalize_metric_match_text(label)}
+    ranking_labels = {normalize_metric_match_text(label) for label in metric_label_texts(ranking_metric) if normalize_metric_match_text(label)}
+    return bool(metric_labels & ranking_labels or phrase in ranking_labels or ranking_phrase in metric_labels)
 
 
 def requested_measure_supported_by_coverage(source_phrase: str, metric: Any, question: str) -> bool:
@@ -3495,16 +3560,27 @@ def semantic_manifest_from_asset_pack(
         "mode": "table_manifest_first",
         "policy": "This is the first layer of semantic context. Read table/detail refs only when needed.",
         "tables": [
-            {
+            add_context_uri({
                 "table": item.table or item.key,
                 "topic": item.topic,
                 "title": item.title,
+                "kind": "TABLE_ASSET",
+                "contextLayer": "L0",
                 "dataGrain": (item.metadata or {}).get("dataGrain", ""),
                 "timeColumn": (item.metadata or {}).get("timeColumn", ""),
                 "merchantFilterColumn": (item.metadata or {}).get("merchantFilterColumn", ""),
                 "sourceRefId": item.source_ref_id,
+                "refId": (
+                    item.source_ref_id.rsplit(":", 1)[0] + ":asset"
+                    if item.source_ref_id.endswith(":table")
+                    else item.source_ref_id or "semantic:%s:%s:asset" % (item.topic or "unknown", item.table or item.key)
+                ),
                 "path": "topics/%s/tables/%s/asset.json" % (item.topic or "unknown", item.table or item.key),
-            }
+            }, ref_id=(
+                item.source_ref_id.rsplit(":", 1)[0] + ":asset"
+                if item.source_ref_id.endswith(":table")
+                else item.source_ref_id or "semantic:%s:%s:asset" % (item.topic or "unknown", item.table or item.key)
+            ), topic=item.topic, table=item.table or item.key, kind="TABLE_ASSET", path="topics/%s/tables/%s/asset.json" % (item.topic or "unknown", item.table or item.key))
             for item in tables[:limit]
         ],
         "relationshipsPathHints": sorted(
@@ -3525,18 +3601,24 @@ def semantic_workspace_manifest_from_asset_pack(
     table_manifest = semantic_manifest_from_asset_pack(asset_pack, limit=limit, table_names=table_names)
     topics = sorted({str(item.get("topic") or "") for item in table_manifest.get("tables") or [] if item.get("topic")})
     manifest_refs = [
-        {
+        add_context_uri({
             "refId": "semantic:%s:manifest" % topic,
             "path": "topics/%s/manifest.json" % topic,
             "kind": "TOPIC_MANIFEST",
             "topic": topic,
             "title": "%s/manifest" % topic,
-        }
+        }, ref_id="semantic:%s:manifest" % topic, topic=topic, kind="TOPIC_MANIFEST", path="topics/%s/manifest.json" % topic)
         for topic in topics
     ]
     return {
         "mode": "filesystem_as_context",
+        "uriScheme": "merchant://",
         "policy": "Initial context is a semantic workspace index, not full schema. Use semantic_ls/grep/read to progressively load only needed details.",
+        "layers": {
+            "L0": "topic manifests and compact table summaries for initial relevance",
+            "L1": "metric, relationship and rule overviews for planning and rerank",
+            "L2": "full table assets, formulas, schema, rows and evidence artifacts loaded on demand",
+        },
         "progressiveDisclosure": [
             "topic manifest -> table and metric summary",
             "table asset -> fields, metrics, keys, filters and warnings",
@@ -3548,6 +3630,11 @@ def semantic_workspace_manifest_from_asset_pack(
         "manifestRefs": manifest_refs,
         "tableRefs": table_manifest.get("tables", [])[:limit],
         "relationshipPathHints": table_manifest.get("relationshipsPathHints", []),
+        "relationshipUris": [
+            merchant_uri_for_semantic_ref("semantic:%s:relationships" % path.split("/")[1])
+            for path in table_manifest.get("relationshipsPathHints", [])
+            if len(str(path).split("/")) >= 2
+        ],
         "loadPolicy": "Read manifests before table assets unless a sourceRefId already identifies the exact table/relationship needed.",
         "offloadPolicy": "Large tool results stay in artifacts; keep previews and paths in prompt.",
     }
@@ -3579,7 +3666,7 @@ def semantic_file_context_from_asset_pack(
         if not item.table and item.source_type == "SEMANTIC_RELATIONSHIP" and relationship_topics and item.topic not in relationship_topics:
             continue
         seen.add(ref_id)
-        ref = {
+        ref = add_context_uri({
             "refId": ref_id,
             "path": path,
             "kind": metadata.get("semanticKind") or item.source_type,
@@ -3588,7 +3675,7 @@ def semantic_file_context_from_asset_pack(
             "title": item.title,
             "estimatedChars": metadata.get("estimatedChars", len(item.content or "")),
             "offloadRecommended": bool(metadata.get("offloadRecommended")),
-        }
+        }, ref_id=ref_id, topic=item.topic, table=item.table, kind=str(metadata.get("semanticKind") or item.source_type), path=path)
         if include_layers:
             ref["layers"] = metadata.get("layers") or {}
         refs.append(ref)
@@ -3602,7 +3689,7 @@ def semantic_file_context_from_asset_pack(
             if not table_name:
                 continue
             refs.append(
-                {
+                add_context_uri({
                     "refId": (
                         table.source_ref_id.rsplit(":", 1)[0] + ":asset"
                         if table.source_ref_id.endswith(":table")
@@ -3615,13 +3702,23 @@ def semantic_file_context_from_asset_pack(
                     "title": table.title or table_name,
                     "estimatedChars": len(table.description or ""),
                     "offloadRecommended": False,
-                }
+                }, ref_id=(
+                    table.source_ref_id.rsplit(":", 1)[0] + ":asset"
+                    if table.source_ref_id.endswith(":table")
+                    else table.source_ref_id or "semantic:%s:%s:asset" % (topic, table_name)
+                ), topic=topic, table=table_name, kind="TABLE_ASSET", path="topics/%s/tables/%s/asset.json" % (topic, table_name))
             )
             if include_layers:
                 refs[-1]["layers"] = {}
     return {
         "mode": "filesystem_as_context",
+        "uriScheme": "merchant://",
         "policy": "Start from manifest refs; when evidence is missing, request semantic_ls/read/grep instead of guessing fields.",
+        "layers": {
+            "L0": "manifest and compact references",
+            "L1": "metric, rule, relationship overview references",
+            "L2": "full assets loaded by semantic_read",
+        },
         "tools": ["semantic_ls", "semantic_read", "semantic_grep", "semantic_write"],
         "refs": refs[:limit],
     }

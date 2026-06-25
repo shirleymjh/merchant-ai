@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from merchant_ai.config import Settings
+from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 
 
 class WorkspaceArtifactStore:
@@ -35,6 +36,7 @@ class WorkspaceArtifactStore:
         return {
             "path": str(target),
             "relativePath": str(target.relative_to(self.root)),
+            "merchantUri": merchant_uri_for_artifact(str(target.relative_to(self.root)), namespace=namespace or "misc"),
             "bytes": len(text.encode("utf-8")),
             "estimatedChars": len(text),
             "sha256": digest,
@@ -54,6 +56,7 @@ class WorkspaceArtifactStore:
             "success": True,
             "path": str(target),
             "relativePath": str(target.relative_to(self.root)) if self._is_under_root(target) else str(target),
+            "merchantUri": merchant_uri_for_artifact(str(target.relative_to(self.root)) if self._is_under_root(target) else str(target)),
             "content": text[start:end],
             "contentOffsetChars": start,
             "nextContentOffsetChars": end if end < len(text) else None,
@@ -81,6 +84,7 @@ class WorkspaceArtifactStore:
                 {
                     "path": str(path),
                     "relativePath": str(path.relative_to(self.root)),
+                    "merchantUri": merchant_uri_for_artifact(str(path.relative_to(self.root))),
                     "score": score,
                     "snippets": artifact_snippets(text, terms, 3),
                 }
@@ -100,6 +104,7 @@ class WorkspaceArtifactStore:
                 {
                     "path": str(path),
                     "relativePath": str(path.relative_to(self.root)) if self._is_under_root(path) else str(path),
+                    "merchantUri": merchant_uri_for_artifact(str(path.relative_to(self.root)) if self._is_under_root(path) else str(path)),
                     "bytes": path.stat().st_size,
                 }
             )

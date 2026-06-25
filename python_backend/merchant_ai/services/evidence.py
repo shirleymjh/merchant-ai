@@ -374,6 +374,8 @@ def evidence_gap_source(code: str) -> str:
         return "contract"
     if code.startswith("UPSTREAM") or code in {"JOIN_KEY_NOT_PRODUCED", "DEPENDENCY_GAP"}:
         return "dependency"
+    if code.startswith("DERIVED_METRIC"):
+        return "calculation"
     if code in {"FIELD_AMBIGUOUS"}:
         return "field_policy"
     return "task"
@@ -386,6 +388,8 @@ def answer_instruction_for_gap(gap: EvidenceGap) -> str:
         return "说明 SQL 成功但返回 0 行，不能解释为业务指标为 0。"
     if gap.code.startswith("UPSTREAM") or gap.code == "JOIN_KEY_NOT_PRODUCED":
         return "说明下游节点因上游实体缺失或依赖键缺失未完整执行。"
+    if gap.code.startswith("DERIVED_METRIC"):
+        return "说明派生指标缺少可计算的分子/分母或组件证据，不能把缺失解释为 0。"
     if gap.code in {"SQL_EXECUTION_FAILED", "UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT"}:
         return "说明该节点 SQL/执行失败，不能基于该节点输出业务结论。"
     if gap.code == "RESOURCE_DEGRADED_QUERY":
@@ -469,6 +473,11 @@ def classify_task_failure(message: str) -> str:
     if "timeout" in lower or "timed out" in lower:
         return "TIMEOUT"
     for code in [
+        "DERIVED_METRIC_COMPONENTS_MISSING",
+        "DERIVED_METRIC_GROUP_KEY_MISSING",
+        "DERIVED_METRIC_NO_JOINED_COMPONENT_ROWS",
+        "DERIVED_METRIC_ZERO_ROWS",
+        "DERIVED_METRIC_FAILED",
         "JOIN_KEY_NOT_PRODUCED",
         "JOIN_KEY_VALUES_EMPTY",
         "UPSTREAM_SQL_FAILED",

@@ -142,6 +142,8 @@ class EsRecallIndexAdapter:
                     "table": {"type": "keyword"},
                     "semantic_ref_id": {"type": "keyword"},
                     "semantic_path": {"type": "keyword"},
+                    "merchant_uri": {"type": "keyword"},
+                    "context_layer": {"type": "keyword"},
                     "metadata": {"type": "object", "enabled": True},
                 }
             }
@@ -293,6 +295,8 @@ def recall_item_to_es_doc(item: RecallItem) -> dict[str, Any]:
         "answer_mode": item.answer_mode,
         "semantic_ref_id": str(metadata.get("semanticRefId") or item.doc_id or ""),
         "semantic_path": str(metadata.get("semanticPath") or ""),
+        "merchant_uri": str(metadata.get("merchantUri") or ""),
+        "context_layer": str(metadata.get("contextLayer") or ""),
         "metadata": metadata,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }

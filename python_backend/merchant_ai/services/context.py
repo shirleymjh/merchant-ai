@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.models import ArtifactRef, ContextDelta, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
+from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 
 
 class ImportantFactExtractor:
@@ -97,7 +98,16 @@ class ContextManager:
         )
 
     def source_refs(self, state: Dict[str, Any], stage: str) -> List[SourceRef]:
-        refs = [SourceRef(ref_type="state", title=stage, locator="AgentState", reason="context snapshot source")]
+        refs = [
+            SourceRef(
+                ref_type="state",
+                title=stage,
+                locator="AgentState",
+                reason="context snapshot source",
+                merchant_uri="merchant://state/agent",
+                context_layer="L0",
+            )
+        ]
         thread_data = state.get("thread_data")
         outputs_path = getattr(thread_data, "outputs_path", "") if thread_data is not None else ""
         if outputs_path:
@@ -107,6 +117,8 @@ class ContextManager:
                     path=str(Path(outputs_path) / "trace_replay.json"),
                     title="trace_replay.json",
                     reason="full replay can restore compressed details",
+                    merchant_uri=merchant_uri_for_artifact("trace_replay.json", namespace="trace"),
+                    context_layer="L2",
                 )
             )
         return refs
@@ -228,6 +240,8 @@ class ContextManager:
                         reason="recoverable context artifact",
                         bytes=path.stat().st_size,
                         estimated_chars=path.stat().st_size,
+                        merchant_uri=merchant_uri_for_artifact(relative, namespace=relative.split("/", 1)[0] if "/" in relative else "trace"),
+                        context_layer="L2",
                     )
                 )
         return refs
