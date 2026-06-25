@@ -30,14 +30,14 @@
     },
     {
       "columnName": "order_id",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "主订单编号",
       "nullable": true,
       "keyType": ""
     },
     {
       "columnName": "sub_order_id",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "子订单号",
       "nullable": true,
       "keyType": ""
@@ -72,7 +72,7 @@
     },
     {
       "columnName": "buyer_id",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "买家id",
       "nullable": true,
       "keyType": ""
@@ -86,7 +86,7 @@
     },
     {
       "columnName": "seller_id",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "卖家id",
       "nullable": true,
       "keyType": ""
@@ -121,14 +121,14 @@
     },
     {
       "columnName": "refund_status_name",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "退款状态name",
       "nullable": true,
       "keyType": ""
     },
     {
       "columnName": "refund_reason",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "退款原因",
       "nullable": true,
       "keyType": ""
@@ -142,7 +142,7 @@
     },
     {
       "columnName": "sku_title",
-      "dataType": "text",
+      "dataType": "varchar",
       "comment": "商品标题",
       "nullable": true,
       "keyType": ""
@@ -268,7 +268,7 @@
     },
     {
       "columnName": "refund_create_time",
-      "dataType": "text",
+      "dataType": "datetime",
       "comment": "创建时间",
       "nullable": true,
       "keyType": ""
@@ -331,7 +331,7 @@
     },
     {
       "columnName": "pay_amt",
-      "dataType": "bigint",
+      "dataType": "decimal",
       "comment": "支付金额",
       "nullable": true,
       "keyType": ""

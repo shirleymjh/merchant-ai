@@ -124,6 +124,20 @@ class EvidenceVerifier:
             level = str(contract.get("requiredLevel") or contract.get("required_level") or "required").lower()
             if level in {"optional", "info", "warning"}:
                 continue
+            evidence_source = str(contract.get("evidenceSource") or contract.get("evidence_source") or "").lower()
+            if evidence_source in {"knowledge_ref", "knowledge", "rule"}:
+                if self._knowledge_contract_covered(contract):
+                    continue
+                semantic_label = str(contract.get("semanticLabel") or contract.get("semantic_label") or "knowledge evidence")
+                gaps.append(
+                    EvidenceGap(
+                        code="MISSING_REQUIRED_EVIDENCE",
+                        task_id=str(contract.get("taskId") or contract.get("task_id") or ""),
+                        evidence=semantic_label,
+                        reason="%s 缺少召回知识引用" % semantic_label,
+                    )
+                )
+                continue
             task_id = str(contract.get("taskId") or contract.get("task_id") or "")
             table = str(contract.get("table") or "")
             columns = [str(item) for item in contract.get("columns", []) if item]
@@ -189,6 +203,13 @@ class EvidenceVerifier:
     def _covered_contract_labels(self, contracts: List[Dict[str, Any]], run_result: AgentRunResult) -> Set[str]:
         labels: Set[str] = set()
         for contract in contracts:
+            evidence_source = str(contract.get("evidenceSource") or contract.get("evidence_source") or "").lower()
+            if evidence_source in {"knowledge_ref", "knowledge", "rule"}:
+                if self._knowledge_contract_covered(contract):
+                    label = str(contract.get("semanticLabel") or contract.get("semantic_label") or "")
+                    if label:
+                        labels.add(label)
+                continue
             task_result = self._matching_task_result(str(contract.get("taskId") or contract.get("task_id") or ""), str(contract.get("table") or ""), run_result)
             if not task_result or task_result.query_bundle.failed or not task_result.query_bundle.rows:
                 continue
@@ -207,6 +228,12 @@ class EvidenceVerifier:
             if label:
                 labels.add(label)
         return labels
+
+    def _knowledge_contract_covered(self, contract: Dict[str, Any]) -> bool:
+        refs = contract.get("knowledgeRefs") or contract.get("knowledge_refs") or []
+        if not isinstance(refs, list):
+            return bool(refs)
+        return any(str(ref or "").strip() for ref in refs)
 
     def _matching_task_result(self, task_id: str, table: str, run_result: AgentRunResult):
         for task_result in run_result.task_results:

@@ -46,6 +46,16 @@ class HybridKnowledgeRetrievalService:
             request.merchant_id,
             request.topic_categories,
         )
+        if request.topic_categories and not request.knowledge_request:
+            broad_bundle = self.recall_service.recall(
+                request.query,
+                ExtractedKeywords(keywords=request.keywords),
+                request.history_rows,
+                request.knowledge_context,
+                request.merchant_id,
+                [],
+            )
+            recall_bundle = merge_recall_bundles(recall_bundle, broad_bundle)
         source_refs = unique_source_refs(recall_bundle.items)
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
         trace = RecallRoundTrace(
@@ -98,6 +108,11 @@ class EsKnowledgeRetrievalService:
         include_base_wiki = QuestionCategory.PLATFORM_RULE in set(normalized_categories) or route_is_rule_sensitive(request)
         try:
             items = self._search(query_text, topics, include_base_wiki=include_base_wiki)
+            if topics and not request.knowledge_request:
+                try:
+                    items = merge_recall_items(items, self._search(query_text, [], include_base_wiki=False))
+                except Exception:
+                    pass
             blocked_reason = ""
         except Exception as exc:
             items = []
@@ -211,6 +226,27 @@ class EsKnowledgeRetrievalService:
         except Exception:
             return ""
         return str(payload.get("indexVersion") or "")
+
+
+def merge_recall_bundles(primary: RecallBundle, secondary: RecallBundle) -> RecallBundle:
+    items = merge_recall_items(primary.items, secondary.items)
+    return RecallBundle(
+        items=items,
+        top_score=items[0].fusion_score if items else 0.0,
+        merged_context="\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items),
+    )
+
+
+def merge_recall_items(primary: list[RecallItem], secondary: list[RecallItem]) -> list[RecallItem]:
+    by_id: dict[str, RecallItem] = {}
+    for item in list(primary or []) + list(secondary or []):
+        key = item.doc_id or str((item.metadata or {}).get("semanticRefId") or "")
+        if not key:
+            continue
+        current = by_id.get(key)
+        if current is None or item.fusion_score >= current.fusion_score:
+            by_id[key] = item
+    return sorted(by_id.values(), key=lambda item: item.fusion_score, reverse=True)
 
 
 def unique_source_refs(items: list[RecallItem]) -> list[str]:

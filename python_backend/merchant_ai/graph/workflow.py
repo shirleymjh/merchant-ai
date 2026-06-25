@@ -704,7 +704,7 @@ class MerchantQaWorkflow:
                 if current is None or item.fusion_score >= current.fusion_score or set((item.metadata or {}).get("recallQueries") or []) != set((current.metadata or {}).get("recallQueries") or []):
                     all_items[item.doc_id] = item
         lineage_items = list(all_items.values())
-        items = sorted(lineage_items, key=lambda item: item.fusion_score, reverse=True)[:12]
+        items = sorted(lineage_items, key=lambda item: item.fusion_score, reverse=True)[:24]
         state["recall_bundle"] = RecallBundle(
             items=items,
             top_score=items[0].fusion_score if items else 0.0,

@@ -668,6 +668,46 @@ def test_understanding_coverage_critic_completes_missing_parallel_metric():
     assert any("REQUESTED_MEASURE_APPENDED:dwd_merchant_appeal_detail_df:appeal_success_rate" in item for item in plan.compiler_trace)
 
 
+def test_understanding_coverage_critic_does_not_add_implicit_refund_rate():
+    settings = get_settings()
+    question = "最近 30 天退款金额最高的商品，看看对应下单量是否也高。"
+    builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+    understanding = {
+        "analysisGrain": "product",
+        "analysisIntent": "comparison",
+        "requiresExplanation": True,
+        "rankingObjective": {
+            "metricRef": "pay_amt",
+            "ownerTable": "dwm_trade_refund_detail_di",
+            "sourcePhrase": "退款金额",
+            "groupByColumn": "spu_id",
+            "objectiveType": "ranking",
+            "order": "desc",
+            "limit": 1,
+        },
+        "requestedMeasures": [
+            {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "下单量"}
+        ],
+        "requiredEvidenceIntents": [],
+        "timeWindowDays": 30,
+    }
+
+    result = UnderstandingCoverageCritic().complete(question, understanding, pack)
+
+    requested = {
+        (item.get("ownerTable"), item.get("metricRef"))
+        for item in result.understanding.get("requestedMeasures", [])
+        if isinstance(item, dict)
+    }
+    assert ("dwm_trade_refund_detail_di", "refund_rate") not in requested
+    assert any("UNDERSTANDING_COVERAGE_SKIP_DERIVED_IMPLICIT:dwm_trade_refund_detail_di:refund_rate" in item for item in result.trace)
+
+
 def test_sql_validator_allows_cte_and_rejects_unknown_real_table():
     pack = PlanningAssetPack(
         tables=[
@@ -3108,7 +3148,7 @@ def test_scope_ratio_resolves_rate_metric_to_event_component_numerator():
     assert not any(gap.code == "CALCULATION_NUMERATOR_NOT_EVENT_METRIC" for gap in validation.gaps)
 
 
-def test_query_graph_contract_validator_rejects_same_table_scope_without_filter_or_subset_metric():
+def test_planner_reflection_rejects_same_table_scope_without_filter_or_subset_metric():
     pack = PlanningAssetPack(
         tables=[
             PlanningAssetEntry(
@@ -3168,8 +3208,9 @@ def test_query_graph_contract_validator_rejects_same_table_scope_without_filter_
     )
 
     validation = QueryGraphValidator().validate("某业务集合里的订单占比", plan, pack)
-    assert not validation.valid
-    assert any(gap.code == "SCOPE_NOT_NARROWING" for gap in validation.gaps)
+    assert validation.valid
+    reflection = PlannerReflectionAgent().reflect("某业务集合里的订单占比", plan, pack)
+    assert "SCOPE_NOT_NARROWING" in {issue["code"] for issue in reflection.issues}
 
 
 def test_compiler_ignores_scope_that_duplicates_ranking_objective():
@@ -5318,9 +5359,11 @@ def test_graph_sanity_rejects_ranking_metric_as_dependent_root():
     )
 
     result = QueryGraphValidator().validate("最近7天发货超时订单量是多少", plan, pack)
+    reflection = PlannerReflectionAgent().reflect("最近7天发货超时订单量是多少", plan, pack)
 
-    assert not result.valid
-    codes = {gap.code for gap in result.gaps}
+    assert result.valid
+    assert not reflection.passed
+    codes = {issue.get("code") for issue in reflection.issues}
     assert "ROOT_METRIC_NOT_ROOT" in codes
     assert "DEPENDENCY_NOT_ENTITY_FILTER" in codes
 
@@ -5414,9 +5457,11 @@ def test_graph_sanity_requires_target_grain_output():
     )
 
     result = QueryGraphValidator().validate("赔付单量较高商品", plan, pack)
+    reflection = PlannerReflectionAgent().reflect("赔付单量较高商品", plan, pack)
 
-    assert not result.valid
-    assert "TARGET_GRAIN_NOT_OUTPUT" in {gap.code for gap in result.gaps}
+    assert result.valid
+    assert not reflection.passed
+    assert "TARGET_GRAIN_NOT_OUTPUT" in {issue.get("code") for issue in reflection.issues}
 
 
 def test_query_graph_validator_rejects_self_dependency_edge():
@@ -5536,6 +5581,44 @@ def test_lead_policy_reunderstands_contract_mismatch_from_validator():
     decision = V2AgentPolicy(get_settings()).decide(state)
     assert decision.selected_action == "plan_graph"
     assert "repair_graph" not in decision.available_actions
+
+
+def test_lead_policy_reunderstands_missing_explicit_object_filter():
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "skills_loaded": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": True,
+        "query_graph_validated": True,
+        "react_round": 5,
+        "query_graph_plan_attempts": 0,
+        "query_graph_retrieve_count": 0,
+        "query_graph_repair_attempts": 0,
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="查询订单 order_id_100 的订单明细，并查看退款金额。",
+                    intent_type="VALID",
+                    answer_mode="TOPN",
+                    plan_task_id="anchor_refund",
+                    preferred_table="dwm_trade_refund_detail_di",
+                )
+            ]
+        ),
+        "planner_reflection": PlannerReflectionResult(passed=True),
+        "query_graph_validation_result": GraphValidationResult(
+            valid=False,
+            gaps=[GraphValidationGap(code="OBJECT_REF_FILTER_MISSING", evidence="order_id=order_id_100")],
+            repairable=True,
+        ),
+    }
+
+    decision = V2AgentPolicy(get_settings()).decide(state)
+
+    assert decision.selected_action == "plan_graph"
+    assert "execute_graph" not in decision.available_actions
 
 
 def test_lead_policy_reunderstands_invalid_ratio_numerator_before_retrieval():
@@ -5672,6 +5755,40 @@ def test_lead_policy_does_not_execute_invalid_graph_when_main_budget_exhausted()
     assert decision.selected_node == "answer_analysis"
     assert "execute_graph" not in decision.available_actions
     assert decision.budget_exhausted
+
+
+def test_lead_policy_validates_after_reflection_repair_budget_exhausted():
+    settings = get_settings()
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": True,
+        "query_graph_validated": False,
+        "react_round": 8,
+        "query_graph_repair_attempts": settings.agent_graph_repair_rounds,
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="查询订单 order_id_100 的订单明细",
+                    intent_type="VALID",
+                    answer_mode="DETAIL",
+                    plan_task_id="anchor_order",
+                    preferred_table="dwm_trade_order_detail_di",
+                )
+            ]
+        ),
+        "planner_reflection": PlannerReflectionResult(
+            passed=False,
+            issues=[{"code": "REPAIR_EXHAUSTED", "severity": "warning"}],
+        ),
+    }
+
+    decision = V2AgentPolicy(settings).decide(state)
+
+    assert decision.selected_action == "validate_graph"
+    assert decision.selected_node == "validate_query_graph"
 
 
 def test_lead_policy_prioritizes_existing_plan_over_pending_requests():
@@ -6109,6 +6226,8 @@ def test_planner_reflection_checks_required_evidence_intents_not_question_terms(
                     "requiredLevel": "required",
                     "suggestedMetricRefs": ["order_detail_cnt", "ticket_cnt"],
                     "suggestedDomains": ["trade", "ticket"],
+                    "suggestedTables": ["dwm_cs_ticket_detail_di"],
+                    "suggestedFields": ["ticket_id"],
                 }
             ],
             "rankingObjective": {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di"},
@@ -7214,6 +7333,49 @@ def test_compiler_refund_detail_preserves_requested_metrics_and_valid_dependenci
     assert not any(gap.code == "DEPENDENCY_KEY_NOT_PRODUCED" for gap in result.gaps)
 
 
+def test_compiler_detail_anchor_uses_explicit_order_filter_even_when_metric_points_to_refund():
+    question = "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。"
+    pack = trade_refund_goods_pack()
+    understanding = {
+        "analysisGrain": "order",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "pay_amt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "订单明细",
+            "objectiveType": "detail_anchor",
+            "groupByColumn": "order_id",
+            "limit": 1,
+        },
+        "requestedMeasures": [
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"}
+        ],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "商品发布时间",
+                "requiredLevel": "required",
+                "suggestedTables": ["dwm_goods_detail_df"],
+                "suggestedFields": ["spu_apply_create_time"],
+            }
+        ],
+        "filters": [{"field": "order_id", "value": "order_id_100"}],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    validation = QueryGraphValidator().validate(question, plan, pack)
+    root = plan.intents[0]
+
+    assert root.preferred_table == "dwm_trade_order_detail_di"
+    assert root.answer_mode == AnswerMode.DETAIL
+    assert root.filter_column == "order_id"
+    assert root.filter_value == "order_id_100"
+    assert any(intent.preferred_table == "dwm_trade_refund_detail_di" for intent in plan.intents)
+    assert not any(gap.code == "OBJECT_REF_FILTER_MISSING" for gap in validation.gaps)
+    assert validation.valid
+
+
 def test_compiler_scope_phrase_does_not_override_explicit_order_anchor_metric():
     settings = get_settings()
     question = "最近20天优惠券活动订单的退款率和GMV表现怎么样？"
@@ -7285,7 +7447,7 @@ def test_compiler_scope_phrase_does_not_override_explicit_order_anchor_metric():
     assert result.valid
 
 
-def test_compiler_finalizes_required_evidence_domains_as_query_nodes():
+def test_compiler_does_not_turn_suggested_domains_into_query_nodes():
     settings = get_settings()
     question = "最近30天退款率最高的前10个商品，同时看下单数、退款金额和商品发布时间，帮我判断哪些是高风险新品。"
     pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
@@ -7325,8 +7487,8 @@ def test_compiler_finalizes_required_evidence_domains_as_query_nodes():
     reflection = PlannerReflectionAgent().reflect(question, plan, pack)
 
     assert result.valid
-    assert any(intent.preferred_table == "dwm_goods_detail_df" for intent in plan.intents)
-    assert any(item.startswith("EVIDENCE_DOMAIN_REPAIR:") and "goods" in item for item in plan.compiler_trace)
+    assert not any(intent.preferred_table == "dwm_goods_detail_df" for intent in plan.intents)
+    assert not any(item.startswith("EVIDENCE_DOMAIN_REPAIR:") and "goods" in item for item in plan.compiler_trace)
     assert "DOMAIN_COVERAGE_GAP" not in {issue["code"] for issue in reflection.issues}
 
 
@@ -7406,9 +7568,11 @@ def test_query_graph_validator_rejects_missing_required_field_evidence():
     )
 
     validation = QueryGraphValidator().validate("商品发布时间", plan, pack)
+    reflection = PlannerReflectionAgent().reflect("商品发布时间", plan, pack)
 
-    assert not validation.valid
-    assert any(gap.code == "MISSING_REQUIRED_FIELD_EVIDENCE" for gap in validation.gaps)
+    assert validation.valid
+    assert not reflection.passed
+    assert any(issue.get("code") == "MISSING_REQUIRED_FIELD_EVIDENCE" for issue in reflection.issues)
 
 
 def test_query_graph_validator_rejects_pending_knowledge_requests():
@@ -7446,6 +7610,192 @@ def test_query_graph_validator_rejects_pending_knowledge_requests():
 
     assert not validation.valid
     assert any(gap.code == "PENDING_KNOWLEDGE_REQUEST" for gap in validation.gaps)
+
+
+def test_query_graph_validator_requires_explicit_object_ref_filter():
+    question = "查询订单 order_id_100 的订单明细，并查看退款金额。"
+    pack = trade_refund_goods_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.TOPN,
+                plan_task_id="anchor_refund",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="pay_amt",
+                metric_column="pay_amt",
+                group_by_column="order_id",
+                output_keys=["seller_id", "order_id"],
+            )
+        ]
+    )
+
+    validation = QueryGraphValidator().validate(question, plan, pack)
+
+    assert not validation.valid
+    assert any(gap.code == "OBJECT_REF_FILTER_MISSING" and gap.evidence == "order_id=order_id_100" for gap in validation.gaps)
+
+
+def test_query_graph_validator_accepts_explicit_object_ref_detail_filter():
+    question = "查询订单 order_id_100 的订单明细，并查看退款金额。"
+    pack = trade_refund_goods_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                plan_task_id="anchor_order",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_trade_order_detail_di",
+                filter_column="order_id",
+                filter_value="order_id_100",
+                output_keys=["seller_id", "order_id", "sub_order_id"],
+            )
+        ]
+    )
+
+    validation = QueryGraphValidator().validate(question, plan, pack)
+
+    assert not any(gap.code == "OBJECT_REF_FILTER_MISSING" for gap in validation.gaps)
+
+
+def test_compiler_preserves_parallel_detail_branches_with_topn_metric():
+    question = "最近7天订单明细和退款明细都给我看一下，并找出退款金额最高的前3单。"
+    pack = trade_refund_goods_pack()
+    understanding = {
+        "analysisGrain": "order",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "pay_amt",
+            "ownerTable": "dwm_trade_refund_detail_di",
+            "sourcePhrase": "退款金额",
+            "objectiveType": "ranking",
+            "groupByColumn": "order_id",
+            "order": "desc",
+            "limit": 3,
+        },
+        "requestedMeasures": [
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单明细"},
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+        ],
+        "requiredEvidenceIntents": [],
+        "filters": [],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    validation = QueryGraphValidator().validate(question, plan, pack)
+    detail_tables = {
+        intent.preferred_table
+        for intent in plan.intents
+        if intent.answer_mode == AnswerMode.DETAIL and "detailEvidence=" in str(intent.analysis_note)
+    }
+
+    assert validation.valid
+    assert {"dwm_trade_order_detail_di", "dwm_trade_refund_detail_di"} <= detail_tables
+    assert any(intent.answer_mode == AnswerMode.TOPN and intent.metric_name == "pay_amt" for intent in plan.intents)
+    assert any(item.startswith("DETAIL_EVIDENCE_BRANCH:") for item in plan.compiler_trace)
+    assert not any(str(intent.analysis_note).startswith("missingDomain=") for intent in plan.intents)
+
+
+def test_validator_rejects_missing_parallel_detail_branch():
+    question = "最近7天订单明细和退款明细都给我看一下，并找出退款金额最高的前3单。"
+    pack = trade_refund_goods_pack()
+    plan = QueryPlan(
+        question_understanding={
+            "requestedMeasures": [
+                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单明细"},
+                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+            ]
+        },
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.TOPN,
+                plan_task_id="anchor_refund",
+                task_role=TaskRole.ANCHOR,
+                preferred_table="dwm_trade_refund_detail_di",
+                metric_name="pay_amt",
+                metric_column="pay_amt",
+                group_by_column="order_id",
+                output_keys=["seller_id", "order_id", "pay_amt"],
+            )
+        ],
+    )
+
+    validation = QueryGraphValidator().validate(question, plan, pack)
+    reflection = PlannerReflectionAgent().reflect(question, plan, pack)
+
+    assert validation.valid
+    assert not reflection.passed
+    assert {issue.get("code") for issue in reflection.issues} >= {"DETAIL_EVIDENCE_NOT_PLANNED"}
+
+
+def test_compiler_does_not_turn_metric_phrases_into_detail_branches():
+    question = "最近7天支付订单量和交易成功订单量分别是多少，差异大不大？"
+    pack = trade_refund_goods_pack()
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "comparison",
+        "requiresExplanation": True,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "支付订单量",
+            "groupByColumn": "pt",
+        },
+        "requestedMeasures": [
+            {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "交易成功订单量",
+                "groupByColumn": "pt",
+            }
+        ],
+        "requiredEvidenceIntents": [],
+        "filters": [],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+
+    assert not any("detailEvidence=" in str(intent.analysis_note) for intent in plan.intents)
+
+
+def test_compiler_does_not_repair_metric_domain_from_explanatory_evidence_domains():
+    question = "平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。"
+    pack = trade_refund_goods_pack()
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "overview",
+        "requiresExplanation": True,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "发货超时订单量",
+            "groupByColumn": "pt",
+        },
+        "requestedMeasures": [],
+        "requiredEvidenceIntents": [
+            {
+                "semanticLabel": "发货超时规则与注意事项",
+                "requiredLevel": "required",
+                "suggestedDomains": ["scm", "order"],
+                "reason": "需要规则说明，不是补 SCM 指标",
+            }
+        ],
+        "filters": [],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+
+    assert not any(str(item).startswith("EVIDENCE_DOMAIN_REPAIR") for item in plan.compiler_trace)
 
 
 def test_coverage_critic_adds_recalled_metric_evidence_for_ship_timeout_order_count():
@@ -7989,7 +8339,7 @@ def test_compiler_adds_parallel_rule_evidence_branch_for_rule_data_question():
             {
                 "semanticLabel": "shipping_timeout_explanation",
                 "requiredLevel": "required",
-                "suggestedDomains": ["order"],
+                "suggestedDomains": ["rule", "order"],
             }
         ],
         "timeWindowDays": 7,
@@ -8777,6 +9127,8 @@ def trade_refund_goods_pack(include_missing_goods_metric=False):
             PlanningAssetEntry(
                 table="dwm_trade_order_detail_di",
                 columns=["seller_id", "pt", "spu_id", "spu_name", "sub_order_id", "order_id", "discount_rel_id", "pay_amt"],
+                title="订单明细表",
+                aliases=["订单/子订单明细表", "订单明细", "子订单明细"],
             ),
             PlanningAssetEntry(
                 table="dwm_trade_refund_detail_di",
@@ -8791,10 +9143,14 @@ def trade_refund_goods_pack(include_missing_goods_metric=False):
                     "refund_status_name",
                     "refund_create_time",
                 ],
+                title="退款明细表",
+                aliases=["退款/售后明细表", "退款明细", "售后明细"],
             ),
             PlanningAssetEntry(
                 table="dwm_goods_detail_df",
                 columns=["seller_id", "pt", "spu_id", "spu_name", "spu_apply_create_time", "spu_status_name"],
+                title="商品明细表",
+                aliases=["商品明细", "SPU 明细"],
             ),
         ],
         metrics=metrics,

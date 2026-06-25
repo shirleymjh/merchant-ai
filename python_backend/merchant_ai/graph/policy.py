@@ -104,6 +104,8 @@ class V2AgentPolicy:
             if self.has_task_results(state) and not state.get("evidence_graph_verified"):
                 return ["verify_evidence"], "evidence must be verified after execution before answer", True
             if self.has_executable_plan(state) and not state.get("sql_generated"):
+                if self.has_blocking_reflection_issues(state):
+                    return ["answer_data"], "main agent budget exhausted with unresolved PlannerCritic errors; answer with structured planning gap", True
                 if self.has_validated_executable_plan(state):
                     return ["execute_graph"], "main agent budget exhausted but validated QueryGraph still needs NodeAgent execution", True
                 if not state.get("query_graph_validated"):
@@ -146,6 +148,8 @@ class V2AgentPolicy:
             if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "retrieve_knowledge", "answer_data"], self.repair_decision_reason(reflection, "repair_graph"), False
             if "answer_with_gap" in repair_actions:
+                if not state.get("query_graph_validated"):
+                    return ["validate_graph"], "PlannerCritic requested answer_with_gap; validate QueryGraph before answering", True
                 return ["answer_data"], self.repair_decision_reason(reflection, "answer_data"), True
             has_blocking_issue = any(str(issue.get("severity") or "") == "error" for issue in reflection.issues)
             if (
@@ -156,6 +160,8 @@ class V2AgentPolicy:
                 return ["retrieve_knowledge", "repair_graph", "answer_data"], "planner reflection requested more knowledge", False
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"], "planner reflection found repairable graph issues", False
+            if not state.get("query_graph_validated"):
+                return ["validate_graph"], "planner reflection repair budget exhausted; validate QueryGraph before answer", True
             return ["answer_data"], "planner reflection failed and repair budget is exhausted", True
         if not state.get("query_graph_validated"):
             return ["validate_graph"], "QueryGraph has not been validated", False
@@ -168,6 +174,8 @@ class V2AgentPolicy:
             if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"], "validator found repairable graph gaps", False
             return ["answer_data"], "QueryGraph validation failed and cannot be repaired in budget", True
+        if self.has_blocking_reflection_issues(state):
+            return ["answer_data"], "PlannerCritic still has blocking errors; do not execute even if structural validation passed", True
         if self.has_validated_executable_plan(state) and not state.get("sql_generated"):
             return ["execute_graph"], "validated QueryGraph is ready for NodeAgent execution", False
         if self.has_graph_repairable_execution_gap(state):
@@ -258,7 +266,13 @@ class V2AgentPolicy:
         if not self.has_executable_plan(state) or not state.get("query_graph_validated"):
             return False
         validation = state.get("query_graph_validation_result")
-        return bool(validation and getattr(validation, "valid", False))
+        return bool(validation and getattr(validation, "valid", False) and not self.has_blocking_reflection_issues(state))
+
+    def has_blocking_reflection_issues(self, state: AgentState) -> bool:
+        reflection = normalize_reflection(state.get("planner_reflection"))
+        if not reflection or reflection.passed:
+            return False
+        return any(str(issue.get("severity") or "") == "error" for issue in reflection.issues)
 
     def has_task_results(self, state: AgentState) -> bool:
         run_result = state.get("agent_run_result")
@@ -307,7 +321,15 @@ class V2AgentPolicy:
 
     def validation_requires_reunderstand(self, validation: object) -> bool:
         codes = {str(gap.code) for gap in getattr(validation, "gaps", [])}
-        return bool(codes & {"SCOPE_NOT_NARROWING", "OBJECTIVE_NOT_COMPILED", "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"})
+        return bool(
+            codes
+            & {
+                "SCOPE_NOT_NARROWING",
+                "OBJECTIVE_NOT_COMPILED",
+                "OBJECT_REF_FILTER_MISSING",
+                "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR",
+            }
+        )
 
     def validation_requires_knowledge(self, validation: object) -> bool:
         codes = {str(gap.code) for gap in getattr(validation, "gaps", [])}

@@ -309,7 +309,11 @@ class AnswerComposeService:
             return "这次查询没有成功执行：%s。已保留执行轨迹，建议检查数据表、字段或 SQL 口径。" % bundle.error
         if not bundle.rows:
             return "本轮查询执行成功但返回 0 行；这只能说明当前 SQL 口径下没有返回记录，不能解释为业务指标为 0。若这是近期数据问题，可能需要检查离线分区或实时 fallback。"
-        lines = ["已按当前口径查询到 %s 行数据。" % bundle.effective_row_count()]
+        successful_task_count = len([item for item in run_result.task_results if not item.query_bundle.failed]) if run_result else 0
+        if successful_task_count > 1:
+            lines = ["本轮形成 %s 个成功证据节点，合计返回 %s 行证据数据。" % (successful_task_count, bundle.effective_row_count())]
+        else:
+            lines = ["已按当前口径查询到 %s 行数据。" % bundle.effective_row_count()]
         for table in bundle.tables:
             lines.append("- 使用表：%s" % table)
         gaps = run_result.evidence_gaps if run_result else []

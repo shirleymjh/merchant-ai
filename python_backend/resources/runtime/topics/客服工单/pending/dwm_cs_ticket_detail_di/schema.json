@@ -12,7 +12,7 @@
   "keyType" : "UNI"
 }, {
   "columnName" : "ticket_title",
-  "dataType" : "text",
+  "dataType" : "varchar",
   "comment" : "工单标题",
   "nullable" : true,
   "keyType" : ""
@@ -42,7 +42,7 @@
   "keyType" : ""
 }, {
   "columnName" : "priority_name",
-  "dataType" : "text",
+  "dataType" : "varchar",
   "comment" : "工单等级类型name，普通、加急",
   "nullable" : true,
   "keyType" : ""
@@ -84,7 +84,7 @@
   "keyType" : ""
 }, {
   "columnName" : "is_reopen",
-  "dataType" : "bigint",
+  "dataType" : "tinyint",
   "comment" : "是否二次开启 0否 1时",
   "nullable" : true,
   "keyType" : ""
@@ -144,7 +144,7 @@
   "keyType" : ""
 }, {
   "columnName" : "ticket_status_name",
-  "dataType" : "text",
+  "dataType" : "varchar",
   "comment" : "工单状态name",
   "nullable" : true,
   "keyType" : ""
@@ -156,7 +156,7 @@
   "keyType" : ""
 }, {
   "columnName" : "is_reminder",
-  "dataType" : "bigint",
+  "dataType" : "tinyint",
   "comment" : "是否催单 0 否 1 是",
   "nullable" : true,
   "keyType" : ""
@@ -180,13 +180,13 @@
   "keyType" : ""
 }, {
   "columnName" : "ticket_score",
-  "dataType" : "bigint",
+  "dataType" : "decimal",
   "comment" : "工单评价分数",
   "nullable" : true,
   "keyType" : ""
 }, {
   "columnName" : "ticket_create_time",
-  "dataType" : "text",
+  "dataType" : "datetime",
   "comment" : "工单创建时间",
   "nullable" : true,
   "keyType" : ""
@@ -282,7 +282,7 @@
   "keyType" : ""
 }, {
   "columnName" : "seller_id",
-  "dataType" : "text",
+  "dataType" : "varchar",
   "comment" : "卖家用户id",
   "nullable" : true,
   "keyType" : ""
