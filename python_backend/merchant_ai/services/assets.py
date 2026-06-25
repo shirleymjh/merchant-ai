@@ -1929,14 +1929,54 @@ def relationship_entry(topic: str, rel: Dict[str, Any]) -> RelationshipEntry:
     for pair in rel.get("keys") or []:
         if isinstance(pair, list) and len(pair) >= 2:
             keys.append({"leftColumn": str(pair[0]), "rightColumn": str(pair[1])})
+    path_semantics = [
+        str(item)
+        for item in rel.get("pathSemantics")
+        or rel.get("path_semantics")
+        or infer_relationship_path_semantics(rel, keys)
+        if str(item or "").strip()
+    ]
     return RelationshipEntry(
         relationship_id=str(rel.get("name") or ""),
         left_table=str(rel.get("leftTable") or ""),
         right_table=str(rel.get("rightTable") or ""),
         join_keys=keys,
+        grain=str(rel.get("grain") or ""),
+        path_semantics=path_semantics,
+        use_cases=[str(item) for item in rel.get("useCases") or rel.get("use_cases") or [] if str(item or "").strip()],
+        cautions=[str(item) for item in rel.get("cautions") or [] if str(item or "").strip()],
         source_ref_id="semantic:%s:relationship:%s" % (topic, rel.get("name") or ""),
         description=json.dumps(rel, ensure_ascii=False),
     )
+
+
+def infer_relationship_path_semantics(rel: Dict[str, Any], keys: List[Dict[str, str]]) -> List[str]:
+    columns = {
+        str(key.get("leftColumn") or "").lower()
+        for key in keys
+    } | {
+        str(key.get("rightColumn") or "").lower()
+        for key in keys
+    }
+    grain = str(rel.get("grain") or "").lower()
+    semantics: List[str] = []
+    if columns <= {"seller_id", "merchant_id"}:
+        semantics.append("tenant_context")
+    if {"sub_order_id", "order_id"} & columns or "order" in grain:
+        semantics.append("order_entity")
+    if {"spu_id", "spu_name"} & columns or "spu" in grain or "product" in grain:
+        semantics.append("product_entity")
+    if "ticket_id" in columns or "ticket" in grain:
+        semantics.append("ticket_entity")
+    if "refund_id" in columns or "refund" in grain:
+        semantics.append("refund_entity")
+    if {"coupon_id", "discount_rel_id", "discount_id"} & columns or "coupon" in grain:
+        semantics.append("coupon_entity")
+    if {"bill_id", "repay_id"} & columns or "bill" in grain or "repay" in grain:
+        semantics.append("compensation_entity")
+    if "tenant_context" not in semantics:
+        semantics.append("entity_filter")
+    return list(dict.fromkeys(semantics))
 
 
 def recalled_relationship_tables(item: RecallItem) -> List[str]:
@@ -2429,21 +2469,30 @@ class SemanticAssetGovernanceService:
             )
         )
         validation = validate_semantic_asset(asset, self.topic_assets.load_relationships(topic))
+        drift_gate = schema_drift_release_gate(drift)
+        validation_gate = semantic_validation_gate(validation)
+        release_gate = combine_release_gates(validation_gate, drift_gate)
+        impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
         payload = {
             "success": True,
-            "publishable": not validation["errors"],
-            "status": "PREFLIGHT_PASSED" if not validation["errors"] else "PREFLIGHT_FAILED",
+            "publishable": release_gate["publishable"],
+            "status": "PREFLIGHT_PASSED" if release_gate["publishable"] else "PREFLIGHT_FAILED",
             "topic": topic,
             "tableName": table,
             "semanticCatalogVersion": version.model_dump(by_alias=True),
             "schemaDriftReport": drift.model_dump(by_alias=True),
+            "driftGovernance": drift_gate,
             "validation": validation,
+            "releaseGate": release_gate,
+            "impactTestPlan": impact_plan,
+            "rollbackCandidate": semantic_rollback_candidate(self.topic_assets.table_asset_dir(topic, table)),
         }
         payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "preflight", version.semantic_version, payload))
         return payload
 
     def after_publish(self, topic: str, table: str, reviewer: str = "", review_note: str = "") -> Dict[str, Any]:
         target_dir = self.topic_assets.table_asset_dir(topic, table)
+        rollback_candidate = semantic_rollback_candidate(target_dir)
         asset = self._load_asset_dir(target_dir, topic, table)
         semantic_schema = schema_columns(asset)
         live_schema = self._live_schema(table)
@@ -2468,6 +2517,11 @@ class SemanticAssetGovernanceService:
             "publishedAt": datetime.utcnow().isoformat() + "Z",
         }
         write_json(target_dir / "semantic_version.json", version_payload)
+        drift_gate = schema_drift_release_gate(drift)
+        validation = validate_semantic_asset(asset, self.topic_assets.load_relationships(topic))
+        validation_gate = semantic_validation_gate(validation)
+        release_gate = combine_release_gates(validation_gate, drift_gate)
+        impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
         payload = {
             "success": True,
             "status": "GOVERNED_PUBLISHED",
@@ -2475,9 +2529,15 @@ class SemanticAssetGovernanceService:
             "tableName": table,
             "semanticCatalogVersion": version_payload,
             "schemaDriftReport": drift.model_dump(by_alias=True),
+            "driftGovernance": drift_gate,
+            "validation": validation,
+            "releaseGate": release_gate,
+            "impactTestPlan": impact_plan,
+            "rollbackCandidate": rollback_candidate,
             "cachePolicy": "recall index manager clears recall, asset pack, live schema, and Doris query caches after publish",
         }
         payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "publish", version.semantic_version, payload))
+        payload["publishHistoryPath"] = str(append_semantic_publish_history(target_dir, payload))
         return payload
 
     def _load_asset_dir(self, directory: Path, topic: str, table: str) -> Dict[str, Any]:
@@ -2561,6 +2621,196 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             if key and key not in columns:
                 errors.append({"code": "RELATIONSHIP_KEY_COLUMN_MISSING", "relationship": relationship.get("name") or relationship.get("relationshipId"), "column": key})
     return {"errors": errors, "warnings": warnings, "errorCount": len(errors), "warningCount": len(warnings)}
+
+
+def semantic_validation_gate(validation: Dict[str, Any]) -> Dict[str, Any]:
+    error_count = int(validation.get("errorCount") or len(validation.get("errors") or []))
+    warning_count = int(validation.get("warningCount") or len(validation.get("warnings") or []))
+    if error_count:
+        return {
+            "publishable": False,
+            "severity": "blocking",
+            "status": "BLOCKED",
+            "blockingReasons": ["SEMANTIC_VALIDATION_ERRORS"],
+            "warningReasons": [],
+            "errorCount": error_count,
+            "warningCount": warning_count,
+        }
+    return {
+        "publishable": True,
+        "severity": "warning" if warning_count else "passed",
+        "status": "REVIEW_REQUIRED" if warning_count else "PASSED",
+        "blockingReasons": [],
+        "warningReasons": ["SEMANTIC_VALIDATION_WARNINGS"] if warning_count else [],
+        "errorCount": error_count,
+        "warningCount": warning_count,
+    }
+
+
+def schema_drift_release_gate(drift: SchemaDriftReport) -> Dict[str, Any]:
+    missing = list(drift.missing_live_columns or [])
+    extra = list(drift.extra_live_columns or [])
+    type_changed = list(drift.type_changed_columns or [])
+    incompatible_type_changes = [
+        item
+        for item in type_changed
+        if not compatible_schema_type_change(str(item.get("semanticType") or ""), str(item.get("liveType") or ""))
+    ]
+    blocking: List[str] = []
+    warnings: List[str] = []
+    if missing:
+        blocking.append("MISSING_LIVE_COLUMNS")
+    if incompatible_type_changes:
+        blocking.append("INCOMPATIBLE_TYPE_CHANGES")
+    compatible_type_changes = max(0, len(type_changed) - len(incompatible_type_changes))
+    if compatible_type_changes:
+        warnings.append("COMPATIBLE_TYPE_CHANGES")
+    if extra:
+        warnings.append("EXTRA_LIVE_COLUMNS")
+    if not drift.live_column_count:
+        warnings.append("LIVE_SCHEMA_UNAVAILABLE")
+    severity = "blocking" if blocking else "warning" if warnings else "passed"
+    return {
+        "publishable": not blocking,
+        "severity": severity,
+        "status": "BLOCKED" if blocking else "REVIEW_REQUIRED" if warnings else "PASSED",
+        "blockingReasons": blocking,
+        "warningReasons": warnings,
+        "missingLiveColumnCount": len(missing),
+        "extraLiveColumnCount": len(extra),
+        "typeChangedColumnCount": len(type_changed),
+        "incompatibleTypeChangedColumnCount": len(incompatible_type_changes),
+    }
+
+
+def compatible_schema_type_change(semantic_type: str, live_type: str) -> bool:
+    semantic = normalize_column_type_family(semantic_type)
+    live = normalize_column_type_family(live_type)
+    if not semantic or not live:
+        return True
+    if semantic == live:
+        return True
+    compatible = {
+        ("bigint", "decimal"),
+        ("int", "bigint"),
+        ("int", "decimal"),
+        ("float", "decimal"),
+        ("double", "decimal"),
+        ("text", "varchar"),
+        ("varchar", "text"),
+        ("string", "varchar"),
+        ("varchar", "string"),
+        ("datetime", "varchar"),
+        ("date", "varchar"),
+    }
+    return (semantic, live) in compatible
+
+
+def normalize_column_type_family(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text.startswith("decimal"):
+        return "decimal"
+    if text.startswith("varchar") or text.startswith("char"):
+        return "varchar"
+    if text.startswith("datetime"):
+        return "datetime"
+    if text.startswith("date"):
+        return "date"
+    if text.startswith("bigint"):
+        return "bigint"
+    if text.startswith("int"):
+        return "int"
+    if text.startswith("tinyint"):
+        return "int"
+    if text.startswith("double"):
+        return "double"
+    if text.startswith("float"):
+        return "float"
+    if text in {"text", "string", "json", "boolean", "bool"}:
+        return text
+    return text.split("(", 1)[0]
+
+
+def combine_release_gates(*gates: Dict[str, Any]) -> Dict[str, Any]:
+    blocking: List[str] = []
+    warnings: List[str] = []
+    for gate in gates:
+        blocking.extend(str(item) for item in gate.get("blockingReasons") or [])
+        warnings.extend(str(item) for item in gate.get("warningReasons") or [])
+    publishable = not blocking
+    return {
+        "publishable": publishable,
+        "status": "BLOCKED" if blocking else "REVIEW_REQUIRED" if warnings else "PASSED",
+        "severity": "blocking" if blocking else "warning" if warnings else "passed",
+        "blockingReasons": sorted(set(blocking)),
+        "warningReasons": sorted(set(warnings)),
+    }
+
+
+def semantic_asset_impact_test_plan(topic: str, table: str, asset: Dict[str, Any], drift: SchemaDriftReport) -> Dict[str, Any]:
+    metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
+    metric_keys = [
+        str(metric.get("metricKey") or metric.get("key") or "")
+        for metric in metrics
+        if isinstance(metric, dict) and str(metric.get("metricKey") or metric.get("key") or "")
+    ][:8]
+    impacted_columns = sorted(
+        set(drift.missing_live_columns or [])
+        | {str(item.get("column") or "") for item in drift.type_changed_columns or [] if item.get("column")}
+    )
+    commands = [
+        "python_backend/.venv/bin/python -m ruff check python_backend scripts",
+        "cd python_backend && .venv/bin/python -m pytest tests/test_harness.py -q -k 'semantic or drift or recall or planner'",
+    ]
+    return {
+        "topic": topic,
+        "tableName": table,
+        "impactedMetrics": metric_keys,
+        "impactedColumns": impacted_columns[:16],
+        "suggestedCommands": commands,
+        "reviewFocus": [
+            "schema drift blocking columns",
+            "metric canonical/alias consistency",
+            "recall index changed refs",
+            "planner asset pack compactness",
+        ],
+    }
+
+
+def semantic_rollback_candidate(target_dir: Path) -> Dict[str, Any]:
+    version_path = target_dir / "semantic_version.json"
+    version = read_json(version_path)
+    if not isinstance(version, dict):
+        return {}
+    return {
+        "semanticVersion": version.get("semanticVersion") or version.get("semantic_version") or "",
+        "schemaVersion": version.get("schemaVersion") or version.get("schema_version") or "",
+        "sourceHash": version.get("sourceHash") or version.get("source_hash") or "",
+        "publishedAt": version.get("publishedAt") or version.get("published_at") or "",
+        "versionPath": str(version_path),
+    }
+
+
+def append_semantic_publish_history(target_dir: Path, payload: Dict[str, Any]) -> Path:
+    path = target_dir / "semantic_publish_history.json"
+    existing = read_json(path)
+    history = existing if isinstance(existing, list) else []
+    version = payload.get("semanticCatalogVersion") if isinstance(payload.get("semanticCatalogVersion"), dict) else {}
+    history.append(
+        {
+            "semanticVersion": version.get("semanticVersion") or version.get("semantic_version") or "",
+            "schemaVersion": version.get("schemaVersion") or version.get("schema_version") or "",
+            "sourceHash": version.get("sourceHash") or version.get("source_hash") or "",
+            "publishedAt": version.get("publishedAt") or version.get("published_at") or "",
+            "status": payload.get("status"),
+            "releaseGate": payload.get("releaseGate"),
+            "reviewArtifact": payload.get("reviewArtifact"),
+        }
+    )
+    write_json(path, history[-50:])
+    return path
 
 
 def schema_columns(asset: Dict[str, Any]) -> List[Dict[str, Any]]:

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     llm_answer_timeout_seconds: int = Field(30, validation_alias="YSHOPPING_LLM_ANSWER_TIMEOUT_SECONDS")
     llm_analysis_timeout_seconds: int = Field(20, validation_alias="YSHOPPING_LLM_ANALYSIS_TIMEOUT_SECONDS")
     llm_max_tokens: int = Field(2048, validation_alias="YSHOPPING_LLM_MAX_TOKENS")
+    answer_skill_match_mode: str = Field("off", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
 
     embedding_base_url: str = Field("https://api.openai.com/v1", validation_alias="YSHOPPING_EMBEDDING_BASE_URL")
     embedding_model: str = Field("text-embedding-3-small", validation_alias="YSHOPPING_EMBEDDING_MODEL")
@@ -73,6 +74,9 @@ class Settings(BaseSettings):
     agent_sql_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_SQL_REPAIR_ROUNDS")
     agent_max_entity_values: int = Field(200, validation_alias="YSHOPPING_AGENT_MAX_ENTITY_VALUES")
     agent_trace_replay_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_TRACE_REPLAY_ENABLED")
+    agent_checkpointer_backend: str = Field("sqlite", validation_alias="YSHOPPING_AGENT_CHECKPOINTER_BACKEND")
+    agent_checkpointer_sqlite_path: str = Field("", validation_alias="YSHOPPING_AGENT_CHECKPOINTER_SQLITE_PATH")
+    agent_checkpointer_postgres_uri: str = Field("", validation_alias="YSHOPPING_AGENT_CHECKPOINTER_POSTGRES_URI")
     agent_main_rounds: int = Field(18, validation_alias="YSHOPPING_AGENT_MAIN_ROUNDS")
     agent_retrieve_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_RETRIEVE_ROUNDS")
     agent_plan_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_PLAN_ROUNDS")
@@ -137,6 +141,12 @@ class Settings(BaseSettings):
         if self.harness_workspace_path:
             return Path(self.harness_workspace_path)
         return self.repo_root / "python_backend" / ".merchant-ai"
+
+    @property
+    def resolved_checkpointer_sqlite_path(self) -> Path:
+        if self.agent_checkpointer_sqlite_path:
+            return Path(self.agent_checkpointer_sqlite_path)
+        return self.resolved_workspace_path / "checkpoints" / "langgraph.sqlite"
 
     @property
     def openai_api_key(self) -> str:

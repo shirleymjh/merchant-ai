@@ -1012,10 +1012,22 @@ class QueryGraphPlanner:
         if prior_understanding:
             user_payload["previousUnderstanding"] = compact_previous_understanding(prior_understanding)
         tool = question_understanding_tool(force_catalog)
-        user = json.dumps(user_payload, ensure_ascii=False)
         tool_schema = compact_openai_tool_schema(tool.openai_schema())
-        stats = planner_prompt_stats(prompt.system_prompt, user, tool_schema)
         budget = int(getattr(self.settings, "agent_planner_prompt_budget_chars", 0) or 0)
+        user, stats, budget_trace = self._budgeted_understanding_user_payload(
+            question,
+            asset_pack,
+            gaps,
+            trace,
+            force_catalog,
+            compact_retry,
+            planner_context,
+            use_tool_loop,
+            prior_understanding,
+            prompt.system_prompt,
+            tool_schema,
+            budget,
+        )
         if budget > 0 and stats.get("totalChars", 0) > budget and not use_tool_loop:
             return {
                 "status": "INVALID",
@@ -1024,6 +1036,7 @@ class QueryGraphPlanner:
                 "_promptTrace": prompt.trace(),
                 "_toolSchema": tool.trace_schema(),
                 "_plannerContextOverBudget": True,
+                "_plannerBudgetTrace": budget_trace,
             }
         payload = (
             self._llm_understand_with_semantic_tools(prompt.system_prompt, user_payload, tool, force_catalog)
@@ -1057,11 +1070,69 @@ class QueryGraphPlanner:
             payload["_promptStats"] = stats
         else:
             payload["_usedSemanticToolLoop"] = True
+            payload["_promptStats"] = stats
         payload["_promptTrace"] = prompt.trace()
         payload["_toolSchema"] = tool.trace_schema()
+        payload["_plannerBudgetTrace"] = budget_trace
         if compact_retry:
             payload["_compactRetry"] = True
         return payload
+
+    def _budgeted_understanding_user_payload(
+        self,
+        question: str,
+        asset_pack: PlanningAssetPack,
+        gaps: List[GraphValidationGap],
+        trace: List[str],
+        force_catalog: bool,
+        compact_retry: bool,
+        planner_context: Dict[str, Any] | None,
+        use_tool_loop: bool,
+        prior_understanding: Dict[str, Any] | None,
+        system_prompt: str,
+        tool_schema: Dict[str, Any],
+        budget: int,
+    ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+        budget_trace: List[Dict[str, Any]] = []
+        max_level = 0 if use_tool_loop else 2
+        selected_user = ""
+        selected_stats: Dict[str, Any] = {}
+        for level in range(0, max_level + 1):
+            payload = self._understanding_payload(
+                question,
+                asset_pack,
+                gaps,
+                trace,
+                force_catalog,
+                compact_retry or level > 0,
+                planner_context,
+                include_full_file_context=use_tool_loop,
+                prior_understanding=prior_understanding,
+                budget_level=level,
+            )
+            if prior_understanding:
+                payload["previousUnderstanding"] = compact_previous_understanding(prior_understanding, max_items=max(1, 3 - level))
+            user = json.dumps(payload, ensure_ascii=False)
+            stats = planner_prompt_stats(system_prompt, user, tool_schema)
+            stats["budgetLevel"] = level
+            stats["catalogTables"] = len((payload.get("semanticCatalog") or {}).get("tables") or [])
+            stats["catalogMetrics"] = len((payload.get("semanticCatalog") or {}).get("candidateMetrics") or [])
+            stats["catalogRelationships"] = len((payload.get("semanticCatalog") or {}).get("relationships") or [])
+            budget_trace.append(
+                {
+                    "budgetLevel": level,
+                    "totalChars": stats.get("totalChars", 0),
+                    "userPromptChars": stats.get("userPromptChars", 0),
+                    "catalogTables": stats["catalogTables"],
+                    "catalogMetrics": stats["catalogMetrics"],
+                    "catalogRelationships": stats["catalogRelationships"],
+                }
+            )
+            selected_user, selected_stats = user, stats
+            if not budget or stats.get("totalChars", 0) <= budget:
+                break
+        selected_stats["budgetTrace"] = budget_trace
+        return selected_user, selected_stats, budget_trace
 
     def _should_enter_semantic_tool_loop(self, payload: Dict[str, Any], plan: QueryPlan) -> bool:
         if not self.semantic_catalog or not hasattr(self.llm, "tool_chat") or self.settings.agent_planner_tool_rounds <= 0:
@@ -1107,19 +1178,21 @@ class QueryGraphPlanner:
         planner_context: Dict[str, Any] | None,
         include_full_file_context: bool = False,
         prior_understanding: Dict[str, Any] | None = None,
+        budget_level: int = 0,
     ) -> Dict[str, Any]:
-        catalog = ultra_compact_understanding_catalog(asset_pack, question, planner_context)
+        catalog = ultra_compact_understanding_catalog(asset_pack, question, planner_context, budget_level=budget_level)
         prompt_tables = [str(item.get("table") or "") for item in catalog.get("tables") or [] if item.get("table")]
         table_limit = max(1, int(self.settings.agent_planner_seed_table_limit or 4))
         repair_feedback = planner_repair_feedback_for_understanding(gaps, prior_understanding or {})
         payload = {
             "question": question,
             "semanticCatalog": catalog,
-            "diagnosticContext": compact_planner_context(planner_context),
+            "diagnosticContext": compact_planner_context(planner_context) if budget_level < 2 else {},
             "validationGaps": [gap.model_dump(by_alias=True) for gap in gaps],
             "repairFeedback": repair_feedback,
-            "trace": compact_planner_trace(trace, gaps, compact_retry),
+            "trace": compact_planner_trace(trace, gaps, compact_retry)[: max(1, 3 - budget_level)],
             "plannerToolResults": [],
+            "plannerBudgetLevel": budget_level,
             "outputContract": {
                 "tool": "emit_question_understanding",
                 "status": "UNDERSTOOD | INVALID" if force_catalog else "UNDERSTOOD | NEED_MORE_KNOWLEDGE | INVALID",
@@ -1826,14 +1899,22 @@ def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Di
     return compact
 
 
-def compact_previous_understanding(payload: Dict[str, Any]) -> Dict[str, Any]:
+def compact_previous_understanding(payload: Dict[str, Any], max_items: int = 3) -> Dict[str, Any]:
     understanding = payload.get("questionUnderstanding") or payload.get("question_understanding") or {}
     if not isinstance(understanding, dict):
         understanding = {}
+    compact_understanding: Dict[str, Any] = {}
+    for key, value in understanding.items():
+        if isinstance(value, list):
+            compact_understanding[key] = value[:max(1, max_items)]
+        elif isinstance(value, dict):
+            compact_understanding[key] = value
+        elif key in {"analysisIntent", "analysis_intent", "requiresExplanation", "requires_explanation", "analysisGrain", "analysis_grain"}:
+            compact_understanding[key] = value
     return {
         "status": str(payload.get("status") or ""),
         "reason": str(payload.get("reason") or "")[:500],
-        "questionUnderstanding": understanding,
+        "questionUnderstanding": compact_understanding,
     }
 
 
@@ -1924,6 +2005,14 @@ class RelationshipGraphEdge:
     @property
     def relationship_id(self) -> str:
         return str(getattr(self.relationship, "relationship_id", "") or "")
+
+    @property
+    def grain(self) -> str:
+        return str(getattr(self.relationship, "grain", "") or "")
+
+    @property
+    def path_semantics(self) -> set[str]:
+        return {str(item) for item in getattr(self.relationship, "path_semantics", []) or [] if str(item or "")}
 
 
 class SemanticRelationshipGraphIndex:
@@ -2051,12 +2140,26 @@ class SemanticRelationshipGraphIndex:
             edge_columns = set(edge.from_columns) | set(edge.to_columns)
             path_columns |= edge_columns
             business_columns = edge_columns - {"seller_id", "merchant_id", "pt"}
+            semantics = edge.path_semantics
             if len(path) == 1 and business_columns:
                 score -= 50
             if business_columns:
                 score -= min(len(business_columns), 3) * 2
             else:
                 score += 20
+            if "tenant_context" in semantics and not relationship_path_allows_tenant_context(
+                start_table,
+                target_table,
+                analysis_grain,
+            ):
+                score += 35
+            if "entity_filter" in semantics:
+                score -= 8
+            semantic_match = relationship_semantics_match_grain(semantics, analysis_grain)
+            if semantic_match:
+                score -= 12
+            elif analysis_grain and semantics and "tenant_context" not in semantics:
+                score += 4
             if relationship_edge_touches_hub(edge, start_table, target_table):
                 score += 30 if not business_columns else 12
         if desired_keys:
@@ -2094,6 +2197,34 @@ def relationship_preferred_keys_for_grain(analysis_grain: str) -> set[str]:
         "day": {"pt"},
     }
     return set(mapping.get(grain, set()))
+
+
+def relationship_semantics_match_grain(semantics: set[str], analysis_grain: str) -> bool:
+    grain = (analysis_grain or "").strip().lower()
+    if not grain:
+        return False
+    grain_semantics = {
+        "order": {"order_entity"},
+        "product": {"product_entity"},
+        "goods": {"product_entity"},
+        "ticket": {"ticket_entity"},
+        "refund": {"refund_entity", "order_entity"},
+        "coupon": {"coupon_entity", "order_entity"},
+        "scm": {"product_entity"},
+        "compensation": {"compensation_entity", "order_entity"},
+        "repay": {"compensation_entity", "order_entity"},
+        "day": set(),
+        "merchant": {"tenant_context"},
+    }
+    expected = grain_semantics.get(grain, set())
+    return bool(expected and semantics & expected)
+
+
+def relationship_path_allows_tenant_context(start_table: str, target_table: str, analysis_grain: str) -> bool:
+    domains = {semantic_domain_for_table(start_table), semantic_domain_for_table(target_table)}
+    if domains <= {"profile", "merchant"}:
+        return True
+    return (analysis_grain or "").strip().lower() in {"merchant", "shop", "seller"}
 
 
 def relationship_edge_touches_hub(edge: RelationshipGraphEdge, start_table: str, target_table: str) -> bool:
@@ -3161,10 +3292,17 @@ def ultra_compact_understanding_catalog(
     asset_pack: PlanningAssetPack,
     question: str = "",
     planner_context: Dict[str, Any] | None = None,
+    budget_level: int = 0,
 ) -> Dict[str, Any]:
     metrics = prompt_metric_entries(asset_pack, question, 6)
     table_limit = max(1, int(get_settings().agent_planner_seed_table_limit or 4))
     metric_limit = max(4, int(get_settings().agent_planner_seed_metric_limit or 14))
+    if budget_level >= 1:
+        table_limit = min(table_limit, 3)
+        metric_limit = min(metric_limit, 8)
+    if budget_level >= 2:
+        table_limit = min(table_limit, 2)
+        metric_limit = min(metric_limit, 5)
     diagnostic_context = compact_planner_context(planner_context)
     if diagnostic_context:
         table_entries = diagnostic_catalog_table_entries(asset_pack, question, metrics, 2)
@@ -3176,21 +3314,21 @@ def ultra_compact_understanding_catalog(
         asset_pack,
         question,
         prompt_table_list,
-        per_table_limit=2,
-        total_limit=min(metric_limit, max(6, len(prompt_table_list) * 2 + 2)),
+        per_table_limit=1 if budget_level >= 2 else 2,
+        total_limit=min(metric_limit, max(3 if budget_level >= 2 else 6, len(prompt_table_list) * (1 if budget_level >= 2 else 2) + 1)),
     )
-    fields = prompt_field_entries(asset_pack, question, prompt_tables, total_limit=8)
+    fields = prompt_field_entries(asset_pack, question, prompt_tables, total_limit=0 if budget_level >= 2 else 4 if budget_level >= 1 else 8)
     relationships = [
         rel
         for rel in asset_pack.relationships
         if rel.left_table in prompt_tables and rel.right_table in prompt_tables
-    ][:4]
+    ][: 1 if budget_level >= 2 else 2 if budget_level >= 1 else 4]
     return {
         "tables": [
             {
                 "table": item.table or item.key,
                 "domain": semantic_domain_for_table(item.table or item.key),
-                "keyColumns": select_planner_columns(item.columns, question)[:4],
+                "keyColumns": select_planner_columns(item.columns, question)[: 2 if budget_level >= 2 else 3 if budget_level >= 1 else 4],
                 "sourceRefId": item.source_ref_id,
             }
             for item in table_entries
@@ -3201,7 +3339,7 @@ def ultra_compact_understanding_catalog(
                 "table": item.table,
                 "title": item.title,
                 "columns": item.columns[:1],
-                "matchedPhrases": metric_matched_phrases(question, item)[:3],
+                "matchedPhrases": metric_matched_phrases(question, item)[: 1 if budget_level >= 2 else 2 if budget_level >= 1 else 3],
                 "sourceRefId": item.source_ref_id,
             }
             for item in metrics
@@ -3211,7 +3349,7 @@ def ultra_compact_understanding_catalog(
                 "key": item.key,
                 "table": item.table,
                 "title": item.title,
-                "matchedPhrases": field_matched_phrases(question, item)[:3],
+                "matchedPhrases": field_matched_phrases(question, item)[: 1 if budget_level >= 1 else 3],
                 "sourceRefId": item.source_ref_id,
             }
             for item in fields
@@ -3221,11 +3359,12 @@ def ultra_compact_understanding_catalog(
                 "relationshipId": item.relationship_id,
                 "leftTable": item.left_table,
                 "rightTable": item.right_table,
-                "joinKeys": item.join_keys[:2],
+                "joinKeys": item.join_keys[:1 if budget_level >= 1 else 2],
                 "sourceRefId": item.source_ref_id,
             }
             for item in relationships
         ],
+        "budgetLevel": budget_level,
         "catalogPolicy": (
             "ultra compact semantic candidates for questionUnderstanding; tables are first-layer manifests, "
             "candidateMetrics are selected by per-table coverage first and global relevance second; "
@@ -6300,7 +6439,9 @@ def compile_scope_context(
     root_table = ""
     current_task = ""
     current_table = ""
-    for scope in scope_constraints_from_understanding(understanding):
+    for raw_scope in scope_constraints_from_understanding(understanding):
+        scope, normalization_trace = normalize_scope_source_for_compilation(raw_scope, understanding, asset_pack)
+        trace.extend(normalization_trace)
         duplicate_reason = scope_duplicates_metric_obligation(scope, understanding)
         if duplicate_reason:
             trace.append("SCOPE_SKIPPED_NOT_POPULATION:%s:%s" % (duplicate_reason, scope.get("sourcePhrase", "")))
@@ -6423,6 +6564,52 @@ def compile_scope_context(
         leaf_table=current_table,
         trace=trace,
     )
+
+
+def normalize_scope_source_for_compilation(
+    scope: Dict[str, Any],
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> tuple[Dict[str, Any], List[str]]:
+    """Repair a common LLM contract ambiguity without using question text.
+
+    For population scopes the LLM should set ownerTable to the source business
+    object that defines the population. In practice it may put the target
+    population table there (for example order table) and use targetDomain to
+    name the source domain (for example coupon). When that scope duplicates the
+    metric obligation, treating it as same-table scope would silently drop the
+    real population filter. Use semantic table domains to swap source/target.
+    """
+
+    owner_table = str(scope.get("ownerTable") or "")
+    owner_domain = semantic_domain_for_table(owner_table)
+    hinted_domain = normalize_semantic_domain(str(scope.get("targetDomain") or ""))
+    if not owner_table or not owner_domain or not hinted_domain or hinted_domain == owner_domain:
+        return scope, []
+    if not scope_duplicates_metric_obligation(scope, understanding):
+        return scope, []
+    if scope_duplicates_ranking_objective(scope, understanding) and not scope_phrase_is_strict_subset_of_ranking(scope, understanding):
+        return scope, []
+    hinted_table = best_table_for_domain(hinted_domain, asset_pack)
+    if not hinted_table or hinted_table == owner_table:
+        return scope, []
+    corrected = dict(scope)
+    corrected["ownerTable"] = hinted_table
+    corrected["targetDomain"] = owner_domain
+    corrected["metricRef"] = ""
+    return corrected, [
+        "SCOPE_SOURCE_DOMAIN_REPAIRED:%s->%s target=%s"
+        % (owner_table, hinted_table, owner_domain)
+    ]
+
+
+def scope_phrase_is_strict_subset_of_ranking(scope: Dict[str, Any], understanding: Dict[str, Any]) -> bool:
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    if not isinstance(ranking, dict):
+        return False
+    scope_phrase = normalize_metric_match_text(str(scope.get("sourcePhrase") or scope.get("source_phrase") or ""))
+    ranking_phrase = normalize_metric_match_text(str(ranking.get("sourcePhrase") or ranking.get("source_phrase") or ""))
+    return bool(scope_phrase and ranking_phrase and scope_phrase != ranking_phrase and scope_phrase in ranking_phrase)
 
 
 def compiled_scope_anchor_intent(
@@ -6641,16 +6828,6 @@ def same_table_dependency_from_parent(
     produced = set(parent.output_keys + parent.required_evidence)
     produced.update(column for column in [parent.group_by_column, parent.filter_column] if column)
     for key in ["sub_order_id", "order_id", "spu_id", "spu_name", "coupon_id", "discount_rel_id", "discount_id", "refund_id", "ticket_id", "bill_id"]:
-        if key in columns and key in produced:
-            return PlanDependency(
-                anchor_task_id=parent.plan_task_id,
-                dependent_task_id=child.plan_task_id,
-                join_key=key,
-                anchor_column=key,
-                dependent_column=key,
-                relation_type="LOOKUP",
-            )
-    for key in ["seller_id", "merchant_id"]:
         if key in columns and key in produced:
             return PlanDependency(
                 anchor_task_id=parent.plan_task_id,
@@ -8640,9 +8817,13 @@ def ensure_bridge_for_relationship_edge(
         if compiler_trace is not None:
             compiler_trace.append("ENTITY_BRIDGE_UNAVAILABLE:%s:%s" % (parent_task, ",".join(missing)))
         return parent_task
+    bridge_key = parent_intent.group_by_column or parent_intent.filter_column
+    if bridge_key in {"", "seller_id", "merchant_id", "pt"}:
+        if compiler_trace is not None:
+            compiler_trace.append("ENTITY_BRIDGE_SKIPPED_TECHNICAL_KEY:%s:%s" % (parent_task, bridge_key or "missing"))
+        return parent_task
     expansion = expansion.model_copy(update={"plan_task_id": unique_task_id(expansion.plan_task_id, [item.plan_task_id for item in intents])})
     intents.append(expansion)
-    bridge_key = parent_intent.group_by_column or parent_intent.filter_column
     add_dependency_if_valid(
         dependencies,
         PlanDependency(

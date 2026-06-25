@@ -21,6 +21,28 @@ export async function sendMessage(message, context) {
   })
 }
 
+export async function startAsyncRun(message, context, options = {}) {
+  return request('/api/runs/async', {
+    method: 'POST',
+    body: JSON.stringify({ message, merchantId: DEFAULT_MERCHANT_ID, context }),
+    signal: options.signal
+  })
+}
+
+export async function getRun(threadId, runId) {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}`)
+}
+
+export async function getRunEvents(threadId, runId) {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/events`)
+}
+
+export async function cancelRun(threadId, runId) {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST'
+  })
+}
+
 export async function sendFeedback(id, payload) {
   return request(`/api/answers/${id}/feedback`, {
     method: 'POST',

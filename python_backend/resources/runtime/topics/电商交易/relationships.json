@@ -6,6 +6,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
     "grain": "sub_order_id_refund_id",
+    "pathSemantics": ["order_entity", "refund_entity", "entity_filter"],
     "useCases": ["订单明细关联退款明细", "退款订单对应订单状态"],
     "cautions": ["汇总金额时避免一单多退导致订单金额重复计数"]
   },
@@ -16,6 +17,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
     "grain": "sub_order_id_ticket_id",
+    "pathSemantics": ["order_entity", "ticket_entity", "entity_filter"],
     "useCases": ["订单明细关联工单明细", "催单工单定位到订单"]
   },
   {
@@ -25,6 +27,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
     "grain": "sub_order_id_bill_id",
+    "pathSemantics": ["order_entity", "compensation_entity", "entity_filter"],
     "useCases": ["订单明细关联赔付明细", "赔付订单对应订单金额和商品"]
   },
   {
@@ -34,6 +37,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["spu_id", "spu_id"]],
     "grain": "spu_id_sub_order_id",
+    "pathSemantics": ["product_entity", "order_entity", "entity_filter"],
     "useCases": ["商品状态关联订单成交"]
   },
   {
@@ -43,6 +47,7 @@
     "joinType": "LEFT",
     "keys": [["merchant_id", "seller_id"]],
     "grain": "merchant_sub_order_id",
+    "pathSemantics": ["tenant_context"],
     "useCases": ["商家维度信息关联订单明细"]
   }
 ]

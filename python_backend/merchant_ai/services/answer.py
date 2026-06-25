@@ -104,9 +104,10 @@ class AnswerComposeService:
         self.last_analysis_skill_trace = {}
         if not run_result or not run_result.merged_query_bundle.rows:
             return ""
-        if not analysis_summary_required(plan):
+        skill_name = self.propose_answer_skill(question, plan, run_result, bool(rule_context))
+        if not skill_name and not analysis_summary_required(plan):
             return ""
-        skill_answer = self.run_analysis_skill(question, plan, run_result, outputs_path, rule_context)
+        skill_answer = self.run_analysis_skill(question, plan, run_result, outputs_path, rule_context, skill_name=skill_name)
         if skill_answer:
             return skill_answer
         if not self.llm.configured:
@@ -131,6 +132,71 @@ class AnswerComposeService:
         self.last_analysis_skill_trace["llmFallbackUsed"] = bool(answer)
         return answer
 
+    def propose_answer_skill(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        has_rule_context: bool = False,
+    ) -> str:
+        candidates = answer_skill_headers(self.llm.settings.resources_root / "runtime" / "agent_skills")
+        fallback = select_answer_skill(plan, run_result, has_rule_context)
+        trace: Dict[str, Any] = {
+            "lifecycle": ["match", "confirm", "isolated_execute", "progress", "output"],
+            "matchMode": self.llm.settings.answer_skill_match_mode,
+            "candidateSkills": [item.get("name") for item in candidates],
+            "fallbackSkill": fallback,
+        }
+        self.last_analysis_skill_trace = trace
+        if not candidates or self.llm.settings.answer_skill_match_mode == "off":
+            trace["matchedBy"] = "deterministic_fallback"
+            trace["skillName"] = fallback
+            return fallback
+        if not self.llm.configured and self.llm.settings.answer_skill_match_mode != "always":
+            trace["matchedBy"] = "deterministic_fallback_no_llm"
+            trace["skillName"] = fallback
+            return fallback
+        prompt_payload = {
+            "question": question,
+            "questionUnderstanding": plan.question_understanding,
+            "plannedEvidence": [
+                {
+                    "taskId": intent.plan_task_id,
+                    "category": category_display(intent.category),
+                    "answerMode": str(intent.answer_mode),
+                    "metric": intent.metric_name,
+                    "table": intent.preferred_table,
+                    "resolution": intent.metric_resolution,
+                }
+                for intent in plan.intents[:10]
+            ],
+            "hasRuleContext": has_rule_context,
+            "evidenceRows": run_result.merged_query_bundle.rows[:5] if run_result else [],
+            "evidenceGaps": [gap.model_dump(by_alias=True) for gap in (run_result.evidence_gaps if run_result else [])[:5]],
+            "skills": candidates,
+        }
+        system = (
+            "You are an Answer Skill matcher. Choose at most one skill from the provided skill headers. "
+            "Do not invent skill names. Return JSON only: {\"skillName\":\"...\", \"confidence\":0-1, \"reason\":\"...\"}. "
+            "Return empty skillName when no skill should run."
+        )
+        raw = self.llm.chat(system, json.dumps(prompt_payload, ensure_ascii=False, default=str), "", timeout_seconds=8)
+        trace["matchedBy"] = "llm_skill_header_match"
+        trace["llmRaw"] = raw[:800] if raw else ""
+        payload = parse_skill_match_payload(raw)
+        allowed = {str(item.get("name") or "") for item in candidates}
+        selected = str(payload.get("skillName") or "")
+        if selected and selected not in allowed:
+            selected = ""
+            trace["matchWarning"] = "LLM_SELECTED_UNKNOWN_SKILL"
+        if not selected:
+            selected = fallback
+            trace["matchedBy"] = "deterministic_fallback_after_llm"
+        trace["skillName"] = selected
+        trace["confidence"] = payload.get("confidence")
+        trace["reason"] = payload.get("reason")
+        return selected
+
     def run_analysis_skill(
         self,
         question: str,
@@ -138,25 +204,42 @@ class AnswerComposeService:
         run_result: AgentRunResult,
         outputs_path: str = "",
         rule_context: str = "",
+        skill_name: str = "",
     ) -> str:
-        skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / "bi_trend_attribution"
+        selected_skill = skill_name or select_answer_skill(plan, run_result, bool(rule_context)) or "bi_trend_attribution"
+        skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / selected_skill
         skill_file = skill_dir / "SKILL.md"
         script = skill_dir / "scripts" / "profile_timeseries.py"
         trace: Dict[str, Any] = {
-            "skillName": "bi_trend_attribution",
-            "matchedBy": "questionUnderstanding.analysisIntent",
+            "skillName": selected_skill,
+            "matchedBy": self.last_analysis_skill_trace.get("matchedBy") or "questionUnderstanding+verifiedEvidence",
+            "matchTrace": dict(self.last_analysis_skill_trace or {}),
             "activated": False,
             "skillPath": str(skill_file),
             "scriptPath": str(script),
         }
         self.last_analysis_skill_trace = trace
-        if not skill_file.exists() or not script.exists():
+        if not skill_file.exists():
             trace["error"] = "skill package missing"
             return ""
         skill_meta = load_skill_frontmatter(skill_file)
         trace["metadata"] = skill_meta
+        if selected_skill != "bi_trend_attribution":
+            return self.run_structured_answer_skill(
+                selected_skill,
+                skill_meta,
+                question,
+                plan,
+                run_result,
+                outputs_path,
+                rule_context,
+                trace,
+            )
+        if not script.exists():
+            trace["error"] = "skill script missing"
+            return ""
         artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
-        target = artifact_root / "artifacts" / "analysis_skills" / "bi_trend_attribution"
+        target = artifact_root / "artifacts" / "analysis_skills" / selected_skill
         target.mkdir(parents=True, exist_ok=True)
         input_path = target / "skill_input.json"
         output_path = target / "skill_output.json"
@@ -199,6 +282,47 @@ class AnswerComposeService:
         answer = str(result.get("answerMarkdown") or "").strip()
         if not answer:
             trace["error"] = "empty skill answer"
+        return answer
+
+    def run_structured_answer_skill(
+        self,
+        skill_name: str,
+        skill_meta: Dict[str, Any],
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        outputs_path: str = "",
+        rule_context: str = "",
+        trace: Dict[str, Any] | None = None,
+    ) -> str:
+        trace = trace if trace is not None else {}
+        artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
+        target = artifact_root / "artifacts" / "analysis_skills" / skill_name
+        target.mkdir(parents=True, exist_ok=True)
+        input_path = target / "skill_input.json"
+        output_path = target / "skill_output.json"
+        payload = answer_data_package(question, plan, run_result, rule_context)
+        payload["questionUnderstanding"] = plan.question_understanding
+        payload["skillMetadata"] = skill_meta
+        input_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        answer = render_structured_skill_answer(skill_name, payload)
+        output = {
+            "skillName": skill_name,
+            "rowCount": len(payload.get("dataRows") or []),
+            "answerMarkdown": answer,
+            "caveats": [gap.get("code") for gap in payload.get("evidenceGaps") or [] if isinstance(gap, dict)],
+        }
+        output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        trace.update(
+            {
+                "activated": True,
+                "inputArtifact": str(input_path),
+                "outputArtifact": str(output_path),
+                "inputRows": len(payload.get("dataRows") or []),
+                "outputRows": output["rowCount"],
+                "deterministicRenderer": True,
+            }
+        )
         return answer
 
     def append_business_advice(self, answer: str, intents: List[QuestionIntent], bundle: QueryBundle) -> str:
@@ -774,6 +898,74 @@ def analysis_summary_required(plan: QueryPlan) -> bool:
     return requires_explanation or (analysis_intent and analysis_intent != "none")
 
 
+def answer_skill_required(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> bool:
+    return bool(select_answer_skill(plan, run_result, has_rule_context))
+
+
+def select_answer_skill(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> str:
+    understanding = plan.question_understanding or {}
+    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
+    requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
+    categories = {intent.category for intent in plan.intents}
+    if plan_requires_rule_evidence(plan) and has_rule_context:
+        return "rule_compliance"
+    if plan_has_ratio_calculation(plan):
+        return "ratio_analysis"
+    if plan_has_new_product_risk_shape(plan):
+        return "new_product_risk"
+    if analysis_intent in {"trend_check", "anomaly_check", "diagnosis", "comparison", "overview"} and requires_explanation:
+        return "bi_trend_attribution"
+    risk_domains = {QuestionCategory.REFUND, QuestionCategory.COMPENSATION, QuestionCategory.CS_TICKET, QuestionCategory.GOODS, QuestionCategory.SCM}
+    if analysis_intent in {"risk_ranking", "diagnosis", "anomaly_check"} and categories & risk_domains:
+        return "risk_analysis"
+    if run_result and run_result.evidence_gaps and analysis_intent not in {"none", ""}:
+        return "risk_analysis"
+    return ""
+
+
+def plan_has_ratio_calculation(plan: QueryPlan) -> bool:
+    understanding = plan.question_understanding or {}
+    for item in understanding.get("calculationIntents") or understanding.get("calculation_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation") or "").lower()
+        if operation in {"ratio", "percentage", "share", "rate"}:
+            return True
+    for intent in plan.intents:
+        resolution = intent.metric_resolution or {}
+        if resolution.get("computeStrategy") == "scope_event_ratio":
+            return True
+        formula = str(resolution.get("formula") or intent.metric_formula or "")
+        if "/" in formula and intent.answer_mode == AnswerMode.DERIVED:
+            return True
+    return False
+
+
+def plan_has_new_product_risk_shape(plan: QueryPlan) -> bool:
+    understanding = plan.question_understanding or {}
+    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "").lower()
+    requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
+    if analysis_intent not in {"risk_ranking", "diagnosis", "anomaly_check"} and not requires_explanation:
+        return False
+    categories = {intent.category for intent in plan.intents}
+    if QuestionCategory.GOODS not in categories:
+        return False
+    lifecycle_terms = {"publish", "published", "online", "spu_apply_create_time", "goods_online", "商品发布时间", "发布时间", "上架"}
+    for intent in plan.intents:
+        payload = json.dumps(
+            {
+                "metric": intent.metric_name,
+                "columns": intent.output_keys + intent.required_evidence,
+                "resolution": intent.metric_resolution,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        if any(term in payload for term in lifecycle_terms):
+            return True
+    return False
+
+
 def plan_requires_rule_evidence(plan: QueryPlan) -> bool:
     if any(intent.answer_mode == AnswerMode.RULE for intent in plan.intents):
         return True
@@ -1001,6 +1193,154 @@ def dedupe_dicts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def render_structured_skill_answer(skill_name: str, payload: Dict[str, Any]) -> str:
+    rows = payload.get("dataRows") or []
+    disclosures = payload.get("metricDisclosures") or []
+    gaps = payload.get("evidenceGaps") or []
+    rule_evidence = payload.get("ruleEvidence") or []
+    question = str(payload.get("question") or "")
+    title = {
+        "risk_analysis": "风险分析",
+        "rule_compliance": "规则合规分析",
+        "ratio_analysis": "占比分析",
+        "new_product_risk": "新品风险分析",
+    }.get(skill_name, "分析结果")
+    lines = ["%s：" % title]
+    if skill_name == "ratio_analysis":
+        lines.extend(ratio_skill_lines(disclosures, rows))
+    elif skill_name == "rule_compliance":
+        lines.extend(rule_compliance_skill_lines(rule_evidence, rows))
+    elif skill_name == "new_product_risk":
+        lines.extend(new_product_risk_skill_lines(rows, disclosures))
+    else:
+        lines.extend(risk_skill_lines(rows, disclosures, question))
+    if gaps:
+        lines.append("")
+        lines.append("证据缺口：")
+        for gap in gaps[:5]:
+            if not isinstance(gap, dict):
+                continue
+            lines.append("- %s：%s" % (gap.get("code") or "EVIDENCE_GAP", gap.get("reason") or gap.get("answerInstruction") or "证据未完全覆盖"))
+    lines.append("")
+    lines.append("说明：以上结论只基于已验证查询结果和语义层指标口径。")
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def ratio_skill_lines(disclosures: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> List[str]:
+    derived = [
+        item
+        for item in disclosures
+        if isinstance(item, dict) and ("/" in str(item.get("formula") or "") or "share" in str(item.get("metricKey") or ""))
+    ]
+    lines: List[str] = []
+    if derived:
+        item = derived[0]
+        lines.append("- 公式：%s = %s" % (item.get("metricKey") or item.get("displayName") or "派生占比", item.get("formula") or "分子 / 分母"))
+    else:
+        lines.append("- 公式：按语义层解析出的分子 / 分母计算，占比必须同时具备两侧证据。")
+    if rows:
+        lines.append("- 证据样例：%s" % compact_row_preview(rows[0]))
+    else:
+        lines.append("- 当前没有可用于展示的结果行。")
+    lines.append("- 判断：若分子、分母任一缺失，不把缺失值解释为 0。")
+    return lines
+
+
+def rule_compliance_skill_lines(rule_evidence: List[str], rows: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    if rule_evidence:
+        lines.append("- 规则依据：%s" % "；".join(rule_evidence[:3]))
+    else:
+        lines.append("- 规则依据：当前召回规则证据不足，不能形成强合规判断。")
+    if rows:
+        lines.append("- 数据证据：%s" % compact_row_preview(rows[0]))
+    else:
+        lines.append("- 数据证据：当前没有可用于对照规则的结果行。")
+    lines.append("- 判断：只在规则证据给出明确口径/条件时判断风险，不用高指标值直接推断违规。")
+    return lines
+
+
+def new_product_risk_skill_lines(rows: List[Dict[str, Any]], disclosures: List[Dict[str, Any]]) -> List[str]:
+    lines = ["- 识别口径：只有存在商品发布/上架/审核生命周期证据时，才标记为新品风险。"]
+    if rows:
+        for index, row in enumerate(rows[:5], 1):
+            lines.append("- 候选 %d：%s" % (index, compact_row_preview(row)))
+    else:
+        lines.append("- 当前没有可排序的商品结果行。")
+    if disclosures:
+        lines.append("- 指标口径：%s" % "; ".join(compact_disclosure(item) for item in disclosures[:4]))
+    lines.append("- 判断：优先关注同时具备新品生命周期证据和退款/赔付/工单压力的商品。")
+    return lines
+
+
+def risk_skill_lines(rows: List[Dict[str, Any]], disclosures: List[Dict[str, Any]], question: str) -> List[str]:
+    lines: List[str] = []
+    if rows:
+        lines.append("- 优先项：")
+        for index, row in enumerate(rows[:5], 1):
+            lines.append("  %d. %s" % (index, compact_row_preview(row)))
+    else:
+        lines.append("- 当前没有可排序的风险结果行。")
+    if disclosures:
+        lines.append("- 使用指标：%s" % "; ".join(compact_disclosure(item) for item in disclosures[:5]))
+    lines.append("- 判断：把金额、单量、比例、工单/赔付证据共同出现的对象作为高优先级，缺证据时只给风险提示。")
+    return lines
+
+
+def compact_disclosure(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    name = item.get("displayName") or item.get("metricKey") or item.get("metric") or "指标"
+    formula = item.get("formula") or ""
+    return ("%s=%s" % (name, formula))[:120] if formula else str(name)[:80]
+
+
+def compact_row_preview(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return str(row)[:180]
+    parts: List[str] = []
+    for key, value in list(row.items())[:8]:
+        parts.append("%s=%s" % (key, format_cell(value)))
+    return "，".join(parts)[:220]
+
+
+def answer_skill_headers(root: Path) -> List[Dict[str, Any]]:
+    if not root.exists():
+        return []
+    headers: List[Dict[str, Any]] = []
+    for skill_file in sorted(root.glob("*/SKILL.md")):
+        meta = load_skill_frontmatter(skill_file)
+        name = str(meta.get("name") or skill_file.parent.name)
+        if not name:
+            continue
+        headers.append(
+            {
+                "name": name,
+                "description": str(meta.get("description") or "")[:500],
+                "path": str(skill_file.relative_to(root.parent.parent) if root.parent.parent in skill_file.parents else skill_file),
+            }
+        )
+    return headers
+
+
+def parse_skill_match_payload(raw: str) -> Dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
 
 
 def load_skill_frontmatter(path: Path) -> Dict[str, Any]:

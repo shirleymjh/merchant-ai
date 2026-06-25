@@ -6,6 +6,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["coupon_id", "discount_rel_id"]],
     "grain": "coupon_sub_order_id",
+    "pathSemantics": ["coupon_entity", "order_entity", "entity_filter"],
     "useCases": ["优惠券覆盖订单表现", "券活动关联下单商品"],
     "cautions": ["订单表 discount_rel_id 表示优惠方式关联 id，优惠券场景下关联 coupon_id"]
   },
@@ -16,6 +17,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["coupon_id", "discount_id"]],
     "grain": "coupon_refund_id",
+    "pathSemantics": ["coupon_entity", "refund_entity", "entity_filter"],
     "useCases": ["优惠券覆盖订单回看退款表现", "券投入关联退款金额"],
     "cautions": ["退款表 discount_id 为优惠券编号"]
   }

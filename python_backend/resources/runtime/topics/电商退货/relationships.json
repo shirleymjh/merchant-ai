@@ -6,6 +6,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
     "grain": "sub_order_id_refund_id",
+    "pathSemantics": ["order_entity", "refund_entity", "entity_filter"],
     "useCases": ["退款明细关联订单明细", "退款原因回看订单状态"],
     "cautions": ["一笔子订单可能有多笔退款，订单金额汇总前先按子订单去重"]
   },
@@ -16,6 +17,7 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["spu_name", "spu_name"]],
     "grain": "spu_refund_id",
+    "pathSemantics": ["product_entity", "refund_entity", "entity_filter"],
     "useCases": ["退款商品回看商品发布和审核信息", "商品明细关联退款表现"],
     "cautions": ["优先使用 spu_id 关系；退款明细当前只发布 spu_name 时，用 seller_id + spu_name 降级关联"]
   }

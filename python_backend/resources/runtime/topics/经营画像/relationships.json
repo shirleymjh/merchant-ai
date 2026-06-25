@@ -6,6 +6,7 @@
     "joinType": "LEFT",
     "keys": [["merchant_id", "seller_id"]],
     "grain": "merchant_day_sub_order",
+    "pathSemantics": ["tenant_context"],
     "useCases": ["经营画像关联订单明细", "merchant_id 通过画像 merchant_id 约束订单 seller_id"],
     "cautions": ["ads_merchant_profile 是商家-日期画像表；跨明细表补证据时用 merchant_id 映射 seller_id，不用画像指标替代明细口径"]
   },
@@ -16,6 +17,7 @@
     "joinType": "LEFT",
     "keys": [["merchant_id", "seller_id"]],
     "grain": "merchant_day_refund",
+    "pathSemantics": ["tenant_context"],
     "useCases": ["经营画像关联退款明细", "merchant_id 通过画像 merchant_id 约束退款 seller_id"],
     "cautions": ["退款金额明细口径必须由退款表字段或指标资产明确给出，不能仅因存在 pay_amt 就自动等同 refund_amount"]
   },
@@ -26,6 +28,7 @@
     "joinType": "LEFT",
     "keys": [["merchant_id", "seller_id"]],
     "grain": "merchant_day_ticket",
+    "pathSemantics": ["tenant_context"],
     "useCases": ["经营画像关联客服工单明细", "merchant_id 通过画像 merchant_id 约束工单 seller_id"],
     "cautions": ["工单与订单关联仍应优先使用 order_ticket_by_sub_order 的订单键，不用 seller_id 单独证明订单级覆盖"]
   },
@@ -36,6 +39,7 @@
     "joinType": "LEFT",
     "keys": [["merchant_id", "seller_id"]],
     "grain": "merchant_day_repay",
+    "pathSemantics": ["tenant_context"],
     "useCases": ["经营画像关联赔付明细", "merchant_id 通过画像 merchant_id 约束赔付 seller_id"],
     "cautions": ["赔付订单补证据仍应使用 order_repay_by_sub_order 或 ticket_repay_by_ticket，不用 seller_id 单独证明订单级覆盖"]
   }

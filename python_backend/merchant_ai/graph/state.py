@@ -62,6 +62,7 @@ class AgentState(TypedDict, total=False):
     response_context: Optional[ChatContext]
     thread_id: str
     run_id: str
+    checkpoint_thread_id: str
     thread_data: ThreadData
     event_listener: Optional[GraphEventListener]
 

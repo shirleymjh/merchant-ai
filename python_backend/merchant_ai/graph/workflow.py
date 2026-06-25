@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from merchant_ai.config import Settings, get_settings
@@ -58,8 +57,9 @@ from merchant_ai.models import (
     ThreadData,
     TopicRoutingDecision,
 )
-from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, build_response_context, joined_categories
+from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_skill_required, build_response_context, joined_categories
 from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService, WikiMemoryService
+from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.llm import LlmClient
@@ -115,6 +115,7 @@ class MerchantQaWorkflow:
         self.policy = V2AgentPolicy(settings)
         self.prompt_assembler = PromptAssembler()
         self.context_manager = ContextManager(settings)
+        self.checkpoint_manager = CheckpointManager(settings)
         self.graph = self._build_graph()
 
     def run(
@@ -128,7 +129,7 @@ class MerchantQaWorkflow:
     ) -> ChatResponse:
         effective_merchant_id = merchant_id or self.settings.merchant_id
         state = self._initial_state(question, effective_merchant_id, context, listener, thread_id, run_id)
-        config = {"configurable": {"thread_id": state["thread_id"]}, "recursion_limit": 80}
+        config = self.checkpoint_manager.config_for_run(state["thread_id"], state["run_id"])
         register_event_listener(state["run_id"], listener)
         try:
             final_state = self.graph.invoke(state, config=config)
@@ -147,7 +148,7 @@ class MerchantQaWorkflow:
     ) -> ChatResponse:
         effective_merchant_id = merchant_id or self.settings.merchant_id
         state = self._initial_state(question, effective_merchant_id, context, listener, thread_id, run_id)
-        config = {"configurable": {"thread_id": state["thread_id"]}, "recursion_limit": 80}
+        config = self.checkpoint_manager.config_for_run(state["thread_id"], state["run_id"])
         register_event_listener(state["run_id"], listener)
         try:
             final_state = await asyncio.to_thread(self.graph.invoke, state, config)
@@ -178,6 +179,7 @@ class MerchantQaWorkflow:
             response_context=None,
             thread_id=actual_thread_id,
             run_id=actual_run_id,
+            checkpoint_thread_id=self.checkpoint_manager.thread_id_for_run(actual_thread_id, actual_run_id),
             thread_data=ThreadData(
                 thread_id=actual_thread_id,
                 run_id=actual_run_id,
@@ -337,7 +339,7 @@ class MerchantQaWorkflow:
         builder.add_edge("answer_analysis", "cache_answer")
         builder.add_edge("human_in_loop", END)
         builder.add_edge("cache_answer", END)
-        return builder.compile(checkpointer=MemorySaver())
+        return builder.compile(checkpointer=self.checkpoint_manager.saver())
 
     def inherit_context(self, state: AgentState) -> AgentState:
         started = now_ms()
@@ -1613,7 +1615,11 @@ class MerchantQaWorkflow:
             self.request_human_clarification(state, self.build_scope_clarification_prompt(state), "BUSINESS_SCOPE", "business_scope", business_scope_options())
             return self.human_in_loop(state)
         else:
-            answer_needs_llm = analysis_summary_required(state["plan"])
+            answer_needs_llm = analysis_summary_required(state["plan"]) or answer_skill_required(
+                state["plan"],
+                state["agent_run_result"],
+                bool(state.get("rule_recall_context", "")),
+            )
             analysis_summary_attempted = False
             if answer_needs_llm and not state.get("analysis_summary"):
                 analysis_summary_attempted = True
@@ -1741,6 +1747,7 @@ class MerchantQaWorkflow:
                 "actionTimeline": [item.model_dump(by_alias=True) for item in state.get("run_steps", [])],
                 "spanTimeline": [item.model_dump(by_alias=True) for item in state.get("trace_spans", [])],
                 "performance": performance_summary(state),
+                "checkpoint": self.checkpoint_debug(state),
                 "artifactManifest": self.artifact_manifest(state),
                 "actionHistory": [item.model_dump(by_alias=True) for item in state.get("action_history", [])],
                 "leadDecisions": [item.model_dump(by_alias=True) for item in state.get("lead_decisions", [])],
@@ -1849,6 +1856,7 @@ class MerchantQaWorkflow:
                     "leadDecisions": [item.model_dump(by_alias=True) for item in state.get("lead_decisions", [])],
                     "decisionReason": state.get("agent_decision_reason", ""),
                     "performance": performance_summary(state),
+                    "checkpoint": self.checkpoint_debug(state),
                     "traceReplay": self.trace_replay_debug(state),
                     "llmLastError": self.planner.llm.last_error or self.node_worker.llm.last_error,
                     "llmErrors": (self.planner.llm.error_events or [])[-12:],
@@ -1978,6 +1986,27 @@ class MerchantQaWorkflow:
             "actionTimelineCount": len(state.get("run_steps", [])),
             "spanTimelineCount": len(state.get("trace_spans", [])),
             "artifactCount": len(self.artifact_manifest(state)),
+        }
+
+    def checkpoint_debug(self, state: AgentState) -> Dict[str, Any]:
+        ref = self.checkpoint_manager.run_ref(state.get("thread_id", ""), state.get("run_id", ""))
+        ref["checkpointThreadId"] = state.get("checkpoint_thread_id") or ref.get("checkpointThreadId", "")
+        return ref
+
+    def checkpoint_state_summary(self, thread_id: str, run_id: str) -> Dict[str, Any]:
+        config = self.checkpoint_manager.config_for_run(thread_id, run_id)
+        snapshot = self.graph.get_state(config)
+        values = snapshot.values if hasattr(snapshot, "values") else {}
+        metadata = snapshot.metadata if hasattr(snapshot, "metadata") else {}
+        tasks = snapshot.tasks if hasattr(snapshot, "tasks") else ()
+        next_nodes = snapshot.next if hasattr(snapshot, "next") else ()
+        return {
+            "checkpointRef": self.checkpoint_manager.run_ref(thread_id, run_id),
+            "metadata": metadata or {},
+            "next": list(next_nodes or []),
+            "taskCount": len(tasks or []),
+            "valueKeys": sorted(list((values or {}).keys()))[:80] if isinstance(values, dict) else [],
+            "hasValues": bool(values),
         }
 
     def open_diagnostic_debug(self, state: AgentState) -> Dict[str, Any]:

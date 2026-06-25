@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, Path as ApiPath, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from merchant_ai.config import get_settings
 from merchant_ai.graph.workflow import create_workflow
@@ -24,13 +24,19 @@ from merchant_ai.services.answer import DailyReportService, FeedbackService
 from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicBuilderWorkflow
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
-from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService
+from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, run_duration_ms, run_summary_payload
 
 settings = get_settings()
 workflow = create_workflow(settings)
 
 run_manager = AgentRunManager(settings)
 stream_service = AgentRunStreamService(run_manager, workflow.run, settings.merchant_id)
+async_run_service = AgentAsyncRunService(
+    run_manager,
+    workflow.run,
+    settings.merchant_id,
+    max_workers=settings.max_concurrent_sub_agents,
+)
 topic_assets = workflow.recall_service.topic_assets
 doris_repository = workflow.node_worker.doris_repository
 daily_report_service = DailyReportService(doris_repository)
@@ -84,6 +90,50 @@ def stream_chat(request: RunCreateRequest):
     return StreamingResponse(stream_service.stream(request), media_type="text/event-stream")
 
 
+@app.post("/api/runs/async")
+def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
+    run = async_run_service.submit(request)
+    return {
+        "success": True,
+        "mode": "async",
+        "threadId": run.thread_id,
+        "runId": run.run_id,
+        "run": jsonable_encoder(run_summary_payload(run, run_duration_ms(run)), by_alias=True),
+        "links": {
+            "run": "/api/threads/%s/runs/%s" % (run.thread_id, run.run_id),
+            "events": "/api/threads/%s/runs/%s/events" % (run.thread_id, run.run_id),
+            "trace": "/api/threads/%s/runs/%s/trace" % (run.thread_id, run.run_id),
+            "checkpoint": "/api/threads/%s/runs/%s/checkpoint" % (run.thread_id, run.run_id),
+        },
+    }
+
+
+@app.get("/api/runs")
+def list_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    status: Optional[str] = Query(default=None),
+    merchant_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    runs = run_manager.list_runs(limit=limit, status=status or "", merchant_id=merchant_id or "")
+    summaries = [run_summary_payload(run, run_duration_ms(run)) for run in runs]
+    return {"success": True, "runs": jsonable_encoder(summaries, by_alias=True)}
+
+
+@app.get("/api/runs/dashboard")
+def runs_dashboard(
+    limit: int = Query(default=50, ge=1, le=200),
+    status: Optional[str] = Query(default=None),
+    merchant_id: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    dashboard = run_manager.dashboard(limit=limit, status=status or "", merchant_id=merchant_id or "")
+    return {"success": True, "dashboard": jsonable_encoder(dashboard, by_alias=True)}
+
+
+@app.get("/ops/runs", response_class=HTMLResponse)
+def ops_runs_dashboard() -> HTMLResponse:
+    return HTMLResponse(RUNS_DASHBOARD_HTML)
+
+
 @app.post("/api/threads")
 def create_thread(request: Optional[RunCreateRequest] = None) -> Dict[str, Any]:
     safe = request or RunCreateRequest()
@@ -132,12 +182,24 @@ def get_run_trace(thread_id: str, run_id: str) -> Dict[str, Any]:
     return {"success": True, "runId": run_id, "threadId": thread_id, "trace": trace}
 
 
+@app.get("/api/threads/{thread_id}/runs/{run_id}/checkpoint")
+def get_run_checkpoint(thread_id: str, run_id: str) -> Dict[str, Any]:
+    run = run_manager.get_run(run_id)
+    if not run or run.thread_id != thread_id:
+        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+    try:
+        checkpoint = workflow.checkpoint_state_summary(thread_id, run_id)
+    except Exception as exc:
+        checkpoint = {"checkpointRef": run.checkpoint_ref, "error": str(exc)[:500], "hasValues": False}
+    return {"success": True, "runId": run_id, "threadId": thread_id, "checkpoint": jsonable_encoder(checkpoint, by_alias=True)}
+
+
 @app.post("/api/threads/{thread_id}/runs/{run_id}/cancel")
 def cancel_run(thread_id: str, run_id: str) -> Dict[str, Any]:
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread_id:
         return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
-    return {"success": True, "run": jsonable_encoder(run_manager.cancel_run(run_id), by_alias=True)}
+    return {"success": True, "run": jsonable_encoder(async_run_service.cancel(run_id), by_alias=True)}
 
 
 @app.post("/api/answers/{answer_id}/feedback")
@@ -304,3 +366,102 @@ def load_knowledge_suggestions() -> Any:
 
 def save_knowledge_suggestions(items: Any) -> None:
     write_json(knowledge_suggestions_path(), {"items": items})
+
+
+RUNS_DASHBOARD_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Merchant AI Runs</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f6f7f9; }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 24px; }
+    button { border: 1px solid #cfd6e4; background: white; border-radius: 6px; padding: 8px 12px; cursor: pointer; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card { background: white; border: 1px solid #e2e7f0; border-radius: 8px; padding: 14px; }
+    .label { color: #667085; font-size: 12px; }
+    .value { margin-top: 6px; font-size: 22px; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #e2e7f0; border-radius: 8px; overflow: hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #edf1f7; text-align: left; vertical-align: top; font-size: 13px; }
+    th { color: #667085; background: #fbfcfe; font-weight: 600; }
+    tr:last-child td { border-bottom: 0; }
+    a { color: #245dc1; text-decoration: none; }
+    .status { display: inline-block; min-width: 78px; font-weight: 700; }
+    .error { color: #b42318; }
+    .muted { color: #667085; }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } main { padding: 14px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Merchant AI Runs</h1>
+        <div class="muted">Run lifecycle, latency, errors, trace replay</div>
+      </div>
+      <button onclick="loadDashboard()">Refresh</button>
+    </header>
+    <section class="grid" id="cards"></section>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Status</th>
+          <th>Duration</th>
+          <th>Question</th>
+          <th>Links</th>
+        </tr>
+      </thead>
+      <tbody id="runs"></tbody>
+    </table>
+  </main>
+  <script>
+    function fmtMs(value) {
+      if (value === null || value === undefined) return "-";
+      if (value >= 1000) return (value / 1000).toFixed(2) + "s";
+      return Math.round(value) + "ms";
+    }
+    function esc(value) {
+      return String(value || "").replace(/[&<>"']/g, function(ch) {
+        return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}[ch];
+      });
+    }
+    async function loadDashboard() {
+      const res = await fetch("/api/runs/dashboard?limit=100");
+      const payload = await res.json();
+      const data = payload.dashboard || {};
+      const counts = data.statusCounts || {};
+      document.getElementById("cards").innerHTML = [
+        ["Total", data.totalRuns || 0],
+        ["Queued", counts.QUEUED || 0],
+        ["Running", counts.RUNNING || 0],
+        ["Completed", counts.COMPLETED || 0],
+        ["Failed", counts.FAILED || 0],
+        ["Avg Duration", fmtMs(data.avgDurationMs || 0)]
+      ].map(([label, value]) => `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
+      document.getElementById("runs").innerHTML = (data.runs || []).map(function(run) {
+        const detail = `/api/threads/${encodeURIComponent(run.threadId)}/runs/${encodeURIComponent(run.runId)}`;
+        const events = `${detail}/events`;
+        const trace = `${detail}/trace`;
+        const checkpoint = `${detail}/checkpoint`;
+        const statusClass = run.status === "FAILED" ? "status error" : "status";
+        return `<tr>
+          <td>${esc(run.startTime)}</td>
+          <td><span class="${statusClass}">${esc(run.status)}</span><div class="error">${esc(run.error)}</div></td>
+          <td>${fmtMs(run.durationMs)}</td>
+          <td>${esc(run.question)}<div class="muted">${esc(run.answerPreview)}</div></td>
+          <td><a href="${detail}">run</a> · <a href="${events}">events</a> · <a href="${trace}">trace</a> · <a href="${checkpoint}">checkpoint</a></td>
+        </tr>`;
+      }).join("");
+    }
+    loadDashboard().catch(function(err) {
+      document.getElementById("runs").innerHTML = `<tr><td colspan="5" class="error">${esc(err.message)}</td></tr>`;
+    });
+  </script>
+</body>
+</html>
+"""

@@ -118,6 +118,7 @@ class ResultScope(str, Enum):
 
 class AgentRunStatus(str, Enum):
     CREATED = "CREATED"
+    QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -782,6 +783,10 @@ class RelationshipEntry(APIModel):
     left_table: str = ""
     right_table: str = ""
     join_keys: List[Dict[str, str]] = Field(default_factory=list)
+    grain: str = ""
+    path_semantics: List[str] = Field(default_factory=list)
+    use_cases: List[str] = Field(default_factory=list)
+    cautions: List[str] = Field(default_factory=list)
     source_ref_id: str = ""
     description: str = ""
 
@@ -1106,5 +1111,8 @@ class AgentRunRecord(APIModel):
     final_answer_hash: str = ""
     performance_summary: Dict[str, Any] = Field(default_factory=dict)
     trace_path: str = ""
+    checkpoint_ref: Dict[str, Any] = Field(default_factory=dict)
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    resumable: bool = False
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)

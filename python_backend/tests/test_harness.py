@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -65,9 +66,11 @@ from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.answer import (
     AnswerComposeService,
     analysis_summary_required,
+    answer_skill_required,
     answer_data_package,
     compact_rule_evidence,
     plan_requires_rule_evidence,
+    select_answer_skill,
     business_summary_table,
     task_evidence_sections,
 )
@@ -75,7 +78,7 @@ from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
 from merchant_ai.services.llm import LlmClient
-from merchant_ai.services.runs import AgentRunManager, AgentRunStreamService, answer_chunks
+from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, answer_chunks, run_duration_ms
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService
 from merchant_ai.services.recall_index import RecallIndexManager
@@ -474,12 +477,14 @@ def test_relationship_graph_scores_entity_path_above_merchant_hub():
                 left_table="dwm_cs_repay_detail_df",
                 right_table="ads_merchant_profile",
                 join_keys=[{"leftColumn": "seller_id", "rightColumn": "seller_id"}],
+                path_semantics=["tenant_context"],
             ),
             RelationshipEntry(
                 relationship_id="profile_deposit_by_seller",
                 left_table="ads_merchant_profile",
                 right_table="dwd_merchant_deposit_recharge_df",
                 join_keys=[{"leftColumn": "seller_id", "rightColumn": "seller_id"}],
+                path_semantics=["tenant_context"],
             ),
             RelationshipEntry(
                 relationship_id="repay_order_by_sub_order",
@@ -489,6 +494,8 @@ def test_relationship_graph_scores_entity_path_above_merchant_hub():
                     {"leftColumn": "seller_id", "rightColumn": "seller_id"},
                     {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
                 ],
+                grain="sub_order_id_bill_id",
+                path_semantics=["order_entity", "compensation_entity", "entity_filter"],
             ),
         ],
     )
@@ -500,6 +507,20 @@ def test_relationship_graph_scores_entity_path_above_merchant_hub():
     )
 
     assert [edge.relationship_id for edge in path] == ["repay_order_by_sub_order"]
+
+
+def test_relationship_entry_loads_grain_and_path_semantics_from_assets():
+    settings = get_settings()
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        "最近30天有客服工单的订单里，哪些后来发生了退款或赔付？",
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.CS_TICKET, QuestionCategory.COMPENSATION],
+    )
+
+    rel = next(item for item in pack.relationships if item.relationship_id == "order_ticket_by_sub_order")
+
+    assert rel.grain == "sub_order_id_ticket_id"
+    assert {"order_entity", "ticket_entity", "entity_filter"} <= set(rel.path_semantics)
 
 
 def test_metric_resolver_treats_owner_table_as_scope_not_bonus():
@@ -1422,6 +1443,49 @@ def test_successful_planner_fast_path_does_not_call_recovery_llm():
     assert plan.planner_prompt_stats["schemaMode"] == "compact_tool_schema"
 
 
+def test_planner_auto_compacts_catalog_before_context_over_budget():
+    base_settings = get_settings()
+    question = "最近 7 天下单最多的前 5 个 SPU，同时看它们的退款量和退款金额。"
+    builder = PlanningAssetPackBuilder(TopicAssetService(base_settings), SkillLoader(base_settings))
+    pack = builder.compact(
+        question,
+        recall_bundle_empty(),
+        [
+            QuestionCategory.TRADE,
+            QuestionCategory.REFUND,
+            QuestionCategory.GOODS,
+        ],
+    )
+    planner = QueryGraphPlanner(FakeCaseUnderstandingLlm(), settings=base_settings.model_copy(update={"agent_planner_prompt_budget_chars": 100000}))
+    prompt = planner.prompt_assembler.render("planner.question_understanding", sections={"context_policy": "Planner fast path"})
+    tool_schema = compact_openai_tool_schema(question_understanding_tool(False).openai_schema())
+    level0_payload = planner._understanding_payload(question, pack, [], [], False, False, None, budget_level=0)
+    level2_payload = planner._understanding_payload(question, pack, [], [], False, True, None, budget_level=2)
+    level0_total = planner_prompt_stats(prompt.system_prompt, json.dumps(level0_payload, ensure_ascii=False), tool_schema)["totalChars"]
+    level2_total = planner_prompt_stats(prompt.system_prompt, json.dumps(level2_payload, ensure_ascii=False), tool_schema)["totalChars"]
+    assert level0_total > level2_total
+
+    budget = min(level0_total - 100, level2_total + 1200)
+    assert level2_total < budget < level0_total
+    settings = base_settings.model_copy(update={"agent_planner_prompt_budget_chars": budget})
+    plan, requests, reason = QueryGraphPlanner(FakeCaseUnderstandingLlm(), settings=settings).plan(
+        question,
+        [],
+        "",
+        recall_bundle_empty(),
+        pack,
+        [],
+        [],
+    )
+
+    assert plan.intents
+    assert not requests
+    assert reason != "PLANNER_CONTEXT_OVER_BUDGET"
+    assert plan.planner_prompt_stats["budgetLevel"] >= 1
+    assert plan.planner_prompt_stats["totalChars"] <= budget
+    assert plan.planner_prompt_stats["budgetTrace"][0]["totalChars"] > budget
+
+
 def test_planner_reflection_uses_resolved_metric_for_anchor_check():
     question = "最近30天GMV最高的前5天。"
     plan = QueryPlan(
@@ -1809,6 +1873,173 @@ def test_answer_compose_merges_rule_evidence_with_bi_data():
     assert "规则依据" in answer
     assert "发货时效" in answer
     assert compact_rule_evidence("发货超时要注意什么", rule_context)
+
+
+def test_answer_skill_selects_ratio_analysis_for_scope_event_ratio(tmp_path):
+    settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "comparison",
+            "requiresExplanation": True,
+            "calculationIntents": [
+                {
+                    "operation": "ratio",
+                    "basePopulationPhrase": "使用优惠券的订单",
+                    "eventPopulationPhrase": "有退货的订单",
+                    "denominatorMetricRef": "order_detail_cnt",
+                    "numeratorMetricRef": "refund_bill_cnt",
+                }
+            ],
+        },
+        intents=[
+            QuestionIntent(
+                question="最近10天使用优惠券的订单中，有退货的订单占多少？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                plan_task_id="derived_refund_share",
+                metric_name="refund_bill_cnt_share_of_order_detail_cnt",
+                metric_formula="refund_bill_cnt / order_detail_cnt",
+                metric_resolution={"computeStrategy": "scope_event_ratio", "formula": "refund_bill_cnt / order_detail_cnt"},
+            )
+        ],
+    )
+    bundle = QueryBundle(
+        rows=[{"order_detail_cnt": 10, "refund_bill_cnt": 2, "refund_bill_cnt_share_of_order_detail_cnt": 0.2}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="derived_refund_share", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+
+    assert select_answer_skill(plan, run, False) == "ratio_analysis"
+    answer = service.summarize_analysis("最近10天使用优惠券的订单中，有退货的订单占多少？", plan, run, str(tmp_path))
+
+    assert "占比分析" in answer
+    assert "refund_bill_cnt / order_detail_cnt" in answer
+    assert service.last_analysis_skill_trace["skillName"] == "ratio_analysis"
+    assert service.last_analysis_skill_trace["deterministicRenderer"] is True
+
+
+def test_answer_skill_match_can_use_llm_header_selection(tmp_path):
+    class HeaderMatchLlm:
+        configured = True
+        settings = get_settings().model_copy(
+            update={
+                "harness_workspace_path": str(tmp_path),
+                "answer_skill_match_mode": "always",
+            }
+        )
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            assert "Answer Skill matcher" in system_prompt
+            assert "ratio_analysis" in user_prompt
+            return '{"skillName":"ratio_analysis","confidence":0.91,"reason":"ratio calculation"}'
+
+    service = AnswerComposeService(HeaderMatchLlm())
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "comparison",
+            "requiresExplanation": True,
+            "calculationIntents": [{"operation": "ratio", "numeratorMetricRef": "refund_bill_cnt", "denominatorMetricRef": "order_detail_cnt"}],
+        },
+        intents=[
+            QuestionIntent(
+                question="占比",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                metric_resolution={"computeStrategy": "scope_event_ratio", "formula": "refund_bill_cnt / order_detail_cnt"},
+            )
+        ],
+    )
+    bundle = QueryBundle(rows=[{"order_detail_cnt": 10, "refund_bill_cnt": 2}], original_row_count=1)
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="ratio", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+
+    answer = service.summarize_analysis("占比", plan, run, str(tmp_path))
+
+    assert "占比分析" in answer
+    assert service.last_analysis_skill_trace["matchedBy"] == "llm_skill_header_match"
+    assert service.last_analysis_skill_trace["skillName"] == "ratio_analysis"
+
+
+def test_answer_skill_selects_rule_compliance_for_rule_plus_data(tmp_path):
+    settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "diagnosis",
+            "requiresExplanation": True,
+            "requiredEvidenceIntents": [{"semanticLabel": "platform_rule", "suggestedDomains": ["rule"]}],
+        },
+        intents=[
+            QuestionIntent(
+                question="平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                metric_name="ship_timeout_order_cnt_1d",
+            )
+        ],
+    )
+    bundle = QueryBundle(rows=[{"pt": "2026-06-20", "ship_timeout_order_cnt_1d": 3}], original_row_count=1)
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="ship_timeout", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+
+    assert answer_skill_required(plan, run, True)
+    answer = service.summarize_analysis("平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。", plan, run, str(tmp_path), "发货超时需关注发货时效。")
+
+    assert "规则合规分析" in answer
+    assert "规则依据" in answer
+    assert service.last_analysis_skill_trace["skillName"] == "rule_compliance"
+
+
+def test_answer_skill_selects_new_product_risk_from_structured_lifecycle_evidence(tmp_path):
+    settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={"analysisIntent": "risk_ranking", "requiresExplanation": True},
+        intents=[
+            QuestionIntent(
+                question="最近30天退款率最高的商品，判断高风险新品。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.GOODS,
+                preferred_table="dwm_goods_detail_df",
+                output_keys=["spu_id", "spu_apply_create_time"],
+                required_evidence=["spu_apply_create_time"],
+            ),
+            QuestionIntent(
+                question="最近30天退款率最高的商品，判断高风险新品。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.REFUND,
+                metric_name="refund_bill_cnt",
+            ),
+        ],
+    )
+    bundle = QueryBundle(rows=[{"spu_id": "spu_1", "spu_apply_create_time": "2026-06-01", "refund_bill_cnt": 5}], original_row_count=1)
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="risk", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+
+    assert select_answer_skill(plan, run, False) == "new_product_risk"
+    answer = service.summarize_analysis("最近30天退款率最高的商品，判断高风险新品。", plan, run, str(tmp_path))
+
+    assert "新品风险分析" in answer
+    assert "spu_apply_create_time" in answer
 
 
 def test_rule_only_evidence_intent_does_not_trigger_bi_analysis_summary():
@@ -2603,7 +2834,10 @@ def test_semantic_governance_preflight_rejects_missing_metric_column(tmp_path):
 
     assert not result["publishable"]
     assert result["status"] == "PREFLIGHT_FAILED"
+    assert result["releaseGate"]["severity"] == "blocking"
+    assert "SEMANTIC_VALIDATION_ERRORS" in result["releaseGate"]["blockingReasons"]
     assert result["validation"]["errors"][0]["code"] == "METRIC_SOURCE_COLUMN_MISSING"
+    assert "impactTestPlan" in result
     assert Path(result["reviewArtifact"]).exists()
 
 
@@ -2624,7 +2858,28 @@ def test_semantic_governance_publish_writes_version_and_drift_artifact(tmp_path)
     version = json.loads(version_path.read_text(encoding="utf-8"))
     assert version["semanticVersion"].startswith("semantic-")
     assert governed["schemaDriftReport"]["extraLiveColumns"] == []
+    assert governed["releaseGate"]["publishable"]
+    assert governed["driftGovernance"]["severity"] == "passed"
+    assert governed["impactTestPlan"]["impactedMetrics"] == ["pay_amt"]
     assert Path(governed["reviewArtifact"]).exists()
+    assert Path(governed["publishHistoryPath"]).exists()
+
+
+def test_semantic_governance_blocks_missing_live_columns(tmp_path):
+    settings = get_settings().model_copy(update={"topic_path": str(tmp_path / "topics"), "harness_workspace_path": str(tmp_path / "workspace")})
+    write_pending_governance_asset(settings.resolved_topic_path)
+
+    class MissingLiveColumnDoris:
+        def show_full_columns(self, table):
+            return [{"Field": "seller_id", "Type": "varchar"}]
+
+    service = SemanticAssetGovernanceService(settings, MissingLiveColumnDoris(), TopicAssetService(settings))
+
+    result = service.preflight_publish("电商退货", "dwm_trade_refund_detail_di")
+
+    assert not result["publishable"]
+    assert result["driftGovernance"]["severity"] == "blocking"
+    assert "MISSING_LIVE_COLUMNS" in result["releaseGate"]["blockingReasons"]
 
 
 def test_recall_index_manager_writes_manifest_and_clears_cache(tmp_path):
@@ -3014,6 +3269,104 @@ def test_scope_ratio_numerator_knowledge_request_keeps_event_context():
     assert "invalid numerator=order_detail_cnt" in request.query
     assert "denominator=order_detail_cnt" in request.query
     assert "event subset metric" in request.query
+
+
+def test_compiler_repairs_scope_source_domain_from_semantic_target_hint():
+    question = "最近10天使用优惠券的订单中，有退货的订单占多少"
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_coupon_detail_di", columns=["seller_id", "coupon_id", "pt"]),
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "order_id", "sub_order_id", "discount_rel_id", "pt"],
+            ),
+            PlanningAssetEntry(
+                table="dwm_trade_refund_detail_di",
+                columns=["seller_id", "order_id", "sub_order_id", "refund_id", "discount_id", "pt"],
+            ),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                metadata={"metricKey": "order_detail_cnt", "formula": "COUNT(DISTINCT sub_order_id)"},
+            ),
+            PlanningAssetEntry(
+                key="refund_bill_cnt",
+                table="dwm_trade_refund_detail_di",
+                columns=["refund_id"],
+                metadata={"metricKey": "refund_bill_cnt", "formula": "COUNT(DISTINCT refund_id)"},
+            ),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="coupon_order_by_coupon_id",
+                left_table="dwm_coupon_detail_di",
+                right_table="dwm_trade_order_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "coupon_id", "rightColumn": "discount_rel_id"},
+                ],
+            ),
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+                join_keys=[
+                    {"leftColumn": "seller_id", "rightColumn": "seller_id"},
+                    {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"},
+                ],
+            ),
+        ],
+    )
+    understanding = {
+        "analysisGrain": "order",
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "groupByColumn": "order_id",
+            "sourcePhrase": "使用优惠券的订单中有退货的订单占多少",
+        },
+        "requestedMeasures": [
+            {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单"},
+            {"metricRef": "refund_bill_cnt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "有退货的订单"},
+        ],
+        "scopeConstraints": [
+            {
+                "scopeId": "coupon_used_orders",
+                "sourcePhrase": "使用优惠券的订单",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "metricRef": "order_detail_cnt",
+                "entityGrain": "order",
+                "targetDomain": "coupon",
+                "required": True,
+            }
+        ],
+        "calculationIntents": [
+            {
+                "operation": "ratio",
+                "sourcePhrase": "使用优惠券的订单中有退货的订单占多少",
+                "basePopulationPhrase": "使用优惠券的订单",
+                "eventPopulationPhrase": "有退货的订单",
+                "denominatorMetricRef": "order_detail_cnt",
+                "numeratorMetricRef": "refund_bill_cnt",
+                "groupByColumn": "order_id",
+            }
+        ],
+    }
+
+    plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
+    validation = QueryGraphValidator().validate(question, plan, pack)
+
+    assert any("SCOPE_SOURCE_DOMAIN_REPAIRED" in item for item in plan.compiler_trace)
+    assert any(intent.preferred_table == "dwm_coupon_detail_di" for intent in plan.intents)
+    assert any(
+        dep.anchor_column == "seller_id+coupon_id"
+        and dep.dependent_column == "seller_id+discount_rel_id"
+        for dep in plan.dependencies
+    )
+    assert not any(gap.code.startswith("SCOPE_") for gap in validation.gaps)
 
 
 def test_semantic_metric_resolver_uses_event_population_phrase_for_ratio_numerator():
@@ -10363,9 +10716,58 @@ def test_file_run_event_store_persists_run_events_and_trace(tmp_path):
     assert loaded.status == "COMPLETED"
     assert loaded.performance_summary["totalDurationMs"] == 12
     assert loaded.final_answer_hash
+    assert loaded.resumable
+    assert loaded.checkpoint_ref["backend"] == "sqlite"
+    assert loaded.checkpoint_ref["checkpointThreadId"] == "%s:%s" % (thread.thread_id, run.run_id)
+    assert loaded.artifact_refs
     assert any(event.step_id == "step_1" and event.tool_call_id == "tool_1" for event in events)
     assert trace is not None
     assert trace["harness"]["traceReplay"]["version"] == "v2"
+
+
+def test_run_manager_lists_runs_and_builds_dashboard_from_store(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    manager = AgentRunManager(settings)
+    thread = manager.create_thread("100", "电商交易", ChatContext(topic="电商交易"))
+    completed = manager.create_run(thread.thread_id, "100", "最近7天订单量")
+    manager.complete_run(
+        completed.run_id,
+        ChatResponse(
+            id="qa_completed",
+            answer="订单量为 10。",
+            debug_trace={"harness": {"performance": {"totalDurationMs": 25}}},
+        ),
+    )
+    failed = manager.create_run(thread.thread_id, "100", "最近7天GMV")
+    manager.fail_run(failed.run_id, "PLANNER_LLM_TIMEOUT")
+
+    reloaded = AgentRunManager(settings)
+    runs = reloaded.list_runs(limit=10, merchant_id="100")
+    dashboard = reloaded.dashboard(limit=10, merchant_id="100")
+
+    assert {run.run_id for run in runs} == {completed.run_id, failed.run_id}
+    assert dashboard["totalRuns"] == 2
+    assert dashboard["statusCounts"]["COMPLETED"] == 1
+    assert dashboard["statusCounts"]["FAILED"] == 1
+    assert dashboard["runs"][0]["runId"]
+    assert dashboard["slowestRuns"][0]["durationMs"] >= 0
+    assert dashboard["recentErrors"][0]["error"] == "PLANNER_LLM_TIMEOUT"
+    assert run_duration_ms(next(run for run in runs if run.run_id == completed.run_id)) == 25
+
+
+def test_run_manager_marks_memory_checkpointer_as_not_resumable(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "agent_checkpointer_backend": "memory",
+        }
+    )
+    manager = AgentRunManager(settings)
+    thread = manager.create_thread("100")
+    run = manager.create_run(thread.thread_id, "100", "最近7天订单量")
+
+    assert not run.resumable
+    assert run.checkpoint_ref["backend"] == "memory"
 
 
 def test_stream_service_emits_answer_delta_events(tmp_path):
@@ -10387,6 +10789,77 @@ def test_stream_service_emits_answer_delta_events(tmp_path):
     stored_types = [event.event_type for event in manager.events(run_id)]
     assert "answer.delta" in stored_types
     assert "answer.completed" in stored_types
+
+
+def wait_for_run_status(manager: AgentRunManager, run_id: str, statuses: set[str], timeout_seconds: float = 2.0):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        run = manager.get_run(run_id)
+        if run and str(getattr(run.status, "value", run.status)) in statuses:
+            return run
+        time.sleep(0.02)
+    return manager.get_run(run_id)
+
+
+def wait_for_run_event(manager: AgentRunManager, run_id: str, event_type: str, timeout_seconds: float = 2.0) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if any(event.event_type == event_type for event in manager.events(run_id)):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_async_run_service_completes_in_background(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    manager = AgentRunManager(settings)
+
+    def run_chat(message, merchant_id, context, listener, thread_id, run_id):
+        listener("node.completed", "ANSWER", {"message": message})
+        return ChatResponse(id="qa_async", answer="done", debug_trace={"harness": {"performance": {"totalDurationMs": 7}}})
+
+    service = AgentAsyncRunService(manager, run_chat, "100", max_workers=1)
+    run = service.submit(RunCreateRequest(message="最近7天订单量", merchant_id="100"))
+
+    assert run.status == "QUEUED"
+    completed = wait_for_run_status(manager, run.run_id, {"COMPLETED"})
+    events = [event.event_type for event in manager.events(run.run_id)]
+
+    assert completed is not None
+    assert completed.status == "COMPLETED"
+    assert completed.answer and completed.answer.answer == "done"
+    assert "run.queued" in events
+    assert "run.worker.started" in events
+    assert "run.completed" in events
+
+
+def test_async_run_cancel_preserves_canceled_status_after_worker_finishes(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    manager = AgentRunManager(settings)
+    started = Event()
+    release = Event()
+
+    def run_chat(message, merchant_id, context, listener, thread_id, run_id):
+        started.set()
+        release.wait(timeout=1)
+        return ChatResponse(id="qa_async", answer="late answer", debug_trace={"harness": {"performance": {"totalDurationMs": 9}}})
+
+    service = AgentAsyncRunService(manager, run_chat, "100", max_workers=1)
+    run = service.submit(RunCreateRequest(message="慢查询", merchant_id="100"))
+    assert started.wait(timeout=1)
+
+    canceled = service.cancel(run.run_id)
+    release.set()
+    final = wait_for_run_status(manager, run.run_id, {"CANCELED"}, timeout_seconds=1.5)
+    assert wait_for_run_event(manager, run.run_id, "run.completion_ignored", timeout_seconds=1.5)
+    events = [event.event_type for event in manager.events(run.run_id)]
+
+    assert canceled is not None
+    assert final is not None
+    assert final.status == "CANCELED"
+    assert final.answer is None
+    assert "run.cancel.requested" in events
+    assert "run.completion_ignored" in events
 
 
 def test_analysis_skill_runner_generates_evidence_bound_summary(tmp_path):

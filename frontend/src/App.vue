@@ -66,7 +66,11 @@
         />
         <div v-if="loading" class="loading-card">
           <LoaderCircle :size="18" />
-          <span>正在分析问题并读取经营数据</span>
+          <span>{{ runStatusText }}</span>
+          <button type="button" class="stop-run-button" title="停止回答" :disabled="stopping" @click="stopCurrentRun">
+            <CircleStop :size="15" />
+            <span>{{ stopping ? '停止中' : '停止' }}</span>
+          </button>
         </div>
       </section>
 
@@ -79,8 +83,11 @@
         />
         <form class="input-bar" @submit.prevent="submit">
           <input v-model.trim="input" type="text" placeholder="说出您的疑惑吧，yshopping 帮你解决" />
-          <button type="submit" class="send-button" title="发送" :disabled="!input || loading">
+          <button v-if="!loading" type="submit" class="send-button" title="发送" :disabled="!input">
             <Send :size="20" />
+          </button>
+          <button v-else type="button" class="send-button stop-button" title="停止回答" :disabled="stopping" @click="stopCurrentRun">
+            <CircleStop :size="20" />
           </button>
         </form>
       </div>
@@ -98,15 +105,20 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue'
-import { LoaderCircle, Plus, Search, Send, Zap } from 'lucide-vue-next'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { CircleStop, LoaderCircle, Plus, Search, Send, Zap } from 'lucide-vue-next'
 import ChatMessage from './components/ChatMessage.vue'
 import DailyReportCard from './components/DailyReportCard.vue'
 import SuggestionList from './components/SuggestionList.vue'
-import { getDailyReport, mockChat, mockDailyReport, sendFeedback, sendMessage } from './api/client'
+import { cancelRun, getDailyReport, getRun, getRunEvents, mockChat, mockDailyReport, sendFeedback, startAsyncRun } from './api/client'
 
 const input = ref('')
 const loading = ref(false)
+const stopping = ref(false)
+const runStatusText = ref('正在分析问题并读取经营数据')
+const activeRun = ref(null)
+let submitController = null
+let pollTimer = null
 const chatList = ref(null)
 const dailyReport = ref(null)
 const sessionFilter = ref('')
@@ -185,6 +197,10 @@ onMounted(async () => {
   }
 })
 
+onBeforeUnmount(() => {
+  clearRunPoll()
+})
+
 async function submit() {
   if (!input.value || loading.value) return
   const message = input.value
@@ -198,21 +214,180 @@ async function sendSuggestion(question) {
 }
 
 async function ask(message) {
+  clearRunPoll()
+  clearSubmitController()
   messages.value.push({
     localId: `u_${Date.now()}`,
     role: 'user',
     text: message
   })
   loading.value = true
+  stopping.value = false
+  runStatusText.value = '正在提交任务'
   await scrollBottom()
+  submitController = new AbortController()
   try {
-    const response = await sendMessage(message, conversationContext.value)
-    appendAssistant(response)
+    const created = await startAsyncRun(message, conversationContext.value, { signal: submitController.signal })
+    submitController = null
+    const runId = created.runId
+    const threadId = created.threadId
+    if (!runId || !threadId) {
+      throw new Error('RUN_CREATE_FAILED')
+    }
+    activeRun.value = {
+      runId,
+      threadId,
+      token: `run_${Date.now()}_${Math.random().toString(16).slice(2)}`
+    }
+    runStatusText.value = '任务已提交，正在排队'
+    scheduleRunPoll(activeRun.value.token, 300)
+  } catch (error) {
+    const aborted = error?.name === 'AbortError'
+    clearRunPoll()
+    clearSubmitController()
+    loading.value = false
+    stopping.value = false
+    if (aborted) {
+      appendAssistant(systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
+    } else {
+      appendAssistant(mockChat(message))
+    }
+    await scrollBottom()
+  }
+}
+
+function scheduleRunPoll(token, delay = 900) {
+  clearRunPoll()
+  pollTimer = window.setTimeout(() => {
+    pollActiveRun(token)
+  }, delay)
+}
+
+async function pollActiveRun(token) {
+  const current = activeRun.value
+  if (!current || current.token !== token) return
+  try {
+    const [runPayload, eventsPayload] = await Promise.allSettled([
+      getRun(current.threadId, current.runId),
+      getRunEvents(current.threadId, current.runId)
+    ])
+    if (!activeRun.value || activeRun.value.token !== token) return
+    const run = runPayload.status === 'fulfilled' ? runPayload.value?.run : null
+    if (eventsPayload.status === 'fulfilled') {
+      runStatusText.value = latestRunStatusText(run, eventsPayload.value?.events || [])
+    } else {
+      runStatusText.value = latestRunStatusText(run, [])
+    }
+    const status = String(run?.status || '').toUpperCase()
+    if (status === 'COMPLETED') {
+      clearRunPoll()
+      loading.value = false
+      stopping.value = false
+      activeRun.value = null
+      if (run.answer) {
+        appendAssistant(run.answer)
+      } else {
+        appendAssistant(systemMessage('任务已完成，但没有返回可展示的答案。'))
+      }
+      await scrollBottom()
+      return
+    }
+    if (status === 'FAILED') {
+      clearRunPoll()
+      loading.value = false
+      stopping.value = false
+      activeRun.value = null
+      appendAssistant(systemMessage(`本次回答失败：${run?.error || '后端执行异常'}`))
+      await scrollBottom()
+      return
+    }
+    if (status === 'CANCELED') {
+      clearRunPoll()
+      loading.value = false
+      stopping.value = false
+      activeRun.value = null
+      await scrollBottom()
+      return
+    }
+    scheduleRunPoll(token)
   } catch {
-    appendAssistant(mockChat(message))
+    if (!activeRun.value || activeRun.value.token !== token) return
+    runStatusText.value = '正在等待后端返回状态'
+    scheduleRunPoll(token, 1200)
+  }
+}
+
+async function stopCurrentRun() {
+  if (stopping.value) return
+  const current = activeRun.value
+  stopping.value = true
+  runStatusText.value = '正在停止本次回答'
+  clearRunPoll()
+  if (!current && submitController) {
+    submitController.abort()
+    return
+  }
+  if (!current) {
+    loading.value = false
+    stopping.value = false
+    return
+  }
+  const stoppedRun = current
+  activeRun.value = null
+  try {
+    await cancelRun(stoppedRun.threadId, stoppedRun.runId)
+  } catch {
+    // 取消请求失败也要允许用户继续提问；后端旧结果不会再被当前 token 接收。
   } finally {
     loading.value = false
+    stopping.value = false
+    appendAssistant(systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
     await scrollBottom()
+  }
+}
+
+function clearRunPoll() {
+  if (pollTimer) {
+    window.clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+function clearSubmitController() {
+  submitController = null
+}
+
+function latestRunStatusText(run, events = []) {
+  const status = String(run?.status || '').toUpperCase()
+  if (status === 'QUEUED') return '任务已提交，正在排队'
+  if (status === 'RUNNING') {
+    const lastEvent = [...events].reverse().find(event => event?.node && event.node !== 'RUN_MANAGER')
+    if (lastEvent?.node) {
+      return `正在执行 ${formatNodeName(lastEvent.node)}`
+    }
+    return '正在分析问题并读取经营数据'
+  }
+  if (status === 'FAILED') return '执行失败'
+  if (status === 'CANCELED') return '已停止'
+  return '正在等待任务状态'
+}
+
+function formatNodeName(node) {
+  return String(node || '')
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, char => char.toUpperCase())
+}
+
+function systemMessage(text) {
+  return {
+    id: `local_${Date.now()}`,
+    answer: text,
+    thinkingSteps: [],
+    dorisTables: [],
+    dataRows: [],
+    dataSections: [],
+    persisted: false
   }
 }
 
@@ -276,7 +451,10 @@ function nextFeedbackStatus(current, payload) {
   return next
 }
 
-function resetChat() {
+async function resetChat() {
+  if (loading.value && activeRun.value) {
+    await stopCurrentRun()
+  }
   messages.value = [
     {
       localId: 'welcome',
