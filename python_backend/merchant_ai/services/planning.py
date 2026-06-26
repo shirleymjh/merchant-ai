@@ -1311,7 +1311,11 @@ class QueryGraphPlanner:
         final_payload: Dict[str, Any] = {}
         for round_index in range(max(1, self.settings.agent_planner_tool_rounds)):
             round_payload = dict(user_payload)
-            round_payload["plannerToolResults"] = planner_tool_results[-8:]
+            round_payload["plannerToolResults"] = planner_tool_results_for_prompt(
+                planner_tool_results,
+                max_items=4,
+                max_chars=int(self.settings.context_file_inline_max_chars or 12000),
+            )
             round_payload["plannerToolPolicy"] = {
                 "round": round_index + 1,
                 "maxRounds": self.settings.agent_planner_tool_rounds,
@@ -2004,6 +2008,36 @@ def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Di
     else:
         compact = {"preview": payload[:limit], "truncated": True}
     return compact
+
+
+def planner_tool_results_for_prompt(results: List[Dict[str, Any]], max_items: int = 4, max_chars: int = 12000) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    budget = max(1000, int(max_chars or 12000))
+    used = 0
+    for item in list(results or [])[-max(1, max_items) :]:
+        compact = dict(item or {})
+        if "result" in compact:
+            compact["result"] = compact_tool_result_for_prompt(compact.get("result") or {}, max(1000, int(budget / max(1, max_items))))
+        for key in ["promptArtifact", "artifact"]:
+            if key in compact and isinstance(compact[key], dict):
+                compact[key] = {
+                    "relativePath": compact[key].get("relativePath") or compact[key].get("path", ""),
+                    "sha256": compact[key].get("sha256", ""),
+                    "estimatedChars": compact[key].get("estimatedChars", 0),
+                }
+        raw = json.dumps(compact, ensure_ascii=False, default=str)
+        if used + len(raw) > budget and selected:
+            selected.append(
+                {
+                    "offloaded": True,
+                    "reason": "planner tool results exceeded prompt budget",
+                    "omittedCount": max(0, len(results or []) - len(selected)),
+                }
+            )
+            break
+        selected.append(compact)
+        used += len(raw)
+    return selected
 
 
 def compact_previous_understanding(payload: Dict[str, Any], max_items: int = 3) -> Dict[str, Any]:

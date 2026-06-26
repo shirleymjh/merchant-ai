@@ -381,6 +381,20 @@ class IntentSignals(APIModel):
     observations: List[str] = Field(default_factory=list)
 
 
+class FastUnderstandingResult(APIModel):
+    complexity: str = "unknown"
+    intent_kind: str = "unknown"
+    topics: List[QuestionCategory] = Field(default_factory=list)
+    object_refs: Dict[str, List[str]] = Field(default_factory=dict)
+    time_window_days: int = 0
+    metric_phrases: List[str] = Field(default_factory=list)
+    needs_planner: bool = True
+    needs_knowledge: bool = True
+    suggested_actions: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    reasons: List[str] = Field(default_factory=list)
+
+
 class KnowledgeRequest(APIModel):
     type: KnowledgeRequestType = KnowledgeRequestType.TABLE
     query: str = ""
@@ -568,6 +582,104 @@ class ContextPackage(APIModel):
     offload_reason: str = ""
     context_hash: str = ""
     context_delta: ContextDelta = Field(default_factory=ContextDelta)
+
+
+class MiddlewareEvent(APIModel):
+    event_id: str = ""
+    middleware: str = ""
+    stage: str = ""
+    status: str = "ok"
+    code: str = ""
+    message: str = ""
+    input_chars: int = 0
+    output_chars: int = 0
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ContextBudgetReport(APIModel):
+    stage: str = ""
+    window_tokens: int = 0
+    estimated_tokens: int = 0
+    usage_ratio: float = 0.0
+    threshold_ratio: float = 0.0
+    over_budget: bool = False
+    protected_fact_count: int = 0
+    artifact_count: int = 0
+    summary_chars: int = 0
+    decision: str = ""
+
+
+class ContextCompressionEvent(APIModel):
+    stage: str = ""
+    before_tokens: int = 0
+    after_tokens: int = 0
+    target_ratio: float = 0.0
+    summary_artifact: ArtifactRef = Field(default_factory=ArtifactRef)
+    protected_keys: List[str] = Field(default_factory=list)
+    reason: str = ""
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ContextAssemblyReport(APIModel):
+    stage: str = ""
+    agent: str = ""
+    input_chars: int = 0
+    output_chars: int = 0
+    budget_chars: int = 0
+    compacted: bool = False
+    trimmed_sections: List[str] = Field(default_factory=list)
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    context_hash: str = ""
+    reason: str = ""
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ToolCallLedgerEntry(APIModel):
+    tool_call_id: str = ""
+    tool_name: str = ""
+    stage: str = ""
+    status: str = ""
+    duration_ms: int = 0
+    attempts: int = 0
+    cache_hit: bool = False
+    rate_limited: bool = False
+    target: str = ""
+    error_type: str = ""
+    error_message: str = ""
+    result_ref: ArtifactRef = Field(default_factory=ArtifactRef)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ToolCallRecoveryEvent(APIModel):
+    tool_call_id: str = ""
+    tool_name: str = ""
+    stage: str = ""
+    action: str = ""
+    reason: str = ""
+    status_before: str = ""
+    status_after: str = ""
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class WorkspaceManifestEntry(APIModel):
+    path: str = ""
+    relative_path: str = ""
+    namespace: str = ""
+    bytes: int = 0
+    estimated_chars: int = 0
+    sha256: str = ""
+    merchant_uri: str = ""
+    updated_at: str = ""
+
+
+class WorkspaceManifest(APIModel):
+    root: str = ""
+    entries: List[WorkspaceManifestEntry] = Field(default_factory=list)
+    entry_count: int = 0
+    total_bytes: int = 0
+    updated_at: str = ""
 
 
 class TraceSpan(APIModel):
@@ -820,6 +932,7 @@ class NodeExecutionBatch(APIModel):
     ready_task_ids: List[str] = Field(default_factory=list)
     submitted_task_ids: List[str] = Field(default_factory=list)
     completed_task_ids: List[str] = Field(default_factory=list)
+    failed_task_ids: List[str] = Field(default_factory=list)
     timed_out_task_ids: List[str] = Field(default_factory=list)
     blocked_task_ids: List[str] = Field(default_factory=list)
     max_concurrency: int = 0

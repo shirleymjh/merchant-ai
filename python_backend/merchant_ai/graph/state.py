@@ -11,14 +11,19 @@ from merchant_ai.models import (
     ContextPackage,
     ChatContext,
     CircuitBreakerState,
+    ContextBudgetReport,
+    ContextAssemblyReport,
+    ContextCompressionEvent,
     ContextSnapshot,
     FreshnessCheckResult,
+    FastUnderstandingResult,
     GraphValidationResult,
     IntentSignals,
     KnowledgeBundle,
     KnowledgeRequest,
     MerchantInfo,
     MerchantRecentFocus,
+    MiddlewareEvent,
     NodeToolCall,
     PlannerRepairRequest,
     PlanningAssetPack,
@@ -31,11 +36,14 @@ from merchant_ai.models import (
     RoutingDecision,
     ThreadData,
     ToolCallExecutionResult,
+    ToolCallLedgerEntry,
+    ToolCallRecoveryEvent,
     ToolFailureRecord,
     ToolRuntimePolicy,
     RunStep,
     TraceSpan,
     TopicRoutingDecision,
+    WorkspaceManifest,
 )
 
 
@@ -73,6 +81,7 @@ class AgentState(TypedDict, total=False):
     route_slots: RouteSlots
     route_decision_trace: List[Dict[str, Any]]
     bounded_route_llm_trace: Dict[str, Any]
+    bounded_lead_llm_trace: Dict[str, Any]
     extracted_keywords: Any
     plan: QueryPlan
     recall_bundle: RecallBundle
@@ -80,6 +89,7 @@ class AgentState(TypedDict, total=False):
     recall_rounds: List[Any]
     knowledge_request_lineage: Dict[str, Any]
     intent_signals: IntentSignals
+    fast_understanding: FastUnderstandingResult
     planning_asset_pack: PlanningAssetPack
     query_graph_validation_result: GraphValidationResult
     pending_knowledge_requests: List[KnowledgeRequest]
@@ -99,6 +109,13 @@ class AgentState(TypedDict, total=False):
     freshness_reports: List[FreshnessCheckResult]
     context_snapshots: List[ContextSnapshot]
     context_packages: List[ContextPackage]
+    context_budget_reports: List[ContextBudgetReport]
+    context_assembly_reports: List[ContextAssemblyReport]
+    context_compression_events: List[ContextCompressionEvent]
+    middleware_events: List[MiddlewareEvent]
+    tool_call_ledger: List[ToolCallLedgerEntry]
+    tool_call_recovery_events: List[ToolCallRecoveryEvent]
+    workspace_manifest: WorkspaceManifest
     run_steps: List[RunStep]
     trace_spans: List[TraceSpan]
     planner_repair_requests: List[PlannerRepairRequest]
@@ -115,9 +132,13 @@ class AgentState(TypedDict, total=False):
     recall_context: str
     merchant_profile_context: str
     memory_context: str
+    runtime_context: str
     session_context: str
     summary_context: str
     tool_context: str
+    thread_context: Dict[str, Any]
+    runtime_injection: Dict[str, Any]
+    memory_injection: Dict[str, Any]
     open_diagnostic_scope: str
     open_diagnostic_intent: str
     open_diagnostic_goal: str
@@ -136,6 +157,7 @@ class AgentState(TypedDict, total=False):
     query_graph_plan_attempts: int
     query_graph_repair_attempts: int
     planning_assets_compacted: bool
+    fast_understood: bool
     skills_loaded: bool
     loaded_skills: List[str]
     rule_recall_ready: bool
@@ -153,6 +175,8 @@ class AgentState(TypedDict, total=False):
     data_discovered: bool
     sql_generated: bool
     chat_bi_completed: bool
+    run_canceled: bool
+    middleware_loop_blocked: bool
     should_persist: bool
     persisted: bool
 
@@ -185,6 +209,7 @@ def knowledge_context(state: AgentState) -> str:
     for title, key in [
         ("店铺画像", "merchant_profile_context"),
         ("长期记忆", "memory_context"),
+        ("运行时注入", "runtime_context"),
         ("基础业务知识", "base_knowledge_context"),
         ("Topic资产", "topic_asset_context"),
         ("召回上下文", "recall_context"),

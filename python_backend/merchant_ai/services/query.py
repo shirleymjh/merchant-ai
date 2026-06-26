@@ -434,6 +434,7 @@ class NodeWorkerExecutor:
                     blocked = self.tool_failure_registry.should_block("node_agent", node_args)
                     if blocked:
                         batch.blocked_task_ids.append(task_id)
+                        batch.failed_task_ids.append(task_id)
                         results[task_id] = failed_result(task_id, pending[task_id], "node_agent blocked by circuit breaker: %s" % blocked.reason)
                         continue
                     context = self._node_context(task_id, pending[task_id], completed, plan, merchant_id, question, asset_pack)
@@ -448,11 +449,16 @@ class NodeWorkerExecutor:
                     node_args = {"taskId": task_id, "table": pending[task_id].preferred_table}
                     try:
                         task_result = future.result(timeout=0)
-                        self.tool_failure_registry.record_success("node_agent", node_args)
-                        batch.completed_task_ids.append(task_id)
+                        if task_result.query_bundle.failed:
+                            self.tool_failure_registry.record_failure("node_agent", node_args, "NODE_FAILED", task_result.query_bundle.error or task_result.summary)
+                            batch.failed_task_ids.append(task_id)
+                        else:
+                            self.tool_failure_registry.record_success("node_agent", node_args)
+                            batch.completed_task_ids.append(task_id)
                     except Exception as exc:
                         self.tool_failure_registry.record_failure("node_agent", node_args, "ERROR", str(exc))
                         task_result = failed_result(task_id, pending[task_id], "NodeWorker 执行异常: %s" % str(exc)[:200])
+                        batch.failed_task_ids.append(task_id)
                     task_result.task_id = task_id
                     results[task_id] = task_result
                 for future in not_done:
@@ -464,6 +470,7 @@ class NodeWorkerExecutor:
                         "node execution timed out",
                     )
                     batch.timed_out_task_ids.append(task_id)
+                    batch.failed_task_ids.append(task_id)
                     results[task_id] = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
                     future.cancel()
             finally:
@@ -481,7 +488,9 @@ class NodeWorkerExecutor:
                 )
                 results[task_id] = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
                 batch.timed_out_task_ids.append(task_id)
+                batch.failed_task_ids.append(task_id)
         batch.completed_task_ids = list(dict.fromkeys(batch.completed_task_ids))
+        batch.failed_task_ids = list(dict.fromkeys(batch.failed_task_ids))
         batch.timed_out_task_ids = list(dict.fromkeys(batch.timed_out_task_ids))
         batch.duration_ms = int((time.perf_counter() - started) * 1000)
         return results, batch

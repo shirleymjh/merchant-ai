@@ -19,6 +19,7 @@ class AgentActionRegistry:
     def __init__(self):
         actions = [
             AgentAction(id="route_topic", node="route_topic", agent="LeadAgent", description="route BI topic"),
+            AgentAction(id="fast_understand", node="fast_understand", agent="LeadAgent", description="cheap complexity and intent sketch before heavy planning"),
             AgentAction(id="retrieve_knowledge", node="retrieve_knowledge", agent="KnowledgeAgent", description="retrieve semantic rules, terms and thin skill policies"),
             AgentAction(id="compact_assets", node="compact_assets", agent="KnowledgeAgent", description="build semantic asset pack"),
             AgentAction(id="plan_graph", node="plan_query_graph", agent="PlannerAgent", description="build QueryGraph"),
@@ -93,6 +94,10 @@ class V2AgentPolicy:
         return self.registry.actions(action_ids)
 
     def _candidate_action_ids(self, state: AgentState) -> tuple[List[str], str, bool]:
+        if state.get("run_canceled"):
+            return ["cache_answer"], "run was canceled by user; stop the ReAct loop", True
+        if state.get("middleware_loop_blocked"):
+            return ["answer_data"], "middleware loop guard blocked repeated action pattern", True
         route = state.get("routing_decision")
         if route and route.route == QuestionRoute.GREETING:
             return ["answer_data"], "greeting route uses lightweight answer", False
@@ -117,7 +122,12 @@ class V2AgentPolicy:
         if not state.get("topic_routed"):
             return ["route_topic"], "topic has not been routed", False
         if not state.get("data_discovered"):
-            return ["retrieve_knowledge"], "semantic knowledge has not been retrieved", False
+            if not state.get("fast_understood") and state.get("route_slots"):
+                return ["fast_understand"], "fast understanding has not classified complexity and intent kind", False
+            fast = state.get("fast_understanding")
+            if fast and getattr(fast, "intent_kind", "") == "rule_only":
+                return ["retrieve_knowledge", "answer_rule"], "fast understanding classified rule-only; retrieve rule knowledge first", False
+            return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge has not been retrieved"), False
         if self.has_rule_recall_ready(state):
             return ["answer_rule"], "platform rule knowledge is ready; answer without BI QueryGraph", False
         if self.has_rule_answer_plan(state):
@@ -215,6 +225,17 @@ class V2AgentPolicy:
         query = str(getattr(first, "query", "") or "")
         suffix = (": %s" % query[:120]) if query else ""
         return "LeadAgent observed pending KnowledgeRequest%s; retrieve before planning/repair (%s)" % (suffix, reason)
+
+    def fast_understanding_reason(self, state: AgentState, default: str) -> str:
+        fast = state.get("fast_understanding")
+        if not fast:
+            return default
+        return "%s; fastUnderstanding intent=%s complexity=%s needsPlanner=%s" % (
+            default,
+            getattr(fast, "intent_kind", "unknown"),
+            getattr(fast, "complexity", "unknown"),
+            getattr(fast, "needs_planner", True),
+        )
 
     def repair_request_actions(self, reflection: PlannerReflectionResult) -> set[str]:
         actions = {str(item.action or "") for item in reflection.repair_requests if getattr(item, "action", "")}

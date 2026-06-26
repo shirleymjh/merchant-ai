@@ -15,6 +15,8 @@ from merchant_ai.graph.workflow import (
     knowledge_request_key,
 )
 from merchant_ai.models import (
+    AgentDecision,
+    AgentActionTrace,
     AgentRunResult,
     AgentTaskResult,
     AnswerMode,
@@ -45,10 +47,12 @@ from merchant_ai.models import (
     RelationshipEntry,
     RecallItem,
     RecallBundle,
+    RouteSlots,
     RoutingDecision,
     SqlRepairAttempt,
     TaskRole,
     ThreadData,
+    ToolCallExecutionResult,
     ToolCallRequest,
     ToolCachePolicy,
     LoadBalancerTarget,
@@ -80,7 +84,20 @@ from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.middleware import (
+    CancellationMiddleware,
+    ContextBudgetMiddleware,
+    DynamicContextMiddleware,
+    FileSystemContextMiddleware,
+    LoopGuardMiddleware,
+    MemoryMiddleware,
+    MiddlewareChain,
+    SummarizeMiddleware,
+    ToolCallRecoveryMiddleware,
+)
+from merchant_ai.services.context_assembly import ContextAssembler, ThreadContextService
 from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, answer_chunks, run_duration_ms
+from merchant_ai.services.memory import StructuredMemoryStore
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService
 from merchant_ai.services.recall_index import RecallIndexManager
@@ -634,6 +651,49 @@ def test_lead_policy_has_no_standalone_load_skills_action():
     decision = policy.decide(state)
     assert decision.selected_action == "retrieve_knowledge"
     assert decision.selected_node == "retrieve_knowledge"
+
+
+def test_lead_policy_inserts_fast_understand_after_route_before_retrieval():
+    policy = V2AgentPolicy(get_settings())
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "route_slots": RouteSlots(),
+        "fast_understood": False,
+        "data_discovered": False,
+        "react_round": 1,
+        "plan": QueryPlan(),
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.selected_action == "fast_understand"
+    assert decision.selected_node == "fast_understand"
+
+
+def test_bounded_lead_llm_cannot_select_action_outside_registry_candidates():
+    class InvalidLeadActionLlm:
+        configured = True
+
+        def json_chat(self, *_args, **_kwargs):
+            return {"selectedAction": "invent_new_action", "reason": "try to bypass registry"}
+
+    settings = get_settings().model_copy(update={"lead_action_llm_mode": "always"})
+    workflow = create_workflow(settings)
+    workflow.planner.llm = InvalidLeadActionLlm()
+    state = workflow._initial_state("最近7天总订单量是多少？", "100", ChatContext(), None, "", "")
+    decision = AgentDecision(
+        selected_action="retrieve_knowledge",
+        selected_node="retrieve_knowledge",
+        available_actions=["retrieve_knowledge", "compact_assets"],
+        reason="deterministic",
+    )
+
+    selected = workflow.apply_bounded_lead_llm_decision(state, decision)
+
+    assert selected.selected_action == "retrieve_knowledge"
+    assert state["bounded_lead_llm_trace"]["status"] == "ignored"
+    assert state["bounded_lead_llm_trace"]["reason"] == "llm_selected_action_not_allowed"
 
 
 def test_asset_pack_does_not_auto_expand_tables_from_relationship_closure():
@@ -4358,6 +4418,219 @@ def test_context_manager_snapshots_protected_facts(tmp_path):
     assert dumped["protectedFacts"][0]["sourceRefs"]
 
 
+def test_middleware_chain_summarizes_and_writes_workspace_manifest(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "context_window_tokens": 20,
+            "context_compaction_threshold_ratio": 0.1,
+            "context_compaction_target_ratio": 0.4,
+        }
+    )
+    outputs = tmp_path / "threads" / "thread_mw" / "outputs"
+    outputs.mkdir(parents=True)
+    state = {
+        "question": "最近7天 GMV、退款金额和工单量分别是多少？" * 80,
+        "thread_data": ThreadData(thread_id="thread_mw", run_id="run_mw", workspace_path=str(outputs.parent), outputs_path=str(outputs)),
+        "context_snapshots": [
+            {
+                "stage": "plan_query_graph",
+                "summary": "important summary",
+                "protectedFacts": [{"key": "question", "value": "GMV refund ticket"}],
+            }
+        ],
+        "context_packages": [],
+        "action_history": [],
+        "middleware_events": [],
+    }
+
+    chain = MiddlewareChain([ContextBudgetMiddleware(settings), SummarizeMiddleware(settings), FileSystemContextMiddleware(settings)])
+    state = chain.before_policy(state)
+
+    assert state["context_budget_reports"][-1].over_budget
+    assert state["context_compression_events"]
+    assert state["context_compression_events"][-1].summary_artifact.path
+    assert (outputs / "workspace_manifest.json").exists()
+    assert state["workspace_manifest"].entry_count >= 1
+    assert any(event.code == "CONTEXT_SUMMARIZED" for event in state["middleware_events"])
+
+
+def test_thread_context_service_restores_previous_artifacts_and_entities(tmp_path):
+    outputs = tmp_path / "threads" / "thread_ctx" / "outputs"
+    node_dir = outputs / "artifacts" / "node"
+    node_dir.mkdir(parents=True)
+    (outputs / "context_snapshot.json").write_text(json.dumps({"summary": "- plan_tables=dwm_trade_order_detail_di"}), encoding="utf-8")
+    (outputs / "trace_replay.json").write_text(
+        json.dumps({"runId": "run_prev", "question": "最近7天下单最多的前5个SPU", "answer": "Top SPU..."}),
+        encoding="utf-8",
+    )
+    (node_dir / "agent_run_result.json").write_text(
+        json.dumps(
+            {
+                "taskResults": [
+                    {
+                        "taskId": "anchor_top_spu",
+                        "entitySet": {
+                            "taskId": "anchor_top_spu",
+                            "joinKey": "spu_id",
+                            "values": ["spu_1", "spu_2"],
+                            "sourceRowCount": 2,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        "thread_id": "thread_ctx",
+        "run_id": "run_new",
+        "checkpoint_thread_id": "thread_ctx:run_new",
+        "thread_data": ThreadData(thread_id="thread_ctx", run_id="run_new", outputs_path=str(outputs)),
+        "session_context": "",
+    }
+
+    context = ThreadContextService().restore(state)
+
+    assert context["restored"]
+    assert context["previousRunId"] == "run_prev"
+    assert context["reusableEntitySets"][0]["joinKey"] == "spu_id"
+    assert "reusableEntitySet" in state["session_context"]
+
+
+def test_dynamic_context_middleware_injects_runtime_boundary(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "context_runtime_budget_chars": 1200})
+    outputs = tmp_path / "threads" / "thread_dyn" / "outputs"
+    outputs.mkdir(parents=True)
+    state = {
+        "question": "最近7天订单量是多少",
+        "requested_merchant_id": "seller_100",
+        "merchant": MerchantInfo(merchant_id="seller_100", merchant_name="测试商家"),
+        "route_slots": RouteSlots(),
+        "thread_context": {"restored": True, "previousQuestion": "上轮问题", "reusableEntitySets": [{"joinKey": "spu_id"}]},
+        "workspace_manifest": {},
+        "loaded_skills": ["trade"],
+        "thread_data": ThreadData(thread_id="thread_dyn", run_id="run_dyn", outputs_path=str(outputs)),
+        "middleware_events": [],
+        "react_round": 1,
+    }
+
+    DynamicContextMiddleware(settings).before_policy(state)
+
+    assert state["runtime_injection"]["merchant"]["merchantId"] == "seller_100"
+    assert state["runtime_injection"]["threadContext"]["restored"]
+    assert "currentDate" in state["runtime_context"]
+    assert state["middleware_events"][-1].code == "RUNTIME_CONTEXT_INJECTED"
+
+
+def test_memory_middleware_injects_and_store_writes_structured_memory(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "context_memory_budget_chars": 1600})
+    store = StructuredMemoryStore(settings)
+    state = {
+        "question": "最近7天GMV是多少",
+        "requested_merchant_id": "seller_100",
+        "plan": QueryPlan(
+            question_understanding={"analysisIntent": "none"},
+            intents=[
+                QuestionIntent(
+                    question="最近7天GMV是多少",
+                    intent_type="VALID",
+                    answer_mode="METRIC",
+                    category=QuestionCategory.TRADE,
+                    metric_name="gmv",
+                    metric_resolution={"metricKey": "gmv_amt"},
+                    days=7,
+                )
+            ],
+        ),
+        "answer": "最近7天GMV为100。",
+        "middleware_events": [],
+    }
+
+    memory = store.update_from_state(state)
+    assert memory["recentFocus"]["topMetrics"][0]["metric"] == "gmv_amt"
+    MemoryMiddleware(settings).before_policy(state)
+    assert state["memory_injection"]["recentFocus"]["topMetrics"]
+    assert "answerPreview" in json.dumps(memory["events"][0], ensure_ascii=False)
+    assert "tool_result" not in json.dumps(memory, ensure_ascii=False)
+
+
+def test_context_assembler_offloads_large_payload(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "context_planner_budget_chars": 1000,
+            "tool_result_offload_chars": 500,
+        }
+    )
+    outputs = tmp_path / "threads" / "thread_asm" / "outputs"
+    outputs.mkdir(parents=True)
+    state = {
+        "thread_data": ThreadData(thread_id="thread_asm", run_id="run_asm", outputs_path=str(outputs)),
+        "context_assembly_reports": [],
+    }
+    payload = {
+        "question": "最近7天退款明细",
+        "plannerToolResults": [{"result": {"content": "x" * 3000}, "artifact": {"relativePath": "old.json"}}],
+    }
+
+    compacted = ContextAssembler(settings).assemble_payload(state, "planner_round", "PlannerAgent", payload, budget_chars=1000)
+
+    assert compacted["plannerToolResults"]["offloaded"]
+    assert state["context_assembly_reports"][-1].compacted
+    artifact_path = outputs / "artifacts" / "context" / "planner_round_plannerToolResults.json"
+    assert artifact_path.exists()
+
+
+def test_tool_call_recovery_patches_dangling_tool_result():
+    state = {
+        "tool_call_results": [ToolCallExecutionResult(id="tool_1", name="semantic_read", status="running")],
+        "tool_call_ledger": [],
+        "tool_call_recovery_events": [],
+        "middleware_events": [],
+    }
+
+    ToolCallRecoveryMiddleware().before_policy(state)
+
+    assert state["tool_call_results"][0].status == "failed"
+    assert state["tool_call_results"][0].error_type == "MISSING_TOOL_RESULT"
+    assert state["tool_call_ledger"][0].tool_call_id == "tool_1"
+    assert state["tool_call_recovery_events"][0].action == "patch_missing_terminal_result"
+
+
+def test_cancellation_middleware_marks_run_canceled(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    runs_dir = tmp_path / "run_events" / "runs"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "run_cancel.json").write_text(json.dumps({"runId": "run_cancel", "status": "CANCELED"}), encoding="utf-8")
+    state = {"run_id": "run_cancel", "middleware_events": [], "chat_bi_completed": False, "answer": ""}
+
+    CancellationMiddleware(settings).before_policy(state)
+
+    assert state["run_canceled"]
+    assert state["chat_bi_completed"]
+    assert "取消" in state["answer"]
+    assert state["middleware_events"][-1].code == "RUN_CANCELED"
+
+
+def test_loop_guard_blocks_repeated_action_pattern():
+    settings = get_settings().model_copy(update={"middleware_loop_guard_threshold": 3})
+    state = {
+        "action_history": [
+            AgentActionTrace(action="retrieve_knowledge"),
+            AgentActionTrace(action="retrieve_knowledge"),
+            AgentActionTrace(action="retrieve_knowledge"),
+        ],
+        "middleware_events": [],
+    }
+
+    LoopGuardMiddleware(settings).before_policy(state)
+
+    assert state["middleware_loop_blocked"]
+    assert state["query_graph_validated"]
+    assert state["query_graph_validation_result"].gaps[0].code == "LOOP_DETECTED"
+
+
 def test_tool_failure_registry_blocks_repeated_identical_failures():
     registry = ToolFailureRegistry(repeat_threshold=2, circuit_threshold=4)
     args = {"taskId": "anchor", "sql": "SELECT * FROM x"}
@@ -4817,6 +5090,60 @@ def test_topn_anchor_uses_structured_fast_path_without_llm_sql():
     assert decision.source == "structured_fast_path"
     assert "GROUP BY" in sql
     assert "COUNT(DISTINCT `sub_order_id`) AS `order_detail_cnt`" in sql
+
+
+def test_node_execution_batch_records_failed_task_without_blocking_success(monkeypatch):
+    settings = get_settings().model_copy(update={"max_concurrent_sub_agents": 2, "agent_node_timeout_seconds": 2})
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="GMV",
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="metric_gmv",
+                preferred_table="ads_merchant_profile",
+            ),
+            QuestionIntent(
+                question="退款金额",
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="metric_refund",
+                preferred_table="ads_merchant_profile",
+            ),
+        ]
+    )
+
+    def fake_execute_node(intent, *_args, **_kwargs):
+        if intent.plan_task_id == "metric_refund":
+            return AgentTaskResult(
+                task_id=intent.plan_task_id,
+                success=False,
+                query_bundle=QueryBundle(failed=True, error="simulated failure"),
+            )
+        return AgentTaskResult(
+            task_id=intent.plan_task_id,
+            success=True,
+            query_bundle=QueryBundle(rows=[{"metric": 1}], tables=[intent.preferred_table]),
+        )
+
+    monkeypatch.setattr(worker, "execute_node", fake_execute_node)
+
+    results, batch = worker._execute_ready_batch(
+        ["metric_gmv", "metric_refund"],
+        {intent.plan_task_id: intent for intent in plan.intents},
+        {},
+        plan,
+        "100",
+        PlanningAssetPack(),
+        "最近7天 GMV 和退款金额分别是多少？",
+        "",
+    )
+
+    assert results["metric_gmv"].success
+    assert results["metric_refund"].query_bundle.failed
+    assert batch.completed_task_ids == ["metric_gmv"]
+    assert batch.failed_task_ids == ["metric_refund"]
 
 
 def test_trend_objective_compiles_to_group_agg():
