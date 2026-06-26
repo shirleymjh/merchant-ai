@@ -410,6 +410,7 @@ class MemoryMiddleware(HarnessMiddleware):
             budget_chars=int(self.settings.context_memory_budget_chars or 1800),
         )
         state["memory_injection"] = injection
+        state["memory_injection_trace"] = injection.get("memoryInjectionTrace", {})
         rendered = self.memory_store.render_injection(injection)
         if rendered:
             state["memory_context"] = rendered[: int(self.settings.context_memory_budget_chars or 1800)]
@@ -426,6 +427,10 @@ class MemoryMiddleware(HarnessMiddleware):
                 "memoryContextChars": len(memory_context),
                 "recentFocusEmpty": bool(recent_focus.is_empty()) if recent_focus else True,
                 "eventCount": len(injection.get("relevantEvents") or []),
+                "candidateCount": (injection.get("memoryInjectionTrace") or {}).get("candidateCount", 0),
+                "selectedIds": (injection.get("memoryInjectionTrace") or {}).get("selectedIds", []),
+                "budgetUsedChars": (injection.get("memoryInjectionTrace") or {}).get("budgetUsedChars", 0),
+                "filteredReasons": (injection.get("memoryInjectionTrace") or {}).get("filteredReasons", {}),
                 "memorySource": injection.get("source", ""),
             },
         )

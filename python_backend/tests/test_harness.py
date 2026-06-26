@@ -43,6 +43,7 @@ from merchant_ai.models import (
     QuestionCategory,
     QuestionIntent,
     QuestionRoute,
+    PendingAnswer,
     RunCreateRequest,
     RelationshipEntry,
     RecallItem,
@@ -71,6 +72,7 @@ from merchant_ai.services.assets import (
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.answer import (
     AnswerComposeService,
+    FeedbackService,
     analysis_summary_required,
     answer_skill_required,
     answer_data_package,
@@ -98,7 +100,7 @@ from merchant_ai.services.middleware import (
 from merchant_ai.services.context_assembly import ContextAssembler, ThreadContextService
 from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, answer_chunks, run_duration_ms
 from merchant_ai.services.memory import StructuredMemoryStore
-from merchant_ai.services.repositories import write_json
+from merchant_ai.services.repositories import PendingAnswerStore, write_json
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.planning import (
@@ -4553,6 +4555,191 @@ def test_memory_middleware_injects_and_store_writes_structured_memory(tmp_path):
     assert state["memory_injection"]["recentFocus"]["topMetrics"]
     assert "answerPreview" in json.dumps(memory["events"][0], ensure_ascii=False)
     assert "tool_result" not in json.dumps(memory, ensure_ascii=False)
+
+
+def test_memory_store_does_not_persist_sql_rows_or_tool_trace(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "context_memory_budget_chars": 1600})
+    store = StructuredMemoryStore(settings)
+    state = {
+        "question": "最近7天退款金额是多少",
+        "requested_merchant_id": "seller_100",
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="最近7天退款金额是多少",
+                    intent_type="VALID",
+                    answer_mode="METRIC",
+                    category=QuestionCategory.REFUND,
+                    metric_name="退款金额",
+                    metric_resolution={"metricKey": "refund_related_pay_amt"},
+                    days=7,
+                )
+            ],
+        ),
+        "answer": "最近7天退款金额为100。",
+        "query_bundle": QueryBundle(
+            sql="SELECT secret_column FROM dwm_trade_refund_detail_di",
+            rows=[{"secret_column": "should_not_persist", "refund_related_pay_amt": 100}],
+        ),
+        "tool_context": "tool_result: full doris rows should_not_persist",
+        "node_tool_traces": [{"sql": "SELECT secret_column FROM table"}],
+    }
+
+    memory = store.update_from_state(state)
+    serialized = json.dumps(memory, ensure_ascii=False)
+    assert "refund_related_pay_amt" in serialized
+    assert "SELECT secret_column" not in serialized
+    assert "should_not_persist" not in serialized
+    assert "tool_result" not in serialized
+
+
+def test_memory_correction_is_prioritized_and_marks_conflict(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "context_memory_budget_chars": 2400})
+    store = StructuredMemoryStore(settings)
+    old_state = {
+        "question": "最近7天退款金额是多少",
+        "requested_merchant_id": "seller_100",
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="最近7天退款金额是多少",
+                    intent_type="VALID",
+                    answer_mode="METRIC",
+                    category=QuestionCategory.REFUND,
+                    metric_name="退款金额",
+                    metric_resolution={"metricKey": "refund_related_pay_amt"},
+                    days=7,
+                )
+            ],
+        ),
+        "answer": "最近7天退款金额为100。",
+    }
+    store.update_from_state(old_state)
+    correction_state = {
+        "question": "不对，不是退款金额，是退款率，以后看售后风险要按退款率。",
+        "requested_merchant_id": "seller_100",
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="不对，不是退款金额，是退款率",
+                    intent_type="VALID",
+                    answer_mode="DERIVED",
+                    category=QuestionCategory.REFUND,
+                    metric_name="退款率",
+                    metric_resolution={"metricKey": "refund_rate"},
+                    days=7,
+                )
+            ],
+        ),
+        "answer": "已按退款率口径记住。",
+    }
+
+    memory = store.update_from_state(correction_state)
+    selected = store.select_for_question(
+        {
+            "question": "最近售后风险怎么看",
+            "requested_merchant_id": "seller_100",
+            "plan": QueryPlan(intents=[QuestionIntent(category=QuestionCategory.REFUND, metric_resolution={"metricKey": "refund_rate"})]),
+        },
+        budget_chars=2400,
+    )
+    assert selected["relevantCorrections"]
+    assert "退款率" in selected["relevantCorrections"][0]["correctionText"]
+    assert memory["conflicts"]
+    assert any(float(item.get("confidence") or 1) <= 0.35 for item in memory["events"] if item.get("memoryType") != "correction")
+
+
+def test_memory_retrieval_prefers_related_topic_and_metrics(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "context_memory_budget_chars": 2400})
+    store = StructuredMemoryStore(settings)
+    store.update_from_state(
+        {
+            "question": "最近7天退款率是多少",
+            "requested_merchant_id": "seller_100",
+            "plan": QueryPlan(
+                intents=[
+                    QuestionIntent(
+                        question="最近7天退款率是多少",
+                        category=QuestionCategory.REFUND,
+                        metric_resolution={"metricKey": "refund_rate"},
+                        days=7,
+                    )
+                ]
+            ),
+            "answer": "退款率为2%。",
+        }
+    )
+    store.update_from_state(
+        {
+            "question": "最近10天商品审核拒绝明细",
+            "requested_merchant_id": "seller_100",
+            "plan": QueryPlan(
+                intents=[
+                    QuestionIntent(
+                        question="最近10天商品审核拒绝明细",
+                        category=QuestionCategory.GOODS,
+                        metric_resolution={"metricKey": "goods_audit_reject_cnt"},
+                        days=10,
+                    )
+                ]
+            ),
+            "answer": "商品审核拒绝明细已返回。",
+        }
+    )
+
+    selected = store.select_for_question(
+        {
+            "question": "最近30天售后退款风险",
+            "requested_merchant_id": "seller_100",
+            "plan": QueryPlan(
+                intents=[
+                    QuestionIntent(
+                        question="最近30天售后退款风险",
+                        category=QuestionCategory.REFUND,
+                        metric_resolution={"metricKey": "refund_rate"},
+                        days=30,
+                    )
+                ]
+            ),
+        },
+        budget_chars=2400,
+    )
+    serialized = json.dumps(selected["relevantEvents"] + selected["relevantPreferences"], ensure_ascii=False)
+    assert "refund_rate" in serialized
+    assert selected["memoryInjectionTrace"]["candidateCount"] >= 2
+    assert selected["memoryInjectionTrace"]["selectedIds"]
+
+
+def test_feedback_service_updates_memory_store(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "context_memory_budget_chars": 2400})
+    store = StructuredMemoryStore(settings)
+    pending_store = PendingAnswerStore()
+    pending_store.put(
+        PendingAnswer(
+            id="ans_mem_1",
+            question="最近7天GMV是多少",
+            answer="最近7天GMV为100。",
+            merchant_id="seller_100",
+            merchant_name="测试商家",
+            category_name="TRADE",
+            doris_tables="ads_merchant_profile",
+            suggested_questions="[]",
+        )
+    )
+
+    class FakeAnswerRepository:
+        def insert_answer(self, pending, adopted=False, liked=False, disliked=False):
+            return True
+
+        def update_feedback(self, answer_id, adopted, liked, disliked):
+            return None
+
+    service = FeedbackService(FakeAnswerRepository(), pending_store, store)
+    assert service.apply_feedback("ans_mem_1", adopted=True, liked=True, disliked=False) is True
+    memory = store.load("seller_100")
+    assert memory["events"]
+    assert "adopted" in memory["events"][-1]["feedbackSignal"]
+    assert memory["recentFocus"]["topMetrics"]
 
 
 def test_context_assembler_offloads_large_payload(tmp_path):

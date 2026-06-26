@@ -139,6 +139,8 @@ class AgentState(TypedDict, total=False):
     thread_context: Dict[str, Any]
     runtime_injection: Dict[str, Any]
     memory_injection: Dict[str, Any]
+    memory_injection_trace: Dict[str, Any]
+    memory_ingestion_trace: Dict[str, Any]
     open_diagnostic_scope: str
     open_diagnostic_intent: str
     open_diagnostic_goal: str

@@ -1257,6 +1257,96 @@ class PendingAnswer(APIModel):
     create_time: datetime = Field(default_factory=datetime.now)
 
 
+class MemoryEvent(APIModel):
+    event_id: str = ""
+    memory_type: str = "query_event"
+    question: str = ""
+    answer_preview: str = ""
+    topics: List[str] = Field(default_factory=list)
+    metrics: List[str] = Field(default_factory=list)
+    time_windows: List[int] = Field(default_factory=list)
+    analysis_intent: str = ""
+    is_follow_up: bool = False
+    feedback_signal: str = ""
+    correction_text: str = ""
+    confidence: float = 0.5
+    source: str = "answer_run"
+    hit_count: int = 0
+    last_used_at: str = ""
+    decay_score: float = 1.0
+    valid_until: str = ""
+    supersedes: List[str] = Field(default_factory=list)
+    conflicts_with: List[str] = Field(default_factory=list)
+    created_at: str = ""
+
+
+class MemoryFact(APIModel):
+    fact_id: str = ""
+    memory_type: str = "business_focus"
+    content: str = ""
+    topics: List[str] = Field(default_factory=list)
+    metrics: List[str] = Field(default_factory=list)
+    confidence: float = 0.5
+    source: str = ""
+    hit_count: int = 0
+    last_used_at: str = ""
+    decay_score: float = 1.0
+    valid_until: str = ""
+    supersedes: List[str] = Field(default_factory=list)
+    conflicts_with: List[str] = Field(default_factory=list)
+    created_at: str = ""
+
+
+class MemoryPreference(APIModel):
+    preference_id: str = ""
+    memory_type: str = "user_preference"
+    key: str = ""
+    value: str = ""
+    topics: List[str] = Field(default_factory=list)
+    metrics: List[str] = Field(default_factory=list)
+    confidence: float = 0.5
+    source: str = ""
+    hit_count: int = 0
+    last_used_at: str = ""
+    decay_score: float = 1.0
+    valid_until: str = ""
+    created_at: str = ""
+
+
+class MemoryRetrievalCandidate(APIModel):
+    memory_id: str = ""
+    memory_type: str = ""
+    score: float = 0.0
+    reasons: List[str] = Field(default_factory=list)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    filtered: bool = False
+    filter_reason: str = ""
+
+
+class MemoryInjectionTrace(APIModel):
+    merchant_id: str = ""
+    budget_chars: int = 0
+    candidate_count: int = 0
+    injected_event_count: int = 0
+    injected_preference_count: int = 0
+    injected_correction_count: int = 0
+    injected_fact_count: int = 0
+    budget_used_chars: int = 0
+    truncated: bool = False
+    selected_ids: List[str] = Field(default_factory=list)
+    filtered_reasons: Dict[str, int] = Field(default_factory=dict)
+    candidates: List[MemoryRetrievalCandidate] = Field(default_factory=list)
+
+
+class MemoryConflictResolution(APIModel):
+    conflict_id: str = ""
+    winner_id: str = ""
+    loser_id: str = ""
+    reason: str = ""
+    action: str = ""
+    created_at: str = ""
+
+
 class ThreadData(APIModel):
     thread_id: str = ""
     run_id: str = ""

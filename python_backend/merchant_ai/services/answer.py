@@ -5,7 +5,7 @@ import re
 import subprocess
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from merchant_ai.models import (
     AgentRunResult,
@@ -21,6 +21,7 @@ from merchant_ai.models import (
     category_display,
 )
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.memory import StructuredMemoryStore
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, PendingAnswerStore
 
@@ -1473,9 +1474,15 @@ class DailyReportService:
 
 
 class FeedbackService:
-    def __init__(self, answer_repository: AnswerRepository, pending_store: PendingAnswerStore):
+    def __init__(
+        self,
+        answer_repository: AnswerRepository,
+        pending_store: PendingAnswerStore,
+        memory_store: Optional[StructuredMemoryStore] = None,
+    ):
         self.answer_repository = answer_repository
         self.pending_store = pending_store
+        self.memory_store = memory_store
 
     def apply_feedback(self, answer_id: str, adopted: Any, liked: Any, disliked: Any) -> bool:
         pending = self.pending_store.get(answer_id)
@@ -1488,6 +1495,11 @@ class FeedbackService:
                 disliked=bool(disliked) if disliked is not None else False,
             )
         self.answer_repository.update_feedback(answer_id, adopted, liked, disliked)
+        if self.memory_store is not None and pending:
+            try:
+                self.memory_store.update_from_feedback(pending, adopted=adopted, liked=liked, disliked=disliked)
+            except Exception:
+                pass
         return persisted
 
 

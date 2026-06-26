@@ -262,6 +262,8 @@ class MerchantQaWorkflow:
             thread_context={},
             runtime_injection={},
             memory_injection={},
+            memory_injection_trace={},
+            memory_ingestion_trace={},
             open_diagnostic_scope="",
             open_diagnostic_intent="",
             open_diagnostic_goal="",
@@ -1991,10 +1993,12 @@ class MerchantQaWorkflow:
             add_step(state, "寒暄或无效意图不写入问答记录")
         try:
             memory_payload = self.memory_store.update_from_state(state)
+            state["memory_ingestion_trace"] = memory_payload.get("memoryIngestionTrace", {})
             state["memory_injection"] = self.memory_store.select_for_question(
                 state,
                 budget_chars=int(self.settings.context_memory_budget_chars or 1800),
             )
+            state["memory_injection_trace"] = state["memory_injection"].get("memoryInjectionTrace", {})
             add_step(
                 state,
                 "Memory Middleware：已更新结构化长期记忆 events=%d"
@@ -2062,6 +2066,7 @@ class MerchantQaWorkflow:
                 "threadContext": state.get("thread_context", {}),
                 "runtimeInjection": state.get("runtime_injection", {}),
                 "memoryInjection": state.get("memory_injection", {}),
+                "memory": self.memory_debug(state),
                 "contextSnapshots": state.get("context_snapshots", []),
                 "contextManagement": self.context_management_debug(state),
                 "middleware": self.middleware_debug(state),
@@ -2183,6 +2188,7 @@ class MerchantQaWorkflow:
                     "cache": self.cache_debug(),
                     "runtimeInjection": state.get("runtime_injection", {}),
                     "memoryInjection": state.get("memory_injection", {}),
+                    "memory": self.memory_debug(state),
                     "openDiagnostic": self.open_diagnostic_debug(state),
                     "routeSlots": state.get("route_slots", RouteSlots()).model_dump(by_alias=True),
                     "routeDecisionTrace": state.get("route_decision_trace", []),
@@ -2466,6 +2472,37 @@ class MerchantQaWorkflow:
                 "workspace files",
                 "user clarification",
             ],
+        }
+
+    def memory_debug(self, state: AgentState) -> Dict[str, Any]:
+        injection = state.get("memory_injection") or {}
+        trace = state.get("memory_injection_trace") or injection.get("memoryInjectionTrace") or {}
+        ingestion = state.get("memory_ingestion_trace") or {}
+        candidates = trace.get("candidates") or []
+        conflicts = ingestion.get("conflict") or {}
+        return {
+            "ingestion": ingestion,
+            "retrieval": {
+                "candidateCount": trace.get("candidateCount", 0),
+                "selectedIds": trace.get("selectedIds", []),
+                "filteredReasons": trace.get("filteredReasons", {}),
+                "topCandidates": candidates[:8],
+            },
+            "injection": {
+                "budgetChars": trace.get("budgetChars", 0),
+                "budgetUsedChars": trace.get("budgetUsedChars", 0),
+                "truncated": bool(trace.get("truncated")),
+                "recentFocus": injection.get("recentFocus", {}),
+                "correctionCount": len(injection.get("relevantCorrections") or []),
+                "preferenceCount": len(injection.get("relevantPreferences") or []),
+                "factCount": len(injection.get("relevantFacts") or []),
+                "eventCount": len(injection.get("relevantEvents") or []),
+            },
+            "conflicts": [conflicts] if conflicts else [],
+            "decay": {
+                "strategy": "confidence * time_decay * feedback_weight * hit_count_boost",
+                "recentFocusWeighted": bool((injection.get("recentFocus") or {}).get("updatedBy")),
+            },
         }
 
     def middleware_debug(self, state: AgentState) -> Dict[str, Any]:
