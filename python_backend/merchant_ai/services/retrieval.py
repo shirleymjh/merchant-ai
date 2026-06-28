@@ -104,6 +104,7 @@ class EsKnowledgeRetrievalService:
         self.settings = settings
         self.topic_assets = topic_assets
         self._recall_cache = build_ttl_cache("es_recall", settings, settings.cache_recall_ttl_seconds)
+        self._embedding_cache = build_ttl_cache("es_embedding", settings, settings.cache_recall_ttl_seconds)
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
@@ -120,6 +121,10 @@ class EsKnowledgeRetrievalService:
                 "includeBaseWiki": include_base_wiki,
                 "requestKey": str(request_key or ""),
                 "indexVersion": self._index_version(),
+                "vectorEnabled": self._vector_enabled(),
+                "embeddingModel": self.settings.embedding_model if self._vector_enabled() else "",
+                "rrfK": self.settings.es_rrf_k,
+                "hybridTopK": self.settings.es_hybrid_top_k,
             },
         )
         cached = self._recall_cache.get(cache_key)
@@ -177,9 +182,66 @@ class EsKnowledgeRetrievalService:
         return names
 
     def _search(self, query_text: str, topics: list[str], include_base_wiki: bool = False) -> list[RecallItem]:
+        text_items = self._text_search(query_text, topics, include_base_wiki=include_base_wiki)
+        if not self._vector_enabled() or not query_text:
+            return text_items
+        try:
+            vector = self._embed_text(query_text)
+            vector_items = self._vector_search(query_text, vector, topics, include_base_wiki=include_base_wiki) if vector else []
+        except Exception:
+            vector_items = []
+        if not vector_items:
+            return text_items
+        return rrf_fuse_recall_items(
+            [("bm25", text_items), ("vector", vector_items)],
+            rrf_k=self.settings.es_rrf_k,
+            score_scale=self.settings.es_rrf_score_scale,
+            limit=self.settings.es_hybrid_top_k,
+        )
+
+    def _text_search(self, query_text: str, topics: list[str], include_base_wiki: bool = False) -> list[RecallItem]:
         if not self.settings.es_base_url:
             raise RuntimeError("ES_BASE_URL_MISSING")
-        size = 12 if topics else 4
+        size = self._text_size(topics)
+        query = self._text_query(query_text, topics, include_base_wiki=include_base_wiki)
+        response = requests.post(
+            "%s/%s/_search" % (self.settings.es_base_url.rstrip("/"), self.settings.es_index),
+            headers=self._headers(),
+            auth=self._auth(),
+            json={"size": size, "query": query},
+            timeout=10,
+        )
+        response.raise_for_status()
+        hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
+        return [es_hit_to_recall_item(hit, query_text, channel="bm25") for hit in hits]
+
+    def _vector_search(self, query_text: str, query_vector: list[float], topics: list[str], include_base_wiki: bool = False) -> list[RecallItem]:
+        if not self.settings.es_base_url:
+            raise RuntimeError("ES_BASE_URL_MISSING")
+        if not query_vector:
+            return []
+        size = self._vector_size(topics)
+        filters = self._filters(topics, include_base_wiki=include_base_wiki)
+        knn: dict[str, object] = {
+            "field": self.settings.es_vector_field,
+            "query_vector": query_vector,
+            "k": size,
+            "num_candidates": max(size, int(self.settings.es_vector_num_candidates or 0)),
+        }
+        if filters:
+            knn["filter"] = filters if len(filters) > 1 else filters[0]
+        response = requests.post(
+            "%s/%s/_search" % (self.settings.es_base_url.rstrip("/"), self.settings.es_index),
+            headers=self._headers(),
+            auth=self._auth(),
+            json={"size": size, "knn": knn},
+            timeout=10,
+        )
+        response.raise_for_status()
+        hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
+        return [es_hit_to_recall_item(hit, query_text, channel="vector") for hit in hits]
+
+    def _text_query(self, query_text: str, topics: list[str], include_base_wiki: bool = False) -> dict[str, object]:
         must: list[dict[str, object]] = []
         if query_text:
             must.append(
@@ -198,6 +260,12 @@ class EsKnowledgeRetrievalService:
                     }
                 }
             )
+        filters = self._filters(topics, include_base_wiki=include_base_wiki)
+        if must or filters:
+            return {"bool": {"must": must or [{"match_all": {}}], "filter": filters}}
+        return {"match_all": {}}
+
+    def _filters(self, topics: list[str], include_base_wiki: bool = False) -> list[dict[str, object]]:
         filters: list[dict[str, object]] = []
         if topics:
             topic_should: list[dict[str, object]] = [
@@ -211,24 +279,70 @@ class EsKnowledgeRetrievalService:
             filters.append({"bool": {"should": topic_should, "minimum_should_match": 1}})
         elif include_base_wiki:
             filters.append({"term": {"source_type": "BASE_WIKI"}})
-        query: dict[str, object]
-        if must or filters:
-            query = {"bool": {"must": must or [{"match_all": {}}], "filter": filters}}
-        else:
-            query = {"match_all": {}}
+        return filters
+
+    def _text_size(self, topics: list[str]) -> int:
+        return max(1, int(self.settings.es_text_top_k if topics else self.settings.es_broad_text_top_k))
+
+    def _vector_size(self, topics: list[str]) -> int:
+        return max(1, int(self.settings.es_vector_top_k if topics else self.settings.es_broad_vector_top_k))
+
+    def _vector_enabled(self) -> bool:
+        return bool(self.settings.es_vector_enabled and self.settings.es_vector_field and self.settings.embedding_model and self._embedding_api_key())
+
+    def _embedding_api_key(self) -> str:
+        return str(self.settings.embedding_api_key or self.settings.llm_api_key or "").strip()
+
+    def _embed_text(self, text: str) -> list[float]:
+        value = str(text or "").strip()
+        if not value:
+            return []
+        cache_key = stable_cache_key(
+            "embedding",
+            {
+                "baseUrl": self.settings.embedding_base_url,
+                "model": self.settings.embedding_model,
+                "dims": self.settings.embedding_dims,
+                "text": value,
+            },
+        )
+        cached = self._embedding_cache.get(cache_key)
+        if isinstance(cached, list):
+            return [float(item) for item in cached]
+        payload: dict[str, object] = {"model": self.settings.embedding_model, "input": value}
+        if int(self.settings.embedding_dims or 0) > 0:
+            payload["dimensions"] = int(self.settings.embedding_dims)
         response = requests.post(
-            "%s/%s/_search" % (self.settings.es_base_url.rstrip("/"), self.settings.es_index),
-            headers=self._headers(),
-            auth=self._auth(),
-            json={"size": size, "query": query},
+            "%s/embeddings" % self.settings.embedding_base_url.rstrip("/"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer %s" % self._embedding_api_key(),
+            },
+            json=payload,
             timeout=10,
         )
         response.raise_for_status()
-        hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
-        return [es_hit_to_recall_item(hit, query_text) for hit in hits]
+        data = response.json() or {}
+        vector = (((data.get("data") or [{}])[0] or {}).get("embedding") or [])
+        result = [float(item) for item in vector if isinstance(item, (int, float))]
+        if result:
+            self._embedding_cache.set(cache_key, result)
+        return result
 
     def cache_trace(self) -> dict[str, object]:
-        return {"esRecall": self._recall_cache.trace()}
+        trace = {"esRecall": self._recall_cache.trace(), "esEmbedding": self._embedding_cache.trace()}
+        trace["hybridRecall"] = {
+            "vectorEnabled": self._vector_enabled(),
+            "vectorField": self.settings.es_vector_field,
+            "textTopK": self.settings.es_text_top_k,
+            "vectorTopK": self.settings.es_vector_top_k,
+            "broadTextTopK": self.settings.es_broad_text_top_k,
+            "broadVectorTopK": self.settings.es_broad_vector_top_k,
+            "rrfK": self.settings.es_rrf_k,
+            "hybridTopK": self.settings.es_hybrid_top_k,
+        }
+        return trace
 
     def _exact_metric_evidence(self, query_text: str, topics: list[str]) -> list[RecallItem]:
         """Protect exact metric evidence from ES topK truncation.
@@ -338,6 +452,77 @@ def merge_recall_items(primary: list[RecallItem], secondary: list[RecallItem]) -
     return sorted(by_id.values(), key=lambda item: item.fusion_score, reverse=True)
 
 
+def rrf_fuse_recall_items(
+    ranked_groups: list[tuple[str, list[RecallItem]]],
+    rrf_k: int = 60,
+    score_scale: float = 1000.0,
+    limit: int = 24,
+) -> list[RecallItem]:
+    """Fuse ranked recall lists with reciprocal rank fusion.
+
+    BM25 scores and vector similarities are not comparable. RRF only uses the
+    rank position inside each channel, so a document that appears near the top
+    in both channels naturally wins without score normalization.
+    """
+    k = max(1, int(rrf_k or 60))
+    scale = float(score_scale or 1.0)
+    by_id: dict[str, RecallItem] = {}
+    scores: dict[str, float] = {}
+    ranks: dict[str, dict[str, int]] = {}
+    channel_scores: dict[str, dict[str, float]] = {}
+    for channel, items in ranked_groups:
+        channel_name = str(channel or "unknown")
+        seen_in_channel: set[str] = set()
+        for rank, item in enumerate(items or [], start=1):
+            key = item.doc_id or str((item.metadata or {}).get("semanticRefId") or "")
+            if not key or key in seen_in_channel:
+                continue
+            seen_in_channel.add(key)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            ranks.setdefault(key, {})[channel_name] = rank
+            channel_scores.setdefault(key, {})[channel_name] = float(item.fusion_score or 0.0)
+            if key not in by_id:
+                by_id[key] = item
+            else:
+                by_id[key] = merge_recall_item_metadata(by_id[key], item)
+    fused: list[RecallItem] = []
+    for key, item in by_id.items():
+        metadata = dict(item.metadata or {})
+        metadata["recallFusion"] = "rrf"
+        metadata["rrfScore"] = scores.get(key, 0.0)
+        metadata["rrfK"] = k
+        metadata["rrfRanks"] = ranks.get(key, {})
+        metadata["channelScores"] = channel_scores.get(key, {})
+        metadata["recallChannels"] = sorted((ranks.get(key) or {}).keys())
+        fused.append(item.model_copy(update={"fusion_score": round(scores.get(key, 0.0) * scale, 6), "metadata": metadata}))
+    fused = sorted(fused, key=lambda item: item.fusion_score, reverse=True)
+    return fused[: max(1, int(limit or len(fused)))] if limit else fused
+
+
+def merge_recall_item_metadata(primary: RecallItem, secondary: RecallItem) -> RecallItem:
+    metadata = dict(primary.metadata or {})
+    other = dict(secondary.metadata or {})
+    for key, value in other.items():
+        if key not in metadata or is_empty_metadata_value(metadata.get(key)):
+            metadata[key] = value
+    queries: list[str] = []
+    for source in [metadata, other]:
+        for raw in list(source.get("recallQueries") or []) + [source.get("recallQuery")]:
+            query = str(raw or "").strip()
+            if query and query not in queries:
+                queries.append(query)
+    if queries:
+        metadata["recallQueries"] = queries
+        metadata["recallQuery"] = queries[0]
+    if secondary.content and len(secondary.content) > len(primary.content or ""):
+        return secondary.model_copy(update={"metadata": metadata})
+    return primary.model_copy(update={"metadata": metadata})
+
+
+def is_empty_metadata_value(value: object) -> bool:
+    return value is None or value == "" or value == []
+
+
 def unique_source_refs(items: list[RecallItem]) -> list[str]:
     refs: list[str] = []
     seen: set[str] = set()
@@ -441,7 +626,7 @@ def route_is_rule_sensitive(request: KnowledgeRetrievalRequest) -> bool:
     return risk_level == "rule_sensitive"
 
 
-def es_hit_to_recall_item(hit: dict[str, object], query_text: str) -> RecallItem:
+def es_hit_to_recall_item(hit: dict[str, object], query_text: str, channel: str = "bm25") -> RecallItem:
     source = hit.get("_source") if isinstance(hit, dict) else {}
     source = source if isinstance(source, dict) else {}
     metadata = dict(source.get("metadata") or {})
@@ -459,6 +644,11 @@ def es_hit_to_recall_item(hit: dict[str, object], query_text: str) -> RecallItem
     metadata["recallQuery"] = query_text
     metadata["recallQueries"] = [query_text] if query_text else []
     metadata["esScore"] = float(hit.get("_score") or 0.0)
+    metadata["recallChannel"] = channel
+    if channel == "bm25":
+        metadata["bm25Score"] = float(hit.get("_score") or 0.0)
+    elif channel == "vector":
+        metadata["vectorScore"] = float(hit.get("_score") or 0.0)
     return RecallItem(
         doc_id=str(source.get("doc_id") or semantic_ref_id or hit.get("_id") or ""),
         title=str(source.get("title") or ""),

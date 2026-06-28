@@ -103,8 +103,8 @@ from merchant_ai.services.context_assembly import ContextAssembler, ThreadContex
 from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, answer_chunks, run_duration_ms
 from merchant_ai.services.memory import StructuredMemoryStore
 from merchant_ai.services.repositories import PendingAnswerStore, write_json
-from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService
-from merchant_ai.services.recall_index import RecallIndexManager
+from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, rrf_fuse_recall_items
+from merchant_ai.services.recall_index import EsRecallIndexAdapter, RecallIndexManager
 from merchant_ai.services.planning import (
     PlannerReflectionAgent,
     QuestionUnderstandingCompiler,
@@ -3171,6 +3171,84 @@ def test_es_retrieval_supplements_exact_metric_evidence_when_topk_misses_it(monk
     assert pay_item.metadata["businessName"] == "退款金额"
     assert pay_item.metadata["matchedExactMetricLabel"] == "退款金额"
     assert pay_item.metadata["recallSupplement"] == "exact_metric_evidence"
+
+
+def test_rrf_fusion_prefers_items_ranked_by_both_channels():
+    text_items = [
+        RecallItem(doc_id="semantic:a", title="A", fusion_score=100, metadata={"recallChannel": "bm25"}),
+        RecallItem(doc_id="semantic:b", title="B", fusion_score=80, metadata={"recallChannel": "bm25"}),
+    ]
+    vector_items = [
+        RecallItem(doc_id="semantic:b", title="B", fusion_score=0.91, metadata={"recallChannel": "vector"}),
+        RecallItem(doc_id="semantic:c", title="C", fusion_score=0.89, metadata={"recallChannel": "vector"}),
+    ]
+
+    fused = rrf_fuse_recall_items([("bm25", text_items), ("vector", vector_items)], rrf_k=60, score_scale=1000, limit=10)
+
+    assert [item.doc_id for item in fused][:3] == ["semantic:b", "semantic:a", "semantic:c"]
+    assert fused[0].metadata["recallFusion"] == "rrf"
+    assert fused[0].metadata["rrfRanks"] == {"bm25": 2, "vector": 1}
+    assert set(fused[0].metadata["recallChannels"]) == {"bm25", "vector"}
+
+
+def test_es_hybrid_search_uses_vector_and_rrf_when_embedding_configured(monkeypatch):
+    settings = get_settings().model_copy(
+        update={
+            "embedding_api_key": "test-key",
+            "es_vector_enabled": True,
+            "es_hybrid_top_k": 10,
+            "cache_enabled": False,
+        }
+    )
+    service = EsKnowledgeRetrievalService(settings, TopicAssetService(settings))
+    monkeypatch.setattr(service, "_embed_text", lambda text: [0.1, 0.2])
+    monkeypatch.setattr(
+        service,
+        "_text_search",
+        lambda query_text, topics, include_base_wiki=False: [
+            RecallItem(doc_id="semantic:a", title="A", fusion_score=100),
+            RecallItem(doc_id="semantic:b", title="B", fusion_score=80),
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "_vector_search",
+        lambda query_text, vector, topics, include_base_wiki=False: [
+            RecallItem(doc_id="semantic:b", title="B", fusion_score=0.91),
+            RecallItem(doc_id="semantic:c", title="C", fusion_score=0.89),
+        ],
+    )
+
+    items = service._search("退款金额 商品发布时间", ["电商退货", "商品管理"])
+
+    assert [item.doc_id for item in items][:3] == ["semantic:b", "semantic:a", "semantic:c"]
+    assert items[0].metadata["recallFusion"] == "rrf"
+    assert items[0].metadata["rrfRanks"] == {"bm25": 2, "vector": 1}
+
+
+def test_es_hybrid_search_falls_back_to_text_without_embedding_key(monkeypatch):
+    settings = get_settings().model_copy(update={"embedding_api_key": "", "llm_api_key": "", "es_vector_enabled": True})
+    service = EsKnowledgeRetrievalService(settings, TopicAssetService(settings))
+    text_items = [RecallItem(doc_id="semantic:a", title="A", fusion_score=100)]
+    monkeypatch.setattr(service, "_text_search", lambda query_text, topics, include_base_wiki=False: text_items)
+
+    items = service._search("退款金额", ["电商退货"])
+
+    assert items == text_items
+
+
+def test_es_index_adapter_adds_content_vector_when_embedding_configured(monkeypatch):
+    settings = get_settings().model_copy(update={"embedding_api_key": "test-key", "embedding_dims": 2, "es_vector_enabled": True})
+    adapter = EsRecallIndexAdapter(settings)
+    monkeypatch.setattr(adapter, "_embed_recall_item", lambda item: [0.1, 0.2])
+
+    payload = adapter._recall_item_to_es_doc(
+        RecallItem(doc_id="semantic:test", title="退款金额", content="退款金额指标定义", metadata={"semanticRefId": "semantic:test"})
+    )
+
+    assert payload["content_vector"] == [0.1, 0.2]
+    assert payload["metadata"]["embeddingModel"] == settings.embedding_model
+    assert payload["metadata"]["embeddingDims"] == 2
 
 
 def test_llm_understanding_compiles_same_table_daily_metric_dependents():

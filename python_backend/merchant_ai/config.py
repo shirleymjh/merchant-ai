@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     es_api_key: str = Field("", validation_alias="YSHOPPING_ES_API_KEY")
     es_username: str = Field("", validation_alias="YSHOPPING_ES_USERNAME")
     es_password: str = Field("", validation_alias="YSHOPPING_ES_PASSWORD")
+    es_vector_enabled: bool = Field(True, validation_alias="YSHOPPING_ES_VECTOR_ENABLED")
+    es_vector_field: str = Field("content_vector", validation_alias="YSHOPPING_ES_VECTOR_FIELD")
+    es_text_top_k: int = Field(12, validation_alias="YSHOPPING_ES_TEXT_TOP_K")
+    es_broad_text_top_k: int = Field(4, validation_alias="YSHOPPING_ES_BROAD_TEXT_TOP_K")
+    es_vector_top_k: int = Field(12, validation_alias="YSHOPPING_ES_VECTOR_TOP_K")
+    es_broad_vector_top_k: int = Field(4, validation_alias="YSHOPPING_ES_BROAD_VECTOR_TOP_K")
+    es_vector_num_candidates: int = Field(80, validation_alias="YSHOPPING_ES_VECTOR_NUM_CANDIDATES")
+    es_rrf_k: int = Field(60, validation_alias="YSHOPPING_ES_RRF_K")
+    es_rrf_score_scale: float = Field(1000.0, validation_alias="YSHOPPING_ES_RRF_SCORE_SCALE")
+    es_hybrid_top_k: int = Field(24, validation_alias="YSHOPPING_ES_HYBRID_TOP_K")
 
     doris_jdbc_url: str = Field(
         "jdbc:mysql://127.0.0.1:9030/yshopping?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai",

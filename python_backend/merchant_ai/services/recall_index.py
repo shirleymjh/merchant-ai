@@ -10,6 +10,7 @@ import requests
 
 from merchant_ai.config import Settings
 from merchant_ai.models import RecallItem
+from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
 class RecallDocumentProvider(Protocol):
@@ -92,6 +93,7 @@ def build_index_manifest(root: Path, previous: dict[str, Any], changed_only: boo
 class EsRecallIndexAdapter:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._embedding_cache = build_ttl_cache("recall_index_embedding", settings, settings.cache_recall_ttl_seconds)
 
     def sync(self, docs: list[RecallItem], deleted_refs: list[str], replace_all: bool = False) -> dict[str, Any]:
         if not self.settings.es_base_url:
@@ -128,6 +130,7 @@ class EsRecallIndexAdapter:
         url = self._url(self.settings.es_index)
         response = requests.head(url, headers=self._headers(), auth=self._auth(), timeout=10)
         if response.status_code == 200:
+            self._ensure_vector_mapping()
             return
         if response.status_code not in {404, 400}:
             response.raise_for_status()
@@ -148,9 +151,37 @@ class EsRecallIndexAdapter:
                 }
             }
         }
+        if self.settings.es_vector_enabled:
+            mapping["mappings"]["properties"][self.settings.es_vector_field] = self._vector_mapping()
         put_response = requests.put(url, headers=self._headers(), auth=self._auth(), json=mapping, timeout=20)
         if put_response.status_code not in {200, 201}:
             put_response.raise_for_status()
+
+    def _ensure_vector_mapping(self) -> None:
+        if not self.settings.es_vector_enabled or not self.settings.es_vector_field:
+            return
+        try:
+            response = requests.put(
+                self._url("%s/_mapping" % self.settings.es_index),
+                headers=self._headers(),
+                auth=self._auth(),
+                json={"properties": {self.settings.es_vector_field: self._vector_mapping()}},
+                timeout=20,
+            )
+            if response.status_code in {200, 201}:
+                return
+            if response.status_code >= 400:
+                response.raise_for_status()
+        except Exception:
+            return
+
+    def _vector_mapping(self) -> dict[str, Any]:
+        return {
+            "type": "dense_vector",
+            "dims": max(1, int(self.settings.embedding_dims or 1536)),
+            "index": True,
+            "similarity": "cosine",
+        }
 
     def _bulk_upsert(self, docs: list[RecallItem]) -> dict[str, Any]:
         if not docs:
@@ -158,7 +189,7 @@ class EsRecallIndexAdapter:
         lines: list[str] = []
         for doc in docs:
             lines.append(json.dumps({"index": {"_index": self.settings.es_index, "_id": doc.doc_id}}, ensure_ascii=False))
-            lines.append(json.dumps(recall_item_to_es_doc(doc), ensure_ascii=False))
+            lines.append(json.dumps(self._recall_item_to_es_doc(doc), ensure_ascii=False))
         payload = "\n".join(lines) + "\n"
         response = requests.post(
             self._url("_bulk"),
@@ -171,6 +202,63 @@ class EsRecallIndexAdapter:
             return {"success": False, "count": 0, "error": response.text[:500]}
         body = response.json()
         return {"success": not bool(body.get("errors")), "count": len(docs), "error": json.dumps(body, ensure_ascii=False)[:500] if body.get("errors") else ""}
+
+    def _recall_item_to_es_doc(self, item: RecallItem) -> dict[str, Any]:
+        payload = recall_item_to_es_doc(item)
+        vector = self._embed_recall_item(item)
+        if vector:
+            payload[self.settings.es_vector_field] = vector
+            metadata = dict(payload.get("metadata") or {})
+            metadata["embeddingModel"] = self.settings.embedding_model
+            metadata["embeddingDims"] = len(vector)
+            payload["metadata"] = metadata
+        return payload
+
+    def _embed_recall_item(self, item: RecallItem) -> list[float]:
+        if not self._vector_enabled():
+            return []
+        text = "\n".join(part for part in [item.title, item.content] if str(part or "").strip()).strip()
+        if not text:
+            return []
+        cache_key = stable_cache_key(
+            "recall_index_embedding",
+            {
+                "baseUrl": self.settings.embedding_base_url,
+                "model": self.settings.embedding_model,
+                "dims": self.settings.embedding_dims,
+                "docId": item.doc_id,
+                "textHash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            },
+        )
+        cached = self._embedding_cache.get(cache_key)
+        if isinstance(cached, list):
+            return [float(value) for value in cached]
+        payload: dict[str, Any] = {"model": self.settings.embedding_model, "input": text}
+        if int(self.settings.embedding_dims or 0) > 0:
+            payload["dimensions"] = int(self.settings.embedding_dims)
+        response = requests.post(
+            "%s/embeddings" % self.settings.embedding_base_url.rstrip("/"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": "Bearer %s" % self._embedding_api_key(),
+            },
+            json=payload,
+            timeout=20,
+        )
+        response.raise_for_status()
+        body = response.json() or {}
+        vector = (((body.get("data") or [{}])[0] or {}).get("embedding") or [])
+        result = [float(value) for value in vector if isinstance(value, (int, float))]
+        if result:
+            self._embedding_cache.set(cache_key, result)
+        return result
+
+    def _vector_enabled(self) -> bool:
+        return bool(self.settings.es_vector_enabled and self.settings.es_vector_field and self.settings.embedding_model and self._embedding_api_key())
+
+    def _embedding_api_key(self) -> str:
+        return str(self.settings.embedding_api_key or self.settings.llm_api_key or "").strip()
 
     def _delete_refs(self, deleted_refs: list[str]) -> dict[str, Any]:
         count = 0
