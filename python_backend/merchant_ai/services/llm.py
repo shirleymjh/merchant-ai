@@ -6,7 +6,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
-from merchant_ai.services.cache import TTLCache, stable_cache_key
+from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
 class LlmClient:
@@ -18,11 +18,7 @@ class LlmClient:
         self._models_by_timeout: Dict[int, Any] = {}
         self.last_error = ""
         self.error_events: List[str] = []
-        self.response_cache = TTLCache(
-            "llm_response",
-            settings.cache_memory_max_entries,
-            settings.cache_llm_ttl_seconds if settings.cache_enabled else 0,
-        )
+        self.response_cache = build_ttl_cache("llm_response", settings, settings.cache_llm_ttl_seconds)
         self.last_cache_hit = False
         self.last_cache_key = ""
 

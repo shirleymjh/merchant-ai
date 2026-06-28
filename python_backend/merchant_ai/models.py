@@ -770,6 +770,7 @@ class ToolRuntimePolicy(APIModel):
     backoff_seconds: float = 0.0
     retryable_errors: List[str] = Field(default_factory=list)
     non_retryable_errors: List[str] = Field(default_factory=list)
+    fallback_tools: List[str] = Field(default_factory=list)
 
 
 class ToolCachePolicy(APIModel):
@@ -815,22 +816,52 @@ class RuntimeAlert(APIModel):
     created_at: str = ""
 
 
+class ToolRecoveryAction(APIModel):
+    error_type: str = ""
+    tool_kind: str = ""
+    action: str = ""
+    retryable: bool = False
+    fallback_tools: List[str] = Field(default_factory=list)
+    message: str = ""
+
+
 class ToolFailureRecord(APIModel):
     fingerprint: str = ""
     tool_name: str = ""
+    service_name: str = ""
+    target: str = ""
+    merchant_id: str = ""
+    thread_id: str = ""
+    params_hash: str = ""
+    circuit_key: str = ""
     error_type: str = ""
     error_message: str = ""
     count: int = 0
     blocked: bool = False
+    first_failed_at_ms: int = 0
+    last_failed_at_ms: int = 0
+    recovery_action: str = ""
 
 
 class CircuitBreakerState(APIModel):
+    circuit_key: str = ""
     tool_name: str = ""
+    service_name: str = ""
+    target: str = ""
+    merchant_id: str = ""
+    thread_id: str = ""
+    params_hash: str = ""
+    state: str = "closed"
     open: bool = False
     failure_count: int = 0
     reason: str = ""
     opened_at_ms: int = 0
     open_until_ms: int = 0
+    half_open_probe_in_flight: bool = False
+    last_probe_at_ms: int = 0
+    recovery_action: str = ""
+    recommended_action: str = ""
+    fallback_tools: List[str] = Field(default_factory=list)
 
 
 class ToolCallRequest(APIModel):
@@ -852,6 +883,13 @@ class ToolCallExecutionResult(APIModel):
     cache_key: str = ""
     rate_limited: bool = False
     target: str = ""
+    service_name: str = ""
+    circuit_key: str = ""
+    retryable: bool = False
+    recommended_action: str = ""
+    fallback_tools: List[str] = Field(default_factory=list)
+    tool_message: Dict[str, Any] = Field(default_factory=dict)
+    runtime_events: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class FreshnessCheckResult(APIModel):

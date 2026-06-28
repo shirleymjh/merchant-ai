@@ -22,7 +22,7 @@ from merchant_ai.models import (
     TopicBuildRequest,
     category_display,
 )
-from merchant_ai.services.cache import TTLCache, stable_cache_key
+from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.repositories import DorisRepository, write_json
 
@@ -589,11 +589,7 @@ class HybridRecallService:
         self.semantic_catalog = SemanticCatalogService(topic_assets)
         self.wiki_memory = wiki_memory
         self._documents: Optional[List[RecallItem]] = None
-        self._recall_cache = TTLCache(
-            "hybrid_recall",
-            settings.cache_memory_max_entries,
-            settings.cache_recall_ttl_seconds if settings.cache_enabled else 0,
-        )
+        self._recall_cache = build_ttl_cache("hybrid_recall", settings, settings.cache_recall_ttl_seconds)
 
     def recall(
         self,
@@ -887,10 +883,10 @@ class PlanningAssetPackBuilder:
         self.doris_repository = doris_repository
         self._all_metrics_by_key_cache: Optional[Dict[str, List[PlanningAssetEntry]]] = None
         self._live_schema_cache: Dict[str, List[Dict[str, Any]]] = {}
-        self._compact_cache = TTLCache(
+        self._compact_cache = build_ttl_cache(
             "planning_asset_pack",
-            topic_assets.settings.cache_memory_max_entries,
-            topic_assets.settings.cache_asset_pack_ttl_seconds if topic_assets.settings.cache_enabled else 0,
+            topic_assets.settings,
+            topic_assets.settings.cache_asset_pack_ttl_seconds,
         )
 
     def compact(

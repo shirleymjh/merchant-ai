@@ -17,7 +17,8 @@ from merchant_ai.models import (
     RecallRoundTrace,
     category_display,
 )
-from merchant_ai.services.assets import HybridRecallService, TopicAssetService
+from merchant_ai.services.assets import HybridRecallService, TopicAssetService, compact_metric_for_recall
+from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
 class KnowledgeRetrievalService(Protocol):
@@ -86,6 +87,9 @@ class HybridKnowledgeRetrievalService:
             return ""
         return str(payload.get("indexVersion") or "")
 
+    def cache_trace(self) -> dict[str, object]:
+        return self.recall_service.cache_trace() if hasattr(self.recall_service, "cache_trace") else {}
+
 
 class EsKnowledgeRetrievalService:
     """Elasticsearch-backed knowledge retrieval adapter.
@@ -99,6 +103,7 @@ class EsKnowledgeRetrievalService:
     def __init__(self, settings: Settings, topic_assets: TopicAssetService):
         self.settings = settings
         self.topic_assets = topic_assets
+        self._recall_cache = build_ttl_cache("es_recall", settings, settings.cache_recall_ttl_seconds)
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
@@ -106,6 +111,20 @@ class EsKnowledgeRetrievalService:
         normalized_categories = [category for category in [normalize_question_category(item) for item in request.topic_categories] if category]
         topics = self._allowed_topics(normalized_categories)
         include_base_wiki = QuestionCategory.PLATFORM_RULE in set(normalized_categories) or route_is_rule_sensitive(request)
+        cache_key = stable_cache_key(
+            "es_recall",
+            {
+                "query": query_text,
+                "merchantId": request.merchant_id,
+                "topics": topics,
+                "includeBaseWiki": include_base_wiki,
+                "requestKey": str(request_key or ""),
+                "indexVersion": self._index_version(),
+            },
+        )
+        cached = self._recall_cache.get(cache_key)
+        if cached is not None:
+            return KnowledgeBundle.model_validate(cached)
         try:
             items = self._search(query_text, topics, include_base_wiki=include_base_wiki)
             if topics and not request.knowledge_request:
@@ -113,6 +132,7 @@ class EsKnowledgeRetrievalService:
                     items = merge_recall_items(items, self._search(query_text, [], include_base_wiki=False))
                 except Exception:
                     pass
+            items = merge_recall_items(items, self._exact_metric_evidence(query_text, topics))
             blocked_reason = ""
         except Exception as exc:
             items = []
@@ -129,7 +149,7 @@ class EsKnowledgeRetrievalService:
             blocked_reason=blocked_reason,
         )
         merged = "\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items)
-        return KnowledgeBundle(
+        bundle = KnowledgeBundle(
             recall_bundle=RecallBundle(
                 items=items,
                 top_score=items[0].fusion_score if items else 0.0,
@@ -141,6 +161,9 @@ class EsKnowledgeRetrievalService:
             index_version=self._index_version(),
             semantic_source_hash=semantic_hash_for_items(items),
         )
+        if not blocked_reason:
+            self._recall_cache.set(cache_key, bundle.model_dump(by_alias=True))
+        return bundle
 
     def _allowed_topics(self, topic_categories: list[QuestionCategory]) -> list[str]:
         topic_names = self.topic_assets.topic_names_for_categories(topic_categories)
@@ -203,6 +226,72 @@ class EsKnowledgeRetrievalService:
         response.raise_for_status()
         hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
         return [es_hit_to_recall_item(hit, query_text) for hit in hits]
+
+    def cache_trace(self) -> dict[str, object]:
+        return {"esRecall": self._recall_cache.trace()}
+
+    def _exact_metric_evidence(self, query_text: str, topics: list[str]) -> list[RecallItem]:
+        """Protect exact metric evidence from ES topK truncation.
+
+        ES remains the retrieval backend; this only supplements semantic metric
+        refs whose governed businessName/alias appears verbatim in the query.
+        It does not choose the final metric for the planner.
+        """
+        query = (query_text or "").strip()
+        if not query:
+            return []
+        topic_names = topics or self.topic_assets.all_topic_names()
+        items: list[RecallItem] = []
+        seen: set[str] = set()
+        for topic in topic_names:
+            for manifest_item in self.topic_assets.load_manifest(topic):
+                table = str(manifest_item.get("tableName") or "")
+                if not table:
+                    continue
+                for metric in self.topic_assets.load_table_metrics(topic, table):
+                    if not isinstance(metric, dict):
+                        continue
+                    metric_key = str(metric.get("metricKey") or "")
+                    if not metric_key:
+                        continue
+                    matched_label = exact_metric_label_in_query(metric, query)
+                    if not matched_label:
+                        continue
+                    semantic_ref_id = "semantic:%s:%s:metric:%s" % (topic, table, metric_key)
+                    if semantic_ref_id in seen:
+                        continue
+                    seen.add(semantic_ref_id)
+                    items.append(
+                        RecallItem(
+                            doc_id=semantic_ref_id,
+                            title="%s/%s/%s metric" % (topic, table, metric_key),
+                            content=compact_metric_for_recall(topic, table, metric),
+                            source_type="SEMANTIC_METRIC",
+                            topic=topic,
+                            table=table,
+                            fusion_score=0.01,
+                            metadata={
+                                "semanticSource": "metrics",
+                                "semanticKind": "METRIC",
+                                "semanticRefId": semantic_ref_id,
+                                "metricKey": metric_key,
+                                "tableName": table,
+                                "topic": topic,
+                                "businessName": metric.get("businessName") or metric_key,
+                                "canonicalMetricKey": metric.get("canonicalMetricKey") or "",
+                                "aliasOf": metric.get("aliasOf") or "",
+                                "metricLevel": metric.get("metricLevel") or "",
+                                "formula": metric.get("formula") or metric.get("metricFormula") or "",
+                                "sourceColumns": metric.get("sourceColumns") or [],
+                                "aliases": metric.get("aliases") or [],
+                                "recallQuery": query,
+                                "recallQueries": [query],
+                                "matchedExactMetricLabel": matched_label,
+                                "recallSupplement": "exact_metric_evidence",
+                            },
+                        )
+                    )
+        return items
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -283,6 +372,51 @@ def retrieval_query_text(request: KnowledgeRetrievalRequest) -> str:
         seen.add(value)
         values.append(value)
     return " ".join(values)
+
+
+GENERIC_METRIC_LABELS = {
+    "金额",
+    "数量",
+    "单量",
+    "商品",
+    "订单",
+    "退款",
+    "退货",
+    "售后",
+    "支付",
+    "下单",
+    "情况",
+}
+
+
+def exact_metric_label_in_query(metric: dict[str, object], query_text: str) -> str:
+    query = normalize_recall_label(query_text)
+    if not query:
+        return ""
+    labels = [
+        str(metric.get("businessName") or ""),
+        str(metric.get("metricKey") or ""),
+        *[str(alias) for alias in metric.get("aliases") or []],
+    ]
+    for label in labels:
+        normalized = normalize_recall_label(label)
+        if not is_protective_metric_label(normalized):
+            continue
+        if normalized and normalized in query:
+            return label
+    return ""
+
+
+def normalize_recall_label(value: str) -> str:
+    return "".join(str(value or "").lower().split())
+
+
+def is_protective_metric_label(label: str) -> bool:
+    if not label or label in GENERIC_METRIC_LABELS:
+        return False
+    if "_" in label:
+        return len(label) >= 4
+    return len(label) >= 3
 
 
 def normalize_question_category(category: object) -> QuestionCategory | None:

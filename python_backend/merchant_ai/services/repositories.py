@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings, jdbc_to_pymysql_kwargs
 from merchant_ai.models import MerchantInfo, PendingAnswer
-from merchant_ai.services.cache import TTLCache, stable_cache_key
+from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
 class DatabaseClient:
@@ -64,11 +64,7 @@ class DorisRepository:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.db = DatabaseClient(settings.doris_jdbc_url, settings.doris_username, settings.doris_password, settings.doris_read_timeout_seconds)
-        self.query_cache = TTLCache(
-            "doris_select",
-            settings.cache_memory_max_entries,
-            settings.cache_doris_select_ttl_seconds if settings.cache_enabled else 0,
-        )
+        self.query_cache = build_ttl_cache("doris_select", settings, settings.cache_doris_select_ttl_seconds)
         self.last_cache_hit = False
         self.last_cache_key = ""
 

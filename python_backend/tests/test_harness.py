@@ -70,6 +70,7 @@ from merchant_ai.services.assets import (
     WikiMemoryService,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.cache import build_ttl_cache
 from merchant_ai.services.answer import (
     AnswerComposeService,
     FeedbackService,
@@ -88,6 +89,7 @@ from merchant_ai.services.formulas import compile_metric_formula, reconcile_metr
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.middleware import (
     CancellationMiddleware,
+    ClarificationMiddleware,
     ContextBudgetMiddleware,
     DynamicContextMiddleware,
     FileSystemContextMiddleware,
@@ -1702,6 +1704,17 @@ def test_first_step_topic_router_covers_trade_refund_goods_for_top_spu_refund_qu
     assert "不表示 anchor" in topic.reason
 
 
+def test_multi_topic_route_does_not_assign_fixed_order_primary_topic():
+    question = "最近30天退款金额最高的前5个商品，同时看这些商品的下单量和商品发布时间，帮我判断哪些是高风险新品。"
+    keywords = KeywordExtractService().extract(question)
+    slots = RouteSlotExtractor().extract(question, keywords)
+    topic = TopicRouterService().route(question, keywords, route_slots=slots)
+
+    assert topic.primary_topic == QuestionCategory.UNKNOWN
+    assert topic.recall_topics() == [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS]
+    assert "primaryTopic 保持 UNKNOWN" in topic.reason
+
+
 def test_first_step_topic_router_covers_coupon_activity_synonym():
     question = "最近30天券活动投入最高的活动，带来的支付订单数怎么样？"
     keywords = KeywordExtractService().extract(question)
@@ -1757,6 +1770,11 @@ def test_route_topic_blocks_write_operation_before_retrieval():
     assert state["human_clarification_required"]
     assert state["human_clarification_type"] == "write_operation"
     assert workflow.policy.decide(state).selected_action == "ask_human"
+    state = workflow.policy_node(state)
+    assert state["_next_action"] == "human_in_loop"
+    assert state["clarification_tool_message"]["toolName"] == "ask_clarification"
+    assert state["clarification_command"]["goto"] == "END"
+    assert state["tool_call_results"][-1].name == "ask_clarification"
 
 
 def test_bounded_route_llm_can_only_filter_allowed_topics(tmp_path):
@@ -3109,9 +3127,50 @@ def test_es_knowledge_retrieval_returns_source_refs(monkeypatch):
     )
 
     assert bundle.backend == "es"
-    assert bundle.source_refs == ["semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_related_pay_amt"]
+    assert "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_related_pay_amt" in bundle.source_refs
     assert bundle.recall_rounds[0].backend == "es"
     assert bundle.recall_bundle.items[0].table == "dwm_trade_refund_detail_di"
+
+
+def test_es_retrieval_supplements_exact_metric_evidence_when_topk_misses_it(monkeypatch):
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    service = EsKnowledgeRetrievalService(settings, topic_assets)
+
+    def fake_search(query_text, topics, include_base_wiki=False):
+        return [
+            RecallItem(
+                doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
+                title="refund rate",
+                content="退款率",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=99.0,
+                metadata={
+                    "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
+                    "metricKey": "refund_rate",
+                    "tableName": "dwm_trade_refund_detail_di",
+                    "topic": "电商退货",
+                    "businessName": "商品退货率",
+                },
+            )
+        ]
+
+    monkeypatch.setattr(service, "_search", fake_search)
+    bundle = service.retrieve(
+        KnowledgeRetrievalRequest(
+            query="最近30天退款金额最高的前5个商品",
+            topic_categories=[QuestionCategory.REFUND, QuestionCategory.GOODS],
+        )
+    )
+
+    metric_ids = {item.doc_id for item in bundle.recall_bundle.items if str(item.source_type).upper() == "SEMANTIC_METRIC"}
+    assert "semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt" in metric_ids
+    pay_item = next(item for item in bundle.recall_bundle.items if item.doc_id.endswith(":pay_amt"))
+    assert pay_item.metadata["businessName"] == "退款金额"
+    assert pay_item.metadata["matchedExactMetricLabel"] == "退款金额"
+    assert pay_item.metadata["recallSupplement"] == "exact_metric_evidence"
 
 
 def test_llm_understanding_compiles_same_table_daily_metric_dependents():
@@ -4785,6 +4844,34 @@ def test_tool_call_recovery_patches_dangling_tool_result():
     assert state["tool_call_recovery_events"][0].action == "patch_missing_terminal_result"
 
 
+def test_clarification_middleware_intercepts_ask_human_as_virtual_tool_call():
+    state = {
+        "qa_id": "qa_clarify",
+        "question": "删除最近30天订单数据",
+        "human_clarification_required": True,
+        "human_clarification_question": "写操作需要人工确认。",
+        "human_clarification_stage": "BUSINESS_SCOPE",
+        "human_clarification_type": "write_operation",
+        "human_clarification_options": ["取消操作", "提交工单"],
+        "tool_call_results": [],
+        "tool_call_ledger": [],
+        "middleware_events": [],
+        "tool_runtime_events": [],
+    }
+    decision = AgentDecision(selected_action="ask_human", selected_node="human_in_loop", available_actions=["ask_human"])
+
+    ClarificationMiddleware().before_action(state, decision)
+
+    assert state["_clarification_tool_intercepted"]
+    assert state["clarification_command"]["goto"] == "END"
+    assert state["clarification_tool_message"]["toolName"] == "ask_clarification"
+    assert state["clarification_tool_message"]["question"] == "写操作需要人工确认。"
+    assert state["tool_call_results"][0].name == "ask_clarification"
+    assert state["tool_call_results"][0].tool_message["type"] == "clarification_request"
+    assert state["tool_call_ledger"][0].tool_name == "ask_clarification"
+    assert state["middleware_events"][-1].code == "CLARIFICATION_TOOL_INTERCEPTED"
+
+
 def test_cancellation_middleware_marks_run_canceled(tmp_path):
     settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
     runs_dir = tmp_path / "run_events" / "runs"
@@ -4831,6 +4918,22 @@ def test_tool_failure_registry_blocks_repeated_identical_failures():
     assert "repeated identical failure" in blocked.reason
 
 
+def test_tool_failure_registry_separates_merchant_thread_and_target():
+    registry = ToolFailureRegistry(repeat_threshold=2, circuit_threshold=5)
+    args_a = {"taskId": "anchor", "sql": "SELECT * FROM x", "merchantId": "seller_a", "threadId": "thread_a"}
+    args_b = {"taskId": "anchor", "sql": "SELECT * FROM x", "merchantId": "seller_b", "threadId": "thread_a"}
+    registry.record_failure("execute_sql", args_a, "TIMEOUT", "slow", service_name="doris", target="primary")
+    registry.record_failure("execute_sql", args_a, "TIMEOUT", "slow", service_name="doris", target="primary")
+
+    blocked_a = registry.should_block("execute_sql", args_a, service_name="doris", target="primary")
+    blocked_b = registry.should_block("execute_sql", args_b, service_name="doris", target="primary")
+
+    assert blocked_a is not None
+    assert blocked_a.merchant_id == "seller_a"
+    assert blocked_a.target == "primary"
+    assert blocked_b is None
+
+
 def test_tool_failure_registry_releases_tool_after_cooldown():
     registry = ToolFailureRegistry(repeat_threshold=5, circuit_threshold=1, cooldown_seconds=1)
     args = {"taskId": "anchor", "sql": "SELECT * FROM x"}
@@ -4840,6 +4943,23 @@ def test_tool_failure_registry_releases_tool_after_cooldown():
     assert blocked.open
     blocked.open_until_ms = 1
     assert registry.should_block("execute_sql", {"taskId": "other"}) is None
+
+
+def test_tool_failure_registry_half_open_probe_closes_on_success():
+    registry = ToolFailureRegistry(repeat_threshold=5, circuit_threshold=1, cooldown_seconds=1)
+    args = {"taskId": "anchor", "sql": "SELECT * FROM x"}
+    registry.record_failure("execute_sql", args, "TIMEOUT", "slow", service_name="doris", target="primary")
+    circuit = registry.should_block("execute_sql", args, service_name="doris", target="primary")
+    assert circuit is not None
+    circuit.open_until_ms = 1
+
+    assert registry.should_block("execute_sql", args, service_name="doris", target="primary") is None
+    half_open = registry.trace()["circuits"][0]
+    assert half_open["state"] == "half_open"
+    registry.record_success("execute_sql", args, service_name="doris", target="primary")
+    closed = registry.trace()["circuits"][0]
+    assert closed["state"] == "closed"
+    assert closed["open"] is False
 
 
 def test_entity_transfer_does_not_mix_order_id_into_sub_order_id_dependency():
@@ -4924,6 +5044,56 @@ def test_tool_runtime_service_caches_successful_result():
     assert metrics["cacheHits"] == 1
 
 
+def test_redis_ttl_cache_falls_back_to_memory_when_unavailable(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "redis_enabled": True,
+            "redis_cache_enabled": True,
+            "redis_url": "redis://127.0.0.1:1/0",
+            "redis_socket_timeout_seconds": 0.05,
+            "cache_memory_max_entries": 8,
+        }
+    )
+    cache = build_ttl_cache("unit_redis_fallback", settings, 60)
+
+    cache.set("key", {"value": 1})
+    assert cache.get("key") == {"value": 1}
+    trace = cache.trace()
+    assert trace["backend"] == "redis+memory_fallback"
+    assert trace["fallback"]["hits"] == 1
+
+
+def test_tool_runtime_redis_cache_store_falls_back_to_memory_when_unavailable(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "redis_enabled": True,
+            "redis_cache_enabled": True,
+            "redis_rate_limit_enabled": True,
+            "redis_url": "redis://127.0.0.1:1/0",
+            "redis_socket_timeout_seconds": 0.05,
+            "semantic_cache_ttl_seconds": 60,
+        }
+    )
+    runtime = ToolRuntimeService(settings)
+    calls = {"count": 0}
+
+    def handler(args):
+        calls["count"] += 1
+        return {"value": args["value"], "count": calls["count"]}
+
+    policy = ToolCachePolicy(enabled=True, namespace="semantic_test", ttl_seconds=60)
+    runtime.execute("semantic_read", {"value": 7, "semanticVersion": "v1"}, handler, cache_policy=policy)
+    second = runtime.execute("semantic_read", {"value": 7, "semanticVersion": "v1"}, handler, cache_policy=policy)
+
+    assert second.cache_hit
+    assert calls["count"] == 1
+    assert runtime.trace()["cache"]["backend"] == "redis+memory_fallback"
+
+
 def test_tool_runtime_service_rate_limit_blocks_without_calling_handler():
     settings = get_settings().model_copy(update={"tool_rate_limit_enabled": True, "tool_default_qps": 1})
     runtime = ToolRuntimeService(settings)
@@ -4940,6 +5110,64 @@ def test_tool_runtime_service_rate_limit_blocks_without_calling_handler():
     assert second.status == "blocked"
     assert second.error_type == "RATE_LIMITED"
     assert calls["count"] == 1
+
+
+def test_tool_runtime_service_returns_structured_tool_message_and_recovery_action():
+    settings = get_settings().model_copy(update={"tool_rate_limit_enabled": False})
+    runtime = ToolRuntimeService(settings)
+
+    def handler(args):
+        raise RuntimeError("Unknown column 'refund_amt'")
+
+    result = runtime.execute(
+        "execute_sql",
+        {"sql": "SELECT refund_amt FROM t", "merchantId": "seller_100", "threadId": "thread_1"},
+        handler,
+        target_kind="doris",
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == "UNKNOWN_COLUMN"
+    assert result.service_name == "doris"
+    assert result.circuit_key
+    assert result.retryable is False
+    assert result.recommended_action == "semantic_recall_or_graph_repair"
+    assert "semantic_read" in result.fallback_tools
+    assert result.tool_message["errorCode"] == "UNKNOWN_COLUMN"
+    assert result.tool_message["recommendedAction"] == "semantic_recall_or_graph_repair"
+    event_types = [item["eventType"] for item in runtime.trace()["events"]]
+    assert "tool.failed" in event_types
+    assert "tool.recovery.recommended" in event_types
+
+
+def test_tool_runtime_service_circuit_half_open_events():
+    settings = get_settings().model_copy(
+        update={
+            "tool_rate_limit_enabled": False,
+            "tool_circuit_threshold": 1,
+            "tool_circuit_cooldown_seconds": 1,
+        }
+    )
+    runtime = ToolRuntimeService(settings)
+    calls = {"count": 0}
+
+    def fail_once(args):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("timeout")
+        return {"ok": True}
+
+    first = runtime.execute("semantic_read", {"refId": "metric.refund_rate"}, fail_once)
+    assert first.status == "failed"
+    circuit = runtime.failure_registry.trace()["circuits"][0]
+    assert circuit["state"] == "open"
+    runtime.failure_registry.circuits[circuit["circuitKey"]].open_until_ms = 1
+
+    second = runtime.execute("semantic_read", {"refId": "metric.refund_rate"}, fail_once)
+    assert second.status == "success"
+    event_types = [item["eventType"] for item in runtime.trace()["events"]]
+    assert "tool.circuit.half_open" in event_types
+    assert "tool.circuit.closed" in event_types
 
 
 def test_round_robin_load_balancer_cycles_targets():
@@ -11802,6 +12030,44 @@ def test_hybrid_recall_caches_by_question_and_topics(tmp_path):
 
     assert len(second.items) == len(first.items)
     assert recall.cache_trace()["recall"]["hits"] == 1
+
+
+def test_es_retrieval_caches_successful_bundle(tmp_path, monkeypatch):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "cache_enabled": True,
+            "cache_recall_ttl_seconds": 60,
+            "cache_memory_max_entries": 8,
+        }
+    )
+    retriever = EsKnowledgeRetrievalService(settings, TopicAssetService(settings))
+    calls = {"count": 0}
+
+    def fake_search(query_text, topics, include_base_wiki=False):
+        calls["count"] += 1
+        return [
+            RecallItem(
+                doc_id="semantic:test",
+                title="退款金额",
+                content="退款金额指标",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=10,
+            )
+        ]
+
+    monkeypatch.setattr(retriever, "_search", fake_search)
+    monkeypatch.setattr(retriever, "_exact_metric_evidence", lambda query_text, topics: [])
+    request = KnowledgeRetrievalRequest(query="最近7天退款金额", merchant_id="100", topic_categories=[])
+
+    first = retriever.retrieve(request)
+    second = retriever.retrieve(request)
+
+    assert first.source_refs == second.source_refs == ["semantic:test"]
+    assert calls["count"] == 1
+    assert retriever.cache_trace()["esRecall"]["hits"] == 1
 
 
 def test_asset_pack_cache_returns_deep_copy(tmp_path):

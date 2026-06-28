@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
@@ -18,6 +19,7 @@ from merchant_ai.models import (
     ToolCallExecutionResult,
     ToolCallRequest,
     ToolFailureRecord,
+    ToolRecoveryAction,
     ToolRuntimeMetrics,
     ToolRuntimePolicy,
 )
@@ -45,6 +47,178 @@ def classify_tool_error(error: Exception | str) -> str:
     if "provider" in lower or "llm" in lower or "model" in lower:
         return "PROVIDER_ERROR"
     return "ERROR"
+
+
+def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", target: str = "") -> Dict[str, str]:
+    safe_args = args if isinstance(args, dict) else {}
+    raw_target = safe_args.get("_target") if isinstance(safe_args, dict) else {}
+    target_name = target
+    if not target_name and isinstance(raw_target, dict):
+        target_name = str(raw_target.get("name") or raw_target.get("endpoint") or "")
+    service = service_name or str(safe_args.get("_service") or safe_args.get("service") or "")
+    merchant_id = str(
+        safe_args.get("merchantId")
+        or safe_args.get("merchant_id")
+        or safe_args.get("sellerId")
+        or safe_args.get("seller_id")
+        or ""
+    )
+    thread_id = str(safe_args.get("threadId") or safe_args.get("thread_id") or "")
+    params_hash = tool_params_hash(safe_args)
+    service = service or "tool"
+    circuit_key = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s" % (
+        tool_name,
+        service,
+        target_name or "default",
+        merchant_id or "*",
+        thread_id or "*",
+    )
+    fingerprint = "%s|params=%s" % (circuit_key, params_hash)
+    return {
+        "toolName": tool_name,
+        "serviceName": service,
+        "target": target_name or "default",
+        "merchantId": merchant_id,
+        "threadId": thread_id,
+        "paramsHash": params_hash,
+        "circuitKey": circuit_key,
+        "fingerprint": fingerprint,
+    }
+
+
+def tool_params_hash(args: Any) -> str:
+    safe_args = sanitize_tool_args(args)
+    try:
+        payload = json.dumps(safe_args, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        payload = str(safe_args)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def sanitize_tool_args(args: Any) -> Any:
+    if not isinstance(args, dict):
+        return args
+    return {key: value for key, value in args.items() if not str(key).startswith("_")}
+
+
+def recovery_action_for(tool_name: str, error_type: str, tool_kind: str = "") -> ToolRecoveryAction:
+    kind = tool_kind or infer_tool_kind(tool_name)
+    error = str(error_type or "ERROR")
+    if error in {"UNKNOWN_COLUMN", "UNKNOWN_BASE_TABLE"}:
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="semantic_recall_or_graph_repair",
+            retryable=False,
+            fallback_tools=["semantic_read", "semantic_grep", "graph_repair"],
+            message="字段或表不存在，请回到语义层确认口径或修正 QueryGraph。",
+        )
+    if error in {"INVALID_ARGUMENT", "PARSE_ERROR", "UNSAFE_SQL"}:
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="fix_arguments_or_use_structured_fallback",
+            retryable=False,
+            fallback_tools=["structured_sql_fallback", "ask_human"],
+            message="参数或 SQL 不满足工具约束，请修正参数或使用结构化兜底。",
+        )
+    if error == "MEM_ALLOC_FAILED":
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="reduce_query_scope_or_answer_with_gap",
+            retryable=False,
+            fallback_tools=["use_cache", "limit_rows", "answer_with_gap"],
+            message="查询资源不足，请缩小时间范围、减少行数或返回部分证据。",
+        )
+    if error == "TIMEOUT":
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="retry_if_policy_allows_or_degrade",
+            retryable=kind in {"llm", "es", "semantic"},
+            fallback_tools=["use_cache", "partial_answer", "ask_user_to_narrow"],
+            message="工具超时，可按策略有限重试；不可恢复时使用缓存、部分结果或澄清。",
+        )
+    if error == "RATE_LIMITED":
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="wait_or_degrade",
+            retryable=False,
+            fallback_tools=["use_cache", "answer_with_gap"],
+            message="工具被限流，短时间内不应继续高频调用。",
+        )
+    if error == "CIRCUIT_OPEN":
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="use_fallback_tool_or_answer_with_gap",
+            retryable=False,
+            fallback_tools=["use_cache", "fallback_tool", "answer_with_gap"],
+            message="工具熔断中，请使用备用工具、缓存或带缺口回答。",
+        )
+    if error == "PROVIDER_ERROR":
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="retry_or_switch_provider",
+            retryable=True,
+            fallback_tools=["fallback_model", "template_answer"],
+            message="模型服务异常，可有限重试或切换备用模型。",
+        )
+    if error in {"NOT_FOUND", "PERMISSION_DENIED"}:
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="ask_user_or_human_review",
+            retryable=False,
+            fallback_tools=["ask_human", "answer_with_gap"],
+            message="资源不存在或权限不足，应澄清、人工介入或带缺口回答。",
+        )
+    return ToolRecoveryAction(
+        error_type=error,
+        tool_kind=kind,
+        action="classify_error_and_answer_with_gap",
+        retryable=False,
+        fallback_tools=["answer_with_gap"],
+        message="工具失败，请根据结构化错误决定是否换工具、重规划或带缺口回答。",
+    )
+
+
+def infer_tool_kind(tool_name: str) -> str:
+    if tool_name in {"draft_llm_sql", "repair_sql", "emit_question_understanding", "draft_sql", "llm_chat", "llm_tool_chat"}:
+        return "llm"
+    if tool_name in {"execute_sql", "check_freshness", "doris_query"}:
+        return "doris"
+    if tool_name.startswith("semantic_") or tool_name.startswith("artifact_"):
+        return "semantic"
+    if tool_name.startswith("es_") or tool_name == "retrieve_knowledge":
+        return "es"
+    return "tool"
+
+
+def structured_tool_message(
+    tool_name: str,
+    status: str,
+    error_type: str = "",
+    message: str = "",
+    recovery: ToolRecoveryAction | None = None,
+    circuit_key: str = "",
+    retryable: bool | None = None,
+    fallback_tools: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    action = recovery or recovery_action_for(tool_name, error_type)
+    return {
+        "toolName": tool_name,
+        "status": status,
+        "errorCode": error_type,
+        "retryable": action.retryable if retryable is None else bool(retryable),
+        "recommendedAction": action.action,
+        "fallbackTools": list(fallback_tools if fallback_tools is not None else action.fallback_tools),
+        "message": message or action.message,
+        "circuitKey": circuit_key,
+    }
 
 
 class CacheStore:
@@ -108,6 +282,124 @@ class MemoryCacheStore(CacheStore):
             return {"entries": len(self._items), "hits": self._hits, "misses": self._misses, "maxEntries": self.max_entries}
 
 
+class RedisCacheStore(CacheStore):
+    """Redis implementation for tool-runtime cache, with memory fallback."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.namespace = safe_redis_namespace(settings.redis_namespace)
+        self._fallback = MemoryCacheStore(settings.cache_memory_max_entries)
+        self._client = None
+        self.available = False
+        self.last_error = ""
+        self._hits = 0
+        self._misses = 0
+        self._sets = 0
+        try:
+            import redis
+
+            timeout = max(0.05, float(settings.redis_socket_timeout_seconds or 1.0))
+            self._client = redis.Redis.from_url(
+                settings.redis_url,
+                socket_timeout=timeout,
+                socket_connect_timeout=timeout,
+                decode_responses=False,
+            )
+            self._client.ping()
+            self.available = True
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self._client = None
+            self.available = False
+
+    def get(self, key: str) -> Any:
+        if not key:
+            self._misses += 1
+            return None
+        if not self.available or self._client is None:
+            return self._fallback.get(key)
+        try:
+            raw = self._client.get(self._key(key))
+            if raw is None:
+                self._misses += 1
+                return None
+            self._hits += 1
+            return pickle.loads(raw)
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self.available = False
+            return self._fallback.get(key)
+
+    def set(self, key: str, value: Any, ttl_seconds: int) -> None:
+        if not key:
+            return
+        ttl = max(1, int(ttl_seconds or 1))
+        if not self.available or self._client is None:
+            self._fallback.set(key, value, ttl)
+            return
+        try:
+            self._client.setex(self._key(key), ttl, pickle.dumps(value))
+            self._sets += 1
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self.available = False
+            self._fallback.set(key, value, ttl)
+
+    def delete(self, key: str) -> None:
+        self._fallback.delete(key)
+        if not self.available or self._client is None:
+            return
+        try:
+            self._client.delete(self._key(key))
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self.available = False
+
+    def clear(self) -> None:
+        self._fallback.clear()
+        if not self.available or self._client is None:
+            return
+        try:
+            keys = list(self._client.scan_iter(match=self._key("*"), count=200))
+            if keys:
+                self._client.delete(*keys)
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self.available = False
+
+    def trace(self) -> Dict[str, Any]:
+        trace = {
+            "backend": "redis" if self.available else "redis+memory_fallback",
+            "available": self.available,
+            "namespace": self.namespace,
+            "entries": self._entry_count(),
+            "hits": self._hits + int(self._fallback.trace().get("hits", 0)),
+            "misses": self._misses + int(self._fallback.trace().get("misses", 0)),
+            "sets": self._sets,
+            "fallback": self._fallback.trace() if not self.available else {},
+        }
+        if self.last_error:
+            trace["lastError"] = self.last_error
+        return trace
+
+    def _key(self, key: str) -> str:
+        return "%s:tool_cache:%s" % (self.namespace, key)
+
+    def _entry_count(self) -> int:
+        if not self.available or self._client is None:
+            return int(self._fallback.trace().get("entries", 0))
+        try:
+            count = 0
+            for _ in self._client.scan_iter(match=self._key("*"), count=200):
+                count += 1
+                if count >= self.settings.cache_memory_max_entries:
+                    break
+            return count
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            return 0
+
+
 class RateLimitStore:
     def allow(self, key: str, qps: int) -> bool:
         raise NotImplementedError
@@ -145,6 +437,101 @@ class MemoryRateLimitStore(RateLimitStore):
                 key: {"tokens": round(value.get("tokens", 0), 3), "limited": self._limited.get(key, 0)}
                 for key, value in sorted(self._buckets.items())
             }
+
+
+class RedisRateLimitStore(RateLimitStore):
+    """Redis-backed token bucket for cross-instance tool rate limiting."""
+
+    _ALLOW_SCRIPT = """
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local now_ms = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[3])
+local values = redis.call('HMGET', key, 'tokens', 'updated', 'limited', 'label')
+local tokens = tonumber(values[1])
+local updated = tonumber(values[2])
+local limited = tonumber(values[3]) or 0
+if tokens == nil then tokens = capacity end
+if updated == nil then updated = now_ms end
+local elapsed = math.max(0, now_ms - updated) / 1000
+tokens = math.min(capacity, tokens + elapsed * capacity)
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+else
+  limited = limited + 1
+end
+redis.call('HSET', key, 'tokens', tokens, 'updated', now_ms, 'limited', limited, 'label', ARGV[4])
+redis.call('PEXPIRE', key, ttl_ms)
+return {allowed, tokens, limited}
+"""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.namespace = safe_redis_namespace(settings.redis_namespace)
+        self._fallback = MemoryRateLimitStore()
+        self._client = None
+        self.available = False
+        self.last_error = ""
+        try:
+            import redis
+
+            timeout = max(0.05, float(settings.redis_socket_timeout_seconds or 1.0))
+            self._client = redis.Redis.from_url(
+                settings.redis_url,
+                socket_timeout=timeout,
+                socket_connect_timeout=timeout,
+                decode_responses=True,
+            )
+            self._client.ping()
+            self.available = True
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self._client = None
+            self.available = False
+
+    def allow(self, key: str, qps: int) -> bool:
+        if not self.available or self._client is None:
+            return self._fallback.allow(key, qps)
+        capacity = max(1, int(qps or 1))
+        redis_key = self._key(key)
+        ttl_ms = max(1000, int((capacity + 2) * 1000))
+        try:
+            result = self._client.eval(self._ALLOW_SCRIPT, 1, redis_key, capacity, int(time.time() * 1000), ttl_ms, key)
+            return bool(int(result[0]))
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            self.available = False
+            return self._fallback.allow(key, qps)
+
+    def trace(self) -> Dict[str, Any]:
+        if not self.available or self._client is None:
+            payload = self._fallback.trace()
+            payload["_backend"] = "redis+memory_fallback"
+            payload["_available"] = False
+            if self.last_error:
+                payload["_lastError"] = self.last_error
+            return payload
+        trace: Dict[str, Any] = {"_backend": "redis", "_available": True, "_namespace": self.namespace}
+        try:
+            for redis_key in self._client.scan_iter(match=self._key("*"), count=100):
+                data = self._client.hgetall(redis_key) or {}
+                label = data.get("label") or str(redis_key).rsplit(":", 1)[-1]
+                trace[str(label)] = {
+                    "tokens": round(float(data.get("tokens") or 0), 3),
+                    "limited": int(float(data.get("limited") or 0)),
+                }
+                if len(trace) > 50:
+                    break
+        except Exception as exc:
+            self.last_error = str(exc)[:200]
+            trace["_lastError"] = self.last_error
+        return trace
+
+    def _key(self, key: str) -> str:
+        digest = hashlib.sha256(str(key or "").encode("utf-8")).hexdigest()[:24]
+        return "%s:rate_limit:%s" % (self.namespace, digest)
 
 
 class RoundRobinLoadBalancer:
@@ -317,11 +704,30 @@ class ToolRuntimePolicyRegistry:
 
     def policy_for(self, tool_name: str) -> ToolRuntimePolicy:
         if tool_name in {"inspect_schema", "resolve_columns", "check_freshness", "summarize_node_result"}:
-            return ToolRuntimePolicy(tool_name=tool_name, timeout_seconds=5, max_retries=0, non_retryable_errors=["UNKNOWN_COLUMN", "INVALID_ARGUMENT"])
+            return ToolRuntimePolicy(
+                tool_name=tool_name,
+                timeout_seconds=5,
+                max_retries=0,
+                non_retryable_errors=["UNKNOWN_COLUMN", "INVALID_ARGUMENT"],
+                fallback_tools=["semantic_read", "answer_with_gap"],
+            )
         if tool_name in {"semantic_ls", "semantic_read", "semantic_grep", "semantic_write", "artifact_ls", "artifact_read", "artifact_grep", "artifact_write"}:
-            return ToolRuntimePolicy(tool_name=tool_name, timeout_seconds=5, max_retries=0, non_retryable_errors=["INVALID_ARGUMENT", "ARTIFACT_NOT_FOUND", "SEMANTIC_REF_NOT_FOUND"])
+            return ToolRuntimePolicy(
+                tool_name=tool_name,
+                timeout_seconds=5,
+                max_retries=0,
+                non_retryable_errors=["INVALID_ARGUMENT", "ARTIFACT_NOT_FOUND", "SEMANTIC_REF_NOT_FOUND"],
+                fallback_tools=["semantic_grep", "retrieve_knowledge", "answer_with_gap"],
+            )
         if tool_name in {"draft_llm_sql", "repair_sql", "emit_question_understanding", "draft_sql"}:
-            return ToolRuntimePolicy(tool_name=tool_name, timeout_seconds=max(1, self.settings.llm_request_timeout_seconds), max_retries=1, backoff_seconds=0.2, retryable_errors=["TIMEOUT", "PROVIDER_ERROR"])
+            return ToolRuntimePolicy(
+                tool_name=tool_name,
+                timeout_seconds=max(1, self.settings.llm_request_timeout_seconds),
+                max_retries=1,
+                backoff_seconds=0.2,
+                retryable_errors=["TIMEOUT", "PROVIDER_ERROR"],
+                fallback_tools=["structured_sql_fallback", "fallback_model"],
+            )
         if tool_name == "execute_sql":
             return ToolRuntimePolicy(
                 tool_name=tool_name,
@@ -330,9 +736,16 @@ class ToolRuntimePolicyRegistry:
                 backoff_seconds=0.0,
                 retryable_errors=[],
                 non_retryable_errors=["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT", "PARSE_ERROR", "UNSAFE_SQL", "UNKNOWN_BASE_TABLE"],
+                fallback_tools=["use_cache", "structured_sql_fallback", "partial_answer", "answer_with_gap"],
             )
         if tool_name in {"node_agent", "node_agent_batch"}:
-            return ToolRuntimePolicy(tool_name=tool_name, timeout_seconds=max(1, self.settings.agent_node_timeout_seconds), max_retries=0, non_retryable_errors=["TIMEOUT"])
+            return ToolRuntimePolicy(
+                tool_name=tool_name,
+                timeout_seconds=max(1, self.settings.agent_node_timeout_seconds),
+                max_retries=0,
+                non_retryable_errors=["TIMEOUT"],
+                fallback_tools=["skip_non_critical_node", "partial_answer"],
+            )
         return ToolRuntimePolicy(tool_name=tool_name, timeout_seconds=max(1, self.settings.agent_node_timeout_seconds), max_retries=0)
 
     def trace(self) -> List[Dict[str, Any]]:
@@ -360,57 +773,167 @@ class ToolFailureRegistry:
         self.records: Dict[str, ToolFailureRecord] = {}
         self.circuits: Dict[str, CircuitBreakerState] = {}
 
-    def fingerprint(self, tool_name: str, args: Any) -> str:
-        try:
-            payload = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
-        except Exception:
-            payload = str(args)
-        digest = hashlib.sha256(("%s:%s" % (tool_name, payload)).encode("utf-8")).hexdigest()[:16]
-        return "%s:%s" % (tool_name, digest)
+    def fingerprint(
+        self,
+        tool_name: str,
+        args: Any,
+        service_name: str = "",
+        target: str = "",
+        merchant_id: str = "",
+        thread_id: str = "",
+    ) -> str:
+        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        return context["fingerprint"]
 
-    def should_block(self, tool_name: str, args: Any) -> CircuitBreakerState | None:
-        circuit = self.circuits.get(tool_name)
-        if circuit and circuit.open:
+    def context(
+        self,
+        tool_name: str,
+        args: Any,
+        service_name: str = "",
+        target: str = "",
+        merchant_id: str = "",
+        thread_id: str = "",
+    ) -> Dict[str, str]:
+        context = normalize_tool_context(tool_name, args, service_name, target)
+        if merchant_id:
+            context["merchantId"] = merchant_id
+        if thread_id:
+            context["threadId"] = thread_id
+        context["circuitKey"] = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s" % (
+            tool_name,
+            context["serviceName"] or "tool",
+            context["target"] or "default",
+            context["merchantId"] or "*",
+            context["threadId"] or "*",
+        )
+        context["fingerprint"] = "%s|params=%s" % (context["circuitKey"], context["paramsHash"])
+        return context
+
+    def should_block(
+        self,
+        tool_name: str,
+        args: Any,
+        service_name: str = "",
+        target: str = "",
+        merchant_id: str = "",
+        thread_id: str = "",
+    ) -> CircuitBreakerState | None:
+        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        circuit = self.circuits.get(context["circuitKey"])
+        if circuit and circuit.state == "open":
             if circuit.open_until_ms and circuit.open_until_ms <= now_ms():
+                circuit.state = "half_open"
                 circuit.open = False
-                circuit.failure_count = 0
-                circuit.reason = ""
-                self.circuits[tool_name] = circuit
+                circuit.half_open_probe_in_flight = True
+                circuit.last_probe_at_ms = now_ms()
+                circuit.reason = "half-open probe allowed after cooldown"
+                self.circuits[context["circuitKey"]] = circuit
             else:
                 return circuit
-        circuit = self.circuits.get(tool_name)
-        if circuit and circuit.open:
+        elif circuit and circuit.state == "half_open" and circuit.half_open_probe_in_flight:
+            circuit.open = True
+            circuit.reason = circuit.reason or "half-open probe already in flight"
             return circuit
-        record = self.records.get(self.fingerprint(tool_name, args))
+        record = self.records.get(context["fingerprint"])
         if record and record.blocked:
-            return CircuitBreakerState(tool_name=tool_name, open=True, failure_count=record.count, reason="repeated identical failure: %s" % record.error_type)
+            return CircuitBreakerState(
+                circuit_key=context["fingerprint"],
+                tool_name=tool_name,
+                service_name=context["serviceName"],
+                target=context["target"],
+                merchant_id=context["merchantId"],
+                thread_id=context["threadId"],
+                params_hash=context["paramsHash"],
+                state="open",
+                open=True,
+                failure_count=record.count,
+                reason="repeated identical failure: %s" % record.error_type,
+                recovery_action=record.recovery_action,
+                recommended_action=record.recovery_action,
+            )
         return None
 
-    def record_success(self, tool_name: str, args: Any) -> None:
-        self.records.pop(self.fingerprint(tool_name, args), None)
-        circuit = self.circuits.get(tool_name)
+    def record_success(
+        self,
+        tool_name: str,
+        args: Any,
+        service_name: str = "",
+        target: str = "",
+        merchant_id: str = "",
+        thread_id: str = "",
+    ) -> CircuitBreakerState | None:
+        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        self.records.pop(context["fingerprint"], None)
+        circuit = self.circuits.get(context["circuitKey"])
         if circuit:
             circuit.failure_count = 0
             circuit.open = False
+            circuit.state = "closed"
             circuit.reason = ""
             circuit.open_until_ms = 0
+            circuit.half_open_probe_in_flight = False
+            self.circuits[context["circuitKey"]] = circuit
+            return circuit
+        return None
 
-    def record_failure(self, tool_name: str, args: Any, error_type: str, error_message: str) -> ToolFailureRecord:
-        fingerprint = self.fingerprint(tool_name, args)
-        record = self.records.get(fingerprint) or ToolFailureRecord(fingerprint=fingerprint, tool_name=tool_name)
+    def record_failure(
+        self,
+        tool_name: str,
+        args: Any,
+        error_type: str,
+        error_message: str,
+        service_name: str = "",
+        target: str = "",
+        merchant_id: str = "",
+        thread_id: str = "",
+    ) -> ToolFailureRecord:
+        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        fingerprint = context["fingerprint"]
+        recovery = recovery_action_for(tool_name, error_type, context["serviceName"])
+        timestamp = now_ms()
+        record = self.records.get(fingerprint) or ToolFailureRecord(
+            fingerprint=fingerprint,
+            tool_name=tool_name,
+            service_name=context["serviceName"],
+            target=context["target"],
+            merchant_id=context["merchantId"],
+            thread_id=context["threadId"],
+            params_hash=context["paramsHash"],
+            circuit_key=context["circuitKey"],
+            first_failed_at_ms=timestamp,
+        )
         record.error_type = error_type or "ERROR"
         record.error_message = str(error_message or "")[:500]
         record.count += 1
         record.blocked = record.count >= self.repeat_threshold
+        record.last_failed_at_ms = timestamp
+        record.recovery_action = recovery.action
         self.records[fingerprint] = record
-        circuit = self.circuits.get(tool_name) or CircuitBreakerState(tool_name=tool_name)
+        circuit = self.circuits.get(context["circuitKey"]) or CircuitBreakerState(
+            circuit_key=context["circuitKey"],
+            tool_name=tool_name,
+            service_name=context["serviceName"],
+            target=context["target"],
+            merchant_id=context["merchantId"],
+            thread_id=context["threadId"],
+            params_hash=context["paramsHash"],
+        )
         circuit.failure_count += 1
-        if circuit.failure_count >= self.circuit_threshold:
+        circuit.params_hash = context["paramsHash"]
+        circuit.recovery_action = recovery.action
+        circuit.recommended_action = recovery.action
+        circuit.fallback_tools = list(recovery.fallback_tools)
+        if circuit.state == "half_open" or circuit.failure_count >= self.circuit_threshold:
+            circuit.state = "open"
             circuit.open = True
             circuit.reason = "tool failure threshold reached: %s" % record.error_type
             circuit.opened_at_ms = now_ms()
             circuit.open_until_ms = circuit.opened_at_ms + self.cooldown_seconds * 1000
-        self.circuits[tool_name] = circuit
+            circuit.half_open_probe_in_flight = False
+        else:
+            circuit.state = "closed"
+            circuit.open = False
+        self.circuits[context["circuitKey"]] = circuit
         return record
 
     def trace(self) -> Dict[str, Any]:
@@ -427,6 +950,23 @@ def default_load_balancer(settings: Settings) -> RoundRobinLoadBalancer:
         "doris": RoundRobinLoadBalancer.parse_targets(settings.doris_targets, "doris"),
     }
     return RoundRobinLoadBalancer({kind: values for kind, values in targets.items() if values})
+
+
+def default_cache_store(settings: Settings) -> CacheStore:
+    if settings.redis_enabled and settings.redis_cache_enabled:
+        return RedisCacheStore(settings)
+    return MemoryCacheStore(settings.cache_memory_max_entries)
+
+
+def default_rate_limit_store(settings: Settings) -> RateLimitStore:
+    if settings.redis_enabled and settings.redis_rate_limit_enabled:
+        return RedisRateLimitStore(settings)
+    return MemoryRateLimitStore()
+
+
+def safe_redis_namespace(namespace: str) -> str:
+    text = str(namespace or "merchant_ai").strip()
+    return "".join(ch if ch.isalnum() or ch in {"_", "-", ":"} else "_" for ch in text) or "merchant_ai"
 
 
 class ToolRuntimeService:
@@ -449,11 +989,13 @@ class ToolRuntimeService:
             circuit_threshold=settings.tool_circuit_threshold,
             cooldown_seconds=settings.tool_circuit_cooldown_seconds,
         )
-        self.cache_store = cache_store or MemoryCacheStore(settings.cache_memory_max_entries)
-        self.rate_limit_store = rate_limit_store or MemoryRateLimitStore()
+        self.cache_store = cache_store or default_cache_store(settings)
+        self.rate_limit_store = rate_limit_store or default_rate_limit_store(settings)
         self.load_balancer = load_balancer or default_load_balancer(settings)
         self.metrics = metrics or RuntimeMetricsAggregator()
         self.alert_manager = RuntimeAlertManager(settings, self.metrics)
+        self._events: List[Dict[str, Any]] = []
+        self._events_lock = threading.RLock()
 
     def cache_key(self, tool_name: str, args: Dict[str, Any], policy: ToolCachePolicy | None = None) -> str:
         cache_policy = policy or ToolCachePolicy()
@@ -480,21 +1022,68 @@ class ToolRuntimeService:
         target_kind: str = "",
     ) -> ToolCallExecutionResult:
         call = ToolCallRequest(id=call_id or tool_name, name=tool_name, args=args or {})
-        blocked = self.failure_registry.should_block(tool_name, call.args)
+        service_name = target_kind or self._tool_kind(tool_name)
+        selected_target = self.load_balancer.select(service_name)
+        context = self.failure_registry.context(tool_name, call.args, service_name=service_name, target=selected_target.name)
+        blocked = self.failure_registry.should_block(tool_name, call.args, service_name=service_name, target=selected_target.name)
+        pre_runtime_events: List[Dict[str, Any]] = []
         if blocked:
+            recovery = recovery_action_for(tool_name, "CIRCUIT_OPEN", service_name)
+            tool_message = structured_tool_message(
+                tool_name,
+                "blocked",
+                "CIRCUIT_OPEN",
+                blocked.reason,
+                recovery,
+                blocked.circuit_key or context["circuitKey"],
+            )
             result = ToolCallExecutionResult(
                 id=call.id,
                 name=tool_name,
                 status="blocked",
                 error_type="CIRCUIT_OPEN",
                 error_message=blocked.reason,
+                target=selected_target.name,
+                service_name=service_name,
+                circuit_key=blocked.circuit_key or context["circuitKey"],
+                retryable=False,
+                recommended_action=recovery.action,
+                fallback_tools=list(recovery.fallback_tools),
+                tool_message=tool_message,
             )
+            event = self._record_event("tool.circuit.open", result, {"circuit": blocked.model_dump(by_alias=True)})
+            result.runtime_events.append(event)
             self.metrics.record(tool_name, result.status, 0, result.error_type, circuit_blocked=True)
             self.alert_manager.evaluate()
             return result
+        probe_circuit = self.failure_registry.circuits.get(context["circuitKey"])
+        if probe_circuit and probe_circuit.state == "half_open" and probe_circuit.half_open_probe_in_flight:
+            pre_runtime_events.append(
+                self._record_event(
+                    "tool.circuit.half_open",
+                    ToolCallExecutionResult(
+                        id=call.id,
+                        name=tool_name,
+                        status="probing",
+                        target=selected_target.name,
+                        service_name=service_name,
+                        circuit_key=context["circuitKey"],
+                    ),
+                    {"circuit": probe_circuit.model_dump(by_alias=True)},
+                )
+            )
         if self.settings.tool_rate_limit_enabled:
-            rate_key = target_kind or self._tool_kind(tool_name)
+            rate_key = service_name
             if not self.rate_limit_store.allow(rate_key, self._tool_qps(tool_name, rate_key)):
+                recovery = recovery_action_for(tool_name, "RATE_LIMITED", service_name)
+                tool_message = structured_tool_message(
+                    tool_name,
+                    "blocked",
+                    "RATE_LIMITED",
+                    "tool rate limited: %s" % rate_key,
+                    recovery,
+                    context["circuitKey"],
+                )
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
@@ -502,7 +1091,16 @@ class ToolRuntimeService:
                     error_type="RATE_LIMITED",
                     error_message="tool rate limited: %s" % rate_key,
                     rate_limited=True,
+                    target=selected_target.name,
+                    service_name=service_name,
+                    circuit_key=context["circuitKey"],
+                    retryable=False,
+                    recommended_action=recovery.action,
+                    fallback_tools=list(recovery.fallback_tools),
+                    tool_message=tool_message,
                 )
+                event = self._record_event("tool.rate_limited", result, {"rateLimitKey": rate_key})
+                result.runtime_events.append(event)
                 self.metrics.record(tool_name, result.status, 0, result.error_type, rate_limited=True)
                 return result
         cache_key = ""
@@ -510,6 +1108,9 @@ class ToolRuntimeService:
             cache_key = self.cache_key(tool_name, call.args, cache_policy)
             cached = self.cache_store.get(cache_key)
             if cached is not None:
+                closed_circuit = None
+                if probe_circuit and probe_circuit.state == "half_open":
+                    closed_circuit = self.failure_registry.record_success(tool_name, call.args, service_name=service_name, target=selected_target.name)
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
@@ -518,7 +1119,14 @@ class ToolRuntimeService:
                     cache_hit=True,
                     cache_key=cache_key,
                     attempts=0,
+                    target=selected_target.name,
+                    service_name=service_name,
+                    circuit_key=context["circuitKey"],
+                    tool_message={"toolName": tool_name, "status": "success", "cacheHit": True},
+                    runtime_events=list(pre_runtime_events),
                 )
+                if closed_circuit:
+                    result.runtime_events.append(self._record_event("tool.circuit.closed", result, {"circuit": closed_circuit.model_dump(by_alias=True)}))
                 self.metrics.record(tool_name, result.status, 0, cache_hit=True)
                 return result
         started = time.monotonic()
@@ -526,7 +1134,6 @@ class ToolRuntimeService:
         attempts = max(1, policy.max_retries + 1)
         last_error = ""
         last_error_type = "ERROR"
-        selected_target = self.load_balancer.select(target_kind or self._tool_kind(tool_name))
         for attempt in range(attempts):
             try:
                 next_args = dict(call.args)
@@ -534,7 +1141,7 @@ class ToolRuntimeService:
                     next_args.setdefault("_target", selected_target.model_dump(by_alias=True))
                 value = self._call_with_timeout(handler, next_args, policy.timeout_seconds)
                 duration_ms = int((time.monotonic() - started) * 1000)
-                self.failure_registry.record_success(tool_name, call.args)
+                closed_circuit = self.failure_registry.record_success(tool_name, call.args, service_name=service_name, target=selected_target.name)
                 if cache_key and cache_policy:
                     self.cache_store.set(cache_key, value or {}, cache_policy.ttl_seconds or self.settings.semantic_cache_ttl_seconds)
                 result = ToolCallExecutionResult(
@@ -547,7 +1154,14 @@ class ToolRuntimeService:
                     cache_hit=False,
                     cache_key=cache_key,
                     target=selected_target.name,
+                    service_name=service_name,
+                    circuit_key=context["circuitKey"],
+                    tool_message={"toolName": tool_name, "status": "success", "cacheHit": False},
+                    runtime_events=list(pre_runtime_events),
                 )
+                if closed_circuit and closed_circuit.state == "closed":
+                    event = self._record_event("tool.circuit.closed", result, {"circuit": closed_circuit.model_dump(by_alias=True)})
+                    result.runtime_events.append(event)
                 self.metrics.record(tool_name, result.status, duration_ms, attempts=result.attempts, target=selected_target.name)
                 self.alert_manager.evaluate()
                 return result
@@ -560,8 +1174,25 @@ class ToolRuntimeService:
                     break
                 if policy.backoff_seconds > 0:
                     time.sleep(policy.backoff_seconds * (attempt + 1))
+                self._record_event(
+                    "tool.retry",
+                    ToolCallExecutionResult(
+                        id=call.id,
+                        name=tool_name,
+                        status="retrying",
+                        error_type=last_error_type,
+                        error_message=last_error[:500],
+                        attempts=attempt + 1,
+                        target=selected_target.name,
+                        service_name=service_name,
+                        circuit_key=context["circuitKey"],
+                    ),
+                    {"nextAttempt": attempt + 2},
+                )
         duration_ms = int((time.monotonic() - started) * 1000)
-        self.failure_registry.record_failure(tool_name, call.args, last_error_type, last_error)
+        record = self.failure_registry.record_failure(tool_name, call.args, last_error_type, last_error, service_name=service_name, target=selected_target.name)
+        recovery = recovery_action_for(tool_name, last_error_type, service_name)
+        tool_message = structured_tool_message(tool_name, "failed", last_error_type, last_error[:500], recovery, record.circuit_key)
         result = ToolCallExecutionResult(
             id=call.id,
             name=tool_name,
@@ -572,7 +1203,21 @@ class ToolRuntimeService:
             attempts=attempts,
             cache_key=cache_key,
             target=selected_target.name,
+            service_name=service_name,
+            circuit_key=record.circuit_key,
+            retryable=recovery.retryable,
+            recommended_action=recovery.action,
+            fallback_tools=list(recovery.fallback_tools or policy.fallback_tools),
+            tool_message=tool_message,
+            runtime_events=list(pre_runtime_events),
         )
+        failed_event = self._record_event("tool.failed", result, {"failure": record.model_dump(by_alias=True)})
+        result.runtime_events.append(failed_event)
+        if record.recovery_action:
+            result.runtime_events.append(self._record_event("tool.recovery.recommended", result, {"recommendedAction": record.recovery_action}))
+        circuit = self.failure_registry.circuits.get(record.circuit_key)
+        if circuit and circuit.open:
+            result.runtime_events.append(self._record_event("tool.circuit.open", result, {"circuit": circuit.model_dump(by_alias=True)}))
         self.metrics.record(tool_name, result.status, duration_ms, result.error_type, attempts=result.attempts, target=selected_target.name)
         self.alert_manager.evaluate()
         return result
@@ -611,7 +1256,33 @@ class ToolRuntimeService:
             "cache": self.cache_store.trace(),
             "loadBalancer": self.load_balancer.trace(),
             "alerts": self.alert_manager.trace(),
+            "events": self.events(),
         }
+
+    def events(self) -> List[Dict[str, Any]]:
+        with self._events_lock:
+            return list(self._events[-200:])
+
+    def _record_event(self, event_type: str, result: ToolCallExecutionResult, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        event = {
+            "eventId": hashlib.sha256(("%s:%s:%s:%s" % (event_type, result.id, result.name, time.time_ns())).encode("utf-8")).hexdigest()[:16],
+            "eventType": event_type,
+            "toolCallId": result.id,
+            "toolName": result.name,
+            "status": result.status,
+            "errorType": result.error_type,
+            "serviceName": result.service_name,
+            "target": result.target,
+            "circuitKey": result.circuit_key,
+            "recommendedAction": result.recommended_action,
+            "fallbackTools": result.fallback_tools,
+            "createdAt": datetime.now().isoformat(),
+            "payload": payload or {},
+        }
+        with self._events_lock:
+            self._events.append(event)
+            self._events = self._events[-300:]
+        return event
 
     def _call_with_timeout(self, handler: Callable[[Dict[str, Any]], Dict[str, Any]], args: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
         executor = ThreadPoolExecutor(max_workers=1)
@@ -666,6 +1337,7 @@ class ToolCallExecutor:
             for call in calls:
                 blocked = self.failure_registry.should_block(call.name, call.args)
                 if blocked:
+                    recovery = recovery_action_for(call.name, "CIRCUIT_OPEN", infer_tool_kind(call.name))
                     results.append(
                         ToolCallExecutionResult(
                             id=call.id,
@@ -673,13 +1345,31 @@ class ToolCallExecutor:
                             status="blocked",
                             error_type="CIRCUIT_OPEN",
                             error_message=blocked.reason,
+                            service_name=infer_tool_kind(call.name),
+                            circuit_key=blocked.circuit_key,
+                            retryable=False,
+                            recommended_action=recovery.action,
+                            fallback_tools=list(recovery.fallback_tools),
+                            tool_message=structured_tool_message(call.name, "blocked", "CIRCUIT_OPEN", blocked.reason, recovery, blocked.circuit_key),
                         )
                     )
                     continue
                 handler = handlers.get(call.name)
                 if handler is None:
+                    recovery = recovery_action_for(call.name, "UNKNOWN_TOOL", infer_tool_kind(call.name))
                     results.append(
-                        ToolCallExecutionResult(id=call.id, name=call.name, status="failed", error_type="UNKNOWN_TOOL", error_message="No handler registered")
+                        ToolCallExecutionResult(
+                            id=call.id,
+                            name=call.name,
+                            status="failed",
+                            error_type="UNKNOWN_TOOL",
+                            error_message="No handler registered",
+                            service_name=infer_tool_kind(call.name),
+                            retryable=False,
+                            recommended_action=recovery.action,
+                            fallback_tools=list(recovery.fallback_tools),
+                            tool_message=structured_tool_message(call.name, "failed", "UNKNOWN_TOOL", "No handler registered", recovery),
+                        )
                     )
                     continue
                 futures[executor.submit(self._run_one, call, handler)] = call
@@ -696,6 +1386,7 @@ class ToolCallExecutor:
                             results.append(future.result(timeout=0))
                         except Exception as exc:
                             self.failure_registry.record_failure(call.name, call.args, "ERROR", str(exc))
+                            recovery = recovery_action_for(call.name, "ERROR", infer_tool_kind(call.name))
                             results.append(
                                 ToolCallExecutionResult(
                                     id=call.id,
@@ -703,6 +1394,11 @@ class ToolCallExecutor:
                                     status="failed",
                                     error_type="ERROR",
                                     error_message=str(exc)[:500],
+                                    service_name=infer_tool_kind(call.name),
+                                    retryable=recovery.retryable,
+                                    recommended_action=recovery.action,
+                                    fallback_tools=list(recovery.fallback_tools),
+                                    tool_message=structured_tool_message(call.name, "failed", "ERROR", str(exc)[:500], recovery),
                                 )
                             )
                 except TimeoutError:
@@ -712,6 +1408,7 @@ class ToolCallExecutor:
                         continue
                     future.cancel()
                     self.failure_registry.record_failure(call.name, call.args, "TIMEOUT", "tool execution timed out")
+                    recovery = recovery_action_for(call.name, "TIMEOUT", infer_tool_kind(call.name))
                     results.append(
                         ToolCallExecutionResult(
                             id=call.id,
@@ -719,6 +1416,11 @@ class ToolCallExecutor:
                             status="failed",
                             error_type="TIMEOUT",
                             error_message="tool execution timed out",
+                            service_name=infer_tool_kind(call.name),
+                            retryable=recovery.retryable,
+                            recommended_action=recovery.action,
+                            fallback_tools=list(recovery.fallback_tools),
+                            tool_message=structured_tool_message(call.name, "failed", "TIMEOUT", "tool execution timed out", recovery),
                         )
                     )
         return sorted(results, key=lambda item: order.get(item.id, 999))
@@ -739,6 +1441,8 @@ class ToolCallExecutor:
                     status="success",
                     result=result or {},
                     duration_ms=int((time.monotonic() - started) * 1000),
+                    service_name=infer_tool_kind(call.name),
+                    tool_message={"toolName": call.name, "status": "success"},
                 )
             except Exception as exc:
                 last_error = str(exc)
@@ -750,6 +1454,7 @@ class ToolCallExecutor:
                 if policy.backoff_seconds > 0:
                     time.sleep(policy.backoff_seconds * (attempt + 1))
         self.failure_registry.record_failure(call.name, call.args, last_error_type, last_error)
+        recovery = recovery_action_for(call.name, last_error_type, infer_tool_kind(call.name))
         return ToolCallExecutionResult(
             id=call.id,
             name=call.name,
@@ -757,4 +1462,9 @@ class ToolCallExecutor:
             error_type=last_error_type,
             error_message=last_error[:500],
             duration_ms=int((time.monotonic() - started) * 1000),
+            service_name=infer_tool_kind(call.name),
+            retryable=recovery.retryable,
+            recommended_action=recovery.action,
+            fallback_tools=list(recovery.fallback_tools),
+            tool_message=structured_tool_message(call.name, "failed", last_error_type, last_error[:500], recovery),
         )

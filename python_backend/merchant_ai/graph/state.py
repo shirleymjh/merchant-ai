@@ -123,6 +123,9 @@ class AgentState(TypedDict, total=False):
     circuit_breakers: List[CircuitBreakerState]
     tool_runtime_policies: List[ToolRuntimePolicy]
     tool_call_results: List[ToolCallExecutionResult]
+    tool_runtime_events: List[Dict[str, Any]]
+    clarification_tool_message: Dict[str, Any]
+    clarification_command: Dict[str, Any]
     agent_decision_reason: str
     planner_repair_reason: str
     planner_provider_error: str

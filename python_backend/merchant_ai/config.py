@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     cache_recall_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_RECALL_TTL_SECONDS")
     cache_asset_pack_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_ASSET_PACK_TTL_SECONDS")
     cache_llm_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_LLM_TTL_SECONDS")
+    redis_enabled: bool = Field(False, validation_alias="YSHOPPING_REDIS_ENABLED")
+    redis_url: str = Field("redis://127.0.0.1:6379/0", validation_alias="YSHOPPING_REDIS_URL")
+    redis_namespace: str = Field("yshopping_merchant_ai", validation_alias="YSHOPPING_REDIS_NAMESPACE")
+    redis_socket_timeout_seconds: float = Field(1.0, validation_alias="YSHOPPING_REDIS_SOCKET_TIMEOUT_SECONDS")
+    redis_cache_enabled: bool = Field(True, validation_alias="YSHOPPING_REDIS_CACHE_ENABLED")
+    redis_rate_limit_enabled: bool = Field(True, validation_alias="YSHOPPING_REDIS_RATE_LIMIT_ENABLED")
     python_executable: str = Field(default_factory=lambda: sys.executable, validation_alias="YSHOPPING_PYTHON_EXECUTABLE")
 
     wiki_path: str = Field("", validation_alias="YSHOPPING_WIKI_PATH")

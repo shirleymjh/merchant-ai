@@ -39,6 +39,18 @@ export YSHOPPING_ANSWER_PASSWORD=""
 
 也兼容 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OPENAI_API_KEY`。
 
+可选 Redis 配置：
+
+```bash
+export YSHOPPING_REDIS_ENABLED=true
+export YSHOPPING_REDIS_URL="redis://127.0.0.1:6379/0"
+export YSHOPPING_REDIS_NAMESPACE="yshopping_merchant_ai"
+export YSHOPPING_REDIS_CACHE_ENABLED=true
+export YSHOPPING_REDIS_RATE_LIMIT_ENABLED=true
+```
+
+Redis 默认关闭。开启后，召回、语义资产包、Doris SELECT、LLM 响应、工具语义缓存会优先写 Redis；ToolRuntime 的工具缓存和限流状态也会跨实例共享。Redis 不可用时会回退到进程内内存缓存，避免本地开发环境直接启动失败。
+
 ## V2 QueryGraph 行为
 
 Python 版按附件里的 V2 思路实现：

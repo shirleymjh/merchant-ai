@@ -377,17 +377,28 @@ class TopicRouterService:
             )
         top_score = max(scores.get(category, 0) for category in candidates)
         confidence = min(0.95, 0.45 + 0.08 * len(candidates) + 0.08 * top_score)
+        primary_topic = route_primary_topic(candidates)
         return TopicRoutingDecision(
-            primary_topic=candidates[0],
+            primary_topic=primary_topic,
             candidate_topics=candidates,
-            dimension_topics=candidates[1:],
+            dimension_topics=[] if primary_topic == QuestionCategory.UNKNOWN else candidates[1:],
             confidence=confidence,
             clarification_required=False,
-            reason="按显式业务词选择 topic；primaryTopic 仅兼容字段，不表示 anchor",
+            reason=(
+                "按显式业务词选择候选 topic；多 topic 时 primaryTopic 保持 UNKNOWN，"
+                "不表示 anchor，避免把召回范围误当主 anchor"
+                if primary_topic == QuestionCategory.UNKNOWN
+                else "按显式业务词选择 topic；primaryTopic 仅兼容字段，不表示 anchor"
+            ),
         )
 
     def _explicit_topics(self, scores: Dict[QuestionCategory, int]) -> List[QuestionCategory]:
         return [category for category in topic_domain_order() if scores.get(category, 0) > 0]
+
+
+def route_primary_topic(candidates: List[QuestionCategory]) -> QuestionCategory:
+    """Only a single-topic route can safely expose a compatibility primary topic."""
+    return candidates[0] if len(candidates) == 1 else QuestionCategory.UNKNOWN
 
 
 def extract_days(question: str, default: int = 7) -> int:

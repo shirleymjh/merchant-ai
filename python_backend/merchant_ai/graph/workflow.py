@@ -76,7 +76,7 @@ from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
-from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService
+from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService, route_primary_topic
 from merchant_ai.services.tools import artifact_file_tool_schemas, lead_action_selection_tool, node_runtime_tool_schemas, semantic_file_tool_schemas
 
 
@@ -247,6 +247,9 @@ class MerchantQaWorkflow:
             circuit_breakers=[],
             tool_runtime_policies=[],
             tool_call_results=[],
+            tool_runtime_events=[],
+            clarification_tool_message={},
+            clarification_command={},
             agent_decision_reason="",
             planner_repair_reason="",
             planner_provider_error="",
@@ -853,10 +856,12 @@ class MerchantQaWorkflow:
             trace.update({"status": "ignored", "reason": "llm_topics_failed_enum_parse", "payload": payload or {}})
             return decision, trace
         decision.candidate_topics = categories
-        decision.primary_topic = categories[0]
-        decision.dimension_topics = categories[1:]
+        decision.primary_topic = route_primary_topic(categories)
+        decision.dimension_topics = [] if decision.primary_topic == QuestionCategory.UNKNOWN else categories[1:]
         decision.confidence = float((payload or {}).get("confidence") or decision.confidence or route_slots.route_confidence or 0.0)
-        decision.reason = "受限 route LLM 确认；primaryTopic 仅兼容字段，不表示 anchor。%s" % str((payload or {}).get("reason") or "")
+        decision.reason = "受限 route LLM 确认；多 topic 时 primaryTopic 保持 UNKNOWN，不表示 anchor。%s" % str(
+            (payload or {}).get("reason") or ""
+        )
         trace.update({"status": "applied", "topics": topics, "payload": payload or {}})
         return decision, trace
 
@@ -1962,6 +1967,8 @@ class MerchantQaWorkflow:
         state["should_persist"] = False
         state["persisted"] = False
         state["suggestions"] = state.get("human_clarification_options") or business_scope_options()
+        if state.get("clarification_tool_message"):
+            add_step(state, "ClarificationMiddleware：已拦截 ask_clarification 工具调用，并以 Command(goto=END) 语义暂停当前 run")
         add_step(state, "Human-in-the-loop / ask_human Tool：已用业务问题暂停自动推进，等待商家补充确认")
         self.record_span(state, "action", "ask_human", started, status="gap", error_code="HUMAN_CLARIFICATION_REQUIRED")
         self.finish_run_step(state, step, "gap", output_summary=prompt[:500], error_code="HUMAN_CLARIFICATION_REQUIRED")
@@ -2417,17 +2424,36 @@ class MerchantQaWorkflow:
 
     def sync_tool_runtime_state(self, state: AgentState) -> None:
         failure_trace = {"failures": [], "circuits": []}
+        runtime_events: List[Dict[str, Any]] = []
         registries = []
+        runtime_services = []
         if hasattr(self.node_worker, "tool_failure_registry"):
             registries.append(self.node_worker.tool_failure_registry)
         if hasattr(self.planner, "tool_failure_registry"):
             registries.append(self.planner.tool_failure_registry)
+        if hasattr(self.node_worker, "tool_runtime_service"):
+            runtime_services.append(("node", self.node_worker.tool_runtime_service))
+        if hasattr(self.planner, "tool_runtime_service"):
+            runtime_services.append(("planner", self.planner.tool_runtime_service))
         for registry in registries:
             trace = registry.trace()
             failure_trace["failures"].extend(trace.get("failures", []))
             failure_trace["circuits"].extend(trace.get("circuits", []))
+        for runtime_name, service in runtime_services:
+            for event in service.events()[-100:]:
+                next_event = dict(event)
+                next_event["runtime"] = runtime_name
+                runtime_events.append(next_event)
         state["tool_failures"] = failure_trace.get("failures", [])
         state["circuit_breakers"] = failure_trace.get("circuits", [])
+        seen_ids = set(state.get("_emitted_tool_runtime_event_ids") or [])
+        for event in runtime_events:
+            event_id = str(event.get("eventId") or "")
+            if event_id and event_id not in seen_ids:
+                emit(state, str(event.get("eventType") or "tool.runtime"), "TOOL_RUNTIME", event)
+                seen_ids.add(event_id)
+        state["_emitted_tool_runtime_event_ids"] = list(seen_ids)[-500:]
+        state["tool_runtime_events"] = runtime_events[-200:]
         if hasattr(self.node_worker, "tool_runtime_policies"):
             state["tool_runtime_policies"] = self.node_worker.tool_runtime_policies.trace()
 
@@ -2542,10 +2568,15 @@ class MerchantQaWorkflow:
                 runtime_traces[name] = owner.tool_runtime_service.trace()
         merged_alerts = []
         merged_metrics = []
+        merged_events = []
         merged_rate_limits: Dict[str, Any] = {}
         merged_load_balancer: Dict[str, Any] = {}
         for name, trace in runtime_traces.items():
             merged_alerts.extend(trace.get("alerts", []))
+            for event in trace.get("events", []):
+                next_event = dict(event)
+                next_event["runtime"] = name
+                merged_events.append(next_event)
             for item in trace.get("metrics", {}).get("tools", []):
                 next_item = dict(item)
                 next_item["runtime"] = name
@@ -2560,6 +2591,7 @@ class MerchantQaWorkflow:
             "failures": failures,
             "circuits": circuits,
             "metrics": {"tools": merged_metrics},
+            "events": state.get("tool_runtime_events", merged_events[-200:]),
             "rateLimits": merged_rate_limits,
             "loadBalancer": merged_load_balancer,
             "alerts": merged_alerts,
@@ -2583,6 +2615,9 @@ class MerchantQaWorkflow:
             "enabled": self.settings.cache_enabled,
             "memoryMaxEntries": self.settings.cache_memory_max_entries,
             "recall": self.recall_service.cache_trace() if hasattr(self.recall_service, "cache_trace") else {},
+            "knowledgeRetriever": self.knowledge_retriever.cache_trace()
+            if hasattr(self.knowledge_retriever, "cache_trace")
+            else {},
             "assetBuilder": self.asset_builder.cache_trace() if hasattr(self.asset_builder, "cache_trace") else {},
             "doris": self.node_worker.doris_repository.cache_trace()
             if hasattr(self.node_worker.doris_repository, "cache_trace")

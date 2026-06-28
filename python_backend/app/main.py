@@ -137,6 +137,7 @@ def _runtime_trace() -> Dict[str, Any]:
             traces[name] = service.trace()
     metrics = []
     alerts = []
+    events = []
     rate_limits: Dict[str, Any] = {}
     load_balancer: Dict[str, Any] = {}
     for name, trace in traces.items():
@@ -145,11 +146,16 @@ def _runtime_trace() -> Dict[str, Any]:
             next_item["runtime"] = name
             metrics.append(next_item)
         alerts.extend(trace.get("alerts", []))
+        for event in trace.get("events", []):
+            next_event = dict(event)
+            next_event["runtime"] = name
+            events.append(next_event)
         rate_limits[name] = trace.get("rateLimits", {})
         load_balancer[name] = trace.get("loadBalancer", {})
     return {
         "metrics": {"tools": metrics},
         "alerts": alerts,
+        "events": events[-200:],
         "rateLimits": rate_limits,
         "loadBalancer": load_balancer,
     }

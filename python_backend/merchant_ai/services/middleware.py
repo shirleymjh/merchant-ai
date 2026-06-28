@@ -474,6 +474,95 @@ class ProviderCompatibilityMiddleware(HarnessMiddleware):
         return state
 
 
+class ClarificationMiddleware(HarnessMiddleware):
+    """Turn human clarification into a virtual tool-call result.
+
+    The frontend contract stays as ChatResponse.clarification, but internally the
+    run now has an ask_clarification tool message that mirrors LangGraph-style
+    tool interception.
+    """
+
+    name = "clarification"
+
+    def before_policy(self, state: AgentState) -> AgentState:
+        if state.get("human_clarification_required"):
+            return self._intercept(state, stage="before_policy", reason="state_requires_clarification")
+        return state
+
+    def before_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
+        if decision.selected_action == "ask_human" or state.get("human_clarification_required"):
+            return self._intercept(state, stage="before_action", reason="ask_human_selected")
+        return state
+
+    def _intercept(self, state: AgentState, stage: str, reason: str) -> AgentState:
+        if state.get("_clarification_tool_intercepted"):
+            return state
+        question = str(state.get("human_clarification_question") or "").strip()
+        if not question:
+            question = "我还需要补充确认后才能继续处理这个问题。"
+        options = [str(item) for item in (state.get("human_clarification_options") or []) if str(item).strip()]
+        context = {
+            "stage": str(state.get("human_clarification_stage") or ""),
+            "type": str(state.get("human_clarification_type") or ""),
+            "pendingQuestion": str(state.get("question") or ""),
+            "reason": reason,
+        }
+        tool_call_id = "ask_clarification:%s" % (state.get("qa_id") or state.get("run_id") or uuid.uuid4().hex)
+        content = format_clarification_message(question, options)
+        tool_message = {
+            "toolName": "ask_clarification",
+            "status": "success",
+            "type": "clarification_request",
+            "content": content,
+            "question": question,
+            "options": options,
+            "context": context,
+            "endsRun": True,
+        }
+        result = ToolCallExecutionResult(
+            id=tool_call_id,
+            name="ask_clarification",
+            status="success",
+            result={"question": question, "options": options, "context": context},
+            service_name="human",
+            tool_message=tool_message,
+            attempts=1,
+            runtime_events=[
+                {
+                    "eventType": "tool.intercepted",
+                    "toolCallId": tool_call_id,
+                    "toolName": "ask_clarification",
+                    "status": "success",
+                    "middleware": self.name,
+                    "createdAt": datetime.now().isoformat(),
+                    "payload": {"stage": stage, "reason": reason, "goto": "END"},
+                }
+            ],
+        )
+        state["clarification_tool_message"] = tool_message
+        state["clarification_command"] = {
+            "update": {"messages": [tool_message]},
+            "goto": "END",
+            "reason": "clarification_required",
+        }
+        state.setdefault("tool_call_results", []).append(result)
+        state["tool_call_results"] = state["tool_call_results"][-100:]
+        state.setdefault("tool_runtime_events", []).extend(result.runtime_events)
+        state["tool_runtime_events"] = state["tool_runtime_events"][-200:]
+        ensure_tool_ledger_entry(state, result, stage)
+        state["_clarification_tool_intercepted"] = True
+        append_middleware_event(
+            state,
+            self.name,
+            stage,
+            status="intercepted",
+            code="CLARIFICATION_TOOL_INTERCEPTED",
+            message="ask_clarification was intercepted and converted to a terminal user clarification",
+            metadata={"toolCallId": tool_call_id, "goto": "END", "optionsCount": len(options), "reason": reason},
+        )
+        return state
+
+
 class ContextSnapshotMiddleware(HarnessMiddleware):
     name = "context_snapshot"
 
@@ -496,6 +585,7 @@ def default_harness_middlewares(settings: Settings, context_manager: ContextMana
         CancellationMiddleware(settings),
         PermissionMiddleware(),
         ProviderCompatibilityMiddleware(),
+        ClarificationMiddleware(),
         ToolCallRecoveryMiddleware(),
         LoopGuardMiddleware(settings),
         MemoryMiddleware(settings),
@@ -535,6 +625,42 @@ def append_middleware_event(
     )
     state.setdefault("middleware_events", []).append(event)
     state["middleware_events"] = state["middleware_events"][-200:]
+
+
+def format_clarification_message(question: str, options: List[str]) -> str:
+    if not options:
+        return question
+    lines = [question, "", "可选项："]
+    for index, option in enumerate(options, start=1):
+        lines.append("%d. %s" % (index, option))
+    return "\n".join(lines)
+
+
+def ensure_tool_ledger_entry(state: AgentState, result: ToolCallExecutionResult, stage: str) -> None:
+    key = "%s:%s" % (result.id, result.status)
+    existing = {
+        "%s:%s" % (entry.tool_call_id, entry.status)
+        for entry in state.get("tool_call_ledger", [])
+        if hasattr(entry, "tool_call_id")
+    }
+    if key in existing:
+        return
+    state.setdefault("tool_call_ledger", []).append(
+        ToolCallLedgerEntry(
+            tool_call_id=result.id,
+            tool_name=result.name,
+            stage=stage,
+            status=result.status,
+            duration_ms=result.duration_ms,
+            attempts=result.attempts,
+            cache_hit=result.cache_hit,
+            rate_limited=result.rate_limited,
+            target=result.target,
+            error_type=result.error_type,
+            error_message=result.error_message,
+        )
+    )
+    state["tool_call_ledger"] = state["tool_call_ledger"][-200:]
 
 
 def estimate_context_tokens(state: AgentState) -> int:
