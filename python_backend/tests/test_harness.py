@@ -5792,6 +5792,39 @@ def test_node_agent_llm_writes_plan_bound_sql_from_contract():
     assert result.node_plan_critiques[0].valid
 
 
+def test_node_agent_accepts_window_sql_cte_alias_from_llm():
+    settings = get_settings()
+    llm = WindowRefundSqlLlm()
+    worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
+    pack = trade_refund_goods_pack()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="每个商品取最近一笔退款记录",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="latest_refund_per_goods",
+                preferred_table="dwm_trade_refund_detail_di",
+                sql_strategy="llm_first_debug",
+                output_keys=["seller_id", "spu_name", "refund_id", "refund_create_time", "pay_amt"],
+                required_evidence=["seller_id", "spu_name", "refund_id", "refund_create_time", "pay_amt"],
+                days=30,
+                limit=50,
+            )
+        ]
+    )
+
+    result = worker.execute_plan("100", plan, pack, "", "每个商品取最近一笔退款记录")
+
+    assert result.task_results[0].success
+    assert llm.calls == 1
+    sql = result.task_results[0].query_bundle.sql
+    assert "ROW_NUMBER()" in sql
+    assert "PARTITION BY `spu_name`" in sql
+    assert result.sql_draft_decisions[0].source == "llm_plan_bound"
+    assert result.task_results[0].validation_results[-1].valid
+
+
 def test_detail_node_uses_structured_fast_path_before_llm():
     settings = get_settings()
     llm = FakeLlm()
@@ -7697,6 +7730,84 @@ def test_sql_validator_does_not_hide_unknown_column_behind_same_name_alias():
     assert not result.valid
     assert result.error_code == "UNKNOWN_COLUMN"
     assert result.unknown_columns == ["dwm_goods_detail_df.spu_auth_price"]
+
+
+def test_sql_validator_allows_window_alias_from_cte_scope():
+    pack = trade_refund_goods_pack()
+    result = SqlValidationService().validate(
+        """
+        WITH ranked AS (
+          SELECT
+            seller_id,
+            spu_name,
+            refund_id,
+            refund_create_time,
+            pay_amt,
+            pt,
+            ROW_NUMBER() OVER(PARTITION BY spu_name ORDER BY refund_create_time DESC) AS rn
+          FROM dwm_trade_refund_detail_di
+          WHERE seller_id = '100'
+            AND pt >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+        )
+        SELECT seller_id, spu_name, refund_id, refund_create_time, pay_amt, rn
+        FROM ranked
+        WHERE rn = 1
+        LIMIT 50
+        """,
+        pack,
+    )
+
+    assert result.valid
+    assert "ranked" in result.cte_names
+    assert result.base_tables == ["dwm_trade_refund_detail_di"]
+
+
+def test_sql_validator_still_rejects_unknown_real_column_inside_window():
+    pack = trade_refund_goods_pack()
+    result = SqlValidationService().validate(
+        """
+        WITH ranked AS (
+          SELECT
+            seller_id,
+            spu_name,
+            refund_id,
+            ROW_NUMBER() OVER(PARTITION BY spu_name ORDER BY refund_created_at DESC) AS rn
+          FROM dwm_trade_refund_detail_di
+          WHERE seller_id = '100'
+        )
+        SELECT seller_id, spu_name, refund_id, rn
+        FROM ranked
+        WHERE rn = 1
+        """,
+        pack,
+    )
+
+    assert not result.valid
+    assert result.error_code == "UNKNOWN_COLUMN"
+    assert result.unknown_columns == ["dwm_trade_refund_detail_di.refund_created_at"]
+
+
+def test_sql_validator_allows_derived_table_window_alias_scope():
+    pack = trade_refund_goods_pack()
+    result = SqlValidationService().validate(
+        """
+        SELECT r.seller_id, r.spu_name, r.refund_id, r.rn
+        FROM (
+          SELECT
+            seller_id,
+            spu_name,
+            refund_id,
+            ROW_NUMBER() OVER(PARTITION BY spu_name ORDER BY refund_create_time DESC) AS rn
+          FROM dwm_trade_refund_detail_di
+          WHERE seller_id = '100'
+        ) r
+        WHERE r.rn = 1
+        """,
+        pack,
+    )
+
+    assert result.valid
+    assert result.base_tables == ["dwm_trade_refund_detail_di"]
 
 
 def test_structured_first_uses_safe_single_table_sql_before_llm():
@@ -10728,6 +10839,31 @@ class GoodPlanBoundSqlLlm:
             )
         )
         return {"sql": sql, "reason": "plan-bound test SQL"}
+
+
+class WindowRefundSqlLlm:
+    configured = True
+    last_error = ""
+    error_events = []
+
+    def __init__(self):
+        self.calls = 0
+
+    def json_chat(self, system_prompt, user_prompt, fallback=None):
+        self.calls += 1
+        return {
+            "sql": (
+                "WITH ranked AS ("
+                "SELECT `seller_id`, `spu_name`, `refund_id`, `refund_create_time`, `pay_amt`, `pt`, "
+                "ROW_NUMBER() OVER(PARTITION BY `spu_name` ORDER BY `refund_create_time` DESC) AS `rn` "
+                "FROM `dwm_trade_refund_detail_di` "
+                "WHERE `seller_id` = '100' AND `pt` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)"
+                ") "
+                "SELECT `seller_id`, `spu_name`, `refund_id`, `refund_create_time`, `pay_amt`, `rn` "
+                "FROM ranked WHERE `rn` = 1 LIMIT 50"
+            ),
+            "reason": "latest refund per goods via window function",
+        }
 
 
 class BadContractColumnSqlLlm:

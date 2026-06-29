@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from merchant_ai.config import Settings
 from merchant_ai.models import (
@@ -119,33 +120,7 @@ class SqlValidationService:
                 unknown_tables=unknown_tables,
             )
 
-        unknown_columns: List[str] = []
-        select_aliases = {
-            alias.alias
-            for alias in parsed.find_all(exp.Alias)
-            if alias.alias
-        }
-        single_base_table = base_tables[0] if len(base_tables) == 1 else ""
-        for column in parsed.find_all(exp.Column):
-            table_alias = column.table
-            column_name = column.name
-            if not column_name:
-                continue
-            if column_name.lower() in SQL_BUILTIN_IDENTIFIERS:
-                continue
-            if table_alias:
-                base_table = table_aliases.get(table_alias)
-                if not base_table:
-                    continue
-            elif single_base_table:
-                if column_name in cte_names or is_select_alias_reference(column, select_aliases):
-                    continue
-                base_table = single_base_table
-            else:
-                continue
-            known_columns = set(asset_pack.known_columns(base_table))
-            if known_columns and column_name not in known_columns:
-                unknown_columns.append("%s.%s" % (table_alias or base_table, column_name))
+        unknown_columns = sql_scope_unknown_columns(parsed, asset_pack)
         if unknown_columns:
             return SqlValidationResult(
                 valid=False,
@@ -1902,22 +1877,8 @@ class NodeWorkerExecutor:
             return validation
         allowed = set(contract.allowed_columns)
         if allowed:
-            select_aliases = {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}
-            cte_names = {cte.alias for cte in parsed.find_all(exp.CTE) if cte.alias}
             metric_aliases = contract_metric_aliases(contract)
-            unknown_contract_columns: List[str] = []
-            for column in parsed.find_all(exp.Column):
-                column_name = column.name
-                if not column_name:
-                    continue
-                if column_name.lower() in SQL_BUILTIN_IDENTIFIERS:
-                    continue
-                if is_select_alias_reference(column, select_aliases):
-                    continue
-                if column_name in metric_aliases and (cte_names or is_select_alias_reference(column, select_aliases)):
-                    continue
-                if column_name not in allowed:
-                    unknown_contract_columns.append(column_name)
+            unknown_contract_columns = sql_scope_unknown_contract_columns(parsed, allowed, metric_aliases)
             if unknown_contract_columns:
                 return validation.model_copy(
                     update={
@@ -2497,6 +2458,110 @@ def contract_metric_aliases(contract: NodePlanContract) -> Set[str]:
     if metric_key:
         aliases.add(metric_key)
     return {alias for alias in aliases if alias}
+
+
+def sql_scope_unknown_columns(parsed: exp.Expression, asset_pack: PlanningAssetPack) -> List[str]:
+    unknown_columns: List[str] = []
+    for scope in traverse_scope(parsed):
+        select_aliases = immediate_select_aliases(scope.expression)
+        selected_sources = getattr(scope, "selected_sources", {}) or {}
+        for column in scope.columns:
+            column_name = column.name
+            if not column_name or column_name.lower() in SQL_BUILTIN_IDENTIFIERS:
+                continue
+            if is_select_alias_reference(column, select_aliases):
+                continue
+            source_alias, source = resolve_scope_column_source(scope, column)
+            if source is None:
+                continue
+            if is_derived_scope_source(source):
+                output_names = source_output_names(source, asset_pack)
+                if output_names is not None and column_name not in output_names:
+                    unknown_columns.append("%s.%s" % (source_alias or "derived", column_name))
+                continue
+            if isinstance(source, exp.Table):
+                base_table = source.name
+                known_columns = set(asset_pack.known_columns(base_table))
+                if known_columns and column_name not in known_columns:
+                    unknown_columns.append("%s.%s" % (source_alias or base_table, column_name))
+                continue
+            if not selected_sources and len(set(asset_pack.known_tables())) == 1:
+                base_table = next(iter(asset_pack.known_tables()))
+                known_columns = set(asset_pack.known_columns(base_table))
+                if known_columns and column_name not in known_columns:
+                    unknown_columns.append("%s.%s" % (base_table, column_name))
+    return sorted(set(unknown_columns))
+
+
+def sql_scope_unknown_contract_columns(parsed: exp.Expression, allowed: Set[str], metric_aliases: Set[str]) -> List[str]:
+    unknown_columns: List[str] = []
+    for scope in traverse_scope(parsed):
+        select_aliases = immediate_select_aliases(scope.expression)
+        for column in scope.columns:
+            column_name = column.name
+            if not column_name or column_name.lower() in SQL_BUILTIN_IDENTIFIERS:
+                continue
+            if is_select_alias_reference(column, select_aliases):
+                continue
+            _source_alias, source = resolve_scope_column_source(scope, column)
+            if source is not None and is_derived_scope_source(source):
+                output_names = source_output_names(source)
+                if output_names is None or column_name in output_names or column_name in metric_aliases:
+                    continue
+            if column_name not in allowed:
+                unknown_columns.append(column_name)
+    return sorted(set(unknown_columns))
+
+
+def resolve_scope_column_source(scope: Any, column: exp.Column) -> Tuple[str, Any]:
+    selected_sources = getattr(scope, "selected_sources", {}) or {}
+    table_alias = column.table
+    if table_alias:
+        pair = selected_sources.get(table_alias)
+        return table_alias, pair[1] if pair else None
+    if len(selected_sources) == 1:
+        source_alias, pair = next(iter(selected_sources.items()))
+        return source_alias, pair[1]
+    for source_alias, pair in selected_sources.items():
+        source = pair[1]
+        if is_derived_scope_source(source):
+            output_names = source_output_names(source)
+            if output_names is None or column.name in output_names:
+                return source_alias, source
+    return "", None
+
+
+def is_derived_scope_source(source: Any) -> bool:
+    return hasattr(source, "expression") and hasattr(source, "selected_sources")
+
+
+def source_output_names(source: Any, asset_pack: Optional[PlanningAssetPack] = None) -> Optional[Set[str]]:
+    if not is_derived_scope_source(source):
+        return None
+    names = selected_output_names(source.expression)
+    if names:
+        return names
+    if not getattr(source, "stars", None):
+        return set()
+    expanded: Set[str] = set()
+    for _, pair in (getattr(source, "selected_sources", {}) or {}).items():
+        child = pair[1]
+        if isinstance(child, exp.Table):
+            if asset_pack is None:
+                return None
+            expanded.update(asset_pack.known_columns(child.name))
+            continue
+        child_names = source_output_names(child, asset_pack)
+        if child_names is None:
+            return None
+        expanded.update(child_names)
+    return expanded or None
+
+
+def immediate_select_aliases(expression: exp.Expression) -> Set[str]:
+    if not isinstance(expression, exp.Select):
+        return set()
+    return {item.alias for item in expression.expressions if getattr(item, "alias", "")}
 
 
 def selected_output_names(parsed: exp.Expression) -> Set[str]:
