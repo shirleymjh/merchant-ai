@@ -6,7 +6,7 @@
           <button
             v-for="session in sessions"
             :key="session.id"
-            :class="['topic-tab', { active: session.id === activeSessionId }]"
+            :class="['topic-tab', { active: session.id === activeSessionId, running: isSessionRunning(session) }]"
             type="button"
             :title="session.title"
             @click="switchSession(session.id)"
@@ -86,13 +86,9 @@ import SuggestionList from './components/SuggestionList.vue'
 import { cancelRun, getDailyReport, getRun, getRunEvents, mockChat, mockDailyReport, sendFeedback, startAsyncRun } from './api/client'
 
 const input = ref('')
-const loading = ref(false)
-const stopping = ref(false)
-const runStatusText = ref('正在分析问题并读取经营数据')
-const activeRun = ref(null)
-let submitController = null
-let pollTimer = null
-let chatEpoch = 0
+const defaultRunStatusText = '正在分析问题并读取经营数据'
+const sessionStorageKey = 'evan_merchant_ai_sessions_v1'
+const runPollTimers = new Map()
 let newSessionTimer = null
 const chatList = ref(null)
 const inputRef = ref(null)
@@ -129,18 +125,25 @@ const defaultSuggestions = [
   '退款金额最高的前5单给我看一下',
   '催单工单最近是否升高？'
 ]
-const suggestions = ref(defaultSuggestions.slice(0, 3))
-const suggestionPool = ref(defaultSuggestions.slice())
-const suggestionCursor = ref(0)
 const suggestionPageSize = 3
-const conversationContext = ref(null)
 const initialSession = createConversationSession('经营分析工作台', '您好，我是 yshopping 商家 AI 助手，有经营问题欢迎随时问我。')
-const sessions = ref([initialSession])
-const activeSessionId = ref(initialSession.id)
-const messages = ref(cloneValue(initialSession.messages))
+const restoredConversation = restorePersistedSessions(initialSession)
+const sessions = ref(restoredConversation.sessions)
+const activeSessionId = ref(restoredConversation.activeSessionId)
+const initialVisibleSession = findSessionSnapshot(sessions.value, activeSessionId.value) || sessions.value[0]
+const messages = ref(cloneValue(initialVisibleSession.messages))
+const suggestions = ref(cloneValue(initialVisibleSession.suggestions || defaultSuggestions.slice(0, 3)))
+const suggestionPool = ref(cloneValue(initialVisibleSession.suggestionPool || defaultSuggestions.slice()))
+const suggestionCursor = ref(Number(initialVisibleSession.suggestionCursor || 0))
+const conversationContext = ref(cloneValue(initialVisibleSession.conversationContext))
 
+const activeSession = computed(() => sessions.value.find(session => session.id === activeSessionId.value) || sessions.value[0])
 const hasConversation = computed(() => messages.value.some(message => message.role === 'user'))
+const loading = computed(() => isSessionRunning(activeSession.value))
+const stopping = computed(() => Boolean(activeSession.value?.stopping))
+const runStatusText = computed(() => activeSession.value?.runStatusText || defaultRunStatusText)
 onMounted(async () => {
+  resumeSessionRuns()
   try {
     dailyReport.value = await getDailyReport()
   } catch {
@@ -149,7 +152,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  clearRunPoll()
+  clearAllRunPolls()
   clearNewSessionTimer()
 })
 
@@ -166,153 +169,192 @@ async function sendSuggestion(question) {
 }
 
 async function ask(message) {
-  const epoch = chatEpoch
+  const session = activeSession.value
+  if (!session || isSessionRunning(session)) return
+  const sessionId = session.id
+  const controller = new AbortController()
   clearNewSessionTimer()
   newSessionFlash.value = false
-  clearRunPoll()
-  clearSubmitController()
   messages.value.push({
     localId: `u_${Date.now()}`,
     role: 'user',
     text: message
   })
   saveActiveSessionSnapshot()
-  loading.value = true
-  stopping.value = false
-  runStatusText.value = '正在提交任务'
+  updateSessionRuntime(sessionId, {
+    submitting: true,
+    submitController: controller,
+    stopping: false,
+    stopRequested: false,
+    runStatusText: '正在提交任务'
+  })
   await scrollBottom()
-  submitController = new AbortController()
   try {
-    const created = await startAsyncRun(message, conversationContext.value, { signal: submitController.signal })
-    submitController = null
-    if (epoch !== chatEpoch) return
+    const requestContext = cloneValue(session.conversationContext)
+    const created = await startAsyncRun(message, requestContext, { signal: controller.signal })
     const runId = created.runId
     const threadId = created.threadId
     if (!runId || !threadId) {
       throw new Error('RUN_CREATE_FAILED')
     }
-    activeRun.value = {
+    const run = {
       runId,
       threadId,
       token: `run_${Date.now()}_${Math.random().toString(16).slice(2)}`
     }
-    runStatusText.value = '任务已提交，正在排队'
-    scheduleRunPoll(activeRun.value.token, 300)
+    updateSessionRuntime(sessionId, {
+      activeRun: run,
+      submitting: false,
+      submitController: null,
+      runStatusText: '任务已提交，正在排队'
+    })
+    scheduleRunPoll(sessionId, run.token, 300)
   } catch (error) {
-    if (epoch !== chatEpoch) return
     const aborted = error?.name === 'AbortError'
-    clearRunPoll()
-    clearSubmitController()
-    loading.value = false
-    stopping.value = false
+    const currentSession = findSession(sessionId)
+    updateSessionRuntime(sessionId, {
+      activeRun: null,
+      submitting: false,
+      submitController: null,
+      stopping: false,
+      runStatusText: defaultRunStatusText
+    })
     if (aborted) {
-      appendAssistant(systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
+      if (currentSession?.stopRequested) {
+        appendAssistantToSession(sessionId, systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
+      }
     } else {
-      appendAssistant(mockChat(message))
+      appendAssistantToSession(sessionId, mockChat(message))
     }
-    await scrollBottom()
   }
 }
 
-function scheduleRunPoll(token, delay = 900) {
-  clearRunPoll()
-  pollTimer = window.setTimeout(() => {
-    pollActiveRun(token)
+function scheduleRunPoll(sessionId, token, delay = 900) {
+  clearRunPoll(sessionId)
+  const timer = window.setTimeout(() => {
+    pollSessionRun(sessionId, token)
   }, delay)
+  runPollTimers.set(sessionId, timer)
 }
 
-async function pollActiveRun(token) {
-  const current = activeRun.value
+async function pollSessionRun(sessionId, token) {
+  const session = findSession(sessionId)
+  const current = session?.activeRun
   if (!current || current.token !== token) return
   try {
     const [runPayload, eventsPayload] = await Promise.allSettled([
       getRun(current.threadId, current.runId),
       getRunEvents(current.threadId, current.runId)
     ])
-    if (!activeRun.value || activeRun.value.token !== token) return
+    const latestSession = findSession(sessionId)
+    if (!latestSession?.activeRun || latestSession.activeRun.token !== token) return
     const run = runPayload.status === 'fulfilled' ? runPayload.value?.run : null
+    let nextStatusText = defaultRunStatusText
     if (eventsPayload.status === 'fulfilled') {
-      runStatusText.value = latestRunStatusText(run, eventsPayload.value?.events || [])
+      nextStatusText = latestRunStatusText(run, eventsPayload.value?.events || [])
     } else {
-      runStatusText.value = latestRunStatusText(run, [])
+      nextStatusText = latestRunStatusText(run, [])
     }
+    updateSessionRuntime(sessionId, { runStatusText: nextStatusText })
     const status = String(run?.status || '').toUpperCase()
     if (status === 'COMPLETED') {
-      clearRunPoll()
-      loading.value = false
-      stopping.value = false
-      activeRun.value = null
+      clearRunPoll(sessionId)
+      updateSessionRuntime(sessionId, {
+        activeRun: null,
+        submitting: false,
+        stopping: false,
+        runStatusText: defaultRunStatusText
+      })
       if (run.answer) {
-        appendAssistant(run.answer)
+        appendAssistantToSession(sessionId, run.answer)
       } else {
-        appendAssistant(systemMessage('任务已完成，但没有返回可展示的答案。'))
+        appendAssistantToSession(sessionId, systemMessage('任务已完成，但没有返回可展示的答案。'))
       }
-      await scrollBottom()
       return
     }
     if (status === 'FAILED') {
-      clearRunPoll()
-      loading.value = false
-      stopping.value = false
-      activeRun.value = null
-      appendAssistant(systemMessage(`本次回答失败：${run?.error || '后端执行异常'}`))
-      await scrollBottom()
+      clearRunPoll(sessionId)
+      updateSessionRuntime(sessionId, {
+        activeRun: null,
+        submitting: false,
+        stopping: false,
+        runStatusText: defaultRunStatusText
+      })
+      appendAssistantToSession(sessionId, systemMessage(`本次回答失败：${run?.error || '后端执行异常'}`))
       return
     }
     if (status === 'CANCELED') {
-      clearRunPoll()
-      loading.value = false
-      stopping.value = false
-      activeRun.value = null
-      await scrollBottom()
+      clearRunPoll(sessionId)
+      updateSessionRuntime(sessionId, {
+        activeRun: null,
+        submitting: false,
+        stopping: false,
+        runStatusText: defaultRunStatusText
+      })
       return
     }
-    scheduleRunPoll(token)
+    scheduleRunPoll(sessionId, token)
   } catch {
-    if (!activeRun.value || activeRun.value.token !== token) return
-    runStatusText.value = '正在等待后端返回状态'
-    scheduleRunPoll(token, 1200)
+    const latestSession = findSession(sessionId)
+    if (!latestSession?.activeRun || latestSession.activeRun.token !== token) return
+    updateSessionRuntime(sessionId, { runStatusText: '正在等待后端返回状态' })
+    scheduleRunPoll(sessionId, token, 1200)
   }
 }
 
 async function stopCurrentRun() {
   if (stopping.value) return
-  const current = activeRun.value
-  stopping.value = true
-  runStatusText.value = '正在停止本次回答'
-  clearRunPoll()
-  if (!current && submitController) {
-    submitController.abort()
+  const session = activeSession.value
+  if (!session) return
+  const current = session.activeRun
+  updateSessionRuntime(session.id, {
+    stopping: true,
+    stopRequested: true,
+    runStatusText: '正在停止本次回答'
+  })
+  clearRunPoll(session.id)
+  if (!current && session.submitController) {
+    session.submitController.abort()
     return
   }
   if (!current) {
-    loading.value = false
-    stopping.value = false
+    updateSessionRuntime(session.id, {
+      submitting: false,
+      stopping: false,
+      submitController: null,
+      runStatusText: defaultRunStatusText
+    })
     return
   }
   const stoppedRun = current
-  activeRun.value = null
+  updateSessionRuntime(session.id, { activeRun: null })
   try {
     await cancelRun(stoppedRun.threadId, stoppedRun.runId)
   } catch {
     // 取消请求失败也要允许用户继续提问；后端旧结果不会再被当前 token 接收。
   } finally {
-    loading.value = false
-    stopping.value = false
-    appendAssistant(systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
-    await scrollBottom()
+    updateSessionRuntime(session.id, {
+      submitting: false,
+      stopping: false,
+      runStatusText: defaultRunStatusText
+    })
+    appendAssistantToSession(session.id, systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
   }
 }
 
-function clearRunPoll() {
-  if (pollTimer) {
-    window.clearTimeout(pollTimer)
-    pollTimer = null
+function clearRunPoll(sessionId) {
+  const timer = runPollTimers.get(sessionId)
+  if (timer) {
+    window.clearTimeout(timer)
+    runPollTimers.delete(sessionId)
   }
 }
 
-function clearSubmitController() {
-  submitController = null
+function clearAllRunPolls() {
+  for (const timer of runPollTimers.values()) {
+    window.clearTimeout(timer)
+  }
+  runPollTimers.clear()
 }
 
 function latestRunStatusText(run, events = []) {
@@ -363,8 +405,13 @@ function systemMessage(text) {
 }
 
 function appendAssistant(response) {
-  messages.value.push({
-    localId: `a_${Date.now()}`,
+  appendAssistantToSession(activeSessionId.value, response)
+}
+
+function appendAssistantToSession(sessionId, response) {
+  const targetMessages = sessionId === activeSessionId.value ? messages.value : cloneValue(findSession(sessionId)?.messages || [])
+  targetMessages.push({
+    localId: `a_${Date.now()}_${Math.random().toString(16).slice(2)}`,
     id: response.id || `local_${Date.now()}`,
     role: 'assistant',
     text: response.answer,
@@ -383,15 +430,31 @@ function appendAssistant(response) {
       persisted: Boolean(response.persisted)
     }
   })
+  const sessionUpdates = {
+    messages: cloneValue(targetMessages)
+  }
   if (response.suggestions?.length) {
-    suggestionPool.value = mergeSuggestionPool(response.suggestions)
-    suggestionCursor.value = 0
-    suggestions.value = suggestionPool.value.slice(0, 3)
+    const nextPool = mergeSuggestionPoolFor(sessionId, response.suggestions)
+    sessionUpdates.suggestionPool = nextPool
+    sessionUpdates.suggestionCursor = 0
+    sessionUpdates.suggestions = nextPool.slice(0, 3)
   }
   if (response.context) {
-    conversationContext.value = response.context
+    sessionUpdates.conversationContext = cloneValue(response.context)
   }
-  saveActiveSessionSnapshot()
+  updateSession(sessionId, sessionUpdates)
+  if (sessionId === activeSessionId.value) {
+    messages.value = cloneValue(sessionUpdates.messages)
+    if (sessionUpdates.suggestionPool) {
+      suggestionPool.value = cloneValue(sessionUpdates.suggestionPool)
+      suggestionCursor.value = 0
+      suggestions.value = cloneValue(sessionUpdates.suggestions)
+    }
+    if (response.context) {
+      conversationContext.value = cloneValue(response.context)
+    }
+    scrollBottom()
+  }
 }
 
 async function handleFeedback(payload) {
@@ -432,12 +495,12 @@ function nextFeedbackStatus(current, payload) {
 
 async function resetChat() {
   saveActiveSessionSnapshot()
-  cancelActiveInteraction()
   input.value = ''
   newSessionFlash.value = true
   const session = createConversationSession('新会话', '您好，我是 Evan，新的经营分析会话已开启。')
   sessions.value = [session, ...sessions.value].slice(0, 6)
   loadSession(session.id)
+  persistSessions()
   await nextTick()
   if (chatList.value) {
     chatList.value.scrollTo({ top: 0, behavior: 'smooth' })
@@ -453,7 +516,6 @@ async function resetChat() {
 async function switchSession(sessionId) {
   if (sessionId === activeSessionId.value) return
   saveActiveSessionSnapshot()
-  cancelActiveInteraction()
   clearNewSessionTimer()
   newSessionFlash.value = false
   loadSession(sessionId)
@@ -474,9 +536,7 @@ function loadSession(sessionId) {
   suggestionCursor.value = Number(session.suggestionCursor || 0)
   suggestions.value = cloneValue(session.suggestions || pickSuggestionPage(suggestionCursor.value))
   input.value = ''
-  loading.value = false
-  stopping.value = false
-  runStatusText.value = '正在分析问题并读取经营数据'
+  persistSessions()
 }
 
 function saveActiveSessionSnapshot() {
@@ -492,22 +552,7 @@ function saveActiveSessionSnapshot() {
     suggestionCursor: suggestionCursor.value,
     suggestions: cloneValue(suggestions.value)
   }
-}
-
-function cancelActiveInteraction() {
-  chatEpoch += 1
-  clearRunPoll()
-  if (submitController) {
-    submitController.abort()
-    clearSubmitController()
-  }
-  const running = activeRun.value
-  activeRun.value = null
-  if (running) {
-    cancelRun(running.threadId, running.runId).catch(() => {})
-  }
-  loading.value = false
-  stopping.value = false
+  persistSessions()
 }
 
 function createConversationSession(title, welcomeText) {
@@ -518,7 +563,13 @@ function createConversationSession(title, welcomeText) {
     conversationContext: null,
     suggestionPool: defaultSuggestions.slice(),
     suggestionCursor: 0,
-    suggestions: defaultSuggestions.slice(0, 3)
+    suggestions: defaultSuggestions.slice(0, 3),
+    activeRun: null,
+    submitting: false,
+    submitController: null,
+    stopping: false,
+    stopRequested: false,
+    runStatusText: defaultRunStatusText
   }
 }
 
@@ -546,11 +597,123 @@ function cloneValue(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
+function restorePersistedSessions(fallbackSession) {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return { sessions: [fallbackSession], activeSessionId: fallbackSession.id }
+  }
+  try {
+    const raw = window.localStorage.getItem(sessionStorageKey)
+    if (!raw) return { sessions: [fallbackSession], activeSessionId: fallbackSession.id }
+    const parsed = JSON.parse(raw)
+    const restoredSessions = Array.isArray(parsed?.sessions)
+      ? parsed.sessions.map(normalizeRestoredSession).filter(Boolean).slice(0, 6)
+      : []
+    if (!restoredSessions.length) {
+      return { sessions: [fallbackSession], activeSessionId: fallbackSession.id }
+    }
+    const restoredActiveId = restoredSessions.some(session => session.id === parsed.activeSessionId)
+      ? parsed.activeSessionId
+      : restoredSessions[0].id
+    return { sessions: restoredSessions, activeSessionId: restoredActiveId }
+  } catch {
+    return { sessions: [fallbackSession], activeSessionId: fallbackSession.id }
+  }
+}
+
+function normalizeRestoredSession(session) {
+  if (!session || typeof session !== 'object') return null
+  const activeRun = session.activeRun?.threadId && session.activeRun?.runId
+    ? {
+        threadId: session.activeRun.threadId,
+        runId: session.activeRun.runId,
+        token: session.activeRun.token || `run_restore_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      }
+    : null
+  return {
+    id: session.id || `session_restore_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    title: session.title || '经营分析工作台',
+    messages: Array.isArray(session.messages) && session.messages.length
+      ? cloneValue(session.messages)
+      : [createWelcomeMessage('您好，我是 Evan，新的经营分析会话已开启。')],
+    conversationContext: cloneValue(session.conversationContext),
+    suggestionPool: Array.isArray(session.suggestionPool) && session.suggestionPool.length
+      ? cloneValue(session.suggestionPool)
+      : defaultSuggestions.slice(),
+    suggestionCursor: Number(session.suggestionCursor || 0),
+    suggestions: Array.isArray(session.suggestions) && session.suggestions.length
+      ? cloneValue(session.suggestions)
+      : defaultSuggestions.slice(0, 3),
+    activeRun,
+    submitting: false,
+    submitController: null,
+    stopping: false,
+    stopRequested: false,
+    runStatusText: activeRun ? (session.runStatusText || '正在等待任务状态') : defaultRunStatusText
+  }
+}
+
+function findSessionSnapshot(sessionList, sessionId) {
+  return sessionList.find(session => session.id === sessionId)
+}
+
+function persistSessions() {
+  if (typeof window === 'undefined' || !window.localStorage) return
+  const payload = {
+    activeSessionId: activeSessionId.value,
+    sessions: sessions.value.map(toPersistedSession)
+  }
+  window.localStorage.setItem(sessionStorageKey, JSON.stringify(payload))
+}
+
+function toPersistedSession(session) {
+  return {
+    ...session,
+    messages: cloneValue(session.messages),
+    conversationContext: cloneValue(session.conversationContext),
+    suggestionPool: cloneValue(session.suggestionPool),
+    suggestions: cloneValue(session.suggestions),
+    submitController: null,
+    submitting: false,
+    stopping: false,
+    stopRequested: false
+  }
+}
+
+function resumeSessionRuns() {
+  for (const session of sessions.value) {
+    if (session.activeRun?.token) {
+      scheduleRunPoll(session.id, session.activeRun.token, 250)
+    }
+  }
+}
+
 function clearNewSessionTimer() {
   if (newSessionTimer) {
     window.clearTimeout(newSessionTimer)
     newSessionTimer = null
   }
+}
+
+function findSession(sessionId) {
+  return sessions.value.find(session => session.id === sessionId)
+}
+
+function isSessionRunning(session) {
+  return Boolean(session?.submitting || session?.activeRun)
+}
+
+function updateSession(sessionId, updates) {
+  const index = sessions.value.findIndex(session => session.id === sessionId)
+  if (index < 0) return
+  sessions.value[index] = {
+    ...sessions.value[index],
+    ...updates
+  }
+  persistSessions()
+}
+
+function updateSessionRuntime(sessionId, updates) {
+  updateSession(sessionId, updates)
 }
 
 function rotateSuggestions() {
@@ -566,16 +729,27 @@ function rotateSuggestions() {
     if (nextPage.some(item => !current.has(item))) {
       suggestionCursor.value = nextCursor
       suggestions.value = nextPage
+      saveActiveSessionSnapshot()
       return
     }
   }
   suggestionCursor.value = (suggestionCursor.value + 1) % suggestionPool.value.length
   suggestions.value = pickSuggestionPage(suggestionCursor.value)
+  saveActiveSessionSnapshot()
 }
 
 function mergeSuggestionPool(serverSuggestions = []) {
+  return mergeSuggestionPoolFrom(defaultSuggestions, serverSuggestions)
+}
+
+function mergeSuggestionPoolFor(sessionId, serverSuggestions = []) {
+  const session = findSession(sessionId)
+  return mergeSuggestionPoolFrom(session?.suggestionPool || defaultSuggestions, serverSuggestions)
+}
+
+function mergeSuggestionPoolFrom(basePool, serverSuggestions = []) {
   const merged = []
-  for (const item of [...serverSuggestions, ...defaultSuggestions]) {
+  for (const item of [...serverSuggestions, ...basePool, ...defaultSuggestions]) {
     const text = String(item || '').trim()
     if (!text || merged.includes(text)) continue
     merged.push(text)

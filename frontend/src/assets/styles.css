@@ -1228,6 +1228,16 @@ body {
   background: #f5f7ff;
 }
 
+.topic-tab.running::after {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #18a058;
+  box-shadow: 0 0 0 3px rgba(24, 160, 88, 0.12);
+}
+
 .topic-tab span {
   min-width: 0;
   overflow: hidden;
