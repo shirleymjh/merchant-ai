@@ -2015,7 +2015,8 @@ def test_answer_compose_merges_rule_evidence_with_bi_data():
 
     answer = service.compose("平台规则说发货超时要注意什么，同时看最近7天发货超时订单量。", MerchantInfo(merchant_id="100"), plan, run, "", rule_context=rule_context)
 
-    assert "已按当前口径查询到 1 行数据" in answer
+    assert "发货超时" in answer or "订单" in answer
+    assert "已按当前口径" not in answer
     assert "规则依据" in answer
     assert "发货时效" in answer
     assert compact_rule_evidence("发货超时要注意什么", rule_context)
@@ -9533,6 +9534,52 @@ def test_compiler_keeps_parallel_metrics_as_sibling_nodes_even_when_tables_are_r
     assert PlannerReflectionAgent().reflect("最近30天订单量和退款金额分别是多少", plan, pack).passed
 
 
+def test_compiler_adds_daily_trend_context_for_time_window_metric():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "sub_order_id", "pt"],
+            )
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                title="订单量",
+                metadata={"metricKey": "order_detail_cnt", "sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+            )
+        ],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "order_detail_cnt",
+            "ownerTable": "dwm_trade_order_detail_di",
+            "sourcePhrase": "订单量",
+            "objectiveType": "metric_total",
+            "groupByColumn": "seller_id",
+            "limit": 1,
+        },
+        "requestedMeasures": [],
+        "scopeConstraints": [],
+        "filters": [],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("最近7天订单量是多少？", understanding, pack)
+
+    trend = next((intent for intent in plan.intents if intent.group_by_column == "pt"), None)
+    assert trend is not None
+    assert trend.answer_mode == AnswerMode.GROUP_AGG
+    assert trend.metric_name == "order_detail_cnt"
+    assert str((trend.metric_resolution or {}).get("visualization")) == "line_chart"
+    assert any(item.startswith("DEFAULT_TREND_CONTEXT:") for item in plan.compiler_trace)
+
+
 def test_compiler_keeps_top_entity_requested_metric_dependent():
     pack = PlanningAssetPack(
         tables=[
@@ -10243,6 +10290,73 @@ def test_planner_expands_asset_pack_from_llm_requested_metric_owner_table():
     assert not any(issue["code"] == "REQUESTED_MEASURE_NOT_PLANNED" for issue in reflection.issues)
 
 
+def test_materialized_profile_rate_metric_uses_standard_field_not_formula_components():
+    pack = profile_daily_pack()
+    pack.tables[0].columns.extend(["refund_rate_1d", "return_cnt_1d", "pay_order_cnt_1d"])
+    pack.metrics.extend(
+        [
+            PlanningAssetEntry(
+                key="return_cnt_1d",
+                table="ads_merchant_profile",
+                columns=["return_cnt_1d"],
+                title="退货量",
+                metadata={"sourceColumns": ["return_cnt_1d"], "formula": "SUM(return_cnt_1d)"},
+            ),
+            PlanningAssetEntry(
+                key="pay_order_cnt_1d",
+                table="ads_merchant_profile",
+                columns=["pay_order_cnt_1d"],
+                title="支付订单量",
+                metadata={"sourceColumns": ["pay_order_cnt_1d"], "formula": "SUM(pay_order_cnt_1d)"},
+            ),
+            PlanningAssetEntry(
+                key="refund_rate_1d",
+                table="ads_merchant_profile",
+                columns=["refund_rate_1d"],
+                title="退货量占支付订单量比例",
+                aliases=["退货率", "退款率", "退货比例"],
+                metadata={
+                    "sourceColumns": ["return_cnt_1d", "pay_order_cnt_1d"],
+                    "formula": "return_cnt_1d / pay_order_cnt_1d",
+                    "unit": "%",
+                },
+            ),
+        ]
+    )
+    understanding = {
+        "analysisGrain": "day",
+        "rankingObjective": {
+            "metricRef": "refund_rate_1d",
+            "ownerTable": "ads_merchant_profile",
+            "sourcePhrase": "退货比例",
+            "groupByColumn": "pt",
+            "order": "desc",
+            "limit": 30,
+        },
+        "requestedMeasures": [],
+        "filters": [],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("最近30天退货比例走势", understanding, pack)
+
+    intent = next(intent for intent in plan.intents if intent.metric_name == "refund_rate_1d")
+    assert intent.preferred_table == "ads_merchant_profile"
+    assert intent.answer_mode != AnswerMode.DERIVED
+    assert intent.metric_column == "refund_rate_1d"
+    assert intent.metric_formula == "AVG(`refund_rate_1d`)"
+    assert "return_cnt_1d" not in intent.required_evidence
+    assert "pay_order_cnt_1d" not in intent.required_evidence
+    assert not any(dep.relation_type == "DERIVED_COMPONENT" for dep in plan.dependencies)
+
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), get_settings())
+    sql = worker._draft_sql(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+    assert "AVG(`refund_rate_1d`) AS `refund_rate_1d`" in sql
+    assert "return_cnt_1d / pay_order_cnt_1d" not in sql
+    assert "return_cnt_1d" not in sql
+    assert "pay_order_cnt_1d" not in sql
+
+
 def test_planner_reflection_flags_requested_measure_not_planned():
     pack = PlanningAssetPack(
         tables=[
@@ -10537,7 +10651,7 @@ def test_answer_analysis_summary_skips_when_structured_intent_is_none():
     assert llm.calls == 0
 
 
-def test_answer_compose_skips_llm_for_plain_query_with_rows():
+def test_answer_compose_uses_llm_for_plain_query_with_rows():
     class FakeAnswerLlm:
         configured = True
         settings = get_settings()
@@ -10547,7 +10661,8 @@ def test_answer_compose_skips_llm_for_plain_query_with_rows():
 
         def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
             self.calls += 1
-            return "不应该调用"
+            assert "不要输出 markdown 表格" in system_prompt
+            return "最近30天退款金额最高的商品是 A，退款金额为 12.3。"
 
     llm = FakeAnswerLlm()
     run = AgentRunResult(
@@ -10582,8 +10697,152 @@ def test_answer_compose_skips_llm_for_plain_query_with_rows():
         ],
     )
     answer = AnswerComposeService(llm).compose("最近30天退款金额最高的商品", MerchantInfo(merchant_id="100"), plan, run, "")
-    assert "已按当前口径查询到" in answer
-    assert llm.calls == 0
+    assert "退款金额最高的商品是 A" in answer
+    assert "已按当前口径" not in answer
+    assert llm.calls == 1
+
+
+def test_answer_sections_convert_daily_metric_rows_to_chart_series():
+    settings = get_settings()
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="anchor_order",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                metric_resolution={"metricKey": "order_detail_cnt", "displayName": "订单量"},
+            ),
+            QuestionIntent(
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="trend_order_order_detail_cnt",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_detail_cnt",
+                group_by_column="pt",
+                metric_resolution={"metricKey": "order_detail_cnt", "displayName": "订单量", "visualization": "line_chart"},
+            ),
+        ]
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="anchor_order",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_order_detail_di"],
+                    rows=[{"seller_id": "100", "order_detail_cnt": 17}],
+                    original_row_count=1,
+                ),
+            ),
+            AgentTaskResult(
+                task_id="trend_order_order_detail_cnt",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_trade_order_detail_di"],
+                    rows=[
+                        {"seller_id": "100", "pt": "2026-06-23", "order_detail_cnt": 3},
+                        {"seller_id": "100", "pt": "2026-06-24", "order_detail_cnt": 5},
+                    ],
+                    original_row_count=2,
+                ),
+            ),
+        ]
+    )
+
+    sections = service.build_sections(plan, run)
+
+    trend_section = next(section for section in sections if section.title == "订单量趋势")
+    assert trend_section.data_rows == [
+        {"metric_name": "订单量", "pt": "2026-06-23", "value": 3.0},
+        {"metric_name": "订单量", "pt": "2026-06-24", "value": 5.0},
+    ]
+
+
+def test_answer_compose_keeps_summary_metric_authoritative_when_trend_is_partial():
+    class MisreadingAnswerLlm:
+        configured = True
+        settings = get_settings()
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            assert "resultRole=summary" in system_prompt
+            return (
+                "最近7天咨询工单量是 5 单。\n\n"
+                "从已提供的分日情况看：6月24日 3单，6月23日 1单，6月22日 1单。\n"
+                "其余日期这里没有看到分日明细。\n"
+                "建议优先回看 6月24日工单上升的咨询类型。"
+            )
+
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.CS_TICKET,
+                plan_task_id="anchor_ticket",
+                preferred_table="ads_merchant_profile",
+                metric_name="cs_ticket_cnt_1d",
+                metric_resolution={"metricKey": "cs_ticket_cnt_1d", "displayName": "咨询工单量"},
+            ),
+            QuestionIntent(
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.CS_TICKET,
+                plan_task_id="trend_ticket_cs_ticket_cnt_1d",
+                preferred_table="ads_merchant_profile",
+                metric_name="cs_ticket_cnt_1d",
+                group_by_column="pt",
+                metric_resolution={"metricKey": "cs_ticket_cnt_1d", "displayName": "咨询工单量", "displayRole": "trend_context"},
+            ),
+        ]
+    )
+    run = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            tables=["ads_merchant_profile"],
+            rows=[
+                {"merchant_id": "100", "cs_ticket_cnt_1d": 5},
+                {"merchant_id": "100", "pt": "2026-06-22", "cs_ticket_cnt_1d": 1},
+                {"merchant_id": "100", "pt": "2026-06-23", "cs_ticket_cnt_1d": 1},
+                {"merchant_id": "100", "pt": "2026-06-24", "cs_ticket_cnt_1d": 3},
+            ],
+        ),
+        task_results=[
+            AgentTaskResult(
+                task_id="anchor_ticket",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["ads_merchant_profile"],
+                    rows=[{"merchant_id": "100", "cs_ticket_cnt_1d": 5}],
+                    original_row_count=1,
+                ),
+            ),
+            AgentTaskResult(
+                task_id="trend_ticket_cs_ticket_cnt_1d",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["ads_merchant_profile"],
+                    rows=[
+                        {"merchant_id": "100", "pt": "2026-06-22", "cs_ticket_cnt_1d": 1},
+                        {"merchant_id": "100", "pt": "2026-06-23", "cs_ticket_cnt_1d": 1},
+                        {"merchant_id": "100", "pt": "2026-06-24", "cs_ticket_cnt_1d": 3},
+                    ],
+                    original_row_count=3,
+                ),
+            ),
+        ],
+    )
+
+    answer = AnswerComposeService(MisreadingAnswerLlm()).compose("最近7天咨询工单量", MerchantInfo(merchant_id="100"), plan, run, "")
+
+    assert "最近7天咨询工单量是 5 单" in answer
+    assert "其余日期" not in answer
+    assert "未带日期" not in answer
+    assert "建议优先" not in answer
+    assert answer.count("- ") == 2
 
 
 def recall_bundle_empty():

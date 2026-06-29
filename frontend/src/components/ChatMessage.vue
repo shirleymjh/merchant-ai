@@ -1,24 +1,12 @@
 <template>
   <article :class="['message', role]">
     <div v-if="role === 'assistant'" class="assistant-message">
-      <div class="assistant-avatar">D</div>
+      <div class="assistant-avatar">E</div>
       <div class="assistant-stream">
         <div class="message-meta">
-          <strong>Diana</strong>
+          <strong>Evan</strong>
           <span>· {{ displayTime }}</span>
         </div>
-        <details v-if="steps?.length" class="query-runner">
-          <summary>
-            <span>Ran {{ queryCount }} {{ queryCount === 1 ? 'query' : 'queries' }}</span>
-            <small>Click to expand</small>
-          </summary>
-          <div class="thinking">
-            <div v-for="step in steps" :key="step" class="thinking-step">
-              <CircleCheck :size="14" />
-              <span>{{ step }}</span>
-            </div>
-          </div>
-        </details>
         <div class="assistant-card">
           <div class="answer-text">
             <section
@@ -31,6 +19,18 @@
               <ul v-if="block.items.length" class="answer-block-list">
                 <li v-for="item in block.items" :key="item">{{ item }}</li>
               </ul>
+            </section>
+          </div>
+          <div v-if="metricSummarySections.length" class="metric-summary-grid">
+            <section
+              v-for="(section, sectionIndex) in metricSummarySections"
+              :key="`metric-summary-${sectionIndex}-${section.valueColumn}`"
+              class="metric-summary-card"
+            >
+              <p class="metric-summary-kicker">核心指标</p>
+              <h3>{{ section.label }}</h3>
+              <strong>{{ section.value }}</strong>
+              <span v-if="section.tables?.length">{{ tableLabel(section.tables[0]) }}</span>
             </section>
           </div>
           <MetricLineChart
@@ -90,7 +90,26 @@
             :key="`table-${sectionIndex}-${section.title || section.tables?.join(',')}`"
             class="detail-table-wrap"
           >
-            <p v-if="section.title" class="answer-block-title">{{ section.title }}</p>
+            <div class="detail-table-head">
+              <div>
+                <p>{{ section.rows.length }} 行</p>
+                <h3>{{ presentSectionTitle(section.title) }}</h3>
+              </div>
+              <div class="result-toolbar" aria-label="表格操作">
+                <button type="button" title="放大查看">
+                  <Maximize2 :size="14" />
+                </button>
+                <button type="button" title="下载结果">
+                  <Download :size="14" />
+                </button>
+                <button type="button" title="筛选">
+                  <Filter :size="14" />
+                </button>
+                <button type="button" title="复制">
+                  <Copy :size="14" />
+                </button>
+              </div>
+            </div>
             <table class="detail-table">
               <thead>
                 <tr>
@@ -115,7 +134,7 @@
               type="button"
               :class="['adopt-action', { active: feedbackStatus?.adopted }]"
               title="采纳"
-              @click="$emit('feedback', { id, adopted: true })"
+              @click="$emit('feedback', { id, adopted: !feedbackStatus?.adopted })"
             >
               <Check :size="16" />
               <span>{{ feedbackStatus?.adopted ? '已采纳' : '采纳' }}</span>
@@ -124,7 +143,7 @@
               type="button"
               :class="{ active: feedbackStatus?.liked }"
               title="点赞"
-              @click="$emit('feedback', { id, liked: true, disliked: false })"
+              @click="$emit('feedback', { id, liked: !feedbackStatus?.liked, disliked: false })"
             >
               <ThumbsUp :size="16" />
             </button>
@@ -132,7 +151,7 @@
               type="button"
               :class="{ active: feedbackStatus?.disliked }"
               title="点踩"
-              @click="$emit('feedback', { id, liked: false, disliked: true })"
+              @click="$emit('feedback', { id, liked: false, disliked: !feedbackStatus?.disliked })"
             >
               <ThumbsDown :size="16" />
             </button>
@@ -147,7 +166,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { Check, CircleCheck, ThumbsDown, ThumbsUp } from 'lucide-vue-next'
+import { Check, Copy, Download, Filter, Maximize2, ThumbsDown, ThumbsUp } from 'lucide-vue-next'
 import MetricLineChart from './MetricLineChart.vue'
 
 const props = defineProps({
@@ -190,17 +209,6 @@ const displayTime = new Date().toLocaleString('zh-CN', {
   minute: '2-digit'
 }).replace(/\//g, '/')
 
-const queryCount = computed(() => {
-  const querySteps = (props.steps || []).filter(step => /query_doris|SQL|Doris|工具|SubAgent|retrieve_knowledge/.test(step))
-  if (visibleDataSections.value.length) {
-    return Math.max(visibleDataSections.value.length, querySteps.length ? 1 : 0)
-  }
-  if (props.tables?.length) {
-    return Math.max(props.tables.length, 1)
-  }
-  return Math.max(querySteps.length, 1)
-})
-
 const visibleDataSections = computed(() => {
   const sections = props.dataSections || []
   if (sections.length <= 1) {
@@ -212,6 +220,19 @@ const visibleDataSections = computed(() => {
   }
   const selected = sections.filter(section => answerTitles.has(normalizeSectionTitle(section?.title || '')))
   return selected.length ? selected : sections
+})
+
+const metricSummarySections = computed(() => {
+  const structuredSections = visibleDataSections.value
+    .map((section) => {
+      const rows = extractDisplayRows(section?.dataRows || [])
+      return metricSummaryFromRows(rows, section?.title || '', section?.dorisTables || [])
+    })
+    .filter(Boolean)
+  if (structuredSections.length) {
+    return structuredSections
+  }
+  return [metricSummaryFromRows(extractDisplayRows(props.dataRows || []), '', props.tables || [])].filter(Boolean)
 })
 
 const chartSections = computed(() => {
@@ -276,7 +297,7 @@ const tableSections = computed(() => {
         columns: collectColumns(rows)
       }
     })
-    .filter(section => section.rows.length && !isMetricSeriesRows(section.rows) && !isAggregateRows(section.rows))
+    .filter(section => section.rows.length && !isMetricSeriesRows(section.rows) && !isAggregateRows(section.rows) && !isSingleMetricRows(section.rows))
   if (structuredSections.length) {
     return structuredSections
   }
@@ -284,7 +305,7 @@ const tableSections = computed(() => {
   if (!rows.length) {
     return []
   }
-  if (isMetricSeriesRows(rows) || isAggregateRows(rows)) {
+  if (isMetricSeriesRows(rows) || isAggregateRows(rows) || isSingleMetricRows(rows)) {
     return []
   }
   const hasMetricRows = (props.dataRows || []).some(row => Object.prototype.hasOwnProperty.call(row || {}, 'metric_name'))
@@ -383,6 +404,62 @@ function isAggregateRows(rows) {
     && rows.every(row =>
       Object.prototype.hasOwnProperty.call(row || {}, 'group_value')
       && Object.prototype.hasOwnProperty.call(row || {}, 'metric_value'))
+}
+
+function isSingleMetricRows(rows) {
+  if (!Array.isArray(rows) || rows.length !== 1) return false
+  return metricValueColumns(rows[0]).length === 1
+}
+
+function metricSummaryFromRows(rows, title, tables) {
+  if (!isSingleMetricRows(rows)) {
+    return null
+  }
+  const row = rows[0]
+  const valueColumn = metricValueColumns(row)[0]
+  return {
+    label: title && !looksLikeRawField(title) ? presentSectionTitle(title) : columnLabel(valueColumn),
+    value: formatMetricSummaryValue(row[valueColumn], valueColumn),
+    valueColumn,
+    tables
+  }
+}
+
+function metricValueColumns(row) {
+  return Object.keys(row || {}).filter((column) => {
+    if (isIdentifierColumn(column) || column.startsWith('__')) return false
+    return numericValue(row[column]) !== null
+  })
+}
+
+function isIdentifierColumn(column) {
+  const text = String(column || '').toLowerCase()
+  return text === 'pt'
+    || text === 'seller_id'
+    || text === 'merchant_id'
+    || text.endsWith('_id')
+    || text.endsWith('_no')
+}
+
+function numericValue(value) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null
+  const numeric = Number(String(value).replace(/,/g, ''))
+  return Number.isFinite(numeric) ? numeric : null
+}
+
+function formatMetricSummaryValue(value, column) {
+  const numeric = numericValue(value)
+  if (numeric === null) return formatCell(value)
+  if (/amt|amount|gmv|金额|pay/i.test(String(column || ''))) {
+    return `${formatCompactNumber(numeric)}元`
+  }
+  return formatCompactNumber(numeric)
+}
+
+function formatCompactNumber(value) {
+  if (Math.abs(value) >= 10000) return `${(value / 10000).toFixed(2).replace(/\.00$/, '')}万`
+  if (Number.isInteger(value)) return String(value)
+  return value.toFixed(2).replace(/\.00$/, '')
 }
 
 function collectColumns(rows) {
@@ -668,12 +745,17 @@ function inferAggregateMode(title, rows) {
 
 function presentSectionTitle(title) {
   if (!title) {
-    return '查询结果'
+    return '明细结果'
   }
-  return String(title)
+  const normalized = String(title)
     .split('-')
     .filter(Boolean)
     .join(' / ')
+  return looksLikeRawField(normalized) ? columnLabel(normalized) : normalized
+}
+
+function looksLikeRawField(title) {
+  return /^[a-z][a-z0-9_]*$/i.test(String(title || ''))
 }
 
 function resolveGroupLabel(title) {

@@ -1,47 +1,25 @@
 <template>
-  <main class="diana-app">
-    <aside class="workspace-sidebar">
-      <div class="sidebar-brand">
-        <img src="/yshopping-logo.svg" alt="yshopping" />
-        <div>
-          <span>当前经营主题</span>
-          <strong>商家经营分析</strong>
-        </div>
-      </div>
-      <div class="sidebar-search">
-        <Search :size="15" />
-        <input v-model.trim="sessionFilter" type="search" placeholder="搜索常用问题" />
-      </div>
-      <nav class="session-list">
-        <button class="session-item active" type="button">
-          <span class="session-dot"></span>
-          <span>当前会话</span>
-          <small>当前</small>
-        </button>
-        <button
-          v-for="item in filteredSessionExamples"
-          :key="item"
-          class="session-item"
-          type="button"
-          @click="sendSuggestion(item)"
-        >
-          <span class="session-dot muted-dot"></span>
-          <span>{{ item }}</span>
-          <small>常用</small>
-        </button>
-        <p v-if="!filteredSessionExamples.length" class="session-empty">没有匹配的问题</p>
-      </nav>
-    </aside>
-
+  <main class="evan-app">
     <section class="workspace-main">
       <header class="topic-header">
         <div class="topic-tabs">
-          <button class="topic-tab active" type="button">
-            <span>{{ currentTopicTitle }}</span>
+          <button
+            v-for="session in sessions"
+            :key="session.id"
+            :class="['topic-tab', { active: session.id === activeSessionId }]"
+            type="button"
+            :title="session.title"
+            @click="switchSession(session.id)"
+          >
+            <span>{{ session.title }}</span>
           </button>
-          <button class="topic-tab new-session" type="button" @click="resetChat">
+          <button
+            :class="['topic-tab', 'new-session', { confirmed: newSessionFlash }]"
+            type="button"
+            @click="resetChat"
+          >
             <Plus :size="15" />
-            <span>新会话</span>
+            <span>{{ newSessionFlash ? '已开启' : '新会话' }}</span>
           </button>
         </div>
         <div class="topic-status">
@@ -82,7 +60,7 @@
           @refresh="rotateSuggestions"
         />
         <form class="input-bar" @submit.prevent="submit">
-          <input v-model.trim="input" type="text" placeholder="说出您的疑惑吧，yshopping 帮你解决" />
+          <input ref="inputRef" v-model.trim="input" type="text" placeholder="说出您的疑惑吧，yshopping 帮你解决" />
           <button v-if="!loading" type="submit" class="send-button" title="发送" :disabled="!input">
             <Send :size="20" />
           </button>
@@ -95,18 +73,13 @@
 
     <aside class="insight-rail">
       <DailyReportCard v-if="dailyReport" :report="dailyReport" :compact="true" />
-      <section class="rail-card">
-        <p class="rail-kicker">分析能力</p>
-        <h3>经营数据分析</h3>
-        <p>可查经营指标、明细数据、规则说明，并基于结果做异常判断。</p>
-      </section>
     </aside>
   </main>
 </template>
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { CircleStop, LoaderCircle, Plus, Search, Send, Zap } from 'lucide-vue-next'
+import { CircleStop, LoaderCircle, Plus, Send, Zap } from 'lucide-vue-next'
 import ChatMessage from './components/ChatMessage.vue'
 import DailyReportCard from './components/DailyReportCard.vue'
 import SuggestionList from './components/SuggestionList.vue'
@@ -119,9 +92,12 @@ const runStatusText = ref('正在分析问题并读取经营数据')
 const activeRun = ref(null)
 let submitController = null
 let pollTimer = null
+let chatEpoch = 0
+let newSessionTimer = null
 const chatList = ref(null)
+const inputRef = ref(null)
 const dailyReport = ref(null)
-const sessionFilter = ref('')
+const newSessionFlash = ref(false)
 const defaultSuggestions = [
   '我想查看保证金',
   '最近7天咨询工单量',
@@ -153,42 +129,17 @@ const defaultSuggestions = [
   '退款金额最高的前5单给我看一下',
   '催单工单最近是否升高？'
 ]
-const sessionExamples = [
-  '最近7天咨询工单量',
-  '最近30天 GMV 下降原因',
-  '最近10天退款明细',
-  '商品审核拒绝原因',
-  '保证金充值流水'
-]
 const suggestions = ref(defaultSuggestions.slice(0, 3))
 const suggestionPool = ref(defaultSuggestions.slice())
 const suggestionCursor = ref(0)
 const suggestionPageSize = 3
 const conversationContext = ref(null)
-const messages = ref([
-  {
-    localId: 'welcome',
-    role: 'assistant',
-    text: '您好，我是 yshopping 商家 AI 助手，有经营问题欢迎随时问我。',
-    steps: [],
-    tables: [],
-    dataRows: [],
-    dataSections: [],
-    feedbackStatus: {}
-  }
-])
+const initialSession = createConversationSession('经营分析工作台', '您好，我是 yshopping 商家 AI 助手，有经营问题欢迎随时问我。')
+const sessions = ref([initialSession])
+const activeSessionId = ref(initialSession.id)
+const messages = ref(cloneValue(initialSession.messages))
 
 const hasConversation = computed(() => messages.value.some(message => message.role === 'user'))
-const currentTopicTitle = computed(() => {
-  const lastUserMessage = [...messages.value].reverse().find(message => message.role === 'user')
-  return lastUserMessage?.text || '经营分析工作台'
-})
-const filteredSessionExamples = computed(() => {
-  const keyword = sessionFilter.value.trim()
-  if (!keyword) return sessionExamples
-  return sessionExamples.filter(item => item.includes(keyword))
-})
-
 onMounted(async () => {
   try {
     dailyReport.value = await getDailyReport()
@@ -199,6 +150,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   clearRunPoll()
+  clearNewSessionTimer()
 })
 
 async function submit() {
@@ -214,6 +166,9 @@ async function sendSuggestion(question) {
 }
 
 async function ask(message) {
+  const epoch = chatEpoch
+  clearNewSessionTimer()
+  newSessionFlash.value = false
   clearRunPoll()
   clearSubmitController()
   messages.value.push({
@@ -221,6 +176,7 @@ async function ask(message) {
     role: 'user',
     text: message
   })
+  saveActiveSessionSnapshot()
   loading.value = true
   stopping.value = false
   runStatusText.value = '正在提交任务'
@@ -229,6 +185,7 @@ async function ask(message) {
   try {
     const created = await startAsyncRun(message, conversationContext.value, { signal: submitController.signal })
     submitController = null
+    if (epoch !== chatEpoch) return
     const runId = created.runId
     const threadId = created.threadId
     if (!runId || !threadId) {
@@ -242,6 +199,7 @@ async function ask(message) {
     runStatusText.value = '任务已提交，正在排队'
     scheduleRunPoll(activeRun.value.token, 300)
   } catch (error) {
+    if (epoch !== chatEpoch) return
     const aborted = error?.name === 'AbortError'
     clearRunPoll()
     clearSubmitController()
@@ -363,7 +321,7 @@ function latestRunStatusText(run, events = []) {
   if (status === 'RUNNING') {
     const lastEvent = [...events].reverse().find(event => event?.node && event.node !== 'RUN_MANAGER')
     if (lastEvent?.node) {
-      return `正在执行 ${formatNodeName(lastEvent.node)}`
+      return friendlyNodeStatus(lastEvent.node)
     }
     return '正在分析问题并读取经营数据'
   }
@@ -372,11 +330,24 @@ function latestRunStatusText(run, events = []) {
   return '正在等待任务状态'
 }
 
-function formatNodeName(node) {
-  return String(node || '')
-    .replace(/_/g, ' ')
-    .toLowerCase()
-    .replace(/\b\w/g, char => char.toUpperCase())
+function friendlyNodeStatus(node) {
+  const value = String(node || '').toLowerCase()
+  if (value.includes('retrieve') || value.includes('knowledge') || value.includes('recall')) {
+    return '正在匹配相关知识和指标口径'
+  }
+  if (value.includes('plan') || value.includes('graph') || value.includes('compile')) {
+    return '正在规划查询路径'
+  }
+  if (value.includes('execute') || value.includes('query') || value.includes('doris') || value.includes('sql')) {
+    return '正在查询经营数据'
+  }
+  if (value.includes('verify') || value.includes('evidence') || value.includes('critic')) {
+    return '正在核对查询结果'
+  }
+  if (value.includes('answer')) {
+    return '正在整理回答'
+  }
+  return '正在分析问题并读取经营数据'
 }
 
 function systemMessage(text) {
@@ -420,12 +391,14 @@ function appendAssistant(response) {
   if (response.context) {
     conversationContext.value = response.context
   }
+  saveActiveSessionSnapshot()
 }
 
 async function handleFeedback(payload) {
   const message = messages.value.find(item => item.id === payload.id)
   if (message) {
     message.feedbackStatus = nextFeedbackStatus(message.feedbackStatus || {}, payload)
+    saveActiveSessionSnapshot()
   }
   try {
     const result = await sendFeedback(payload.id, payload)
@@ -439,38 +412,145 @@ async function handleFeedback(payload) {
 
 function nextFeedbackStatus(current, payload) {
   const next = { ...current }
-  if (payload.adopted) next.adopted = true
-  if (payload.liked) {
-    next.liked = true
+  if (Object.prototype.hasOwnProperty.call(payload, 'adopted')) {
+    next.adopted = Boolean(payload.adopted)
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'liked')) {
+    next.liked = Boolean(payload.liked)
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'disliked')) {
+    next.disliked = Boolean(payload.disliked)
+  }
+  if (next.liked) {
     next.disliked = false
   }
-  if (payload.disliked) {
-    next.disliked = true
+  if (next.disliked) {
     next.liked = false
   }
   return next
 }
 
 async function resetChat() {
-  if (loading.value && activeRun.value) {
-    await stopCurrentRun()
+  saveActiveSessionSnapshot()
+  cancelActiveInteraction()
+  input.value = ''
+  newSessionFlash.value = true
+  const session = createConversationSession('新会话', '您好，我是 Evan，新的经营分析会话已开启。')
+  sessions.value = [session, ...sessions.value].slice(0, 6)
+  loadSession(session.id)
+  await nextTick()
+  if (chatList.value) {
+    chatList.value.scrollTo({ top: 0, behavior: 'smooth' })
   }
-  messages.value = [
-    {
-      localId: 'welcome',
-      role: 'assistant',
-      text: '您好，我是 yshopping 商家 AI 助手，有经营问题欢迎随时问我。',
-      steps: [],
-      tables: [],
-      dataRows: [],
-      dataSections: [],
-      feedbackStatus: {}
-    }
-  ]
-  conversationContext.value = null
-  suggestionPool.value = defaultSuggestions.slice()
-  suggestionCursor.value = 0
-  suggestions.value = pickSuggestionPage(0)
+  inputRef.value?.focus()
+  clearNewSessionTimer()
+  newSessionTimer = window.setTimeout(() => {
+    newSessionFlash.value = false
+    newSessionTimer = null
+  }, 1400)
+}
+
+async function switchSession(sessionId) {
+  if (sessionId === activeSessionId.value) return
+  saveActiveSessionSnapshot()
+  cancelActiveInteraction()
+  clearNewSessionTimer()
+  newSessionFlash.value = false
+  loadSession(sessionId)
+  await nextTick()
+  if (chatList.value) {
+    chatList.value.scrollTo({ top: chatList.value.scrollHeight, behavior: 'smooth' })
+  }
+  inputRef.value?.focus()
+}
+
+function loadSession(sessionId) {
+  const session = sessions.value.find(item => item.id === sessionId)
+  if (!session) return
+  activeSessionId.value = session.id
+  messages.value = cloneValue(session.messages)
+  conversationContext.value = cloneValue(session.conversationContext)
+  suggestionPool.value = cloneValue(session.suggestionPool || defaultSuggestions)
+  suggestionCursor.value = Number(session.suggestionCursor || 0)
+  suggestions.value = cloneValue(session.suggestions || pickSuggestionPage(suggestionCursor.value))
+  input.value = ''
+  loading.value = false
+  stopping.value = false
+  runStatusText.value = '正在分析问题并读取经营数据'
+}
+
+function saveActiveSessionSnapshot() {
+  const index = sessions.value.findIndex(item => item.id === activeSessionId.value)
+  if (index < 0) return
+  const existing = sessions.value[index]
+  sessions.value[index] = {
+    ...existing,
+    title: sessionTitleFromMessages(messages.value, existing.title),
+    messages: cloneValue(messages.value),
+    conversationContext: cloneValue(conversationContext.value),
+    suggestionPool: cloneValue(suggestionPool.value),
+    suggestionCursor: suggestionCursor.value,
+    suggestions: cloneValue(suggestions.value)
+  }
+}
+
+function cancelActiveInteraction() {
+  chatEpoch += 1
+  clearRunPoll()
+  if (submitController) {
+    submitController.abort()
+    clearSubmitController()
+  }
+  const running = activeRun.value
+  activeRun.value = null
+  if (running) {
+    cancelRun(running.threadId, running.runId).catch(() => {})
+  }
+  loading.value = false
+  stopping.value = false
+}
+
+function createConversationSession(title, welcomeText) {
+  return {
+    id: `session_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    title,
+    messages: [createWelcomeMessage(welcomeText)],
+    conversationContext: null,
+    suggestionPool: defaultSuggestions.slice(),
+    suggestionCursor: 0,
+    suggestions: defaultSuggestions.slice(0, 3)
+  }
+}
+
+function createWelcomeMessage(text) {
+  return {
+    localId: `welcome_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    role: 'assistant',
+    text,
+    steps: [],
+    tables: [],
+    dataRows: [],
+    dataSections: [],
+    feedbackStatus: {}
+  }
+}
+
+function sessionTitleFromMessages(sessionMessages, fallback) {
+  const lastUserMessage = [...sessionMessages].reverse().find(message => message.role === 'user')
+  const text = String(lastUserMessage?.text || fallback || '新会话').trim()
+  return text.length > 18 ? `${text.slice(0, 18)}...` : text
+}
+
+function cloneValue(value) {
+  if (value === undefined || value === null) return value
+  return JSON.parse(JSON.stringify(value))
+}
+
+function clearNewSessionTimer() {
+  if (newSessionTimer) {
+    window.clearTimeout(newSessionTimer)
+    newSessionTimer = null
+  }
 }
 
 function rotateSuggestions() {

@@ -1906,9 +1906,7 @@ class MerchantQaWorkflow:
                 state["agent_run_result"],
                 bool(state.get("rule_recall_context", "")),
             )
-            analysis_summary_attempted = False
             if answer_needs_llm and not state.get("analysis_summary"):
-                analysis_summary_attempted = True
                 state["analysis_summary"] = self.answer_service.summarize_analysis(
                     state["question"],
                     state["plan"],
@@ -1931,11 +1929,15 @@ class MerchantQaWorkflow:
                 state["agent_run_result"],
                 answer_context,
                 state.get("analysis_summary", ""),
-                allow_llm=not (analysis_summary_attempted and not state.get("analysis_summary")),
+                allow_llm=True,
                 rule_context=state.get("rule_recall_context", ""),
             )
             skill_trace = state.get("analysis_skill_trace") or {}
-            state["answer_used_llm"] = bool(answer_needs_llm and skill_trace.get("llmFallbackUsed"))
+            state["answer_used_llm"] = bool(
+                state.get("analysis_summary")
+                or skill_trace.get("llmFallbackUsed")
+                or getattr(self.answer_service, "last_compose_used_llm", False)
+            )
         state["suggestions"] = self.answer_service.contextual_suggestions(state["question"], state["plan"].intents)
         state["chat_bi_completed"] = True
         add_step(state, "Result Loop：完成结果解读、建议生成与可视化数据组织")

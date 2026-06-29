@@ -4,7 +4,7 @@
   background: #edf4ff;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --input-bar-height: 96px;
+  --input-bar-height: 68px;
 }
 
 * {
@@ -1013,9 +1013,9 @@ button {
   }
 }
 
-/* Diana-style analytical workspace */
+/* Evan analytical workspace */
 :root {
-  --input-bar-height: 82px;
+  --input-bar-height: 68px;
 }
 
 html,
@@ -1030,19 +1030,19 @@ body {
   background: #f7f6fc;
 }
 
-.diana-app {
+.evan-app {
   width: 100%;
   height: 100vh;
   display: grid;
-  grid-template-columns: 238px minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr) 300px;
   color: #202329;
   background: #f8f7fc;
 }
 
 .workspace-sidebar {
+  display: none;
   min-width: 0;
   height: 100vh;
-  display: grid;
   grid-template-rows: auto auto 1fr;
   gap: 12px;
   padding: 14px 10px;
@@ -1193,9 +1193,16 @@ body {
 
 .topic-tabs {
   min-width: 0;
+  flex: 1;
   display: flex;
   align-items: center;
   gap: 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.topic-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .topic-tab {
@@ -1205,13 +1212,20 @@ body {
   align-items: center;
   gap: 7px;
   padding: 0 13px;
-  border: 1px solid #d7defd;
+  border: 1px solid #e1e5ef;
   border-radius: 18px;
-  color: #245ce8;
-  background: #f5f7ff;
+  color: #636b7b;
+  background: #ffffff;
   font-size: 14px;
   font-weight: 750;
   cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.topic-tab.active {
+  color: #245ce8;
+  border-color: #c9d7ff;
+  background: #f5f7ff;
 }
 
 .topic-tab span {
@@ -1226,6 +1240,12 @@ body {
   border-style: dashed;
   border-color: #d7dae5;
   background: #ffffff;
+}
+
+.topic-tab.new-session.confirmed {
+  color: #047857;
+  border-color: #98d9bd;
+  background: #effcf6;
 }
 
 .topic-status {
@@ -1243,7 +1263,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 18px;
-  padding: 34px min(7vw, 84px) 28px;
+  padding: 34px min(8vw, 110px) 28px;
   background:
     linear-gradient(90deg, rgba(248, 247, 252, 0.88) 0 1px, transparent 1px) 0 0 / 120px 120px,
     #ffffff;
@@ -1265,8 +1285,20 @@ body {
   backdrop-filter: none;
 }
 
+.composer-area .suggestion-card.compact {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 7px 28px 4px;
+}
+
 .composer-area .suggestion-head {
   margin-bottom: 8px;
+}
+
+.composer-area .suggestion-card.compact .suggestion-head {
+  display: contents;
 }
 
 .composer-area .suggestion-card h2 {
@@ -1276,11 +1308,25 @@ body {
   font-weight: 750;
 }
 
+.composer-area .suggestion-card.compact h2 {
+  white-space: nowrap;
+}
+
 .composer-area .suggestion-chip-list {
   gap: 8px;
   flex-wrap: nowrap;
   overflow-x: auto;
   padding-bottom: 4px;
+}
+
+.composer-area .suggestion-card.compact .suggestion-chip-list {
+  min-width: 0;
+  padding-bottom: 0;
+  scrollbar-width: none;
+}
+
+.composer-area .suggestion-card.compact .suggestion-chip-list::-webkit-scrollbar {
+  display: none;
 }
 
 .composer-area .suggestion-chip {
@@ -1293,15 +1339,33 @@ body {
   background: #f7f8fb;
 }
 
+.composer-area .suggestion-card.compact .suggestion-chip {
+  min-height: 30px;
+  gap: 6px;
+  padding: 4px 10px 4px 6px;
+  border-radius: 999px;
+}
+
 .composer-area .suggestion-index {
   width: 22px;
   height: 22px;
   font-size: 13px;
 }
 
+.composer-area .suggestion-card.compact .suggestion-index {
+  width: 20px;
+  height: 20px;
+  font-size: 12px;
+}
+
 .composer-area .suggestion-chip b {
   max-width: 240px;
   font-size: 13px;
+}
+
+.composer-area .suggestion-card.compact .suggestion-chip b {
+  max-width: 220px;
+  font-size: 12px;
 }
 
 .composer-area .refresh-btn {
@@ -1312,22 +1376,28 @@ body {
   font-size: 12px;
 }
 
+.composer-area .suggestion-card.compact .refresh-btn {
+  grid-column: 3;
+  height: 28px;
+  white-space: nowrap;
+}
+
 .input-bar {
   position: static;
   left: auto;
   bottom: auto;
   transform: none;
   width: 100%;
-  min-height: var(--input-bar-height);
+  min-height: 58px;
   grid-template-columns: minmax(0, 1fr) 44px;
-  padding: 12px 28px 16px;
+  padding: 6px 28px 10px;
   border-top: 0;
   background: transparent;
   backdrop-filter: none;
 }
 
 .input-bar input {
-  height: 48px;
+  height: 42px;
   border: 1px solid #eceef5;
   border-radius: 12px;
   background: #f6f7fb;
@@ -1335,8 +1405,8 @@ body {
 }
 
 .send-button {
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   border-radius: 12px;
   background: #2e6df0;
 }
@@ -1355,11 +1425,12 @@ body {
 }
 
 .insight-rail {
-  height: 100vh;
+  min-width: 0;
   display: grid;
+  height: 100vh;
   align-content: start;
   gap: 14px;
-  padding: 78px 18px 18px;
+  padding: 76px 14px 18px;
   border-left: 1px solid #ececf4;
   background: #fbfbff;
   overflow: auto;
@@ -1419,7 +1490,7 @@ body {
 }
 
 .assistant-message {
-  width: min(100%, 980px);
+  width: min(100%, 1120px);
   display: grid;
   grid-template-columns: 40px minmax(0, 1fr);
   gap: 12px;
@@ -1574,8 +1645,53 @@ body {
   color: #252a33;
 }
 
+.metric-summary-grid {
+  max-width: 980px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.metric-summary-card {
+  min-height: 118px;
+  padding: 15px 16px;
+  border: 1px solid #eceff5;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.metric-summary-kicker,
+.metric-summary-card span {
+  margin: 0;
+  color: #8a90a0;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.metric-summary-card h3 {
+  margin: 8px 0 12px;
+  color: #1f232d;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.metric-summary-card strong {
+  display: block;
+  color: #111827;
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 850;
+  letter-spacing: 0;
+}
+
+.metric-summary-card span {
+  display: inline-block;
+  margin-top: 12px;
+}
+
 .metric-chart-card {
-  max-width: 640px;
+  max-width: 720px;
   margin-top: 22px;
   padding: 14px 16px 10px;
   border: 1px solid #eceff5;
@@ -1587,6 +1703,32 @@ body {
 .metric-chart-head h3 {
   color: #1f232d;
   font-size: 15px;
+}
+
+.metric-chart-actions,
+.result-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.metric-chart-actions button,
+.result-toolbar button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  color: #8b93a3;
+  background: transparent;
+  cursor: pointer;
+}
+
+.metric-chart-actions button:hover,
+.result-toolbar button:hover {
+  color: #2e6df0;
+  background: #f2f5ff;
 }
 
 .metric-chart-kicker {
@@ -1608,12 +1750,36 @@ body {
 
 .aggregate-card,
 .detail-table-wrap {
-  max-width: 860px;
+  max-width: 1060px;
   margin-top: 22px;
   border: 1px solid #eceff5;
   border-radius: 8px;
   background: #ffffff;
   box-shadow: none;
+}
+
+.detail-table-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 52px;
+  padding: 11px 14px;
+  border-bottom: 1px solid #eceff5;
+  background: #ffffff;
+}
+
+.detail-table-head p {
+  margin: 0 0 4px;
+  color: #8a90a0;
+  font-size: 12px;
+}
+
+.detail-table-head h3 {
+  margin: 0;
+  color: #1f232d;
+  font-size: 15px;
+  line-height: 1.35;
 }
 
 .aggregate-card {
@@ -1683,8 +1849,8 @@ body {
 }
 
 @media (max-width: 1180px) {
-  .diana-app {
-    grid-template-columns: 220px minmax(0, 1fr);
+  .evan-app {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .insight-rail {
@@ -1699,7 +1865,7 @@ body {
     overflow: auto;
   }
 
-  .diana-app {
+  .evan-app {
     min-height: 100vh;
     height: auto;
     grid-template-columns: 1fr;
@@ -1740,6 +1906,11 @@ body {
   .aggregate-card,
   .detail-table-wrap {
     max-width: 100%;
+  }
+
+  .metric-summary-grid {
+    max-width: 100%;
+    grid-template-columns: 1fr;
   }
 
   .input-bar,

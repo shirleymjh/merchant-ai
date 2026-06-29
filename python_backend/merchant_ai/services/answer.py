@@ -32,6 +32,8 @@ class AnswerComposeService:
         self.prompt_assembler = PromptAssembler()
         self.last_prompt_chars = 0
         self.last_analysis_skill_trace: Dict[str, Any] = {}
+        self.last_compose_llm_attempted = False
+        self.last_compose_used_llm = False
 
     def compose(
         self,
@@ -44,6 +46,9 @@ class AnswerComposeService:
         allow_llm: bool = True,
         rule_context: str = "",
     ) -> str:
+        self.last_compose_llm_attempted = False
+        self.last_compose_used_llm = False
+        self.last_prompt_chars = 0
         if not plan.intents:
             return self._no_execution_answer(plan)
         primary = plan.intents[0] if plan.intents else QuestionIntent()
@@ -64,13 +69,23 @@ class AnswerComposeService:
                 self._append_rule_evidence(self.append_business_advice(self._execution_failure_answer(run_result), plan.intents, bundle), question, effective_rule_context),
                 run_result,
             )
-        if allow_llm and self.llm.configured and bundle.rows and analysis_summary_required(plan):
+        if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
+            self.last_compose_llm_attempted = True
             prompt = json.dumps(answer_data_package(question, plan, run_result, rule_context), ensure_ascii=False, default=str)
             self.last_prompt_chars = len(prompt)
             answer_prompt = self.prompt_assembler.render(
                 "answer.bi",
                 sections={
-                    "answer_context_policy": "AnswerAgent 只读取 question、dataRows、metricDisclosures、evidenceGaps；不要读取或推断 QueryGraph。",
+                    "answer_context_policy": (
+                        "AnswerAgent 只读取 question、tables、rowCount、dataRows、dataSections、metricDisclosures、evidenceGaps；不要读取或推断 QueryGraph。"
+                        "用商家能理解的自然语言先给结论；不要说“查到几行”“使用表”“SQL”“字段名”。"
+                        "不要输出 markdown 表格，表格由前端结构化区域渲染。只有用户追问口径时才轻量解释指标口径。"
+                        "dataRows 或 dataSections 中 resultRole=summary 的行是已验证汇总结果，优先用于回答总量；"
+                        "resultRole=trend_context 的行只是趋势辅助，不能因为趋势只有部分有数日期，就否定 summary 汇总。"
+                        "如果 summary 和 trend_context 是同一个指标，不要把 summary 行说成“未带日期的记录”。"
+                        "趋势只用于说明有波动的日期，不要说“其余日期没有看到明细”这类会让商家误解为总量不可信的话。"
+                        "最后最多给 2 条和当前问题强相关的经营建议，不要泛泛说继续追问。"
+                    ),
                 },
             )
             self.last_prompt_chars += len(answer_prompt.system_prompt)
@@ -81,6 +96,9 @@ class AnswerComposeService:
                 timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
             )
             if answer:
+                self.last_compose_used_llm = True
+                answer = self._correct_metric_total_misread(answer, question, plan, run_result)
+                answer = self._clean_summary_trend_misphrasing(answer, plan, run_result)
                 return self._apply_answer_guard(
                     self._append_rule_evidence(self.append_business_advice(answer, plan.intents, bundle), question, effective_rule_context),
                     run_result,
@@ -329,16 +347,51 @@ class AnswerComposeService:
     def append_business_advice(self, answer: str, intents: List[QuestionIntent], bundle: QueryBundle) -> str:
         if not answer:
             answer = "当前没有足够数据形成结论。"
-        if "建议" in answer:
+        answer = re.sub(r"\n\n建议[:：].*$", "", answer.rstrip(), flags=re.S)
+        answer = strip_model_advice_lines(answer)
+        items = business_advice_items(intents, bundle)
+        return answer.rstrip() + "\n\n建议：\n" + "\n".join("- %s" % item for item in items[:2])
+
+    def _correct_metric_total_misread(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not answer or not run_result or run_result.evidence_gaps:
             return answer
-        categories = {intent.category for intent in intents}
-        if QuestionCategory.REFUND in categories or QuestionCategory.COMPENSATION in categories:
-            return answer + "\n\n建议：优先核对高金额订单的售后原因、赔付责任和客服触达记录，避免重复赔付或异常退款扩大。"
-        if QuestionCategory.CS_TICKET in categories:
-            return answer + "\n\n建议：关注工单高发问题和二次开启场景，把催单、退款、物流异常拆开跟进。"
-        if QuestionCategory.GOODS in categories:
-            return answer + "\n\n建议：结合商品审核状态、最近发布商品和成交表现，优先处理影响转化的商品资料问题。"
-        return answer + "\n\n建议：可以继续追问明细、Top 排名或按日期趋势，我会基于同一业务口径继续展开。"
+        if not re.search(r"(不能|无法|不(?:能|可)直接|不能准确).{0,24}(确认|判断|得到)", answer):
+            return answer
+        summary = primary_summary_metric_value(plan, run_result)
+        if not summary:
+            return answer
+        label = summary.get("label") or "指标"
+        value = summary.get("value")
+        time_phrase = extract_question_time_phrase(question)
+        prefix = "%s，" % time_phrase if time_phrase else "当前查询范围内，"
+        trend = primary_trend_points(plan, run_result, summary.get("metricKey") or "")
+        lines = ["%s%s为 %s。" % (prefix, label, format_cell(value))]
+        if trend:
+            lines.append("")
+            lines.append("按日趋势已整理在下方图表中。")
+        return "\n".join(lines)
+
+    def _clean_summary_trend_misphrasing(self, answer: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not answer or not run_result or run_result.evidence_gaps:
+            return answer
+        summary = primary_summary_metric_value(plan, run_result)
+        if not summary:
+            return answer
+        trend = primary_trend_points(plan, run_result, summary.get("metricKey") or "")
+        if not trend:
+            return answer
+        cleaned_lines: List[str] = []
+        for line in answer.splitlines():
+            text = line.strip()
+            if re.search(r"(其余|其他).{0,8}(日期|天).{0,16}(没有|未|暂无).{0,12}(看到|分日|明细|数据)", text):
+                continue
+            if re.search(r"(只|仅).{0,4}覆盖.{0,12}\d+.{0,4}(个)?(自然日|天)", text):
+                continue
+            if re.search(r"未带日期.{0,16}(记录|数据)", text):
+                continue
+            cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines).strip()
+        return cleaned or answer
 
     def _apply_answer_guard(self, answer: str, run_result: AgentRunResult | None) -> str:
         verified = run_result.verified_evidence if run_result else None
@@ -383,18 +436,30 @@ class AnswerComposeService:
         sections: List[ChatDataSection] = []
         if not run_result:
             return sections
-        for index, bundle in enumerate(run_result.query_bundles):
+        intent_map = intent_by_task_id(plan)
+        sources: List[Any] = []
+        if run_result.task_results:
+            sources = [(intent_map.get(item.task_id), item.query_bundle) for item in run_result.task_results]
+        else:
+            sources = [
+                (plan.intents[index] if index < len(plan.intents) else None, bundle)
+                for index, bundle in enumerate(run_result.query_bundles)
+            ]
+        for intent, bundle in sources:
             if bundle.failed or not bundle.rows:
                 continue
             title = "查询结果"
-            if index < len(plan.intents):
-                intent = plan.intents[index]
-                title = intent.metric_name or intent.preferred_table or title
+            data_rows = bundle.rows[:50]
+            if intent:
+                title = section_title_for_intent(plan, intent, title)
+                series_rows = metric_series_rows_for_intent(plan, intent, bundle.rows)
+                if series_rows:
+                    data_rows = series_rows
             sections.append(
                 ChatDataSection(
                     title=title,
                     doris_tables=bundle.tables,
-                    data_rows=bundle.rows[:50],
+                    data_rows=data_rows,
                     original_row_count=bundle.effective_row_count(),
                     result_summary=bundle.summary,
                 )
@@ -431,30 +496,27 @@ class AnswerComposeService:
 
     def _fallback_data_answer(self, question: str, plan: QueryPlan, bundle: QueryBundle, run_result: AgentRunResult | None = None) -> str:
         if bundle.failed:
-            return "这次查询没有成功执行：%s。已保留执行轨迹，建议检查数据表、字段或 SQL 口径。" % bundle.error
+            return "这次没有拿到可靠的数据结果，暂时不能给出具体数值。可以稍后重试，或缩小时间范围后再查。"
         if not bundle.rows:
-            return "本轮查询执行成功但返回 0 行；这只能说明当前 SQL 口径下没有返回记录，不能解释为业务指标为 0。若这是近期数据问题，可能需要检查离线分区或实时 fallback。"
+            return "当前查询范围内没有查到符合条件的数据。"
+        friendly = merchant_friendly_data_answer(question, plan, bundle, run_result)
+        if friendly:
+            return friendly
         successful_task_count = len([item for item in run_result.task_results if not item.query_bundle.failed]) if run_result else 0
         if successful_task_count > 1:
-            lines = ["本轮形成 %s 个成功证据节点，合计返回 %s 行证据数据。" % (successful_task_count, bundle.effective_row_count())]
+            lines = ["已完成本轮关联指标查询，结果已整理在下方表格中。"]
         else:
-            lines = ["已按当前口径查询到 %s 行数据。" % bundle.effective_row_count()]
-        for table in bundle.tables:
-            lines.append("- 使用表：%s" % table)
+            lines = ["已拿到当前查询范围内的结果，明细见下方表格。"]
         gaps = run_result.evidence_gaps if run_result else []
         if gaps:
-            lines.append("- 证据状态：%s" % "；".join("%s:%s" % (gap.code, gap.reason[:80]) for gap in gaps[:4]))
+            lines.append("其中有部分关联信息暂时未补齐，结论需要结合下方明细谨慎判断。")
         multi_node_success = bool(run_result and len([item for item in run_result.task_results if not item.query_bundle.failed]) > 1)
-        columns = fallback_display_columns(plan, bundle.rows)
-        if columns and not multi_node_success:
-            lines.append("")
-            lines.append(markdown_table(bundle.rows[:8], columns))
         derived = run_result.verified_evidence.derived_evidence if run_result and run_result.verified_evidence else []
         if derived:
             formulas = ["%s=%s" % (item.get("metric"), item.get("formula")) for item in derived[:6] if item.get("metric") and item.get("formula")]
             if formulas:
                 lines.append("")
-                lines.append("口径：%s" % "；".join(formulas))
+                lines.append("计算说明：%s" % "；".join(formulas))
         if multi_node_success and run_result:
             summary_table = business_summary_table(plan, run_result)
             if summary_table:
@@ -494,6 +556,302 @@ class AnswerComposeService:
         if not plan.intents:
             return "本轮没有实际执行数据查询：QueryGraph 没有形成可执行节点，因此不能判断为业务为 0。"
         return "本轮没有实际执行数据查询：QueryGraph 尚未进入 SQL 执行阶段，因此不能判断为业务为 0。Planner 轨迹：%s。" % trace
+
+
+def merchant_friendly_data_answer(question: str, plan: QueryPlan, bundle: QueryBundle, run_result: AgentRunResult | None = None) -> str:
+    rows = bundle.rows or []
+    if not rows:
+        return ""
+    successful_task_count = len([item for item in run_result.task_results if not item.query_bundle.failed]) if run_result else 0
+    time_prefix = extract_question_time_phrase(question)
+    prefix = "%s，" % time_prefix if time_prefix else "当前查询范围内，"
+    if successful_task_count > 1:
+        if is_ranking_plan(plan):
+            return "%s已整理出排名结果和关联指标，完整明细见下方表格。" % prefix
+        return "%s已完成关联指标查询，完整结果见下方表格。" % prefix
+    row = rows[0]
+    metric_column = primary_answer_metric_column(plan, row)
+    if metric_column:
+        metric_label = friendly_column_label(plan, metric_column)
+        metric_value = format_cell(row.get(metric_column))
+        entity_column = primary_entity_column(plan, row)
+        if is_ranking_plan(plan) and entity_column:
+            entity_label = friendly_column_label(plan, entity_column)
+            entity_value = format_cell(row.get(entity_column))
+            return "%s%s %s 的%s为 %s，下方表格里有完整排名。" % (prefix, entity_label, entity_value, metric_label, metric_value)
+        if len(rows) == 1:
+            return "%s%s为 %s。" % (prefix, metric_label, metric_value)
+        return "%s%s结果已整理出来，明细见下方表格。" % (prefix, metric_label)
+    if len(rows) == 1:
+        return "%s已查询到对应结果，详情见下方表格。" % prefix
+    return "%s已整理出相关明细，详情见下方表格。" % prefix
+
+
+def business_advice_items(intents: List[QuestionIntent], bundle: QueryBundle) -> List[str]:
+    categories = {intent.category for intent in intents}
+    metric_text = " ".join(
+        str(item or "")
+        for intent in intents
+        for item in [
+            intent.metric_name,
+            intent.metric_column,
+            intent.group_by_column,
+            (intent.metric_resolution or {}).get("displayName"),
+            (intent.metric_resolution or {}).get("metricKey"),
+        ]
+    ).lower()
+    if QuestionCategory.REFUND in categories or QuestionCategory.COMPENSATION in categories:
+        return [
+            "优先拆到退款原因、商品和订单状态，定位是商品描述、履约还是售后处理导致的退款/赔付。",
+            "如果金额或单量集中在少数商品，可以继续看这些商品的下单量、退款率和客服工单，判断是否需要调整商品说明或售后策略。",
+        ]
+    if QuestionCategory.CS_TICKET in categories:
+        return [
+            "建议按工单类型、催单/物流/退款场景拆开看，先定位是否集中在少数问题类型。",
+            "如果工单量升高，可以联动发货超时订单和退款订单，判断是否是履约异常带来的客服压力。",
+        ]
+    if QuestionCategory.GOODS in categories:
+        return [
+            "建议结合商品发布时间、审核状态和近期开单表现，优先处理新上架但转化或售后异常的商品。",
+            "如果审核拒绝或质检异常集中在少数类目，可以继续拆拒绝原因、图片资质和标题类目规范。",
+        ]
+    if QuestionCategory.SCM in categories:
+        return [
+            "建议把履约量和发货超时、签收超时一起看，先判断问题集中在出库、物流还是签收环节。",
+            "如果异常集中在某个仓或某批商品，可以继续拆仓库、商品和订单明细做定位。",
+        ]
+    if QuestionCategory.TRADE in categories:
+        if "gmv" in metric_text or "amt" in metric_text or "金额" in metric_text:
+            return [
+                "建议按日期趋势和商品/类目拆分 GMV，先判断是整体下滑还是少数商品贡献变化。",
+                "可以联动订单量、支付用户数和客单价，判断变化来自流量、转化还是客单价。",
+            ]
+        return [
+            "建议先看按日趋势，确认订单量是否集中在某几天波动，再拆到商品或类目定位来源。",
+            "可以联动 GMV、支付用户数和客单价，判断是订单规模变化还是客单价变化。",
+        ]
+    if bundle.rows:
+        return [
+            "建议先看时间趋势，再按商品、类目或订单维度拆分，确认异常是否集中。",
+            "可以结合退款、工单和履约指标一起看，避免只看单一指标造成误判。",
+        ]
+    return [
+        "建议补充更明确的时间范围或业务对象，我可以继续按同一口径查询。",
+        "如果要做分析，可以同时给出主指标和想对比的关联指标。",
+    ]
+
+
+def section_title_for_intent(plan: QueryPlan, intent: QuestionIntent, default: str = "查询结果") -> str:
+    resolution = intent.metric_resolution or {}
+    metric_key = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+    metric_label = str(resolution.get("displayName") or "").strip() or (friendly_column_label(plan, metric_key) if metric_key else "")
+    if intent.group_by_column == "pt" and metric_label:
+        return "%s趋势" % metric_label
+    if metric_label:
+        return metric_label
+    return intent.preferred_table or default
+
+
+def metric_series_rows_for_intent(plan: QueryPlan, intent: QuestionIntent, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if intent.group_by_column != "pt" or intent.answer_mode != AnswerMode.GROUP_AGG or not rows:
+        return []
+    value_column = metric_value_column_for_rows(plan, intent, rows)
+    if not value_column:
+        return []
+    resolution = intent.metric_resolution or {}
+    metric_label = str(resolution.get("displayName") or "").strip() or friendly_column_label(plan, value_column)
+    series = []
+    for row in sorted(rows, key=lambda item: str(item.get("pt") or "")):
+        if row.get("pt") in (None, ""):
+            continue
+        value = answer_numeric_value(row.get(value_column))
+        if value is None:
+            continue
+        series.append({"metric_name": metric_label, "pt": row.get("pt"), "value": value})
+    return series
+
+
+def metric_value_column_for_rows(plan: QueryPlan, intent: QuestionIntent, rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    resolution = intent.metric_resolution or {}
+    candidates = [
+        resolution.get("metricKey"),
+        intent.metric_name,
+        intent.metric_column,
+        *(resolution.get("sourceColumns") or []),
+    ]
+    available = set(str(key) for row in rows[:5] for key in row.keys())
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text and text in available and any(answer_numeric_value(row.get(text)) is not None for row in rows):
+            return text
+    for column in rows[0].keys():
+        text = str(column or "")
+        if text in {"pt", "seller_id", "merchant_id"} or identifier_like_column(text):
+            continue
+        if any(answer_numeric_value(row.get(text)) is not None for row in rows):
+            return text
+    return ""
+
+
+def answer_numeric_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def strip_model_advice_lines(answer: str) -> str:
+    cleaned: List[str] = []
+    for line in str(answer or "").splitlines():
+        text = line.strip()
+        if re.match(r"^(建议|建议优先|可以继续追问|如需|如果需要)", text):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def primary_summary_metric_value(plan: QueryPlan, run_result: AgentRunResult) -> Dict[str, Any]:
+    if not run_result:
+        return {}
+    for item in visible_successful_tasks(plan, run_result):
+        intent = intent_by_task_id(plan).get(item.task_id)
+        if answer_result_role(intent) != "summary" or not item.query_bundle.rows:
+            continue
+        rows = item.query_bundle.rows
+        value_column = metric_value_column_for_rows(plan, intent, rows) if intent else ""
+        if not value_column:
+            continue
+        value = rows[0].get(value_column)
+        if value in (None, ""):
+            continue
+        resolution = intent.metric_resolution or {}
+        return {
+            "metricKey": str(resolution.get("metricKey") or intent.metric_name or value_column),
+            "label": str(resolution.get("displayName") or friendly_column_label(plan, value_column)),
+            "value": value,
+            "taskId": item.task_id,
+        }
+    return {}
+
+
+def primary_trend_points(plan: QueryPlan, run_result: AgentRunResult, metric_key: str) -> List[Dict[str, Any]]:
+    if not run_result:
+        return []
+    for item in visible_successful_tasks(plan, run_result):
+        intent = intent_by_task_id(plan).get(item.task_id)
+        if answer_result_role(intent) != "trend_context" or not item.query_bundle.rows:
+            continue
+        resolution = intent.metric_resolution or {}
+        current_key = str(resolution.get("metricKey") or intent.metric_name or "").strip() if intent else ""
+        if metric_key and current_key and metric_key != current_key:
+            continue
+        return metric_series_rows_for_intent(plan, intent, item.query_bundle.rows) if intent else []
+    return []
+
+
+def extract_question_time_phrase(question: str) -> str:
+    text = str(question or "")
+    for pattern in [
+        r"最近\s*\d+\s*[天日周月]",
+        r"近\s*\d+\s*[天日周月]",
+        r"过去\s*\d+\s*[天日周月]",
+        r"昨天",
+        r"今日",
+        r"今天",
+        r"本周",
+        r"本月",
+    ]:
+        match = re.search(pattern, text)
+        if match:
+            return re.sub(r"\s+", "", match.group(0))
+    return ""
+
+
+def primary_answer_metric_column(plan: QueryPlan, row: Dict[str, Any]) -> str:
+    available = set(str(key) for key in (row or {}).keys())
+    for intent in plan.intents:
+        resolution = intent.metric_resolution or {}
+        candidates = [
+            resolution.get("metricKey"),
+            intent.metric_name,
+            intent.metric_column,
+            *(resolution.get("sourceColumns") or []),
+        ]
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text and text in available and not identifier_like_column(text):
+                return text
+    for column, value in (row or {}).items():
+        text = str(column or "")
+        if identifier_like_column(text):
+            continue
+        if isinstance(value, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(value or "")):
+            return text
+    return ""
+
+
+def primary_entity_column(plan: QueryPlan, row: Dict[str, Any]) -> str:
+    available = set(str(key) for key in (row or {}).keys())
+    for column in primary_summary_entity_columns(plan):
+        if column in available and row.get(column) not in (None, ""):
+            return column
+    for column in ["spu_name", "spu_id", "sub_order_id", "order_id", "refund_id", "ticket_id", "bill_id"]:
+        if column in available and row.get(column) not in (None, ""):
+            return column
+    return ""
+
+
+def friendly_column_label(plan: QueryPlan, column: str) -> str:
+    labels = answer_column_labels(plan)
+    if labels.get(column):
+        return labels[column]
+    for intent in plan.intents:
+        resolution = intent.metric_resolution or {}
+        if column == str(resolution.get("metricKey") or "") and resolution.get("displayName"):
+            return str(resolution.get("displayName"))
+    return humanize_column_name(column)
+
+
+def humanize_column_name(column: str) -> str:
+    text = str(column or "").strip()
+    dictionary = {
+        "order": "订单",
+        "detail": "明细",
+        "cnt": "数量",
+        "amt": "金额",
+        "gmv": "GMV",
+        "refund": "退款",
+        "return": "退货",
+        "rate": "比例",
+        "pay": "支付",
+        "user": "用户",
+        "ticket": "工单",
+        "goods": "商品",
+        "spu": "商品",
+        "create": "创建",
+        "time": "时间",
+    }
+    parts = [dictionary.get(part, "") for part in re.split(r"[_\s]+", text.lower())]
+    label = "".join(part for part in parts if part)
+    return label or text
+
+
+def identifier_like_column(column: str) -> bool:
+    text = str(column or "").strip().lower()
+    return text in {"seller_id", "merchant_id", "user_id", "pt"} or text.endswith("_id") or text.endswith("_no")
+
+
+def is_ranking_plan(plan: QueryPlan) -> bool:
+    return any(intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG} for intent in plan.intents)
 
 
 def fallback_display_columns(plan: QueryPlan, rows: List[Dict[str, Any]]) -> List[str]:
@@ -1062,6 +1420,7 @@ def answer_data_package(
         "tables": run_result.merged_query_bundle.tables,
         "rowCount": run_result.merged_query_bundle.effective_row_count(),
         "dataRows": answer_data_rows(plan, run_result),
+        "dataSections": answer_prompt_sections(plan, run_result),
         "metricDisclosures": metric_disclosures(plan, verified),
         "evidenceGaps": compact_evidence_gaps(run_result.evidence_gaps),
         "ruleEvidence": compact_rule_evidence(question, rule_context),
@@ -1111,8 +1470,54 @@ def prioritized_task_metric_rows(plan: QueryPlan, run_result: AgentRunResult) ->
             enriched.setdefault("__taskId", item.task_id)
             enriched.setdefault("__metricKey", metric_key)
             enriched.setdefault("__metricName", display)
+            enriched.setdefault("__resultRole", answer_result_role(intent))
+            enriched.setdefault("__groupByColumn", intent.group_by_column or "")
             rows.append(enriched)
     return rows
+
+
+def answer_prompt_sections(plan: QueryPlan, run_result: AgentRunResult) -> List[Dict[str, Any]]:
+    sections: List[Dict[str, Any]] = []
+    for item in visible_successful_tasks(plan, run_result):
+        intent = intent_by_task_id(plan).get(item.task_id)
+        if not intent or not item.query_bundle.rows:
+            continue
+        role = answer_result_role(intent)
+        sections.append(
+            {
+                "taskId": item.task_id,
+                "resultRole": role,
+                "title": section_title_for_intent(plan, intent, item.task_id),
+                "metricKey": (intent.metric_resolution or {}).get("metricKey") or intent.metric_name,
+                "metricName": (intent.metric_resolution or {}).get("displayName") or intent.metric_name,
+                "groupByColumn": intent.group_by_column or "",
+                "tables": item.query_bundle.tables,
+                "rowCount": item.query_bundle.effective_row_count(),
+                "rows": item.query_bundle.rows[:10],
+            }
+        )
+    return sections
+
+
+def answer_result_role(intent: QuestionIntent | None) -> str:
+    if not intent:
+        return "result"
+    resolution = intent.metric_resolution or {}
+    if resolution.get("displayRole") == "trend_context":
+        return "trend_context"
+    if intent.group_by_column == "pt" and intent.answer_mode == AnswerMode.GROUP_AGG:
+        return "trend_context"
+    if intent.answer_mode == AnswerMode.METRIC:
+        return "summary"
+    if intent.answer_mode == AnswerMode.TOPN:
+        return "ranking"
+    if intent.answer_mode == AnswerMode.GROUP_AGG:
+        return "group_summary"
+    if intent.answer_mode == AnswerMode.DETAIL:
+        return "detail"
+    if intent.answer_mode == AnswerMode.DERIVED:
+        return "derived"
+    return "result"
 
 
 def visible_successful_tasks(plan: QueryPlan, run_result: AgentRunResult) -> List[Any]:

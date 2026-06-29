@@ -5,9 +5,13 @@
         <p class="metric-chart-kicker">{{ kicker }}</p>
         <h3>{{ displayTitle }}</h3>
       </div>
-      <div class="metric-chart-stat">
-        <span>{{ summaryLabel }}</span>
-        <strong>{{ summaryValue }}</strong>
+      <div class="metric-chart-actions" aria-label="图表操作">
+        <button type="button" title="放大查看">
+          <Maximize2 :size="14" />
+        </button>
+        <button type="button" title="复制图表">
+          <Copy :size="14" />
+        </button>
       </div>
     </div>
 
@@ -77,6 +81,7 @@
 
 <script setup>
 import { computed } from 'vue'
+import { Copy, Maximize2 } from 'lucide-vue-next'
 
 const props = defineProps({
   title: {
@@ -233,17 +238,6 @@ const peakPoint = computed(() => {
 const kicker = computed(() => {
   if (!normalizedRows.value.length) return '趋势分析'
   return titleLooksLikeAmount(displayTitle.value) ? '金额趋势' : '指标趋势'
-})
-
-const summaryLabel = computed(() => (titleLooksLikeAmount(displayTitle.value) ? '总计' : '峰值'))
-
-const summaryValue = computed(() => {
-  if (!normalizedRows.value.length) return '-'
-  if (titleLooksLikeAmount(displayTitle.value)) {
-    const total = normalizedRows.value.reduce((sum, row) => sum + row.value, 0)
-    return formatMetricValue(total)
-  }
-  return formatMetricValue(peakPoint.value?.value ?? 0)
 })
 
 const peakLabel = computed(() => {

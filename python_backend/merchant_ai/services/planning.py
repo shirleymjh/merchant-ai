@@ -4269,6 +4269,19 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
         )
     intents.append(anchor)
     graph_role_traces = graph_contract_trace(primary_metric_graph_contract(ranking_metric, ranking_resolution, ranking, anchor), anchor.plan_task_id)
+    trend_context = default_time_series_context_intent(
+        question=question,
+        metric=ranking_metric,
+        metric_resolution=ranking_resolution.payload(),
+        anchor=anchor,
+        anchor_mode=anchor_mode,
+        objective_type=objective_type,
+        asset_pack=asset_pack,
+        existing_task_ids=[intent.plan_task_id for intent in intents],
+    )
+    if trend_context:
+        intents.append(trend_context)
+        graph_role_traces.append("DEFAULT_TREND_CONTEXT:%s:%s" % (trend_context.plan_task_id, ranking_metric.key))
     planned_metric_identities_for_compile = {(ranking_metric.table, ranking_metric.key)}
     task_by_table: Dict[str, str] = {intent.preferred_table: intent.plan_task_id for intent in intents if intent.preferred_table and intent.plan_task_id}
     measures = understanding.get("requestedMeasures") or understanding.get("requested_measures") or []
@@ -8423,6 +8436,8 @@ def expand_measure_items_with_metric_dependencies(
     for metric in seed_metrics:
         if not metric:
             continue
+        if materialized_metric_column(metric, asset_pack):
+            continue
         if derived_metric_components(metric, asset_pack):
             continue
         same_table_columns = set(asset_pack.known_columns(metric.table))
@@ -8448,6 +8463,56 @@ def expand_measure_items_with_metric_dependencies(
     return expanded, dedupe_strings(added_refs)
 
 
+def default_time_series_context_intent(
+    question: str,
+    metric: Any,
+    metric_resolution: Dict[str, Any],
+    anchor: QuestionIntent,
+    anchor_mode: AnswerMode,
+    objective_type: str,
+    asset_pack: PlanningAssetPack,
+    existing_task_ids: List[str],
+) -> QuestionIntent | None:
+    days = extract_days(question, 0)
+    if days <= 1:
+        return None
+    if anchor_mode != AnswerMode.METRIC or objective_type not in {"metric_total", "total", "metric"}:
+        return None
+    if anchor.task_role != TaskRole.ANCHOR or anchor.depends_on_task_ids:
+        return None
+    if anchor.group_by_column == "pt":
+        return None
+    columns = set(asset_pack.known_columns(metric.table))
+    if "pt" not in columns:
+        return None
+    payload = dict(metric_resolution or {})
+    payload.update(
+        {
+            "displayRole": "trend_context",
+            "visualization": "line_chart",
+            "groupByColumn": "pt",
+        }
+    )
+    base_task_id = "trend_%s_%s" % (semantic_domain_for_metric(metric) or semantic_domain_for_table(metric.table), metric.key)
+    intent = compiled_metric_intent(
+        question=question,
+        metric=metric,
+        task_id=unique_task_id(base_task_id, existing_task_ids),
+        role=TaskRole.ANCHOR,
+        mode=AnswerMode.GROUP_AGG,
+        grain="day",
+        group_by="pt",
+        depends_on=[],
+        limit=min(max(days, 7), 60),
+        asset_pack=asset_pack,
+        metric_resolution=payload,
+    )
+    if not intent:
+        return None
+    note = "%s; default daily trend context" % (intent.analysis_note or "")
+    return intent.model_copy(update={"analysis_note": note.strip("; ")})
+
+
 def compiled_metric_intent(
     question: str,
     metric: Any,
@@ -8465,8 +8530,14 @@ def compiled_metric_intent(
     columns = set(asset_pack.known_columns(table))
     if not columns:
         return None
-    source_columns = metric_source_columns_for_entry(metric)
-    reconciliation = reconcile_metric_formula_for_schema(metric_formula_for_entry(metric), source_columns, columns, metric.key, table)
+    materialized_column = materialized_metric_column(metric, asset_pack)
+    if materialized_column:
+        source_columns = [materialized_column]
+        raw_formula = materialized_metric_formula(metric, materialized_column)
+    else:
+        source_columns = metric_source_columns_for_entry(metric)
+        raw_formula = metric_formula_for_entry(metric)
+    reconciliation = reconcile_metric_formula_for_schema(raw_formula, source_columns, columns, metric.key, table)
     source_column = next((column for column in reconciliation.available_source_columns if column in columns), "")
     if not source_column:
         source_column = next((column for column in getattr(metric, "columns", []) if column in columns), "")
@@ -10021,8 +10092,47 @@ def metric_dependency_refs(metric: Any) -> List[str]:
     return dedupe_strings(metric_source_columns_for_entry(metric))
 
 
+def materialized_metric_column(metric: Any, asset_pack: PlanningAssetPack) -> str:
+    if not metric:
+        return ""
+    table = str(getattr(metric, "table", "") or "")
+    if not table:
+        return ""
+    table_columns = physical_columns_for_table(table, asset_pack)
+    metric_key = str(getattr(metric, "key", "") or "")
+    if metric_key and metric_key in table_columns:
+        return metric_key
+    return ""
+
+
+def metric_is_rate_like(metric: Any) -> bool:
+    metadata = getattr(metric, "metadata", {}) or {}
+    unit = str(metadata.get("unit") or metadata.get("valueUnit") or "").strip().lower()
+    if unit in {"%", "percent", "percentage"}:
+        return True
+    text_parts = [
+        str(getattr(metric, "key", "") or ""),
+        str(getattr(metric, "title", "") or ""),
+        str(getattr(metric, "description", "") or ""),
+        " ".join(str(item) for item in getattr(metric, "aliases", []) or []),
+        str(metadata.get("formula") or metadata.get("metricFormula") or ""),
+        str(metadata.get("businessName") or metadata.get("semanticName") or ""),
+    ]
+    text = " ".join(text_parts).lower()
+    return any(token in text for token in ["rate", "ratio", "share", "proportion", "率", "比例", "占比"])
+
+
+def materialized_metric_formula(metric: Any, column: str) -> str:
+    if not column:
+        return ""
+    aggregate = "AVG" if metric_is_rate_like(metric) else "SUM"
+    return "%s(`%s`)" % (aggregate, column)
+
+
 def derived_metric_components(metric: Any, asset_pack: PlanningAssetPack) -> List[Any]:
     if not metric:
+        return []
+    if materialized_metric_column(metric, asset_pack):
         return []
     refs = metric_dependency_refs(metric)
     if not refs:
