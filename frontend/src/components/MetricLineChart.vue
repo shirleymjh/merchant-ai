@@ -73,9 +73,6 @@
       <span>峰值 {{ peakLabel }}</span>
     </div>
 
-    <div v-if="tables?.length" class="table-tags section-table-tags">
-      <span v-for="table in tables" :key="table">{{ tableLabel(table) }}</span>
-    </div>
   </section>
 
   <Teleport to="body">

@@ -30,7 +30,6 @@
               <p class="metric-summary-kicker">核心指标</p>
               <h3>{{ section.label }}</h3>
               <strong>{{ section.value }}</strong>
-              <span v-if="section.tables?.length">{{ tableLabel(section.tables[0]) }}</span>
             </section>
           </div>
           <MetricLineChart
@@ -81,9 +80,6 @@
                 </tr>
               </tbody>
             </table>
-            <div v-if="section.tables?.length" class="table-tags section-table-tags">
-              <span v-for="table in section.tables" :key="table">{{ tableLabel(table) }}</span>
-            </div>
           </section>
           <div
             v-for="(section, sectionIndex) in tableSections"
@@ -139,12 +135,6 @@
                 </tr>
               </tbody>
             </table>
-            <div v-if="section.tables?.length" class="table-tags section-table-tags">
-              <span v-for="table in section.tables" :key="table">{{ tableLabel(table) }}</span>
-            </div>
-          </div>
-          <div v-if="tables?.length && !tableSections.length && !metricSummarySections.length && !chartSections.length && !aggregateSections.length" class="table-tags">
-            <span v-for="table in tables" :key="table">{{ tableLabel(table) }}</span>
           </div>
           <div v-if="id" class="message-actions">
             <button
@@ -881,13 +871,15 @@ function tableFilterQuery(index) {
 
 function toggleTableFilter(index) {
   const current = tableFilters.value[index] || { open: false, query: '' }
+  const nextOpen = !current.open
   tableFilters.value = {
     ...tableFilters.value,
     [index]: {
       ...current,
-      open: !current.open
+      open: nextOpen
     }
   }
+  showToast(nextOpen ? '已打开筛选' : '已关闭筛选')
 }
 
 function setTableFilterQuery(index, query) {
@@ -944,6 +936,7 @@ function openExpandedTable(section, index) {
     columns: section?.columns || [],
     rows: filteredTableRows(section, index)
   }
+  showToast('已打开放大视图')
 }
 
 function closeExpandedTable() {

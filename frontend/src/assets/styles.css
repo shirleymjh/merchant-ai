@@ -1287,7 +1287,7 @@ body {
 
 .composer-area .suggestion-card {
   margin: 0;
-  padding: 8px 28px 8px;
+  padding: 5px 24px 5px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -1298,9 +1298,9 @@ body {
 .composer-area .suggestion-card.compact {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
-  padding: 7px 28px 4px;
+  padding: 5px 24px 3px;
 }
 
 .composer-area .suggestion-head {
@@ -1314,7 +1314,7 @@ body {
 .composer-area .suggestion-card h2 {
   display: block;
   color: #8a90a0;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 750;
 }
 
@@ -1323,10 +1323,10 @@ body {
 }
 
 .composer-area .suggestion-chip-list {
-  gap: 8px;
+  gap: 6px;
   flex-wrap: nowrap;
   overflow-x: auto;
-  padding-bottom: 4px;
+  padding-bottom: 2px;
 }
 
 .composer-area .suggestion-card.compact .suggestion-chip-list {
@@ -1340,55 +1340,55 @@ body {
 }
 
 .composer-area .suggestion-chip {
-  min-height: 34px;
+  min-height: 30px;
   flex: 0 0 auto;
-  gap: 8px;
-  padding: 6px 12px 6px 7px;
-  border-radius: 18px;
+  gap: 6px;
+  padding: 4px 10px 4px 6px;
+  border-radius: 999px;
   box-shadow: none;
   background: #f7f8fb;
 }
 
 .composer-area .suggestion-card.compact .suggestion-chip {
-  min-height: 30px;
-  gap: 6px;
-  padding: 4px 10px 4px 6px;
+  min-height: 28px;
+  gap: 5px;
+  padding: 3px 9px 3px 5px;
   border-radius: 999px;
 }
 
 .composer-area .suggestion-index {
-  width: 22px;
-  height: 22px;
-  font-size: 13px;
-}
-
-.composer-area .suggestion-card.compact .suggestion-index {
   width: 20px;
   height: 20px;
   font-size: 12px;
 }
 
+.composer-area .suggestion-card.compact .suggestion-index {
+  width: 18px;
+  height: 18px;
+  font-size: 11px;
+}
+
 .composer-area .suggestion-chip b {
-  max-width: 240px;
-  font-size: 13px;
+  max-width: 210px;
+  font-size: 12px;
 }
 
 .composer-area .suggestion-card.compact .suggestion-chip b {
-  max-width: 220px;
+  max-width: 190px;
   font-size: 12px;
 }
 
 .composer-area .refresh-btn {
   min-width: auto;
-  height: 28px;
-  padding: 0 10px;
+  height: 26px;
+  padding: 0 9px;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .composer-area .suggestion-card.compact .refresh-btn {
   grid-column: 3;
-  height: 28px;
+  height: 26px;
   white-space: nowrap;
 }
 
@@ -1398,9 +1398,9 @@ body {
   bottom: auto;
   transform: none;
   width: 100%;
-  min-height: 58px;
+  min-height: 54px;
   grid-template-columns: minmax(0, 1fr) 44px;
-  padding: 6px 28px 10px;
+  padding: 5px 24px 8px;
   border-top: 0;
   background: transparent;
   backdrop-filter: none;
@@ -1643,6 +1643,10 @@ body {
   margin-top: 0;
   padding-top: 0;
   border-top: 0;
+}
+
+.section-table-tags {
+  display: none;
 }
 
 .answer-block-text {

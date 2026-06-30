@@ -10625,8 +10625,11 @@ def test_answer_guard_appends_required_metric_resolution_disclosure():
         ]
     )
     answer = AnswerComposeService(FakeAnswerLlm()).compose("看退款金额", MerchantInfo(merchant_id="100"), plan, run, "")
-    assert "证据门禁" in answer
-    assert disclosure in answer
+    assert "证据门禁" not in answer
+    assert "说明" in answer
+    assert "退款金额" in answer
+    assert "dwm_trade_refund_detail_di" not in answer
+    assert "pay_amt" not in answer
 
 
 def test_answer_analysis_summary_uses_structured_analysis_intent_not_question_terms():

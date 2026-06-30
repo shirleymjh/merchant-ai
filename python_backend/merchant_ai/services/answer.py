@@ -641,7 +641,11 @@ class AnswerComposeService:
         additions = dedupe_strings(additions)
         if not additions:
             return answer
-        return answer.rstrip() + "\n\n证据门禁：\n" + "\n".join("- %s" % item for item in additions[:8])
+        merchant_notes = [merchant_facing_gap_note(item) for item in additions]
+        merchant_notes = [item for item in dedupe_strings(merchant_notes) if item and item not in answer]
+        if not merchant_notes:
+            return answer
+        return answer.rstrip() + "\n\n说明：\n" + "\n".join("- %s" % item for item in merchant_notes[:3])
 
     def contextual_suggestions(
         self,
@@ -1988,16 +1992,108 @@ def sanitize_business_answer_text(answer: str, question: str, plan: QueryPlan, r
         text = remove_metric_disclosure_block(text)
     text = re.sub(r"(?m)^\s*分析结论[:：]\s*$\n?", "", text)
     text = re.sub(r"(?m)^\s*关键证据[:：]\s*$\n?", "", text)
-    text = re.sub(r"(?m)^\s*限制[:：]", "说明：", text)
+    text = re.sub(r"(?m)^\s*(限制|证据缺口|证据门禁)[:：]", "说明：", text)
     text = re.sub(r"(?m)^\s*证据[:：]\s*$\n?", "", text)
-    text = re.sub(r"当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。", "当前数据存在波动，建议结合下方趋势一起看。", text)
+    text = re.sub(r"当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。", "这几天有波动，建议结合下方趋势和关联指标一起看。", text)
+    text = re.sub(r"当前数据看存在可解释的波动点，不能简单判断为业务为 0 或无异常。", "这几天有波动，建议结合下方趋势和关联指标一起看。", text)
     text = re.sub(r"已看到的点位显示[:：]?", "", text)
     text = re.sub(r"当前证据显示", "当前数据看", text)
+    text = re.sub(r"证据显示", "数据看", text)
     text = re.sub(r"已验证查询结果", "当前查询结果", text)
     text = re.sub(r"语义层指标口径", "当前指标口径", text)
+    text = re.sub(r"业务为\s*0\s*或无异常", "没有异常", text)
     text = re.sub(r"(?m)^\s*-\s*(当前)?可用行数较少，异常判断可信度有限。", "- 可用数据点较少，异常判断可信度有限。", text)
     text = remove_hidden_alternate_metric_lines(text, plan)
+    if not question_asks_metric_disclosure(question):
+        text = remove_internal_answer_lines(text)
+    text = normalize_answer_headings(text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def normalize_answer_headings(text: str) -> str:
+    lines: List[str] = []
+    previous_blank = False
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if not previous_blank:
+                lines.append("")
+            previous_blank = True
+            continue
+        previous_blank = False
+        if re.match(r"^(分析结论|关键证据)[:：]?$", stripped):
+            continue
+        if re.match(r"^(限制|证据缺口|证据门禁)[:：]?$", stripped):
+            lines.append("说明：")
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def remove_internal_answer_lines(text: str) -> str:
+    kept: List[str] = []
+    skip_until_blank = False
+    for raw_line in str(text or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            skip_until_blank = False
+            kept.append(raw_line)
+            continue
+        if re.match(r"^(口径|指标口径|字段口径|计算口径|使用表|来源表|SQL|字段名)[:：]", stripped, flags=re.I):
+            skip_until_blank = True
+            continue
+        if skip_until_blank:
+            if re.match(r"^(建议|说明)[:：]", stripped):
+                skip_until_blank = False
+                kept.append(raw_line)
+            continue
+        if is_internal_answer_line(stripped):
+            continue
+        kept.append(raw_line)
+    return "\n".join(kept).strip()
+
+
+def is_internal_answer_line(line: str) -> bool:
+    if re.search(r"\b(SQL|Doris|QueryGraph|SELECT|FROM|WHERE|GROUP BY|HAVING|JOIN)\b", line, flags=re.I):
+        return True
+    if re.search(r"\b(?:ads|dwm|dwd|dim)_[a-z0-9_]+\b", line, flags=re.I):
+        return True
+    if re.search(r"\b(?:SUM|COUNT|AVG|MAX|MIN)\s*\(", line, flags=re.I):
+        return True
+    if re.search(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+){2,}\b", line) and re.search(r"[:：=(),]", line):
+        return True
+    if re.search(r"(查到|查询到)\s*\d+\s*行|使用表|字段名|表名|执行失败|节点|EVIDENCE_GAP", line, flags=re.I):
+        return True
+    return False
+
+
+def merchant_facing_gap_note(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^[A-Z_]+[:：]\s*", "", text)
+    replacements = {
+        "证据门禁": "说明",
+        "证据缺口": "说明",
+        "证据": "数据",
+        "Doris": "数据源",
+        "SQL": "查询",
+        "QueryGraph": "查询计划",
+        "节点": "部分数据",
+        "字段": "指标",
+        "表关系": "数据关系",
+        "语义层": "指标口径",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"\b(?:ads|dwm|dwd|dim)_[a-z0-9_]+\b", "相关数据", text, flags=re.I)
+    text = re.sub(r"相关数据\.[A-Za-z0-9_]+", "当前已确认口径", text)
+    text = re.sub(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+){2,}\b", "相关指标", text)
+    text = re.sub(r"\s+", " ", text).strip(" ：:-")
+    if not text:
+        return ""
+    if len(text) > 80:
+        text = text[:77].rstrip() + "..."
+    return text
 
 
 def hidden_alternate_metric_terms(plan: QueryPlan) -> List[str]:
@@ -2083,13 +2179,15 @@ def render_structured_skill_answer(skill_name: str, payload: Dict[str, Any]) -> 
         lines.extend(risk_skill_lines(rows, disclosures, question))
     if gaps:
         lines.append("")
-        lines.append("证据缺口：")
+        lines.append("说明：")
         for gap in gaps[:5]:
             if not isinstance(gap, dict):
                 continue
-            lines.append("- %s：%s" % (gap.get("code") or "EVIDENCE_GAP", gap.get("reason") or gap.get("answerInstruction") or "证据未完全覆盖"))
+            note = merchant_facing_gap_note(gap.get("reason") or gap.get("answerInstruction") or "当前信息还不完整")
+            if note:
+                lines.append("- %s" % note)
     lines.append("")
-    lines.append("说明：以上结论只基于已验证查询结果和语义层指标口径。")
+    lines.append("说明：以上判断基于本轮已查询到的数据。")
     return "\n".join(line for line in lines if line is not None).strip()
 
 
@@ -2293,9 +2391,21 @@ def contextual_business_suggestions(
         if "订单" in label or "GMV" in label.upper():
             add("订单量变化主要来自哪些商品？", 10)
 
-    add("最近7天店铺整体经营情况怎么样？", 1)
-    add("最近7天订单量和退款金额有什么变化？", 1)
-    add("商品审核被拒怎么办？", 1)
+    if suggestion_has(context_signal_text, r"退款|售后|退货"):
+        add("退款高发商品优先排查哪些原因？", 9)
+    if suggestion_has(context_signal_text, r"工单|客服|咨询|催单"):
+        add("咨询工单最多的问题怎么处理？", 9)
+    if suggestion_has(context_signal_text, r"商品审核|上架|新品"):
+        add("商品审核拒绝后下一步怎么改？", 9)
+    if suggestion_has(context_signal_text, r"发货|履约|供应链|超时"):
+        add("发货超时订单集中在哪些商品？", 9)
+    if suggestion_has(context_signal_text, r"保证金|冻结|充值"):
+        add("保证金冻结和充值流水一起看", 9)
+
+    if len(ranked) < 3:
+        add("最近7天店铺整体经营情况怎么样？", 1)
+        add("最近7天订单量和退款金额有什么变化？", 1)
+        add("商品审核被拒怎么办？", 1)
 
     sorted_items = sorted(ranked.items(), key=lambda item: (-item[1][0], item[1][1]))
     return [item[0] for item in sorted_items[:9]]
