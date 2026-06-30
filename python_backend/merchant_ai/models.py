@@ -155,6 +155,7 @@ class ChatContext(APIModel):
 
 class ChatDataSection(APIModel):
     title: str = ""
+    result_role: str = ""
     doris_tables: List[str] = Field(default_factory=list)
     data_rows: List[Dict[str, Any]] = Field(default_factory=list)
     offloaded: bool = False

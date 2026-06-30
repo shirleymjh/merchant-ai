@@ -92,23 +92,37 @@
           >
             <div class="detail-table-head">
               <div>
-                <p>{{ section.rows.length }} 行</p>
+                <p>{{ filteredTableRows(section, sectionIndex).length }} 行</p>
                 <h3>{{ presentSectionTitle(section.title) }}</h3>
               </div>
               <div class="result-toolbar" aria-label="表格操作">
-                <button type="button" title="放大查看">
+                <button type="button" title="放大查看" @click="openExpandedTable(section, sectionIndex)">
                   <Maximize2 :size="14" />
                 </button>
-                <button type="button" title="下载结果">
+                <button type="button" title="下载结果" @click="downloadTable(section, sectionIndex)">
                   <Download :size="14" />
                 </button>
-                <button type="button" title="筛选">
+                <button
+                  type="button"
+                  :class="{ active: tableFilterOpen(sectionIndex) }"
+                  title="筛选"
+                  @click="toggleTableFilter(sectionIndex)"
+                >
                   <Filter :size="14" />
                 </button>
-                <button type="button" title="复制">
+                <button type="button" title="复制" @click="copyTable(section, sectionIndex)">
                   <Copy :size="14" />
                 </button>
               </div>
+            </div>
+            <div v-if="tableFilterOpen(sectionIndex)" class="table-filter-row">
+              <input
+                :value="tableFilterQuery(sectionIndex)"
+                type="search"
+                placeholder="筛选当前表格"
+                @input="setTableFilterQuery(sectionIndex, $event.target.value)"
+              >
+              <button type="button" @click="setTableFilterQuery(sectionIndex, '')">清除</button>
             </div>
             <table class="detail-table">
               <thead>
@@ -117,8 +131,11 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(row, rowIndex) in section.rows" :key="rowIndex">
+                <tr v-for="(row, rowIndex) in filteredTableRows(section, sectionIndex)" :key="rowIndex">
                   <td v-for="column in section.columns" :key="column">{{ formatCell(row[column]) }}</td>
+                </tr>
+                <tr v-if="!filteredTableRows(section, sectionIndex).length">
+                  <td :colspan="section.columns.length" class="empty-table-cell">没有匹配的数据</td>
                 </tr>
               </tbody>
             </table>
@@ -126,7 +143,7 @@
               <span v-for="table in section.tables" :key="table">{{ tableLabel(table) }}</span>
             </div>
           </div>
-          <div v-if="tables?.length && !tableSections.length" class="table-tags">
+          <div v-if="tables?.length && !tableSections.length && !metricSummarySections.length && !chartSections.length && !aggregateSections.length" class="table-tags">
             <span v-for="table in tables" :key="table">{{ tableLabel(table) }}</span>
           </div>
           <div v-if="id" class="message-actions">
@@ -161,12 +178,44 @@
       </div>
     </div>
     <div v-else class="user-bubble">{{ text }}</div>
+    <Teleport v-if="role === 'assistant'" to="body">
+      <div v-if="expandedTable" class="result-modal-backdrop" @click.self="closeExpandedTable">
+        <section class="result-modal" role="dialog" aria-modal="true" :aria-label="`${expandedTable.title} 放大查看`">
+          <div class="result-modal-head">
+            <div>
+              <p>{{ expandedTable.rows.length }} 行</p>
+              <h3>{{ expandedTable.title }}</h3>
+            </div>
+            <button type="button" title="关闭" @click="closeExpandedTable">
+              <X :size="18" />
+            </button>
+          </div>
+          <div class="result-modal-body">
+            <div class="result-modal-table-wrap">
+              <table class="detail-table result-modal-table">
+                <thead>
+                  <tr>
+                    <th v-for="column in expandedTable.columns" :key="column">{{ columnLabel(column) }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, rowIndex) in expandedTable.rows" :key="rowIndex">
+                    <td v-for="column in expandedTable.columns" :key="column">{{ formatCell(row[column]) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </div>
+      <div v-if="toastMessage" class="app-toast">{{ toastMessage }}</div>
+    </Teleport>
   </article>
 </template>
 
 <script setup>
-import { computed } from 'vue'
-import { Check, Copy, Download, Filter, Maximize2, ThumbsDown, ThumbsUp } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
+import { Check, Copy, Download, Filter, Maximize2, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
 import MetricLineChart from './MetricLineChart.vue'
 
 const props = defineProps({
@@ -208,6 +257,11 @@ const displayTime = new Date().toLocaleString('zh-CN', {
   hour: '2-digit',
   minute: '2-digit'
 }).replace(/\//g, '/')
+
+const toastMessage = ref('')
+const expandedTable = ref(null)
+const tableFilters = ref({})
+let toastTimer = null
 
 const visibleDataSections = computed(() => {
   const sections = props.dataSections || []
@@ -301,8 +355,14 @@ const tableSections = computed(() => {
   if (structuredSections.length) {
     return structuredSections
   }
+  if ((props.dataSections || []).length) {
+    return []
+  }
   const rows = extractDisplayRows(props.dataRows || [])
   if (!rows.length) {
+    return []
+  }
+  if ((props.dataRows || []).length && (props.dataRows || []).every(row => Object.prototype.hasOwnProperty.call(row || {}, '__metricKey'))) {
     return []
   }
   if (isMetricSeriesRows(rows) || isAggregateRows(rows) || isSingleMetricRows(rows)) {
@@ -334,13 +394,14 @@ const answerBlocks = computed(() => {
       flush()
       continue
     }
-    if (/^[一二三四五六七八九十]+、/.test(line)) {
+    if (/^([一二三四五六七八九十]+、|\d+[.、]\s*)/.test(line)) {
       flush()
       current.title = line
       continue
     }
-    if (line.startsWith('- ')) {
-      current.items.push(line.slice(2).trim())
+    const bulletMatch = line.match(/^[-*•]\s+(.+)$/)
+    if (bulletMatch) {
+      current.items.push(bulletMatch[1].trim())
       continue
     }
     if (!current.text) {
@@ -450,7 +511,7 @@ function numericValue(value) {
 function formatMetricSummaryValue(value, column) {
   const numeric = numericValue(value)
   if (numeric === null) return formatCell(value)
-  if (/amt|amount|gmv|金额|pay/i.test(String(column || ''))) {
+  if (/amt|amount|gmv|金额/i.test(String(column || ''))) {
     return `${formatCompactNumber(numeric)}元`
   }
   return formatCompactNumber(numeric)
@@ -466,6 +527,7 @@ function collectColumns(rows) {
   const columns = []
   for (const row of rows) {
     for (const column of Object.keys(row || {})) {
+      if (column.startsWith('__')) continue
       if (!columns.includes(column)) {
         columns.push(column)
       }
@@ -497,7 +559,15 @@ const columnLabels = {
   sku_title: '商品标题',
   sku_cnt: '商品数量',
   sku_count: '商品数量',
-  pay_amt: '支付金额',
+  pay_amt: '退款金额',
+  order_detail_cnt: '订单量',
+  order_gmv_amt_1d: 'GMV',
+  pay_gmv_amt_1d: '支付GMV',
+  trade_success_gmv_amt_1d: '交易成功GMV',
+  refund_amt_1d: '退款金额',
+  seller_repay_amt_1d: '赔付金额',
+  cs_ticket_cnt_1d: '咨询工单量',
+  pay_order_cnt_1d: '支付订单量',
   pay_status_name: '支付状态',
   pay_way_name: '赔款方式',
   sub_order_create_time: '下单时间',
@@ -799,6 +869,149 @@ function formatAggregateCount(value) {
     return formatCell(value)
   }
   return `${numeric}条记录`
+}
+
+function tableFilterOpen(index) {
+  return Boolean(tableFilters.value[index]?.open)
+}
+
+function tableFilterQuery(index) {
+  return tableFilters.value[index]?.query || ''
+}
+
+function toggleTableFilter(index) {
+  const current = tableFilters.value[index] || { open: false, query: '' }
+  tableFilters.value = {
+    ...tableFilters.value,
+    [index]: {
+      ...current,
+      open: !current.open
+    }
+  }
+}
+
+function setTableFilterQuery(index, query) {
+  const current = tableFilters.value[index] || { open: true, query: '' }
+  tableFilters.value = {
+    ...tableFilters.value,
+    [index]: {
+      ...current,
+      open: true,
+      query
+    }
+  }
+}
+
+function filteredTableRows(section, index) {
+  const rows = section?.rows || []
+  const query = tableFilterQuery(index).trim().toLowerCase()
+  if (!query) {
+    return rows
+  }
+  const columns = section?.columns || []
+  return rows.filter(row => columns.some(column => {
+    const label = columnLabel(column).toLowerCase()
+    const value = formatCell(row?.[column]).toLowerCase()
+    return label.includes(query) || value.includes(query)
+  }))
+}
+
+async function copyTable(section, index) {
+  const rows = filteredTableRows(section, index)
+  const text = tableToDelimitedText(section, rows, '\t')
+  const copied = await writeClipboardText(text)
+  showToast(copied ? '已复制表格' : '复制失败，请重试')
+}
+
+function downloadTable(section, index) {
+  const rows = filteredTableRows(section, index)
+  const csv = `\ufeff${tableToDelimitedText(section, rows, ',')}`
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${safeFileName(presentSectionTitle(section?.title) || '查询结果')}.csv`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+  showToast('已下载 CSV')
+}
+
+function openExpandedTable(section, index) {
+  expandedTable.value = {
+    title: presentSectionTitle(section?.title),
+    columns: section?.columns || [],
+    rows: filteredTableRows(section, index)
+  }
+}
+
+function closeExpandedTable() {
+  expandedTable.value = null
+}
+
+function tableToDelimitedText(section, rows, delimiter) {
+  const columns = section?.columns || []
+  const escapeValue = delimiter === ',' ? csvEscape : textEscape
+  const header = columns.map(column => escapeValue(columnLabel(column))).join(delimiter)
+  const body = (rows || []).map(row =>
+    columns.map(column => escapeValue(formatCell(row?.[column]))).join(delimiter)
+  )
+  return [header, ...body].join('\n')
+}
+
+function csvEscape(value) {
+  const text = String(value ?? '')
+  if (/[",\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`
+  }
+  return text
+}
+
+function textEscape(value) {
+  return String(value ?? '').replace(/\t/g, ' ').replace(/\n/g, ' ')
+}
+
+function safeFileName(name) {
+  return String(name || '查询结果')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 60)
+}
+
+async function writeClipboardText(text) {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Fall through to the textarea fallback.
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    textarea.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
+function showToast(message) {
+  toastMessage.value = message
+  if (toastTimer) {
+    window.clearTimeout(toastTimer)
+  }
+  toastTimer = window.setTimeout(() => {
+    toastMessage.value = ''
+  }, 1800)
 }
 
 defineEmits(['feedback'])

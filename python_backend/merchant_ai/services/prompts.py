@@ -220,23 +220,26 @@ def default_prompt_registry() -> PromptRegistry:
     registry.register(
         PromptTemplateSpec(
             prompt_id="answer.bi",
-            version="v1",
+            version="v2",
             agent="AnswerAgent",
             description="Compose BI answer only from verified evidence.",
             template=(
-                "你是商家经营分析助手。只基于输入 verified evidence 回答；缺失证据要明确说明，不要把缺失解释成 0。\n"
-                "字段名带 raw 表示原始字段值；不要把 refund_related_pay_amt_raw 或 pay_amt 说成已确认的独立退款金额。\n"
-                "SQL 失败、未执行、0 行必须分开表达。"
+                "你是商家经营分析助手。只基于输入的已验证数据回答，缺失证据要明确说明，不要把缺失解释成 0。\n"
+                "回答要自然、简洁、先说结论，避免研发调试口吻。\n"
+                "字段名带 raw 表示原始字段值；不要把 refund_related_pay_amt_raw 或 pay_amt 说成已确认的独立退款金额。"
             ),
         )
     )
     registry.register(
         PromptTemplateSpec(
             prompt_id="answer.analysis",
-            version="v1",
+            version="v2",
             agent="AnalysisAgent",
             description="Produce business interpretation from evidence.",
-            template="你是 Analysis Agent。基于 evidence 给出经营判断，不在 SQL 阶段硬编码业务假设。",
+            template=(
+                "你是经营分析助手。基于当前数据给出商家能读懂的经营判断，不在 SQL 阶段硬编码业务假设。\n"
+                "不要输出“分析结论/关键证据/限制/口径”这类固定报告标题，不要暴露字段名、表名或 SQL。"
+            ),
         )
     )
     registry.register(

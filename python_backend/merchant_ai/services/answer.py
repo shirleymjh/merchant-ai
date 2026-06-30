@@ -26,6 +26,21 @@ from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, PendingAnswerStore
 
 
+def answer_context_policy() -> str:
+    return (
+        "AnswerAgent 只读取 question、businessContext、dataRows、dataSections、metricDisclosures、evidenceGaps、analysisDraft；不要读取或推断 QueryGraph。"
+        "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
+        "不要使用“分析结论”“关键证据”“限制”“证据门禁”“当前证据显示”“已看到的点位显示”这类报告或内部调试话术。"
+        "不要说“查到几行”“使用表”“SQL”“字段名”“Doris”；不要输出 markdown 表格，表格和图表由前端结构化区域渲染。"
+        "用户没有问口径时，不要展开字段、来源表和计算公式；同一指标存在多个候选口径时，只回答语义层确认的主口径，不要把多个相似口径并列解释。"
+        "如果是趋势问题，第一段直接写“最近N天，指标从 A 变化到 B，整体上升/下降 C。”，不要写“趋势里”“点位显示”；有峰值和低点时用一句话说明。"
+        "dataRows 或 dataSections 中 resultRole=summary 的行是已验证汇总结果，优先用于回答总量；resultRole=trend_context 的行只用于解释趋势。"
+        "不要因为趋势只有部分日期有点位，就否定 summary 汇总；不要说“其余日期没有看到明细”。"
+        "如果 evidenceGaps 存在，用“说明：”简短提示，不要扩大成失败结论。"
+        "最后输出“建议：”，用短横线列出最多 2 条；建议必须结合 businessContext 的商家画像、长期记忆/近期关注和本轮数据，避免泛泛说继续追问。"
+    )
+
+
 class AnswerComposeService:
     def __init__(self, llm: LlmClient):
         self.llm = llm
@@ -45,6 +60,7 @@ class AnswerComposeService:
         analysis_summary: str = "",
         allow_llm: bool = True,
         rule_context: str = "",
+        personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         self.last_compose_llm_attempted = False
         self.last_compose_used_llm = False
@@ -59,53 +75,101 @@ class AnswerComposeService:
         if primary.answer_mode == AnswerMode.RULE:
             return self._compose_rule_answer(question, knowledge_context)
         effective_rule_context = rule_context if plan_requires_rule_evidence(plan) else ""
-        if analysis_summary:
-            return self._apply_answer_guard(self._append_rule_evidence(analysis_summary, question, effective_rule_context), run_result)
         bundle = run_result.merged_query_bundle if run_result else QueryBundle()
+        if analysis_summary:
+            cleaned_summary = sanitize_business_answer_text(analysis_summary, question, plan, run_result)
+            llm_answer = ""
+            if allow_llm and self.llm.configured and (bundle.rows or (run_result and run_result.evidence_gaps)):
+                llm_answer = self._compose_llm_business_answer(
+                    question,
+                    plan,
+                    run_result,
+                    rule_context,
+                    merchant,
+                    personalization_context,
+                    analysis_summary=cleaned_summary,
+                )
+            answer = llm_answer or cleaned_summary
+            return self._apply_answer_guard(
+                self._append_rule_evidence(
+                    self.append_business_advice(
+                        answer,
+                        plan.intents,
+                        bundle,
+                        question=question,
+                        plan=plan,
+                        run_result=run_result,
+                        merchant=merchant,
+                        personalization_context=personalization_context,
+                        allow_llm=allow_llm,
+                    ),
+                    question,
+                    effective_rule_context,
+                ),
+                run_result,
+            )
         if primary.intent_type == "VALID" and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT} and (not run_result or not run_result.task_results):
             return self._no_execution_answer(plan)
         if run_result and run_result.task_results and all(result.query_bundle.failed for result in run_result.task_results):
             return self._apply_answer_guard(
-                self._append_rule_evidence(self.append_business_advice(self._execution_failure_answer(run_result), plan.intents, bundle), question, effective_rule_context),
+                self._append_rule_evidence(
+                    self.append_business_advice(
+                        self._execution_failure_answer(run_result),
+                        plan.intents,
+                        bundle,
+                        question=question,
+                        plan=plan,
+                        run_result=run_result,
+                        merchant=merchant,
+                        personalization_context=personalization_context,
+                        allow_llm=allow_llm,
+                    ),
+                    question,
+                    effective_rule_context,
+                ),
                 run_result,
             )
         if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
-            self.last_compose_llm_attempted = True
-            prompt = json.dumps(answer_data_package(question, plan, run_result, rule_context), ensure_ascii=False, default=str)
-            self.last_prompt_chars = len(prompt)
-            answer_prompt = self.prompt_assembler.render(
-                "answer.bi",
-                sections={
-                    "answer_context_policy": (
-                        "AnswerAgent 只读取 question、tables、rowCount、dataRows、dataSections、metricDisclosures、evidenceGaps；不要读取或推断 QueryGraph。"
-                        "用商家能理解的自然语言先给结论；不要说“查到几行”“使用表”“SQL”“字段名”。"
-                        "不要输出 markdown 表格，表格由前端结构化区域渲染。只有用户追问口径时才轻量解释指标口径。"
-                        "dataRows 或 dataSections 中 resultRole=summary 的行是已验证汇总结果，优先用于回答总量；"
-                        "resultRole=trend_context 的行只是趋势辅助，不能因为趋势只有部分有数日期，就否定 summary 汇总。"
-                        "如果 summary 和 trend_context 是同一个指标，不要把 summary 行说成“未带日期的记录”。"
-                        "趋势只用于说明有波动的日期，不要说“其余日期没有看到明细”这类会让商家误解为总量不可信的话。"
-                        "最后最多给 2 条和当前问题强相关的经营建议，不要泛泛说继续追问。"
-                    ),
-                },
-            )
-            self.last_prompt_chars += len(answer_prompt.system_prompt)
-            answer = self.llm.chat(
-                answer_prompt.system_prompt,
-                prompt,
-                "",
-                timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
+            answer = self._compose_llm_business_answer(
+                question,
+                plan,
+                run_result,
+                rule_context,
+                merchant,
+                personalization_context,
             )
             if answer:
-                self.last_compose_used_llm = True
-                answer = self._correct_metric_total_misread(answer, question, plan, run_result)
-                answer = self._clean_summary_trend_misphrasing(answer, plan, run_result)
                 return self._apply_answer_guard(
-                    self._append_rule_evidence(self.append_business_advice(answer, plan.intents, bundle), question, effective_rule_context),
+                    self._append_rule_evidence(
+                        self.append_business_advice(
+                            answer,
+                            plan.intents,
+                            bundle,
+                            question=question,
+                            plan=plan,
+                            run_result=run_result,
+                            merchant=merchant,
+                            personalization_context=personalization_context,
+                            allow_llm=allow_llm,
+                        ),
+                        question,
+                        effective_rule_context,
+                    ),
                     run_result,
                 )
         return self._apply_answer_guard(
             self._append_rule_evidence(
-                self.append_business_advice(self._fallback_data_answer(question, plan, bundle, run_result), plan.intents, bundle),
+                self.append_business_advice(
+                    self._fallback_data_answer(question, plan, bundle, run_result),
+                    plan.intents,
+                    bundle,
+                    question=question,
+                    plan=plan,
+                    run_result=run_result,
+                    merchant=merchant,
+                    personalization_context=personalization_context,
+                    allow_llm=allow_llm,
+                ),
                 question,
                 effective_rule_context,
             ),
@@ -119,6 +183,8 @@ class AnswerComposeService:
         run_result: AgentRunResult,
         outputs_path: str = "",
         rule_context: str = "",
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         self.last_analysis_skill_trace = {}
         if not run_result or not run_result.merged_query_bundle.rows:
@@ -126,17 +192,39 @@ class AnswerComposeService:
         skill_name = self.propose_answer_skill(question, plan, run_result, bool(rule_context))
         if not skill_name and not analysis_summary_required(plan):
             return ""
-        skill_answer = self.run_analysis_skill(question, plan, run_result, outputs_path, rule_context, skill_name=skill_name)
+        skill_answer = self.run_analysis_skill(
+            question,
+            plan,
+            run_result,
+            outputs_path,
+            rule_context,
+            skill_name=skill_name,
+            merchant=merchant,
+            personalization_context=personalization_context,
+        )
         if skill_answer:
             return skill_answer
         if not self.llm.configured:
             return ""
         analysis_prompt = self.prompt_assembler.render(
             "answer.analysis",
-            sections={"analysis_policy": "只能基于 compact evidence 判断趋势、异常和原因假设；不能把缺失证据当事实。"},
+            sections={
+                "analysis_policy": (
+                    "只能基于 compact evidence 判断趋势、异常和原因假设；不能把缺失证据当事实。"
+                    "输出给最终 AnswerAgent 继续润色，所以只保留业务判断和必要说明；"
+                    "不要输出“分析结论/关键证据/限制/口径”等标题。"
+                )
+            },
         )
         prompt = json.dumps(
-            answer_data_package(question, plan, run_result, rule_context),
+            answer_data_package(
+                question,
+                plan,
+                run_result,
+                rule_context,
+                merchant=merchant,
+                personalization_context=personalization_context,
+            ),
             ensure_ascii=False,
             default=str,
         )
@@ -150,6 +238,48 @@ class AnswerComposeService:
         )
         self.last_analysis_skill_trace["llmFallbackUsed"] = bool(answer)
         return answer
+
+    def _compose_llm_business_answer(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+        rule_context: str,
+        merchant: MerchantInfo | None,
+        personalization_context: Optional[Dict[str, Any]],
+        analysis_summary: str = "",
+    ) -> str:
+        self.last_compose_llm_attempted = True
+        package = answer_data_package(
+            question,
+            plan,
+            run_result,
+            rule_context,
+            merchant=merchant,
+            personalization_context=personalization_context,
+        )
+        if analysis_summary:
+            package["analysisDraft"] = analysis_summary[:1800]
+        prompt = json.dumps(package, ensure_ascii=False, default=str)
+        answer_prompt = self.prompt_assembler.render(
+            "answer.bi",
+            sections={"answer_context_policy": answer_context_policy()},
+        )
+        self.last_prompt_chars += len(prompt) + len(answer_prompt.system_prompt)
+        answer = self.llm.chat(
+            answer_prompt.system_prompt,
+            prompt,
+            "",
+            timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
+        )
+        if not answer:
+            return ""
+        self.last_compose_used_llm = True
+        answer = sanitize_business_answer_text(answer, question, plan, run_result)
+        answer = self._ensure_multi_metric_summary_coverage(answer, question, plan, run_result)
+        answer = self._correct_metric_total_misread(answer, question, plan, run_result)
+        answer = self._clean_summary_trend_misphrasing(answer, plan, run_result)
+        return sanitize_business_answer_text(answer, question, plan, run_result)
 
     def propose_answer_skill(
         self,
@@ -224,6 +354,8 @@ class AnswerComposeService:
         outputs_path: str = "",
         rule_context: str = "",
         skill_name: str = "",
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         selected_skill = skill_name or select_answer_skill(plan, run_result, bool(rule_context)) or "bi_trend_attribution"
         skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / selected_skill
@@ -253,6 +385,8 @@ class AnswerComposeService:
                 outputs_path,
                 rule_context,
                 trace,
+                merchant=merchant,
+                personalization_context=personalization_context,
             )
         if not script.exists():
             trace["error"] = "skill script missing"
@@ -262,7 +396,14 @@ class AnswerComposeService:
         target.mkdir(parents=True, exist_ok=True)
         input_path = target / "skill_input.json"
         output_path = target / "skill_output.json"
-        payload = answer_data_package(question, plan, run_result, rule_context)
+        payload = answer_data_package(
+            question,
+            plan,
+            run_result,
+            rule_context,
+            merchant=merchant,
+            personalization_context=personalization_context,
+        )
         payload["questionUnderstanding"] = plan.question_understanding
         payload["skillMetadata"] = skill_meta
         input_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -313,6 +454,8 @@ class AnswerComposeService:
         outputs_path: str = "",
         rule_context: str = "",
         trace: Dict[str, Any] | None = None,
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         trace = trace if trace is not None else {}
         artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
@@ -320,7 +463,14 @@ class AnswerComposeService:
         target.mkdir(parents=True, exist_ok=True)
         input_path = target / "skill_input.json"
         output_path = target / "skill_output.json"
-        payload = answer_data_package(question, plan, run_result, rule_context)
+        payload = answer_data_package(
+            question,
+            plan,
+            run_result,
+            rule_context,
+            merchant=merchant,
+            personalization_context=personalization_context,
+        )
         payload["questionUnderstanding"] = plan.question_understanding
         payload["skillMetadata"] = skill_meta
         input_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -344,19 +494,74 @@ class AnswerComposeService:
         )
         return answer
 
-    def append_business_advice(self, answer: str, intents: List[QuestionIntent], bundle: QueryBundle) -> str:
+    def append_business_advice(
+        self,
+        answer: str,
+        intents: List[QuestionIntent],
+        bundle: QueryBundle,
+        question: str = "",
+        plan: QueryPlan | None = None,
+        run_result: AgentRunResult | None = None,
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
+        allow_llm: bool = False,
+    ) -> str:
         if not answer:
             answer = "当前没有足够数据形成结论。"
-        answer = re.sub(r"\n\n建议[:：].*$", "", answer.rstrip(), flags=re.S)
-        answer = strip_model_advice_lines(answer)
-        items = business_advice_items(intents, bundle)
-        return answer.rstrip() + "\n\n建议：\n" + "\n".join("- %s" % item for item in items[:2])
+        answer = normalize_inline_business_advice(answer.rstrip())
+        if has_business_advice_section(answer):
+            return answer
+        if allow_llm and self.llm.configured and plan is not None:
+            items = self._llm_business_advice(question, answer, plan, run_result, merchant, personalization_context)
+            if items:
+                return answer.rstrip() + "\n\n建议：\n" + "\n".join("- %s" % item for item in items[:2])
+        return answer.rstrip()
+
+    def _llm_business_advice(
+        self,
+        question: str,
+        answer: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+        merchant: MerchantInfo | None,
+        personalization_context: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        package = answer_data_package(
+            question,
+            plan,
+            run_result,
+            merchant=merchant,
+            personalization_context=personalization_context,
+        )
+        payload = {
+            "question": question,
+            "answerDraft": answer[:1200],
+            "businessContext": package.get("businessContext", {}),
+            "currentDataSignals": (package.get("businessContext") or {}).get("currentDataSignals", []),
+            "evidenceGaps": package.get("evidenceGaps", []),
+        }
+        system = (
+            "你是商家经营助手的建议生成器。只基于输入中的商家画像、长期记忆/近期关注和本轮已验证数据给建议。"
+            "输出 JSON：{\"suggestions\":[\"建议1\",\"建议2\"]}。最多 2 条，每条不超过 45 个中文字符。"
+            "不要建议用户继续追问，不要暴露表名、字段名、SQL 或内部证据口径。"
+        )
+        raw = self.llm.chat(
+            system,
+            json.dumps(payload, ensure_ascii=False, default=str),
+            "",
+            timeout_seconds=min(int(self.llm.settings.llm_answer_timeout_seconds or 12), 8),
+        )
+        self.last_prompt_chars += len(system) + len(json.dumps(payload, ensure_ascii=False, default=str))
+        return parse_llm_suggestions(raw)
 
     def _correct_metric_total_misread(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
         if not answer or not run_result or run_result.evidence_gaps:
             return answer
         if not re.search(r"(不能|无法|不(?:能|可)直接|不能准确).{0,24}(确认|判断|得到)", answer):
             return answer
+        sentence = multi_summary_metric_sentence(question, plan, run_result)
+        if sentence:
+            return sentence + chart_hint_sentence(plan, run_result)
         summary = primary_summary_metric_value(plan, run_result)
         if not summary:
             return answer
@@ -370,6 +575,26 @@ class AnswerComposeService:
             lines.append("")
             lines.append("按日趋势已整理在下方图表中。")
         return "\n".join(lines)
+
+    def _ensure_multi_metric_summary_coverage(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not answer or not run_result or run_result.evidence_gaps:
+            return answer
+        summaries = summary_metric_values(plan, run_result)
+        if len(summaries) <= 1:
+            return answer
+        missing = [
+            item for item in summaries
+            if str(item.get("label") or "") and str(item.get("label") or "") not in answer
+        ]
+        if not missing:
+            return answer
+        sentence = multi_summary_metric_sentence(question, plan, run_result)
+        if not sentence:
+            return answer
+        stripped = answer.strip()
+        if re.match(r"^分析结论[:：]\s*$", stripped.splitlines()[0].strip() if stripped.splitlines() else ""):
+            return sentence + "\n\n" + stripped
+        return sentence + "\n\n" + stripped
 
     def _clean_summary_trend_misphrasing(self, answer: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
         if not answer or not run_result or run_result.evidence_gaps:
@@ -418,19 +643,21 @@ class AnswerComposeService:
             return answer
         return answer.rstrip() + "\n\n证据门禁：\n" + "\n".join("- %s" % item for item in additions[:8])
 
-    def contextual_suggestions(self, question: str, intents: List[QuestionIntent]) -> List[str]:
-        categories = {intent.category for intent in intents}
-        if QuestionCategory.TRADE in categories:
-            return ["最近7天GMV趋势", "最近30天订单量Top5日期", "昨天支付订单明细"]
-        if QuestionCategory.REFUND in categories:
-            return ["最近30天退款金额Top5订单", "昨天退款明细", "退款订单对应商品情况"]
-        if QuestionCategory.CS_TICKET in categories:
-            return ["最近7天客服工单量", "催单工单对应订单状态", "二次开启工单明细"]
-        if QuestionCategory.COMPENSATION in categories:
-            return ["最近30天赔付金额Top5订单", "赔付订单关联退款状态", "赔付金额趋势"]
-        if QuestionCategory.GOODS in categories:
-            return ["最近15天新发布商品表现", "商品审核拒绝原因", "上架商品成交情况"]
-        return ["最近7天经营概况", "昨天退款明细", "最近30天GMV最高的前5天"]
+    def contextual_suggestions(
+        self,
+        question: str,
+        intents: List[QuestionIntent],
+        run_result: AgentRunResult | None = None,
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        return contextual_business_suggestions(
+            question,
+            intents,
+            run_result=run_result,
+            merchant=merchant,
+            personalization_context=personalization_context,
+        )
 
     def build_sections(self, plan: QueryPlan, run_result: AgentRunResult) -> List[ChatDataSection]:
         sections: List[ChatDataSection] = []
@@ -439,7 +666,7 @@ class AnswerComposeService:
         intent_map = intent_by_task_id(plan)
         sources: List[Any] = []
         if run_result.task_results:
-            sources = [(intent_map.get(item.task_id), item.query_bundle) for item in run_result.task_results]
+            sources = [(intent_map.get(item.task_id), item.query_bundle) for item in visible_successful_tasks(plan, run_result)]
         else:
             sources = [
                 (plan.intents[index] if index < len(plan.intents) else None, bundle)
@@ -458,6 +685,7 @@ class AnswerComposeService:
             sections.append(
                 ChatDataSection(
                     title=title,
+                    result_role=answer_result_role(intent),
                     doris_tables=bundle.tables,
                     data_rows=data_rows,
                     original_row_count=bundle.effective_row_count(),
@@ -568,6 +796,9 @@ def merchant_friendly_data_answer(question: str, plan: QueryPlan, bundle: QueryB
     if successful_task_count > 1:
         if is_ranking_plan(plan):
             return "%s已整理出排名结果和关联指标，完整明细见下方表格。" % prefix
+        summary_sentence = multi_summary_metric_sentence(question, plan, run_result)
+        if summary_sentence:
+            return summary_sentence + chart_hint_sentence(plan, run_result)
         return "%s已完成关联指标查询，完整结果见下方表格。" % prefix
     row = rows[0]
     metric_column = primary_answer_metric_column(plan, row)
@@ -585,60 +816,6 @@ def merchant_friendly_data_answer(question: str, plan: QueryPlan, bundle: QueryB
     if len(rows) == 1:
         return "%s已查询到对应结果，详情见下方表格。" % prefix
     return "%s已整理出相关明细，详情见下方表格。" % prefix
-
-
-def business_advice_items(intents: List[QuestionIntent], bundle: QueryBundle) -> List[str]:
-    categories = {intent.category for intent in intents}
-    metric_text = " ".join(
-        str(item or "")
-        for intent in intents
-        for item in [
-            intent.metric_name,
-            intent.metric_column,
-            intent.group_by_column,
-            (intent.metric_resolution or {}).get("displayName"),
-            (intent.metric_resolution or {}).get("metricKey"),
-        ]
-    ).lower()
-    if QuestionCategory.REFUND in categories or QuestionCategory.COMPENSATION in categories:
-        return [
-            "优先拆到退款原因、商品和订单状态，定位是商品描述、履约还是售后处理导致的退款/赔付。",
-            "如果金额或单量集中在少数商品，可以继续看这些商品的下单量、退款率和客服工单，判断是否需要调整商品说明或售后策略。",
-        ]
-    if QuestionCategory.CS_TICKET in categories:
-        return [
-            "建议按工单类型、催单/物流/退款场景拆开看，先定位是否集中在少数问题类型。",
-            "如果工单量升高，可以联动发货超时订单和退款订单，判断是否是履约异常带来的客服压力。",
-        ]
-    if QuestionCategory.GOODS in categories:
-        return [
-            "建议结合商品发布时间、审核状态和近期开单表现，优先处理新上架但转化或售后异常的商品。",
-            "如果审核拒绝或质检异常集中在少数类目，可以继续拆拒绝原因、图片资质和标题类目规范。",
-        ]
-    if QuestionCategory.SCM in categories:
-        return [
-            "建议把履约量和发货超时、签收超时一起看，先判断问题集中在出库、物流还是签收环节。",
-            "如果异常集中在某个仓或某批商品，可以继续拆仓库、商品和订单明细做定位。",
-        ]
-    if QuestionCategory.TRADE in categories:
-        if "gmv" in metric_text or "amt" in metric_text or "金额" in metric_text:
-            return [
-                "建议按日期趋势和商品/类目拆分 GMV，先判断是整体下滑还是少数商品贡献变化。",
-                "可以联动订单量、支付用户数和客单价，判断变化来自流量、转化还是客单价。",
-            ]
-        return [
-            "建议先看按日趋势，确认订单量是否集中在某几天波动，再拆到商品或类目定位来源。",
-            "可以联动 GMV、支付用户数和客单价，判断是订单规模变化还是客单价变化。",
-        ]
-    if bundle.rows:
-        return [
-            "建议先看时间趋势，再按商品、类目或订单维度拆分，确认异常是否集中。",
-            "可以结合退款、工单和履约指标一起看，避免只看单一指标造成误判。",
-        ]
-    return [
-        "建议补充更明确的时间范围或业务对象，我可以继续按同一口径查询。",
-        "如果要做分析，可以同时给出主指标和想对比的关联指标。",
-    ]
 
 
 def section_title_for_intent(plan: QueryPlan, intent: QuestionIntent, default: str = "查询结果") -> str:
@@ -709,19 +886,11 @@ def answer_numeric_value(value: Any) -> float | None:
         return None
 
 
-def strip_model_advice_lines(answer: str) -> str:
-    cleaned: List[str] = []
-    for line in str(answer or "").splitlines():
-        text = line.strip()
-        if re.match(r"^(建议|建议优先|可以继续追问|如需|如果需要)", text):
-            continue
-        cleaned.append(line)
-    return "\n".join(cleaned).strip()
-
-
-def primary_summary_metric_value(plan: QueryPlan, run_result: AgentRunResult) -> Dict[str, Any]:
+def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[Dict[str, Any]]:
     if not run_result:
-        return {}
+        return []
+    values: List[Dict[str, Any]] = []
+    seen: set[str] = set()
     for item in visible_successful_tasks(plan, run_result):
         intent = intent_by_task_id(plan).get(item.task_id)
         if answer_result_role(intent) != "summary" or not item.query_bundle.rows:
@@ -734,12 +903,63 @@ def primary_summary_metric_value(plan: QueryPlan, run_result: AgentRunResult) ->
         if value in (None, ""):
             continue
         resolution = intent.metric_resolution or {}
-        return {
-            "metricKey": str(resolution.get("metricKey") or intent.metric_name or value_column),
-            "label": str(resolution.get("displayName") or friendly_column_label(plan, value_column)),
-            "value": value,
-            "taskId": item.task_id,
-        }
+        metric_key = str(resolution.get("metricKey") or intent.metric_name or value_column)
+        if metric_key in seen:
+            continue
+        seen.add(metric_key)
+        values.append(
+            {
+                "metricKey": metric_key,
+                "label": str(resolution.get("displayName") or friendly_column_label(plan, value_column)),
+                "value": value,
+                "taskId": item.task_id,
+            }
+        )
+    return values
+
+
+def multi_summary_metric_sentence(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+    if not run_result:
+        return ""
+    summaries = summary_metric_values(plan, run_result)
+    if len(summaries) <= 1:
+        return ""
+    time_phrase = extract_question_time_phrase(question)
+    prefix = "%s，" % time_phrase if time_phrase else "当前查询范围内，"
+    parts = []
+    for item in summaries[:5]:
+        label = item.get("label") or "指标"
+        value = format_metric_value_for_answer(item.get("value"), item.get("metricKey") or "", str(label))
+        parts.append("%s为 %s" % (label, value))
+    return prefix + "，".join(parts) + "。"
+
+
+def chart_hint_sentence(plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+    if not run_result:
+        return ""
+    has_trend = any(answer_result_role(intent_by_task_id(plan).get(item.task_id)) == "trend_context" for item in visible_successful_tasks(plan, run_result))
+    return "\n\n按日趋势已整理在下方图表中。" if has_trend else ""
+
+
+def format_metric_value_for_answer(value: Any, metric_key: str, label: str = "") -> str:
+    text = format_cell(value)
+    numeric = answer_numeric_value(value)
+    if numeric is None:
+        return text
+    metric_text = "%s %s" % (metric_key or "", label or "")
+    if re.search(r"(gmv|amt|amount|金额|赔付|退款|优惠|补贴)", metric_text, flags=re.I):
+        if float(numeric).is_integer():
+            return "%s元" % int(numeric)
+        return ("%s元" % ("%.2f" % numeric)).replace(".00元", "元")
+    return text
+
+
+def primary_summary_metric_value(plan: QueryPlan, run_result: AgentRunResult) -> Dict[str, Any]:
+    if not run_result:
+        return {}
+    values = summary_metric_values(plan, run_result)
+    if values:
+        return values[0]
     return {}
 
 
@@ -1058,7 +1278,18 @@ def answer_column_labels(plan: QueryPlan) -> Dict[str, str]:
         "pay_amt": "退款金额",
         "refund_bill_cnt": "退款单量",
         "repay_bill_cnt": "赔付单量",
-        "order_detail_cnt": "下单数",
+        "order_detail_cnt": "订单量",
+        "order_gmv_amt_1d": "GMV",
+        "pay_gmv_amt_1d": "支付GMV",
+        "trade_success_gmv_amt_1d": "交易成功GMV",
+        "refund_amt_1d": "退款金额",
+        "return_success_amt_1d": "退货成功金额",
+        "seller_repay_amt_1d": "赔付金额",
+        "cs_ticket_cnt_1d": "咨询工单量",
+        "pay_order_cnt_1d": "支付订单量",
+        "order_cnt_1d": "订单量",
+        "pay_user_cnt_1d": "支付用户量",
+        "avg_pay_order_amt_1d": "客单价",
     }
     for intent in plan.intents:
         resolution = intent.metric_resolution or {}
@@ -1146,12 +1377,83 @@ def answer_visible_task(intent: QuestionIntent | None, item: Any, plan: QueryPla
     resolution = intent.metric_resolution or {}
     source_phrase = str(resolution.get("sourcePhrase") or "").strip()
     metric_key = str(resolution.get("metricKey") or intent.metric_name or "").strip()
+    if should_hide_alternate_metric(plan, intent):
+        return False
     if metric_key and source_phrase and not source_phrase_in_question(source_phrase, intent.question):
         refs = required_evidence_refs(plan.question_understanding or {})
         ranking_refs = ranking_metric_refs(plan.question_understanding or {})
         if metric_key not in refs["metrics"] and metric_key not in ranking_refs:
             return False
     return True
+
+
+def should_hide_alternate_metric(plan: QueryPlan, intent: QuestionIntent | None) -> bool:
+    if not intent:
+        return False
+    metric_key = intent_metric_key(intent)
+    family = semantic_metric_family(metric_key)
+    if not family:
+        return False
+    question = plan_question_text(plan)
+    if question_requests_multiple_metric_family(question, family):
+        return False
+    primary = primary_metric_for_family(plan, family)
+    return bool(primary and metric_key and metric_key != primary)
+
+
+def intent_metric_key(intent: QuestionIntent | None) -> str:
+    if not intent:
+        return ""
+    resolution = intent.metric_resolution or {}
+    return str(resolution.get("metricKey") or intent.metric_name or intent.metric_column or "").strip()
+
+
+def semantic_metric_family(metric_key: str) -> str:
+    text = str(metric_key or "").strip().lower()
+    if "gmv" in text:
+        return "gmv"
+    return ""
+
+
+def plan_question_text(plan: QueryPlan) -> str:
+    questions = [str(intent.question or "").strip() for intent in plan.intents if str(intent.question or "").strip()]
+    return " ".join(questions)
+
+
+def question_requests_multiple_metric_family(question: str, family: str) -> bool:
+    text = re.sub(r"\s+", "", str(question or "").lower())
+    if family == "gmv":
+        if re.search(r"(不同口径|各口径|分别|对比|比较|口径)", text):
+            return True
+    return False
+
+
+def primary_metric_for_family(plan: QueryPlan, family: str) -> str:
+    metrics: List[str] = []
+    metrics.extend(ranking_metric_refs(plan.question_understanding or {}))
+    metrics.extend(question_understanding_metric_refs(plan.question_understanding or {}))
+    for intent in plan.intents:
+        key = intent_metric_key(intent)
+        if key:
+            metrics.append(key)
+    preferred_by_family = {
+        "gmv": ["order_gmv_amt_1d", "pay_gmv_amt_1d", "trade_success_gmv_amt_1d"],
+    }
+    candidates = [metric for metric in metrics if semantic_metric_family(metric) == family]
+    question = re.sub(r"\s+", "", plan_question_text(plan).lower())
+    if family == "gmv":
+        explicit = []
+        if "支付gmv" in question:
+            explicit.append("pay_gmv_amt_1d")
+        if "交易成功gmv" in question or "成交gmv" in question:
+            explicit.append("trade_success_gmv_amt_1d")
+        for metric in explicit:
+            if metric in candidates:
+                return metric
+    for preferred in preferred_by_family.get(family, []):
+        if preferred in candidates:
+            return preferred
+    return candidates[0] if candidates else ""
 
 
 def source_phrase_in_question(source_phrase: str, question: str) -> bool:
@@ -1405,10 +1707,13 @@ def answer_data_package(
     plan: QueryPlan,
     run_result: AgentRunResult | None,
     rule_context: str = "",
+    merchant: MerchantInfo | None = None,
+    personalization_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not run_result:
         return {
             "question": question,
+            "businessContext": answer_business_context(question, plan, run_result, merchant, personalization_context),
             "dataRows": [],
             "metricDisclosures": [],
             "evidenceGaps": [],
@@ -1417,6 +1722,7 @@ def answer_data_package(
     verified = run_result.verified_evidence
     return {
         "question": question,
+        "businessContext": answer_business_context(question, plan, run_result, merchant, personalization_context),
         "tables": run_result.merged_query_bundle.tables,
         "rowCount": run_result.merged_query_bundle.effective_row_count(),
         "dataRows": answer_data_rows(plan, run_result),
@@ -1583,6 +1889,8 @@ def _rule_line_score(question: str, line: str) -> int:
 def metric_disclosures(plan: QueryPlan, verified: Any) -> List[Dict[str, Any]]:
     disclosures: List[Dict[str, Any]] = []
     for intent in plan.intents:
+        if should_hide_alternate_metric(plan, intent):
+            continue
         if intent.metric_specs:
             for spec in intent.metric_specs:
                 if not isinstance(spec, dict):
@@ -1624,6 +1932,11 @@ def metric_disclosures(plan: QueryPlan, verified: Any) -> List[Dict[str, Any]]:
             )
     for item in getattr(verified, "derived_evidence", [])[:8]:
         if isinstance(item, dict):
+            metric_key = str(item.get("metric") or item.get("metricKey") or "").strip()
+            if metric_key and semantic_metric_family(metric_key):
+                primary = primary_metric_for_family(plan, semantic_metric_family(metric_key))
+                if primary and metric_key != primary and not question_requests_multiple_metric_family(plan_question_text(plan), semantic_metric_family(metric_key)):
+                    continue
             disclosures.append(
                 {
                     key: item.get(key)
@@ -1661,6 +1974,92 @@ def dedupe_dicts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
+def sanitize_business_answer_text(answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None = None) -> str:
+    text = str(answer or "").strip()
+    if not text:
+        return text
+    labels = answer_column_labels(plan)
+    for raw, label in sorted(labels.items(), key=lambda item: len(item[0]), reverse=True):
+        if not raw or not label or raw == label:
+            continue
+        text = re.sub(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(raw), label, text)
+    text = text.replace("verified evidence", "当前数据").replace("Verified evidence", "当前数据")
+    if not question_asks_metric_disclosure(question):
+        text = remove_metric_disclosure_block(text)
+    text = re.sub(r"(?m)^\s*分析结论[:：]\s*$\n?", "", text)
+    text = re.sub(r"(?m)^\s*关键证据[:：]\s*$\n?", "", text)
+    text = re.sub(r"(?m)^\s*限制[:：]", "说明：", text)
+    text = re.sub(r"(?m)^\s*证据[:：]\s*$\n?", "", text)
+    text = re.sub(r"当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。", "当前数据存在波动，建议结合下方趋势一起看。", text)
+    text = re.sub(r"已看到的点位显示[:：]?", "", text)
+    text = re.sub(r"当前证据显示", "当前数据看", text)
+    text = re.sub(r"已验证查询结果", "当前查询结果", text)
+    text = re.sub(r"语义层指标口径", "当前指标口径", text)
+    text = re.sub(r"(?m)^\s*-\s*(当前)?可用行数较少，异常判断可信度有限。", "- 可用数据点较少，异常判断可信度有限。", text)
+    text = remove_hidden_alternate_metric_lines(text, plan)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def hidden_alternate_metric_terms(plan: QueryPlan) -> List[str]:
+    labels = answer_column_labels(plan)
+    terms: List[str] = []
+    for intent in plan.intents:
+        if not should_hide_alternate_metric(plan, intent):
+            continue
+        resolution = intent.metric_resolution or {}
+        metric_key = intent_metric_key(intent)
+        candidates = [
+            metric_key,
+            intent.metric_name,
+            intent.metric_column,
+            resolution.get("displayName"),
+            labels.get(metric_key),
+            labels.get(str(intent.metric_name or "")),
+        ]
+        for item in candidates:
+            term = str(item or "").strip()
+            if len(term) >= 2 and term not in terms:
+                terms.append(term)
+    return terms
+
+
+def remove_hidden_alternate_metric_lines(text: str, plan: QueryPlan) -> str:
+    terms = hidden_alternate_metric_terms(plan)
+    if not terms:
+        return text
+    kept: List[str] = []
+    for line in str(text or "").splitlines():
+        if any(term and term in line for term in terms):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def question_asks_metric_disclosure(question: str) -> bool:
+    return bool(re.search(r"(口径|怎么算|计算方式|字段|来源表|SQL|sql)", str(question or ""), flags=re.I))
+
+
+def remove_metric_disclosure_block(text: str) -> str:
+    lines = str(text or "").splitlines()
+    cleaned: List[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(口径|指标口径|字段口径|计算口径)[:：]\s*$", stripped):
+            skipping = True
+            continue
+        if skipping:
+            if not stripped:
+                skipping = False
+                continue
+            if re.match(r"^(建议|说明|限制|分析结论|关键证据)[:：]", stripped):
+                skipping = False
+                cleaned.append(line)
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
 def render_structured_skill_answer(skill_name: str, payload: Dict[str, Any]) -> str:
     rows = payload.get("dataRows") or []
     disclosures = payload.get("metricDisclosures") or []
@@ -1692,6 +2091,369 @@ def render_structured_skill_answer(skill_name: str, payload: Dict[str, Any]) -> 
     lines.append("")
     lines.append("说明：以上结论只基于已验证查询结果和语义层指标口径。")
     return "\n".join(line for line in lines if line is not None).strip()
+
+
+def has_business_advice_section(answer: str) -> bool:
+    return bool(re.search(r"(^|\n)\s*建议[:：]", str(answer or "")))
+
+
+def normalize_inline_business_advice(answer: str) -> str:
+    body_lines: List[str] = []
+    advice_items: List[str] = []
+    in_advice = False
+    for line in str(answer or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^建议[:：]\s*$", stripped):
+            in_advice = True
+            continue
+        if re.match(r"^建议(?:[:：]|\S)", stripped):
+            in_advice = True
+            item = re.sub(r"^建议[:：]?\s*", "", stripped).strip()
+            if item:
+                advice_items.append(re.sub(r"^[-*\d.、\s]+", "", item).strip())
+            continue
+        if in_advice:
+            if not stripped:
+                continue
+            if re.match(r"^(说明|参考|备注|数据|结论)[:：]\s*$", stripped):
+                in_advice = False
+                body_lines.append(line)
+                continue
+            item = re.sub(r"^[-*]?\s*\d+[.、]\s*", "", stripped).strip()
+            item = re.sub(r"^[-*]\s*", "", item).strip()
+            if item:
+                advice_items.append(item)
+            continue
+        body_lines.append(line)
+    if not advice_items:
+        return answer
+    cleaned_items = [re.sub(r"^[-*\d.、\s]+", "", item).strip() for item in advice_items if item.strip()]
+    body = "\n".join(body_lines).rstrip()
+    return body + "\n\n建议：\n" + "\n".join("- %s" % item for item in cleaned_items[:2])
+
+
+def parse_llm_suggestions(raw: str) -> List[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    payload: Any = None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if match:
+            try:
+                payload = json.loads(match.group(0))
+            except Exception:
+                payload = None
+    suggestions: List[str] = []
+    if isinstance(payload, dict):
+        raw_items = payload.get("suggestions") or payload.get("建议") or []
+    elif isinstance(payload, list):
+        raw_items = payload
+    else:
+        raw_items = []
+    for item in raw_items:
+        value = re.sub(r"^[-*\d.、\s]+", "", str(item or "").strip())
+        if not value:
+            continue
+        if re.search(r"(继续追问|如需|如果需要|可以再问|我可以)", value):
+            continue
+        if re.search(r"(SQL|sql|字段|表名|QueryGraph|Doris)", value):
+            continue
+        if value not in suggestions:
+            suggestions.append(value[:90])
+        if len(suggestions) >= 2:
+            break
+    return suggestions
+
+
+def contextual_business_suggestions(
+    question: str,
+    intents: List[QuestionIntent],
+    run_result: AgentRunResult | None = None,
+    merchant: MerchantInfo | None = None,
+    personalization_context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    plan = QueryPlan(intents=intents or [])
+    business_context = answer_business_context(question, plan, run_result, merchant, personalization_context)
+    intent_signal_text = contextual_question_intent_signal_text(question, intents)
+    context_signal_text = contextual_suggestion_signal_text(question, intents, business_context, merchant, personalization_context)
+    categories = {normalize_question_category(intent.category) for intent in intents or []}
+    ranked: Dict[str, tuple[float, int]] = {}
+    order = 0
+    question_norm = normalize_suggestion_text(question)
+
+    def add(text: str, score: float) -> None:
+        nonlocal order
+        value = re.sub(r"\s+", "", str(text or "").strip())
+        if not value:
+            return
+        normalized = normalize_suggestion_text(value)
+        if not normalized or normalized == question_norm:
+            return
+        if re.search(r"(SQL|sql|字段名|表名|Doris|QueryGraph|继续追问|我可以)", value):
+            return
+        current = ranked.get(value)
+        if current is None:
+            ranked[value] = (score, order)
+            order += 1
+        elif score > current[0]:
+            ranked[value] = (score, current[1])
+
+    has_trade = QuestionCategory.TRADE in categories or suggestion_has(intent_signal_text, r"gmv|成交|销售额|订单|下单|客单价")
+    has_refund = QuestionCategory.REFUND in categories or suggestion_has(intent_signal_text, r"退款|退货|售后|退款率")
+    has_ticket = QuestionCategory.CS_TICKET in categories or suggestion_has(intent_signal_text, r"工单|客服|咨询|催单")
+    has_goods = QuestionCategory.GOODS in categories or suggestion_has(intent_signal_text, r"商品|货品|上架|审核|新品|spu")
+    has_compensation = QuestionCategory.COMPENSATION in categories or suggestion_has(intent_signal_text, r"赔付|理赔|补偿")
+    has_coupon = QuestionCategory.COUPON in categories or suggestion_has(intent_signal_text, r"优惠券|券|补贴|优惠金额")
+    has_scm = QuestionCategory.SCM in categories or suggestion_has(intent_signal_text, r"供应链|履约|发货|超时|入库|签收")
+    has_rule = QuestionCategory.PLATFORM_RULE in categories or suggestion_has(intent_signal_text, r"规则|资质|规范|处罚|申诉")
+    has_deposit = QuestionCategory.MERCHANT_OTHER in categories or suggestion_has(intent_signal_text, r"保证金|deposit|冻结|充值")
+
+    if has_trade and has_refund and has_ticket:
+        add("按商品拆解订单量、退款金额和工单量", 18)
+        add("退款金额最高的商品是否也带来更多工单？", 17)
+        add("工单最多的问题类型和订单状态是什么？", 16)
+    if has_trade and has_refund:
+        add("订单量变化和退款金额是否同步波动？", 15)
+        add("退款金额最高的商品有哪些？", 14)
+        add("下单多但退款也高的商品有哪些？", 13)
+    if has_refund and has_ticket:
+        add("退款相关工单主要集中在哪些问题？", 15)
+        add("退款率高的商品是否也带来较多工单？", 14)
+    if has_goods and has_refund:
+        add("新品退款率是否偏高？", 15)
+        add("退款高的商品发布时间是什么时候？", 14)
+    if has_goods and has_ticket:
+        add("商品审核问题是否带来客服咨询？", 13)
+
+    if has_trade:
+        if suggestion_has(intent_signal_text, r"gmv|生意流水|成交额|销售额"):
+            add("GMV变化主要来自订单量还是客单价？", 17)
+            add("GMV下降商品主要集中在哪些类目？", 16)
+            add("最近7天GMV和退款金额一起看", 12)
+        if suggestion_has(intent_signal_text, r"订单|下单|支付订单|成交订单"):
+            add("最近7天下单量按日趋势如何？", 13)
+            add("下单量最高的商品有哪些？", 12)
+            add("支付订单量和退款率是否同步变化？", 11)
+        add("最近7天店铺整体经营情况怎么样？", 7)
+    if has_refund:
+        add("退款原因占比最近是否变化？", 13)
+        add("最近7天退款金额按日趋势如何？", 12)
+        add("直接退款和退货退款分别占多少？", 11)
+    if has_ticket:
+        add("工单最多的问题类型有哪些？", 13)
+        add("催单工单对应订单状态是什么？", 12)
+        add("客服工单量按天趋势如何？", 11)
+    if has_goods:
+        add("商品审核拒绝原因主要是什么？", 13)
+        add("最近上架失败商品明细有哪些？", 12)
+        add("最近15天新发布商品表现如何？", 11)
+    if has_compensation:
+        add("赔付金额最高的订单有哪些？", 13)
+        add("赔付订单是否关联退款或工单？", 12)
+        add("赔付金额按天趋势如何？", 11)
+    if has_coupon:
+        add("优惠券投入带来了多少订单？", 13)
+        add("优惠券订单退款率是否偏高？", 12)
+        add("最近7天优惠金额和GMV表现如何？", 11)
+    if has_scm:
+        add("最近7天发货超时订单量是多少？", 13)
+        add("履约异常集中在哪些商品？", 12)
+        add("供应链履约量按天趋势如何？", 11)
+    if has_rule:
+        add("商品上架需要补哪些资质？", 12)
+        add("商品审核被拒后优先排查什么？", 11)
+        add("平台规则里哪些处罚会影响经营？", 8)
+    if has_deposit:
+        add("保证金余额和冻结金额是否异常？", 12)
+        add("最近30天保证金充值流水", 11)
+        add("保证金冻结原因是什么？", 10)
+
+    if suggestion_has(intent_signal_text, r"趋势|变化|下降|上升|波动|异常"):
+        add("波动最大的日期对应哪些订单或商品？", 12)
+        if has_trade:
+            add("近期流量和转化是否影响成交？", 10)
+        if has_refund:
+            add("波动当天退款原因和商品分布是什么？", 11)
+    if suggestion_has(intent_signal_text, r"top|前\d+|最高|最多|排行"):
+        add("这些对象的明细和关联指标一起看", 12)
+    if suggestion_has(context_signal_text, r"七天无理由|7天无理由"):
+        add("七天无理由退货占比最近是否升高？", 10)
+    if suggestion_has(context_signal_text, r"自发货|发货模式|履约模式"):
+        add("自发货订单是否存在发货超时风险？", 10)
+
+    for signal in business_context.get("currentDataSignals") or []:
+        label = str(signal.get("label") or "")
+        if "退款" in label:
+            add("退款金额高的商品和订单明细", 10)
+        if "工单" in label or "咨询" in label:
+            add("工单上升那几天主要是什么问题？", 10)
+        if "订单" in label or "GMV" in label.upper():
+            add("订单量变化主要来自哪些商品？", 10)
+
+    add("最近7天店铺整体经营情况怎么样？", 1)
+    add("最近7天订单量和退款金额有什么变化？", 1)
+    add("商品审核被拒怎么办？", 1)
+
+    sorted_items = sorted(ranked.items(), key=lambda item: (-item[1][0], item[1][1]))
+    return [item[0] for item in sorted_items[:9]]
+
+
+def normalize_question_category(value: Any) -> QuestionCategory:
+    if isinstance(value, QuestionCategory):
+        return value
+    try:
+        return QuestionCategory(str(value))
+    except Exception:
+        return QuestionCategory.UNKNOWN
+
+
+def normalize_suggestion_text(value: str) -> str:
+    return re.sub(r"[\s？?。！!，,、]+", "", str(value or "").strip().lower())
+
+
+def suggestion_has(text: str, pattern: str) -> bool:
+    return bool(re.search(pattern, text, flags=re.I))
+
+
+def contextual_question_intent_signal_text(question: str, intents: List[QuestionIntent]) -> str:
+    parts: List[str] = [str(question or "")]
+    for intent in intents or []:
+        resolution = intent.metric_resolution or {}
+        parts.extend(
+            [
+                category_display(normalize_question_category(intent.category)),
+                str(intent.metric_name or ""),
+                str(intent.metric_column or ""),
+                str(intent.group_by_name or ""),
+                str(intent.group_by_column or ""),
+                str(intent.preferred_table or ""),
+                str(resolution.get("metricKey") or ""),
+                str(resolution.get("displayName") or ""),
+                str(resolution.get("semanticLabel") or ""),
+            ]
+        )
+    return "\n".join(part for part in parts if part)
+
+
+def contextual_suggestion_signal_text(
+    question: str,
+    intents: List[QuestionIntent],
+    business_context: Dict[str, Any],
+    merchant: MerchantInfo | None,
+    personalization_context: Optional[Dict[str, Any]],
+) -> str:
+    parts: List[str] = [contextual_question_intent_signal_text(question, intents)]
+    context = personalization_context or {}
+    parts.append(str((business_context or {}).get("merchantProfile") or ""))
+    parts.append(str((business_context or {}).get("memorySummary") or ""))
+    parts.append(json.dumps((business_context or {}).get("recentFocus") or {}, ensure_ascii=False, default=str))
+    parts.append(json.dumps((business_context or {}).get("relevantPreferences") or [], ensure_ascii=False, default=str))
+    parts.append(json.dumps((business_context or {}).get("currentDataSignals") or [], ensure_ascii=False, default=str))
+    parts.append(str(context.get("runtimeContext") or ""))
+    if merchant is not None:
+        parts.append(merchant.profile_markdown())
+    return "\n".join(part for part in parts if part)
+
+
+def answer_business_context(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    merchant: MerchantInfo | None = None,
+    personalization_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    context = personalization_context or {}
+    memory_injection = context.get("memoryInjection") or context.get("memory_injection") or {}
+    recent_focus = context.get("recentFocus") or memory_injection.get("recentFocus") or {}
+    merchant_profile = str(context.get("merchantProfileContext") or "")
+    if not merchant_profile and merchant is not None:
+        merchant_profile = merchant.profile_markdown()
+    return {
+        "merchantProfile": compact_answer_context_text(merchant_profile, 1200),
+        "memorySummary": compact_answer_context_text(str(context.get("memoryContext") or ""), 1000),
+        "recentFocus": compact_recent_focus(recent_focus),
+        "relevantPreferences": compact_memory_payloads(memory_injection.get("relevantPreferences") or memory_injection.get("preferences") or [], 4),
+        "relevantCorrections": compact_memory_payloads(memory_injection.get("relevantCorrections") or [], 3),
+        "relevantFacts": compact_memory_payloads(memory_injection.get("relevantFacts") or memory_injection.get("facts") or [], 3),
+        "questionCategories": [category_display(intent.category) for intent in plan.intents[:6]],
+        "currentDataSignals": answer_current_data_signals(question, plan, run_result),
+    }
+
+
+def compact_answer_context_text(value: str, max_chars: int) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", str(value or "").strip())
+    return text[:max_chars]
+
+
+def compact_recent_focus(focus: Any) -> Dict[str, Any]:
+    if not isinstance(focus, dict):
+        return {}
+    return {
+        "summary": focus.get("summary") or focus.get("focusPattern") or "",
+        "topTopics": focus.get("topTopics") or focus.get("top_categories") or [],
+        "topMetrics": focus.get("topMetrics") or focus.get("top_metrics") or [],
+        "commonTimeWindows": focus.get("commonTimeWindows") or focus.get("common_time_ranges") or [],
+    }
+
+
+def compact_memory_payloads(items: Any, max_items: int) -> List[Dict[str, Any]]:
+    compacted: List[Dict[str, Any]] = []
+    for item in list(items or [])[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        compacted.append(
+            {
+                key: item.get(key)
+                for key in ["memoryType", "summary", "value", "topics", "metrics", "timeWindows", "confidence"]
+                if item.get(key) not in (None, "", [])
+            }
+        )
+    return compacted
+
+
+def answer_current_data_signals(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> List[Dict[str, Any]]:
+    if not run_result:
+        return []
+    signals: List[Dict[str, Any]] = []
+    for item in summary_metric_values(plan, run_result)[:6]:
+        label = str(item.get("label") or item.get("metricKey") or "指标")
+        signals.append(
+            {
+                "type": "summary",
+                "label": label,
+                "value": format_metric_value_for_answer(item.get("value"), str(item.get("metricKey") or ""), label),
+                "taskId": item.get("taskId"),
+            }
+        )
+    for task in visible_successful_tasks(plan, run_result)[:8]:
+        intent = intent_by_task_id(plan).get(task.task_id)
+        if answer_result_role(intent) != "trend_context" or not task.query_bundle.rows:
+            continue
+        resolution = (intent.metric_resolution if intent else {}) or {}
+        metric_key = str(resolution.get("metricKey") or getattr(intent, "metric_name", "") or "")
+        label = str(resolution.get("displayName") or friendly_column_label(plan, metric_key) or "指标")
+        points = metric_series_rows_for_intent(plan, intent, task.query_bundle.rows) if intent else []
+        if not points:
+            continue
+        values = [answer_numeric_value(point.get("value")) for point in points]
+        numeric_values = [value for value in values if value is not None]
+        if not numeric_values:
+            continue
+        peak = max(points, key=lambda point: answer_numeric_value(point.get("value")) or float("-inf"))
+        signals.append(
+            {
+                "type": "trend",
+                "label": label,
+                "dateRange": extract_question_time_phrase(question),
+                "pointCount": len(points),
+                "peakDate": peak.get("pt"),
+                "peakValue": format_metric_value_for_answer(peak.get("value"), metric_key, label),
+            }
+        )
+    return signals[:10]
 
 
 def ratio_skill_lines(disclosures: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> List[str]:

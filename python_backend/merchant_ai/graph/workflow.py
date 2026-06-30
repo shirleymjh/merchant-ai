@@ -1846,7 +1846,13 @@ class MerchantQaWorkflow:
             rule_context,
         )
         state["answer_used_llm"] = bool(self.answer_service.llm.configured and rule_context)
-        state["suggestions"] = self.answer_service.contextual_suggestions(state["question"], state["plan"].intents)
+        state["suggestions"] = self.answer_service.contextual_suggestions(
+            state["question"],
+            state["plan"].intents,
+            run_result=state.get("agent_run_result"),
+            merchant=state.get("merchant"),
+            personalization_context=self.answer_personalization_context(state),
+        )
         state["chat_bi_completed"] = True
         state["should_persist"] = False
         state["persisted"] = False
@@ -1871,6 +1877,7 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "answer", "AnswerAgent", "ANSWER_ANALYSIS", input_summary="verified=%s" % state["agent_run_result"].verified_evidence.passed)
         increment_round(state)
         emit(state, "node.started", "ANSWER_ANALYSIS", {})
+        personalization_context = self.answer_personalization_context(state)
         route = state["routing_decision"].route
         if route == QuestionRoute.GREETING:
             state["plan"] = QueryPlan(
@@ -1896,6 +1903,7 @@ class MerchantQaWorkflow:
                     knowledge_context(state),
                     budget_chars=int(self.settings.context_answer_budget_chars or 10000),
                 ),
+                personalization_context=personalization_context,
             )
         elif route == QuestionRoute.INVALID:
             self.request_human_clarification(state, self.build_scope_clarification_prompt(state), "BUSINESS_SCOPE", "business_scope", business_scope_options())
@@ -1913,6 +1921,8 @@ class MerchantQaWorkflow:
                     state["agent_run_result"],
                     state["thread_data"].outputs_path,
                     state.get("rule_recall_context", ""),
+                    merchant=state["merchant"],
+                    personalization_context=personalization_context,
                 )
                 state["analysis_skill_trace"] = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
             answer_context = self.context_assembler.compact_text_context(
@@ -1931,6 +1941,7 @@ class MerchantQaWorkflow:
                 state.get("analysis_summary", ""),
                 allow_llm=True,
                 rule_context=state.get("rule_recall_context", ""),
+                personalization_context=personalization_context,
             )
             skill_trace = state.get("analysis_skill_trace") or {}
             state["answer_used_llm"] = bool(
@@ -1938,7 +1949,13 @@ class MerchantQaWorkflow:
                 or skill_trace.get("llmFallbackUsed")
                 or getattr(self.answer_service, "last_compose_used_llm", False)
             )
-        state["suggestions"] = self.answer_service.contextual_suggestions(state["question"], state["plan"].intents)
+        state["suggestions"] = self.answer_service.contextual_suggestions(
+            state["question"],
+            state["plan"].intents,
+            run_result=state.get("agent_run_result"),
+            merchant=state.get("merchant"),
+            personalization_context=personalization_context,
+        )
         state["chat_bi_completed"] = True
         add_step(state, "Result Loop：完成结果解读、建议生成与可视化数据组织")
         self.record_span(
@@ -1959,6 +1976,17 @@ class MerchantQaWorkflow:
         self.finish_run_step(state, step, "success", output_summary="answerChars=%d" % len(state.get("answer", "")))
         emit(state, "node.completed", "ANSWER_ANALYSIS", {"answerReady": bool(state["answer"])})
         return state
+
+    def answer_personalization_context(self, state: AgentState) -> Dict[str, Any]:
+        return {
+            "merchantProfileContext": state.get("merchant_profile_context", ""),
+            "memoryContext": state.get("memory_context", ""),
+            "runtimeContext": state.get("runtime_context", ""),
+            "runtimeInjection": state.get("runtime_injection", {}),
+            "memoryInjection": state.get("memory_injection", {}),
+            "memoryInjectionTrace": state.get("memory_injection_trace", {}),
+            "threadContext": state.get("thread_context", {}),
+        }
 
     def human_in_loop(self, state: AgentState) -> AgentState:
         started = now_ms()

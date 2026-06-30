@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List
@@ -22,13 +23,14 @@ def main() -> None:
 def build_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     rows = [row for row in payload.get("dataRows") or [] if isinstance(row, dict)]
     date_key = first_present_key(rows, ["pt", "date", "dt", "biz_date"])
+    labels = metric_labels(payload, rows)
     metric_keys = numeric_metric_keys(rows, payload, exclude={date_key, "seller_id", "merchant_id"})
-    metrics = [metric_profile(rows, date_key, key) for key in metric_keys[:6]]
+    metrics = [metric_profile(rows, date_key, key, labels) for key in metric_keys[:6]]
     metrics = [item for item in metrics if item]
     findings = build_findings(metrics)
     caveats = []
     if not rows:
-        caveats.append("没有可用于分析的 verified data rows。")
+        caveats.append("没有可用于分析的当前数据。")
     if not date_key:
         caveats.append("结果缺少日期字段，只能做横截面比较，不能判断走势。")
     if len(rows) < 3:
@@ -49,7 +51,7 @@ def build_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def metric_profile(rows: List[Dict[str, Any]], date_key: str, metric_key: str) -> Dict[str, Any]:
+def metric_profile(rows: List[Dict[str, Any]], date_key: str, metric_key: str, labels: Dict[str, str]) -> Dict[str, Any]:
     points = []
     for row in rows:
         value = decimal_value(row.get(metric_key))
@@ -74,6 +76,7 @@ def metric_profile(rows: List[Dict[str, Any]], date_key: str, metric_key: str) -
     max_vs_avg = safe_pct(maximum["value"] - avg, avg)
     return {
         "metric": metric_key,
+        "label": labels.get(metric_key) or fallback_metric_label(metric_key),
         "points": len(points),
         "first": format_decimal(first),
         "last": format_decimal(last),
@@ -90,6 +93,7 @@ def build_findings(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     findings = []
     for item in metrics:
         metric = item.get("metric") or "metric"
+        label = item.get("label") or metric
         has_date = bool((item.get("max") or {}).get("date") or (item.get("min") or {}).get("date"))
         delta = decimal_value(item.get("delta"))
         max_vs_avg = decimal_value(item.get("maxVsAvgPct"))
@@ -97,67 +101,129 @@ def build_findings(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             direction = "上升" if delta > 0 else "下降"
             findings.append(
                 {
-                    "title": "%s 期初到期末%s" % (metric, direction),
-                    "evidence": "%s 从 %s 变化到 %s，变化 %s。" % (metric, item.get("first"), item.get("last"), item.get("delta")),
+                    "title": "%s 期初到期末%s" % (label, direction),
+                    "evidence": "%s 从 %s 变化到 %s，变化 %s。" % (label, item.get("first"), item.get("last"), item.get("delta")),
                 }
             )
         if max_vs_avg is not None and max_vs_avg.copy_abs() >= Decimal("30"):
             peak = item.get("max") or {}
             findings.append(
                 {
-                    "title": "%s 存在高峰日" % metric,
+                    "title": "%s 存在高峰日" % label,
                     "evidence": "%s 在 %s 达到 %s，较均值高 %s%%。"
-                    % (metric, peak.get("date") or "未知日期", peak.get("value"), item.get("maxVsAvgPct")),
+                    % (label, peak.get("date") or "未知日期", peak.get("value"), item.get("maxVsAvgPct")),
                 }
             )
     return findings[:8]
 
 
 def render_answer(payload: Dict[str, Any], metrics: List[Dict[str, Any]], findings: List[Dict[str, Any]], caveats: List[str]) -> str:
-    lines = ["分析结论："]
-    if findings:
-        lines.append("- 当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。")
-    else:
-        lines.append("- 当前 verified evidence 没有显示足够强的异常信号，建议结合更长时间窗或更多维度复核。")
-    lines.append("")
-    lines.append("关键证据：")
-    if findings:
-        for item in findings[:6]:
-            lines.append("- %s：%s" % (item.get("title"), item.get("evidence")))
-    else:
-        for item in metrics[:4]:
+    lines = []
+    time_phrase = extract_question_time_phrase(str(payload.get("question") or ""))
+    if metrics:
+        primary = metrics[0]
+        label = primary.get("label") or primary.get("metric") or "指标"
+        direction = trend_direction(primary)
+        prefix = "%s，" % time_phrase if time_phrase else ""
+        if direction:
+            first = format_business_number(primary.get("first"))
+            last = format_business_number(primary.get("last"))
+            delta = format_business_number(abs_decimal_text(primary.get("delta")))
             lines.append(
-                "- %s：首值 %s，末值 %s，均值 %s，峰值 %s。"
-                % (
-                    item.get("metric"),
-                    item.get("first"),
-                    item.get("last"),
-                    item.get("average"),
-                    (item.get("max") or {}).get("value"),
-                )
+                "%s%s从 %s 变化到 %s，整体%s %s。"
+                % (prefix, label, first, last, direction, delta)
             )
+        else:
+            lines.append("%s%s整体比较平稳，当前没有看到明显单边变化。" % (prefix, label))
+        peak = primary.get("max") or {}
+        trough = primary.get("min") or {}
+        if peak.get("date") and trough.get("date") and peak.get("date") != trough.get("date"):
+            lines.append(
+                "峰值出现在 %s，为 %s；低点出现在 %s，为 %s。"
+                % (peak.get("date"), format_business_number(peak.get("value")), trough.get("date"), format_business_number(trough.get("value")))
+            )
+        if len(metrics) > 1:
+            extra = []
+            for item in metrics[1:3]:
+                item_label = item.get("label") or item.get("metric") or "指标"
+                item_direction = trend_direction(item)
+                if item_direction:
+                    delta = format_business_number(abs_decimal_text(item.get("delta")))
+                    extra.append("%s%s %s" % (item_label, item_direction, delta))
+            if extra:
+                lines.append("同时看到%s。" % "，".join(extra))
+    else:
+        lines.append("当前查询结果还不足以判断趋势。")
     disclosures = payload.get("metricDisclosures") or []
-    if disclosures:
+    if disclosures and question_asks_metric_disclosure(str(payload.get("question") or "")):
         lines.append("")
         lines.append("口径：")
         for item in disclosures[:6]:
             if isinstance(item, dict):
-                metric = item.get("metricKey") or item.get("displayName") or item.get("requestedMetricRef")
+                metric = item.get("displayName") or item.get("metricKey") or item.get("requestedMetricRef")
                 if not metric:
                     continue
                 formula = item.get("formula") or ""
-                table = item.get("ownerTable") or ""
                 warning = item.get("fieldWarning") or ""
-                detail = "，".join(part for part in [str(table), str(formula), str(warning)] if part)
+                detail = "，".join(part for part in [str(formula), str(warning)] if part)
                 lines.append("- %s：%s" % (metric, detail))
     if caveats:
         lines.append("")
-        lines.append("限制：")
+        lines.append("说明：")
         for item in dedupe(caveats)[:6]:
             lines.append("- %s" % item)
-    lines.append("")
-    lines.append("建议：优先核对峰值日期对应的订单、退款原因和活动/履约变化，再判断是否需要按商品或订单继续下钻。")
     return "\n".join(lines)
+
+
+def metric_labels(payload: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+    for item in payload.get("metricDisclosures") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("metricKey") or item.get("requestedMetricRef") or item.get("metric") or "").strip()
+        label = str(item.get("displayName") or "").strip()
+        if key and label:
+            labels[key] = label
+    for row in rows[:40]:
+        key = str(row.get("__metricKey") or "").strip()
+        label = str(row.get("__metricName") or "").strip()
+        if key and label:
+            labels.setdefault(key, label)
+    return labels
+
+
+def fallback_metric_label(metric_key: str) -> str:
+    mapping = {
+        "order_gmv_amt_1d": "GMV",
+        "pay_gmv_amt_1d": "支付GMV",
+        "trade_success_gmv_amt_1d": "交易成功GMV",
+        "refund_amt_1d": "退款金额",
+        "pay_amt": "退款金额",
+        "seller_repay_amt_1d": "赔付金额",
+        "cs_ticket_cnt_1d": "咨询工单量",
+        "order_detail_cnt": "订单量",
+    }
+    if metric_key in mapping:
+        return mapping[metric_key]
+    text = str(metric_key or "")
+    dictionary = {
+        "order": "订单",
+        "detail": "明细",
+        "cnt": "数量",
+        "amt": "金额",
+        "gmv": "GMV",
+        "refund": "退款",
+        "trade": "交易",
+        "success": "成功",
+        "pay": "支付",
+        "ticket": "工单",
+    }
+    label = "".join(dictionary.get(part, "") for part in re.split(r"[_\s]+", text.lower()))
+    return label or text
+
+
+def question_asks_metric_disclosure(question: str) -> bool:
+    return bool(re.search(r"(口径|怎么算|计算方式|字段|来源表|SQL|sql)", str(question or ""), flags=re.I))
 
 
 def numeric_metric_keys(rows: List[Dict[str, Any]], payload: Dict[str, Any], exclude: set[str]) -> List[str]:
@@ -170,11 +236,55 @@ def numeric_metric_keys(rows: List[Dict[str, Any]], payload: Dict[str, Any], exc
                 continue
             if entity_or_code_key(name):
                 continue
-            if disclosed and name not in disclosed and not metric_shaped_key(name):
+            if disclosed and name not in disclosed:
+                continue
+            if not disclosed and not metric_shaped_key(name):
                 continue
             if decimal_value(value) is not None:
                 keys.append(name)
     return keys
+
+
+def extract_question_time_phrase(question: str) -> str:
+    for pattern in [
+        r"最近\s*\d+\s*[天日周月]",
+        r"近\s*\d+\s*[天日周月]",
+        r"过去\s*\d+\s*[天日周月]",
+        r"昨天",
+        r"今日",
+        r"今天",
+        r"本周",
+        r"本月",
+    ]:
+        match = re.search(pattern, str(question or ""))
+        if match:
+            return re.sub(r"\s+", "", match.group(0))
+    return ""
+
+
+def trend_direction(item: Dict[str, Any]) -> str:
+    delta = decimal_value(item.get("delta"))
+    if delta is None or delta == 0:
+        return ""
+    return "下降" if delta < 0 else "上升"
+
+
+def abs_decimal_text(value: Any) -> str:
+    numeric = decimal_value(value)
+    if numeric is None:
+        return str(value or "")
+    return format_decimal(abs(numeric))
+
+
+def format_business_number(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return text
+    numeric = decimal_value(text)
+    if numeric is None:
+        return text
+    formatted = format_decimal(numeric).rstrip("0").rstrip(".")
+    return formatted or "0"
 
 
 def disclosed_metric_keys(payload: Dict[str, Any]) -> set[str]:

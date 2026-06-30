@@ -749,7 +749,14 @@ function mergeSuggestionPoolFor(sessionId, serverSuggestions = []) {
 
 function mergeSuggestionPoolFrom(basePool, serverSuggestions = []) {
   const merged = []
-  for (const item of [...serverSuggestions, ...basePool, ...defaultSuggestions]) {
+  const dynamicSuggestions = serverSuggestions
+    .map(item => String(item || '').trim())
+    .filter(Boolean)
+  const includeDefaults = dynamicSuggestions.length < suggestionPageSize * 2
+  const source = includeDefaults
+    ? [...dynamicSuggestions, ...basePool, ...defaultSuggestions]
+    : [...dynamicSuggestions, ...basePool]
+  for (const item of source) {
     const text = String(item || '').trim()
     if (!text || merged.includes(text)) continue
     merged.push(text)

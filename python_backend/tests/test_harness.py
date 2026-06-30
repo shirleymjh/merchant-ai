@@ -80,6 +80,7 @@ from merchant_ai.services.answer import (
     compact_rule_evidence,
     plan_requires_rule_evidence,
     select_answer_skill,
+    sanitize_business_answer_text,
     business_summary_table,
     task_evidence_sections,
 )
@@ -2347,7 +2348,7 @@ def test_product_risk_ranking_lookup_does_not_trigger_trend_analysis_summary():
 def test_trend_skill_ignores_entity_identifier_columns():
     import importlib.util
 
-    script = Path("resources/runtime/agent_skills/bi_trend_attribution/scripts/profile_timeseries.py")
+    script = get_settings().resources_root / "runtime" / "agent_skills" / "bi_trend_attribution" / "scripts" / "profile_timeseries.py"
     spec = importlib.util.spec_from_file_location("profile_timeseries_for_test", script)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
@@ -2369,6 +2370,35 @@ def test_trend_skill_ignores_entity_identifier_columns():
     assert "spu_id" not in profile["metricKeys"]
     assert set(profile["metricKeys"]) == {"repay_bill_cnt", "pay_amt"}
     assert not any("spu_id" in (finding.get("title") or "") for finding in profile["findings"])
+
+
+def test_trend_skill_only_uses_disclosed_metric_not_alternate_gmv_candidates():
+    import importlib.util
+
+    script = get_settings().resources_root / "runtime" / "agent_skills" / "bi_trend_attribution" / "scripts" / "profile_timeseries.py"
+    spec = importlib.util.spec_from_file_location("profile_timeseries_disclosed_metric_test", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+
+    profile = module.build_profile(
+        {
+            "question": "最近7天GMV趋势",
+            "dataRows": [
+                {"pt": "2026-06-22", "pay_gmv_amt_1d": "990.00", "trade_success_gmv_amt_1d": "507.00"},
+                {"pt": "2026-06-23", "pay_gmv_amt_1d": "782.50", "trade_success_gmv_amt_1d": "563.50"},
+            ],
+            "metricDisclosures": [
+                {"metricKey": "pay_gmv_amt_1d", "displayName": "支付GMV"},
+            ],
+        }
+    )
+
+    assert profile["metricKeys"] == ["pay_gmv_amt_1d"]
+    assert "交易成功GMV" not in profile["answerMarkdown"]
+    assert "关键证据" not in profile["answerMarkdown"]
+    assert "限制" not in profile["answerMarkdown"]
+    assert "建议" not in profile["answerMarkdown"]
 
 
 def test_task_evidence_sections_prioritize_user_facing_nodes():
@@ -9932,10 +9962,16 @@ def test_compiler_adds_parallel_rule_evidence_branch_for_rule_data_question():
     plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
     reflection = PlannerReflectionAgent().reflect(question, plan, pack)
 
-    data_intents = [intent for intent in plan.intents if intent.answer_mode != AnswerMode.RULE]
+    data_intents = [
+        intent
+        for intent in plan.intents
+        if intent.answer_mode != AnswerMode.RULE and (intent.metric_resolution or {}).get("displayRole") != "trend_context"
+    ]
+    trend_intents = [intent for intent in plan.intents if (intent.metric_resolution or {}).get("displayRole") == "trend_context"]
     rule_intents = [intent for intent in plan.intents if intent.answer_mode == AnswerMode.RULE]
     assert len(data_intents) == 1
     assert data_intents[0].metric_name == "ship_timeout_order_cnt_1d"
+    assert trend_intents
     assert len(rule_intents) == 1
     assert rule_intents[0].knowledge_ref_ids == ["rule:shipping_timeout"]
     assert not plan.dependencies
@@ -10622,7 +10658,8 @@ def test_answer_analysis_summary_uses_structured_analysis_intent_not_question_te
         }
     )
     summary = AnswerComposeService(llm).summarize_analysis("最近30天GMV是否正常？", plan, run)
-    assert summary.startswith("分析结论")
+    assert "GMV" in summary
+    assert "分析结论" not in summary
     assert llm.calls == 0
 
 
@@ -10662,7 +10699,7 @@ def test_answer_compose_uses_llm_for_plain_query_with_rows():
         def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
             self.calls += 1
             assert "不要输出 markdown 表格" in system_prompt
-            return "最近30天退款金额最高的商品是 A，退款金额为 12.3。"
+            return "最近30天退款金额最高的商品是 A，退款金额为 12.3。\n\n建议：\n- 优先查看该商品退款原因，确认是否和描述或履约有关。"
 
     llm = FakeAnswerLlm()
     run = AgentRunResult(
@@ -10700,6 +10737,195 @@ def test_answer_compose_uses_llm_for_plain_query_with_rows():
     assert "退款金额最高的商品是 A" in answer
     assert "已按当前口径" not in answer
     assert llm.calls == 1
+
+
+def test_answer_compose_passes_profile_memory_and_data_to_llm_advice():
+    class FakeAnswerLlm:
+        configured = True
+        settings = get_settings()
+
+        def __init__(self):
+            self.calls = 0
+            self.payload = {}
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            self.calls += 1
+            self.payload = json.loads(user_prompt)
+            assert "businessContext" in user_prompt
+            return "\n".join(
+                [
+                    "最近7天，订单量为 17，退款金额为 130元，咨询工单量为 5。",
+                    "",
+                    "建议：",
+                    "- 结合近期售后关注，优先排查高退款商品和对应工单。",
+                    "- 若订单量集中在少数商品，检查商品描述和履约承诺是否一致。",
+                ]
+            )
+
+    question = "最近7天订单量、退款金额、咨询工单量分别是多少？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="order_metric",
+                metric_name="order_detail_cnt",
+                metric_resolution={"metricKey": "order_detail_cnt", "displayName": "订单量"},
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.REFUND,
+                plan_task_id="refund_metric",
+                metric_name="pay_amt",
+                metric_resolution={"metricKey": "pay_amt", "displayName": "退款金额"},
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.CS_TICKET,
+                plan_task_id="ticket_metric",
+                metric_name="cs_ticket_cnt_1d",
+                metric_resolution={"metricKey": "cs_ticket_cnt_1d", "displayName": "咨询工单量"},
+            ),
+        ]
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="order_metric", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "order_detail_cnt": 17}])),
+            AgentTaskResult(task_id="refund_metric", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "pay_amt": 130}])),
+            AgentTaskResult(task_id="ticket_metric", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "cs_ticket_cnt_1d": 5}])),
+        ],
+        merged_query_bundle=QueryBundle(rows=[{"seller_id": "100", "order_detail_cnt": 17, "pay_amt": 130, "cs_ticket_cnt_1d": 5}]),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    merchant = MerchantInfo(merchant_id="100", rows={"merchant_type_name": "认证商户", "is_unconditional_refund": 1})
+    personalization_context = {
+        "memoryContext": "近期经营记忆：该商家最近持续关注退款率、客服工单和售后风险。",
+        "memoryInjection": {
+            "recentFocus": {"summary": "近期重点关注退款率和客服工单", "topMetrics": ["退款率", "咨询工单量"]},
+            "relevantPreferences": [{"memoryType": "metric_habit", "summary": "常看最近7天售后指标", "confidence": 0.86}],
+        },
+    }
+
+    llm = FakeAnswerLlm()
+    answer = AnswerComposeService(llm).compose(
+        question,
+        merchant,
+        plan,
+        run,
+        "",
+        personalization_context=personalization_context,
+    )
+
+    business_context = llm.payload["businessContext"]
+    assert "认证商户" in business_context["merchantProfile"]
+    assert "退款率" in business_context["memorySummary"]
+    assert any(item["label"] == "订单量" and item["value"] == "17" for item in business_context["currentDataSignals"])
+    assert "结合近期售后关注" in answer
+    assert "继续追问" not in answer
+    assert llm.calls == 1
+
+
+def test_answer_compose_polishes_analysis_summary_for_business_user():
+    class FakeAnswerLlm:
+        configured = True
+        settings = get_settings()
+
+        def __init__(self):
+            self.calls = 0
+            self.payload = {}
+
+        def chat(self, system_prompt, user_prompt, fallback="", timeout_seconds=None):
+            self.calls += 1
+            self.payload = json.loads(user_prompt)
+            assert "analysisDraft" in self.payload
+            assert "不要使用“分析结论”" in system_prompt
+            return "\n".join(
+                [
+                    "最近7天，GMV从 990 变化到 782.5，整体下降 207.5。",
+                    "峰值出现在 2026-06-24，为 990；低点出现在 2026-06-23，为 782.5。",
+                    "",
+                    "说明：",
+                    "- 可用数据点较少，异常判断可信度有限。",
+                    "",
+                    "建议：",
+                    "1. 近7天GMV下滑，优先复盘近两日流量与转化变化。",
+                    "2. 结合近期退款关注，排查退款补偿是否拖累净成交。",
+                ]
+            )
+
+    question = "最近7天GMV趋势"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_trend",
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_resolution={"metricKey": "order_gmv_amt_1d", "displayName": "GMV"},
+                group_by_column="pt",
+            )
+        ]
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="gmv_trend",
+                success=True,
+                query_bundle=QueryBundle(
+                    rows=[
+                        {"pt": "2026-06-23", "order_gmv_amt_1d": 990},
+                        {"pt": "2026-06-24", "order_gmv_amt_1d": 782.5},
+                    ]
+                ),
+            )
+        ],
+        merged_query_bundle=QueryBundle(
+            rows=[
+                {"pt": "2026-06-23", "order_gmv_amt_1d": 990},
+                {"pt": "2026-06-24", "order_gmv_amt_1d": 782.5},
+            ]
+        ),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    bad_draft = "\n".join(
+        [
+            "分析结论：",
+            "- 当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。",
+            "",
+            "关键证据：",
+            "- order_gmv_amt_1d 期初到期末下降。",
+            "",
+            "限制：",
+            "- 可用行数较少，异常判断可信度有限。",
+        ]
+    )
+
+    answer = AnswerComposeService(FakeAnswerLlm()).compose(
+        question,
+        MerchantInfo(merchant_id="100"),
+        plan,
+        run,
+        "",
+        analysis_summary=bad_draft,
+    )
+
+    assert "最近7天，GMV从 990 变化到 782.5" in answer
+    assert "分析结论" not in answer
+    assert "关键证据" not in answer
+    assert "order_gmv_amt_1d" not in answer
+    assert "限制" not in answer
+    assert "建议：" in answer
+    assert "- 近7天GMV下滑" in answer
+    assert "1. 近7天GMV下滑" not in answer
 
 
 def test_answer_sections_convert_daily_metric_rows_to_chart_series():
@@ -10761,6 +10987,105 @@ def test_answer_sections_convert_daily_metric_rows_to_chart_series():
         {"metric_name": "订单量", "pt": "2026-06-23", "value": 3.0},
         {"metric_name": "订单量", "pt": "2026-06-24", "value": 5.0},
     ]
+
+
+def test_contextual_suggestions_use_question_profile_memory_and_result():
+    service = AnswerComposeService(LlmClient(get_settings()))
+    intents = [
+        QuestionIntent(
+            intent_type="VALID",
+            answer_mode=AnswerMode.METRIC,
+            category=QuestionCategory.TRADE,
+            plan_task_id="order",
+            metric_name="order_detail_cnt",
+            metric_resolution={"metricKey": "order_detail_cnt", "displayName": "订单量"},
+        ),
+        QuestionIntent(
+            intent_type="VALID",
+            answer_mode=AnswerMode.METRIC,
+            category=QuestionCategory.REFUND,
+            plan_task_id="refund",
+            metric_name="refund_amt_1d",
+            metric_resolution={"metricKey": "refund_amt_1d", "displayName": "退款金额"},
+        ),
+        QuestionIntent(
+            intent_type="VALID",
+            answer_mode=AnswerMode.METRIC,
+            category=QuestionCategory.CS_TICKET,
+            plan_task_id="ticket",
+            metric_name="cs_ticket_cnt_1d",
+            metric_resolution={"metricKey": "cs_ticket_cnt_1d", "displayName": "咨询工单量"},
+        ),
+    ]
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="order", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "order_detail_cnt": 17}])),
+            AgentTaskResult(task_id="refund", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "refund_amt_1d": 130}])),
+            AgentTaskResult(task_id="ticket", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "cs_ticket_cnt_1d": 5}])),
+        ]
+    )
+    merchant = MerchantInfo(merchant_id="100", rows={"is_unconditional_refund": 1, "merchant_type_name": "企业商户"})
+    personalization_context = {
+        "memoryContext": "近期持续关注退款、客服工单和七天无理由售后风险。",
+        "memoryInjection": {
+            "recentFocus": {"topTopics": ["电商退货", "客服工单"], "topMetrics": ["退款金额", "咨询工单量"]}
+        },
+    }
+
+    suggestions = service.contextual_suggestions(
+        "最近7天订单量、退款金额、咨询工单量分别是多少？",
+        intents,
+        run_result=run,
+        merchant=merchant,
+        personalization_context=personalization_context,
+    )
+
+    assert suggestions[:3] == [
+        "按商品拆解订单量、退款金额和工单量",
+        "退款金额最高的商品是否也带来更多工单？",
+        "工单最多的问题类型和订单状态是什么？",
+    ]
+    assert "我想查看保证金" not in suggestions[:3]
+
+
+def test_contextual_suggestions_for_gmv_trend_prioritize_trade_drilldowns():
+    service = AnswerComposeService(LlmClient(get_settings()))
+    intents = [
+        QuestionIntent(
+            intent_type="VALID",
+            answer_mode=AnswerMode.GROUP_AGG,
+            category=QuestionCategory.TRADE,
+            plan_task_id="gmv_trend",
+            metric_name="order_gmv_amt_1d",
+            group_by_column="pt",
+            metric_resolution={"metricKey": "order_gmv_amt_1d", "displayName": "GMV"},
+        )
+    ]
+
+    suggestions = service.contextual_suggestions(
+        "最近7天GMV趋势",
+        intents,
+        run_result=AgentRunResult(
+            task_results=[
+                AgentTaskResult(
+                    task_id="gmv_trend",
+                    success=True,
+                    query_bundle=QueryBundle(
+                        rows=[
+                            {"pt": "2026-06-23", "order_gmv_amt_1d": 990},
+                            {"pt": "2026-06-24", "order_gmv_amt_1d": 782.5},
+                        ]
+                    ),
+                )
+            ]
+        ),
+        merchant=MerchantInfo(merchant_id="100", rows={"merchant_type_name": "企业商户"}),
+        personalization_context={"memoryContext": "近期关注 GMV 下滑和退款影响。"},
+    )
+
+    assert suggestions[0] == "GMV变化主要来自订单量还是客单价？"
+    assert any("退款金额" in item for item in suggestions[:4])
+    assert "我想查看保证金" not in suggestions[:3]
 
 
 def test_answer_compose_keeps_summary_metric_authoritative_when_trend_is_partial():
@@ -10842,7 +11167,8 @@ def test_answer_compose_keeps_summary_metric_authoritative_when_trend_is_partial
     assert "其余日期" not in answer
     assert "未带日期" not in answer
     assert "建议优先" not in answer
-    assert answer.count("- ") == 2
+    assert "建议：" in answer
+    assert "- 优先回看 6月24日工单上升的咨询类型。" in answer
 
 
 def recall_bundle_empty():
@@ -12369,6 +12695,7 @@ def test_analysis_skill_runner_generates_evidence_bound_summary(tmp_path):
                     "metricKey": "order_gmv_amt_1d",
                     "ownerTable": "ads_merchant_profile",
                     "formula": "SUM(order_gmv_amt_1d)",
+                    "displayName": "GMV",
                 },
             )
         ],
@@ -12383,14 +12710,135 @@ def test_analysis_skill_runner_generates_evidence_bound_summary(tmp_path):
         verified_evidence=VerifiedEvidence(passed=True),
     )
     answer = service.summarize_analysis("最近30天GMV和退款金额走势是否正常？", plan, run, str(tmp_path))
-    assert "分析结论" in answer
-    assert "关键证据" in answer
-    assert "order_gmv_amt_1d" in answer
+    assert "GMV" in answer
+    assert "关键证据" not in answer
+    assert "限制" not in answer
+    assert "建议" not in answer
+    assert "GMV" in answer
+    assert "order_gmv_amt_1d" not in answer
+    assert "口径" not in answer
     trace = service.last_analysis_skill_trace
     assert trace["activated"]
     assert trace["metadata"]["name"] == "bi_trend_attribution"
     assert Path(trace["inputArtifact"]).exists()
     assert Path(trace["outputArtifact"]).exists()
+
+
+def test_answer_package_hides_alternate_gmv_candidate_metrics():
+    question = "最近7天GMV趋势"
+    plan = QueryPlan(
+        question_understanding={"requestedMeasures": [{"metricRef": "order_gmv_amt_1d"}]},
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_order",
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_resolution={"metricKey": "order_gmv_amt_1d", "displayName": "GMV"},
+                group_by_column="pt",
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_pay",
+                preferred_table="ads_merchant_profile",
+                metric_name="pay_gmv_amt_1d",
+                metric_resolution={"metricKey": "pay_gmv_amt_1d", "displayName": "支付GMV", "sourcePhrase": "GMV"},
+                group_by_column="pt",
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_trade_success",
+                preferred_table="ads_merchant_profile",
+                metric_name="trade_success_gmv_amt_1d",
+                metric_resolution={"metricKey": "trade_success_gmv_amt_1d", "displayName": "交易成功GMV", "sourcePhrase": "GMV"},
+                group_by_column="pt",
+            ),
+        ],
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="gmv_order", success=True, query_bundle=QueryBundle(rows=[{"pt": "2026-06-22", "order_gmv_amt_1d": 1671}])),
+            AgentTaskResult(task_id="gmv_pay", success=True, query_bundle=QueryBundle(rows=[{"pt": "2026-06-22", "pay_gmv_amt_1d": 1518}])),
+            AgentTaskResult(task_id="gmv_trade_success", success=True, query_bundle=QueryBundle(rows=[{"pt": "2026-06-22", "trade_success_gmv_amt_1d": 1200}])),
+        ],
+        merged_query_bundle=QueryBundle(rows=[{"pt": "2026-06-22", "order_gmv_amt_1d": 1671}]),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    package = answer_data_package(question, plan, run)
+    disclosed = {item.get("metricKey") for item in package["metricDisclosures"]}
+    section_metrics = {section.get("metricKey") for section in package["dataSections"]}
+
+    assert disclosed == {"order_gmv_amt_1d"}
+    assert section_metrics == {"order_gmv_amt_1d"}
+    cleaned = sanitize_business_answer_text(
+        "GMV从 1671 变化到 1200。\n同时，交易成功GMV从 1518 变化到 1200。",
+        question,
+        plan,
+        run,
+    )
+    assert "交易成功GMV" not in cleaned
+    assert "GMV从 1671" in cleaned
+
+
+def test_multi_metric_answer_mentions_all_summary_metrics():
+    service = AnswerComposeService(LlmClient(get_settings().model_copy(update={"llm_api_key": ""})))
+    question = "最近7天订单量、退款金额、咨询工单量分别是多少？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="order_metric",
+                metric_name="order_detail_cnt",
+                metric_resolution={"metricKey": "order_detail_cnt", "displayName": "订单量"},
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.REFUND,
+                plan_task_id="refund_metric",
+                metric_name="pay_amt",
+                metric_resolution={"metricKey": "pay_amt", "displayName": "退款金额"},
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.CS_TICKET,
+                plan_task_id="ticket_metric",
+                metric_name="cs_ticket_cnt_1d",
+                metric_resolution={"metricKey": "cs_ticket_cnt_1d", "displayName": "咨询工单量"},
+            ),
+        ]
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="order_metric", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "order_detail_cnt": 17}])),
+            AgentTaskResult(task_id="refund_metric", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "pay_amt": 130}])),
+            AgentTaskResult(task_id="ticket_metric", success=True, query_bundle=QueryBundle(rows=[{"seller_id": "100", "cs_ticket_cnt_1d": 5}])),
+        ],
+        merged_query_bundle=QueryBundle(rows=[{"seller_id": "100", "order_detail_cnt": 17, "pay_amt": 130, "cs_ticket_cnt_1d": 5}]),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    answer = service.compose(question, MerchantInfo(merchant_id="100"), plan, run, "", allow_llm=False)
+
+    assert "订单量为 17" in answer
+    assert "退款金额为 130元" in answer
+    assert "咨询工单量为 5" in answer
 
 
 def test_context_package_keeps_minimal_refs_not_full_debug_trace(tmp_path):

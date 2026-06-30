@@ -6,10 +6,10 @@
         <h3>{{ displayTitle }}</h3>
       </div>
       <div class="metric-chart-actions" aria-label="图表操作">
-        <button type="button" title="放大查看">
+        <button type="button" title="放大查看" @click="expanded = true">
           <Maximize2 :size="14" />
         </button>
-        <button type="button" title="复制图表">
+        <button type="button" title="复制图表数据" @click="copyChartData">
           <Copy :size="14" />
         </button>
       </div>
@@ -77,11 +77,84 @@
       <span v-for="table in tables" :key="table">{{ tableLabel(table) }}</span>
     </div>
   </section>
+
+  <Teleport to="body">
+    <div v-if="expanded" class="result-modal-backdrop" @click.self="expanded = false">
+      <section class="result-modal result-chart-modal" role="dialog" aria-modal="true" :aria-label="`${displayTitle} 放大查看`">
+        <div class="result-modal-head">
+          <div>
+            <p>{{ rangeLabel }} · {{ pointCount }} 个采样点</p>
+            <h3>{{ displayTitle }}</h3>
+          </div>
+          <button type="button" title="关闭" @click="expanded = false">
+            <X :size="18" />
+          </button>
+        </div>
+        <svg
+          class="metric-chart-svg metric-chart-modal-svg"
+          viewBox="0 0 640 260"
+          role="img"
+          :aria-label="`${displayTitle} 趋势图`"
+          preserveAspectRatio="none"
+        >
+          <g v-for="tick in yTicks" :key="`modal-grid-${tick.value}`">
+            <line
+              :x1="padding.left"
+              :x2="chartWidth - padding.right"
+              :y1="tick.y"
+              :y2="tick.y"
+              class="metric-chart-grid"
+            />
+            <text
+              :x="padding.left - 12"
+              :y="tick.y + 4"
+              text-anchor="end"
+              class="metric-chart-y-label"
+            >
+              {{ formatAxisValue(tick.value) }}
+            </text>
+          </g>
+
+          <g v-for="label in xLabels" :key="`modal-label-${label.index}`">
+            <line
+              :x1="label.x"
+              :x2="label.x"
+              :y1="padding.top"
+              :y2="chartHeight - padding.bottom"
+              class="metric-chart-column"
+            />
+            <text
+              :x="label.x"
+              :y="chartHeight - padding.bottom + 24"
+              text-anchor="middle"
+              class="metric-chart-x-label"
+            >
+              {{ label.text }}
+            </text>
+          </g>
+
+          <path :d="areaPath" class="metric-chart-area" />
+          <path :d="linePath" class="metric-chart-line" />
+
+          <g v-for="point in points" :key="`modal-point-${point.label}-${point.index}`">
+            <circle :cx="point.x" :cy="point.y" r="4.5" class="metric-chart-point-shadow" />
+            <circle :cx="point.x" :cy="point.y" r="3.2" class="metric-chart-point" />
+          </g>
+        </svg>
+        <div class="metric-chart-footer result-modal-footer">
+          <span>{{ rangeLabel }}</span>
+          <span>{{ pointCount }} 个采样点</span>
+          <span>峰值 {{ peakLabel }}</span>
+        </div>
+      </section>
+    </div>
+    <div v-if="toastMessage" class="app-toast">{{ toastMessage }}</div>
+  </Teleport>
 </template>
 
 <script setup>
-import { computed } from 'vue'
-import { Copy, Maximize2 } from 'lucide-vue-next'
+import { computed, ref } from 'vue'
+import { Copy, Maximize2, X } from 'lucide-vue-next'
 
 const props = defineProps({
   title: {
@@ -120,6 +193,9 @@ function tableLabel(table) {
 const chartWidth = 640
 const chartHeight = 260
 const padding = { top: 20, right: 18, bottom: 44, left: 52 }
+const expanded = ref(false)
+const toastMessage = ref('')
+let toastTimer = null
 
 const displayTitle = computed(() => props.title || '指标趋势')
 
@@ -276,5 +352,47 @@ function compactDate(text) {
 
 function titleLooksLikeAmount(title) {
   return /金额|gmv|销售额|成交额|流水/i.test(String(title || ''))
+}
+
+async function copyChartData() {
+  const rows = normalizedRows.value.map(row => `${row.label}\t${formatMetricValue(row.value)}`)
+  const text = [`${displayTitle.value}`, '日期\t数值', ...rows].join('\n')
+  const copied = await writeClipboardText(text)
+  showToast(copied ? '已复制趋势数据' : '复制失败，请重试')
+}
+
+async function writeClipboardText(text) {
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Use the textarea fallback below.
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    textarea.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
+function showToast(message) {
+  toastMessage.value = message
+  if (toastTimer) {
+    window.clearTimeout(toastTimer)
+  }
+  toastTimer = window.setTimeout(() => {
+    toastMessage.value = ''
+  }, 1800)
 }
 </script>
