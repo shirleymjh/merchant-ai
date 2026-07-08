@@ -153,6 +153,14 @@ class ChatContext(APIModel):
     pending_clarification_options: List[str] = Field(default_factory=list)
 
 
+class ConversationMessage(APIModel):
+    role: str = ""
+    text: str = ""
+    id: str = ""
+    local_id: str = ""
+    created_at: str = ""
+
+
 class ChatDataSection(APIModel):
     title: str = ""
     result_role: str = ""
@@ -176,6 +184,7 @@ class ChatRequest(APIModel):
     message: str
     merchant_id: str = ""
     context: Optional[ChatContext] = None
+    message_history: List[ConversationMessage] = Field(default_factory=list)
 
 
 class RunCreateRequest(APIModel):
@@ -183,6 +192,7 @@ class RunCreateRequest(APIModel):
     merchant_id: str = ""
     thread_id: str = ""
     context: Optional[ChatContext] = None
+    message_history: List[ConversationMessage] = Field(default_factory=list)
 
 
 class FeedbackRequest(APIModel):
@@ -223,6 +233,35 @@ class KnowledgeSuggestionReviewRequest(APIModel):
     approved: bool = False
     reviewer: str = ""
     review_note: str = ""
+    action: str = "review"
+
+
+class KnowledgeSuggestion(APIModel):
+    suggestion_id: str = ""
+    suggestion_type: str = "metric"
+    status: str = "candidate"
+    source: str = ""
+    source_memory_id: str = ""
+    source_refs: List[str] = Field(default_factory=list)
+    topic: str = ""
+    metric_name: str = ""
+    aliases: List[str] = Field(default_factory=list)
+    source_table: str = ""
+    source_fields: List[str] = Field(default_factory=list)
+    aggregation: str = ""
+    filter_conditions: List[str] = Field(default_factory=list)
+    dependency_fields: List[str] = Field(default_factory=list)
+    reviewer: str = ""
+    review_note: str = ""
+    approved_by: str = ""
+    reviewed_at: str = ""
+    publish_requested_at: str = ""
+    publish_requested_by: str = ""
+    published_ref_id: str = ""
+    indexed_at: str = ""
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
 
 
 class TopicBuildRequest(APIModel):
@@ -429,6 +468,14 @@ class RecallRoundTrace(APIModel):
     new_refs: List[str] = Field(default_factory=list)
     blocked_reason: str = ""
     item_count: int = 0
+    recall_channels: List[str] = Field(default_factory=list)
+    source_type_top_k: Dict[str, int] = Field(default_factory=dict)
+    vector_enabled: bool = False
+    vector_disabled: bool = False
+    metric_candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    retrieval_profile: Dict[str, Any] = Field(default_factory=dict)
+    query_type: str = ""
+    retrieval_lanes: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class KnowledgeBundle(APIModel):
@@ -456,6 +503,11 @@ class AgentAction(APIModel):
     node: str = ""
     agent: str = ""
     description: str = ""
+    required_state_keys: List[str] = Field(default_factory=list)
+    required_state_flags: List[str] = Field(default_factory=list)
+    expected_state_keys: List[str] = Field(default_factory=list)
+    expected_state_flags: List[str] = Field(default_factory=list)
+    fallback_action: str = ""
 
 
 class AgentDecision(APIModel):
@@ -464,6 +516,8 @@ class AgentDecision(APIModel):
     available_actions: List[str] = Field(default_factory=list)
     reason: str = ""
     budget_exhausted: bool = False
+    observation: str = ""
+    source: str = "policy"
 
 
 class ActionResult(APIModel):
@@ -634,6 +688,20 @@ class ContextAssemblyReport(APIModel):
     artifact_refs: List[ArtifactRef] = Field(default_factory=list)
     context_hash: str = ""
     reason: str = ""
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ContextManifest(APIModel):
+    stage: str = ""
+    agent: str = ""
+    context_package_id: str = ""
+    context_hash: str = ""
+    allowed_tables: List[str] = Field(default_factory=list)
+    allowed_metrics: List[str] = Field(default_factory=list)
+    memory_ids: List[str] = Field(default_factory=list)
+    semantic_ref_ids: List[str] = Field(default_factory=list)
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    budget_report: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -911,6 +979,8 @@ class NodePlanContract(APIModel):
     question: str = ""
     preferred_table: str = ""
     allowed_columns: List[str] = Field(default_factory=list)
+    visible_columns: List[str] = Field(default_factory=list)
+    internal_only_columns: List[str] = Field(default_factory=list)
     required_columns: List[str] = Field(default_factory=list)
     metric_column: str = ""
     metric_name: str = ""
@@ -923,6 +993,10 @@ class NodePlanContract(APIModel):
     limit: int = 0
     merchant_id: str = ""
     merchant_filter_column: str = ""
+    access_role: str = "merchant_analyst"
+    row_scope_policy: Dict[str, Any] = Field(default_factory=dict)
+    column_access_policy: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    masked_columns: Dict[str, str] = Field(default_factory=dict)
     answer_mode: str = ""
     task_role: str = ""
     sql_strategy: str = ""
@@ -1104,9 +1178,14 @@ class EntitySet(APIModel):
 
 class NodeExecutionContext(APIModel):
     merchant_id: str = ""
+    access_role: str = "merchant_analyst"
     question: str = ""
     upstream_entity_sets: List[EntitySet] = Field(default_factory=list)
     upstream_rows: List[Dict[str, Any]] = Field(default_factory=list)
+    sub_agent_run_id: str = ""
+    checkpoint_path: str = ""
+    workspace_path: str = ""
+    context_package: Dict[str, Any] = Field(default_factory=dict)
 
 
 class EvidenceGap(APIModel):
@@ -1207,6 +1286,7 @@ class SqlDraft(APIModel):
 
 class QueryBundle(APIModel):
     sql: str = ""
+    params: List[Any] = Field(default_factory=list)
     tables: List[str] = Field(default_factory=list)
     rows: List[Dict[str, Any]] = Field(default_factory=list)
     failed: bool = False
@@ -1241,6 +1321,10 @@ class AgentTask(APIModel):
 class AgentTaskResult(APIModel):
     task_id: str = ""
     sub_agent_type: str = "NODE_WORKER"
+    sub_agent_run_id: str = ""
+    sub_agent_checkpoint_path: str = ""
+    sub_agent_workspace: str = ""
+    sub_agent_context: Dict[str, Any] = Field(default_factory=dict)
     success: bool = False
     summary: str = ""
     query_bundle: QueryBundle = Field(default_factory=QueryBundle)
@@ -1254,12 +1338,29 @@ class AgentTaskResult(APIModel):
     node_plan_contract: NodePlanContract = Field(default_factory=NodePlanContract)
     node_plan_critique: NodePlanCritiqueResult = Field(default_factory=NodePlanCritiqueResult)
     sql_draft_decision: SqlDraftDecision = Field(default_factory=SqlDraftDecision)
+    file_tool_results: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class EvidenceCheckResult(APIModel):
     passed: bool = False
     summary: str = ""
     gaps: List[str] = Field(default_factory=list)
+
+
+class SkillLifecycleRecord(APIModel):
+    skill_name: str = ""
+    stage: str = ""
+    status: str = ""
+    matched_by: str = ""
+    requires_confirmation: bool = False
+    confirmed: bool = False
+    isolated_run_id: str = ""
+    workspace_path: str = ""
+    checkpoint_path: str = ""
+    progress: List[str] = Field(default_factory=list)
+    reuse_candidate: bool = False
+    summary: str = ""
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRunResult(APIModel):
@@ -1280,6 +1381,7 @@ class AgentRunResult(APIModel):
     node_plan_critiques: List[NodePlanCritiqueResult] = Field(default_factory=list)
     sql_draft_decisions: List[SqlDraftDecision] = Field(default_factory=list)
     node_execution_batches: List[NodeExecutionBatch] = Field(default_factory=list)
+    skill_lifecycle_records: List[SkillLifecycleRecord] = Field(default_factory=list)
 
 
 class PendingAnswer(APIModel):
@@ -1314,14 +1416,23 @@ class MemoryEvent(APIModel):
     last_used_at: str = ""
     decay_score: float = 1.0
     valid_until: str = ""
+    retention_days: int = 0
     supersedes: List[str] = Field(default_factory=list)
     conflicts_with: List[str] = Field(default_factory=list)
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    visibility: str = "merchant"
+    allowed_roles: List[str] = Field(default_factory=list)
+    approved_by: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
+    case_payload: Dict[str, Any] = Field(default_factory=dict)
+    case_summary: str = ""
     created_at: str = ""
 
 
 class MemoryFact(APIModel):
     fact_id: str = ""
-    memory_type: str = "business_focus"
+    memory_type: str = "business_fact"
     content: str = ""
     topics: List[str] = Field(default_factory=list)
     metrics: List[str] = Field(default_factory=list)
@@ -1331,14 +1442,21 @@ class MemoryFact(APIModel):
     last_used_at: str = ""
     decay_score: float = 1.0
     valid_until: str = ""
+    retention_days: int = 0
     supersedes: List[str] = Field(default_factory=list)
     conflicts_with: List[str] = Field(default_factory=list)
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    visibility: str = "merchant"
+    allowed_roles: List[str] = Field(default_factory=list)
+    approved_by: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
     created_at: str = ""
 
 
 class MemoryPreference(APIModel):
     preference_id: str = ""
-    memory_type: str = "user_preference"
+    memory_type: str = "preference"
     key: str = ""
     value: str = ""
     topics: List[str] = Field(default_factory=list)
@@ -1349,6 +1467,13 @@ class MemoryPreference(APIModel):
     last_used_at: str = ""
     decay_score: float = 1.0
     valid_until: str = ""
+    retention_days: int = 0
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    visibility: str = "merchant"
+    allowed_roles: List[str] = Field(default_factory=list)
+    approved_by: str = ""
+    evidence_refs: List[str] = Field(default_factory=list)
     created_at: str = ""
 
 
@@ -1364,17 +1489,21 @@ class MemoryRetrievalCandidate(APIModel):
 
 class MemoryInjectionTrace(APIModel):
     merchant_id: str = ""
+    budget_tokens: int = 0
     budget_chars: int = 0
     candidate_count: int = 0
     injected_event_count: int = 0
     injected_preference_count: int = 0
     injected_correction_count: int = 0
     injected_fact_count: int = 0
+    budget_used_tokens: int = 0
     budget_used_chars: int = 0
     truncated: bool = False
     selected_ids: List[str] = Field(default_factory=list)
     filtered_reasons: Dict[str, int] = Field(default_factory=dict)
     candidates: List[MemoryRetrievalCandidate] = Field(default_factory=list)
+    candidate_ids: List[str] = Field(default_factory=list)
+    past_case_count: int = 0
 
 
 class MemoryConflictResolution(APIModel):

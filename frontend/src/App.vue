@@ -191,7 +191,8 @@ async function ask(message) {
   await scrollBottom()
   try {
     const requestContext = cloneValue(session.conversationContext)
-    const created = await startAsyncRun(message, requestContext, { signal: controller.signal })
+    const requestHistory = buildMessageHistory(messages.value)
+    const created = await startAsyncRun(message, requestContext, { signal: controller.signal, messageHistory: requestHistory })
     const runId = created.runId
     const threadId = created.threadId
     if (!runId || !threadId) {
@@ -595,6 +596,18 @@ function sessionTitleFromMessages(sessionMessages, fallback) {
 function cloneValue(value) {
   if (value === undefined || value === null) return value
   return JSON.parse(JSON.stringify(value))
+}
+
+function buildMessageHistory(sessionMessages) {
+  return (sessionMessages || [])
+    .filter(message => ['user', 'assistant'].includes(message.role) && String(message.text || '').trim())
+    .slice(-16)
+    .map(message => ({
+      id: message.id || '',
+      localId: message.localId || '',
+      role: message.role,
+      text: String(message.text || '').slice(0, 1200)
+    }))
 }
 
 function restorePersistedSessions(fallbackSession) {

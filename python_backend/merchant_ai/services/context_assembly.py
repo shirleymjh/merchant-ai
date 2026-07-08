@@ -61,6 +61,7 @@ class ContextAssembler:
                 "restored": bool(thread_context.get("restored")),
                 "previousQuestion": thread_context.get("previousQuestion", ""),
                 "reusableEntitySets": thread_context.get("reusableEntitySets", [])[:6],
+                "recentMessages": (thread_context.get("messageHistory") or [])[-8:],
             },
             "workspace": {
                 "manifestPath": str(Path(getattr(state.get("thread_data"), "outputs_path", "") or "") / "workspace_manifest.json"),
@@ -143,6 +144,7 @@ class ContextAssembler:
                     "threadContext",
                     "runtimeInjection",
                     "memoryInjection",
+                    "memoryConstraints",
                 ]
                 if key in compacted
             }

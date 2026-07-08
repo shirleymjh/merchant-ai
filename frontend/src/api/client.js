@@ -14,17 +14,17 @@ async function request(path, options = {}) {
   return response.json()
 }
 
-export async function sendMessage(message, context) {
+export async function sendMessage(message, context, messageHistory = []) {
   return request('/api/chat', {
     method: 'POST',
-    body: JSON.stringify({ message, merchantId: DEFAULT_MERCHANT_ID, context })
+    body: JSON.stringify({ message, merchantId: DEFAULT_MERCHANT_ID, context, messageHistory })
   })
 }
 
 export async function startAsyncRun(message, context, options = {}) {
   return request('/api/runs/async', {
     method: 'POST',
-    body: JSON.stringify({ message, merchantId: DEFAULT_MERCHANT_ID, context }),
+    body: JSON.stringify({ message, merchantId: DEFAULT_MERCHANT_ID, context, messageHistory: options.messageHistory || [] }),
     signal: options.signal
   })
 }

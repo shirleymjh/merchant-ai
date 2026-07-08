@@ -321,8 +321,8 @@ class RecallIndexManager:
         updated_refs = filter_changed_refs_for_scope(manifest.get("updatedRefs") or [], topic, table_name)
         self.clear_caches()
         es_result = {"success": True, "mode": "disabled", "enabled": False}
+        replace_all = not changed_only and not topic and not table_name
         if self.settings.es_enabled:
-            replace_all = not changed_only and not topic and not table_name
             docs = self.scoped_documents(topic, table_name) if replace_all else self.changed_documents(updated_refs, topic, table_name)
             deleted_refs = [ref for ref in updated_refs if str(ref).startswith("deleted:")]
             try:
@@ -338,6 +338,8 @@ class RecallIndexManager:
             "updatedRefs": updated_refs,
             "updatedRefCount": len(updated_refs),
             "cacheInvalidated": True,
+            "rebuildMode": "full" if replace_all else "scoped_incremental",
+            "rebuildScope": {"topic": topic or "", "table": table_name or ""},
             "es": es_result,
             "manifestPath": str(self.manifest_path),
         }

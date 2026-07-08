@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     llm_analysis_timeout_seconds: int = Field(20, validation_alias="YSHOPPING_LLM_ANALYSIS_TIMEOUT_SECONDS")
     llm_max_tokens: int = Field(2048, validation_alias="YSHOPPING_LLM_MAX_TOKENS")
     answer_skill_match_mode: str = Field("off", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
+    skill_confirmation_required: bool = Field(False, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
+    skill_reuse_suggestion_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_REUSE_SUGGESTION_ENABLED")
+    skill_worker_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_ENABLED")
+    skill_worker_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_SKILL_WORKER_TIMEOUT_SECONDS")
+    skill_worker_complex_names: str = Field(
+        "bi_trend_attribution,risk_analysis,rule_compliance,ratio_analysis,new_product_risk",
+        validation_alias="YSHOPPING_SKILL_WORKER_COMPLEX_NAMES",
+    )
 
     embedding_base_url: str = Field("https://api.openai.com/v1", validation_alias="YSHOPPING_EMBEDDING_BASE_URL")
     embedding_model: str = Field("text-embedding-3-small", validation_alias="YSHOPPING_EMBEDDING_MODEL")
@@ -56,6 +64,7 @@ class Settings(BaseSettings):
     es_rrf_k: int = Field(60, validation_alias="YSHOPPING_ES_RRF_K")
     es_rrf_score_scale: float = Field(1000.0, validation_alias="YSHOPPING_ES_RRF_SCORE_SCALE")
     es_hybrid_top_k: int = Field(24, validation_alias="YSHOPPING_ES_HYBRID_TOP_K")
+    es_retrieval_profiles_json: str = Field("", validation_alias="YSHOPPING_ES_RETRIEVAL_PROFILES_JSON")
 
     doris_jdbc_url: str = Field(
         "jdbc:mysql://127.0.0.1:9030/yshopping?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai",
@@ -71,6 +80,17 @@ class Settings(BaseSettings):
     )
     answer_username: str = Field("root", validation_alias="YSHOPPING_ANSWER_USERNAME")
     answer_password: str = Field("", validation_alias="YSHOPPING_ANSWER_PASSWORD")
+
+    memory_backend: str = Field("es", validation_alias="YSHOPPING_MEMORY_BACKEND")
+    memory_mysql_jdbc_url: str = Field("", validation_alias="YSHOPPING_MEMORY_MYSQL_JDBC_URL")
+    memory_mysql_username: str = Field("", validation_alias="YSHOPPING_MEMORY_MYSQL_USERNAME")
+    memory_mysql_password: str = Field("", validation_alias="YSHOPPING_MEMORY_MYSQL_PASSWORD")
+    memory_redis_enabled: bool = Field(False, validation_alias="YSHOPPING_MEMORY_REDIS_ENABLED")
+    memory_vector_enabled: bool = Field(False, validation_alias="YSHOPPING_MEMORY_VECTOR_ENABLED")
+    memory_cache_ttl_seconds: int = Field(600, validation_alias="YSHOPPING_MEMORY_CACHE_TTL_SECONDS")
+    memory_index_async: bool = Field(True, validation_alias="YSHOPPING_MEMORY_INDEX_ASYNC")
+    memory_es_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_ES_INDEX")
+    memory_vector_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_VECTOR_INDEX")
 
     harness_workspace_path: str = Field("", validation_alias="YSHOPPING_HARNESS_WORKSPACE")
     context_window_tokens: int = Field(16000, validation_alias="YSHOPPING_HARNESS_CONTEXT_WINDOW_TOKENS")
@@ -104,12 +124,19 @@ class Settings(BaseSettings):
     agent_plan_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_PLAN_ROUNDS")
     agent_graph_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_GRAPH_REPAIR_ROUNDS")
     agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
-    lead_action_llm_mode: str = Field("off", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
+    planner_filesystem_context_mode: str = Field("auto", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
+    lead_action_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
     agent_planner_seed_table_limit: int = Field(4, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_TABLE_LIMIT")
     agent_planner_seed_metric_limit: int = Field(14, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_METRIC_LIMIT")
     agent_asset_field_entry_limit: int = Field(240, validation_alias="YSHOPPING_AGENT_ASSET_FIELD_ENTRY_LIMIT")
     agent_planner_prompt_budget_chars: int = Field(14000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
+    agent_node_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_NODE_FILE_TOOL_ROUNDS")
+    answer_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_ANSWER_FILE_TOOL_ROUNDS")
     route_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_ROUTE_LLM_MODE")
+    route_force_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_ROUTE_FORCE_CLARIFICATION_ENABLED")
+    route_topic_min_confidence: float = Field(0.52, validation_alias="YSHOPPING_ROUTE_TOPIC_MIN_CONFIDENCE")
+    route_topic_max_candidates: int = Field(4, validation_alias="YSHOPPING_ROUTE_TOPIC_MAX_CANDIDATES")
+    route_mixed_rule_data_min_confidence: float = Field(0.75, validation_alias="YSHOPPING_ROUTE_MIXED_RULE_DATA_MIN_CONFIDENCE")
     context_file_inline_max_chars: int = Field(12000, validation_alias="YSHOPPING_AGENT_CONTEXT_FILE_INLINE_MAX_CHARS")
     context_artifact_inline_max_rows: int = Field(20, validation_alias="YSHOPPING_AGENT_CONTEXT_ARTIFACT_INLINE_MAX_ROWS")
     context_compaction_threshold_ratio: float = Field(0.85, validation_alias="YSHOPPING_CONTEXT_COMPACTION_THRESHOLD_RATIO")
@@ -117,6 +144,7 @@ class Settings(BaseSettings):
     context_runtime_budget_chars: int = Field(6000, validation_alias="YSHOPPING_CONTEXT_RUNTIME_BUDGET_CHARS")
     context_planner_budget_chars: int = Field(12000, validation_alias="YSHOPPING_CONTEXT_PLANNER_BUDGET_CHARS")
     context_answer_budget_chars: int = Field(10000, validation_alias="YSHOPPING_CONTEXT_ANSWER_BUDGET_CHARS")
+    context_memory_budget_tokens: int = Field(1200, validation_alias="YSHOPPING_CONTEXT_MEMORY_BUDGET_TOKENS")
     context_memory_budget_chars: int = Field(1800, validation_alias="YSHOPPING_CONTEXT_MEMORY_BUDGET_CHARS")
     middleware_loop_guard_threshold: int = Field(3, validation_alias="YSHOPPING_MIDDLEWARE_LOOP_GUARD_THRESHOLD")
     middleware_max_manifest_entries: int = Field(200, validation_alias="YSHOPPING_MIDDLEWARE_MAX_MANIFEST_ENTRIES")

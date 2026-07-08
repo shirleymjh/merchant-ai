@@ -24,10 +24,27 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
+from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.repositories import DorisRepository, write_json
+from merchant_ai.services.tools import AgentToolDefinition
 
 
 class TopicAssetService:
+    MANAGED_TABLE_FILENAMES = {
+        "asset.json",
+        "schema.json",
+        "sample_rows.json",
+        "sample_profile.json",
+        "semantic_columns.json",
+        "metrics.json",
+        "terms.json",
+        "knowledge_rules.json",
+    }
+    GOVERNANCE_FILENAMES = {
+        "semantic_version.json",
+        "semantic_publish_history.json",
+    }
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self._table_asset_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -58,14 +75,42 @@ class TopicAssetService:
         write_json(pending / "review-result.json", review_payload)
         if approved:
             target.mkdir(parents=True, exist_ok=True)
-            for file_path in pending.iterdir():
-                if file_path.is_file():
-                    (target / file_path.name).write_bytes(file_path.read_bytes())
+            changed_files: List[str] = []
+            unchanged_files: List[str] = []
+            deleted_files: List[str] = []
+            for name in sorted(self.MANAGED_TABLE_FILENAMES):
+                source_path = pending / name
+                target_path = target / name
+                if source_path.exists() and source_path.is_file():
+                    source_bytes = source_path.read_bytes()
+                    if target_path.exists() and target_path.is_file() and target_path.read_bytes() == source_bytes:
+                        unchanged_files.append(name)
+                        continue
+                    target_path.write_bytes(source_bytes)
+                    changed_files.append(name)
+                    continue
+                if target_path.exists() and target_path.is_file() and name not in self.GOVERNANCE_FILENAMES:
+                    target_path.unlink()
+                    deleted_files.append(name)
             self._table_asset_cache.pop((topic, table_name), None)
             self._manifest_cache.pop(topic, None)
             self._relationship_cache.pop(topic, None)
             self._topic_names_cache = None
-            return {"success": True, "status": "PUBLISHED", "topic": topic, "tableName": table_name}
+            return {
+                "success": True,
+                "status": "PUBLISHED",
+                "topic": topic,
+                "tableName": table_name,
+                "publishMode": "scoped_incremental",
+                "publishScope": {
+                    "topic": topic,
+                    "table": table_name,
+                    "managedFiles": sorted(self.MANAGED_TABLE_FILENAMES),
+                },
+                "changedFiles": changed_files,
+                "unchangedFiles": unchanged_files,
+                "deletedFiles": deleted_files,
+            }
         return {"success": True, "status": "REJECTED", "topic": topic, "tableName": table_name}
 
     def load_manifest(self, topic: str) -> List[Dict[str, Any]]:
@@ -794,6 +839,7 @@ def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
         "dataGrain": asset.get("dataGrain"),
         "timeColumn": asset.get("timeColumn"),
         "merchantFilterColumn": asset.get("merchantFilterColumn"),
+        "rowAccessPolicy": asset.get("rowAccessPolicy") or {},
         "manualNotes": asset.get("manualNotes"),
         "metrics": [
             {
@@ -834,6 +880,8 @@ def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
                 "role": item.get("role"),
                 "description": item.get("description"),
                 "aliases": item.get("aliases") or [],
+                "visibilityPolicy": item.get("visibilityPolicy") or {},
+                "maskingPolicy": item.get("maskingPolicy") or {},
             }
             for item in (asset.get("semanticColumns") or [])[:60]
             if isinstance(item, dict)
@@ -870,6 +918,7 @@ def compact_table_metadata(asset: Dict[str, Any]) -> Dict[str, Any]:
         "dataGrain": asset.get("dataGrain"),
         "timeColumn": asset.get("timeColumn"),
         "merchantFilterColumn": asset.get("merchantFilterColumn"),
+        "rowAccessPolicy": asset.get("rowAccessPolicy") or {},
         "manualNotes": asset.get("manualNotes"),
         "status": asset.get("status"),
         "version": asset.get("version"),
@@ -2446,10 +2495,17 @@ def is_strong_label_text_match(normalized_label: str, normalized_phrase: str) ->
 
 
 class TopicBuilderWorkflow:
-    def __init__(self, settings: Settings, doris_repository: DorisRepository, topic_assets: TopicAssetService):
+    def __init__(
+        self,
+        settings: Settings,
+        doris_repository: DorisRepository,
+        topic_assets: TopicAssetService,
+        llm: Optional[Any] = None,
+    ):
         self.settings = settings
         self.doris_repository = doris_repository
         self.topic_assets = topic_assets
+        self.llm = llm or LlmClient(settings)
 
     def build(self, request: TopicBuildRequest) -> Dict[str, Any]:
         topic = request.topic or "经营画像"
@@ -2458,24 +2514,64 @@ class TopicBuilderWorkflow:
             return {"success": False, "message": "tableName is required"}
         pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
         pending_dir.mkdir(parents=True, exist_ok=True)
-        schema = []
-        try:
-            schema = self.doris_repository.show_full_columns(table)
-        except Exception:
-            if request.schema_ddl:
-                schema = [{"columnName": line.split()[0].strip("`,"), "comment": line} for line in request.schema_ddl.splitlines() if line.strip()]
-        write_json(pending_dir / "schema.json", schema if isinstance(schema, list) else [])
-        write_json(
-            pending_dir / "asset.json",
-            {
-                "topic": topic,
-                "tableName": table,
-                "manualNotes": request.manual_notes,
-                "businessKnowledge": request.business_knowledge,
-                "sampleSqls": request.sample_sqls,
-            },
+        existing = self._existing_asset_context(topic, table)
+        schema = self._load_schema(table, request)
+        sample_rows = self._load_sample_rows(table, request)
+        profile = self._sample_profile(schema, sample_rows, request)
+        generated = self._generate_candidate_payload(topic, table, request, schema, sample_rows, profile, existing)
+        asset_payload = {
+            "topic": topic,
+            "tableName": table,
+            "tableComment": str(generated.get("tableComment") or existing.get("tableComment") or ""),
+            "dataGrain": str(generated.get("dataGrain") or existing.get("dataGrain") or self._infer_data_grain(schema)),
+            "timeColumn": str(generated.get("timeColumn") or existing.get("timeColumn") or profile.get("timeColumn") or ""),
+            "merchantFilterColumn": str(
+                generated.get("merchantFilterColumn") or existing.get("merchantFilterColumn") or profile.get("merchantFilterColumn") or ""
+            ),
+            "rowAccessPolicy": normalize_row_access_policy(
+                generated.get("rowAccessPolicy")
+                or existing.get("rowAccessPolicy")
+                or default_row_access_policy(
+                    str(generated.get("merchantFilterColumn") or existing.get("merchantFilterColumn") or profile.get("merchantFilterColumn") or "")
+                )
+            ),
+            "manualNotes": request.manual_notes or str(existing.get("manualNotes") or ""),
+            "businessKnowledge": request.business_knowledge or str(existing.get("businessKnowledge") or ""),
+            "sampleSqls": request.sample_sqls or list(existing.get("sampleSqls") or []),
+            "buildProfile": profile,
+            "generationMode": str(generated.get("generationMode") or "heuristic"),
+            "generatedAt": datetime.utcnow().isoformat() + "Z",
+            "status": "PENDING_REVIEW",
+        }
+        semantic_columns = self._merge_generated_list(
+            existing.get("semanticColumns"),
+            generated.get("semanticColumns"),
+            "semanticColumns",
+            schema_columns=schema,
         )
-        return {"success": True, "status": "PENDING_REVIEW", "topic": topic, "tableName": table, "path": str(pending_dir)}
+        metrics = self._merge_generated_metrics(existing.get("metrics"), generated.get("metrics"), schema)
+        terms = self._merge_generated_list(existing.get("terms"), generated.get("terms"), "terms")
+        rules = self._merge_generated_list(existing.get("knowledgeRules"), generated.get("knowledgeRules"), "knowledgeRules")
+        write_json(pending_dir / "schema.json", schema if isinstance(schema, list) else [])
+        write_json(pending_dir / "sample_rows.json", sample_rows)
+        write_json(pending_dir / "sample_profile.json", profile)
+        write_json(pending_dir / "asset.json", asset_payload)
+        write_json(pending_dir / "semantic_columns.json", semantic_columns)
+        write_json(pending_dir / "metrics.json", metrics)
+        write_json(pending_dir / "terms.json", terms)
+        write_json(pending_dir / "knowledge_rules.json", rules)
+        return {
+            "success": True,
+            "status": "PENDING_REVIEW",
+            "topic": topic,
+            "tableName": table,
+            "path": str(pending_dir),
+            "generationMode": asset_payload["generationMode"],
+            "schemaColumnCount": len(schema),
+            "sampleRowCount": len(sample_rows),
+            "metricCount": len(metrics),
+            "fieldCount": len(semantic_columns),
+        }
 
     def diff_schema(self, request: TopicBuildRequest) -> Dict[str, Any]:
         topic = request.topic or "经营画像"
@@ -2513,7 +2609,720 @@ class TopicBuilderWorkflow:
         return payload
 
     def refresh_incremental(self, request: TopicBuildRequest) -> Dict[str, Any]:
-        return self.build(request)
+        diff = self.diff_schema(request)
+        built = self.build(request)
+        return {**built, "schemaDiff": diff}
+
+    def _existing_asset_context(self, topic: str, table: str) -> Dict[str, Any]:
+        for directory in [
+            self.settings.resolved_topic_path / topic / "pending" / table,
+            self.topic_assets.table_asset_dir(topic, table),
+        ]:
+            if directory.exists():
+                return self._load_asset_dir(directory, topic, table)
+        return {}
+
+    def _load_asset_dir(self, directory: Path, topic: str, table: str) -> Dict[str, Any]:
+        asset = read_json(directory / "asset.json")
+        payload: Dict[str, Any] = asset if isinstance(asset, dict) else {}
+        payload.setdefault("topic", topic)
+        payload.setdefault("tableName", table)
+        for field, file_name in {
+            "schemaColumns": "schema.json",
+            "semanticColumns": "semantic_columns.json",
+            "metrics": "metrics.json",
+            "terms": "terms.json",
+            "knowledgeRules": "knowledge_rules.json",
+        }.items():
+            sidecar = read_json(directory / file_name)
+            if sidecar:
+                payload[field] = merge_semantic_layer_list(payload.get(field), sidecar, field)
+            else:
+                payload.setdefault(field, [])
+        return payload
+
+    def _load_schema(self, table: str, request: TopicBuildRequest) -> List[Dict[str, Any]]:
+        providers = ["show_full_columns", "describe_table", "datamap_columns"]
+        schema: Any = []
+        for name in providers:
+            provider = getattr(self.doris_repository, name, None)
+            if not callable(provider):
+                continue
+            try:
+                schema = provider(table)
+            except Exception:
+                schema = []
+            if isinstance(schema, list) and schema:
+                break
+        if (not schema) and request.schema_ddl:
+            schema = [
+                {"columnName": line.split()[0].strip("`,"), "comment": line}
+                for line in request.schema_ddl.splitlines()
+                if line.strip()
+            ]
+        return [self._normalize_schema_column(item) for item in (schema if isinstance(schema, list) else [])]
+
+    def _load_sample_rows(self, table: str, request: TopicBuildRequest) -> List[Dict[str, Any]]:
+        provider = getattr(self.doris_repository, "sample_rows", None)
+        if not callable(provider):
+            return []
+        try:
+            rows = provider(table, request.merchant_id or self.settings.merchant_id, max(1, int(request.sample_limit or 20)))
+        except Exception:
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for row in rows[: max(1, int(request.sample_limit or 20))]:
+            if not isinstance(row, dict):
+                continue
+            normalized.append({str(key): self._json_safe(value) for key, value in row.items()})
+        return normalized
+
+    def _sample_profile(self, schema: List[Dict[str, Any]], rows: List[Dict[str, Any]], request: TopicBuildRequest) -> Dict[str, Any]:
+        columns = [str(item.get("columnName") or "") for item in schema if str(item.get("columnName") or "")]
+        enum_limit = max(1, int(request.enum_value_limit or 20))
+        null_rates: Dict[str, float] = {}
+        sample_values: Dict[str, List[Any]] = {}
+        enum_candidates: Dict[str, List[Any]] = {}
+        for column in columns:
+            values = [row.get(column) for row in rows if isinstance(row, dict)]
+            total = len(values)
+            missing = sum(1 for value in values if value in {None, ""})
+            null_rates[column] = round((missing / total), 4) if total else 0.0
+            observed: List[Any] = []
+            for value in values:
+                if value in {None, ""}:
+                    continue
+                if value not in observed:
+                    observed.append(value)
+                if len(observed) >= enum_limit:
+                    break
+            sample_values[column] = observed[:8]
+            unique_values = []
+            for value in values:
+                if value in {None, ""}:
+                    continue
+                if value not in unique_values:
+                    unique_values.append(value)
+                if len(unique_values) > enum_limit:
+                    break
+            if request.enum_discovery_enabled and 0 < len(unique_values) <= enum_limit and self._enum_candidate(column, unique_values):
+                enum_candidates[column] = unique_values
+        partition_candidates = [
+            column
+            for column in columns
+            if column.lower() in {"pt", "dt", "ds", "biz_date"} or normalize_column_type_family(str(next((item.get("dataType") for item in schema if item.get("columnName") == column), ""))) in {"date", "datetime"}
+        ]
+        time_column = next((column for column in partition_candidates if column.lower() == "pt"), partition_candidates[0] if partition_candidates else "")
+        merchant_column = next((column for column in columns if column.lower() in {"seller_id", "merchant_id", "shop_id"}), "")
+        return {
+            "rowCount": len(rows),
+            "nullRates": null_rates,
+            "sampleValues": sample_values,
+            "enumCandidates": enum_candidates,
+            "partitionColumns": partition_candidates,
+            "timeColumn": time_column,
+            "merchantFilterColumn": merchant_column,
+        }
+
+    def _generate_candidate_payload(
+        self,
+        topic: str,
+        table: str,
+        request: TopicBuildRequest,
+        schema: List[Dict[str, Any]],
+        sample_rows: List[Dict[str, Any]],
+        profile: Dict[str, Any],
+        existing: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        heuristic = self._heuristic_candidate_payload(topic, table, request, schema, sample_rows, profile, existing)
+        llm_payload = self._llm_candidate_payload(topic, table, request, schema, sample_rows, profile, existing, heuristic)
+        if llm_payload:
+            llm_payload["semanticColumns"] = merge_semantic_layer_list(
+                heuristic.get("semanticColumns") or [],
+                llm_payload.get("semanticColumns") or [],
+                "semanticColumns",
+            )
+            llm_payload["metrics"] = merge_semantic_layer_list(
+                heuristic.get("metrics") or [],
+                llm_payload.get("metrics") or [],
+                "metrics",
+            )
+            llm_payload["terms"] = merge_semantic_layer_list(
+                heuristic.get("terms") or [],
+                llm_payload.get("terms") or [],
+                "terms",
+            )
+            llm_payload["knowledgeRules"] = merge_semantic_layer_list(
+                heuristic.get("knowledgeRules") or [],
+                llm_payload.get("knowledgeRules") or [],
+                "knowledgeRules",
+            )
+            llm_payload["generationMode"] = "llm"
+            return llm_payload
+        heuristic["generationMode"] = "heuristic"
+        return heuristic
+
+    def _llm_candidate_payload(
+        self,
+        topic: str,
+        table: str,
+        request: TopicBuildRequest,
+        schema: List[Dict[str, Any]],
+        sample_rows: List[Dict[str, Any]],
+        profile: Dict[str, Any],
+        existing: Dict[str, Any],
+        heuristic: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self.llm, "configured", False)):
+            return {}
+        prompt_payload = {
+            "topic": topic,
+            "tableName": table,
+            "schemaColumns": schema,
+            "sampleRows": sample_rows[: min(len(sample_rows), 12)],
+            "sampleProfile": profile,
+            "manualNotes": request.manual_notes,
+            "businessKnowledge": request.business_knowledge,
+            "sampleSqls": request.sample_sqls[:8],
+            "existingAsset": {
+                "tableComment": existing.get("tableComment"),
+                "dataGrain": existing.get("dataGrain"),
+                "timeColumn": existing.get("timeColumn"),
+                "merchantFilterColumn": existing.get("merchantFilterColumn"),
+                "rowAccessPolicy": existing.get("rowAccessPolicy") or {},
+                "semanticColumns": existing.get("semanticColumns") or [],
+                "metrics": existing.get("metrics") or [],
+                "terms": existing.get("terms") or [],
+                "knowledgeRules": existing.get("knowledgeRules") or [],
+            },
+            "heuristicDraft": heuristic,
+        }
+        system_prompt = (
+            "你是资深数据语义建模助手。请基于表 schema、采样数据、业务备注和历史 SQL，"
+            "生成待审核的语义层候选资产。输出必须保守、结构化，不要编造不存在的字段，"
+            "不要生成跨表 join 关系。字段角色只允许 KEY、TIME、DIMENSION、ATTRIBUTE。"
+            "指标必须引用真实存在的 sourceColumns；派生指标可以引用其他 metricKey。"
+            "如果字段疑似手机号、邮箱、身份证、地址等敏感信息，请补充 visibilityPolicy 和 maskingPolicy；"
+            "如果表有明确租户过滤列，请补充 rowAccessPolicy。"
+        )
+        try:
+            payload = self.llm.tool_json_chat(system_prompt, json.dumps(prompt_payload, ensure_ascii=False), semantic_asset_builder_tool().openai_schema(), {})
+        except TypeError:
+            payload = self.llm.tool_json_chat(system_prompt, json.dumps(prompt_payload, ensure_ascii=False), semantic_asset_builder_tool().openai_schema(), {})
+        return payload if isinstance(payload, dict) else {}
+
+    def _heuristic_candidate_payload(
+        self,
+        topic: str,
+        table: str,
+        request: TopicBuildRequest,
+        schema: List[Dict[str, Any]],
+        sample_rows: List[Dict[str, Any]],
+        profile: Dict[str, Any],
+        existing: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        semantic_columns = [self._heuristic_semantic_column(topic, item, profile) for item in schema]
+        metrics = self._heuristic_metrics(topic, table, schema, profile)
+        terms = self._heuristic_terms(metrics, semantic_columns, request)
+        rules = self._heuristic_rules(topic, profile, request)
+        return {
+            "tableComment": str(existing.get("tableComment") or request.manual_notes or table),
+            "dataGrain": str(existing.get("dataGrain") or self._infer_data_grain(schema)),
+            "timeColumn": str(existing.get("timeColumn") or profile.get("timeColumn") or ""),
+            "merchantFilterColumn": str(existing.get("merchantFilterColumn") or profile.get("merchantFilterColumn") or ""),
+            "rowAccessPolicy": normalize_row_access_policy(existing.get("rowAccessPolicy") or default_row_access_policy(str(existing.get("merchantFilterColumn") or profile.get("merchantFilterColumn") or ""))),
+            "semanticColumns": semantic_columns,
+            "metrics": metrics,
+            "terms": terms,
+            "knowledgeRules": rules,
+        }
+
+    def _heuristic_semantic_column(self, topic: str, column: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(column.get("columnName") or "")
+        comment = str(column.get("comment") or column.get("Comment") or name)
+        role = "ATTRIBUTE"
+        lowered = name.lower()
+        if lowered.endswith("_id") or lowered in {"id", "seller_id", "merchant_id", "shop_id"}:
+            role = "KEY"
+        elif lowered in {"pt", "dt", "ds"} or normalize_column_type_family(str(column.get("dataType") or "")) in {"date", "datetime"}:
+            role = "TIME"
+        elif lowered.endswith(("_name", "_status", "_type")) or lowered.startswith(("is_", "has_")) or lowered.endswith("_code"):
+            role = "DIMENSION"
+        aliases = dedupe_strings([name, comment])
+        enum_values = [str(item) for item in (profile.get("enumCandidates", {}).get(name) or [])[:20]]
+        sample_values = [str(item) for item in (profile.get("sampleValues", {}).get(name) or [])[:8]]
+        evidence = ["schema comment=%s" % comment]
+        if sample_values:
+            evidence.append("samples=[%s]" % ", ".join(sample_values))
+        visibility_policy, masking_policy = sensitive_column_policies(name, comment)
+        return {
+            "columnName": name,
+            "businessName": comment,
+            "role": role,
+            "description": comment,
+            "aliases": aliases,
+            "enumValues": enum_values,
+            "sampleValues": sample_values,
+            "confidence": 0.62,
+            "evidence": "; ".join(evidence),
+            "visibilityPolicy": visibility_policy,
+            "maskingPolicy": masking_policy,
+        }
+
+    def _heuristic_metrics(self, topic: str, table: str, schema: List[Dict[str, Any]], profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+        metrics: List[Dict[str, Any]] = []
+        for item in schema:
+            name = str(item.get("columnName") or "")
+            if not name:
+                continue
+            dtype = normalize_column_type_family(str(item.get("dataType") or ""))
+            comment = str(item.get("comment") or item.get("Comment") or name)
+            lowered = name.lower()
+            if dtype in {"int", "bigint", "float", "double", "decimal"} and not lowered.endswith("_id"):
+                formula = "SUM(%s)" % name
+                unit = "%" if "rate" in lowered else ("元" if any(token in lowered for token in ["amt", "amount", "price", "fee"]) else "")
+                metrics.append(
+                    {
+                        "metricKey": name,
+                        "canonicalMetricKey": name,
+                        "businessName": comment,
+                        "formula": formula,
+                        "unit": unit,
+                        "description": comment,
+                        "sourceColumns": [name],
+                        "aliases": dedupe_strings([comment, name]),
+                        "confidence": 0.58,
+                        "evidence": "heuristic numeric column metric",
+                    }
+                )
+            if lowered in {"refund_id", "order_id", "sub_order_id", "ticket_id", "bill_id"}:
+                metric_key = self._count_metric_key_for_id(topic, lowered)
+                business_name = self._count_metric_name_for_id(topic, comment, lowered)
+                metrics.append(
+                    {
+                        "metricKey": metric_key,
+                        "businessName": business_name,
+                        "formula": "COUNT(DISTINCT %s)" % name,
+                        "unit": "单",
+                        "description": "按%s去重计数" % comment,
+                        "sourceColumns": [name],
+                        "aliases": dedupe_strings([business_name, comment, metric_key]),
+                        "confidence": 0.6,
+                        "evidence": "heuristic id distinct count",
+                    }
+                )
+        if not metrics and schema:
+            first_key = next((str(item.get("columnName") or "") for item in schema if str(item.get("columnName") or "").endswith("_id")), "")
+            if first_key:
+                metrics.append(
+                    {
+                        "metricKey": "row_cnt",
+                        "businessName": "记录数",
+                        "formula": "COUNT(DISTINCT %s)" % first_key,
+                        "unit": "条",
+                        "description": "按主键候选去重计数",
+                        "sourceColumns": [first_key],
+                        "aliases": ["记录数", "条数", "row_cnt"],
+                        "confidence": 0.45,
+                        "evidence": "heuristic fallback metric",
+                    }
+                )
+        return dedupe_semantic_items(metrics, "metrics")
+
+    def _heuristic_terms(self, metrics: List[Dict[str, Any]], semantic_columns: List[Dict[str, Any]], request: TopicBuildRequest) -> List[Dict[str, Any]]:
+        terms: List[Dict[str, Any]] = []
+        for metric in metrics[:40]:
+            key = str(metric.get("metricKey") or "")
+            title = str(metric.get("businessName") or key)
+            if not key or not title:
+                continue
+            terms.append(
+                {
+                    "term": title,
+                    "businessName": title,
+                    "description": str(metric.get("description") or title),
+                    "aliases": dedupe_strings([title] + [str(alias) for alias in metric.get("aliases") or []]),
+                    "canonicalMetricKey": key,
+                }
+            )
+        for column in semantic_columns[:40]:
+            title = str(column.get("businessName") or "")
+            if not title:
+                continue
+            terms.append(
+                {
+                    "term": title,
+                    "businessName": title,
+                    "description": str(column.get("description") or title),
+                    "aliases": [title] + [str(alias) for alias in column.get("aliases") or []],
+                }
+            )
+        if request.business_knowledge:
+            terms.append(
+                {
+                    "term": "业务补充说明",
+                    "businessName": "业务补充说明",
+                    "description": request.business_knowledge[:500],
+                    "aliases": ["业务知识", "业务说明"],
+                }
+            )
+        return dedupe_semantic_items(terms, "terms")
+
+    def _heuristic_rules(self, topic: str, profile: Dict[str, Any], request: TopicBuildRequest) -> List[Dict[str, Any]]:
+        rules: List[Dict[str, Any]] = []
+        time_column = str(profile.get("timeColumn") or "")
+        merchant_column = str(profile.get("merchantFilterColumn") or "")
+        if time_column:
+            rules.append(
+                {
+                    "ruleId": "time_partition_rule",
+                    "title": "时间过滤建议",
+                    "description": "该表建议优先使用 %s 作为时间过滤字段" % time_column,
+                    "aliases": ["时间过滤", "分区字段"],
+                    "appliesToColumns": [time_column],
+                }
+            )
+        if merchant_column:
+            rules.append(
+                {
+                    "ruleId": "merchant_scope_rule",
+                    "title": "商家范围约束",
+                    "description": "运行时查询建议使用 %s 作为商家过滤字段" % merchant_column,
+                    "aliases": ["商家过滤", "租户过滤"],
+                    "appliesToColumns": [merchant_column],
+                }
+            )
+        sensitive_columns = [
+            column
+            for column in (profile.get("sampleValues", {}) or {}).keys()
+            if normalize_visibility_level(sensitive_column_policies(str(column))[0].get("level")) == "restricted"
+        ]
+        if sensitive_columns:
+            rules.append(
+                {
+                    "ruleId": "column_access_policy_rule",
+                    "title": "敏感字段访问约束",
+                    "description": "敏感字段默认不直接暴露给 AI 结果，必要时按语义层脱敏策略输出",
+                    "aliases": ["字段权限", "脱敏规则"],
+                    "appliesToColumns": sensitive_columns[:12],
+                    "cautions": ["restricted columns require visibilityPolicy and maskingPolicy review"],
+                }
+            )
+        if request.business_knowledge:
+            rules.append(
+                {
+                    "ruleId": "business_knowledge_note",
+                    "title": "业务知识候选",
+                    "description": request.business_knowledge[:1000],
+                    "aliases": ["业务规则", "人工补充"],
+                }
+            )
+        return dedupe_semantic_items(rules, "knowledgeRules")
+
+    def _merge_generated_list(
+        self,
+        existing: Any,
+        generated: Any,
+        field: str,
+        schema_columns: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        base = existing if isinstance(existing, list) else []
+        override = generated if isinstance(generated, list) else []
+        merged = merge_semantic_layer_list(base, override, field)
+        if field == "semanticColumns" and schema_columns is not None:
+            valid = {str(item.get("columnName") or "") for item in schema_columns if str(item.get("columnName") or "")}
+            return [
+                item for item in merged
+                if isinstance(item, dict) and str(item.get("columnName") or "") in valid
+            ]
+        return [item for item in merged if isinstance(item, dict)]
+
+    def _merge_generated_metrics(self, existing: Any, generated: Any, schema: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        valid = column_name_set(schema)
+        merged = merge_semantic_layer_list(existing if isinstance(existing, list) else [], generated if isinstance(generated, list) else [], "metrics")
+        result: List[Dict[str, Any]] = []
+        for metric in merged:
+            if not isinstance(metric, dict):
+                continue
+            refs = semantic_metric_source_columns(metric)
+            if refs and any((ref not in valid) and not metric_shaped_reference(ref) for ref in refs):
+                continue
+            result.append(metric)
+        return dedupe_semantic_items(result, "metrics")
+
+    def _normalize_schema_column(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        return {
+            "columnName": str(item.get("columnName") or item.get("Field") or item.get("name") or ""),
+            "dataType": str(item.get("dataType") or item.get("Type") or item.get("type") or ""),
+            "comment": str(item.get("comment") or item.get("Comment") or ""),
+            "nullable": self._normalize_nullable(item),
+            "keyType": str(item.get("keyType") or item.get("Key") or ""),
+        }
+
+    def _normalize_nullable(self, item: Dict[str, Any]) -> bool:
+        raw = item.get("nullable")
+        if isinstance(raw, bool):
+            return raw
+        null_value = str(item.get("Null") or "").strip().upper()
+        if null_value in {"YES", "TRUE", "Y"}:
+            return True
+        if null_value in {"NO", "FALSE", "N"}:
+            return False
+        return True
+
+    def _json_safe(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): self._json_safe(item) for key, item in value.items()}
+        return str(value)
+
+    def _enum_candidate(self, column: str, values: List[Any]) -> bool:
+        lowered = column.lower()
+        if lowered.endswith(("_status", "_status_name", "_type", "_type_name", "_code", "_name")):
+            return True
+        if len(values) <= 8:
+            return True
+        return False
+
+    def _infer_data_grain(self, schema: List[Dict[str, Any]]) -> str:
+        columns = {str(item.get("columnName") or "").lower() for item in schema}
+        if "refund_id" in columns:
+            return "退款/售后明细粒度"
+        if "sub_order_id" in columns:
+            return "子订单明细粒度"
+        if "order_id" in columns:
+            return "订单明细粒度"
+        if "spu_id" in columns:
+            return "商品粒度"
+        if "seller_id" in columns:
+            return "商家粒度"
+        return "明细粒度"
+
+    def _count_metric_key_for_id(self, topic: str, column: str) -> str:
+        mapping = {
+            "refund_id": "refund_bill_cnt",
+            "sub_order_id": "order_detail_cnt",
+            "order_id": "order_cnt",
+            "ticket_id": "ticket_cnt",
+            "bill_id": "bill_cnt",
+        }
+        return mapping.get(column, "%s_cnt" % column.removesuffix("_id"))
+
+    def _count_metric_name_for_id(self, topic: str, comment: str, column: str) -> str:
+        mapping = {
+            "refund_id": "退款单量" if "退" in topic else "单量",
+            "sub_order_id": "订单量",
+            "order_id": "订单量",
+            "ticket_id": "工单量",
+            "bill_id": "账单量",
+        }
+        return mapping.get(column, "%s数量" % comment)
+
+
+def semantic_asset_builder_tool() -> AgentToolDefinition:
+    visibility_policy_schema = {
+        "type": "object",
+        "properties": {
+            "level": {"type": "string", "enum": ["public", "restricted", "hidden"]},
+            "allowedRoles": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    masking_policy_schema = {
+        "type": "object",
+        "properties": {
+            "strategy": {"type": "string", "enum": ["none", "partial", "full", "hash"]},
+            "reason": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    row_access_policy_schema = {
+        "type": "object",
+        "properties": {
+            "scopeType": {"type": "string"},
+            "filterColumn": {"type": "string"},
+            "operator": {"type": "string"},
+            "valueSource": {"type": "string"},
+            "required": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    semantic_column_schema = {
+        "type": "object",
+        "properties": {
+            "columnName": {"type": "string"},
+            "businessName": {"type": "string"},
+            "role": {"type": "string", "enum": ["KEY", "TIME", "DIMENSION", "ATTRIBUTE"]},
+            "description": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "enumValues": {"type": "array", "items": {"type": "string"}},
+            "sampleValues": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
+            "evidence": {"type": "string"},
+            "visibilityPolicy": visibility_policy_schema,
+            "maskingPolicy": masking_policy_schema,
+        },
+        "required": ["columnName", "businessName", "role"],
+        "additionalProperties": False,
+    }
+    metric_schema = {
+        "type": "object",
+        "properties": {
+            "metricKey": {"type": "string"},
+            "canonicalMetricKey": {"type": "string"},
+            "aliasOf": {"type": "string"},
+            "businessName": {"type": "string"},
+            "formula": {"type": "string"},
+            "unit": {"type": "string"},
+            "description": {"type": "string"},
+            "sourceColumns": {"type": "array", "items": {"type": "string"}},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number"},
+            "evidence": {"type": "string"},
+        },
+        "required": ["metricKey", "businessName", "formula", "sourceColumns"],
+        "additionalProperties": False,
+    }
+    term_schema = {
+        "type": "object",
+        "properties": {
+            "term": {"type": "string"},
+            "businessName": {"type": "string"},
+            "description": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "canonicalMetricKey": {"type": "string"},
+        },
+        "required": ["term", "businessName"],
+        "additionalProperties": False,
+    }
+    rule_schema = {
+        "type": "object",
+        "properties": {
+            "ruleId": {"type": "string"},
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "appliesToMetrics": {"type": "array", "items": {"type": "string"}},
+            "appliesToColumns": {"type": "array", "items": {"type": "string"}},
+            "cautions": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["title", "description"],
+        "additionalProperties": False,
+    }
+    return AgentToolDefinition(
+        name="propose_semantic_asset",
+        description="Generate candidate semantic-layer assets from schema, sample rows, and business notes.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "tableComment": {"type": "string"},
+                "dataGrain": {"type": "string"},
+                "timeColumn": {"type": "string"},
+                "merchantFilterColumn": {"type": "string"},
+                "rowAccessPolicy": row_access_policy_schema,
+                "semanticColumns": {"type": "array", "items": semantic_column_schema},
+                "metrics": {"type": "array", "items": metric_schema},
+                "terms": {"type": "array", "items": term_schema},
+                "knowledgeRules": {"type": "array", "items": rule_schema},
+            },
+            "required": ["semanticColumns", "metrics", "terms", "knowledgeRules"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def dedupe_semantic_items(items: List[Dict[str, Any]], field: str) -> List[Dict[str, Any]]:
+    return merge_semantic_layer_list([], items, field) if items else []
+
+
+def normalize_visibility_level(level: str) -> str:
+    text = str(level or "").strip().lower()
+    if text in {"public", "restricted", "hidden"}:
+        return text
+    return "public"
+
+
+def normalize_masking_strategy(strategy: str) -> str:
+    text = str(strategy or "").strip().lower()
+    if text in {"none", "partial", "full", "hash"}:
+        return text
+    return "none"
+
+
+def normalize_visibility_policy(policy: Any) -> Dict[str, Any]:
+    if not isinstance(policy, dict):
+        return {"level": "public", "allowedRoles": [], "reason": ""}
+    return {
+        "level": normalize_visibility_level(str(policy.get("level") or "")),
+        "allowedRoles": dedupe_strings([str(item) for item in policy.get("allowedRoles") or []]),
+        "reason": str(policy.get("reason") or ""),
+    }
+
+
+def normalize_masking_policy(policy: Any) -> Dict[str, Any]:
+    if not isinstance(policy, dict):
+        return {"strategy": "none", "reason": ""}
+    return {
+        "strategy": normalize_masking_strategy(str(policy.get("strategy") or "")),
+        "reason": str(policy.get("reason") or ""),
+    }
+
+
+def normalize_row_access_policy(policy: Any) -> Dict[str, Any]:
+    if not isinstance(policy, dict):
+        return {}
+    filter_column = str(policy.get("filterColumn") or "")
+    if not filter_column:
+        return {}
+    return {
+        "scopeType": str(policy.get("scopeType") or "merchant"),
+        "filterColumn": filter_column,
+        "operator": str(policy.get("operator") or "eq"),
+        "valueSource": str(policy.get("valueSource") or "merchant_id"),
+        "required": bool(policy.get("required", True)),
+        "reason": str(policy.get("reason") or ""),
+    }
+
+
+def default_row_access_policy(filter_column: str) -> Dict[str, Any]:
+    column = str(filter_column or "").strip()
+    if not column:
+        return {}
+    return {
+        "scopeType": "merchant",
+        "filterColumn": column,
+        "operator": "eq",
+        "valueSource": "merchant_id",
+        "required": True,
+        "reason": "tenant isolation filter managed by semantic layer",
+    }
+
+
+def sensitive_column_policies(column_name: str, business_name: str = "") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    name = str(column_name or "").lower()
+    label = str(business_name or "").lower()
+    text = "%s %s" % (name, label)
+    restricted_roles = ["merchant_admin", "security_auditor"]
+    full_mask_tokens = ["phone", "mobile", "tel", "telephone", "id_card", "bank_card", "身份证", "银行卡"]
+    partial_mask_tokens = ["email", "mail", "address", "地址", "buyer_name", "user_name", "receiver_name", "consignee_name"]
+    if any(token in text for token in full_mask_tokens):
+        return (
+            {"level": "restricted", "allowedRoles": restricted_roles, "reason": "contains direct personal identifier"},
+            {"strategy": "full", "reason": "hide direct personal identifier in AI results"},
+        )
+    if any(token in text for token in partial_mask_tokens):
+        return (
+            {"level": "restricted", "allowedRoles": restricted_roles, "reason": "contains personal profile field"},
+            {"strategy": "partial", "reason": "mask personal profile field in AI results"},
+        )
+    return ({"level": "public", "allowedRoles": [], "reason": ""}, {"strategy": "none", "reason": ""})
 
 
 class SemanticAssetGovernanceService:
@@ -2609,7 +3418,9 @@ class SemanticAssetGovernanceService:
             "releaseGate": release_gate,
             "impactTestPlan": impact_plan,
             "rollbackCandidate": rollback_candidate,
-            "cachePolicy": "recall index manager clears recall, asset pack, live schema, and Doris query caches after publish",
+            "publishMode": "scoped_incremental",
+            "publishScope": {"topic": topic, "table": table, "mode": "scoped_incremental"},
+            "cachePolicy": "recall index manager does scoped rebuild and clears recall, asset pack, live schema, and Doris query caches after publish",
         }
         payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "publish", version.semantic_version, payload))
         payload["publishHistoryPath"] = str(append_semantic_publish_history(target_dir, payload))
@@ -2652,14 +3463,30 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
     schema = schema_columns(asset)
     columns = column_name_set(schema)
     metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
+    semantic_columns = asset.get("semanticColumns") if isinstance(asset.get("semanticColumns"), list) else []
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
+    row_access_policy = normalize_row_access_policy(asset.get("rowAccessPolicy") or {})
+    if row_access_policy and str(row_access_policy.get("filterColumn") or "") not in columns:
+        errors.append({"code": "ROW_ACCESS_FILTER_COLUMN_MISSING", "column": row_access_policy.get("filterColumn")})
     seen_metrics: set[str] = set()
     metric_keys: set[str] = {
         str(metric.get("metricKey") or metric.get("key") or "").strip()
         for metric in metrics
         if isinstance(metric, dict) and str(metric.get("metricKey") or metric.get("key") or "").strip()
     }
+    for field in semantic_columns:
+        if not isinstance(field, dict):
+            continue
+        column_name = str(field.get("columnName") or "").strip()
+        if column_name and column_name not in columns:
+            warnings.append({"code": "SEMANTIC_COLUMN_NOT_IN_SCHEMA", "column": column_name})
+        visibility = normalize_visibility_policy(field.get("visibilityPolicy") or {})
+        masking = normalize_masking_policy(field.get("maskingPolicy") or {})
+        if visibility.get("level") == "restricted" and not visibility.get("allowedRoles"):
+            warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_ALLOWED_ROLES", "column": column_name})
+        if visibility.get("level") == "restricted" and masking.get("strategy") == "none":
+            warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_MASKING", "column": column_name})
     for metric in metrics:
         if not isinstance(metric, dict):
             continue
@@ -3147,6 +3974,11 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
                 "aliases": metadata.get("aliases") or [],
                 "recallQuery": recall_queries[-1] if recall_queries else "",
                 "recallQueries": recall_queries,
+                "matchedMetricLabel": str(metadata.get("matchedMetricLabel") or metadata.get("matchedExactMetricLabel") or ""),
+                "metricResolutionType": str(metadata.get("metricResolutionType") or ""),
+                "metricResolutionReason": str(metadata.get("metricResolutionReason") or ""),
+                "metricResolutionConfidence": float(metadata.get("metricResolutionConfidence") or 0.0),
+                "metricResolutionAmbiguous": bool(metadata.get("metricResolutionAmbiguous") or False),
             }
             continue
         merged_queries = list(current.get("recallQueries") or [])
@@ -3167,6 +3999,11 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
                     "formula": str(metadata.get("formula") or current.get("formula") or ""),
                     "sourceColumns": metadata.get("sourceColumns") or current.get("sourceColumns") or [],
                     "aliases": metadata.get("aliases") or current.get("aliases") or [],
+                    "matchedMetricLabel": str(metadata.get("matchedMetricLabel") or metadata.get("matchedExactMetricLabel") or current.get("matchedMetricLabel") or ""),
+                    "metricResolutionType": str(metadata.get("metricResolutionType") or current.get("metricResolutionType") or ""),
+                    "metricResolutionReason": str(metadata.get("metricResolutionReason") or current.get("metricResolutionReason") or ""),
+                    "metricResolutionConfidence": float(metadata.get("metricResolutionConfidence") or current.get("metricResolutionConfidence") or 0.0),
+                    "metricResolutionAmbiguous": bool(metadata.get("metricResolutionAmbiguous") if metadata.get("metricResolutionAmbiguous") is not None else current.get("metricResolutionAmbiguous") or False),
                 }
             )
         current["recallQueries"] = merged_queries

@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,8 @@ from merchant_ai.models import (
     ChatContext,
     ChatResponse,
     ClarificationRequest,
+    ContextManifest,
+    ConversationMessage,
     ExtractedKeywords,
     EvidenceGap,
     FastUnderstandingResult,
@@ -55,12 +58,15 @@ from merchant_ai.models import (
     RecallBundle,
     RecallItem,
     RouteSlots,
+    SkillLifecycleRecord,
     TOPIC_TO_CATEGORY,
+    ToolCallRequest,
+    ToolCachePolicy,
     RoutingDecision,
     ThreadData,
     TopicRoutingDecision,
 )
-from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_skill_required, build_response_context, joined_categories
+from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_skill_required, build_response_context, joined_categories, select_answer_skill
 from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService, WikiMemoryService
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.context import ContextManager
@@ -68,7 +74,8 @@ from merchant_ai.services.context_assembly import ContextAssembler, ThreadContex
 from merchant_ai.services.context_filesystem import add_context_uri, context_lineage_record, merchant_uri_for_artifact, merchant_uri_for_semantic_ref
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.llm import LlmClient
-from merchant_ai.services.memory import StructuredMemoryStore
+from merchant_ai.services.memory import create_memory_store
+from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.middleware import MiddlewareChain, default_harness_middlewares
 from merchant_ai.services.observability import append_span, artifact_ref_from_path, now_ms, performance_summary, start_step, finish_step
 from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlanner, QueryGraphValidator, semantic_workspace_manifest_from_asset_pack
@@ -77,7 +84,176 @@ from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService, route_primary_topic
-from merchant_ai.services.tools import artifact_file_tool_schemas, lead_action_selection_tool, node_runtime_tool_schemas, semantic_file_tool_schemas
+from merchant_ai.services.tools import (
+    artifact_file_tool_definitions,
+    artifact_file_tool_schemas,
+    lead_action_selection_tool,
+    node_runtime_tool_schemas,
+    semantic_file_tool_definitions,
+    semantic_file_tool_schemas,
+)
+
+MAX_SHORT_TERM_MESSAGES = 40
+MAX_SHORT_TERM_RECENT_MESSAGES = 6
+MAX_SHORT_TERM_MESSAGE_CHARS = 1200
+MAX_SHORT_TERM_CONTEXT_CHARS = 8000
+MAX_SHORT_TERM_SUMMARY_CHARS = 1800
+
+
+def normalize_message_history(messages: Optional[List[Any]]) -> List[ConversationMessage]:
+    normalized: List[ConversationMessage] = []
+    for item in list(messages or [])[-MAX_SHORT_TERM_MESSAGES:]:
+        try:
+            message = item if isinstance(item, ConversationMessage) else ConversationMessage.model_validate(item)
+        except Exception:
+            continue
+        role = str(message.role or "").strip().lower()
+        text = str(message.text or "").strip()
+        if role not in {"user", "assistant", "system", "tool"} or not text:
+            continue
+        normalized.append(
+            message.model_copy(
+                update={
+                    "role": role,
+                    "text": text[:MAX_SHORT_TERM_MESSAGE_CHARS],
+                }
+            )
+        )
+    return normalized
+
+
+def render_recent_message_history_context(messages: List[ConversationMessage]) -> str:
+    if not messages:
+        return ""
+    lines = [
+        "## 当前会话短期记忆",
+        "以下是当前上下文窗口内的最近多轮 messages 原文片段，用于指代消解、连续任务和未完成事项承接。",
+    ]
+    for index, message in enumerate(messages[-MAX_SHORT_TERM_RECENT_MESSAGES:], start=1):
+        role = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(message.role, message.role or "unknown")
+        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
+        if text:
+            lines.append("- %02d %s：%s" % (index, role, text[:MAX_SHORT_TERM_MESSAGE_CHARS]))
+    return "\n".join(lines)[-MAX_SHORT_TERM_CONTEXT_CHARS:]
+
+
+def render_rule_based_message_summary(messages: List[ConversationMessage]) -> str:
+    if not messages:
+        return ""
+    lines = [
+        "## 旧会话压缩摘要",
+        "模型摘要不可用时使用规则兜底，仅保留较早消息中的关键片段。",
+    ]
+    for index, message in enumerate(messages[-(MAX_SHORT_TERM_MESSAGES - MAX_SHORT_TERM_RECENT_MESSAGES) :], start=1):
+        role = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(message.role, message.role or "unknown")
+        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
+        if text:
+            lines.append("- %02d %s：%s" % (index, role, text[:500]))
+    return "\n".join(lines)[:MAX_SHORT_TERM_SUMMARY_CHARS]
+
+
+def summarize_message_history_context(
+    messages: List[ConversationMessage],
+    question: str,
+    llm: Optional[LlmClient] = None,
+    timeout_seconds: int = 8,
+) -> Dict[str, Any]:
+    if len(messages) <= MAX_SHORT_TERM_RECENT_MESSAGES:
+        return {"summary": "", "usedLlm": False, "sourceMessages": 0, "fallback": False}
+    older_messages = messages[:-MAX_SHORT_TERM_RECENT_MESSAGES]
+    fallback_summary = render_rule_based_message_summary(older_messages)
+    if not llm or not getattr(llm, "configured", False) or not hasattr(llm, "chat"):
+        return {"summary": fallback_summary, "usedLlm": False, "sourceMessages": len(older_messages), "fallback": bool(fallback_summary)}
+
+    rows: List[str] = []
+    for index, message in enumerate(older_messages[-(MAX_SHORT_TERM_MESSAGES - MAX_SHORT_TERM_RECENT_MESSAGES) :], start=1):
+        role = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(message.role, message.role or "unknown")
+        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
+        if text:
+            rows.append("%02d %s：%s" % (index, role, text[:MAX_SHORT_TERM_MESSAGE_CHARS]))
+    if not rows:
+        return {"summary": "", "usedLlm": False, "sourceMessages": len(older_messages), "fallback": False}
+
+    system_prompt = (
+        "你是商家经营问答系统的会话记忆压缩器。"
+        "请只抽取对当前追问仍有用的信息，不补充事实，不推断未出现的数据。"
+        "输出中文，控制在 800 字以内。"
+    )
+    user_prompt = "\n".join(
+        [
+            "当前用户问题：%s" % (question or ""),
+            "",
+            "请从以下较早会话消息中提炼短期会话摘要，重点保留：",
+            "1. 用户确认过的时间范围、筛选条件、指标口径；",
+            "2. 关键对象、实体集合、订单号、商品 ID、退款单号等；",
+            "3. 未完成任务、证据缺口、上一轮查询结果中可复用的对象；",
+            "4. 用户明确纠正、偏好或冲突信息。",
+            "不要复述无关寒暄、长 SQL、完整工具日志。",
+            "",
+            "较早会话消息：",
+            "\n".join(rows),
+            "",
+            "输出格式：",
+            "## 旧会话压缩摘要",
+            "- 已确认约束：...",
+            "- 关键对象：...",
+            "- 未完成任务：...",
+            "- 纠正和偏好：...",
+        ]
+    )
+    summary = str(llm.chat(system_prompt, user_prompt, fallback="", timeout_seconds=timeout_seconds) or "").strip()
+    if not summary:
+        return {"summary": fallback_summary, "usedLlm": False, "sourceMessages": len(older_messages), "fallback": bool(fallback_summary)}
+    if "旧会话压缩摘要" not in summary[:80]:
+        summary = "## 旧会话压缩摘要\n" + summary
+    return {
+        "summary": summary[:MAX_SHORT_TERM_SUMMARY_CHARS],
+        "usedLlm": True,
+        "sourceMessages": len(older_messages),
+        "fallback": False,
+    }
+
+
+def render_message_history_context(messages: List[ConversationMessage], question: str = "", llm: Optional[LlmClient] = None) -> Dict[str, Any]:
+    summary_trace = summarize_message_history_context(messages, question, llm)
+    sections = [summary_trace.get("summary") or "", render_recent_message_history_context(messages)]
+    context = "\n\n".join(section.strip() for section in sections if section and section.strip())[-MAX_SHORT_TERM_CONTEXT_CHARS:]
+    return {
+        "context": context,
+        "usedLlm": bool(summary_trace.get("usedLlm")),
+        "fallback": bool(summary_trace.get("fallback")),
+        "summarySourceMessages": int(summary_trace.get("sourceMessages") or 0),
+        "recentMessages": min(len(messages), MAX_SHORT_TERM_RECENT_MESSAGES),
+    }
+
+
+def append_context_section(existing: str, section: str, max_chars: int = MAX_SHORT_TERM_CONTEXT_CHARS) -> str:
+    parts = [part for part in [existing.strip(), section.strip()] if part]
+    return "\n\n".join(parts)[-max_chars:]
+
+
+def compact_file_tool_results_for_prompt(results: List[Dict[str, Any]], max_items: int = 6) -> List[Dict[str, Any]]:
+    compacted: List[Dict[str, Any]] = []
+    for item in results[-max_items:]:
+        result = item.get("result") or {}
+        payload = {
+            "name": item.get("name"),
+            "status": item.get("status"),
+            "errorType": item.get("errorType"),
+            "errorMessage": item.get("errorMessage"),
+        }
+        if isinstance(result, dict):
+            for key in ["relativePath", "merchantUri", "truncated", "estimatedChars", "nextContentOffsetChars"]:
+                if key in result:
+                    payload[key] = result.get(key)
+            if "content" in result:
+                payload["content"] = str(result.get("content") or "")[:1800]
+            if "items" in result and isinstance(result.get("items"), list):
+                payload["items"] = result.get("items")[:8]
+            if "hits" in result and isinstance(result.get("hits"), list):
+                payload["hits"] = result.get("hits")[:8]
+        compacted.append(payload)
+    return compacted
 
 
 class MerchantQaWorkflow:
@@ -124,7 +300,7 @@ class MerchantQaWorkflow:
         self.context_manager = ContextManager(settings)
         self.context_assembler = ContextAssembler(settings)
         self.thread_context_service = ThreadContextService()
-        self.memory_store = StructuredMemoryStore(settings)
+        self.memory_store = create_memory_store(settings)
         self.middleware_chain = MiddlewareChain(default_harness_middlewares(settings, self.context_manager))
         self.checkpoint_manager = CheckpointManager(settings)
         self.graph = self._build_graph()
@@ -137,9 +313,10 @@ class MerchantQaWorkflow:
         listener: Optional[GraphEventListener] = None,
         thread_id: str = "",
         run_id: str = "",
+        message_history: Optional[List[ConversationMessage]] = None,
     ) -> ChatResponse:
         effective_merchant_id = merchant_id or self.settings.merchant_id
-        state = self._initial_state(question, effective_merchant_id, context, listener, thread_id, run_id)
+        state = self._initial_state(question, effective_merchant_id, context, listener, thread_id, run_id, message_history)
         config = self.checkpoint_manager.config_for_run(state["thread_id"], state["run_id"])
         register_event_listener(state["run_id"], listener)
         try:
@@ -156,9 +333,10 @@ class MerchantQaWorkflow:
         listener: Optional[GraphEventListener] = None,
         thread_id: str = "",
         run_id: str = "",
+        message_history: Optional[List[ConversationMessage]] = None,
     ) -> ChatResponse:
         effective_merchant_id = merchant_id or self.settings.merchant_id
-        state = self._initial_state(question, effective_merchant_id, context, listener, thread_id, run_id)
+        state = self._initial_state(question, effective_merchant_id, context, listener, thread_id, run_id, message_history)
         config = self.checkpoint_manager.config_for_run(state["thread_id"], state["run_id"])
         register_event_listener(state["run_id"], listener)
         try:
@@ -175,6 +353,7 @@ class MerchantQaWorkflow:
         listener: Optional[GraphEventListener],
         thread_id: str,
         run_id: str,
+        message_history: Optional[List[ConversationMessage]] = None,
     ) -> AgentState:
         qa_id = "qa_" + uuid.uuid4().hex
         actual_thread_id = thread_id or "thread_" + uuid.uuid4().hex
@@ -188,6 +367,7 @@ class MerchantQaWorkflow:
             requested_merchant_id=merchant_id,
             request_context=context,
             response_context=None,
+            message_history=normalize_message_history(message_history),
             thread_id=actual_thread_id,
             run_id=actual_run_id,
             checkpoint_thread_id=self.checkpoint_manager.thread_id_for_run(actual_thread_id, actual_run_id),
@@ -207,6 +387,7 @@ class MerchantQaWorkflow:
             route_decision_trace=[],
             bounded_route_llm_trace={},
             bounded_lead_llm_trace={},
+            main_agent_observations=[],
             fast_understanding=FastUnderstandingResult(),
             plan=QueryPlan(),
             recall_bundle=RecallBundle(),
@@ -233,9 +414,13 @@ class MerchantQaWorkflow:
             freshness_reports=[],
             context_snapshots=[],
             context_packages=[],
+            context_manifests=[],
+            active_context_manifest={},
+            active_context_package={},
             context_budget_reports=[],
             context_assembly_reports=[],
             context_compression_events=[],
+            runtime_checkpoints=[],
             middleware_events=[],
             tool_call_ledger=[],
             tool_call_recovery_events=[],
@@ -248,6 +433,7 @@ class MerchantQaWorkflow:
             tool_runtime_policies=[],
             tool_call_results=[],
             tool_runtime_events=[],
+            answer_file_tool_results={},
             clarification_tool_message={},
             clarification_command={},
             agent_decision_reason="",
@@ -267,6 +453,8 @@ class MerchantQaWorkflow:
             memory_injection={},
             memory_injection_trace={},
             memory_ingestion_trace={},
+            memory_constraints=[],
+            memory_constraint_trace={},
             open_diagnostic_scope="",
             open_diagnostic_intent="",
             open_diagnostic_goal="",
@@ -274,6 +462,7 @@ class MerchantQaWorkflow:
             answer="",
             analysis_summary="",
             analysis_skill_trace={},
+            skill_lifecycle_records=[],
             answer_used_llm=False,
             suggestions=[],
             thinking_steps=[],
@@ -392,6 +581,30 @@ class MerchantQaWorkflow:
                 ),
             )
         context = state.get("request_context")
+        history_payload = render_message_history_context(
+            state.get("message_history") or [],
+            question=state.get("question", ""),
+            llm=getattr(self.planner, "llm", None),
+        )
+        history_context = str(history_payload.get("context") or "")
+        if history_context:
+            state.setdefault("thread_context", thread_context or {})["messageHistorySummary"] = {
+                "usedLlm": bool(history_payload.get("usedLlm")),
+                "fallback": bool(history_payload.get("fallback")),
+                "summarySourceMessages": int(history_payload.get("summarySourceMessages") or 0),
+                "recentMessages": int(history_payload.get("recentMessages") or 0),
+            }
+            state["session_context"] = append_context_section(state.get("session_context") or "", history_context)
+            thread_context = state.setdefault("thread_context", thread_context or {})
+            thread_context["messageHistory"] = [
+                item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                for item in (state.get("message_history") or [])[-MAX_SHORT_TERM_MESSAGES:]
+            ]
+            add_step(
+                state,
+                "Short-term Memory：已接入当前会话多轮 messages=%d，旧消息%s压缩"
+                % (len(state.get("message_history") or []), "由 LLM " if history_payload.get("usedLlm") else "规则兜底"),
+            )
         if context and context.pending_clarification_stage and context.pending_question:
             state["question"] = ("%s %s" % (context.pending_question, state["question"])).strip()
             add_step(state, "Context Middleware：已合并上一轮澄清问题")
@@ -436,11 +649,15 @@ class MerchantQaWorkflow:
         started = now_ms()
         step = self.start_run_step(state, "policy", "LeadAgent", "MAIN_AGENT_POLICY", input_summary=state.get("agent_decision_reason", ""))
         state = self.middleware_chain.before_policy(state)
+        observation = self.main_agent_observation(state)
+        state.setdefault("main_agent_observations", []).append(observation)
+        state["main_agent_observations"] = state["main_agent_observations"][-24:]
         decision = self.policy.decide(state)
+        decision.observation = observation.get("summary", "")
         decision = self.apply_bounded_lead_llm_decision(state, decision)
         state = self.middleware_chain.before_action(state, decision)
         state["_next_action"] = decision.selected_node
-        state["available_actions"] = self.policy.available_actions(state)
+        state["available_actions"] = self.policy.registry.actions(decision.available_actions)
         state["agent_decision_reason"] = decision.reason
         self.ensure_terminal_planning_gap(state, decision)
         state.setdefault("lead_decisions", []).append(decision)
@@ -454,6 +671,7 @@ class MerchantQaWorkflow:
                 status="selected",
                 reason=decision.reason,
                 available_actions=decision.available_actions,
+                observation=decision.observation,
             )
         )
         emit(
@@ -466,6 +684,8 @@ class MerchantQaWorkflow:
                 "reactRound": state.get("react_round", 0),
                 "availableActions": [item.model_dump(by_alias=True) for item in state["available_actions"]],
                 "reason": decision.reason,
+                "observation": observation,
+                "source": decision.source,
             },
         )
         self.record_span(state, "action", "policy", started)
@@ -473,14 +693,16 @@ class MerchantQaWorkflow:
         return state
 
     def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
-        mode = str(getattr(self.settings, "lead_action_llm_mode", "off") or "off").lower()
+        mode = str(getattr(self.settings, "lead_action_llm_mode", "low_confidence") or "low_confidence").lower()
         allowed = [str(item) for item in decision.available_actions if item]
+        observation = state.get("main_agent_observations", [{}])[-1] if state.get("main_agent_observations") else {}
         trace: Dict[str, Any] = {
             "mode": mode,
             "status": "skipped",
             "reason": "lead_action_llm_disabled",
             "deterministicAction": decision.selected_action,
             "allowedActions": allowed,
+            "observation": observation,
         }
         state["bounded_lead_llm_trace"] = trace
         if mode in {"off", "false", "0", "disabled"}:
@@ -506,9 +728,14 @@ class MerchantQaWorkflow:
             return decision
         payload = {
             "question": state.get("question", ""),
+            "observation": observation,
             "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
             "deterministicDecision": decision.model_dump(by_alias=True),
             "allowedActions": allowed,
+            "recentActions": [
+                item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                for item in state.get("action_history", [])[-6:]
+            ],
             "pendingKnowledgeRequests": [item.model_dump(by_alias=True) for item in state.get("pending_knowledge_requests", [])[:5]],
             "plannerRepairRequests": [item.model_dump(by_alias=True) for item in state.get("planner_repair_requests", [])[:5]],
             "plannerReflection": (state.get("planner_reflection") or PlannerReflectionResult()).model_dump(by_alias=True),
@@ -516,16 +743,33 @@ class MerchantQaWorkflow:
             "instruction": "只能从 allowedActions 中选择一个 action id。不要创造新 action。返回 JSON: {selectedAction:'', reason:''}",
         }
         try:
-            llm_payload = llm.json_chat(
-                "你是 BI Agent 的受限 LeadAction 选择器，只能在给定 action registry 候选中改选下一步。",
-                json.dumps(payload, ensure_ascii=False, default=str),
-                fallback={},
-                timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
-            )
+            if hasattr(llm, "tool_json_chat"):
+                tool = lead_action_selection_tool(allowed)
+                llm_payload = llm.tool_json_chat(
+                    "你是主 Agent 的 ReAct 决策器。先读 observation，再只能调用 select_agent_action 选择下一步。",
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    tool.openai_schema(),
+                    {},
+                    timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
+                )
+                trace["tool"] = tool.trace_schema()
+            else:
+                llm_payload = llm.json_chat(
+                    "你是 BI Agent 的受限 LeadAction 选择器，只能在给定 action registry 候选中改选下一步。",
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    fallback={},
+                    timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
+                )
         except Exception as exc:
             trace.update({"status": "failed", "errorCode": "LEAD_LLM_FAILED", "errorMessage": str(exc)[:300]})
             return decision
-        selected_action = str((llm_payload or {}).get("selectedAction") or (llm_payload or {}).get("selected_action") or "")
+        selected_action = str(
+            (llm_payload or {}).get("actionId")
+            or (llm_payload or {}).get("action_id")
+            or (llm_payload or {}).get("selectedAction")
+            or (llm_payload or {}).get("selected_action")
+            or ""
+        )
         if selected_action not in allowed:
             trace.update({"status": "ignored", "reason": "llm_selected_action_not_allowed", "payload": llm_payload or {}})
             return decision
@@ -545,7 +789,47 @@ class MerchantQaWorkflow:
             available_actions=allowed,
             reason=reason,
             budget_exhausted=decision.budget_exhausted,
+            observation=str(observation.get("summary") or decision.observation),
+            source="lead_llm_tool",
         )
+
+    def main_agent_observation(self, state: AgentState) -> Dict[str, Any]:
+        validation = state.get("query_graph_validation_result") or GraphValidationResult()
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        plan = state.get("plan") or QueryPlan()
+        pending_requests = state.get("pending_knowledge_requests") or []
+        graph_gaps = getattr(validation, "gaps", []) or []
+        evidence_gaps = getattr(run_result, "evidence_gaps", []) or []
+        summary_parts = [
+            "round=%s" % int(state.get("react_round") or 0),
+            "topicRouted=%s" % bool(state.get("topic_routed")),
+            "retrieved=%s" % bool(state.get("data_discovered")),
+            "assets=%s" % bool(state.get("planning_assets_compacted")),
+            "planNodes=%d" % len(plan.intents),
+            "validated=%s" % bool(state.get("query_graph_validated")),
+            "sqlGenerated=%s" % bool(state.get("sql_generated")),
+            "evidenceVerified=%s" % bool(state.get("evidence_graph_verified")),
+        ]
+        if pending_requests:
+            summary_parts.append("pendingKnowledge=%d" % len(pending_requests))
+        if graph_gaps:
+            summary_parts.append("graphGaps=%d" % len(graph_gaps))
+        if evidence_gaps:
+            summary_parts.append("evidenceGaps=%d" % len(evidence_gaps))
+        if state.get("human_clarification_required"):
+            summary_parts.append("needsHuman=true")
+        last_action = {}
+        if state.get("action_history"):
+            item = state["action_history"][-1]
+            last_action = item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+        return {
+            "summary": "; ".join(summary_parts),
+            "lastAction": last_action,
+            "pendingKnowledgeRequests": [item.model_dump(by_alias=True) for item in pending_requests[:4]],
+            "graphGaps": [gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap for gap in graph_gaps[:6]],
+            "evidenceGaps": [gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap for gap in evidence_gaps[:6]],
+            "toolRuntimeFailures": state.get("tool_failures", [])[-4:],
+        }
 
     def ensure_terminal_planning_gap(self, state: AgentState, decision: Any) -> None:
         if getattr(decision, "selected_action", "") not in {"answer_data", "answer"}:
@@ -637,6 +921,20 @@ class MerchantQaWorkflow:
                 "reason": decision.reason,
             }
         )
+        forced_clarification_reason = self.topic_clarification_gate_reason(state, decision, route_slots)
+        if forced_clarification_reason:
+            decision.clarification_required = True
+            decision.reason = "; ".join([item for item in [decision.reason, forced_clarification_reason] if item])
+            state["route_decision_trace"].append(
+                {
+                    "stage": "topic_clarification_gate",
+                    "candidateTopics": [enum_value(item) for item in decision.recall_topics()],
+                    "confidence": decision.confidence,
+                    "routeConfidence": route_slots.route_confidence,
+                    "warnings": route_slots.route_warnings,
+                    "reason": forced_clarification_reason,
+                }
+            )
         state["topic_routing_decision"] = decision
         state["topic_routed"] = True
         state["context_loaded"] = True
@@ -865,6 +1163,38 @@ class MerchantQaWorkflow:
         trace.update({"status": "applied", "topics": topics, "payload": payload or {}})
         return decision, trace
 
+    def topic_clarification_gate_reason(self, state: AgentState, decision: TopicRoutingDecision, route_slots: RouteSlots) -> str:
+        if not bool(getattr(self.settings, "route_force_clarification_enabled", True)):
+            return ""
+        text = state.get("question", "")
+        context = state.get("request_context")
+        if is_store_health_overview_question(text) or is_priority_recommendation_question(text):
+            return ""
+        if context and context.pending_clarification_type == "priority_goal":
+            return ""
+        topics = decision.recall_topics()
+        business_topics = [
+            topic
+            for topic in topics
+            if topic not in {QuestionCategory.UNKNOWN, QuestionCategory.MERCHANT_OTHER}
+        ]
+        data_topics = [topic for topic in business_topics if topic != QuestionCategory.PLATFORM_RULE]
+        confidence = max(float(decision.confidence or 0.0), float(route_slots.route_confidence or 0.0))
+        min_confidence = float(getattr(self.settings, "route_topic_min_confidence", 0.52) or 0.52)
+        max_candidates = int(getattr(self.settings, "route_topic_max_candidates", 4) or 4)
+        mixed_min_confidence = float(getattr(self.settings, "route_mixed_rule_data_min_confidence", 0.75) or 0.75)
+        if not business_topics and confidence < min_confidence:
+            return "业务域低置信且没有明确候选 Topic，先确认分析范围"
+        if confidence < min_confidence and ("NO_EXPLICIT_TOPIC" in route_slots.route_warnings or not route_slots.object_refs):
+            return "Topic 低置信，缺少明确对象或业务关键词，先确认分析范围"
+        if len(business_topics) > max_candidates and confidence < 0.82:
+            return "候选 Topic 过多且未形成稳定主域，先确认优先业务范围"
+        if QuestionCategory.PLATFORM_RULE in business_topics and data_topics and confidence < mixed_min_confidence:
+            return "规则问题和数据分析域混在一起且置信度不足，先确认是查规则还是查经营数据"
+        if "BROAD_TOPIC_SET" in route_slots.route_warnings and confidence < mixed_min_confidence:
+            return "路由命中范围过宽，先确认要看的业务域"
+        return ""
+
     def load_skill_policies_for_retrieval(self, state: AgentState) -> List[str]:
         skills = self.asset_builder.skill_loader.select(state["question"], self._effective_topic_categories(state))
         state["loaded_skills"] = [skill.domain for skill in skills]
@@ -919,19 +1249,24 @@ class MerchantQaWorkflow:
         for query, query_topics, request in query_scopes[:5]:
             expanded_topics = self._merge_topic_categories(expanded_topics, query_topics)
             keywords = self.keyword_service.extract(query)
-            knowledge_bundle = self.knowledge_retriever.retrieve(
-                KnowledgeRetrievalRequest(
-                    query=query,
-                    keywords=keywords.keywords,
-                    history_rows=state.get("history_rows", []),
-                    knowledge_context=knowledge_context(state),
-                    merchant_id=state["merchant"].merchant_id,
-                    topic_categories=query_topics,
-                    knowledge_request=request,
-                    route_slots=(state.get("route_slots") or RouteSlots()).model_dump(by_alias=True),
-                    round=int(state.get("query_graph_retrieve_count") or 0),
-                )
+            retrieval_request = KnowledgeRetrievalRequest(
+                query=query,
+                keywords=keywords.keywords,
+                history_rows=state.get("history_rows", []),
+                knowledge_context=knowledge_context(state),
+                merchant_id=state["merchant"].merchant_id,
+                topic_categories=query_topics,
+                knowledge_request=request,
+                route_slots=(state.get("route_slots") or RouteSlots()).model_dump(by_alias=True),
+                round=int(state.get("query_graph_retrieve_count") or 0),
             )
+            knowledge_bundle = self.knowledge_retriever.retrieve(retrieval_request)
+            if not knowledge_bundle.recall_bundle.items and str(knowledge_bundle.backend or "").lower().startswith("es"):
+                fallback_bundle = HybridKnowledgeRetrievalService(self.recall_service).retrieve(retrieval_request)
+                if fallback_bundle.recall_bundle.items:
+                    fallback_bundle.backend = "es_fallback_hybrid"
+                    fallback_bundle.recall_rounds = list(knowledge_bundle.recall_rounds or []) + list(fallback_bundle.recall_rounds or [])
+                    knowledge_bundle = fallback_bundle
             knowledge_bundles.append(knowledge_bundle)
             for trace in knowledge_bundle.recall_rounds:
                 trace.new_refs = [ref for ref in trace.source_refs if ref not in existing_refs]
@@ -1296,13 +1631,26 @@ class MerchantQaWorkflow:
         state["query_graph_plan_attempts"] = int(state.get("query_graph_plan_attempts") or 0) + 1
         emit(state, "node.started", "PLAN_QUERY_GRAPH", {})
         self.configure_artifact_roots(state)
+        planner_package = self.prepare_scoped_context_package(
+            state,
+            "plan_query_graph",
+            "PlannerAgent",
+            allowed_tables=(state.get("planning_asset_pack") or PlanningAssetPack()).known_tables()[:12],
+            allowed_metrics=[
+                item.key
+                for item in (state.get("planning_asset_pack") or PlanningAssetPack()).metrics[:24]
+                if item.key
+            ],
+        )
         planner_context = {
+            "contextPackage": self.compact_context_package(planner_package),
             "openDiagnostic": self.open_diagnostic_debug(state),
             "previousUnderstanding": (state.get("plan") or QueryPlan()).question_understanding,
             "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
             "threadContext": state.get("thread_context", {}),
             "runtimeInjection": state.get("runtime_injection", {}),
             "memoryInjection": state.get("memory_injection", {}),
+            "memoryConstraints": state.get("memory_constraints", []),
         }
         planner_context = self.context_assembler.assemble_payload(
             state,
@@ -1450,6 +1798,30 @@ class MerchantQaWorkflow:
         span = append_span(state, kind, name, started_ms, status=status, **kwargs)
         emit(state, "run.span.recorded", name, span.model_dump(by_alias=True))
 
+    @contextmanager
+    def run_node_step(
+        self,
+        state: AgentState,
+        action_id: str,
+        agent: str,
+        node: str,
+        reason: str = "",
+        input_summary: str = "",
+    ):
+        started = now_ms()
+        step = self.start_run_step(state, action_id, agent, node, reason=reason, input_summary=input_summary)
+        try:
+            yield step
+        except Exception as exc:
+            self.record_span(state, "action", action_id, started, status="error", error_code=type(exc).__name__, error_message=str(exc))
+            if getattr(step, "status", "") == "running":
+                self.finish_run_step(state, step, "error", error_code=type(exc).__name__, error_message=str(exc))
+            raise
+        else:
+            if getattr(step, "status", "") == "running":
+                self.record_span(state, "action", action_id, started)
+                self.finish_run_step(state, step, "success", output_summary=getattr(step, "output_summary", ""))
+
     def reflect_query_graph(self, state: AgentState) -> AgentState:
         started = now_ms()
         step = self.start_run_step(state, "reflect_plan", "PlannerCriticAgent", "REFLECT_QUERY_GRAPH", input_summary="nodes=%d" % len(state["plan"].intents))
@@ -1505,7 +1877,12 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "validate_graph", "PlannerCriticAgent", "VALIDATE_QUERY_GRAPH", input_summary="nodes=%d" % len(state["plan"].intents))
         increment_round(state)
         emit(state, "node.started", "VALIDATE_QUERY_GRAPH", {})
-        result = self.graph_validator.validate(state["question"], state["plan"], state["planning_asset_pack"])
+        result = self.graph_validator.validate(
+            state["question"],
+            state["plan"],
+            state["planning_asset_pack"],
+            state.get("memory_constraints", []),
+        )
         state["query_graph_validation_result"] = result
         state["query_graph_validated"] = True
         state["last_query_graph_validation_gaps"] = [] if result.valid else list(result.gaps)
@@ -1661,11 +2038,27 @@ class MerchantQaWorkflow:
             emit(state, "node.completed", "EXECUTE_QUERY_GRAPH", {"tasks": 0, "rows": 0, "skipped": True})
             return state
         try:
+            node_package = self.prepare_scoped_context_package(
+                state,
+                "execute_query_graph",
+                "NodeWorker",
+                allowed_tables=(state.get("planning_asset_pack") or PlanningAssetPack()).known_tables()[:12],
+                allowed_metrics=[
+                    item.key
+                    for item in (state.get("planning_asset_pack") or PlanningAssetPack()).metrics[:24]
+                    if item.key
+                ],
+            )
+            node_knowledge_context = append_context_section(
+                knowledge_context(state),
+                self.render_context_package_for_prompt(node_package),
+                max_chars=int(self.settings.context_runtime_budget_chars or 6000),
+            )
             run_result = self.node_worker.execute_plan(
                 state["merchant"].merchant_id,
                 state["plan"],
                 state["planning_asset_pack"],
-                knowledge_context(state),
+                node_knowledge_context,
                 state["question"],
             )
         except Exception as exc:
@@ -1788,7 +2181,12 @@ class MerchantQaWorkflow:
         started = now_ms()
         step = self.start_run_step(state, "verify_evidence", "EvidenceVerifierAgent", "VERIFY_EVIDENCE_GRAPH", input_summary="tasks=%d" % len(state["agent_run_result"].task_results))
         increment_round(state)
-        verified = self.evidence_verifier.verify(state["question"], state["plan"], state["agent_run_result"])
+        verified = self.evidence_verifier.verify(
+            state["question"],
+            state["plan"],
+            state["agent_run_result"],
+            state.get("memory_constraints", []),
+        )
         state["agent_run_result"].verified_evidence = verified
         state["agent_run_result"].evidence_gaps = verified.gaps
         state["agent_run_result"].partial_answer_reason = verified.partial_answer_reason
@@ -1915,6 +2313,9 @@ class MerchantQaWorkflow:
                 bool(state.get("rule_recall_context", "")),
             )
             if answer_needs_llm and not state.get("analysis_summary"):
+                if self.maybe_request_skill_confirmation(state):
+                    self.finish_run_step(state, step, "gap", output_summary="skill confirmation required", error_code="SKILL_CONFIRMATION_REQUIRED")
+                    return self.human_in_loop(state)
                 state["analysis_summary"] = self.answer_service.summarize_analysis(
                     state["question"],
                     state["plan"],
@@ -1925,11 +2326,33 @@ class MerchantQaWorkflow:
                     personalization_context=personalization_context,
                 )
                 state["analysis_skill_trace"] = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
+                self.record_skill_lifecycle(state, state["analysis_skill_trace"])
+            answer_package = self.prepare_scoped_context_package(
+                state,
+                "answer_analysis",
+                "AnswerAgent",
+                allowed_tables=(state.get("planning_asset_pack") or PlanningAssetPack()).known_tables()[:12],
+                allowed_metrics=[
+                    item.key
+                    for item in (state.get("planning_asset_pack") or PlanningAssetPack()).metrics[:24]
+                    if item.key
+                ],
+            )
+            answer_file_context = self.answer_file_tool_context(state, answer_package)
+            answer_context_source = append_context_section(
+                knowledge_context(state),
+                append_context_section(
+                    self.render_context_package_for_prompt(answer_package),
+                    answer_file_context,
+                    max_chars=int(self.settings.context_answer_budget_chars or 10000),
+                ),
+                max_chars=int(self.settings.context_answer_budget_chars or 10000),
+            )
             answer_context = self.context_assembler.compact_text_context(
                 state,
                 "answer_knowledge_context",
                 "AnswerAgent",
-                knowledge_context(state),
+                answer_context_source,
                 budget_chars=int(self.settings.context_answer_budget_chars or 10000),
             )
             state["answer"] = self.answer_service.compose(
@@ -1977,14 +2400,90 @@ class MerchantQaWorkflow:
         emit(state, "node.completed", "ANSWER_ANALYSIS", {"answerReady": bool(state["answer"])})
         return state
 
+    def maybe_request_skill_confirmation(self, state: AgentState) -> bool:
+        if not bool(getattr(self.settings, "skill_confirmation_required", False)):
+            return False
+        context = state.get("request_context")
+        if context and context.pending_clarification_type == "skill_confirm":
+            return False
+        skill_name = select_answer_skill(
+            state.get("plan") or QueryPlan(),
+            state.get("agent_run_result") or AgentRunResult(),
+            bool(state.get("rule_recall_context", "")),
+        )
+        if not skill_name:
+            return False
+        record = SkillLifecycleRecord(
+            skill_name=skill_name,
+            stage="confirm",
+            status="waiting_confirmation",
+            matched_by="deterministic_precheck",
+            requires_confirmation=True,
+            confirmed=False,
+            progress=["matched", "waiting_confirmation"],
+            summary="等待用户确认是否执行分析技能",
+        )
+        state.setdefault("skill_lifecycle_records", []).append(record)
+        state["agent_run_result"].skill_lifecycle_records.append(record)
+        self.request_human_clarification(
+            state,
+            "这个问题适合执行“%s”分析技能。是否确认执行？" % skill_name,
+            "ANSWER_SKILL",
+            "skill_confirm",
+            ["确认执行", "改为普通回答"],
+        )
+        add_step(state, "AnswerAgent Skill：命中 %s，已进入执行前确认门" % skill_name)
+        return True
+
+    def record_skill_lifecycle(self, state: AgentState, trace: Dict[str, Any]) -> None:
+        if not trace or not trace.get("skillName"):
+            return
+        stage = str(trace.get("lifecycleStage") or ("completed" if trace.get("activated") and not trace.get("error") else "matched"))
+        status = "success" if stage == "completed" and not trace.get("error") else ("failed" if trace.get("error") else stage)
+        record = SkillLifecycleRecord(
+            skill_name=str(trace.get("skillName") or ""),
+            stage=stage,
+            status=status,
+            matched_by=str(trace.get("matchedBy") or ""),
+            requires_confirmation=bool(trace.get("requiresConfirmation")),
+            confirmed=bool(trace.get("confirmed", True)),
+            isolated_run_id=str(trace.get("isolatedRunId") or ""),
+            workspace_path=str(trace.get("workspacePath") or ""),
+            checkpoint_path=str(trace.get("checkpointPath") or ""),
+            progress=[str(item) for item in (trace.get("progress") or [])],
+            reuse_candidate=bool(trace.get("reuseCandidate")),
+            summary=str(trace.get("error") or ("skill completed" if status == "success" else stage)),
+            metadata={
+                "executionMode": trace.get("executionMode"),
+                "workerType": trace.get("workerType"),
+                "subAgentType": trace.get("subAgentType"),
+                "isolatedExecution": trace.get("isolatedExecution"),
+                "contextPackagePath": trace.get("contextPackagePath"),
+                "contextPackage": trace.get("contextPackage") or {},
+                "inputArtifact": trace.get("inputArtifact"),
+                "outputArtifact": trace.get("outputArtifact"),
+                "metadata": trace.get("metadata") or {},
+            },
+        )
+        existing = {item.isolated_run_id for item in state.get("skill_lifecycle_records", []) if item.isolated_run_id}
+        if record.isolated_run_id and record.isolated_run_id in existing:
+            return
+        state.setdefault("skill_lifecycle_records", []).append(record)
+        state["agent_run_result"].skill_lifecycle_records.append(record)
+        add_step(state, "AnswerAgent Skill：%s lifecycle=%s status=%s" % (record.skill_name, record.stage, record.status))
+
     def answer_personalization_context(self, state: AgentState) -> Dict[str, Any]:
+        answer_memory_injection = answer_safe_memory_injection(state.get("memory_injection") or {})
         return {
             "merchantProfileContext": state.get("merchant_profile_context", ""),
+            "sessionContext": state.get("session_context", ""),
             "memoryContext": state.get("memory_context", ""),
             "runtimeContext": state.get("runtime_context", ""),
             "runtimeInjection": state.get("runtime_injection", {}),
-            "memoryInjection": state.get("memory_injection", {}),
+            "memoryInjection": answer_memory_injection,
             "memoryInjectionTrace": state.get("memory_injection_trace", {}),
+            "memoryConstraints": state.get("memory_constraints", []),
+            "memoryConstraintTrace": state.get("memory_constraint_trace", {}),
             "threadContext": state.get("thread_context", {}),
         }
 
@@ -2033,9 +2532,20 @@ class MerchantQaWorkflow:
             state["memory_ingestion_trace"] = memory_payload.get("memoryIngestionTrace", {})
             state["memory_injection"] = self.memory_store.select_for_question(
                 state,
-                budget_chars=int(self.settings.context_memory_budget_chars or 1800),
+                budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
             )
             state["memory_injection_trace"] = state["memory_injection"].get("memoryInjectionTrace", {})
+            state["memory_constraints"] = build_memory_constraints(state["memory_injection"])
+            state["memory_constraint_trace"] = {
+                "constraintCount": len(state["memory_constraints"]),
+                "requiredCount": sum(1 for item in state["memory_constraints"] if str(item.get("enforcement") or "") == "required"),
+                "clarifyCount": sum(
+                    1
+                    for item in state["memory_constraints"]
+                    if str(item.get("enforcement") or "") == "clarify_or_disclose"
+                ),
+                "source": state["memory_injection"].get("source", ""),
+            }
             add_step(
                 state,
                 "Memory Middleware：已更新结构化长期记忆 events=%d"
@@ -2091,6 +2601,7 @@ class MerchantQaWorkflow:
                 "artifactManifest": self.artifact_manifest(state),
                 "actionHistory": [item.model_dump(by_alias=True) for item in state.get("action_history", [])],
                 "leadDecisions": [item.model_dump(by_alias=True) for item in state.get("lead_decisions", [])],
+                "mainAgentObservations": state.get("main_agent_observations", []),
                 "promptManagement": {
                     "templates": self.prompt_assembler.catalog_summary(),
                     "leadPrompt": self.prompt_assembler.lead_prompt_summary(
@@ -2101,11 +2612,18 @@ class MerchantQaWorkflow:
                 },
                 "toolCalling": self.tool_calling_debug(state),
                 "threadContext": state.get("thread_context", {}),
+                "messageHistory": [
+                    item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                    for item in state.get("message_history", [])
+                ],
                 "runtimeInjection": state.get("runtime_injection", {}),
                 "memoryInjection": state.get("memory_injection", {}),
+                "memoryConstraints": state.get("memory_constraints", []),
                 "memory": self.memory_debug(state),
                 "contextSnapshots": state.get("context_snapshots", []),
+                "contextManifests": state.get("context_manifests", []),
                 "contextManagement": self.context_management_debug(state),
+                "observability": observability_summary(state),
                 "middleware": self.middleware_debug(state),
                 "contextLineage": self.context_lineage_debug(state),
                 "toolRuntime": self.tool_runtime_debug(state),
@@ -2127,6 +2645,7 @@ class MerchantQaWorkflow:
                 "metricResolution": metric_resolutions_for_debug(state["plan"]),
                 "answerGuard": answer_guard_debug(state["agent_run_result"]),
                 "analysisSkill": state.get("analysis_skill_trace", {}),
+                "answerFileToolResults": state.get("answer_file_tool_results", {}),
                 "nodeToolTraces": [item.model_dump(by_alias=True) for item in state.get("node_tool_traces", [])],
                 "nodeTaskProfiles": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_task_profiles],
                 "nodeExecutionBatches": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_execution_batches],
@@ -2201,6 +2720,7 @@ class MerchantQaWorkflow:
                     "availableActions": [item.model_dump(by_alias=True) for item in state.get("available_actions", [])],
                     "actionHistory": [item.model_dump(by_alias=True) for item in state.get("action_history", [])],
                     "leadDecisions": [item.model_dump(by_alias=True) for item in state.get("lead_decisions", [])],
+                    "mainAgentObservations": state.get("main_agent_observations", []),
                     "decisionReason": state.get("agent_decision_reason", ""),
                     "performance": performance_summary(state),
                     "checkpoint": self.checkpoint_debug(state),
@@ -2219,6 +2739,7 @@ class MerchantQaWorkflow:
                     "toolCalling": self.tool_calling_debug(state),
                     "threadContext": state.get("thread_context", {}),
                     "contextManagement": self.context_management_debug(state),
+                    "observability": observability_summary(state),
                     "middleware": self.middleware_debug(state),
                     "contextLineage": self.context_lineage_debug(state),
                     "toolRuntime": self.tool_runtime_debug(state),
@@ -2252,6 +2773,7 @@ class MerchantQaWorkflow:
                 "metricResolution": metric_resolutions_for_debug(state["plan"]),
                 "answerGuard": answer_guard_debug(state["agent_run_result"]),
                 "analysisSkill": state.get("analysis_skill_trace", {}),
+                "answerFileToolResults": state.get("answer_file_tool_results", {}),
                 "nodeToolTraces": [item.model_dump(by_alias=True) for item in state.get("node_tool_traces", [])],
                 "nodeTaskProfiles": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_task_profiles],
                 "nodePlanContracts": [item.model_dump(by_alias=True) for item in state["agent_run_result"].node_plan_contracts],
@@ -2448,8 +2970,162 @@ class MerchantQaWorkflow:
             "seedTopics": [enum_value(item) for item in state.get("open_diagnostic_seed_topics", [])],
         }
 
+    def prepare_scoped_context_package(
+        self,
+        state: AgentState,
+        stage: str,
+        agent: str,
+        task_id: str = "",
+        allowed_tables: Optional[List[str]] = None,
+        allowed_metrics: Optional[List[str]] = None,
+    ):
+        snapshot = self.context_manager.snapshot(state, stage)
+        package = self.context_manager.package(
+            state,
+            stage=stage,
+            agent=agent,
+            snapshot=snapshot,
+            task_id=task_id,
+            allowed_tables=allowed_tables or [],
+            allowed_metrics=allowed_metrics or [],
+        )
+        state.setdefault("context_packages", []).append(package)
+        state["context_packages"] = state["context_packages"][-12:]
+        state["active_context_package"] = self.compact_context_package(package)
+        self.record_context_manifest(state, package)
+        self.context_manager.persist_package(state, package)
+        add_step(
+            state,
+            "Context Package：%s 使用最小上下文 package=%s artifacts=%d"
+            % (agent, package.package_id, len(package.artifact_refs)),
+        )
+        return package
+
+    def compact_context_package(self, package: Any) -> Dict[str, Any]:
+        refs = []
+        for ref in getattr(package, "artifact_refs", [])[:8]:
+            refs.append(
+                {
+                    "title": ref.title,
+                    "relativePath": ref.relative_path,
+                    "merchantUri": ref.merchant_uri,
+                    "reason": ref.reason,
+                }
+            )
+        return {
+            "packageId": getattr(package, "package_id", ""),
+            "stage": getattr(package, "stage", ""),
+            "agent": getattr(package, "agent", ""),
+            "taskId": getattr(package, "task_id", ""),
+            "contextHash": getattr(package, "context_hash", ""),
+            "summary": str(getattr(package, "summary", "") or "")[:1200],
+            "constraints": list(getattr(package, "constraints", []) or [])[:6],
+            "allowedTables": list(getattr(package, "allowed_tables", []) or [])[:12],
+            "allowedMetrics": list(getattr(package, "allowed_metrics", []) or [])[:24],
+            "evidenceGaps": list(getattr(package, "evidence_gaps", []) or [])[:8],
+            "artifactRefs": refs,
+        }
+
+    def render_context_package_for_prompt(self, package: Any) -> str:
+        compact = self.compact_context_package(package)
+        return "## ContextPackage\n%s" % json.dumps(compact, ensure_ascii=False, default=str)
+
+    def record_context_manifest(self, state: AgentState, package: Any) -> Dict[str, Any]:
+        manifest = self.build_context_manifest(state, package)
+        package_id = str(manifest.get("contextPackageId") or "")
+        existing = [
+            item
+            for item in state.get("context_manifests", [])
+            if str((item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item).get("contextPackageId") or "") != package_id
+        ]
+        existing.append(manifest)
+        state["context_manifests"] = existing[-24:]
+        state["active_context_manifest"] = manifest
+        return manifest
+
+    def build_context_manifest(self, state: AgentState, package: Any) -> Dict[str, Any]:
+        budget_report = latest_context_budget_report(state, getattr(package, "stage", "") or "")
+        artifact_refs = []
+        for ref in getattr(package, "artifact_refs", [])[:12]:
+            artifact_refs.append(ref if hasattr(ref, "model_dump") else ref)
+        manifest = ContextManifest(
+            stage=str(getattr(package, "stage", "") or ""),
+            agent=str(getattr(package, "agent", "") or ""),
+            context_package_id=str(getattr(package, "package_id", "") or ""),
+            context_hash=str(getattr(package, "context_hash", "") or ""),
+            allowed_tables=list(getattr(package, "allowed_tables", []) or [])[:12],
+            allowed_metrics=list(getattr(package, "allowed_metrics", []) or [])[:24],
+            memory_ids=context_memory_ids(state),
+            semantic_ref_ids=context_semantic_ref_ids(state)[:40],
+            artifact_refs=[
+                item if hasattr(item, "model_dump") else artifact_ref_from_path(str(item.get("path") or item.get("relativePath") or ""), namespace=str(item.get("namespace") or "context"))
+                for item in artifact_refs
+            ],
+            budget_report=budget_report,
+        )
+        return manifest.model_dump(by_alias=True)
+
+    def answer_file_tool_context(self, state: AgentState, package: Any) -> str:
+        max_rounds = int(getattr(self.settings, "answer_file_tool_rounds", 0) or 0)
+        llm = getattr(self.answer_service, "llm", None)
+        if max_rounds <= 0 or not llm or not getattr(llm, "configured", False) or not hasattr(llm, "tool_chat"):
+            return ""
+        tools = semantic_file_tool_definitions() + artifact_file_tool_definitions()
+        tool_schemas = [tool.openai_schema() for tool in tools]
+        handlers = self.planner._semantic_tool_handlers() if hasattr(self.planner, "_semantic_tool_handlers") else {}
+        results: List[Dict[str, Any]] = []
+        calls_trace: List[Dict[str, Any]] = []
+        for round_index in range(max_rounds):
+            payload = {
+                "question": state.get("question", ""),
+                "contextPackage": self.compact_context_package(package),
+                "verifiedEvidence": state["agent_run_result"].verified_evidence.model_dump(by_alias=True),
+                "evidenceGaps": [gap.model_dump(by_alias=True) for gap in state["agent_run_result"].evidence_gaps[:8]],
+                "artifactManifest": self.artifact_manifest(state)[:16],
+                "previousToolResults": compact_file_tool_results_for_prompt(results),
+                "instruction": (
+                    "如果 contextPackage 和 verifiedEvidence 已足够回答，不要调用工具。"
+                    "如果需要查看大结果、证据缺口、SQL 行预览或语义说明，只能读取相关 artifact/semantic 文件。"
+                    "不要根据未验证文件内容创造新结论；读取结果只能作为组织回答和缺口说明的证据补充。"
+                ),
+            }
+            llm_result = llm.tool_chat(
+                "你是 AnswerAgent 的文件上下文选择器。按需读取文件，最终回答仍必须受 verifiedEvidence 约束。",
+                json.dumps(payload, ensure_ascii=False, default=str),
+                tool_schemas,
+                {"content": "", "toolCalls": []},
+                timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
+            )
+            calls = [
+                ToolCallRequest(id=str(call.get("id") or "answer_file_%d_%d" % (round_index, idx)), name=str(call.get("name") or ""), args=call.get("args") or {})
+                for idx, call in enumerate(llm_result.get("toolCalls") or [])
+                if str(call.get("name") or "") in handlers
+            ][:4]
+            if not calls:
+                break
+            cache_policies = {
+                "semantic_ls": ToolCachePolicy(enabled=True, namespace="semantic_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                "semantic_read": ToolCachePolicy(enabled=True, namespace="semantic_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                "semantic_grep": ToolCachePolicy(enabled=True, namespace="semantic_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                "artifact_ls": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                "artifact_read": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+                "artifact_grep": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
+            }
+            executed = self.planner.tool_runtime_service.execute_many(calls, handlers, cache_policies=cache_policies)
+            serialized = [item.model_dump(by_alias=True) for item in executed]
+            calls_trace.extend([call.model_dump(by_alias=True) for call in calls])
+            results.extend(serialized)
+        if not results:
+            return ""
+        state["answer_file_tool_results"] = {"calls": calls_trace, "results": results}
+        add_step(state, "AnswerAgent File Context：按需读取 artifact/semantic 文件 results=%d" % len(results))
+        return "## Answer File Tool Results\n%s" % json.dumps(compact_file_tool_results_for_prompt(results), ensure_ascii=False, default=str)
+
     def refresh_context_snapshot(self, state: AgentState, stage: str) -> None:
         snapshot = self.context_manager.refresh_state(state, stage)
+        packages = state.get("context_packages") or []
+        if packages:
+            self.record_context_manifest(state, packages[-1])
         add_step(state, "Context Manager：刷新上下文快照 stage=%s protectedFacts=%d" % (stage, len(snapshot.protected_facts)))
 
     def sync_tool_runtime_state(self, state: AgentState) -> None:
@@ -2503,10 +3179,16 @@ class MerchantQaWorkflow:
                 item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
                 for item in state.get("context_assembly_reports", [])[-12:]
             ],
+            "contextManifests": [
+                item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                for item in state.get("context_manifests", [])[-8:]
+            ],
+            "activeContextManifest": state.get("active_context_manifest", {}),
             "compressionEvents": [
                 item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
                 for item in state.get("context_compression_events", [])[-8:]
             ],
+            "runtimeCheckpoints": state.get("runtime_checkpoints", [])[-8:],
             "threadContext": state.get("thread_context", {}),
             "runtimeInjectionPreview": json.dumps(state.get("runtime_injection", {}), ensure_ascii=False, default=str)[:1200],
             "memoryInjectionPreview": json.dumps(state.get("memory_injection", {}), ensure_ascii=False, default=str)[:1200],
@@ -2534,6 +3216,8 @@ class MerchantQaWorkflow:
         injection = state.get("memory_injection") or {}
         trace = state.get("memory_injection_trace") or injection.get("memoryInjectionTrace") or {}
         ingestion = state.get("memory_ingestion_trace") or {}
+        constraints = state.get("memory_constraints") or []
+        constraint_trace = state.get("memory_constraint_trace") or {}
         candidates = trace.get("candidates") or []
         conflicts = ingestion.get("conflict") or {}
         return {
@@ -2541,6 +3225,7 @@ class MerchantQaWorkflow:
             "retrieval": {
                 "candidateCount": trace.get("candidateCount", 0),
                 "selectedIds": trace.get("selectedIds", []),
+                "candidateIds": trace.get("candidateIds", []),
                 "filteredReasons": trace.get("filteredReasons", {}),
                 "topCandidates": candidates[:8],
             },
@@ -2553,6 +3238,25 @@ class MerchantQaWorkflow:
                 "preferenceCount": len(injection.get("relevantPreferences") or []),
                 "factCount": len(injection.get("relevantFacts") or []),
                 "eventCount": len(injection.get("relevantEvents") or []),
+                "pastCaseCount": len(injection.get("relevantPastCases") or []),
+                "candidateMemoryCount": len(injection.get("candidateMemories") or []),
+            },
+            "knowledgeSuggestions": {
+                "count": int((ingestion or {}).get("knowledgeSuggestionCount") or 0),
+                "lastSuggestionId": (ingestion or {}).get("knowledgeSuggestionId", ""),
+                "written": bool((ingestion or {}).get("knowledgeSuggestionWritten")),
+            },
+            "constraints": {
+                "constraintCount": constraint_trace.get("constraintCount", len(constraints)),
+                "requiredCount": constraint_trace.get(
+                    "requiredCount",
+                    sum(1 for item in constraints if str(item.get("enforcement") or "") == "required"),
+                ),
+                "clarifyCount": constraint_trace.get(
+                    "clarifyCount",
+                    sum(1 for item in constraints if str(item.get("enforcement") or "") == "clarify_or_disclose"),
+                ),
+                "items": constraints[:8],
             },
             "conflicts": [conflicts] if conflicts else [],
             "decay": {
@@ -2899,6 +3603,7 @@ def graph_repair_validation_gaps(evidence_gaps: List[Any]) -> List[GraphValidati
         "MISSING_OUTPUT_KEY",
         "MISSING_UPSTREAM_ENTITY",
         "CONTRACT_REQUIRED_EVIDENCE_GAP",
+        "MEMORY_CONSTRAINT_UNAPPLIED",
     }
     gaps: List[GraphValidationGap] = []
     for gap in evidence_gaps:
@@ -3170,6 +3875,91 @@ def filter_blocked_knowledge_requests(
     return [request for request in deduped if knowledge_request_key(request) not in blocked_keys]
 
 
+def answer_safe_memory_injection(injection: Dict[str, Any]) -> Dict[str, Any]:
+    safe = dict(injection or {})
+    safe.pop("relevantPastCases", None)
+    safe.pop("relevantProcedures", None)
+    safe.pop("candidateMemories", None)
+    trace = dict(safe.get("memoryInjectionTrace") or {})
+    if trace:
+        trace.pop("candidates", None)
+        safe["memoryInjectionTrace"] = trace
+    return safe
+
+
+def context_memory_ids(state: AgentState) -> List[str]:
+    trace = state.get("memory_injection_trace") or (state.get("memory_injection") or {}).get("memoryInjectionTrace") or {}
+    ids: List[str] = []
+    for raw in list(trace.get("selectedIds") or []) + list(trace.get("candidateIds") or []):
+        text = str(raw or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids
+
+
+def context_semantic_ref_ids(state: AgentState) -> List[str]:
+    refs: List[str] = []
+    bundle = state.get("recall_bundle") or RecallBundle()
+    for item in getattr(bundle, "items", []) or []:
+        metadata = item.metadata or {}
+        ref = str(metadata.get("semanticRefId") or item.doc_id or "")
+        if ref:
+            refs.append(ref)
+    plan = state.get("plan") or QueryPlan()
+    for intent in plan.intents:
+        refs.extend([str(ref) for ref in intent.knowledge_ref_ids if ref])
+        resolution = intent.metric_resolution or {}
+        ref = str(resolution.get("semanticRefId") or resolution.get("semantic_ref_id") or "")
+        if ref:
+            refs.append(ref)
+    pack = state.get("planning_asset_pack") or PlanningAssetPack()
+    for ref_id, item in list((pack.source_refs or {}).items())[:80]:
+        metadata = item.metadata or {}
+        refs.append(str(metadata.get("semanticRefId") or ref_id or item.doc_id or ""))
+    return unique_workflow_strings(refs)
+
+
+def latest_context_budget_report(state: AgentState, stage: str) -> Dict[str, Any]:
+    for item in reversed(state.get("context_budget_reports") or []):
+        payload = item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+        if isinstance(payload, dict) and (not stage or str(payload.get("stage") or "") == stage):
+            return payload
+    return {}
+
+
+def observability_summary(state: AgentState) -> Dict[str, Any]:
+    validation = state.get("query_graph_validation_result") or GraphValidationResult()
+    run_result = state.get("agent_run_result") or AgentRunResult()
+    active_manifest = state.get("active_context_manifest") or {}
+    return {
+        "selectedMemoryIds": context_memory_ids(state),
+        "semanticRefIds": context_semantic_ref_ids(state)[:40],
+        "contextHash": str(active_manifest.get("contextHash") or ""),
+        "contextPackageId": str(active_manifest.get("contextPackageId") or ""),
+        "validationGaps": [
+            gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap
+            for gap in getattr(validation, "gaps", [])[:12]
+        ],
+        "evidenceGaps": [
+            gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap
+            for gap in getattr(run_result, "evidence_gaps", [])[:12]
+        ],
+        "repairCount": int(state.get("query_graph_repair_attempts") or 0),
+    }
+
+
+def unique_workflow_strings(values: List[Any]) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
 def dedupe_workflow_knowledge_requests(items: List[KnowledgeRequest]) -> List[KnowledgeRequest]:
     deduped: List[KnowledgeRequest] = []
     seen: set[str] = set()
@@ -3213,7 +4003,7 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
         asset_builder=asset_builder,
         planner=QueryGraphPlanner(llm, semantic_catalog=semantic_catalog, settings=settings),
         graph_validator=QueryGraphValidator(),
-        node_worker=NodeWorkerExecutor(llm, doris_repository, SqlValidationService(), settings),
+        node_worker=NodeWorkerExecutor(llm, doris_repository, SqlValidationService(), settings, semantic_catalog=semantic_catalog),
         evidence_verifier=EvidenceVerifier(),
         answer_service=AnswerComposeService(llm),
     )

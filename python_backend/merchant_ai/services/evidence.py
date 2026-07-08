@@ -4,10 +4,17 @@ import re
 from typing import Any, Dict, List, Set
 
 from merchant_ai.models import AgentRunResult, EvidenceGap, QueryPlan, VerifiedEvidence
+from merchant_ai.services.memory_constraints import memory_constraint_evidence_gaps
 
 
 class EvidenceVerifier:
-    def verify(self, question: str, plan: QueryPlan, run_result: AgentRunResult) -> VerifiedEvidence:
+    def verify(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        memory_constraints: List[Dict[str, Any]] | None = None,
+    ) -> VerifiedEvidence:
         gaps: List[EvidenceGap] = []
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
@@ -24,6 +31,7 @@ class EvidenceVerifier:
                 gaps.append(EvidenceGap(code="MISSING_REQUIRED_EVIDENCE", evidence=evidence, reason="finalRequiredEvidence 未被结果字段或使用表覆盖"))
         required_disclosures = metric_resolution_disclosures(plan)
         gaps.extend(metric_resolution_warning_gaps(plan))
+        gaps.extend(memory_constraint_evidence_gaps(question, plan, memory_constraints or []))
         for gap in run_result.evidence_check.gaps:
             gaps.append(EvidenceGap(code="DEPENDENCY_GAP", evidence=gap, reason=gap))
         succeeded_tasks = [item for item in run_result.task_results if not item.query_bundle.failed]
@@ -355,7 +363,13 @@ def missing_gap_code(columns: List[str]) -> str:
 
 
 def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
-    warning_codes = {"FIELD_AMBIGUOUS", "ENTITY_SET_TRUNCATED", "OPTIONAL_EVIDENCE_MISSING", "RESOURCE_DEGRADED_QUERY"}
+    warning_codes = {
+        "FIELD_AMBIGUOUS",
+        "ENTITY_SET_TRUNCATED",
+        "OPTIONAL_EVIDENCE_MISSING",
+        "RESOURCE_DEGRADED_QUERY",
+        "MEMORY_METRIC_DISPUTE_REQUIRES_CLARIFICATION",
+    }
     info_codes: Set[str] = set()
     severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"
     instruction = gap.answer_instruction or answer_instruction_for_gap(gap)
@@ -376,6 +390,8 @@ def evidence_gap_source(code: str) -> str:
         return "dependency"
     if code.startswith("DERIVED_METRIC"):
         return "calculation"
+    if code.startswith("MEMORY_"):
+        return "memory"
     if code in {"FIELD_AMBIGUOUS"}:
         return "field_policy"
     return "task"
@@ -390,6 +406,10 @@ def answer_instruction_for_gap(gap: EvidenceGap) -> str:
         return "说明下游节点因上游实体缺失或依赖键缺失未完整执行。"
     if gap.code.startswith("DERIVED_METRIC"):
         return "说明派生指标缺少可计算的分子/分母或组件证据，不能把缺失解释为 0。"
+    if gap.code.startswith("MEMORY_CONSTRAINT"):
+        return "说明长期记忆约束未被本轮 QueryGraph/证据覆盖，不要声称已应用该历史偏好或纠错。"
+    if gap.code.startswith("MEMORY_METRIC_DISPUTE"):
+        return "说明长期记忆存在口径争议，当前仍以语义层/指标中心定义为准。"
     if gap.code in {"SQL_EXECUTION_FAILED", "UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT"}:
         return "说明该节点 SQL/执行失败，不能基于该节点输出业务结论。"
     if gap.code == "RESOURCE_DEGRADED_QUERY":

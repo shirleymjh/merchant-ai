@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +28,8 @@ from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.context_assembly import ContextAssembler
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
-from merchant_ai.services.memory import StructuredMemoryStore
+from merchant_ai.services.memory import create_memory_store, truncate_memory_text_by_tokens
+from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.observability import artifact_ref_from_path
 
 
@@ -127,6 +129,76 @@ class PermissionMiddleware(HarnessMiddleware):
         return state
 
 
+class ActionContractMiddleware(HarnessMiddleware):
+    """Validate the selected action against declared state contracts."""
+
+    name = "action_contract"
+
+    def __init__(self):
+        from merchant_ai.graph.policy import AgentActionRegistry
+
+        self.registry = AgentActionRegistry()
+
+    def before_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
+        action = self.registry.get(decision.selected_action)
+        missing_keys = [key for key in action.required_state_keys if not state_path_ready(state, key)]
+        missing_flags = [flag for flag in action.required_state_flags if not bool(state.get(flag))]
+        if not missing_keys and not missing_flags:
+            return state
+
+        fallback_id = self.fallback_action(action.fallback_action, missing_keys, missing_flags)
+        fallback = self.registry.get(fallback_id)
+        original_action = decision.selected_action
+        original_node = decision.selected_node
+        if fallback.id == original_action:
+            fallback = self.registry.get("answer_data")
+            fallback_id = fallback.id
+
+        decision.selected_action = fallback.id
+        decision.selected_node = fallback.node
+        decision.source = "contract"
+        decision.reason = (
+            "Action contract rerouted %s to %s; missing keys=%s flags=%s. %s"
+            % (original_action, fallback.id, missing_keys, missing_flags, decision.reason or "")
+        ).strip()
+        available = [fallback.id] + [item for item in decision.available_actions if item != fallback.id]
+        decision.available_actions = available
+        append_middleware_event(
+            state,
+            self.name,
+            "before_action",
+            status="rerouted",
+            code="ACTION_CONTRACT_MISSING_PREREQUISITE",
+            message="selected action was rerouted before execution because required state was not ready",
+            metadata={
+                "fromAction": original_action,
+                "fromNode": original_node,
+                "toAction": fallback.id,
+                "toNode": fallback.node,
+                "missingStateKeys": missing_keys,
+                "missingStateFlags": missing_flags,
+            },
+        )
+        return state
+
+    def fallback_action(self, configured: str, missing_keys: List[str], missing_flags: List[str]) -> str:
+        if "topic_routed" in missing_flags:
+            return "route_topic"
+        if "data_discovered" in missing_flags:
+            return "retrieve_knowledge"
+        if "planning_assets_compacted" in missing_flags:
+            return "compact_assets"
+        if "plan.intents" in missing_keys:
+            return "plan_graph"
+        if "query_graph_validated" in missing_flags:
+            return "validate_graph"
+        if "sql_generated" in missing_flags:
+            return "execute_graph"
+        if "agent_run_result.task_results" in missing_keys:
+            return "execute_graph"
+        return configured or "answer_data"
+
+
 class ContextBudgetMiddleware(HarnessMiddleware):
     name = "context_budget"
 
@@ -205,6 +277,16 @@ class SummarizeMiddleware(HarnessMiddleware):
             return state
         before_tokens = context_report_estimated_tokens(report)
         target_tokens = int(max(1, (self.settings.context_window_tokens or 1) * (self.settings.context_compaction_target_ratio or 0.4)))
+        checkpoint = write_middleware_json_artifact(
+            state,
+            self.settings,
+            "context",
+            "runtime_checkpoint_%s.json" % stage,
+            build_runtime_checkpoint_payload(state, stage),
+        )
+        if checkpoint and (checkpoint.path or checkpoint.relative_path or checkpoint.merchant_uri):
+            state.setdefault("runtime_checkpoints", []).append(checkpoint.model_dump(by_alias=True))
+            state["runtime_checkpoints"] = state["runtime_checkpoints"][-8:]
         summary = build_compression_summary(state, target_tokens * 4)
         artifact = write_middleware_text_artifact(state, self.settings, "context", "summary_%s.md" % stage, summary)
         state["summary_context"] = summary
@@ -226,8 +308,8 @@ class SummarizeMiddleware(HarnessMiddleware):
             "before_policy",
             status="compressed",
             code="CONTEXT_SUMMARIZED",
-            message="context compressed to summary artifact",
-            artifact_refs=[artifact],
+            message="context compressed to summary artifact after runtime checkpoint flush",
+            artifact_refs=[ref for ref in [checkpoint, artifact] if ref and (ref.path or ref.relative_path or ref.merchant_uri)],
             input_chars=before_tokens * 4,
             output_chars=len(summary),
         )
@@ -402,18 +484,30 @@ class MemoryMiddleware(HarnessMiddleware):
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.memory_store = StructuredMemoryStore(settings)
+        self.memory_store = create_memory_store(settings)
 
     def before_policy(self, state: AgentState) -> AgentState:
         injection = self.memory_store.select_for_question(
             state,
-            budget_chars=int(self.settings.context_memory_budget_chars or 1800),
+            budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
         )
         state["memory_injection"] = injection
         state["memory_injection_trace"] = injection.get("memoryInjectionTrace", {})
+        constraints = build_memory_constraints(injection)
+        state["memory_constraints"] = constraints
+        state["memory_constraint_trace"] = {
+            "constraintCount": len(constraints),
+            "requiredCount": sum(1 for item in constraints if str(item.get("enforcement") or "") == "required"),
+            "clarifyCount": sum(1 for item in constraints if str(item.get("enforcement") or "") == "clarify_or_disclose"),
+            "source": injection.get("source", ""),
+            "selectedIds": (injection.get("memoryInjectionTrace") or {}).get("selectedIds", []),
+        }
         rendered = self.memory_store.render_injection(injection)
         if rendered:
-            state["memory_context"] = rendered[: int(self.settings.context_memory_budget_chars or 1800)]
+            state["memory_context"] = truncate_memory_text_by_tokens(
+                rendered,
+                int(self.settings.context_memory_budget_tokens or 1200),
+            )
         recent_focus = state.get("recent_focus")
         memory_context = str(state.get("memory_context") or "")
         append_middleware_event(
@@ -432,6 +526,7 @@ class MemoryMiddleware(HarnessMiddleware):
                 "budgetUsedChars": (injection.get("memoryInjectionTrace") or {}).get("budgetUsedChars", 0),
                 "filteredReasons": (injection.get("memoryInjectionTrace") or {}).get("filteredReasons", {}),
                 "memorySource": injection.get("source", ""),
+                "memoryConstraintCount": len(constraints),
             },
         )
         return state
@@ -584,6 +679,7 @@ def default_harness_middlewares(settings: Settings, context_manager: ContextMana
     return [
         CancellationMiddleware(settings),
         PermissionMiddleware(),
+        ActionContractMiddleware(),
         ProviderCompatibilityMiddleware(),
         ClarificationMiddleware(),
         ToolCallRecoveryMiddleware(),
@@ -625,6 +721,24 @@ def append_middleware_event(
     )
     state.setdefault("middleware_events", []).append(event)
     state["middleware_events"] = state["middleware_events"][-200:]
+
+
+def state_path_ready(state: AgentState, path: str) -> bool:
+    value: Any = state
+    for part in [item for item in str(path or "").split(".") if item]:
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            value = getattr(value, part, None)
+        if value is None:
+            return False
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
 
 
 def format_clarification_message(question: str, options: List[str]) -> str:
@@ -717,7 +831,12 @@ def context_report_estimated_tokens(report: Any) -> int:
 
 
 def estimate_text_tokens(text: str) -> int:
-    return max(1, int((len(text or "") + 3) / 4))
+    value = str(text or "")
+    if not value:
+        return 1
+    cjk_count = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", value))
+    non_cjk_count = max(0, len(value) - cjk_count)
+    return max(1, cjk_count + int((non_cjk_count + 3) / 4))
 
 
 def safe_json(value: Any) -> str:
@@ -761,6 +880,42 @@ def build_compression_summary(state: AgentState, max_chars: int) -> str:
         for gap in gaps[:12]:
             lines.append("- %s %s" % (getattr(gap, "code", ""), str(getattr(gap, "message", ""))[:240]))
     return "\n".join(lines)[: max(1000, max_chars)]
+
+
+def build_runtime_checkpoint_payload(state: AgentState, stage: str) -> Dict[str, Any]:
+    validation = state.get("query_graph_validation_result")
+    run_result = state.get("agent_run_result")
+    plan = state.get("plan")
+    manifest = state.get("workspace_manifest")
+    return {
+        "version": "runtime_checkpoint.v1",
+        "stage": stage,
+        "createdAt": datetime.now().isoformat(),
+        "question": state.get("question", ""),
+        "runId": state.get("run_id", ""),
+        "threadId": state.get("thread_id", ""),
+        "queryGraph": plan.model_dump(by_alias=True) if hasattr(plan, "model_dump") else {},
+        "validation": validation.model_dump(by_alias=True) if hasattr(validation, "model_dump") else {},
+        "evidenceGaps": [
+            gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap
+            for gap in getattr(run_result, "evidence_gaps", [])[:24]
+        ]
+        if run_result is not None
+        else [],
+        "memoryConstraints": state.get("memory_constraints", []),
+        "memoryConstraintTrace": state.get("memory_constraint_trace", {}),
+        "runtimeInjection": state.get("runtime_injection", {}),
+        "threadContext": state.get("thread_context", {}),
+        "artifactManifest": manifest.model_dump(by_alias=True) if hasattr(manifest, "model_dump") else manifest,
+        "recentActions": [
+            item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+            for item in state.get("action_history", [])[-12:]
+        ],
+        "recentSteps": [
+            item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+            for item in state.get("run_steps", [])[-12:]
+        ],
+    }
 
 
 def protected_fact_keys(state: AgentState) -> List[str]:

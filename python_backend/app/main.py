@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -77,7 +78,15 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
         run_manager.append_event(run.run_id, thread.thread_id, event_type, node, payload)
 
     try:
-        response = await workflow.run_async(request.message, merchant_id, request.context, listener, thread.thread_id, run.run_id)
+        response = await workflow.run_async(
+            request.message,
+            merchant_id,
+            request.context,
+            listener,
+            thread.thread_id,
+            run.run_id,
+            message_history=request.message_history,
+        )
         run_manager.complete_run(run.run_id, response)
         return response.model_dump(by_alias=True)
     except Exception as exc:
@@ -265,17 +274,21 @@ def review_operator_knowledge_suggestion(item_id: str, request: KnowledgeSuggest
     items = load_knowledge_suggestions()
     target = None
     for item in items:
-        if item.get("id") == item_id:
+        if item.get("id") == item_id or item.get("suggestionId") == item_id:
             target = item
             break
     if target is None:
-        target = {"id": item_id}
+        target = {"id": item_id, "suggestionId": item_id}
         items.append(target)
+    target.setdefault("id", item_id)
+    target.setdefault("suggestionId", item_id)
     target.update(
         {
-            "status": "APPROVED" if request.approved else "REJECTED",
+            "status": "approved" if request.approved else "rejected",
             "reviewer": request.reviewer,
             "reviewNote": request.review_note,
+            "approvedBy": request.reviewer if request.approved else "",
+            "reviewedAt": datetime.now().isoformat(),
         }
     )
     save_knowledge_suggestions(items)

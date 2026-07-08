@@ -43,6 +43,7 @@ from merchant_ai.services.formulas import (
     reconcile_metric_formula_for_schema,
 )
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.memory_constraints import memory_constraint_validation_gaps
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.routing import extract_days
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
@@ -825,10 +826,24 @@ class QueryGraphPlanner:
             else None
         )
         if self.llm.configured:
-            payload = self._llm_understand(question, asset_pack, gaps, trace, planner_context=planner_context, prior_understanding=prior_understanding)
+            initial_tool_entry = self._initial_semantic_tool_entry(question, asset_pack, gaps, planner_context)
+            start_with_workspace = bool(initial_tool_entry)
+            payload = self._llm_understand(
+                question,
+                asset_pack,
+                gaps,
+                trace,
+                planner_context=planner_context,
+                prior_understanding=prior_understanding,
+                use_tool_loop=start_with_workspace,
+                filesystem_context_entry=initial_tool_entry or "fast_path",
+            )
             plan = self._plan_from_payload(question, payload, asset_pack)
             recovery_used = False
             if plan.intents:
+                if start_with_workspace:
+                    plan.agent_trace.append("planner.semantic_tool_loop=%s" % initial_tool_entry)
+                    plan.agent_trace.append("planner.filesystem_context_mode=%s" % self._filesystem_context_mode())
                 plan.agent_trace.append("planner.llm_call_budget=main_only_success")
                 return plan, plan.knowledge_requests, payload.get("reason", "")
             if plan.knowledge_requests:
@@ -850,6 +865,7 @@ class QueryGraphPlanner:
                     planner_context=planner_context,
                     use_tool_loop=True,
                     prior_understanding=prior_understanding,
+                    filesystem_context_entry="recovery",
                 )
                 tool_plan = self._plan_from_payload(question, tool_payload, asset_pack)
                 if tool_plan.intents:
@@ -1051,7 +1067,9 @@ class QueryGraphPlanner:
         planner_context: Dict[str, Any] | None = None,
         use_tool_loop: bool = False,
         prior_understanding: Dict[str, Any] | None = None,
+        filesystem_context_entry: str = "",
     ) -> Dict[str, Any]:
+        filesystem_entry = filesystem_context_entry or ("recovery" if use_tool_loop else "fast_path")
         prompt = self.prompt_assembler.render(
             "planner.question_understanding",
             variables={
@@ -1066,7 +1084,18 @@ class QueryGraphPlanner:
                     "Planner compact retry：只使用最相关的表/指标/关系，优先返回 questionUnderstanding，禁止输出 QueryGraph/SQL。"
                     if compact_retry
                     else (
-                        "Planner semantic tool loop：当 semanticCatalog 清单不足以判断字段/口径/关系时，按需调用 semantic_read/grep 或 artifact_read/grep；准备好后调用 emit_question_understanding。"
+                        (
+                            "Planner File-System-as-Context：初始上下文只提供语义工作区目录和资产引用；"
+                            "涉及指标口径、字段语义、表关系、规则依据时，必须先调用 semantic_ls/semantic_grep/semantic_read 按需读取详情，"
+                            "读到足够依据后再调用 emit_question_understanding。"
+                            if filesystem_entry == "initial"
+                            else (
+                                "Planner adaptive semantic tools：先判断当前 PlanningAssetPack 摘要是否足够；"
+                                "足够就直接调用 emit_question_understanding，不足再按需调用 semantic_ls/semantic_grep/semantic_read 读取指标口径、字段语义或表关系。"
+                                if filesystem_entry == "adaptive"
+                                else "Planner semantic tool loop：当 semanticCatalog 清单不足以判断字段/口径/关系时，按需调用 semantic_read/grep 或 artifact_read/grep；准备好后调用 emit_question_understanding。"
+                            )
+                        )
                         if use_tool_loop
                         else "Planner fast path：只使用 ultra compact semanticCatalog、validationGaps 和最近 trace；优先直接调用 emit_question_understanding。缺关键知识时返回 NEED_MORE_KNOWLEDGE，不要猜表字段。"
                     )
@@ -1083,6 +1112,7 @@ class QueryGraphPlanner:
             planner_context,
             include_full_file_context=use_tool_loop,
             prior_understanding=prior_understanding,
+            filesystem_entry=filesystem_entry,
         )
         if prior_understanding:
             user_payload["previousUnderstanding"] = compact_previous_understanding(prior_understanding)
@@ -1102,6 +1132,7 @@ class QueryGraphPlanner:
             prompt.system_prompt,
             tool_schema,
             budget,
+            filesystem_entry=filesystem_entry,
         )
         if budget > 0 and stats.get("totalChars", 0) > budget and not use_tool_loop:
             return {
@@ -1114,7 +1145,13 @@ class QueryGraphPlanner:
                 "_plannerBudgetTrace": budget_trace,
             }
         payload = (
-            self._llm_understand_with_semantic_tools(prompt.system_prompt, user_payload, tool, force_catalog)
+            self._llm_understand_with_semantic_tools(
+                prompt.system_prompt,
+                user_payload,
+                tool,
+                force_catalog,
+                require_semantic_read_before_emit=filesystem_entry == "initial",
+            )
             if use_tool_loop
             else {}
         )
@@ -1151,6 +1188,8 @@ class QueryGraphPlanner:
         payload["_plannerBudgetTrace"] = budget_trace
         if compact_retry:
             payload["_compactRetry"] = True
+        if use_tool_loop:
+            payload["_filesystemContextEntry"] = filesystem_entry
         return payload
 
     def _budgeted_understanding_user_payload(
@@ -1167,6 +1206,7 @@ class QueryGraphPlanner:
         system_prompt: str,
         tool_schema: Dict[str, Any],
         budget: int,
+        filesystem_entry: str = "",
     ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
         budget_trace: List[Dict[str, Any]] = []
         max_level = 0 if use_tool_loop else 2
@@ -1184,6 +1224,7 @@ class QueryGraphPlanner:
                 include_full_file_context=use_tool_loop,
                 prior_understanding=prior_understanding,
                 budget_level=level,
+                filesystem_entry=filesystem_entry,
             )
             if prior_understanding:
                 payload["previousUnderstanding"] = compact_previous_understanding(prior_understanding, max_items=max(1, 3 - level))
@@ -1208,6 +1249,89 @@ class QueryGraphPlanner:
                 break
         selected_stats["budgetTrace"] = budget_trace
         return selected_user, selected_stats, budget_trace
+
+    def _initial_semantic_tool_entry(
+        self,
+        question: str,
+        asset_pack: PlanningAssetPack,
+        gaps: List[GraphValidationGap],
+        planner_context: Dict[str, Any] | None = None,
+    ) -> str:
+        if not self._semantic_tooling_available():
+            return ""
+        mode = self._filesystem_context_mode()
+        if mode == "off":
+            return ""
+        if mode == "strict":
+            return "initial"
+        return "adaptive"
+
+    def _filesystem_context_mode(self) -> str:
+        mode = str(getattr(self.settings, "planner_filesystem_context_mode", "auto") or "auto").strip().lower()
+        if mode in {"strict", "on", "always", "true", "1"}:
+            return "strict"
+        if mode in {"off", "false", "0", "disabled"}:
+            return "off"
+        return "auto"
+
+    def _semantic_tooling_available(self) -> bool:
+        return bool(self.semantic_catalog and hasattr(self.llm, "tool_chat") and self.settings.agent_planner_tool_rounds > 0)
+
+    def _should_start_with_semantic_workspace(
+        self,
+        question: str,
+        asset_pack: PlanningAssetPack,
+        gaps: List[GraphValidationGap],
+        planner_context: Dict[str, Any] | None = None,
+    ) -> bool:
+        mode = self._filesystem_context_mode()
+        if mode == "off":
+            return False
+        if not self.semantic_catalog or not hasattr(self.llm, "tool_chat") or self.settings.agent_planner_tool_rounds <= 0:
+            return False
+        if mode == "strict":
+            return True
+        normalized = normalize_for_match(question)
+        complex_terms = [
+            "同时",
+            "并且",
+            "再看",
+            "关联",
+            "这些",
+            "判断",
+            "分析",
+            "原因",
+            "为什么",
+            "趋势",
+            "异常",
+            "占比",
+            "比例",
+            "排行",
+            "排名",
+            "top",
+            "最高",
+            "最低",
+            "前",
+        ]
+        has_complex_phrase = any(term in normalized for term in complex_terms)
+        tables = asset_pack.known_tables()
+        metric_tables = {str(item.table or "") for item in asset_pack.metrics if item.table}
+        field_tables = {str(item.table or "") for item in asset_pack.fields if item.table}
+        topics = {
+            str(item.topic or "")
+            for item in list(asset_pack.tables) + list(asset_pack.metrics) + list(asset_pack.fields) + list(asset_pack.rules)
+            if item.topic
+        }
+        has_cross_table_assets = len(set(tables) | metric_tables | field_tables) >= 2
+        has_multiple_metrics = len(asset_pack.metrics) >= 2
+        has_relationships = bool(asset_pack.relationships)
+        has_gaps = bool(gaps)
+        has_prior_understanding = isinstance(planner_context, dict) and bool(planner_context.get("previousUnderstanding"))
+        return bool(
+            has_gaps
+            or has_prior_understanding
+            or (has_complex_phrase and (has_cross_table_assets or has_multiple_metrics or has_relationships or len(topics) >= 2))
+        )
 
     def _should_enter_semantic_tool_loop(self, payload: Dict[str, Any], plan: QueryPlan) -> bool:
         if not self.semantic_catalog or not hasattr(self.llm, "tool_chat") or self.settings.agent_planner_tool_rounds <= 0:
@@ -1254,8 +1378,13 @@ class QueryGraphPlanner:
         include_full_file_context: bool = False,
         prior_understanding: Dict[str, Any] | None = None,
         budget_level: int = 0,
+        filesystem_entry: str = "",
     ) -> Dict[str, Any]:
-        catalog = ultra_compact_understanding_catalog(asset_pack, question, planner_context, budget_level=budget_level)
+        catalog = (
+            filesystem_workspace_index_catalog(asset_pack, question, planner_context, budget_level=budget_level)
+            if include_full_file_context and filesystem_entry == "initial"
+            else ultra_compact_understanding_catalog(asset_pack, question, planner_context, budget_level=budget_level)
+        )
         prompt_tables = [str(item.get("table") or "") for item in catalog.get("tables") or [] if item.get("table")]
         table_limit = max(1, int(self.settings.agent_planner_seed_table_limit or 4))
         repair_feedback = planner_repair_feedback_for_understanding(gaps, prior_understanding or {})
@@ -1263,6 +1392,7 @@ class QueryGraphPlanner:
             "question": question,
             "semanticCatalog": catalog,
             "diagnosticContext": compact_planner_context(planner_context) if budget_level < 2 else {},
+            "memoryConstraints": compact_memory_constraints(planner_context) if budget_level < 2 else [],
             "validationGaps": [gap.model_dump(by_alias=True) for gap in gaps],
             "repairFeedback": repair_feedback,
             "trace": compact_planner_trace(trace, gaps, compact_retry)[: max(1, 3 - budget_level)],
@@ -1271,10 +1401,18 @@ class QueryGraphPlanner:
             "outputContract": {
                 "tool": "emit_question_understanding",
                 "status": "UNDERSTOOD | INVALID" if force_catalog else "UNDERSTOOD | NEED_MORE_KNOWLEDGE | INVALID",
-                "metricRefRule": "rankingObjective/requestedMeasures.metricRef must come from semanticCatalog.candidateMetrics.key",
+                "metricRefRule": (
+                    "rankingObjective/requestedMeasures.metricRef must come from semantic_read loaded metric definitions or semanticCatalog.candidateMetrics.key"
+                    if include_full_file_context
+                    else "rankingObjective/requestedMeasures.metricRef must come from semanticCatalog.candidateMetrics.key"
+                ),
                 "ownerTableRule": "ownerTable must equal the selected metric table",
                 "scopeRule": "business population limits such as 'within a selected set' must be declared in scopeConstraints and compiled before ranking/measures",
                 "calculationRule": "when the user asks for proportion/percentage/占比/占多少, declare calculationIntents as event population divided by base population",
+                "memoryRule": (
+                    "memoryConstraints are validate-only hints: use them only by selecting semanticCatalog-supported "
+                    "metricRefs/filters; never rewrite semanticCatalog formulas, fields, or relationships from memory"
+                ),
                 "populationRatioExamples": [
                     "使用优惠券的订单中有退货占多少 => base=使用优惠券的订单,event=有退货的订单,denom=order_detail_cnt,numer=refund_bill_cnt",
                     "有客服工单的订单后来发生赔付占多少 => base=有客服工单的订单,event=发生赔付的订单,denom=order_detail_cnt,numer=repay_bill_cnt",
@@ -1291,6 +1429,28 @@ class QueryGraphPlanner:
                 limit=table_limit,
             )
             payload["semanticFileContext"] = payload["semanticWorkspace"]
+            payload["filesystemContextPolicy"] = {
+                "entry": filesystem_entry or "recovery",
+                "initialView": (
+                    "semantic workspace index and refs only"
+                    if filesystem_entry == "initial"
+                    else "compact PlanningAssetPack candidates plus semantic workspace refs"
+                    if filesystem_entry == "adaptive"
+                    else "semantic workspace plus compact candidates"
+                ),
+                "mustReadBeforeEmit": filesystem_entry == "initial",
+                "readWhenNeeded": [
+                    "metric口径或别名不确定",
+                    "字段语义或展示字段不确定",
+                    "多表关系、实体键或依赖边不确定",
+                    "规则证据、分析证据或新鲜度口径不确定",
+                ],
+                "forbidden": [
+                    "不要根据表名或字段名猜指标口径",
+                    "不要要求系统预加载全量 schema",
+                    "不要输出 SQL",
+                ],
+            }
         return payload
 
     def _llm_understand_with_semantic_tools(
@@ -1299,6 +1459,7 @@ class QueryGraphPlanner:
         user_payload: Dict[str, Any],
         output_tool: Any,
         force_catalog: bool,
+        require_semantic_read_before_emit: bool = False,
     ) -> Dict[str, Any]:
         if not self.semantic_catalog or not hasattr(self.llm, "tool_chat") or self.settings.agent_planner_tool_rounds <= 0:
             return {}
@@ -1311,6 +1472,24 @@ class QueryGraphPlanner:
         final_payload: Dict[str, Any] = {}
         for round_index in range(max(1, self.settings.agent_planner_tool_rounds)):
             round_payload = dict(user_payload)
+            filesystem_policy = round_payload.get("filesystemContextPolicy") or {}
+            filesystem_entry = str(filesystem_policy.get("entry") or "")
+            if filesystem_entry == "adaptive":
+                planner_tool_instruction = (
+                    "Adaptive semantic tools: first decide whether the compact PlanningAssetPack/semanticCatalog is enough. "
+                    "If enough, call emit_question_understanding immediately. If metric formula, field semantics, relationship keys, "
+                    "rule evidence, or freshness policy is uncertain, call semantic_ls/semantic_grep to locate refs and semantic_read "
+                    "only the exact files needed; then emit_question_understanding. Do not ask the system to preload full semantic assets. "
+                    "If repairFeedback exists, address it before emitting and do not repeat the invalid understanding."
+                )
+            else:
+                planner_tool_instruction = (
+                    "Use FileSystem-as-Context: start from semanticWorkspace manifests, call semantic_ls/semantic_grep to locate refs, "
+                    "then semantic_read only the exact table/metric/relationship/rule file needed; call emit_question_understanding when ready. "
+                    "Do not ask the system to preload full semantic assets. "
+                    "If repairFeedback exists, address it before emitting and do not repeat the invalid understanding. "
+                    "If previousUnderstanding declares comparison_baseline or trend_context, inspect semantic files for the best metric owner table before emitting."
+                )
             round_payload["plannerToolResults"] = planner_tool_results_for_prompt(
                 planner_tool_results,
                 max_items=4,
@@ -1319,13 +1498,7 @@ class QueryGraphPlanner:
             round_payload["plannerToolPolicy"] = {
                 "round": round_index + 1,
                 "maxRounds": self.settings.agent_planner_tool_rounds,
-                "instruction": (
-                    "Use FileSystem-as-Context: start from semanticWorkspace manifests, call semantic_ls/semantic_grep to locate refs, "
-                    "then semantic_read only the exact table/metric/relationship/rule file needed; call emit_question_understanding when ready. "
-                    "Do not ask the system to preload full semantic assets. "
-                    "If repairFeedback exists, address it before emitting and do not repeat the invalid understanding. "
-                    "If previousUnderstanding declares comparison_baseline or trend_context, inspect semantic files for the best metric owner table before emitting."
-                ),
+                "instruction": planner_tool_instruction,
                 "forceCatalog": force_catalog,
             }
             prompt_artifact = self.artifact_store.write_json("planner", "planner_round_%d_prompt.json" % (round_index + 1), round_payload, preview_chars=0)
@@ -1340,6 +1513,18 @@ class QueryGraphPlanner:
             planner_tool_calls.extend([call.model_dump(by_alias=True) for call in calls])
             emit_call = next((call for call in calls if call.name == output_tool.name), None)
             if emit_call:
+                if require_semantic_read_before_emit and not loaded_refs:
+                    planner_tool_results.append(
+                        {
+                            "id": "planner_policy_violation_%d" % (round_index + 1),
+                            "name": "planner_filesystem_context_policy",
+                            "status": "error",
+                            "errorType": "SEMANTIC_READ_REQUIRED",
+                            "errorMessage": "Initial File-System-as-Context requires semantic_ls/grep/read before emit_question_understanding.",
+                            "round": round_index + 1,
+                        }
+                    )
+                    continue
                 final_payload = dict(emit_call.args)
                 break
             semantic_calls = [call for call in calls if call.name.startswith("semantic_") or call.name.startswith("artifact_")]
@@ -2081,6 +2266,36 @@ def compact_planner_context(planner_context: Dict[str, Any] | None) -> Dict[str,
         "goal": str(diagnostic.get("goal") or ""),
         "seedTopics": [str(item) for item in diagnostic.get("seedTopics") or diagnostic.get("seed_topics") or [] if item][:8],
     }
+
+
+def compact_memory_constraints(planner_context: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    if not isinstance(planner_context, dict):
+        return []
+    constraints = planner_context.get("memoryConstraints") or planner_context.get("memory_constraints") or []
+    if not isinstance(constraints, list):
+        return []
+    compacted: List[Dict[str, Any]] = []
+    for item in constraints[:12]:
+        if not isinstance(item, dict):
+            continue
+        compacted.append(
+            {
+                key: item.get(key)
+                for key in [
+                    "id",
+                    "type",
+                    "enforcement",
+                    "instruction",
+                    "targetMetrics",
+                    "topics",
+                    "timeWindows",
+                    "confidence",
+                    "governanceInstruction",
+                ]
+                if item.get(key) not in (None, "", [], {})
+            }
+        )
+    return compacted
 
 
 def planner_failure_trace_reason(configured: bool, last_error: str) -> str:
@@ -2880,6 +3095,8 @@ def critic_actions_for_gap(code: str) -> List[str]:
         return ["repair_graph"]
     if code in {"REQUESTED_MEASURE_NOT_PLANNED"}:
         return ["retrieve_knowledge", "plan_graph"]
+    if code in {"MEMORY_CONSTRAINT_UNAPPLIED"}:
+        return ["plan_graph"]
     return ["repair_graph"]
 
 
@@ -2934,7 +3151,13 @@ def calculation_contract_gaps(plan: QueryPlan) -> List[GraphValidationGap]:
 
 
 class QueryGraphValidator:
-    def validate(self, question: str, plan: QueryPlan, asset_pack: PlanningAssetPack) -> GraphValidationResult:
+    def validate(
+        self,
+        question: str,
+        plan: QueryPlan,
+        asset_pack: PlanningAssetPack,
+        memory_constraints: List[Dict[str, Any]] | None = None,
+    ) -> GraphValidationResult:
         gaps: List[GraphValidationGap] = []
         planner_failure_code = planner_failure_gap_code(plan)
         planner_failed = bool(planner_failure_code)
@@ -3043,6 +3266,7 @@ class QueryGraphValidator:
             )
         gaps.extend(explicit_object_ref_filter_gaps(question, plan, asset_pack))
         gaps.extend(calculation_contract_gaps(plan))
+        gaps.extend(memory_constraint_validation_gaps(question, plan, memory_constraints or []))
         cycle = dependency_cycle(plan.dependencies)
         if cycle:
             gaps.append(
@@ -3510,6 +3734,70 @@ def ultra_compact_understanding_catalog(
             "ultra compact semantic candidates for questionUnderstanding; tables are first-layer manifests, "
             "candidateMetrics are selected by per-table coverage first and global relevance second; "
             "candidateMetrics may cite additional ownerTable values and the compiler will load those tables on demand"
+        ),
+    }
+
+
+def filesystem_workspace_index_catalog(
+    asset_pack: PlanningAssetPack,
+    question: str = "",
+    planner_context: Dict[str, Any] | None = None,
+    budget_level: int = 0,
+) -> Dict[str, Any]:
+    """Planner L0 catalog for File-System-as-Context.
+
+    This intentionally exposes refs and lightweight titles only. Field lists,
+    formulas and join keys should be loaded with semantic_read when needed.
+    """
+
+    base = ultra_compact_understanding_catalog(asset_pack, question, planner_context, budget_level=budget_level)
+    return {
+        "mode": "filesystem_workspace_index",
+        "tables": [
+            {
+                "table": item.get("table", ""),
+                "domain": item.get("domain", ""),
+                "sourceRefId": item.get("sourceRefId", ""),
+                "readHint": "semantic_read table asset before using fields or grain",
+            }
+            for item in base.get("tables", [])
+        ],
+        "candidateMetrics": [
+            {
+                "key": item.get("key", ""),
+                "table": item.get("table", ""),
+                "title": item.get("title", ""),
+                "matchedPhrases": item.get("matchedPhrases", []),
+                "sourceRefId": item.get("sourceRefId", ""),
+                "readHint": "semantic_read metric/table asset before using formula or owner table",
+            }
+            for item in base.get("candidateMetrics", [])
+        ],
+        "candidateFields": [
+            {
+                "key": item.get("key", ""),
+                "table": item.get("table", ""),
+                "title": item.get("title", ""),
+                "matchedPhrases": item.get("matchedPhrases", []),
+                "sourceRefId": item.get("sourceRefId", ""),
+                "readHint": "semantic_read field/table asset before relying on this field",
+            }
+            for item in base.get("candidateFields", [])
+        ],
+        "relationships": [
+            {
+                "relationshipId": item.get("relationshipId", ""),
+                "leftTable": item.get("leftTable", ""),
+                "rightTable": item.get("rightTable", ""),
+                "sourceRefId": item.get("sourceRefId", ""),
+                "readHint": "semantic_read relationships file before creating dependency edges",
+            }
+            for item in base.get("relationships", [])
+        ],
+        "budgetLevel": budget_level,
+        "catalogPolicy": (
+            "L0 workspace index only. Use semantic_ls/semantic_grep to locate refs and semantic_read to load table, "
+            "metric, field or relationship details before emitting questionUnderstanding."
         ),
     }
 

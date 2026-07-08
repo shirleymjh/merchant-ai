@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,7 +22,7 @@ from merchant_ai.models import (
     category_display,
 )
 from merchant_ai.services.llm import LlmClient
-from merchant_ai.services.memory import StructuredMemoryStore
+from merchant_ai.services.memory import MemoryStore
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, PendingAnswerStore
 
@@ -32,7 +33,9 @@ def answer_context_policy() -> str:
         "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
         "不要使用“分析结论”“关键证据”“限制”“证据门禁”“当前证据显示”“已看到的点位显示”这类报告或内部调试话术。"
         "不要说“查到几行”“使用表”“SQL”“字段名”“Doris”；不要输出 markdown 表格，表格和图表由前端结构化区域渲染。"
-        "用户没有问口径时，不要展开字段、来源表和计算公式；同一指标存在多个候选口径时，只回答语义层确认的主口径，不要把多个相似口径并列解释。"
+        "核心经营指标可以默认保留一句业务口径说明，只说统计对象、时间和店铺范围；用户没有问口径时，不要展开字段、来源表和计算公式。"
+        "同一指标存在多个候选口径时，只回答语义层确认的主口径，不要把多个相似口径并列解释。"
+        "用户提到和后台/看板数据不一致时，进入口径对账思路，优先说明时间口径、订单状态、是否扣退款、商品粒度和数据更新时间。"
         "如果是趋势问题，第一段直接写“最近N天，指标从 A 变化到 B，整体上升/下降 C。”，不要写“趋势里”“点位显示”；有峰值和低点时用一句话说明。"
         "dataRows 或 dataSections 中 resultRole=summary 的行是已验证汇总结果，优先用于回答总量；resultRole=trend_context 的行只用于解释趋势。"
         "不要因为趋势只有部分日期有点位，就否定 summary 汇总；不要说“其余日期没有看到明细”。"
@@ -91,20 +94,25 @@ class AnswerComposeService:
                 )
             answer = llm_answer or cleaned_summary
             return self._apply_answer_guard(
-                self._append_rule_evidence(
-                    self.append_business_advice(
-                        answer,
-                        plan.intents,
-                        bundle,
-                        question=question,
-                        plan=plan,
-                        run_result=run_result,
-                        merchant=merchant,
-                        personalization_context=personalization_context,
-                        allow_llm=allow_llm,
+                self._append_lightweight_metric_disclosure(
+                    self._append_rule_evidence(
+                        self.append_business_advice(
+                            answer,
+                            plan.intents,
+                            bundle,
+                            question=question,
+                            plan=plan,
+                            run_result=run_result,
+                            merchant=merchant,
+                            personalization_context=personalization_context,
+                            allow_llm=allow_llm,
+                        ),
+                        question,
+                        effective_rule_context,
                     ),
                     question,
-                    effective_rule_context,
+                    plan,
+                    run_result,
                 ),
                 run_result,
             )
@@ -129,20 +137,13 @@ class AnswerComposeService:
                 ),
                 run_result,
             )
-        if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
-            answer = self._compose_llm_business_answer(
-                question,
-                plan,
-                run_result,
-                rule_context,
-                merchant,
-                personalization_context,
-            )
-            if answer:
+        if question_asks_metric_reconciliation(question):
+            reconciliation_answer = self._metric_reconciliation_answer(question, plan, run_result)
+            if reconciliation_answer:
                 return self._apply_answer_guard(
                     self._append_rule_evidence(
                         self.append_business_advice(
-                            answer,
+                            reconciliation_answer,
                             plan.intents,
                             bundle,
                             question=question,
@@ -157,21 +158,59 @@ class AnswerComposeService:
                     ),
                     run_result,
                 )
+        if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
+            answer = self._compose_llm_business_answer(
+                question,
+                plan,
+                run_result,
+                rule_context,
+                merchant,
+                personalization_context,
+            )
+            if answer:
+                return self._apply_answer_guard(
+                    self._append_lightweight_metric_disclosure(
+                        self._append_rule_evidence(
+                            self.append_business_advice(
+                                answer,
+                                plan.intents,
+                                bundle,
+                                question=question,
+                                plan=plan,
+                                run_result=run_result,
+                                merchant=merchant,
+                                personalization_context=personalization_context,
+                                allow_llm=allow_llm,
+                            ),
+                            question,
+                            effective_rule_context,
+                        ),
+                        question,
+                        plan,
+                        run_result,
+                    ),
+                    run_result,
+                )
         return self._apply_answer_guard(
-            self._append_rule_evidence(
-                self.append_business_advice(
-                    self._fallback_data_answer(question, plan, bundle, run_result),
-                    plan.intents,
-                    bundle,
-                    question=question,
-                    plan=plan,
-                    run_result=run_result,
-                    merchant=merchant,
-                    personalization_context=personalization_context,
-                    allow_llm=allow_llm,
+            self._append_lightweight_metric_disclosure(
+                self._append_rule_evidence(
+                    self.append_business_advice(
+                        self._fallback_data_answer(question, plan, bundle, run_result),
+                        plan.intents,
+                        bundle,
+                        question=question,
+                        plan=plan,
+                        run_result=run_result,
+                        merchant=merchant,
+                        personalization_context=personalization_context,
+                        allow_llm=allow_llm,
+                    ),
+                    question,
+                    effective_rule_context,
                 ),
                 question,
-                effective_rule_context,
+                plan,
+                run_result,
             ),
             run_result,
         )
@@ -358,9 +397,29 @@ class AnswerComposeService:
         personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         selected_skill = skill_name or select_answer_skill(plan, run_result, bool(rule_context)) or "bi_trend_attribution"
+        if self._should_run_isolated_skill_worker(selected_skill):
+            from merchant_ai.services.skill_worker import SkillWorkerExecutor
+
+            result = SkillWorkerExecutor(self.llm).execute_answer_skill(
+                question,
+                plan,
+                run_result,
+                outputs_path,
+                rule_context,
+                selected_skill,
+                merchant=merchant,
+                personalization_context=personalization_context,
+                initial_trace=dict(self.last_analysis_skill_trace or {}),
+            )
+            self.last_analysis_skill_trace = result.trace
+            return result.answer
+        isolated_run_id = "skill_%s_%s" % (selected_skill, uuid.uuid4().hex[:10])
         skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / selected_skill
         skill_file = skill_dir / "SKILL.md"
         script = skill_dir / "scripts" / "profile_timeseries.py"
+        artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
+        target = artifact_root / "artifacts" / "analysis_skills" / selected_skill / "runs" / isolated_run_id
+        checkpoint_path = target / "skill_checkpoint.json"
         trace: Dict[str, Any] = {
             "skillName": selected_skill,
             "matchedBy": self.last_analysis_skill_trace.get("matchedBy") or "questionUnderstanding+verifiedEvidence",
@@ -368,10 +427,20 @@ class AnswerComposeService:
             "activated": False,
             "skillPath": str(skill_file),
             "scriptPath": str(script),
+            "lifecycleStage": "matched",
+            "requiresConfirmation": bool(self.llm.settings.skill_confirmation_required),
+            "confirmed": not bool(self.llm.settings.skill_confirmation_required),
+            "isolatedRunId": isolated_run_id,
+            "workspacePath": str(target),
+            "checkpointPath": str(checkpoint_path),
+            "progress": ["matched"],
+            "reuseCandidate": False,
         }
         self.last_analysis_skill_trace = trace
         if not skill_file.exists():
             trace["error"] = "skill package missing"
+            trace["lifecycleStage"] = "failed"
+            trace["progress"].append("failed:skill package missing")
             return ""
         skill_meta = load_skill_frontmatter(skill_file)
         trace["metadata"] = skill_meta
@@ -390,9 +459,9 @@ class AnswerComposeService:
             )
         if not script.exists():
             trace["error"] = "skill script missing"
+            trace["lifecycleStage"] = "failed"
+            trace["progress"].append("failed:skill script missing")
             return ""
-        artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
-        target = artifact_root / "artifacts" / "analysis_skills" / selected_skill
         target.mkdir(parents=True, exist_ok=True)
         input_path = target / "skill_input.json"
         output_path = target / "skill_output.json"
@@ -413,8 +482,11 @@ class AnswerComposeService:
                 "inputArtifact": str(input_path),
                 "outputArtifact": str(output_path),
                 "inputRows": len(payload.get("dataRows") or []),
+                "lifecycleStage": "isolated_execute",
+                "progress": trace["progress"] + ["confirmed" if trace["confirmed"] else "awaiting_confirmation", "isolated_execute"],
             }
         )
+        self._write_skill_checkpoint(checkpoint_path, trace, status="running")
         try:
             completed = subprocess.run(
                 [self.llm.settings.python_executable, str(script), "--input", str(input_path), "--output", str(output_path)],
@@ -425,24 +497,47 @@ class AnswerComposeService:
             )
         except Exception as exc:
             trace["error"] = str(exc)
+            trace["lifecycleStage"] = "failed"
+            trace["progress"].append("failed:%s" % str(exc)[:80])
+            self._write_skill_checkpoint(checkpoint_path, trace, status="failed")
             return ""
         trace["returnCode"] = completed.returncode
         trace["stderr"] = completed.stderr[-1000:]
         if completed.returncode != 0 or not output_path.exists():
             trace["error"] = completed.stderr[-1000:] or "skill script failed"
+            trace["lifecycleStage"] = "failed"
+            trace["progress"].append("failed:skill script failed")
+            self._write_skill_checkpoint(checkpoint_path, trace, status="failed")
             return ""
         try:
             result = json.loads(output_path.read_text(encoding="utf-8"))
         except Exception as exc:
             trace["error"] = "invalid skill output: %s" % exc
+            trace["lifecycleStage"] = "failed"
+            trace["progress"].append("failed:invalid output")
+            self._write_skill_checkpoint(checkpoint_path, trace, status="failed")
             return ""
         trace["outputRows"] = result.get("rowCount", 0)
         trace["findings"] = result.get("findings", [])[:6]
         trace["caveats"] = result.get("caveats", [])[:6]
+        trace["lifecycleStage"] = "completed"
+        trace["progress"].extend(["progress_synced", "completed"])
+        trace["reuseCandidate"] = bool(self.llm.settings.skill_reuse_suggestion_enabled and answer_skill_reuse_candidate(selected_skill, result))
+        self._write_skill_checkpoint(checkpoint_path, trace, status="completed")
         answer = str(result.get("answerMarkdown") or "").strip()
         if not answer:
             trace["error"] = "empty skill answer"
+            trace["lifecycleStage"] = "failed"
+            trace["progress"].append("failed:empty answer")
+            self._write_skill_checkpoint(checkpoint_path, trace, status="failed")
         return answer
+
+    def _should_run_isolated_skill_worker(self, skill_name: str) -> bool:
+        if not bool(getattr(self.llm.settings, "skill_worker_enabled", True)):
+            return False
+        configured = str(getattr(self.llm.settings, "skill_worker_complex_names", "") or "")
+        names = {item.strip() for item in configured.split(",") if item.strip()}
+        return not names or skill_name in names
 
     def run_structured_answer_skill(
         self,
@@ -459,7 +554,9 @@ class AnswerComposeService:
     ) -> str:
         trace = trace if trace is not None else {}
         artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
-        target = artifact_root / "artifacts" / "analysis_skills" / skill_name
+        isolated_run_id = str(trace.get("isolatedRunId") or "skill_%s_%s" % (skill_name, uuid.uuid4().hex[:10]))
+        target = artifact_root / "artifacts" / "analysis_skills" / skill_name / "runs" / isolated_run_id
+        checkpoint_path = Path(str(trace.get("checkpointPath") or target / "skill_checkpoint.json"))
         target.mkdir(parents=True, exist_ok=True)
         input_path = target / "skill_input.json"
         output_path = target / "skill_output.json"
@@ -490,9 +587,39 @@ class AnswerComposeService:
                 "inputRows": len(payload.get("dataRows") or []),
                 "outputRows": output["rowCount"],
                 "deterministicRenderer": True,
+                "lifecycleStage": "completed",
+                "isolatedRunId": isolated_run_id,
+                "workspacePath": str(target),
+                "checkpointPath": str(checkpoint_path),
+                "progress": list(dict.fromkeys((trace.get("progress") or ["matched"]) + ["confirmed", "isolated_execute", "progress_synced", "completed"])),
+                "reuseCandidate": bool(self.llm.settings.skill_reuse_suggestion_enabled and answer_skill_reuse_candidate(skill_name, output)),
             }
         )
+        self._write_skill_checkpoint(checkpoint_path, trace, status="completed")
         return answer
+
+    def _write_skill_checkpoint(self, path: Path, trace: Dict[str, Any], status: str) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "skillName": trace.get("skillName"),
+                        "isolatedRunId": trace.get("isolatedRunId"),
+                        "status": status,
+                        "stage": trace.get("lifecycleStage"),
+                        "progress": trace.get("progress") or [],
+                        "inputArtifact": trace.get("inputArtifact"),
+                        "outputArtifact": trace.get("outputArtifact"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
 
     def append_business_advice(
         self,
@@ -617,6 +744,44 @@ class AnswerComposeService:
             cleaned_lines.append(line)
         cleaned = "\n".join(cleaned_lines).strip()
         return cleaned or answer
+
+    def _append_lightweight_metric_disclosure(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not answer or not run_result or not run_result.merged_query_bundle.rows:
+            return answer
+        if question_asks_metric_reconciliation(question):
+            return answer
+        note = lightweight_metric_disclosure_note(question, plan, run_result)
+        if not note or note in answer or "统计说明：" in answer:
+            return answer
+        return answer.rstrip() + "\n\n" + note
+
+    def _metric_reconciliation_answer(self, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not run_result:
+            return ""
+        lines: List[str] = []
+        summary = multi_summary_metric_sentence(question, plan, run_result)
+        if not summary:
+            primary = primary_summary_metric_value(plan, run_result)
+            if primary:
+                label = primary.get("label") or "指标"
+                value = format_metric_value_for_answer(primary.get("value"), primary.get("metricKey") or "", str(label))
+                time_phrase = extract_question_time_phrase(question)
+                prefix = "%s，" % time_phrase if time_phrase else "本次查询范围内，"
+                summary = "%s%s为 %s。" % (prefix, label, value)
+        lines.append("口径对账：我先按本次查询口径复核。")
+        if summary:
+            lines.append(summary)
+        note = lightweight_metric_disclosure_note(question, plan, run_result)
+        if note:
+            lines.append(note)
+        lines.append("如果这个数和后台看板不一致，通常优先核对：")
+        lines.append("- 时间口径：后台按下单时间、支付时间还是退款成功时间统计。")
+        lines.append("- 状态口径：是否只算支付成功、交易成功，是否排除关闭或异常订单。")
+        lines.append("- 退款口径：GMV 是否扣退款，退款金额算申请退款还是退款成功。")
+        lines.append("- 商品粒度：按 SPU、SKU、子订单还是商品维度汇总。")
+        lines.append("- 数据更新：离线数仓和后台实时看板是否存在更新时间差。")
+        lines.append("建议把后台看板的指标名称和时间范围发来，我可以按同一口径重算。")
+        return "\n".join(lines)
 
     def _apply_answer_guard(self, answer: str, run_result: AgentRunResult | None) -> str:
         verified = run_result.verified_evidence if run_result else None
@@ -1720,6 +1885,7 @@ def answer_data_package(
             "businessContext": answer_business_context(question, plan, run_result, merchant, personalization_context),
             "dataRows": [],
             "metricDisclosures": [],
+            "lightweightMetricDisclosures": [],
             "evidenceGaps": [],
             "ruleEvidence": compact_rule_evidence(question, rule_context),
         }
@@ -1732,6 +1898,7 @@ def answer_data_package(
         "dataRows": answer_data_rows(plan, run_result),
         "dataSections": answer_prompt_sections(plan, run_result),
         "metricDisclosures": metric_disclosures(plan, verified),
+        "lightweightMetricDisclosures": lightweight_metric_disclosures(question, plan, run_result),
         "evidenceGaps": compact_evidence_gaps(run_result.evidence_gaps),
         "ruleEvidence": compact_rule_evidence(question, rule_context),
     }
@@ -1951,6 +2118,94 @@ def metric_disclosures(plan: QueryPlan, verified: Any) -> List[Dict[str, Any]]:
     return [item for item in dedupe_dicts(disclosures) if item]
 
 
+def lightweight_metric_disclosures(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> List[Dict[str, Any]]:
+    if not run_result:
+        return []
+    items: List[Dict[str, Any]] = []
+    for item in metric_disclosures(plan, run_result.verified_evidence):
+        description = lightweight_metric_description(item)
+        if not description:
+            continue
+        items.append(
+            {
+                "metricKey": item.get("metricKey") or item.get("metric"),
+                "displayName": item.get("displayName") or item.get("metricKey") or item.get("metric"),
+                "description": description,
+            }
+        )
+    return [item for item in dedupe_dicts(items) if item][:4]
+
+
+def lightweight_metric_disclosure_note(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+    disclosures = lightweight_metric_disclosures(question, plan, run_result)
+    if not disclosures:
+        return ""
+    descriptions = dedupe_strings([str(item.get("description") or "").strip() for item in disclosures])
+    descriptions = [item for item in descriptions if item]
+    if not descriptions:
+        return ""
+    time_phrase = extract_question_time_phrase(question) or "本次查询时间范围"
+    return "统计说明：%s；时间为%s；范围为当前店铺。" % ("；".join(descriptions[:3]), time_phrase)
+
+
+def lightweight_metric_description(item: Dict[str, Any]) -> str:
+    family = lightweight_metric_family(item)
+    if not family:
+        return ""
+    text = metric_disclosure_text(item)
+    display_name = str(item.get("displayName") or item.get("metricKey") or item.get("metric") or "指标")
+    if family == "gmv":
+        if re.search(r"(扣|减|净|refund|退款|-)", text, flags=re.I):
+            return "%s按扣除退款后的净成交金额统计" % display_name
+        if "trade_success" in text or "交易成功" in text:
+            return "%s按交易成功金额统计" % display_name
+        return "%s按支付成功订单金额统计，未主动扣除后续退款" % display_name
+    if family == "refund_amount":
+        if "success" in text or "成功" in text:
+            return "%s按退款成功金额统计" % display_name
+        return "%s按已确认的退款金额统计" % display_name
+    if family == "refund_rate":
+        return "%s按已确认的退款分子除以对应订单基数计算" % display_name
+    if family == "order_count":
+        if "distinct" in text or "去重" in text:
+            return "%s按订单或子订单去重统计" % display_name
+        return "%s按当前查询范围内的订单记录统计" % display_name
+    if family == "ticket_count":
+        return "%s按客服工单记录数统计" % display_name
+    return ""
+
+
+def lightweight_metric_family(item: Dict[str, Any]) -> str:
+    text = metric_disclosure_text(item)
+    if not text:
+        return ""
+    if "gmv" in text:
+        return "gmv"
+    if re.search(r"(退款|售后|refund)", text, flags=re.I) and re.search(r"(率|rate|ratio|占比)", text, flags=re.I):
+        return "refund_rate"
+    if re.search(r"(退款|售后|refund)", text, flags=re.I) and re.search(r"(金额|amt|amount|pay)", text, flags=re.I):
+        return "refund_amount"
+    if re.search(r"(下单|订单量|订单数|order.*cnt|order_detail_cnt|order_cnt)", text, flags=re.I):
+        return "order_count"
+    if re.search(r"(工单|咨询|ticket|workorder)", text, flags=re.I) and re.search(r"(量|数|cnt|count)", text, flags=re.I):
+        return "ticket_count"
+    return ""
+
+
+def metric_disclosure_text(item: Dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    parts: List[str] = []
+    for key in ["displayName", "metricKey", "metric", "requestedMetricRef", "formula", "fieldWarning"]:
+        value = item.get(key)
+        if value not in (None, "", []):
+            parts.append(str(value))
+    source_columns = item.get("sourceColumns") or []
+    if isinstance(source_columns, list):
+        parts.extend(str(column) for column in source_columns if column)
+    return " ".join(parts).lower()
+
+
 def compact_evidence_gaps(gaps: List[Any]) -> List[Dict[str, Any]]:
     compacted: List[Dict[str, Any]] = []
     for gap in gaps[:8]:
@@ -2133,6 +2388,18 @@ def remove_hidden_alternate_metric_lines(text: str, plan: QueryPlan) -> str:
 
 def question_asks_metric_disclosure(question: str) -> bool:
     return bool(re.search(r"(口径|怎么算|计算方式|字段|来源表|SQL|sql)", str(question or ""), flags=re.I))
+
+
+def question_asks_metric_reconciliation(question: str) -> bool:
+    return bool(
+        re.search(
+            r"(后台|看板|生意参谋|数据中心|报表).{0,12}(不一致|不一样|对不上|不对|差|少|多)"
+            r"|(?:不一致|不一样|对不上|数不对|差很多|少了|多了).{0,12}(后台|看板|报表)"
+            r"|(?:核对|对账).{0,12}(口径|数据|指标)",
+            str(question or ""),
+            flags=re.I,
+        )
+    )
 
 
 def remove_metric_disclosure_block(text: str) -> str:
@@ -2458,6 +2725,7 @@ def contextual_suggestion_signal_text(
     parts: List[str] = [contextual_question_intent_signal_text(question, intents)]
     context = personalization_context or {}
     parts.append(str((business_context or {}).get("merchantProfile") or ""))
+    parts.append(str((business_context or {}).get("sessionSummary") or ""))
     parts.append(str((business_context or {}).get("memorySummary") or ""))
     parts.append(json.dumps((business_context or {}).get("recentFocus") or {}, ensure_ascii=False, default=str))
     parts.append(json.dumps((business_context or {}).get("relevantPreferences") or [], ensure_ascii=False, default=str))
@@ -2483,6 +2751,7 @@ def answer_business_context(
         merchant_profile = merchant.profile_markdown()
     return {
         "merchantProfile": compact_answer_context_text(merchant_profile, 1200),
+        "sessionSummary": compact_answer_context_text(str(context.get("sessionContext") or ""), 1000),
         "memorySummary": compact_answer_context_text(str(context.get("memoryContext") or ""), 1000),
         "recentFocus": compact_recent_focus(recent_focus),
         "relevantPreferences": compact_memory_payloads(memory_injection.get("relevantPreferences") or memory_injection.get("preferences") or [], 4),
@@ -2681,6 +2950,15 @@ def parse_skill_match_payload(raw: str) -> Dict[str, Any]:
             return {}
 
 
+def answer_skill_reuse_candidate(skill_name: str, result: Dict[str, Any]) -> bool:
+    if not skill_name or not isinstance(result, dict):
+        return False
+    row_count = int(result.get("rowCount") or 0)
+    findings = result.get("findings") or []
+    answer = str(result.get("answerMarkdown") or "")
+    return row_count > 0 and (bool(findings) or len(answer) >= 20)
+
+
 def load_skill_frontmatter(path: Path) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     if not text.startswith("---"):
@@ -2755,7 +3033,7 @@ class FeedbackService:
         self,
         answer_repository: AnswerRepository,
         pending_store: PendingAnswerStore,
-        memory_store: Optional[StructuredMemoryStore] = None,
+        memory_store: Optional[MemoryStore] = None,
     ):
         self.answer_repository = answer_repository
         self.pending_store = pending_store

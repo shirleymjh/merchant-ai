@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from merchant_ai.models import (
@@ -10,10 +12,12 @@ from merchant_ai.models import (
     AgentRunResult,
     ContextPackage,
     ChatContext,
+    ConversationMessage,
     CircuitBreakerState,
     ContextBudgetReport,
     ContextAssemblyReport,
     ContextCompressionEvent,
+    ContextManifest,
     ContextSnapshot,
     FreshnessCheckResult,
     FastUnderstandingResult,
@@ -41,6 +45,7 @@ from merchant_ai.models import (
     ToolFailureRecord,
     ToolRuntimePolicy,
     RunStep,
+    SkillLifecycleRecord,
     TraceSpan,
     TopicRoutingDecision,
     WorkspaceManifest,
@@ -68,6 +73,7 @@ class AgentState(TypedDict, total=False):
     requested_merchant_id: str
     request_context: Optional[ChatContext]
     response_context: Optional[ChatContext]
+    message_history: List[ConversationMessage]
     thread_id: str
     run_id: str
     checkpoint_thread_id: str
@@ -82,6 +88,7 @@ class AgentState(TypedDict, total=False):
     route_decision_trace: List[Dict[str, Any]]
     bounded_route_llm_trace: Dict[str, Any]
     bounded_lead_llm_trace: Dict[str, Any]
+    main_agent_observations: List[Dict[str, Any]]
     extracted_keywords: Any
     plan: QueryPlan
     recall_bundle: RecallBundle
@@ -109,9 +116,13 @@ class AgentState(TypedDict, total=False):
     freshness_reports: List[FreshnessCheckResult]
     context_snapshots: List[ContextSnapshot]
     context_packages: List[ContextPackage]
+    context_manifests: List[ContextManifest]
+    active_context_manifest: Dict[str, Any]
+    active_context_package: Dict[str, Any]
     context_budget_reports: List[ContextBudgetReport]
     context_assembly_reports: List[ContextAssemblyReport]
     context_compression_events: List[ContextCompressionEvent]
+    runtime_checkpoints: List[Dict[str, Any]]
     middleware_events: List[MiddlewareEvent]
     tool_call_ledger: List[ToolCallLedgerEntry]
     tool_call_recovery_events: List[ToolCallRecoveryEvent]
@@ -124,6 +135,7 @@ class AgentState(TypedDict, total=False):
     tool_runtime_policies: List[ToolRuntimePolicy]
     tool_call_results: List[ToolCallExecutionResult]
     tool_runtime_events: List[Dict[str, Any]]
+    answer_file_tool_results: Dict[str, Any]
     clarification_tool_message: Dict[str, Any]
     clarification_command: Dict[str, Any]
     agent_decision_reason: str
@@ -144,6 +156,8 @@ class AgentState(TypedDict, total=False):
     memory_injection: Dict[str, Any]
     memory_injection_trace: Dict[str, Any]
     memory_ingestion_trace: Dict[str, Any]
+    memory_constraints: List[Dict[str, Any]]
+    memory_constraint_trace: Dict[str, Any]
     open_diagnostic_scope: str
     open_diagnostic_intent: str
     open_diagnostic_goal: str
@@ -152,6 +166,7 @@ class AgentState(TypedDict, total=False):
     answer: str
     analysis_summary: str
     analysis_skill_trace: Dict[str, Any]
+    skill_lifecycle_records: List[SkillLifecycleRecord]
     answer_used_llm: bool
     suggestions: List[str]
     thinking_steps: List[str]
@@ -196,7 +211,27 @@ class AgentState(TypedDict, total=False):
 def emit(state: AgentState, event_type: str, node: str, payload: Dict[str, Any]) -> None:
     listener = _EVENT_LISTENERS.get(str(state.get("run_id") or "")) or state.get("event_listener")
     if listener:
-        listener(event_type, node, payload)
+        listener(event_type, node, event_payload(state, event_type, node, payload))
+
+
+def event_payload(state: AgentState, event_type: str, node: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload or {})
+    data.setdefault("eventEnvelopeVersion", "v1")
+    data.setdefault("eventId", "evt_" + uuid.uuid4().hex)
+    data.setdefault("eventType", event_type)
+    data.setdefault("node", node)
+    data.setdefault("runId", str(state.get("run_id") or ""))
+    data.setdefault("threadId", str(state.get("thread_id") or ""))
+    data.setdefault("timestamp", datetime.now().isoformat())
+    correlation_id = (
+        data.get("correlationId")
+        or data.get("toolCallId")
+        or data.get("stepId")
+        or str(state.get("_active_step_id") or "")
+        or str(state.get("run_id") or "")
+    )
+    data.setdefault("correlationId", correlation_id)
+    return data
 
 
 def add_step(state: AgentState, text: str) -> None:

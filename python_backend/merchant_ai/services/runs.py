@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import uuid
 from datetime import datetime
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -26,6 +27,28 @@ from merchant_ai.services.checkpoints import checkpoint_ref_for_run
 
 
 ANSWER_DELTA_CHARS = 80
+
+
+def call_run_chat(
+    run_chat: Callable[..., ChatResponse],
+    message: str,
+    merchant_id: str,
+    context: Optional[ChatContext],
+    listener: Callable[[str, str, Dict[str, Any]], None],
+    thread_id: str,
+    run_id: str,
+    message_history: Optional[List[Any]] = None,
+) -> ChatResponse:
+    try:
+        signature = inspect.signature(run_chat)
+        supports_history = "message_history" in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+        )
+    except Exception:
+        supports_history = False
+    if supports_history:
+        return run_chat(message, merchant_id, context, listener, thread_id, run_id, message_history=message_history or [])
+    return run_chat(message, merchant_id, context, listener, thread_id, run_id)
 
 
 class FileRunEventStore:
@@ -357,7 +380,16 @@ class AgentRunStreamService:
 
         def worker() -> None:
             try:
-                response = self.run_chat(request.message, merchant_id, request.context, listener, thread_id, run.run_id)
+                response = call_run_chat(
+                    self.run_chat,
+                    request.message,
+                    merchant_id,
+                    request.context,
+                    listener,
+                    thread_id,
+                    run.run_id,
+                    request.message_history,
+                )
                 self.run_manager.complete_run(run.run_id, response)
                 for index, chunk in enumerate(answer_chunks(response.answer, ANSWER_DELTA_CHARS)):
                     payload = {
@@ -424,7 +456,7 @@ class AgentAsyncRunService:
             {"workerPool": "thread", "merchantId": merchant_id},
         )
         run_snapshot = run.model_copy(deep=True)
-        future = self.executor.submit(self._worker, run.run_id, thread_id, merchant_id, request.message, request.context)
+        future = self.executor.submit(self._worker, run.run_id, thread_id, merchant_id, request.message, request.context, request.message_history)
         with self._lock:
             self.futures[run.run_id] = future
         return run_snapshot
@@ -444,7 +476,15 @@ class AgentAsyncRunService:
             )
         return run
 
-    def _worker(self, run_id: str, thread_id: str, merchant_id: str, message: str, context: Optional[ChatContext]) -> None:
+    def _worker(
+        self,
+        run_id: str,
+        thread_id: str,
+        merchant_id: str,
+        message: str,
+        context: Optional[ChatContext],
+        message_history: Optional[List[Any]] = None,
+    ) -> None:
         if self.run_manager.is_canceled(run_id):
             return
         self.run_manager.mark_run_running(run_id)
@@ -455,7 +495,7 @@ class AgentAsyncRunService:
                 self.run_manager.append_event(run_id, thread_id, event_type, node, payload)
 
         try:
-            response = self.run_chat(message, merchant_id, context, listener, thread_id, run_id)
+            response = call_run_chat(self.run_chat, message, merchant_id, context, listener, thread_id, run_id, message_history)
             self.run_manager.complete_run(run_id, response)
         except Exception as exc:
             self.run_manager.fail_run(run_id, str(exc))

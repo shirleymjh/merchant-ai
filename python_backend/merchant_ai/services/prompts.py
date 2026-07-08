@@ -157,6 +157,8 @@ def default_prompt_registry() -> PromptRegistry:
                 "只要 analysisIntent 不是 none，requiredEvidenceIntents 必须至少 1 条；comparison/trend_check/anomaly_check/risk_ranking/overview/diagnosis 都不能返回空 evidence intents。\n"
                 "不要依赖代码关键词补规则；如果需要解释型证据，把证据需求写进 requiredEvidenceIntents，再由语义层编译和 Critic 校验。\n"
                 "metricRef 必须来自 semanticCatalog.candidateMetrics.key；ownerTable 必须使用对应 metric 的 table。\n"
+                "memoryConstraints 只能作为本轮解释偏好、历史纠错或口径争议信号；不得用 memory 改写 semanticCatalog、指标公式、表关系或字段定义。\n"
+                "如果 memoryConstraints 与 semanticCatalog 冲突，必须以 semanticCatalog 为准，并通过 validationGaps/clarification 表达未应用原因。\n"
                 "sourcePhrase 必须只填写用户原话中的指标/业务对象原词，不要包含排序词、Top/前N、最高/最低、时间窗或分析动作。例如“GMV最高的前5天”的 sourcePhrase 只写“GMV”。\n"
                 "rankingObjective.objectiveType 用来表达主指标用途：求一个商家总量/指标值用 metric_total；Top/最高/最多/前N 用 ranking；走势用 trend_anchor；明细实体过滤用 detail_anchor。\n"
                 "如果用户问 Top/最高/最多/前N，rankingObjective 必须是被排序的主指标；其他指标放 requestedMeasures。\n"
@@ -183,6 +185,7 @@ def default_prompt_registry() -> PromptRegistry:
                 "你是商家 BI 问题重新理解 agent。只输出 JSON。\n"
                 "不要直接输出 QueryGraph 或 SQL，只输出 questionUnderstanding。\n"
                 "如果 critic 指出 scope 未落地、分析证据契约缺失或未覆盖，必须重新声明 scopeConstraints、analysisIntent、requiresExplanation、requiredEvidenceIntents，并把所需指标放入 requestedMeasures 或 knowledgeRequests。\n"
+                "如果 critic 指出 MEMORY_CONSTRAINT_UNAPPLIED，必须只在 semanticCatalog 可支持时选择对应 metricRef；不支持时输出 clarification/knowledge gap，不得修改语义层定义。\n"
                 "修复必须限制在 semanticCatalog 内，metricRef 必须来自 candidateMetrics.key。"
             ),
         )
