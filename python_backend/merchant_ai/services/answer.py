@@ -228,6 +228,8 @@ class AnswerComposeService:
         self.last_analysis_skill_trace = {}
         if not run_result or not run_result.merged_query_bundle.rows:
             return ""
+        if not analysis_summary_required(plan) and not answer_skill_required(plan, run_result, bool(rule_context)):
+            return ""
         skill_name = self.propose_answer_skill(question, plan, run_result, bool(rule_context))
         if not skill_name and not analysis_summary_required(plan):
             return ""
@@ -340,7 +342,12 @@ class AnswerComposeService:
             trace["matchedBy"] = "deterministic_fallback"
             trace["skillName"] = fallback
             return fallback
-        if not self.llm.configured and self.llm.settings.answer_skill_match_mode != "always":
+        match_mode = str(self.llm.settings.answer_skill_match_mode or "").lower()
+        if fallback and (match_mode in {"deterministic_first", "header"} or (match_mode == "always" and fallback == "bi_trend_attribution")):
+            trace["matchedBy"] = "deterministic_fallback_before_llm"
+            trace["skillName"] = fallback
+            return fallback
+        if not self.llm.configured:
             trace["matchedBy"] = "deterministic_fallback_no_llm"
             trace["skillName"] = fallback
             return fallback
@@ -2919,17 +2926,69 @@ def answer_skill_headers(root: Path) -> List[Dict[str, Any]]:
     headers: List[Dict[str, Any]] = []
     for skill_file in sorted(root.glob("*/SKILL.md")):
         meta = load_skill_frontmatter(skill_file)
+        body = skill_file.read_text(encoding="utf-8")
         name = str(meta.get("name") or skill_file.parent.name)
         if not name:
             continue
+        when_to_use = _skill_header_field(meta, body, "whenToUse", "Activation Contract", 700)
+        required_inputs = _skill_section_lines(meta.get("requiredInputs"), body, "Required Inputs", 6)
+        constraints = _skill_section_lines(meta.get("constraints"), body, "Evidence Rules", 8)
+        if not constraints:
+            constraints = _skill_section_lines("", body, "Constraints", 8)
         headers.append(
             {
                 "name": name,
                 "description": str(meta.get("description") or "")[:500],
+                "whenToUse": when_to_use,
+                "when_to_use": when_to_use,
+                "constraints": constraints,
+                "requiredInputs": required_inputs,
+                "required_inputs": required_inputs,
                 "path": str(skill_file.relative_to(root.parent.parent) if root.parent.parent in skill_file.parents else skill_file),
             }
         )
     return headers
+
+
+def _skill_header_field(meta: Dict[str, Any], body: str, key: str, section: str, limit: int) -> str:
+    value = str(meta.get(key) or meta.get(key[:1].lower() + key[1:]) or "")
+    if value:
+        return value[:limit]
+    lines = _markdown_section_lines(body, section, limit_lines=6)
+    return " ".join(lines)[:limit]
+
+
+def _skill_section_lines(meta_value: Any, body: str, section: str, limit_lines: int) -> List[str]:
+    if isinstance(meta_value, list):
+        return [str(item).strip() for item in meta_value if str(item).strip()][:limit_lines]
+    if str(meta_value or "").strip():
+        return [item.strip() for item in str(meta_value).split(";") if item.strip()][:limit_lines]
+    return _markdown_section_lines(body, section, limit_lines=limit_lines)
+
+
+def _markdown_section_lines(body: str, section: str, limit_lines: int) -> List[str]:
+    lines = body.splitlines()
+    capture = False
+    collected: List[str] = []
+    target = section.strip().lower()
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("##"):
+            heading = stripped.lstrip("#").strip().lower()
+            if capture and heading != target:
+                break
+            capture = heading == target
+            continue
+        if not capture:
+            continue
+        if not stripped or stripped.startswith("```"):
+            continue
+        cleaned = stripped.lstrip("-").strip()
+        if cleaned:
+            collected.append(cleaned)
+        if len(collected) >= limit_lines:
+            break
+    return collected
 
 
 def parse_skill_match_payload(raw: str) -> Dict[str, Any]:

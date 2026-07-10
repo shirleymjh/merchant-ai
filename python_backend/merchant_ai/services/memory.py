@@ -6,8 +6,10 @@ import os
 import re
 import hashlib
 import pickle
+import threading
 import time
 from collections import Counter, defaultdict
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -35,9 +37,29 @@ MAX_EVENTS = 240
 MAX_PREFERENCES = 160
 MAX_FACTS = 120
 MAX_KNOWLEDGE_SUGGESTIONS = 160
+HABIT_CORE_PROMOTION_HIT_COUNT = 2
 APPROVED_MEMORY_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
 PENDING_MEMORY_STATUSES = {"candidate", "pending", "review_required", "needs_review"}
+INACTIVE_MEMORY_STATUSES = {"deleted", "disabled", "inactive", "rejected", "archived", "expired"}
 STRONG_CONSTRAINT_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
+EXPLICIT_HABIT_TERMS = {
+    "以后",
+    "后续",
+    "默认",
+    "固定",
+    "优先",
+    "每次",
+    "一直",
+    "长期",
+    "常用",
+    "习惯",
+    "记住",
+    "以后都",
+    "默认按",
+    "优先看",
+    "不用",
+    "不要只",
+}
 
 
 class MemoryStore:
@@ -252,6 +274,7 @@ class StructuredMemoryStore(MemoryStore):
         renderable = {
             "merchantId": payload.get("merchantId", ""),
             "recentFocus": payload.get("recentFocus", {}),
+            "coreMemory": payload.get("coreMemory", {}),
             "relevantCorrections": payload.get("relevantCorrections", []),
             "relevantMetricDisputes": payload.get("relevantMetricDisputes", []),
             "relevantPreferences": payload.get("relevantPreferences", []),
@@ -283,6 +306,7 @@ class StructuredMemoryStore(MemoryStore):
         return {
             "merchantId": merchant_id or self.settings.merchant_id,
             "recentFocus": {},
+            "coreMemoryProfile": {},
             "preferences": [],
             "facts": [],
             "events": [],
@@ -463,6 +487,7 @@ class MemoryEsRepository:
                     payload["knowledgeSuggestions"].append(suggestion)
             elif doc_type == "memory_profile":
                 payload["recentFocus"] = source.get("recent_focus") if isinstance(source.get("recent_focus"), dict) else {}
+                payload["coreMemoryProfile"] = source.get("core_memory_profile") if isinstance(source.get("core_memory_profile"), dict) else {}
                 if source.get("updated_at"):
                     payload["updatedAt"] = str(source.get("updated_at") or "")
         payload["updatedAt"] = payload.get("updatedAt") or latest_updated_at
@@ -511,7 +536,8 @@ class MemoryEsRepository:
     def save_memory(self, merchant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         self._ensure_ready()
         memory = normalize_memory(payload, merchant_id)
-        docs = memory_es_documents(memory, self.settings, self._vector_helper if self._vector_enabled() else None)
+        vector_async = self._vector_index_async_enabled()
+        docs = memory_es_documents(memory, self.settings, self._vector_helper if self._vector_enabled() and not vector_async else None)
         expected_ids = {str(doc.get("doc_id") or "") for doc in docs if doc.get("doc_id")}
         existing_ids = set(self._existing_doc_ids(merchant_id))
         obsolete_ids = sorted(existing_ids - expected_ids)
@@ -525,7 +551,34 @@ class MemoryEsRepository:
         for doc_id in obsolete_ids:
             lines.append(json.dumps({"delete": {"_index": self.index_name(), "_id": doc_id}}, ensure_ascii=False))
         self._bulk(lines)
+        if vector_async:
+            self._schedule_vector_index(merchant_id, memory)
         return memory
+
+    def sync_vector_index(self, merchant_id: str, memory: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._vector_enabled():
+            return {"success": True, "enabled": False, "updated": 0}
+        self._ensure_ready()
+        normalized = normalize_memory(memory, merchant_id)
+        lines = memory_es_vector_update_lines(normalized, self.settings, self._vector_helper, self.index_name())
+        self._bulk(lines)
+        return {"success": True, "enabled": True, "updated": int(len(lines) / 2)}
+
+    def _schedule_vector_index(self, merchant_id: str, memory: Dict[str, Any]) -> None:
+        snapshot = deepcopy(memory)
+        thread = threading.Thread(
+            target=self._sync_vector_index_safely,
+            args=(merchant_id, snapshot),
+            name="memory-vector-index-%s" % stable_slug(merchant_id)[:40],
+            daemon=True,
+        )
+        thread.start()
+
+    def _sync_vector_index_safely(self, merchant_id: str, memory: Dict[str, Any]) -> None:
+        try:
+            self.sync_vector_index(merchant_id, memory)
+        except Exception:
+            return
 
     def apply_hit_deltas(self, deltas: Dict[str, Dict[str, Any]]) -> int:
         self._ensure_ready()
@@ -644,6 +697,9 @@ class MemoryEsRepository:
 
     def _vector_enabled(self) -> bool:
         return bool(getattr(self.settings, "memory_vector_enabled", False) and self._vector_helper.enabled())
+
+    def _vector_index_async_enabled(self) -> bool:
+        return bool(self._vector_enabled() and getattr(self.settings, "memory_index_async", True))
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -918,6 +974,166 @@ class MemoryKnowledgeGovernanceService:
         }
 
 
+class MemoryManagementService:
+    """Governed management API surface for long-term merchant memory."""
+
+    def __init__(self, settings: Settings, memory_store: Optional[MemoryStore] = None):
+        self.settings = settings
+        self.memory_store = memory_store or create_memory_store(settings)
+
+    def get_memory(self, merchant_id: str, include_inactive: bool = True) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        memory = self.memory_store.load(target)
+        view = memory if include_inactive else filter_memory_items(memory, active_only=True)
+        return {
+            "success": True,
+            "merchantId": target,
+            "memory": view,
+            "counts": memory_item_counts(view),
+            "storageBackend": memory.get("storageBackend") or "",
+            "source": memory_source_label(memory, self.settings),
+        }
+
+    def patch_item(self, merchant_id: str, memory_id: str, patch: Any) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        payload = memory_patch_payload(patch)
+        memory = self.memory_store.load(target)
+        located = locate_memory_item(memory, memory_id)
+        if not located:
+            return {"success": False, "status": "NOT_FOUND", "merchantId": target, "memoryId": memory_id}
+        group, _, item, _ = located
+        try:
+            patch_memory_item(item, payload)
+        except ValueError as exc:
+            return {"success": False, "status": "INVALID_PATCH", "merchantId": target, "memoryId": memory_id, "error": str(exc)}
+        refresh_memory_rollups(memory)
+        saved = self.memory_store.save(target, memory)
+        updated = locate_memory_item(saved, memory_id)
+        return {
+            "success": True,
+            "status": "UPDATED",
+            "merchantId": target,
+            "memoryId": memory_id,
+            "group": group,
+            "item": updated[2] if updated else item,
+            "counts": memory_item_counts(saved),
+        }
+
+    def delete_item(self, merchant_id: str, memory_id: str, hard_delete: bool = False) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        memory = self.memory_store.load(target)
+        located = locate_memory_item(memory, memory_id)
+        if not located:
+            return {"success": False, "status": "NOT_FOUND", "merchantId": target, "memoryId": memory_id}
+        group, _, item, index = located
+        if hard_delete:
+            memory[group].pop(index)
+            status = "HARD_DELETED"
+        else:
+            patch_memory_item(item, {"status": "deleted", "validUntil": datetime.now().isoformat()})
+            status = "DELETED"
+        refresh_memory_rollups(memory)
+        saved = self.memory_store.save(target, memory)
+        return {
+            "success": True,
+            "status": status,
+            "merchantId": target,
+            "memoryId": memory_id,
+            "group": group,
+            "hardDelete": bool(hard_delete),
+            "counts": memory_item_counts(saved),
+        }
+
+    def cleanup_expired(self, merchant_id: str, hard_delete: bool = False, dry_run: bool = False) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        memory = self.memory_store.load(target)
+        scanned = count_memory_items(memory)
+        cleaned: List[Dict[str, Any]] = []
+        for group, _, item, index in list_memory_items(memory, reverse=True):
+            if memory_is_inactive(item) or not is_memory_expired(item):
+                continue
+            cleaned.append({"memoryId": memory_item_id(item), "group": group, "status": memory_status(item)})
+            if dry_run:
+                continue
+            if hard_delete:
+                memory[group].pop(index)
+            else:
+                patch_memory_item(item, {"status": "deleted", "validUntil": datetime.now().isoformat()})
+        saved = memory
+        if cleaned and not dry_run:
+            refresh_memory_rollups(memory)
+            saved = self.memory_store.save(target, memory)
+        return {
+            "success": True,
+            "status": "DRY_RUN" if dry_run else "CLEANED",
+            "merchantId": target,
+            "hardDelete": bool(hard_delete),
+            "dryRun": bool(dry_run),
+            "scanned": scanned,
+            "cleanedCount": len(cleaned),
+            "cleaned": list(reversed(cleaned)),
+            "counts": memory_item_counts(saved),
+        }
+
+    def evaluate_recall(self, merchant_id: str, cases: Any, budget_tokens: int = 0, budget_chars: int = 0) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        case_payloads = memory_recall_case_payloads(cases)
+        results: List[Dict[str, Any]] = []
+        total_expected = 0
+        total_hits = 0
+        total_false_positives = 0
+        for index, case in enumerate(case_payloads):
+            question = str(case.get("question") or "")
+            state: Dict[str, Any] = {
+                "question": question,
+                "requested_merchant_id": target,
+                "access_role": str(case.get("accessRole") or case.get("access_role") or "merchant_analyst"),
+                "memory_eval_context": {
+                    "topics": unique_strings(case.get("topics") or []),
+                    "metrics": unique_strings(case.get("metrics") or []),
+                    "timeWindows": unique_ints(case.get("timeWindows") or case.get("time_windows") or []),
+                },
+            }
+            selected = self.memory_store.select_for_question(state, budget_tokens=budget_tokens, budget_chars=budget_chars)
+            trace = selected.get("memoryInjectionTrace") or {}
+            selected_ids = unique_strings(trace.get("selectedIds") or memory_ids_from_selected(selected))
+            expected_ids = unique_strings(case.get("expectedMemoryIds") or case.get("expected_memory_ids") or [])
+            unexpected_ids = unique_strings(case.get("unexpectedMemoryIds") or case.get("unexpected_memory_ids") or [])
+            hits = [memory_id for memory_id in expected_ids if memory_id in selected_ids]
+            misses = [memory_id for memory_id in expected_ids if memory_id not in selected_ids]
+            false_positives = [memory_id for memory_id in unexpected_ids if memory_id in selected_ids]
+            total_expected += len(expected_ids)
+            total_hits += len(hits)
+            total_false_positives += len(false_positives)
+            results.append(
+                {
+                    "caseId": str(case.get("caseId") or case.get("case_id") or "case_%d" % (index + 1)),
+                    "question": question,
+                    "passed": not misses and not false_positives,
+                    "selectedMemoryIds": selected_ids,
+                    "expectedMemoryIds": expected_ids,
+                    "unexpectedMemoryIds": unexpected_ids,
+                    "hitMemoryIds": hits,
+                    "missedMemoryIds": misses,
+                    "falsePositiveMemoryIds": false_positives,
+                    "candidateCount": int(trace.get("candidateCount") or 0),
+                    "filteredReasons": trace.get("filteredReasons") or {},
+                }
+            )
+        hit_rate = float(total_hits / total_expected) if total_expected else 1.0
+        return {
+            "success": True,
+            "merchantId": target,
+            "caseCount": len(results),
+            "passed": all(item["passed"] for item in results),
+            "hitRate": round(hit_rate, 4),
+            "expectedCount": total_expected,
+            "hitCount": total_hits,
+            "falsePositiveCount": total_false_positives,
+            "results": results,
+        }
+
+
 class MemoryGovernanceService(MemoryKnowledgeGovernanceService):
     """Alias that represents the broader memory governance boundary."""
 
@@ -1129,6 +1345,7 @@ def empty_memory_payload(merchant_id: str) -> Dict[str, Any]:
     return {
         "merchantId": merchant_id,
         "recentFocus": {},
+        "coreMemoryProfile": {},
         "preferences": [],
         "facts": [],
         "events": [],
@@ -1158,6 +1375,124 @@ def memory_id_set(memory: Dict[str, Any]) -> set[str]:
     return ids
 
 
+def list_memory_items(memory: Dict[str, Any], reverse: bool = False) -> List[Tuple[str, str, Dict[str, Any], int]]:
+    items: List[Tuple[str, str, Dict[str, Any], int]] = []
+    for group, id_key in [("events", "eventId"), ("preferences", "preferenceId"), ("facts", "factId")]:
+        group_items = memory.get(group) or []
+        indexes = range(len(group_items) - 1, -1, -1) if reverse else range(len(group_items))
+        for index in indexes:
+            item = group_items[index]
+            if isinstance(item, dict):
+                items.append((group, id_key, item, index))
+    return items
+
+
+def locate_memory_item(memory: Dict[str, Any], memory_id: str) -> Optional[Tuple[str, str, Dict[str, Any], int]]:
+    target = str(memory_id or "")
+    if not target:
+        return None
+    for group, id_key, item, index in list_memory_items(memory):
+        if str(item.get(id_key) or item.get("id") or "") == target:
+            return group, id_key, item, index
+    return None
+
+
+def memory_item_counts(memory: Dict[str, Any]) -> Dict[str, Any]:
+    groups: Dict[str, Dict[str, int]] = {}
+    total = 0
+    active = 0
+    inactive = 0
+    expired = 0
+    for group, _, item, _ in list_memory_items(memory):
+        bucket = groups.setdefault(group, {"total": 0, "active": 0, "inactive": 0, "expired": 0})
+        bucket["total"] += 1
+        total += 1
+        if is_memory_expired(item):
+            bucket["expired"] += 1
+            expired += 1
+        if memory_is_inactive(item):
+            bucket["inactive"] += 1
+            inactive += 1
+        elif not is_memory_expired(item):
+            bucket["active"] += 1
+            active += 1
+    return {"total": total, "active": active, "inactive": inactive, "expired": expired, "groups": groups}
+
+
+def filter_memory_items(memory: Dict[str, Any], active_only: bool = False) -> Dict[str, Any]:
+    payload = dict(memory or {})
+    if not active_only:
+        return payload
+    for group in ["events", "preferences", "facts"]:
+        payload[group] = [
+            item
+            for item in payload.get(group) or []
+            if isinstance(item, dict) and not memory_is_inactive(item) and not is_memory_expired(item)
+        ]
+    payload["recentFocus"] = aggregate_recent_focus(payload.get("events") or [], payload.get("preferences") or [])
+    payload["coreMemoryProfile"] = build_core_memory_profile(payload)
+    return payload
+
+
+def memory_patch_payload(patch: Any) -> Dict[str, Any]:
+    if patch is None:
+        return {}
+    if hasattr(patch, "model_dump"):
+        return patch.model_dump(by_alias=True, exclude_unset=True)
+    if isinstance(patch, dict):
+        return dict(patch)
+    return {}
+
+
+def patch_memory_item(item: Dict[str, Any], patch: Dict[str, Any]) -> None:
+    status = str(patch.get("status") or "").strip().lower()
+    if status:
+        allowed = APPROVED_MEMORY_STATUSES | PENDING_MEMORY_STATUSES | INACTIVE_MEMORY_STATUSES
+        if status not in allowed:
+            raise ValueError("unsupported memory status: %s" % status)
+        item["status"] = "active" if status == "" else status
+    if patch.get("confidence") is not None:
+        item["confidence"] = max(0.0, min(1.0, float(patch.get("confidence") or 0.0)))
+    if patch.get("validUntil") is not None:
+        item["validUntil"] = str(patch.get("validUntil") or "")
+    if patch.get("retentionDays") is not None:
+        item["retentionDays"] = max(0, int(patch.get("retentionDays") or 0))
+    if patch.get("visibility") is not None:
+        item["visibility"] = str(patch.get("visibility") or "merchant")
+    if patch.get("allowedRoles") is not None:
+        item["allowedRoles"] = unique_strings(patch.get("allowedRoles") or [])
+    if patch.get("approvedBy") is not None:
+        item["approvedBy"] = str(patch.get("approvedBy") or "")
+    if memory_status(item) in {"deleted", "expired"} and not item.get("validUntil"):
+        item["validUntil"] = datetime.now().isoformat()
+
+
+def refresh_memory_rollups(memory: Dict[str, Any]) -> None:
+    memory["recentFocus"] = aggregate_recent_focus(
+        [item for item in memory.get("events") or [] if memory_item_can_drive_recent_focus(item)],
+        [item for item in memory.get("preferences") or [] if memory_item_can_drive_recent_focus(item)],
+    )
+    memory["coreMemoryProfile"] = build_core_memory_profile(memory)
+
+
+def memory_recall_case_payloads(cases: Any) -> List[Dict[str, Any]]:
+    if hasattr(cases, "cases"):
+        cases = getattr(cases, "cases")
+    if not isinstance(cases, list):
+        return []
+    payloads: List[Dict[str, Any]] = []
+    for item in cases:
+        if hasattr(item, "model_dump"):
+            payload = item.model_dump(by_alias=True)
+        elif isinstance(item, dict):
+            payload = dict(item)
+        else:
+            continue
+        if str(payload.get("question") or "").strip():
+            payloads.append(payload)
+    return payloads
+
+
 def scan_memory_items_by_ids(memory: Dict[str, Any], memory_ids: List[str], merchant_id: str) -> Dict[str, Any]:
     wanted = set(unique_strings(memory_ids))
     result = empty_memory_payload(merchant_id)
@@ -1185,6 +1520,8 @@ def merge_memory_payload(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[st
         merged[group] = items
     if not merged.get("recentFocus"):
         merged["recentFocus"] = (base or {}).get("recentFocus") or {}
+    if not merged.get("coreMemoryProfile"):
+        merged["coreMemoryProfile"] = (base or {}).get("coreMemoryProfile") or {}
     return merged
 
 
@@ -1264,6 +1601,21 @@ def memory_payload_chars(payload: Dict[str, Any]) -> int:
 
 def memory_payload_tokens(payload: Dict[str, Any]) -> int:
     return estimate_memory_tokens(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def memory_injection_budget_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    budget_payload = dict(payload or {})
+    budget_payload.pop("preferences", None)
+    budget_payload.pop("facts", None)
+    return budget_payload
+
+
+def memory_injection_tokens(payload: Dict[str, Any]) -> int:
+    return memory_payload_tokens(memory_injection_budget_payload(payload))
+
+
+def memory_injection_chars(payload: Dict[str, Any]) -> int:
+    return memory_payload_chars(memory_injection_budget_payload(payload))
 
 
 def truncate_memory_text_by_tokens(text: str, budget_tokens: int) -> str:
@@ -1563,6 +1915,8 @@ def memory_es_mapping(settings: Settings) -> Dict[str, Any]:
         "group": {"type": "keyword"},
         "memory_id": {"type": "keyword"},
         "memory_type": {"type": "keyword"},
+        "memory_tier": {"type": "keyword"},
+        "memory_class": {"type": "keyword"},
         "status": {"type": "keyword"},
         "scope": {"type": "object", "enabled": False},
         "topics": {"type": "keyword"},
@@ -1570,6 +1924,7 @@ def memory_es_mapping(settings: Settings) -> Dict[str, Any]:
         "content_text": {"type": "text"},
         "payload_json": {"type": "object", "enabled": False},
         "recent_focus": {"type": "object", "enabled": False},
+        "core_memory_profile": {"type": "object", "enabled": False},
         "confidence": {"type": "float"},
         "hit_count": {"type": "integer"},
         "decay_score": {"type": "float"},
@@ -1619,6 +1974,8 @@ def memory_es_documents(
                 "group": group,
                 "memory_id": memory_id,
                 "memory_type": str(item.get("memoryType") or group),
+                "memory_tier": memory_tier(item),
+                "memory_class": memory_class(item),
                 "status": memory_status(item),
                 "scope": memory_scope_payload(item),
                 "topics": unique_strings(item.get("topics") or []),
@@ -1692,6 +2049,8 @@ def memory_es_documents(
                 "group": "suggestion",
                 "memory_id": suggestion_id,
                 "memory_type": str(suggestion.get("suggestionType") or "metric"),
+                "memory_tier": "retrieval",
+                "memory_class": "governance_candidate",
                 "status": knowledge_suggestion_status(suggestion),
                 "scope": {"merchantId": merchant_id, "topic": str(suggestion.get("topic") or "")},
                 "topics": unique_strings([suggestion.get("topic")]),
@@ -1720,6 +2079,7 @@ def memory_es_documents(
             "content_text": str(((memory.get("recentFocus") or {}).get("summary") or ""))[:2000],
             "payload_json": {},
             "recent_focus": memory.get("recentFocus") or {},
+            "core_memory_profile": memory.get("coreMemoryProfile") or build_core_memory_profile(memory),
             "confidence": 1.0,
             "hit_count": 0,
             "decay_score": 1.0,
@@ -1728,6 +2088,44 @@ def memory_es_documents(
         }
     )
     return docs
+
+
+def memory_es_vector_update_lines(
+    memory: Dict[str, Any],
+    settings: Settings,
+    embedder: "MemoryVectorIndex",
+    index_name: str,
+) -> List[str]:
+    lines: List[str] = []
+    if not settings.es_vector_field:
+        return lines
+    merchant_id = str(memory.get("merchantId") or "")
+    for group, id_key in [("event", "eventId"), ("preference", "preferenceId"), ("fact", "factId")]:
+        source_key = "facts" if group == "fact" else "%ss" % group
+        if group == "event":
+            source_key = "events"
+        elif group == "preference":
+            source_key = "preferences"
+        for item in memory.get(source_key) or []:
+            if not isinstance(item, dict):
+                continue
+            memory_id = str(item.get(id_key) or item.get("id") or "")
+            if not memory_id:
+                continue
+            content_text = memory_content_text(item)[:2000]
+            if not content_text:
+                continue
+            vector = embedder._embed_text(content_text)
+            if not vector:
+                continue
+            lines.append(
+                json.dumps(
+                    {"update": {"_index": index_name, "_id": memory_item_doc_id(merchant_id, group, memory_id)}},
+                    ensure_ascii=False,
+                )
+            )
+            lines.append(json.dumps({"doc": {settings.es_vector_field: vector}}, ensure_ascii=False, default=str))
+    return lines
 
 
 def memory_item_doc_id(merchant_id: str, group: str, memory_id: str) -> str:
@@ -1758,6 +2156,8 @@ def memory_item_from_es_source(source: Dict[str, Any]) -> Dict[str, Any]:
             if "factId" in next_payload:
                 next_payload["factId"] = str(source.get("memory_id") or next_payload.get("factId") or "")
         next_payload["memoryType"] = str(source.get("memory_type") or next_payload.get("memoryType") or "")
+        next_payload["memoryTier"] = str(source.get("memory_tier") or next_payload.get("memoryTier") or "")
+        next_payload["memoryClass"] = str(source.get("memory_class") or next_payload.get("memoryClass") or "")
         next_payload["status"] = str(source.get("status") or next_payload.get("status") or "active")
         next_payload["scope"] = source.get("scope") if isinstance(source.get("scope"), dict) else next_payload.get("scope") or {}
         next_payload["topics"] = unique_strings(source.get("topics") or next_payload.get("topics") or [])
@@ -1800,7 +2200,14 @@ def memory_vector_documents(memory: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not isinstance(item, dict):
                 continue
             memory_id = str(item.get(id_key) or "")
-            if not memory_id or is_memory_expired(item) or float(item.get("confidence") or 0) <= 0.05 or memory_is_pending(item):
+            if (
+                not memory_id
+                or is_memory_expired(item)
+                or float(item.get("confidence") or 0) <= 0.05
+                or memory_is_pending(item)
+                or memory_is_inactive(item)
+                or memory_tier(item) == "core"
+            ):
                 continue
             content_text = memory_content_text(item)
             if not content_text:
@@ -1845,8 +2252,22 @@ def memory_is_pending(item: Dict[str, Any]) -> bool:
     return memory_status(item) in PENDING_MEMORY_STATUSES
 
 
+def memory_is_inactive(item: Dict[str, Any]) -> bool:
+    return memory_status(item) in INACTIVE_MEMORY_STATUSES
+
+
 def memory_is_approved(item: Dict[str, Any]) -> bool:
     return memory_status(item) in APPROVED_MEMORY_STATUSES
+
+
+def memory_item_can_drive_recent_focus(item: Any) -> bool:
+    return (
+        isinstance(item, dict)
+        and not memory_is_pending(item)
+        and not memory_is_inactive(item)
+        and not is_memory_expired(item)
+        and float(item.get("confidence") or 0.0) > 0.05
+    )
 
 
 def memory_scope_payload(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1898,6 +2319,85 @@ def default_memory_status(memory_type: str, source: str = "") -> str:
     return "active"
 
 
+def default_memory_class(memory_type: str) -> str:
+    normalized = str(memory_type or "")
+    if normalized in {"preference", "user_preference", "business_focus", "metric_habit", "time_window_habit"}:
+        return "preference"
+    if normalized in {"fact", "business_fact"}:
+        return "semantic_fact"
+    if normalized == "correction":
+        return "correction"
+    if normalized == "metric_dispute":
+        return "governance_signal"
+    if normalized == "past_case":
+        return "episodic_case"
+    if normalized == "procedure":
+        return "procedural_rule"
+    if normalized in {"negative_feedback", "feedback"}:
+        return "feedback_event"
+    return "interaction_event"
+
+
+def default_memory_tier(memory_type: str, status: str = "", confidence: float = 0.0) -> str:
+    normalized = str(memory_type or "")
+    normalized_status = str(status or "").strip().lower()
+    if normalized in {"preference", "user_preference", "business_focus", "metric_habit", "time_window_habit"}:
+        return "core"
+    if normalized in {"fact", "business_fact"}:
+        return "core"
+    if normalized == "correction" and normalized_status in STRONG_CONSTRAINT_STATUSES and float(confidence or 0.0) >= 0.9:
+        return "core"
+    return "retrieval"
+
+
+def default_preference_memory_tier(item: Dict[str, Any]) -> str:
+    existing = str((item or {}).get("memoryTier") or (item or {}).get("memory_tier") or "").strip().lower()
+    if existing in {"core", "retrieval"}:
+        return existing
+    memory_type = str((item or {}).get("memoryType") or (item or {}).get("memory_type") or "preference")
+    if memory_type not in {"preference", "user_preference", "business_focus", "metric_habit", "time_window_habit"}:
+        return default_memory_tier(memory_type, memory_status(item), float((item or {}).get("confidence") or 0.55))
+    if int((item or {}).get("hitCount") or (item or {}).get("hit_count") or 0) >= HABIT_CORE_PROMOTION_HIT_COUNT:
+        return "core"
+    if habit_source_is_governed(item) or habit_text_is_explicit(item) or positive_feedback_signal(str((item or {}).get("feedbackSignal") or "")):
+        return "core"
+    return "retrieval"
+
+
+def habit_source_is_governed(item: Dict[str, Any]) -> bool:
+    source = str((item or {}).get("source") or "").strip().lower()
+    return bool((item or {}).get("approvedBy") or (item or {}).get("approved_by") or source in {"manual", "feedback", "correction", "governance"})
+
+
+def habit_text_is_explicit(item: Dict[str, Any]) -> bool:
+    text = " ".join(
+        str((item or {}).get(key) or "")
+        for key in ["question", "answerPreview", "answer_preview", "correctionText", "correction_text", "key", "value", "content"]
+    )
+    return any(term in text for term in EXPLICIT_HABIT_TERMS)
+
+
+def positive_feedback_signal(signal: str) -> bool:
+    value = str(signal or "")
+    return "adopted" in value or "liked" in value
+
+
+def memory_class(item: Dict[str, Any]) -> str:
+    existing = str((item or {}).get("memoryClass") or (item or {}).get("memory_class") or "").strip()
+    return existing or default_memory_class(str((item or {}).get("memoryType") or (item or {}).get("memory_type") or ""))
+
+
+def memory_tier(item: Dict[str, Any]) -> str:
+    existing = str((item or {}).get("memoryTier") or (item or {}).get("memory_tier") or "").strip().lower()
+    if existing in {"core", "retrieval"}:
+        return existing
+    return default_memory_tier(
+        str((item or {}).get("memoryType") or (item or {}).get("memory_type") or ""),
+        memory_status(item),
+        float((item or {}).get("confidence") or 0.0),
+    )
+
+
 def default_retention_days(memory_type: str) -> int:
     normalized = str(memory_type or "")
     if normalized == "correction":
@@ -1929,6 +2429,97 @@ def default_memory_allowed_roles(memory_type: str) -> List[str]:
     return ["merchant_admin", "merchant_analyst"]
 
 
+def build_core_memory_profile(memory: Dict[str, Any]) -> Dict[str, Any]:
+    preferences = sorted(
+        [item for item in memory.get("preferences") or [] if memory_item_can_drive_core_profile(item) and memory_tier(item) == "core"],
+        key=core_memory_rank,
+        reverse=True,
+    )
+    core_fact_items = [
+        item
+        for item in memory.get("facts") or []
+        if memory_item_can_drive_core_profile(item) and memory_tier(item) == "core"
+    ]
+    facts = sorted(
+        [item for item in core_fact_items if str(item.get("memoryType") or "") != "correction"],
+        key=core_memory_rank,
+        reverse=True,
+    )
+    corrections = sorted(
+        [
+            item
+            for item in [
+                *core_fact_items,
+                *[event for event in memory.get("events") or [] if memory_item_can_drive_core_profile(event)],
+            ]
+            if memory_tier(item) == "core" and str(item.get("memoryType") or "") == "correction"
+        ],
+        key=core_memory_rank,
+        reverse=True,
+    )
+    return {
+        "corePreferences": [compact_memory_payload(item, "preference") for item in preferences[:6]],
+        "coreFacts": [compact_memory_payload(item, "fact") for item in facts[:6]],
+        "coreCorrections": [compact_memory_payload(item, "event") for item in corrections[:4]],
+        "summary": build_core_memory_summary(preferences[:3], facts[:3], corrections[:2]),
+    }
+
+
+def memory_item_can_drive_core_profile(item: Any) -> bool:
+    return (
+        isinstance(item, dict)
+        and memory_is_approved(item)
+        and not memory_is_inactive(item)
+        and not is_memory_expired(item)
+        and float(item.get("confidence") or 0.0) > 0.05
+    )
+
+
+def compact_core_memory_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(profile, dict):
+        return {"summary": "", "corePreferenceIds": [], "coreFactIds": [], "coreCorrectionIds": [], "counts": {}}
+    preference_ids = [str(item.get("id") or "") for item in profile.get("corePreferences") or [] if isinstance(item, dict) and item.get("id")]
+    fact_ids = [str(item.get("id") or "") for item in profile.get("coreFacts") or [] if isinstance(item, dict) and item.get("id")]
+    correction_ids = [str(item.get("id") or "") for item in profile.get("coreCorrections") or [] if isinstance(item, dict) and item.get("id")]
+    return {
+        "summary": str(profile.get("summary") or "")[:420],
+        "corePreferenceIds": preference_ids[:6],
+        "coreFactIds": fact_ids[:6],
+        "coreCorrectionIds": correction_ids[:4],
+        "counts": {
+            "preferences": len(preference_ids),
+            "facts": len(fact_ids),
+            "corrections": len(correction_ids),
+        },
+    }
+
+
+def core_memory_rank(item: Dict[str, Any]) -> Tuple[float, int, str]:
+    return (
+        float(item.get("confidence") or 0.0),
+        int(item.get("hitCount") or 0),
+        str(item.get("lastUsedAt") or item.get("createdAt") or ""),
+    )
+
+
+def build_core_memory_summary(preferences: List[Dict[str, Any]], facts: List[Dict[str, Any]], corrections: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    pref_terms = [str(item.get("value") or item.get("key") or "") for item in preferences if str(item.get("value") or item.get("key") or "").strip()]
+    fact_terms = [str(item.get("content") or "") for item in facts if str(item.get("content") or "").strip()]
+    correction_terms = [
+        str(item.get("correctionText") or item.get("content") or item.get("question") or "")
+        for item in corrections
+        if str(item.get("correctionText") or item.get("content") or item.get("question") or "").strip()
+    ]
+    if pref_terms:
+        parts.append("稳定偏好：" + "；".join(pref_terms[:3])[:180])
+    if fact_terms:
+        parts.append("业务事实：" + "；".join(fact_terms[:2])[:180])
+    if correction_terms:
+        parts.append("已确认纠正：" + "；".join(correction_terms[:2])[:180])
+    return " | ".join(parts)[:420]
+
+
 def memory_case_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     payload = (item or {}).get("casePayload") or (item or {}).get("case_payload")
     return payload if isinstance(payload, dict) else {}
@@ -1947,6 +2538,7 @@ def normalize_memory(payload: Dict[str, Any], merchant_id: str) -> Dict[str, Any
     memory = {
         "merchantId": payload.get("merchantId") or merchant_id,
         "recentFocus": payload.get("recentFocus") or {},
+        "coreMemoryProfile": payload.get("coreMemoryProfile") or payload.get("core_memory_profile") or {},
         "preferences": normalize_preferences(payload.get("preferences") or []),
         "facts": normalize_facts(payload.get("facts") or []),
         "events": normalize_events(payload.get("events") or []),
@@ -1961,7 +2553,11 @@ def normalize_memory(payload: Dict[str, Any], merchant_id: str) -> Dict[str, Any
     memory["facts"] = memory["facts"][-MAX_FACTS:]
     memory["knowledgeSuggestions"] = memory["knowledgeSuggestions"][-MAX_KNOWLEDGE_SUGGESTIONS:]
     if not memory["recentFocus"]:
-        memory["recentFocus"] = aggregate_recent_focus(memory["events"], memory["preferences"])
+        memory["recentFocus"] = aggregate_recent_focus(
+            [item for item in memory["events"] if memory_item_can_drive_recent_focus(item)],
+            [item for item in memory["preferences"] if memory_item_can_drive_recent_focus(item)],
+        )
+    memory["coreMemoryProfile"] = build_core_memory_profile(memory)
     return memory
 
 
@@ -1975,6 +2571,8 @@ def normalize_events(items: Any) -> List[Dict[str, Any]]:
         event = MemoryEvent(
             event_id=str(item.get("eventId") or item.get("event_id") or "mem_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f")),
             memory_type=str(item.get("memoryType") or item.get("memory_type") or "query_event"),
+            memory_tier=str(item.get("memoryTier") or item.get("memory_tier") or default_memory_tier(str(item.get("memoryType") or item.get("memory_type") or "query_event"), memory_status(item), float(item.get("confidence") or 0.0))),
+            memory_class=str(item.get("memoryClass") or item.get("memory_class") or default_memory_class(str(item.get("memoryType") or item.get("memory_type") or "query_event"))),
             question=str(item.get("question") or "")[:1000],
             answer_preview=str(item.get("answerPreview") or item.get("answer_preview") or "")[:1000],
             topics=unique_strings(item.get("topics") or []),
@@ -2023,6 +2621,8 @@ def normalize_preferences(items: Any) -> List[Dict[str, Any]]:
         pref = MemoryPreference(
             preference_id=str(item.get("preferenceId") or item.get("preference_id") or "pref_%s" % stable_slug(item_key)),
             memory_type=str(item.get("memoryType") or item.get("memory_type") or "preference"),
+            memory_tier=default_preference_memory_tier(item),
+            memory_class=str(item.get("memoryClass") or item.get("memory_class") or default_memory_class(str(item.get("memoryType") or item.get("memory_type") or "preference"))),
             key=str(item.get("key") or ""),
             value=str(item.get("value") or ""),
             topics=unique_strings(item.get("topics") or []),
@@ -2058,6 +2658,8 @@ def normalize_facts(items: Any) -> List[Dict[str, Any]]:
         fact = MemoryFact(
             fact_id=str(item.get("factId") or item.get("fact_id") or "fact_%s" % stable_slug(item_key)),
             memory_type=str(item.get("memoryType") or item.get("memory_type") or "business_fact"),
+            memory_tier=str(item.get("memoryTier") or item.get("memory_tier") or default_memory_tier(str(item.get("memoryType") or item.get("memory_type") or "business_fact"), memory_status(item), float(item.get("confidence") or 0.6))),
+            memory_class=str(item.get("memoryClass") or item.get("memory_class") or default_memory_class(str(item.get("memoryType") or item.get("memory_type") or "business_fact"))),
             content=str(item.get("content") or item.get("text") or "")[:1000],
             topics=unique_strings(item.get("topics") or []),
             metrics=unique_strings(item.get("metrics") or []),
@@ -2143,6 +2745,8 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="mem_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type=memory_type,
+        memory_tier=default_memory_tier(memory_type, default_memory_status(memory_type, source="answer_run"), default_confidence(memory_type, feedback_signal)),
+        memory_class=default_memory_class(memory_type),
         question=question,
         answer_preview=str(state.get("answer") or "")[:1000],
         topics=topics[:8],
@@ -2178,6 +2782,8 @@ def memory_event_from_feedback(pending: PendingAnswer, adopted: Any = None, like
     event = MemoryEvent(
         event_id="memfb_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type=memory_type,
+        memory_tier=default_memory_tier(memory_type, default_memory_status(memory_type, source="feedback"), default_confidence(memory_type, signal)),
+        memory_class=default_memory_class(memory_type),
         question=str(pending.question or "")[:1000],
         answer_preview=str(pending.answer or "")[:1000],
         topics=unique_strings([pending.category_name]),
@@ -2231,6 +2837,8 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="case_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type="past_case",
+        memory_tier=default_memory_tier("past_case", "approved", 0.72 if case_payload["caseStatus"] == "success" else 0.62),
+        memory_class=default_memory_class("past_case"),
         question=str(state.get("question") or "")[:1000],
         answer_preview=str(state.get("answer") or "")[:500],
         topics=topics[:8],
@@ -2286,6 +2894,8 @@ def procedure_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="proc_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type="procedure",
+        memory_tier=default_memory_tier("procedure", "approved" if payload["reviewed"] else "reviewed", 0.68 if payload["reviewed"] else 0.6),
+        memory_class=default_memory_class("procedure"),
         question=str(state.get("question") or "")[:1000],
         answer_preview=summary[:500],
         topics=topics[:8],
@@ -2518,6 +3128,16 @@ def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
         days = int(((route_payload.get("timeWindow") or {}).get("days") or 0) if route_payload.get("timeWindow") else 0)
         if days and days not in time_windows:
             time_windows.append(days)
+    eval_context = state.get("memory_eval_context") if isinstance(state.get("memory_eval_context"), dict) else {}
+    for topic in unique_strings((eval_context or {}).get("topics") or []):
+        if topic not in topics:
+            topics.append(topic)
+    for metric in unique_strings((eval_context or {}).get("metrics") or []):
+        if metric not in metrics:
+            metrics.append(metric)
+    for days in unique_ints((eval_context or {}).get("timeWindows") or (eval_context or {}).get("time_windows") or []):
+        if days not in time_windows:
+            time_windows.append(days)
     return {
         "question": question,
         "terms": set(re.findall(r"[\w\u4e00-\u9fff]{2,}", question)),
@@ -2545,12 +3165,17 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
             expired = is_memory_expired(item)
             invalid = float(item.get("confidence") or 0) <= 0.05
             pending = memory_is_pending(item)
+            inactive = memory_is_inactive(item)
             permitted = memory_visible_to_role(item, str(context.get("accessRole") or "merchant_analyst"))
-            if expired or invalid or pending or memory_status(item) == "deleted" or not permitted:
+            if expired or invalid or pending or inactive or not permitted:
                 reason = (
                     "expired"
                     if expired
-                    else ("low_confidence" if invalid else ("pending_governance" if pending else ("deleted" if memory_status(item) == "deleted" else "role_filtered")))
+                    else (
+                        "low_confidence"
+                        if invalid
+                        else ("pending_governance" if pending else ("deleted" if memory_status(item) == "deleted" else ("inactive" if inactive else "role_filtered")))
+                    )
                 )
                 filtered_reasons[reason] += 1
                 candidates.append(
@@ -2564,7 +3189,8 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
                 )
                 continue
             score, reasons = memory_relevance_score(item, context, group_name)
-            if score <= 0.25 and str(item.get("memoryType") or "") != "correction":
+            context_match_required = memory_context_match_required(item)
+            if (context_match_required and not memory_has_contextual_match(reasons)) or (score <= 0.25 and str(item.get("memoryType") or "") != "correction"):
                 filtered_reasons["not_relevant"] += 1
                 candidates.append(
                     MemoryRetrievalCandidate(
@@ -2642,9 +3268,77 @@ def memory_relevance_score(item: Dict[str, Any], context: Dict[str, Any], group_
     if str(item.get("memoryType") or "") == "procedure":
         score += 1.6 if (topic_overlap or metric_overlap or term_hits) else 0.2
         reasons.append("procedure_match")
+    if memory_tier(item) == "core":
+        score += 1.1
+        reasons.append("core_memory")
     if group_name == "preference":
         score += 0.5
     return max(0.0, score), reasons
+
+
+def memory_context_match_required(item: Dict[str, Any]) -> bool:
+    memory_type = str((item or {}).get("memoryType") or "")
+    if memory_tier(item) == "core":
+        return False
+    return memory_type in {"query_event", "past_case", "procedure", "negative_feedback", "feedback", "business_focus"}
+
+
+def memory_has_contextual_match(reasons: List[str]) -> bool:
+    contextual_prefixes = (
+        "topic_overlap",
+        "metric_overlap",
+        "time_window_match",
+        "text_match",
+        "analysis_intent_match",
+    )
+    return any(str(reason).startswith(contextual_prefixes) for reason in reasons or [])
+
+
+def candidate_memory_tier(candidate: MemoryRetrievalCandidate) -> str:
+    return str(((candidate.payload or {}).get("memoryTier") or "retrieval")).strip().lower() or "retrieval"
+
+
+def is_core_payload(payload: Dict[str, Any]) -> bool:
+    return str((payload or {}).get("memoryTier") or "").strip().lower() == "core"
+
+
+def merged_payloads_for(
+    candidates: List[MemoryRetrievalCandidate],
+    memory_types: set[str],
+    max_items: int,
+    selected_ids: List[str],
+) -> List[Dict[str, Any]]:
+    payloads = payloads_for(candidates, memory_types, max_items=max_items, selected_ids=selected_ids, allowed_tiers={"core"})
+    if len(payloads) < max_items:
+        payloads.extend(
+            payloads_for(
+                candidates,
+                memory_types,
+                max_items=max_items - len(payloads),
+                selected_ids=selected_ids,
+                allowed_tiers={"retrieval"},
+            )
+        )
+    return payloads
+
+
+def pop_low_priority_payload(items: List[Dict[str, Any]], min_items: int = 0) -> bool:
+    if len(items) <= max(0, int(min_items or 0)):
+        return False
+    for index in range(len(items) - 1, -1, -1):
+        if len(items) <= max(0, int(min_items or 0)):
+            return False
+        if not is_core_payload(items[index]):
+            items.pop(index)
+            return True
+    return False
+
+
+def pop_last_payload(items: List[Dict[str, Any]], min_items: int = 0) -> bool:
+    if len(items) <= max(0, int(min_items or 0)):
+        return False
+    items.pop()
+    return True
 
 
 def allocate_injection(
@@ -2657,17 +3351,19 @@ def allocate_injection(
 ) -> Tuple[Dict[str, Any], MemoryInjectionTrace]:
     usable = [item for item in candidates if not item.filtered]
     selected_ids: List[str] = []
-    corrections = payloads_for(usable, {"correction"}, max_items=3, selected_ids=selected_ids)
+    corrections = merged_payloads_for(usable, {"correction"}, max_items=3, selected_ids=selected_ids)
     metric_disputes = payloads_for(usable, {"metric_dispute"}, max_items=2, selected_ids=selected_ids)
-    preferences = payloads_for(usable, {"user_preference", "business_focus", "metric_habit", "time_window_habit", "preference"}, max_items=4, selected_ids=selected_ids)
-    facts = payloads_for(usable, {"fact", "business_fact"}, max_items=4, selected_ids=selected_ids)
+    preferences = merged_payloads_for(usable, {"user_preference", "business_focus", "metric_habit", "time_window_habit", "preference"}, max_items=4, selected_ids=selected_ids)
+    facts = merged_payloads_for(usable, {"fact", "business_fact"}, max_items=4, selected_ids=selected_ids)
     events = payloads_for(usable, {"query_event", "business_focus", "negative_feedback", "feedback"}, max_items=6, selected_ids=selected_ids)
     past_cases = payloads_for(usable, {"past_case"}, max_items=3, selected_ids=selected_ids)
     procedures = payloads_for(usable, {"procedure"}, max_items=3, selected_ids=selected_ids)
     candidate_memories = candidate_payloads_for(candidates, max_items=4)
+    core_memory = compact_core_memory_profile(memory.get("coreMemoryProfile") or build_core_memory_profile(memory))
     selected = {
         "merchantId": merchant_id,
         "recentFocus": memory.get("recentFocus") or {},
+        "coreMemory": core_memory,
         "relevantCorrections": corrections,
         "relevantMetricDisputes": metric_disputes,
         "relevantPreferences": preferences,
@@ -2681,32 +3377,43 @@ def allocate_injection(
         "source": source,
     }
     truncated = False
-    while memory_payload_tokens(selected) > budget and events:
+    while memory_injection_tokens(selected) > budget and events:
         events.pop()
         truncated = True
-    while memory_payload_tokens(selected) > budget and candidate_memories:
+    while memory_injection_tokens(selected) > budget and candidate_memories:
         candidate_memories.pop()
         truncated = True
-    while memory_payload_tokens(selected) > budget and preferences:
-        preferences.pop()
+    while memory_injection_tokens(selected) > budget and preferences and pop_low_priority_payload(preferences, min_items=1):
         truncated = True
-    while memory_payload_tokens(selected) > budget and facts:
-        facts.pop()
+    while memory_injection_tokens(selected) > budget and facts and pop_low_priority_payload(facts, min_items=1):
         truncated = True
-    while memory_payload_tokens(selected) > budget and procedures:
+    while memory_injection_tokens(selected) > budget and procedures:
         procedures.pop()
         truncated = True
-    while memory_payload_tokens(selected) > budget and metric_disputes:
+    while memory_injection_tokens(selected) > budget and metric_disputes:
         metric_disputes.pop()
         truncated = True
-    while memory_payload_tokens(selected) > budget and past_cases:
+    while memory_injection_tokens(selected) > budget and past_cases:
         past_cases.pop()
         truncated = True
-    while memory_payload_tokens(selected) > budget and len(corrections) > 1:
-        corrections.pop()
+    while memory_injection_tokens(selected) > budget and len(corrections) > 1 and pop_low_priority_payload(corrections, min_items=1):
+        truncated = True
+    while memory_injection_tokens(selected) > budget and len(preferences) > 1 and pop_last_payload(preferences, min_items=1):
+        truncated = True
+    while memory_injection_tokens(selected) > budget and len(facts) > 1 and pop_last_payload(facts, min_items=1):
+        truncated = True
+    while memory_injection_tokens(selected) > budget and len(corrections) > 1 and pop_last_payload(corrections, min_items=1):
+        truncated = True
+    while memory_injection_tokens(selected) > budget and events:
+        events.pop()
         truncated = True
     selected["truncated"] = truncated
     selected_ids = memory_ids_from_selected(selected)
+    core_selected_ids = [
+        *[str(item.get("id") or "") for item in corrections if is_core_payload(item) and item.get("id")],
+        *[str(item.get("id") or "") for item in preferences if is_core_payload(item) and item.get("id")],
+        *[str(item.get("id") or "") for item in facts if is_core_payload(item) and item.get("id")],
+    ]
     trace = MemoryInjectionTrace(
         merchant_id=merchant_id,
         budget_tokens=budget,
@@ -2717,24 +3424,35 @@ def allocate_injection(
         injected_correction_count=len(corrections),
         injected_fact_count=len(facts),
         past_case_count=len(past_cases),
-        budget_used_tokens=memory_payload_tokens(selected),
-        budget_used_chars=memory_payload_chars(selected),
+        budget_used_tokens=memory_injection_tokens(selected),
+        budget_used_chars=memory_injection_chars(selected),
         truncated=truncated,
         selected_ids=selected_ids,
         candidate_ids=[str(item.get("id") or "") for item in candidate_memories if item.get("id")],
+        core_memory_count=len(core_selected_ids),
+        retrieval_memory_count=len([memory_id for memory_id in selected_ids if memory_id not in set(core_selected_ids)]),
+        core_selected_ids=unique_strings(core_selected_ids),
         filtered_reasons=filtered_reasons,
         candidates=candidates[:20],
     )
     return selected, trace
 
 
-def payloads_for(candidates: List[MemoryRetrievalCandidate], memory_types: set[str], max_items: int, selected_ids: List[str]) -> List[Dict[str, Any]]:
+def payloads_for(
+    candidates: List[MemoryRetrievalCandidate],
+    memory_types: set[str],
+    max_items: int,
+    selected_ids: List[str],
+    allowed_tiers: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
     payloads: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for candidate in candidates:
         memory_type = str(candidate.memory_type or "")
         normalized_type = "fact" if memory_type in {"business_fact"} else memory_type
         if normalized_type not in memory_types:
+            continue
+        if allowed_tiers and candidate_memory_tier(candidate) not in allowed_tiers:
             continue
         if candidate.memory_id in seen or candidate.memory_id in selected_ids:
             continue
@@ -2773,6 +3491,8 @@ def compact_memory_payload(item: Dict[str, Any], group_name: str) -> Dict[str, A
     payload = {
         "id": memory_id,
         "memoryType": item.get("memoryType") or group_name,
+        "memoryTier": memory_tier(item),
+        "memoryClass": memory_class(item),
         "topics": item.get("topics") or [],
         "metrics": item.get("metrics") or [],
         "timeWindows": item.get("timeWindows") or [],
@@ -2788,7 +3508,7 @@ def compact_memory_payload(item: Dict[str, Any], group_name: str) -> Dict[str, A
         "createdAt": item.get("createdAt", ""),
         "hitCount": item.get("hitCount", 0),
     }
-    if str(payload.get("memoryType") or "") == "past_case":
+    if str(payload.get("memoryType") or "") in {"past_case", "procedure"}:
         payload["casePayload"] = compact_case_payload(memory_case_payload(item))
         if item.get("caseSummary"):
             payload["caseSummary"] = str(item.get("caseSummary") or "")[:500]
@@ -2840,12 +3560,15 @@ def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> i
         pref = MemoryPreference(
             preference_id="pref_topic_%s" % stable_slug(topic),
             memory_type="business_focus",
+            memory_tier=habit_memory_tier_for_event(event, 1),
+            memory_class=default_memory_class("business_focus"),
             key="topic:%s" % topic,
             value=topic,
             topics=[topic],
             metrics=[],
             confidence=min(0.95, float(event.get("confidence") or 0.5) + 0.1),
             source=event.get("source") or "answer_run",
+            hit_count=1,
             scope=memory_scope_payload(event),
             status=memory_status(event),
             retention_days=default_retention_days("business_focus"),
@@ -2861,12 +3584,15 @@ def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> i
         pref = MemoryPreference(
             preference_id="pref_metric_%s" % stable_slug(metric),
             memory_type="metric_habit",
+            memory_tier=habit_memory_tier_for_event(event, 1),
+            memory_class=default_memory_class("metric_habit"),
             key="metric:%s" % metric,
             value=metric,
             topics=unique_strings(event.get("topics") or []),
             metrics=[metric],
             confidence=min(0.95, float(event.get("confidence") or 0.5) + 0.1),
             source=event.get("source") or "answer_run",
+            hit_count=1,
             scope=memory_scope_payload(event),
             status=memory_status(event),
             retention_days=default_retention_days("metric_habit"),
@@ -2882,12 +3608,15 @@ def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> i
         pref = MemoryPreference(
             preference_id="pref_window_%s" % days,
             memory_type="time_window_habit",
+            memory_tier=habit_memory_tier_for_event(event, 1),
+            memory_class=default_memory_class("time_window_habit"),
             key="timeWindow:%s" % days,
             value="%s天" % days,
             topics=unique_strings(event.get("topics") or []),
             metrics=unique_strings(event.get("metrics") or []),
             confidence=min(0.9, float(event.get("confidence") or 0.5) + 0.05),
             source=event.get("source") or "answer_run",
+            hit_count=1,
             scope=memory_scope_payload(event),
             status=memory_status(event),
             retention_days=default_retention_days("time_window_habit"),
@@ -2903,6 +3632,23 @@ def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> i
     return updates
 
 
+def habit_memory_tier_for_event(event: Dict[str, Any], hit_count: int) -> str:
+    if int(hit_count or 0) >= HABIT_CORE_PROMOTION_HIT_COUNT:
+        return "core"
+    if event_promotes_habit_to_core(event):
+        return "core"
+    return "retrieval"
+
+
+def event_promotes_habit_to_core(event: Dict[str, Any]) -> bool:
+    memory_type = str((event or {}).get("memoryType") or "")
+    if memory_type == "correction":
+        return True
+    if positive_feedback_signal(str((event or {}).get("feedbackSignal") or "")):
+        return True
+    return habit_text_is_explicit(event)
+
+
 def upsert_preference(items: List[Dict[str, Any]], preference: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
     now = datetime.now().isoformat()
     for item in items:
@@ -2913,6 +3659,10 @@ def upsert_preference(items: List[Dict[str, Any]], preference: Dict[str, Any]) -
             item["hitCount"] = int(item.get("hitCount") or 0) + 1
             item["lastUsedAt"] = now
             item["decayScore"] = round(memory_decay_score(item), 4)
+            if memory_tier(preference) == "core" or int(item.get("hitCount") or 0) >= HABIT_CORE_PROMOTION_HIT_COUNT:
+                item["memoryTier"] = "core"
+            elif memory_tier(item) != "core":
+                item["memoryTier"] = "retrieval"
             return items, True
     items.append(preference)
     return items, True
@@ -2923,6 +3673,8 @@ def correction_fact_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
     fact = MemoryFact(
         fact_id="fact_correction_%s" % stable_slug(text[:80]),
         memory_type="business_fact",
+        memory_tier=default_memory_tier("business_fact", memory_status(event), 0.95),
+        memory_class=default_memory_class("business_fact"),
         content=text,
         topics=unique_strings(event.get("topics") or []),
         metrics=unique_strings(event.get("metrics") or []),

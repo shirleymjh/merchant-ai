@@ -16,16 +16,24 @@ from merchant_ai.models import (
     ChatRequest,
     FeedbackRequest,
     KnowledgeSuggestionReviewRequest,
+    MemoryCleanupRequest,
+    MemoryItemPatchRequest,
+    MemoryRecallEvaluationRequest,
     RunCreateRequest,
+    SkillDraftReviewRequest,
+    SkillEvaluationRequest,
     TopicBuildRequest,
     TopicReviewRequest,
     WikiCompressRequest,
 )
 from merchant_ai.services.answer import DailyReportService, FeedbackService
 from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicBuilderWorkflow
+from merchant_ai.services.memory import MemoryManagementService
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, run_duration_ms, run_summary_payload
+from merchant_ai.services.skill_drafts import SkillDraftService
+from merchant_ai.services.skill_evaluation import SkillEvaluationService
 
 settings = get_settings()
 workflow = create_workflow(settings)
@@ -42,6 +50,9 @@ topic_assets = workflow.recall_service.topic_assets
 doris_repository = workflow.node_worker.doris_repository
 daily_report_service = DailyReportService(doris_repository)
 feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store, workflow.memory_store)
+memory_management_service = MemoryManagementService(settings, workflow.memory_store)
+skill_draft_service = SkillDraftService(settings)
+skill_evaluation_service = SkillEvaluationService(settings, workflow.answer_service)
 topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
 semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
 recall_index_manager = RecallIndexManager(
@@ -261,6 +272,36 @@ def feedback(answer_id: str, request: FeedbackRequest) -> Dict[str, Any]:
     return {"success": True, "persisted": persisted}
 
 
+@app.get("/api/memory/{merchant_id}")
+def get_memory(merchant_id: str, include_inactive: bool = Query(default=True)) -> Dict[str, Any]:
+    return memory_management_service.get_memory(merchant_id, include_inactive=include_inactive)
+
+
+@app.patch("/api/memory/{merchant_id}/items/{memory_id}")
+def patch_memory_item(merchant_id: str, memory_id: str, request: MemoryItemPatchRequest) -> Dict[str, Any]:
+    return memory_management_service.patch_item(merchant_id, memory_id, request)
+
+
+@app.delete("/api/memory/{merchant_id}/items/{memory_id}")
+def delete_memory_item(merchant_id: str, memory_id: str, hard_delete: bool = Query(default=False)) -> Dict[str, Any]:
+    return memory_management_service.delete_item(merchant_id, memory_id, hard_delete=hard_delete)
+
+
+@app.post("/api/memory/{merchant_id}/cleanup")
+def cleanup_memory(merchant_id: str, request: MemoryCleanupRequest) -> Dict[str, Any]:
+    return memory_management_service.cleanup_expired(merchant_id, hard_delete=request.hard_delete, dry_run=request.dry_run)
+
+
+@app.post("/api/memory/{merchant_id}/recall-eval")
+def evaluate_memory_recall(merchant_id: str, request: MemoryRecallEvaluationRequest) -> Dict[str, Any]:
+    return memory_management_service.evaluate_recall(
+        merchant_id,
+        request.cases,
+        budget_tokens=request.budget_tokens,
+        budget_chars=request.budget_chars,
+    )
+
+
 @app.get("/api/ops/knowledge-suggestions")
 def operator_knowledge_suggestions(status: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     items = load_knowledge_suggestions()
@@ -293,6 +334,21 @@ def review_operator_knowledge_suggestion(item_id: str, request: KnowledgeSuggest
     )
     save_knowledge_suggestions(items)
     return {"success": True, "item": target}
+
+
+@app.get("/api/ops/skill-drafts")
+def list_skill_drafts(status: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    return {"success": True, "items": skill_draft_service.list_drafts(status or "")}
+
+
+@app.post("/api/ops/skill-drafts/{draft_id}/review")
+def review_skill_draft(draft_id: str, request: SkillDraftReviewRequest) -> Dict[str, Any]:
+    return skill_draft_service.review_draft(draft_id, request)
+
+
+@app.post("/api/ops/skill-evaluations")
+def evaluate_skill_triggers(request: SkillEvaluationRequest) -> Dict[str, Any]:
+    return skill_evaluation_service.evaluate(request)
 
 
 @app.get("/api/daily-report")

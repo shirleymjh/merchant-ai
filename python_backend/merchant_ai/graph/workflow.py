@@ -58,7 +58,9 @@ from merchant_ai.models import (
     RecallBundle,
     RecallItem,
     RouteSlots,
+    SkillDraft,
     SkillLifecycleRecord,
+    SkillMatchState,
     TOPIC_TO_CATEGORY,
     ToolCallRequest,
     ToolCachePolicy,
@@ -66,7 +68,7 @@ from merchant_ai.models import (
     ThreadData,
     TopicRoutingDecision,
 )
-from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_skill_required, build_response_context, joined_categories, select_answer_skill
+from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_skill_headers, answer_skill_required, build_response_context, joined_categories, select_answer_skill
 from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService, WikiMemoryService
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.context import ContextManager
@@ -84,6 +86,7 @@ from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService, route_primary_topic
+from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.tools import (
     artifact_file_tool_definitions,
     artifact_file_tool_schemas,
@@ -301,6 +304,7 @@ class MerchantQaWorkflow:
         self.context_assembler = ContextAssembler(settings)
         self.thread_context_service = ThreadContextService()
         self.memory_store = create_memory_store(settings)
+        self.skill_draft_service = SkillDraftService(settings)
         self.middleware_chain = MiddlewareChain(default_harness_middlewares(settings, self.context_manager))
         self.checkpoint_manager = CheckpointManager(settings)
         self.graph = self._build_graph()
@@ -462,6 +466,8 @@ class MerchantQaWorkflow:
             answer="",
             analysis_summary="",
             analysis_skill_trace={},
+            skill_match=SkillMatchState(),
+            skill_draft=SkillDraft(),
             skill_lifecycle_records=[],
             answer_used_llm=False,
             suggestions=[],
@@ -516,6 +522,7 @@ class MerchantQaWorkflow:
         builder.add_node("execute_query_graph", self.execute_query_graph)
         builder.add_node("repair_sql", self.repair_sql)
         builder.add_node("verify_evidence_graph", self.verify_evidence_graph)
+        builder.add_node("run_analysis_skill", self.run_analysis_skill)
         builder.add_node("answer_rule", self.answer_rule)
         builder.add_node("answer_analysis", self.answer_analysis)
         builder.add_node("human_in_loop", self.human_in_loop)
@@ -539,6 +546,7 @@ class MerchantQaWorkflow:
                 "execute_query_graph": "execute_query_graph",
                 "repair_sql": "repair_sql",
                 "verify_evidence_graph": "verify_evidence_graph",
+                "run_analysis_skill": "run_analysis_skill",
                 "answer_rule": "answer_rule",
                 "answer_analysis": "answer_analysis",
                 "human_in_loop": "human_in_loop",
@@ -557,6 +565,7 @@ class MerchantQaWorkflow:
             "execute_query_graph",
             "repair_sql",
             "verify_evidence_graph",
+            "run_analysis_skill",
         ]:
             builder.add_edge(node, "policy")
         builder.add_edge("answer_rule", "cache_answer")
@@ -652,6 +661,7 @@ class MerchantQaWorkflow:
         observation = self.main_agent_observation(state)
         state.setdefault("main_agent_observations", []).append(observation)
         state["main_agent_observations"] = state["main_agent_observations"][-24:]
+        state["lead_decision_context"] = self.build_lead_decision_context(state, observation)
         decision = self.policy.decide(state)
         decision.observation = observation.get("summary", "")
         decision = self.apply_bounded_lead_llm_decision(state, decision)
@@ -685,6 +695,7 @@ class MerchantQaWorkflow:
                 "availableActions": [item.model_dump(by_alias=True) for item in state["available_actions"]],
                 "reason": decision.reason,
                 "observation": observation,
+                "decisionContext": state.get("lead_decision_context", {}),
                 "source": decision.source,
             },
         )
@@ -693,7 +704,7 @@ class MerchantQaWorkflow:
         return state
 
     def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
-        mode = str(getattr(self.settings, "lead_action_llm_mode", "low_confidence") or "low_confidence").lower()
+        mode = str(getattr(self.settings, "lead_action_llm_mode", "always") or "always").lower()
         allowed = [str(item) for item in decision.available_actions if item]
         observation = state.get("main_agent_observations", [{}])[-1] if state.get("main_agent_observations") else {}
         trace: Dict[str, Any] = {
@@ -740,6 +751,7 @@ class MerchantQaWorkflow:
             "plannerRepairRequests": [item.model_dump(by_alias=True) for item in state.get("planner_repair_requests", [])[:5]],
             "plannerReflection": (state.get("planner_reflection") or PlannerReflectionResult()).model_dump(by_alias=True),
             "queryGraphValidation": (state.get("query_graph_validation_result") or GraphValidationResult()).model_dump(by_alias=True),
+            "decisionContext": state.get("lead_decision_context", {}),
             "instruction": "只能从 allowedActions 中选择一个 action id。不要创造新 action。返回 JSON: {selectedAction:'', reason:''}",
         }
         try:
@@ -830,6 +842,276 @@ class MerchantQaWorkflow:
             "evidenceGaps": [gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap for gap in evidence_gaps[:6]],
             "toolRuntimeFailures": state.get("tool_failures", [])[-4:],
         }
+
+    def build_lead_decision_context(self, state: AgentState, observation: Dict[str, Any]) -> Dict[str, Any]:
+        validation = state.get("query_graph_validation_result") or GraphValidationResult()
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        graph_gaps = list(getattr(validation, "gaps", []) or [])
+        evidence_gaps = list(getattr(run_result, "evidence_gaps", []) or [])
+        sql_failures = self.sql_failure_payloads(run_result)
+        recall_refs = self.current_recall_refs(state)
+        seen_refs = [str(item) for item in state.get("_lead_seen_recall_refs", []) if str(item)]
+        seen_set = set(seen_refs)
+        new_refs = [ref for ref in recall_refs if ref not in seen_set]
+        if recall_refs:
+            state["_lead_seen_recall_refs"] = (seen_refs + new_refs)[-240:]
+        current_counts = {
+            "graphGaps": len(graph_gaps),
+            "evidenceGaps": len(evidence_gaps),
+            "sqlFailures": len(sql_failures),
+            "pendingKnowledge": len(state.get("pending_knowledge_requests") or []),
+        }
+        previous_counts = state.get("_lead_previous_gap_counts") or {}
+        gap_delta = {
+            key: current_counts[key] - int(previous_counts.get(key, 0) or 0)
+            for key in current_counts
+        }
+        state["_lead_previous_gap_counts"] = current_counts
+        last_action, repeat_count = self.last_action_repeat_count(state)
+        knowledge_recall_stalled = bool(
+            last_action == "retrieve_knowledge"
+            and int(state.get("query_graph_retrieve_count") or 0) > 0
+            and not new_refs
+        )
+        decision_hints: List[str] = []
+        if knowledge_recall_stalled:
+            decision_hints.append("retrieve_knowledge_has_no_new_refs")
+        if graph_gaps:
+            decision_hints.append("graph_validation_gaps_present")
+        if evidence_gaps:
+            decision_hints.append("evidence_gaps_present")
+        if sql_failures:
+            decision_hints.append("sql_failures_present")
+        if state.get("human_clarification_required"):
+            decision_hints.append("human_clarification_required")
+        context = {
+            "observationSummary": observation.get("summary", ""),
+            "progress": {
+                "lastAction": last_action,
+                "lastActionRepeatCount": repeat_count,
+                "newRecallRefsCount": len(new_refs),
+                "newRecallRefs": new_refs[:12],
+                "recallRefsTotal": len(recall_refs),
+                "gapDelta": gap_delta,
+                "knowledgeRecallStalled": knowledge_recall_stalled,
+            },
+            "stateFlags": {
+                "topicRouted": bool(state.get("topic_routed")),
+                "fastUnderstood": bool(state.get("fast_understood")),
+                "dataDiscovered": bool(state.get("data_discovered")),
+                "planningAssetsCompacted": bool(state.get("planning_assets_compacted")),
+                "queryGraphReflected": bool(state.get("query_graph_reflected")),
+                "queryGraphValidated": bool(state.get("query_graph_validated")),
+                "sqlGenerated": bool(state.get("sql_generated")),
+                "sqlRepairReviewed": bool(state.get("sql_repair_reviewed")),
+                "evidenceGraphVerified": bool(state.get("evidence_graph_verified")),
+                "chatBiCompleted": bool(state.get("chat_bi_completed")),
+            },
+            "budgets": {
+                "reactRound": int(state.get("react_round") or 0),
+                "queryGraphRetrieveCount": int(state.get("query_graph_retrieve_count") or 0),
+                "queryGraphPlanAttempts": int(state.get("query_graph_plan_attempts") or 0),
+                "queryGraphRepairAttempts": int(state.get("query_graph_repair_attempts") or 0),
+            },
+            "gaps": {
+                "graph": self.gap_payloads(graph_gaps, 8),
+                "evidence": self.gap_payloads(evidence_gaps, 8),
+                "pendingKnowledge": [
+                    item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                    for item in (state.get("pending_knowledge_requests") or [])[:6]
+                ],
+            },
+            "executionFailures": {
+                "sql": sql_failures[:8],
+                "toolRuntime": state.get("tool_failures", [])[-6:],
+            },
+            "retrievalStrategy": state.get("recall_strategy", {}),
+            "workerDispatch": state.get("worker_dispatch_context") or self.worker_dispatch_context(state),
+            "skillDispatch": state.get("skill_dispatch_context") or self.skill_dispatch_context(state),
+            "decisionHints": decision_hints,
+        }
+        return context
+
+    def recall_strategy_payload(self, fast_understanding: FastUnderstandingResult, round_traces: List[Any]) -> Dict[str, Any]:
+        traces: List[Dict[str, Any]] = []
+        for trace in round_traces[-8:]:
+            traces.append(trace.model_dump(by_alias=True) if hasattr(trace, "model_dump") else dict(trace or {}))
+        profiles = [trace.get("retrievalProfile") or {} for trace in traces]
+        query_types = dedupe_texts([str(profile.get("queryType") or trace.get("queryType") or "") for profile, trace in zip(profiles, traces)])
+        profile_kinds = dedupe_texts([str(profile.get("profileKind") or "") for profile in profiles])
+        lanes: List[Dict[str, Any]] = []
+        for trace in traces:
+            for lane in trace.get("retrievalLanes", []) or trace.get("retrieval_lanes", []) or []:
+                if isinstance(lane, dict):
+                    lane_key = "%s:%s:%s" % (lane.get("lane"), lane.get("enabled"), lane.get("topK"))
+                    if not any(item.get("_key") == lane_key for item in lanes):
+                        next_lane = dict(lane)
+                        next_lane["_key"] = lane_key
+                        lanes.append(next_lane)
+        for lane in lanes:
+            lane.pop("_key", None)
+        top_k = {}
+        if profiles:
+            last = profiles[-1]
+            top_k = {
+                "textTopK": int(last.get("textTopK") or 0),
+                "vectorTopK": int(last.get("vectorTopK") or 0),
+                "broadTextTopK": int(last.get("broadTextTopK") or 0),
+                "broadVectorTopK": int(last.get("broadVectorTopK") or 0),
+                "hybridTopK": int(last.get("hybridTopK") or 0),
+            }
+        return {
+            "intentKind": fast_understanding.intent_kind,
+            "complexity": fast_understanding.complexity,
+            "queryTypes": query_types,
+            "profileKinds": profile_kinds,
+            "topK": top_k,
+            "lanes": lanes[:8],
+            "roundCount": len(traces),
+        }
+
+    def worker_dispatch_context(self, state: AgentState) -> Dict[str, Any]:
+        fast = state.get("fast_understanding") or FastUnderstandingResult()
+        plan = state.get("plan") or QueryPlan()
+        intents = list(getattr(plan, "intents", []) or [])
+        node_count = len(intents)
+        dependencies = list(getattr(plan, "dependencies", []) or [])
+        dependent_ids = {str(getattr(item, "dependent_task_id", "") or "") for item in dependencies}
+        root_nodes = [
+            str(getattr(intent, "plan_task_id", "") or "")
+            for intent in intents
+            if str(getattr(intent, "plan_task_id", "") or "") not in dependent_ids
+        ]
+        parallelizable = node_count > 1 and len([item for item in root_nodes if item]) > 1
+        complex_task = fast.complexity in {"medium", "complex"} or fast.intent_kind in {"multi_hop", "analysis", "rule_data_mix"} or node_count > 1
+        worker_type = "NodeWorker" if node_count else ""
+        reason = "no_query_graph_yet"
+        if worker_type and parallelizable:
+            reason = "query_graph_has_parallel_roots"
+        elif worker_type and complex_task:
+            reason = "complex_or_multi_node_query_graph"
+        elif worker_type:
+            reason = "single_node_controlled_sql"
+        return {
+            "workerType": worker_type,
+            "shouldDispatch": bool(worker_type),
+            "complexTask": bool(complex_task),
+            "parallelizable": bool(parallelizable),
+            "nodeCount": node_count,
+            "rootNodeCount": len([item for item in root_nodes if item]),
+            "intentKind": fast.intent_kind,
+            "complexity": fast.complexity,
+            "reason": reason,
+        }
+
+    def skill_dispatch_context(self, state: AgentState) -> Dict[str, Any]:
+        plan = state.get("plan") or QueryPlan()
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        has_rule_context = bool(state.get("rule_recall_context", ""))
+        candidate = select_answer_skill(plan, run_result, has_rule_context)
+        needs_skill = bool(
+            not state.get("analysis_summary")
+            and not state.get("analysis_skill_trace")
+            and getattr(run_result, "task_results", None)
+            and state.get("evidence_graph_verified")
+            and (analysis_summary_required(plan) or answer_skill_required(plan, run_result, has_rule_context))
+        )
+        headers = answer_skill_headers(self.settings.resources_root / "runtime" / "agent_skills") if needs_skill else []
+        return {
+            "needsSkillWorker": bool(needs_skill),
+            "candidateSkill": candidate,
+            "matchMode": str(getattr(self.settings, "answer_skill_match_mode", "")),
+            "availableSkillHeaders": self.skill_header_payloads(headers),
+        }
+
+    def skill_header_payloads(self, headers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for item in headers[:8]:
+            payloads.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "description": str(item.get("description") or "")[:240],
+                    "whenToUse": str(item.get("when_to_use") or item.get("whenToUse") or "")[:360],
+                    "constraints": [str(value)[:220] for value in (item.get("constraints") or [])[:6]],
+                    "requiredInputs": [str(value)[:220] for value in (item.get("required_inputs") or item.get("requiredInputs") or [])[:6]],
+                    "path": str(item.get("path") or ""),
+                }
+            )
+        return payloads
+
+    def current_recall_refs(self, state: AgentState) -> List[str]:
+        refs: List[str] = []
+        bundle = state.get("knowledge_bundle")
+        refs.extend(str(item) for item in getattr(bundle, "source_refs", []) or [] if str(item))
+        recall_bundle = state.get("recall_bundle")
+        for item in getattr(recall_bundle, "items", []) or []:
+            ref = str(getattr(item, "doc_id", "") or ((getattr(item, "metadata", {}) or {}).get("semanticRefId")) or "")
+            if ref:
+                refs.append(ref)
+        for round_trace in state.get("recall_rounds", []) or []:
+            payload = round_trace.model_dump(by_alias=True) if hasattr(round_trace, "model_dump") else round_trace
+            if isinstance(payload, dict):
+                refs.extend(str(item) for item in payload.get("sourceRefs", []) or payload.get("source_refs", []) or [] if str(item))
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for ref in refs:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            ordered.append(ref)
+        return ordered
+
+    def gap_payloads(self, gaps: List[Any], limit: int) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for gap in gaps[:limit]:
+            if hasattr(gap, "model_dump"):
+                payload = gap.model_dump(by_alias=True)
+            elif isinstance(gap, dict):
+                payload = dict(gap)
+            else:
+                payload = {"reason": str(gap)}
+            payloads.append(
+                {
+                    "code": str(payload.get("code") or ""),
+                    "taskId": str(payload.get("taskId") or payload.get("task_id") or ""),
+                    "reason": str(payload.get("reason") or payload.get("message") or "")[:240],
+                    "evidence": str(payload.get("evidence") or "")[:240],
+                    "severity": str(payload.get("severity") or ""),
+                }
+            )
+        return payloads
+
+    def sql_failure_payloads(self, run_result: AgentRunResult) -> List[Dict[str, Any]]:
+        failures: List[Dict[str, Any]] = []
+        for task_result in getattr(run_result, "task_results", []) or []:
+            bundle = getattr(task_result, "query_bundle", None) or QueryBundle()
+            if not getattr(bundle, "failed", False):
+                continue
+            validations = getattr(task_result, "validation_results", []) or []
+            last_validation = validations[-1] if validations else None
+            failures.append(
+                {
+                    "taskId": str(getattr(task_result, "task_id", "") or ""),
+                    "summary": str(getattr(task_result, "summary", "") or "")[:180],
+                    "error": str(getattr(bundle, "error", "") or "")[:240],
+                    "validationErrorCode": str(getattr(last_validation, "error_code", "") or ""),
+                    "validationMessage": str(getattr(last_validation, "message", "") or "")[:240],
+                    "repairAttempts": len(getattr(task_result, "sql_repairs", []) or []),
+                }
+            )
+        return failures
+
+    def last_action_repeat_count(self, state: AgentState) -> tuple[str, int]:
+        history = state.get("action_history") or []
+        if not history:
+            return "", 0
+        last = str(getattr(history[-1], "action", "") or "")
+        count = 0
+        for item in reversed(history):
+            if str(getattr(item, "action", "") or "") != last:
+                break
+            count += 1
+        return last, count
 
     def ensure_terminal_planning_gap(self, state: AgentState, decision: Any) -> None:
         if getattr(decision, "selected_action", "") not in {"answer_data", "answer"}:
@@ -1226,6 +1508,7 @@ class MerchantQaWorkflow:
         state["pending_knowledge_requests"] = active_pending_requests
         had_pending_requests = bool(active_pending_requests)
         base_topics = self._effective_topic_categories(state)
+        fast_understanding = state.get("fast_understanding") or FastUnderstandingResult()
         query_scopes: List[tuple[str, List[QuestionCategory], Optional[KnowledgeRequest]]] = [(state["question"], base_topics, None)]
         route_query = self.route_recall_query(state)
         if route_query and route_query != state["question"]:
@@ -1258,6 +1541,8 @@ class MerchantQaWorkflow:
                 topic_categories=query_topics,
                 knowledge_request=request,
                 route_slots=(state.get("route_slots") or RouteSlots()).model_dump(by_alias=True),
+                intent_kind=fast_understanding.intent_kind,
+                complexity=fast_understanding.complexity,
                 round=int(state.get("query_graph_retrieve_count") or 0),
             )
             knowledge_bundle = self.knowledge_retriever.retrieve(retrieval_request)
@@ -1296,6 +1581,7 @@ class MerchantQaWorkflow:
             semantic_source_hash=next((bundle.semantic_source_hash for bundle in knowledge_bundles if bundle.semantic_source_hash), ""),
         )
         state["recall_rounds"] = round_traces
+        state["recall_strategy"] = self.recall_strategy_payload(fast_understanding, round_traces)
         self.update_knowledge_request_lineage(state, active_pending_requests, lineage_items)
         state["recall_context"] = state["recall_bundle"].merged_context
         state["knowledge_expanded_topics"] = expanded_topics
@@ -1328,17 +1614,26 @@ class MerchantQaWorkflow:
             state["plan"] = QueryPlan()
             state["query_graph_plan_attempts"] = 0
             state["planner_provider_error"] = ""
-        add_step(state, "Main Agent Tool retrieve_knowledge：完成检索，命中 %d 条候选知识/资产片段，skillPolicies=%s" % (len(items), loaded_skills or []))
+        add_step(
+            state,
+            "Main Agent Tool retrieve_knowledge：完成检索，命中 %d 条候选知识/资产片段，profile=%s skillPolicies=%s"
+            % (len(items), ",".join(state["recall_strategy"].get("profileKinds") or []) or "unknown", loaded_skills or []),
+        )
         self.record_span(
             state,
             "semantic_tool",
             "retrieve_knowledge",
             started,
             row_count=len(items),
-            metadata={"skillPolicies": loaded_skills, "pendingRequests": had_pending_requests},
+            metadata={"skillPolicies": loaded_skills, "pendingRequests": had_pending_requests, "recallStrategy": state.get("recall_strategy", {})},
         )
         self.finish_run_step(state, step, "success", output_summary="recallItems=%d skills=%s" % (len(items), loaded_skills or []))
-        emit(state, "node.completed", "RETRIEVE_KNOWLEDGE", {"recallItems": len(items), "skillPolicies": loaded_skills})
+        emit(
+            state,
+            "node.completed",
+            "RETRIEVE_KNOWLEDGE",
+            {"recallItems": len(items), "skillPolicies": loaded_skills, "recallStrategy": state.get("recall_strategy", {})},
+        )
         return state
 
     def update_knowledge_request_lineage(
@@ -1985,7 +2280,8 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "execute_graph", "NodeAgent", "EXECUTE_QUERY_GRAPH", input_summary="nodes=%d" % len(state["plan"].intents))
         increment_round(state)
         self.configure_artifact_roots(state)
-        emit(state, "node.started", "EXECUTE_QUERY_GRAPH", {})
+        state["worker_dispatch_context"] = self.worker_dispatch_context(state)
+        emit(state, "node.started", "EXECUTE_QUERY_GRAPH", {"workerDispatch": state.get("worker_dispatch_context", {})})
         validation = state.get("query_graph_validation_result")
         if state.get("query_graph_validated") and validation and not validation.valid:
             gaps = [
@@ -2103,7 +2399,11 @@ class MerchantQaWorkflow:
                     "rows": task_result.query_bundle.effective_row_count(),
                 },
             )
-        add_step(state, "Main Agent Tool execute_query_graph：派发 NodeWorker Agent 执行 QueryGraph nodes，tasks=%d" % len(run_result.tasks))
+        add_step(
+            state,
+            "Main Agent Tool execute_query_graph：派发 NodeWorker Agent 执行 QueryGraph nodes，tasks=%d reason=%s"
+            % (len(run_result.tasks), state["worker_dispatch_context"].get("reason") or "unknown"),
+        )
         self.refresh_context_snapshot(state, "execute_query_graph")
         failed_tasks = sum(1 for item in run_result.task_results if item.query_bundle.failed)
         self.record_span(
@@ -2115,7 +2415,7 @@ class MerchantQaWorkflow:
             row_count=run_result.merged_query_bundle.effective_row_count(),
             error_code="SQL_TASK_FAILED" if failed_tasks else "",
             retry_or_fallback_count=len(run_result.sql_repairs),
-            metadata={"tasks": len(run_result.tasks), "failedTasks": failed_tasks},
+            metadata={"tasks": len(run_result.tasks), "failedTasks": failed_tasks, "workerDispatch": state.get("worker_dispatch_context", {})},
         )
         self.finish_run_step(
             state,
@@ -2270,6 +2570,172 @@ class MerchantQaWorkflow:
         emit(state, "node.completed", "ANSWER_RULE", {"answerReady": bool(state["answer"])})
         return state
 
+    def run_analysis_skill(self, state: AgentState) -> AgentState:
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "run_analysis_skill",
+            "SkillWorker",
+            "RUN_ANALYSIS_SKILL",
+            input_summary="tasks=%d" % len(state["agent_run_result"].task_results),
+        )
+        increment_round(state)
+        emit(state, "node.started", "RUN_ANALYSIS_SKILL", {})
+        match = self.match_analysis_skill(state)
+        if not match.skill_name:
+            state["skill_worker_completed"] = False
+            self.finish_run_step(state, step, "partial", output_summary="no matched skill", error_code="NO_MATCHED_SKILL")
+            emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"completed": False, "reason": "NO_MATCHED_SKILL"})
+            return state
+        if self.maybe_request_skill_confirmation(state):
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="skill confirmation required",
+                error_code="SKILL_CONFIRMATION_REQUIRED",
+            )
+            emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"confirmationRequired": True})
+            return state
+        personalization_context = self.answer_personalization_context(state)
+        self.emit_skill_lifecycle_event(state, "confirmed", match, {"confirmed": True})
+        self.emit_skill_lifecycle_event(state, "isolated_execute", match, {"workerType": "SKILL_WORKER"})
+        state["analysis_summary"] = self.answer_service.run_analysis_skill(
+            state["question"],
+            state["plan"],
+            state["agent_run_result"],
+            state["thread_data"].outputs_path,
+            state.get("rule_recall_context", ""),
+            skill_name=match.skill_name,
+            merchant=state["merchant"],
+            personalization_context=personalization_context,
+        )
+        state["analysis_skill_trace"] = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
+        self.record_skill_lifecycle(state, state["analysis_skill_trace"])
+        trace = state.get("analysis_skill_trace") or {}
+        if trace.get("progress"):
+            self.emit_skill_lifecycle_event(state, "progress_synced", match, {"progress": trace.get("progress") or []})
+        state["skill_worker_completed"] = bool(state.get("analysis_summary")) and not bool(trace.get("error"))
+        if isinstance(state.get("skill_match"), SkillMatchState):
+            state["skill_match"] = state["skill_match"].model_copy(
+                update={
+                    "status": "completed" if state.get("skill_worker_completed") else "failed",
+                    "confirmed": True,
+                    "trace": trace,
+                }
+            )
+        add_step(
+            state,
+            "LeadAgent Tool run_analysis_skill：已调度 SkillWorker，skill=%s status=%s"
+            % (trace.get("skillName") or "", trace.get("lifecycleStage") or "none"),
+        )
+        self.record_span(
+            state,
+            "worker",
+            "skill_worker:%s" % (trace.get("skillName") or "unknown"),
+            started,
+            status="success" if state.get("skill_worker_completed") else "failed",
+            error_code=str(trace.get("error") or ""),
+            estimated_completion_chars=len(state.get("analysis_summary") or ""),
+            metadata={
+                "skillTrace": trace,
+                "subAgentType": trace.get("subAgentType") or trace.get("workerType"),
+                "isolatedExecution": trace.get("isolatedExecution"),
+            },
+        )
+        self.finish_run_step(
+            state,
+            step,
+            "success" if state.get("skill_worker_completed") else "partial",
+            output_summary="skill=%s summaryChars=%d" % (trace.get("skillName") or "", len(state.get("analysis_summary") or "")),
+            error_code=str(trace.get("error") or ""),
+        )
+        emit(
+            state,
+            "node.completed",
+            "RUN_ANALYSIS_SKILL",
+            {
+                "skillName": trace.get("skillName"),
+                "completed": bool(state.get("skill_worker_completed")),
+                "summaryChars": len(state.get("analysis_summary") or ""),
+                "workerType": trace.get("workerType"),
+            },
+        )
+        self.emit_skill_lifecycle_event(
+            state,
+            "completed" if state.get("skill_worker_completed") else "failed",
+            match,
+            {"summaryChars": len(state.get("analysis_summary") or ""), "error": trace.get("error") or ""},
+        )
+        return state
+
+    def match_analysis_skill(self, state: AgentState) -> SkillMatchState:
+        current = state.get("skill_match")
+        if isinstance(current, SkillMatchState) and current.skill_name:
+            return current
+        plan = state.get("plan") or QueryPlan()
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        has_rule_context = bool(state.get("rule_recall_context", ""))
+        selected = self.answer_service.propose_answer_skill(
+            state.get("question", ""),
+            plan,
+            run_result,
+            has_rule_context,
+        )
+        trace = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
+        headers = self.skill_header_payloads(answer_skill_headers(self.settings.resources_root / "runtime" / "agent_skills"))
+        match = SkillMatchState(
+            skill_name=selected,
+            status="matched" if selected else "no_match",
+            matched_by=str(trace.get("matchedBy") or ""),
+            match_source=str(trace.get("matchMode") or ""),
+            confidence=float(trace.get("confidence") or (0.6 if selected else 0.0)),
+            reason=str(trace.get("reason") or ("fallback skill selected" if selected else "no skill selected")),
+            candidate_skills=[str(item) for item in trace.get("candidateSkills", []) if str(item)],
+            fallback_skill=str(trace.get("fallbackSkill") or ""),
+            requires_confirmation=bool(getattr(self.settings, "skill_confirmation_required", False)),
+            confirmed=not bool(getattr(self.settings, "skill_confirmation_required", False)),
+            headers=headers,
+            trace=trace,
+        )
+        state["skill_match"] = match
+        state["skill_dispatch_context"] = self.skill_dispatch_context(state)
+        self.emit_skill_lifecycle_event(state, "matched", match, {"candidateSkills": match.candidate_skills, "reason": match.reason})
+        record = SkillLifecycleRecord(
+            skill_name=match.skill_name,
+            stage="matched",
+            status=match.status,
+            matched_by=match.matched_by,
+            requires_confirmation=match.requires_confirmation,
+            confirmed=match.confirmed,
+            progress=["matched"],
+            summary=match.reason,
+            metadata={"confidence": match.confidence, "fallbackSkill": match.fallback_skill},
+        )
+        if match.skill_name:
+            state.setdefault("skill_lifecycle_records", []).append(record)
+            state["agent_run_result"].skill_lifecycle_records.append(record)
+        return match
+
+    def emit_skill_lifecycle_event(
+        self,
+        state: AgentState,
+        stage: str,
+        match: SkillMatchState,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = {
+            "skillName": match.skill_name,
+            "stage": stage,
+            "status": stage,
+            "matchedBy": match.matched_by,
+            "requiresConfirmation": match.requires_confirmation,
+            "confirmed": match.confirmed if stage not in {"confirmed", "isolated_execute", "progress_synced", "completed"} else True,
+            "confidence": match.confidence,
+        }
+        payload.update(extra or {})
+        emit(state, "skill.lifecycle", "RUN_ANALYSIS_SKILL", payload)
+
     def answer_analysis(self, state: AgentState) -> AgentState:
         started = now_ms()
         step = self.start_run_step(state, "answer", "AnswerAgent", "ANSWER_ANALYSIS", input_summary="verified=%s" % state["agent_run_result"].verified_evidence.passed)
@@ -2307,26 +2773,6 @@ class MerchantQaWorkflow:
             self.request_human_clarification(state, self.build_scope_clarification_prompt(state), "BUSINESS_SCOPE", "business_scope", business_scope_options())
             return self.human_in_loop(state)
         else:
-            answer_needs_llm = analysis_summary_required(state["plan"]) or answer_skill_required(
-                state["plan"],
-                state["agent_run_result"],
-                bool(state.get("rule_recall_context", "")),
-            )
-            if answer_needs_llm and not state.get("analysis_summary"):
-                if self.maybe_request_skill_confirmation(state):
-                    self.finish_run_step(state, step, "gap", output_summary="skill confirmation required", error_code="SKILL_CONFIRMATION_REQUIRED")
-                    return self.human_in_loop(state)
-                state["analysis_summary"] = self.answer_service.summarize_analysis(
-                    state["question"],
-                    state["plan"],
-                    state["agent_run_result"],
-                    state["thread_data"].outputs_path,
-                    state.get("rule_recall_context", ""),
-                    merchant=state["merchant"],
-                    personalization_context=personalization_context,
-                )
-                state["analysis_skill_trace"] = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
-                self.record_skill_lifecycle(state, state["analysis_skill_trace"])
             answer_package = self.prepare_scoped_context_package(
                 state,
                 "answer_analysis",
@@ -2405,19 +2851,23 @@ class MerchantQaWorkflow:
             return False
         context = state.get("request_context")
         if context and context.pending_clarification_type == "skill_confirm":
+            match = state.get("skill_match")
+            if isinstance(match, SkillMatchState):
+                state["skill_match"] = match.model_copy(update={"confirmed": True, "status": "confirmed"})
+                self.emit_skill_lifecycle_event(state, "confirmed", state["skill_match"], {"confirmed": True})
             return False
-        skill_name = select_answer_skill(
-            state.get("plan") or QueryPlan(),
-            state.get("agent_run_result") or AgentRunResult(),
-            bool(state.get("rule_recall_context", "")),
-        )
+        match = state.get("skill_match")
+        if not isinstance(match, SkillMatchState) or not match.skill_name:
+            match = self.match_analysis_skill(state)
+        skill_name = match.skill_name
         if not skill_name:
             return False
+        state["skill_match"] = match.model_copy(update={"status": "waiting_confirmation", "requires_confirmation": True, "confirmed": False})
         record = SkillLifecycleRecord(
             skill_name=skill_name,
-            stage="confirm",
+            stage="confirmation_required",
             status="waiting_confirmation",
-            matched_by="deterministic_precheck",
+            matched_by=match.matched_by or "skill_match",
             requires_confirmation=True,
             confirmed=False,
             progress=["matched", "waiting_confirmation"],
@@ -2425,6 +2875,12 @@ class MerchantQaWorkflow:
         )
         state.setdefault("skill_lifecycle_records", []).append(record)
         state["agent_run_result"].skill_lifecycle_records.append(record)
+        self.emit_skill_lifecycle_event(
+            state,
+            "confirmation_required",
+            state["skill_match"],
+            {"status": "waiting_confirmation"},
+        )
         self.request_human_clarification(
             state,
             "这个问题适合执行“%s”分析技能。是否确认执行？" % skill_name,
@@ -2553,6 +3009,23 @@ class MerchantQaWorkflow:
             )
         except Exception as exc:
             add_step(state, "Memory Middleware：结构化记忆写入失败 %s" % str(exc)[:180])
+        try:
+            draft_payload = self.skill_draft_service.maybe_create_from_state(state)
+            if draft_payload:
+                state["skill_draft"] = SkillDraft.model_validate(draft_payload)
+                add_step(state, "Skill Governance：已生成待审核 SkillDraft %s" % draft_payload.get("draftId", ""))
+                emit(
+                    state,
+                    "skill.draft_created",
+                    "CACHE_ANSWER",
+                    {
+                        "draftId": draft_payload.get("draftId", ""),
+                        "status": draft_payload.get("status", ""),
+                        "callable": bool(draft_payload.get("callable")),
+                    },
+                )
+        except Exception as exc:
+            add_step(state, "Skill Governance：SkillDraft 生成失败 %s" % str(exc)[:180])
         state["response_context"] = build_response_context(
             state["question"],
             state["plan"],

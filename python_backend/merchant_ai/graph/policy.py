@@ -5,9 +5,10 @@ from typing import Dict, List, Optional
 from merchant_ai.config import Settings
 from merchant_ai.graph.state import AgentState
 from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute
+from merchant_ai.services.answer import analysis_summary_required, answer_skill_required
 
 
-MAX_MAIN_AGENT_ACTIONS = 18
+MAX_MAIN_AGENT_ACTIONS = 16
 MAX_RETRIEVE_ACTIONS = 3
 MAX_PLAN_ACTIONS = 1
 MAX_GRAPH_REPAIR_ACTIONS = 2
@@ -112,6 +113,16 @@ class AgentActionRegistry:
                 required_state_flags=["sql_generated"],
                 expected_state_flags=["evidence_graph_verified"],
                 fallback_action="execute_graph",
+            ),
+            AgentAction(
+                id="run_analysis_skill",
+                node="run_analysis_skill",
+                agent="SkillWorker",
+                description="dynamically dispatch an isolated analysis skill worker before final answer",
+                required_state_keys=["agent_run_result.task_results"],
+                required_state_flags=["sql_generated", "evidence_graph_verified"],
+                expected_state_keys=["analysis_summary"],
+                fallback_action="verify_evidence",
             ),
             AgentAction(
                 id="answer_rule",
@@ -232,6 +243,8 @@ class V2AgentPolicy:
             return ["compact_assets"], "planning asset pack has not been compacted", False
         plan = state.get("plan")
         if self.has_pending_knowledge_requests(state):
+            if self.knowledge_recall_stalled(state):
+                return self.stalled_knowledge_actions(state), "KnowledgeRequest recall produced no new refs; continue with current assets or close with gap", False
             if int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
                 return ["retrieve_knowledge", "compact_assets", "plan_graph", "repair_graph", "answer_data"], self.pending_knowledge_reason(state), False
             if not state.get("query_graph_validated"):
@@ -247,8 +260,10 @@ class V2AgentPolicy:
         reflection = normalize_reflection(state.get("planner_reflection"))
         if reflection and not reflection.passed:
             repair_actions = self.repair_request_actions(reflection)
-            if "semantic_read" in repair_actions and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
+            if "semantic_read" in repair_actions and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions and not self.knowledge_recall_stalled(state):
                 return ["retrieve_knowledge", "compact_assets", "repair_graph", "plan_graph", "answer_data"], self.repair_decision_reason(reflection, "retrieve_knowledge"), False
+            if "semantic_read" in repair_actions and self.knowledge_recall_stalled(state):
+                return self.stalled_knowledge_actions(state), "PlannerCritic requested semantic knowledge but recall has no new refs; continue without another retrieve", False
             if "re_understand" in repair_actions and self.can_reunderstand(state):
                 return ["plan_graph", "repair_graph", "answer_data"], self.repair_decision_reason(reflection, "plan_graph"), False
             if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
@@ -273,8 +288,13 @@ class V2AgentPolicy:
             return ["validate_graph"], "QueryGraph has not been validated", False
         validation = state.get("query_graph_validation_result")
         if validation and not validation.valid:
-            if self.validation_requires_knowledge(validation) and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions:
+            if self.validation_requires_knowledge(validation) and int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions and not self.knowledge_recall_stalled(state):
                 return ["retrieve_knowledge", "compact_assets", "repair_graph", "answer_data"], "validator requested missing semantic knowledge before graph repair", False
+            if self.validation_requires_knowledge(validation) and self.knowledge_recall_stalled(state):
+                if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
+                    return ["plan_graph", "repair_graph", "answer_data"], "validator requested knowledge but recall stalled; rerun understanding or repair current graph", False
+                if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
+                    return ["repair_graph", "answer_data"], "validator requested knowledge but recall stalled; repair current graph", False
             if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
                 return ["plan_graph", "answer_data"], "validator found contract mismatch; rerun LLM understanding", False
             if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
@@ -296,6 +316,8 @@ class V2AgentPolicy:
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"], "evidence verifier found graph-repairable dependency gaps", False
             return ["answer_data"], "graph-repairable evidence gaps remain but repair budget is exhausted", True
+        if self.analysis_skill_needed(state):
+            return ["run_analysis_skill", "answer_data"], "verified evidence is ready; LeadAgent may dispatch isolated SkillWorker before final answer", False
         if not state.get("chat_bi_completed"):
             return ["answer_data"], "ready to compose BI answer", False
         return ["cache_answer"], "answer is complete and can be cached", False
@@ -321,6 +343,25 @@ class V2AgentPolicy:
         query = str(getattr(first, "query", "") or "")
         suffix = (": %s" % query[:120]) if query else ""
         return "LeadAgent observed pending KnowledgeRequest%s; retrieve before planning/repair (%s)" % (suffix, reason)
+
+    def knowledge_recall_stalled(self, state: AgentState) -> bool:
+        context = state.get("lead_decision_context") or {}
+        progress = context.get("progress") or {}
+        return bool(progress.get("knowledgeRecallStalled"))
+
+    def stalled_knowledge_actions(self, state: AgentState) -> List[str]:
+        plan = state.get("plan")
+        actions: List[str] = []
+        if state.get("data_discovered") and not state.get("planning_assets_compacted"):
+            actions.append("compact_assets")
+        if state.get("planning_assets_compacted") and (not plan or not getattr(plan, "intents", None)) and self.can_reunderstand(state):
+            actions.append("plan_graph")
+        if plan and getattr(plan, "intents", None) and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
+            actions.append("repair_graph")
+        if plan and getattr(plan, "intents", None) and not state.get("query_graph_validated"):
+            actions.append("validate_graph")
+        actions.append("answer_data")
+        return dedupe_action_ids(actions)
 
     def fast_understanding_reason(self, state: AgentState, default: str) -> str:
         fast = state.get("fast_understanding")
@@ -412,6 +453,20 @@ class V2AgentPolicy:
             return False
         return any(result.query_bundle.failed for result in run_result.task_results)
 
+    def analysis_skill_needed(self, state: AgentState) -> bool:
+        if state.get("analysis_summary") or state.get("analysis_skill_trace"):
+            return False
+        plan = state.get("plan")
+        run_result = state.get("agent_run_result")
+        if not plan or not run_result or not getattr(run_result, "task_results", None):
+            return False
+        if not state.get("evidence_graph_verified"):
+            return False
+        return bool(
+            analysis_summary_required(plan)
+            or answer_skill_required(plan, run_result, bool(state.get("rule_recall_context", "")))
+        )
+
     def has_graph_repairable_execution_gap(self, state: AgentState) -> bool:
         run_result = state.get("agent_run_result")
         if not run_result:
@@ -492,3 +547,15 @@ def upstream_missing_is_execution_result(task_result: object) -> bool:
         if reason in {"UPSTREAM_SQL_FAILED", "UPSTREAM_ZERO_ROWS"}:
             return True
     return False
+
+
+def dedupe_action_ids(action_ids: List[str]) -> List[str]:
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for action_id in action_ids:
+        value = str(action_id or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped

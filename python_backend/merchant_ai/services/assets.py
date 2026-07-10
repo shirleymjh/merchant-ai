@@ -2519,6 +2519,29 @@ class TopicBuilderWorkflow:
         sample_rows = self._load_sample_rows(table, request)
         profile = self._sample_profile(schema, sample_rows, request)
         generated = self._generate_candidate_payload(topic, table, request, schema, sample_rows, profile, existing)
+        builder_phases = {
+            "schemaDiscovery": {
+                "status": "completed",
+                "artifact": str(pending_dir / "schema.json"),
+                "columnCount": len(schema),
+            },
+            "sampleProfiling": {
+                "status": "completed",
+                "artifact": str(pending_dir / "sample_profile.json"),
+                "sampleRowCount": len(sample_rows),
+            },
+            "semanticAnalysis": {
+                "status": "completed",
+                "mode": str(generated.get("generationMode") or "heuristic"),
+                "artifact": str(pending_dir / "asset.json"),
+                "llmUsed": str(generated.get("generationMode") or "").lower() == "llm",
+            },
+            "humanReviewPublish": {
+                "status": "pending_review",
+                "pendingPath": str(pending_dir),
+                "publishContract": "approved review publishes scoped asset, refreshes semantic catalog, recall index, and caches",
+            },
+        }
         asset_payload = {
             "topic": topic,
             "tableName": table,
@@ -2539,6 +2562,7 @@ class TopicBuilderWorkflow:
             "businessKnowledge": request.business_knowledge or str(existing.get("businessKnowledge") or ""),
             "sampleSqls": request.sample_sqls or list(existing.get("sampleSqls") or []),
             "buildProfile": profile,
+            "builderPhases": builder_phases,
             "generationMode": str(generated.get("generationMode") or "heuristic"),
             "generatedAt": datetime.utcnow().isoformat() + "Z",
             "status": "PENDING_REVIEW",
@@ -2571,6 +2595,7 @@ class TopicBuilderWorkflow:
             "sampleRowCount": len(sample_rows),
             "metricCount": len(metrics),
             "fieldCount": len(semantic_columns),
+            "builderPhases": builder_phases,
         }
 
     def diff_schema(self, request: TopicBuildRequest) -> Dict[str, Any]:

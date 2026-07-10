@@ -201,6 +201,38 @@ class FeedbackRequest(APIModel):
     disliked: Optional[bool] = None
 
 
+class MemoryItemPatchRequest(APIModel):
+    status: Optional[str] = None
+    confidence: Optional[float] = None
+    valid_until: Optional[str] = None
+    retention_days: Optional[int] = None
+    visibility: Optional[str] = None
+    allowed_roles: Optional[List[str]] = None
+    approved_by: Optional[str] = None
+
+
+class MemoryCleanupRequest(APIModel):
+    hard_delete: bool = False
+    dry_run: bool = False
+
+
+class MemoryRecallEvalCase(APIModel):
+    case_id: str = ""
+    question: str = ""
+    expected_memory_ids: List[str] = Field(default_factory=list)
+    unexpected_memory_ids: List[str] = Field(default_factory=list)
+    topics: List[str] = Field(default_factory=list)
+    metrics: List[str] = Field(default_factory=list)
+    time_windows: List[int] = Field(default_factory=list)
+    access_role: str = "merchant_analyst"
+
+
+class MemoryRecallEvaluationRequest(APIModel):
+    cases: List[MemoryRecallEvalCase] = Field(default_factory=list)
+    budget_tokens: int = 0
+    budget_chars: int = 0
+
+
 class ChatResponse(APIModel):
     id: str = ""
     answer: str = ""
@@ -234,6 +266,27 @@ class KnowledgeSuggestionReviewRequest(APIModel):
     reviewer: str = ""
     review_note: str = ""
     action: str = "review"
+
+
+class SkillDraftReviewRequest(APIModel):
+    approved: bool = False
+    reviewer: str = ""
+    review_note: str = ""
+
+
+class SkillEvaluationCase(APIModel):
+    case_id: str = ""
+    question: str = ""
+    expected_skill: str = ""
+    expect_trigger: bool = True
+    question_understanding: Dict[str, Any] = Field(default_factory=dict)
+    planned_evidence: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence_rows: List[Dict[str, Any]] = Field(default_factory=list)
+    has_rule_context: bool = False
+
+
+class SkillEvaluationRequest(APIModel):
+    cases: List[SkillEvaluationCase] = Field(default_factory=list)
 
 
 class KnowledgeSuggestion(APIModel):
@@ -455,6 +508,8 @@ class KnowledgeRetrievalRequest(APIModel):
     topic_categories: List[QuestionCategory] = Field(default_factory=list)
     knowledge_request: Optional[KnowledgeRequest] = None
     route_slots: Dict[str, Any] = Field(default_factory=dict)
+    intent_kind: str = ""
+    complexity: str = ""
     round: int = 0
 
 
@@ -475,6 +530,8 @@ class RecallRoundTrace(APIModel):
     metric_candidates: List[Dict[str, Any]] = Field(default_factory=list)
     retrieval_profile: Dict[str, Any] = Field(default_factory=dict)
     query_type: str = ""
+    intent_kind: str = ""
+    complexity: str = ""
     retrieval_lanes: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -1363,6 +1420,46 @@ class SkillLifecycleRecord(APIModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class SkillMatchState(APIModel):
+    skill_name: str = ""
+    status: str = "matched"
+    matched_by: str = ""
+    match_source: str = ""
+    confidence: float = 0.0
+    reason: str = ""
+    candidate_skills: List[str] = Field(default_factory=list)
+    fallback_skill: str = ""
+    requires_confirmation: bool = False
+    confirmed: bool = False
+    headers: List[Dict[str, Any]] = Field(default_factory=list)
+    trace: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillDraft(APIModel):
+    draft_id: str = ""
+    status: str = "pending_review"
+    callable: bool = False
+    source_thread_id: str = ""
+    source_run_id: str = ""
+    source_qa_id: str = ""
+    merchant_id: str = ""
+    title: str = ""
+    description: str = ""
+    applicability: List[str] = Field(default_factory=list)
+    required_inputs: List[str] = Field(default_factory=list)
+    steps: List[str] = Field(default_factory=list)
+    tools: List[str] = Field(default_factory=list)
+    hard_constraints: List[str] = Field(default_factory=list)
+    evidence_requirements: List[str] = Field(default_factory=list)
+    example_questions: List[str] = Field(default_factory=list)
+    source_artifacts: Dict[str, Any] = Field(default_factory=dict)
+    review_note: str = ""
+    reviewer: str = ""
+    created_at: str = ""
+    reviewed_at: str = ""
+    published_skill_name: str = ""
+
+
 class AgentRunResult(APIModel):
     tasks: List[AgentTask] = Field(default_factory=list)
     task_results: List[AgentTaskResult] = Field(default_factory=list)
@@ -1401,6 +1498,8 @@ class PendingAnswer(APIModel):
 class MemoryEvent(APIModel):
     event_id: str = ""
     memory_type: str = "query_event"
+    memory_tier: str = "retrieval"
+    memory_class: str = "interaction_event"
     question: str = ""
     answer_preview: str = ""
     topics: List[str] = Field(default_factory=list)
@@ -1433,6 +1532,8 @@ class MemoryEvent(APIModel):
 class MemoryFact(APIModel):
     fact_id: str = ""
     memory_type: str = "business_fact"
+    memory_tier: str = "core"
+    memory_class: str = "semantic_fact"
     content: str = ""
     topics: List[str] = Field(default_factory=list)
     metrics: List[str] = Field(default_factory=list)
@@ -1457,6 +1558,8 @@ class MemoryFact(APIModel):
 class MemoryPreference(APIModel):
     preference_id: str = ""
     memory_type: str = "preference"
+    memory_tier: str = "core"
+    memory_class: str = "preference"
     key: str = ""
     value: str = ""
     topics: List[str] = Field(default_factory=list)
@@ -1504,6 +1607,9 @@ class MemoryInjectionTrace(APIModel):
     candidates: List[MemoryRetrievalCandidate] = Field(default_factory=list)
     candidate_ids: List[str] = Field(default_factory=list)
     past_case_count: int = 0
+    core_memory_count: int = 0
+    retrieval_memory_count: int = 0
+    core_selected_ids: List[str] = Field(default_factory=list)
 
 
 class MemoryConflictResolution(APIModel):

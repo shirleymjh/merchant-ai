@@ -45,7 +45,9 @@ from merchant_ai.models import (
     ToolFailureRecord,
     ToolRuntimePolicy,
     RunStep,
+    SkillDraft,
     SkillLifecycleRecord,
+    SkillMatchState,
     TraceSpan,
     TopicRoutingDecision,
     WorkspaceManifest,
@@ -88,6 +90,10 @@ class AgentState(TypedDict, total=False):
     route_decision_trace: List[Dict[str, Any]]
     bounded_route_llm_trace: Dict[str, Any]
     bounded_lead_llm_trace: Dict[str, Any]
+    lead_decision_context: Dict[str, Any]
+    recall_strategy: Dict[str, Any]
+    worker_dispatch_context: Dict[str, Any]
+    skill_dispatch_context: Dict[str, Any]
     main_agent_observations: List[Dict[str, Any]]
     extracted_keywords: Any
     plan: QueryPlan
@@ -166,6 +172,8 @@ class AgentState(TypedDict, total=False):
     answer: str
     analysis_summary: str
     analysis_skill_trace: Dict[str, Any]
+    skill_match: SkillMatchState
+    skill_draft: SkillDraft
     skill_lifecycle_records: List[SkillLifecycleRecord]
     answer_used_llm: bool
     suggestions: List[str]

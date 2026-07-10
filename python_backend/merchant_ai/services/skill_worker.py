@@ -261,9 +261,18 @@ class SkillWorkerExecutor:
             "inputArtifact": str(input_path),
             "outputArtifact": str(output_path),
             "allowedArtifacts": [str(input_path), str(output_path)],
+            "fileContextTools": {
+                "semantic_ls": "list semantic asset directories and compact manifests",
+                "semantic_read": "read approved semantic asset snippets when the skill needs definitions",
+                "semantic_grep": "search approved semantic assets without loading full schema",
+                "artifact_ls": "list run artifacts available to this worker",
+                "artifact_read": "read whitelisted artifacts by path",
+                "artifact_grep": "search whitelisted artifacts without loading full files",
+            },
             "allowedTools": self._allowed_tools(can_execute_script),
             "executionContract": [
                 "只读取 skill_input.json 中的已验证数据和证据缺口",
+                "需要语义资产或中间产物细节时，先通过 semantic/artifact 工具按需读取",
                 "只能写入本次 SkillWorker 工作目录",
                 "不能新增查询、改写查询图或扩大商家/时间范围",
                 "输出必须写入 skill_output.json 并同步 checkpoint",
@@ -284,6 +293,7 @@ class SkillWorkerExecutor:
             "inputArtifact",
             "outputArtifact",
             "allowedTools",
+            "fileContextTools",
         ]
         return {key: package.get(key) for key in keys if key in package}
 
@@ -293,6 +303,12 @@ class SkillWorkerExecutor:
             "write_skill_output": True,
             "write_checkpoint": True,
             "read_workspace_artifact": True,
+            "semantic_ls": True,
+            "semantic_read": True,
+            "semantic_grep": True,
+            "artifact_ls": True,
+            "artifact_read": True,
+            "artifact_grep": True,
             "execute_script": bool(can_execute_script),
         }
         return tools

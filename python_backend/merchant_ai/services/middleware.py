@@ -194,6 +194,8 @@ class ActionContractMiddleware(HarnessMiddleware):
             return "validate_graph"
         if "sql_generated" in missing_flags:
             return "execute_graph"
+        if "evidence_graph_verified" in missing_flags:
+            return "verify_evidence"
         if "agent_run_result.task_results" in missing_keys:
             return "execute_graph"
         return configured or "answer_data"

@@ -119,6 +119,8 @@ class EsKnowledgeRetrievalService:
             topics=topics,
             include_base_wiki=include_base_wiki,
             metric_candidates=metric_candidates,
+            intent_kind=request.intent_kind,
+            complexity=request.complexity,
             settings=self.settings,
         )
         source_type_top_k = source_type_top_k_policy(
@@ -186,6 +188,8 @@ class EsKnowledgeRetrievalService:
             metric_candidates=metric_trace_payload(metric_candidates),
             retrieval_profile=retrieval_profile,
             query_type=str(retrieval_profile.get("queryType") or ""),
+            intent_kind=str(request.intent_kind or ""),
+            complexity=str(request.complexity or ""),
             retrieval_lanes=retrieval_lane_trace(
                 retrieval_profile=retrieval_profile,
                 vector_enabled=self._vector_enabled(),
@@ -701,11 +705,21 @@ def build_retrieval_profile(
     include_base_wiki: bool,
     metric_candidates: list[dict[str, Any]],
     settings: Settings,
+    intent_kind: str = "",
+    complexity: str = "",
 ) -> dict[str, Any]:
     query = str(query_text or "").strip()
     lowered = query.lower()
     reasons: list[str] = []
-    query_type = classify_query_type(query=query, topics=topics, metric_candidates=metric_candidates, include_base_wiki=include_base_wiki, reasons=reasons)
+    query_type = query_type_from_fast_understanding(
+        intent_kind=intent_kind,
+        complexity=complexity,
+        include_base_wiki=include_base_wiki,
+    )
+    if query_type:
+        reasons.append("fast_understanding:%s/%s" % (intent_kind or "unknown", complexity or "unknown"))
+    else:
+        query_type = classify_query_type(query=query, topics=topics, metric_candidates=metric_candidates, include_base_wiki=include_base_wiki, reasons=reasons)
     profile_templates = configured_retrieval_profiles(settings)
     selected = dict(profile_templates.get(query_type) or profile_templates.get("multi_hop_analysis") or {})
     profile_kind = str(selected.get("profileKind") or "balanced")
@@ -714,13 +728,15 @@ def build_retrieval_profile(
     broad_text_top_k = int(selected.get("broadTextTopK") or settings.es_broad_text_top_k or 4)
     broad_vector_top_k = int(selected.get("broadVectorTopK") or settings.es_broad_vector_top_k or 4)
     hybrid_top_k = int(selected.get("hybridTopK") or settings.es_hybrid_top_k or 24)
-    complexity = int(selected.get("complexityScore") or estimate_query_complexity(query, topics, metric_candidates, include_base_wiki))
+    complexity_score = int(selected.get("complexityScore") or estimate_query_complexity(query, topics, metric_candidates, include_base_wiki))
     if any(str(item.get("metricResolutionType") or "").startswith("exact") for item in metric_candidates):
         reasons.append("explicit_metric_candidate")
     return {
         "profileKind": profile_kind,
         "queryType": query_type,
-        "complexity": complexity,
+        "intentKind": str(intent_kind or ""),
+        "fastComplexity": str(complexity or ""),
+        "complexity": complexity_score,
         "reasons": reasons,
         "textTopK": text_top_k,
         "vectorTopK": vector_top_k,
@@ -731,6 +747,24 @@ def build_retrieval_profile(
         "sourceTypeCaps": selected.get("sourceTypeCaps") or {},
         "queryHash": hashlib.sha256(lowered.encode("utf-8")).hexdigest()[:12] if lowered else "",
     }
+
+
+def query_type_from_fast_understanding(intent_kind: str, complexity: str, include_base_wiki: bool) -> str:
+    kind = str(intent_kind or "").strip().lower()
+    level = str(complexity or "").strip().lower()
+    if kind == "rule_only" or (include_base_wiki and kind not in {"rule_data_mix", "mixed_rule_data"}):
+        return "rule_qa"
+    if kind in {"rule_data_mix", "mixed_rule_data"}:
+        return "mixed_rule_data"
+    if kind == "detail_lookup":
+        return "detail_lookup"
+    if kind == "multi_metric":
+        return "multi_metric"
+    if kind in {"multi_hop", "analysis"} or level == "complex":
+        return "multi_hop_analysis"
+    if kind == "metric_query" or level == "simple":
+        return "simple_metric"
+    return ""
 
 
 def configured_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
