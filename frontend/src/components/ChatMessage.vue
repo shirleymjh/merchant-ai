@@ -1,10 +1,10 @@
 <template>
   <article :class="['message', role]">
     <div v-if="role === 'assistant'" class="assistant-message">
-      <div class="assistant-avatar">E</div>
+      <div class="assistant-avatar">Y</div>
       <div class="assistant-stream">
         <div class="message-meta">
-          <strong>Evan</strong>
+          <strong>商家经营助手</strong>
           <span>· {{ displayTime }}</span>
         </div>
         <div class="assistant-card">
@@ -21,6 +21,54 @@
               </ul>
             </section>
           </div>
+          <section v-if="experienceAlerts.length" class="experience-panel alerts">
+            <div class="experience-head">
+              <AlertTriangle :size="16" />
+              <h3>异常提醒</h3>
+            </div>
+            <div class="alert-list">
+              <button
+                v-for="alert in experienceAlerts"
+                :key="alert.message || alert.metric"
+                type="button"
+                class="alert-item"
+                @click="askFollowUp(alert.drillDownQuestion)"
+              >
+                <span>{{ alert.metric || '指标' }}</span>
+                <strong>{{ alert.message }}</strong>
+              </button>
+            </div>
+          </section>
+          <section v-if="businessAdvice.length || drillDownActions.length" class="experience-panel">
+            <div class="experience-head">
+              <Sparkles :size="16" />
+              <h3>下一步</h3>
+            </div>
+            <ul v-if="businessAdvice.length" class="business-advice-list">
+              <li v-for="item in businessAdvice" :key="item">{{ item }}</li>
+            </ul>
+            <div v-if="drillDownActions.length" class="drilldown-actions">
+              <button
+                v-for="action in drillDownActions"
+                :key="`${action.label}-${action.question}`"
+                type="button"
+                @click="askFollowUp(action.question)"
+              >
+                <span>{{ action.label }}</span>
+                <ArrowRight :size="14" />
+              </button>
+            </div>
+          </section>
+          <section v-if="traceabilityItems.length || disclosureItems.length" class="evidence-strip">
+            <div v-if="traceabilityItems.length" class="evidence-group">
+              <Info :size="15" />
+              <span v-for="item in traceabilityItems" :key="item">{{ item }}</span>
+            </div>
+            <div v-if="disclosureItems.length" class="evidence-group">
+              <BookOpenCheck :size="15" />
+              <span v-for="item in disclosureItems" :key="item">{{ item }}</span>
+            </div>
+          </section>
           <div v-if="metricSummarySections.length" class="metric-summary-grid">
             <section
               v-for="(section, sectionIndex) in metricSummarySections"
@@ -205,7 +253,7 @@
 
 <script setup>
 import { computed, ref } from 'vue'
-import { Check, Copy, Download, Filter, Maximize2, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
+import { AlertTriangle, ArrowRight, BookOpenCheck, Check, Copy, Download, Filter, Info, Maximize2, Sparkles, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
 import MetricLineChart from './MetricLineChart.vue'
 
 const props = defineProps({
@@ -234,11 +282,17 @@ const props = defineProps({
     type: Array,
     default: () => []
   },
+  merchantExperience: {
+    type: Object,
+    default: () => ({})
+  },
   feedbackStatus: {
     type: Object,
     default: () => ({})
   }
 })
+
+const emit = defineEmits(['feedback', 'ask'])
 
 const displayTime = new Date().toLocaleString('zh-CN', {
   year: 'numeric',
@@ -252,6 +306,31 @@ const toastMessage = ref('')
 const expandedTable = ref(null)
 const tableFilters = ref({})
 let toastTimer = null
+
+const experienceAlerts = computed(() => (props.merchantExperience?.anomalyAlerts || []).filter(Boolean).slice(0, 3))
+const businessAdvice = computed(() => (props.merchantExperience?.businessAdvice || []).filter(Boolean).slice(0, 2))
+const drillDownActions = computed(() => (props.merchantExperience?.drillDownActions || []).filter(action => action?.question).slice(0, 4))
+const disclosureItems = computed(() => {
+  return (props.merchantExperience?.metricDisclosures || [])
+    .map(item => item.description || item.displayName || item.metricKey)
+    .filter(Boolean)
+    .slice(0, 2)
+})
+const traceabilityItems = computed(() => {
+  const traceability = props.merchantExperience?.traceability || {}
+  const items = []
+  if (traceability.timeRange) items.push(`时间：${traceability.timeRange}`)
+  if (traceability.dataUpdatedAt) items.push(`更新：${traceability.dataUpdatedAt}`)
+  if (traceability.evidenceStatus) items.push(traceability.evidenceStatus === 'verified' ? '证据已校验' : '证据部分覆盖')
+  if (traceability.sourceSummary) items.push(traceability.sourceSummary)
+  return items.slice(0, 4)
+})
+
+function askFollowUp(question) {
+  const text = String(question || '').trim()
+  if (!text) return
+  emit('ask', text)
+}
 
 const visibleDataSections = computed(() => {
   const sections = props.dataSections || []
@@ -1007,5 +1086,4 @@ function showToast(message) {
   }, 1800)
 }
 
-defineEmits(['feedback'])
 </script>

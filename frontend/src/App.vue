@@ -39,8 +39,10 @@
           :tables="message.tables"
           :data-rows="message.dataRows"
           :data-sections="message.dataSections"
+          :merchant-experience="message.merchantExperience"
           :feedback-status="message.feedbackStatus"
           @feedback="handleFeedback"
+          @ask="sendSuggestion"
         />
         <div v-if="loading" class="loading-card">
           <LoaderCircle :size="18" />
@@ -72,7 +74,7 @@
     </section>
 
     <aside class="insight-rail">
-      <DailyReportCard v-if="dailyReport" :report="dailyReport" :compact="true" />
+      <DailyReportCard v-if="dailyReport" :report="dailyReport" :compact="true" @ask="sendSuggestion" />
     </aside>
   </main>
 </template>
@@ -95,38 +97,24 @@ const inputRef = ref(null)
 const dailyReport = ref(null)
 const newSessionFlash = ref(false)
 const defaultSuggestions = [
-  '我想查看保证金',
-  '最近7天咨询工单量',
-  '我要货品上架，具体规则有吗？',
-  '昨天退款金额是多少？',
-  '直接退款量是多少？',
-  '最近10天订单明细',
-  '商品审核被拒怎么办？',
-  '上周供应链履约量是多少',
-  '所有申诉表明细给我看看',
-  '最近7天退款金额和退款量是多少？',
-  '最近10天退款最多的商品有哪些？',
-  '最近7天按工单状态统计工单量',
-  '最近30天 GMV 为什么下降？',
-  '最近7天订单量和退款金额有什么变化？',
-  '上个月退款原因排行前5是什么？',
-  '最近10天商品审核拒绝明细',
-  '最近7天优惠金额和 GMV 表现如何？',
-  '最近30天保证金充值流水有没有异常？',
-  '最近7天履约量和发货超时订单量',
-  '最近10天赔付金额最高的单据',
-  '最近7天商品审核通过量和拒绝量',
-  '最近30天申诉次数和处罚次数',
-  '最近7天退款明细按金额排序',
-  '最近10天工单明细按状态汇总',
-  '最近30天订单量、退货量和催单量',
   '最近7天店铺整体经营情况怎么样？',
-  '商品审核拒绝最多的商品有哪些？',
-  '退款金额最高的前5单给我看一下',
+  '最近7天订单量和退款金额有什么变化？',
+  '最近30天 GMV 为什么下降？',
+  '退款金额最高的前5个商品有哪些？',
+  '退款率高的商品是否也带来较多工单？',
+  '工单最多的问题类型有哪些？',
+  '最近7天客服工单量按天趋势如何？',
+  '最近10天商品审核拒绝明细',
+  '最近7天履约量和发货超时订单量',
+  '最近30天赔付金额最高的订单有哪些？',
+  '最近7天优惠金额和 GMV 表现如何？',
+  '保证金余额和冻结金额是否异常？',
+  '最近30天申诉次数和处罚次数',
+  '商品审核被拒后优先排查什么？',
   '催单工单最近是否升高？'
 ]
 const suggestionPageSize = 3
-const initialSession = createConversationSession('经营分析工作台', '您好，我是 yshopping 商家 AI 助手，有经营问题欢迎随时问我。')
+const initialSession = createConversationSession('经营分析工作台', '您好，我是 yshopping 商家经营助手。可以帮您查订单、退款售后、客服工单、商品审核、履约和经营趋势。')
 const restoredConversation = restorePersistedSessions(initialSession)
 const sessions = ref(restoredConversation.sessions)
 const activeSessionId = ref(restoredConversation.activeSessionId)
@@ -424,6 +412,7 @@ function appendAssistantToSession(sessionId, response) {
       dorisTables: (section.dorisTables || []).filter(table => table !== 'dim_merchant_df'),
       dataRows: section.dataRows || []
     })),
+    merchantExperience: response.merchantExperience || response.merchant_experience || {},
     feedbackStatus: {
       adopted: false,
       liked: false,
@@ -498,7 +487,7 @@ async function resetChat() {
   saveActiveSessionSnapshot()
   input.value = ''
   newSessionFlash.value = true
-  const session = createConversationSession('新会话', '您好，我是 Evan，新的经营分析会话已开启。')
+  const session = createConversationSession('新会话', '您好，我是 yshopping 商家经营助手。新的经营分析会话已开启。')
   sessions.value = [session, ...sessions.value].slice(0, 6)
   loadSession(session.id)
   persistSessions()
@@ -583,6 +572,7 @@ function createWelcomeMessage(text) {
     tables: [],
     dataRows: [],
     dataSections: [],
+    merchantExperience: {},
     feedbackStatus: {}
   }
 }
@@ -647,7 +637,7 @@ function normalizeRestoredSession(session) {
     title: session.title || '经营分析工作台',
     messages: Array.isArray(session.messages) && session.messages.length
       ? cloneValue(session.messages)
-      : [createWelcomeMessage('您好，我是 Evan，新的经营分析会话已开启。')],
+      : [createWelcomeMessage('您好，我是 yshopping 商家经营助手。新的经营分析会话已开启。')],
     conversationContext: cloneValue(session.conversationContext),
     suggestionPool: Array.isArray(session.suggestionPool) && session.suggestionPool.length
       ? cloneValue(session.suggestionPool)

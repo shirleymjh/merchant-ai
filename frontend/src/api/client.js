@@ -68,9 +68,19 @@ export function mockDailyReport() {
       昨日退款金额: 0
     },
     suggestions: [
-      '暂无昨日经营数据，建议补齐商品、保证金与商家资料，先完成基础经营配置。',
-      '可以从上架商品、设置优惠券和检查客服工单开始，逐步提升转化。'
-    ]
+      '关注订单、退款和客服工单是否同步波动。',
+      '可把重点指标加入经营日报，持续跟踪异常变化。'
+    ],
+    anomalyAlerts: [],
+    drillDownActions: [
+      { label: '查看订单趋势', question: '最近7天订单量和GMV按日趋势如何？', actionType: 'follow_up_question' },
+      { label: '查看退款商品', question: '昨日退款金额最高的商品有哪些？', actionType: 'follow_up_question' }
+    ],
+    traceability: {
+      sourceSummary: '演示数据',
+      timeRange: '昨日',
+      sourceTables: ['ads_merchant_profile']
+    }
   }
 }
 
@@ -84,7 +94,17 @@ export function mockChat(message) {
     categoryName: isGreeting ? '未知' : '商家其他信息',
     persisted: false,
     dorisTables: [],
-    suggestions: ['我想查看保证金', '最近7天咨询工单量', '我要货品上架，具体规则有吗？'],
+    suggestions: ['最近7天店铺整体经营情况怎么样？', '退款金额最高的前5个商品有哪些？', '工单最多的问题类型有哪些？'],
+    merchantExperience: {
+      businessAdvice: ['启动后端后会基于真实查询结果生成经营建议。'],
+      suggestedQuestions: ['最近7天店铺整体经营情况怎么样？', '最近7天订单量和退款金额有什么变化？'],
+      anomalyAlerts: [],
+      metricDisclosures: [],
+      traceability: { sourceSummary: '前端演示回复', evidenceStatus: 'demo' },
+      drillDownActions: [],
+      reportSubscriptionHint: {},
+      clarificationHints: []
+    },
     thinkingSteps: ['问题分析完成', '回答整理完成'],
     dataRows: []
   }

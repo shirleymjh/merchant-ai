@@ -245,6 +245,7 @@ class ChatResponse(APIModel):
     data_sections: List[ChatDataSection] = Field(default_factory=list)
     context: Optional[ChatContext] = None
     clarification: Optional[ClarificationRequest] = None
+    merchant_experience: Dict[str, Any] = Field(default_factory=dict)
     debug_trace: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -253,6 +254,9 @@ class DailyReportResponse(APIModel):
     merchant_name: str = ""
     date: str = ""
     metrics: Dict[str, Any] = Field(default_factory=dict)
+    anomaly_alerts: List[Dict[str, Any]] = Field(default_factory=list)
+    drill_down_actions: List[Dict[str, Any]] = Field(default_factory=list)
+    traceability: Dict[str, Any] = Field(default_factory=dict)
     suggestions: List[str] = Field(default_factory=list)
 
 

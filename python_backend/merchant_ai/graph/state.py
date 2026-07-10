@@ -175,6 +175,7 @@ class AgentState(TypedDict, total=False):
     skill_match: SkillMatchState
     skill_draft: SkillDraft
     skill_lifecycle_records: List[SkillLifecycleRecord]
+    merchant_experience: Dict[str, Any]
     answer_used_llm: bool
     suggestions: List[str]
     thinking_steps: List[str]

@@ -835,6 +835,32 @@ class AnswerComposeService:
             personalization_context=personalization_context,
         )
 
+    def merchant_experience(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+        merchant: MerchantInfo | None = None,
+        sections: Optional[List[ChatDataSection]] = None,
+        suggestions: Optional[List[str]] = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return build_merchant_experience_package(
+            question,
+            plan,
+            run_result,
+            merchant=merchant,
+            sections=sections or self.build_sections(plan, run_result or AgentRunResult()),
+            suggestions=suggestions or self.contextual_suggestions(
+                question,
+                plan.intents,
+                run_result=run_result,
+                merchant=merchant,
+                personalization_context=personalization_context,
+            ),
+            personalization_context=personalization_context,
+        )
+
     def build_sections(self, plan: QueryPlan, run_result: AgentRunResult) -> List[ChatDataSection]:
         sections: List[ChatDataSection] = []
         if not run_result:
@@ -2685,6 +2711,196 @@ def contextual_business_suggestions(
     return [item[0] for item in sorted_items[:9]]
 
 
+def build_merchant_experience_package(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    merchant: MerchantInfo | None = None,
+    sections: Optional[List[ChatDataSection]] = None,
+    suggestions: Optional[List[str]] = None,
+    personalization_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    suggestion_items = dedupe_strings([str(item) for item in (suggestions or []) if str(item).strip()])[:8]
+    anomaly_alerts = merchant_anomaly_alerts(question, plan, run_result)
+    traceability = merchant_traceability(question, plan, run_result, merchant, sections or [])
+    drill_actions = merchant_drill_down_actions(question, plan, run_result, suggestion_items)
+    metric_notes = lightweight_metric_disclosures(question, plan, run_result)
+    return {
+        "version": "v1",
+        "businessAdvice": merchant_business_advice(question, plan, run_result, anomaly_alerts, personalization_context)[:2],
+        "suggestedQuestions": suggestion_items[:6],
+        "anomalyAlerts": anomaly_alerts[:4],
+        "metricDisclosures": metric_notes,
+        "traceability": traceability,
+        "drillDownActions": drill_actions[:5],
+        "reportSubscriptionHint": merchant_report_subscription_hint(plan, run_result),
+        "clarificationHints": merchant_clarification_hints(plan),
+    }
+
+
+def merchant_business_advice(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    anomaly_alerts: List[Dict[str, Any]],
+    personalization_context: Optional[Dict[str, Any]],
+) -> List[str]:
+    categories = {normalize_question_category(intent.category) for intent in plan.intents or []}
+    text = contextual_question_intent_signal_text(question, plan.intents)
+    context_text = json.dumps(personalization_context or {}, ensure_ascii=False, default=str)
+    advice: List[str] = []
+    if anomaly_alerts:
+        label = str(anomaly_alerts[0].get("metric") or "异常指标")
+        advice.append("优先排查%s波动对应的商品、订单或渠道。" % label)
+    if QuestionCategory.REFUND in categories or suggestion_has(text + context_text, r"退款|退货|售后"):
+        advice.append("优先查看退款高的商品和退款原因，判断是否集中在质量、描述或履约问题。")
+    if QuestionCategory.CS_TICKET in categories or suggestion_has(text + context_text, r"工单|客服|咨询|催单"):
+        advice.append("同步查看客服工单类型，先处理催单和售后咨询集中的问题。")
+    if QuestionCategory.GOODS in categories or suggestion_has(text + context_text, r"商品|新品|上架|审核"):
+        advice.append("对新上架或审核异常商品做单独下钻，避免问题继续放大。")
+    if QuestionCategory.SCM in categories or suggestion_has(text + context_text, r"发货|履约|超时"):
+        advice.append("优先定位发货或签收超时订单，按商品和仓配链路拆解原因。")
+    if QuestionCategory.TRADE in categories and not advice:
+        advice.append("先拆成订单量、客单价和退款影响三部分看经营变化。")
+    if not advice:
+        advice.append("先从金额、单量和最近波动最大的对象下钻定位原因。")
+    return dedupe_strings(advice)
+
+
+def merchant_anomaly_alerts(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> List[Dict[str, Any]]:
+    if not run_result:
+        return []
+    alerts: List[Dict[str, Any]] = []
+    intent_map = intent_by_task_id(plan)
+    for task in visible_successful_tasks(plan, run_result):
+        intent = intent_map.get(task.task_id)
+        if not intent or not task.query_bundle.rows:
+            continue
+        points = metric_series_rows_for_intent(plan, intent, task.query_bundle.rows)
+        if len(points) < 2:
+            continue
+        first = answer_numeric_value(points[0].get("value"))
+        last = answer_numeric_value(points[-1].get("value"))
+        if first is None or last is None:
+            continue
+        base = abs(first) if abs(first) > 0.000001 else 1.0
+        change_rate = (last - first) / base
+        if abs(change_rate) < 0.3:
+            continue
+        metric_key = str((intent.metric_resolution or {}).get("metricKey") or intent.metric_name or "")
+        metric_label = str((intent.metric_resolution or {}).get("displayName") or friendly_column_label(plan, metric_key) or intent.metric_name or "指标")
+        direction = "上升" if change_rate > 0 else "下降"
+        alerts.append(
+            {
+                "type": "trend_change",
+                "severity": "warning" if abs(change_rate) < 0.8 else "high",
+                "metric": metric_label,
+                "direction": direction,
+                "changeRate": round(change_rate, 4),
+                "message": "%s从 %s 到 %s，%s约 %.1f%%。" % (
+                    metric_label,
+                    format_cell(points[0].get("value")),
+                    format_cell(points[-1].get("value")),
+                    direction,
+                    abs(change_rate) * 100,
+                ),
+                "drillDownQuestion": "%s波动最大的日期对应哪些商品或订单？" % metric_label,
+            }
+        )
+    return alerts
+
+
+def merchant_traceability(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    merchant: MerchantInfo | None,
+    sections: List[ChatDataSection],
+) -> Dict[str, Any]:
+    tables = dedupe_strings(
+        [table for section in sections for table in section.doris_tables]
+        + [table for table in getattr(getattr(run_result, "merged_query_bundle", None), "tables", []) or []]
+    )
+    rows = list(getattr(getattr(run_result, "merged_query_bundle", None), "rows", []) or [])
+    dates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ["pt", "date", "biz_date", "stat_date", "dt"]:
+            if row.get(key):
+                dates.append(str(row.get(key)))
+    return {
+        "sourceSummary": "基于语义层口径、Doris 查询结果和证据校验生成",
+        "merchantId": getattr(merchant, "merchant_id", "") if merchant else "",
+        "merchantName": getattr(merchant, "merchant_name", "") if merchant else "",
+        "timeRange": extract_question_time_phrase(question) or "按本次问题解析的时间范围",
+        "dataUpdatedAt": max(dates) if dates else "",
+        "rowCount": len(rows),
+        "sectionCount": len(sections),
+        "sourceTables": tables[:8],
+        "evidenceStatus": "verified" if run_result and getattr(run_result.verified_evidence, "passed", False) else "partial",
+    }
+
+
+def merchant_drill_down_actions(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    suggestions: List[str],
+) -> List[Dict[str, Any]]:
+    categories = {normalize_question_category(intent.category) for intent in plan.intents or []}
+    text = contextual_question_intent_signal_text(question, plan.intents)
+    actions: List[Dict[str, Any]] = []
+
+    def add(label: str, follow_up: str, action_type: str = "follow_up_question") -> None:
+        if any(item.get("label") == label for item in actions):
+            return
+        actions.append({"label": label, "question": follow_up, "actionType": action_type})
+
+    if QuestionCategory.REFUND in categories or suggestion_has(text, r"退款|退货|售后"):
+        add("查看异常商品", "退款金额或退款率最高的商品有哪些？")
+        add("查看退款原因", "退款原因占比最近是否变化？")
+    if QuestionCategory.CS_TICKET in categories or suggestion_has(text, r"工单|客服|咨询|催单"):
+        add("查看相关工单", "工单最多的问题类型和订单状态是什么？")
+    if QuestionCategory.TRADE in categories or suggestion_has(text, r"gmv|订单|成交|销售额"):
+        add("拆解成交变化", "GMV变化主要来自订单量还是客单价？")
+    if QuestionCategory.GOODS in categories or suggestion_has(text, r"商品|新品|上架|审核"):
+        add("查看商品明细", "这些商品的上架、审核和售后表现一起看")
+    if QuestionCategory.SCM in categories or suggestion_has(text, r"发货|履约|超时"):
+        add("查看履约异常", "发货超时订单集中在哪些商品？")
+    for item in suggestions[:2]:
+        add("继续分析", item)
+    return actions
+
+
+def merchant_report_subscription_hint(plan: QueryPlan, run_result: AgentRunResult | None) -> Dict[str, Any]:
+    categories = {normalize_question_category(intent.category) for intent in plan.intents or []}
+    metrics = dedupe_strings([str(intent.metric_name or (intent.metric_resolution or {}).get("metricKey") or "") for intent in plan.intents if intent.metric_name or (intent.metric_resolution or {}).get("metricKey")])
+    if not categories and not metrics:
+        return {}
+    return {
+        "enabled": True,
+        "title": "加入经营日报关注",
+        "description": "可把本次关注的业务域和指标加入日报，后续自动推送异常和重点变化。",
+        "topics": [category_display(category) for category in categories if category != QuestionCategory.UNKNOWN][:5],
+        "metrics": metrics[:6],
+    }
+
+
+def merchant_clarification_hints(plan: QueryPlan) -> List[str]:
+    hints: List[str] = []
+    if not plan.intents:
+        return ["请选择时间范围，例如最近7天、昨天或最近30天。", "也可以补充要看的业务域，例如交易、退款、客服或商品。"]
+    primary = plan.intents[0]
+    if not primary.days:
+        hints.append("如果没有指定时间，系统会优先按近期常用时间窗或最近7天理解。")
+    if primary.category == QuestionCategory.UNKNOWN:
+        hints.append("业务域不明确时，会先让商家在交易、退款、客服、商品等范围里选择。")
+    if not primary.metric_name and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT}:
+        hints.append("指标不明确时，会先确认要看金额、单量、比例还是明细。")
+    return hints[:3]
+
+
 def normalize_question_category(value: Any) -> QuestionCategory:
     if isinstance(value, QuestionCategory):
         return value
@@ -3075,16 +3291,70 @@ class DailyReportService:
                 "昨日退货量": 0,
                 "昨日退款金额": 0,
             }
+        alerts = daily_report_alerts(metrics)
         return DailyReportResponse(
             merchant_id=target,
             merchant_name=merchant_name,
             date=date.today().isoformat(),
             metrics=metrics,
-            suggestions=[
-                "优先关注订单、退款和客服工单的异常波动。",
-                "可继续追问具体日期、Top 订单或明细，我会基于当前经营口径展开。",
+            anomaly_alerts=alerts,
+            drill_down_actions=[
+                {"label": "查看退款商品", "question": "昨日退款金额最高的商品有哪些？", "actionType": "follow_up_question"},
+                {"label": "查看订单趋势", "question": "最近7天订单量和GMV按日趋势如何？", "actionType": "follow_up_question"},
+                {"label": "查看客服工单", "question": "昨日客服工单最多的问题类型有哪些？", "actionType": "follow_up_question"},
             ],
+            traceability={
+                "sourceSummary": "基于商家画像宽表最新分区生成",
+                "merchantId": target,
+                "merchantName": merchant_name,
+                "timeRange": "昨日",
+                "sourceTables": ["ads_merchant_profile"],
+            },
+            suggestions=daily_report_suggestions(metrics, alerts),
         )
+
+
+def daily_report_alerts(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    alerts: List[Dict[str, Any]] = []
+    refund_amt = answer_numeric_value(metrics.get("昨日退款金额"))
+    order_cnt = answer_numeric_value(metrics.get("昨日总订单量"))
+    gmv = answer_numeric_value(metrics.get("昨日总gmv金额"))
+    if refund_amt is not None and refund_amt > 0:
+        alerts.append(
+            {
+                "type": "refund_attention",
+                "severity": "warning",
+                "metric": "昨日退款金额",
+                "message": "昨日退款金额为 %s，建议下钻退款商品和退款原因。" % format_cell(metrics.get("昨日退款金额")),
+                "drillDownQuestion": "昨日退款金额最高的商品有哪些？",
+            }
+        )
+    if order_cnt is not None and order_cnt == 0 and gmv is not None and gmv == 0:
+        alerts.append(
+            {
+                "type": "trade_flat",
+                "severity": "warning",
+                "metric": "订单量",
+                "message": "昨日订单和GMV均为 0，建议确认是否为休店、流量异常或数据未产出。",
+                "drillDownQuestion": "最近7天订单量和GMV按日趋势如何？",
+            }
+        )
+    return alerts[:3]
+
+
+def daily_report_suggestions(metrics: Dict[str, Any], alerts: List[Dict[str, Any]]) -> List[str]:
+    suggestions: List[str] = []
+    if alerts:
+        suggestions.append("优先处理日报里的异常提醒，并下钻到商品、订单或原因。")
+    if answer_numeric_value(metrics.get("昨日退款金额")) not in (None, 0):
+        suggestions.append("重点查看退款金额最高商品，判断是否集中在质量、描述或履约问题。")
+    suggestions.extend(
+        [
+            "关注订单、退款和客服工单是否同步波动。",
+            "可把重点指标加入经营日报，持续跟踪异常变化。",
+        ]
+    )
+    return dedupe_strings(suggestions)[:3]
 
 
 class FeedbackService:

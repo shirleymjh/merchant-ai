@@ -469,6 +469,7 @@ class MerchantQaWorkflow:
             skill_match=SkillMatchState(),
             skill_draft=SkillDraft(),
             skill_lifecycle_records=[],
+            merchant_experience={},
             answer_used_llm=False,
             suggestions=[],
             thinking_steps=[],
@@ -2551,6 +2552,15 @@ class MerchantQaWorkflow:
             merchant=state.get("merchant"),
             personalization_context=self.answer_personalization_context(state),
         )
+        state["merchant_experience"] = self.answer_service.merchant_experience(
+            state["question"],
+            state["plan"],
+            state.get("agent_run_result"),
+            merchant=state.get("merchant"),
+            sections=self.answer_service.build_sections(state["plan"], state["agent_run_result"]),
+            suggestions=state.get("suggestions", []),
+            personalization_context=self.answer_personalization_context(state),
+        )
         state["chat_bi_completed"] = True
         state["should_persist"] = False
         state["persisted"] = False
@@ -2823,6 +2833,15 @@ class MerchantQaWorkflow:
             state["plan"].intents,
             run_result=state.get("agent_run_result"),
             merchant=state.get("merchant"),
+            personalization_context=personalization_context,
+        )
+        state["merchant_experience"] = self.answer_service.merchant_experience(
+            state["question"],
+            state["plan"],
+            state.get("agent_run_result"),
+            merchant=state.get("merchant"),
+            sections=self.answer_service.build_sections(state["plan"], state["agent_run_result"]),
+            suggestions=state.get("suggestions", []),
             personalization_context=personalization_context,
         )
         state["chat_bi_completed"] = True
@@ -3171,6 +3190,16 @@ class MerchantQaWorkflow:
         if not sections:
             data_rows = state["query_bundle"].rows
             tables = state["query_bundle"].tables
+        if not state.get("merchant_experience"):
+            state["merchant_experience"] = self.answer_service.merchant_experience(
+                state["question"],
+                state["plan"],
+                state.get("agent_run_result"),
+                merchant=state.get("merchant"),
+                sections=sections,
+                suggestions=state.get("suggestions", []),
+                personalization_context=self.answer_personalization_context(state),
+            )
         return ChatResponse(
             id=state["qa_id"],
             answer=state.get("answer", ""),
@@ -3183,6 +3212,7 @@ class MerchantQaWorkflow:
             data_sections=sections,
             context=state["response_context"],
             clarification=clarification,
+            merchant_experience=state.get("merchant_experience", {}),
             debug_trace={
                 "displayPolicy": state["plan"].display_policy,
                 "displayTitle": state["plan"].display_title,
@@ -3872,10 +3902,10 @@ class MerchantQaWorkflow:
         state["human_clarification_options"] = options
 
     def build_scope_clarification_prompt(self, state: AgentState) -> str:
-        return "我还需要确认您要分析的业务范围。可以补充时间范围、业务域或具体指标，例如“最近7天GMV趋势”或“昨天退款明细”。"
+        return "你想看哪个范围？我可以按最近7天、最近30天或昨天来查，也可以直接看交易、退款、客服或商品。"
 
     def build_topic_clarification_prompt(self, state: AgentState) -> str:
-        return "这个问题可能涉及多个业务域，请确认优先看哪个范围：交易、退款、客服工单、赔付、商品或供应链。"
+        return "这个问题可能涉及多个业务域。你想优先看交易、退款售后、客服工单、商品还是供应链？"
 
     def build_priority_goal_clarification_prompt(self, state: AgentState) -> str:
         return "你希望“优先处理”按什么目标排序？我可以按综合经营风险默认评估，也可以更偏向退款/赔付损失、GMV 下单或客服压力。"
@@ -4002,7 +4032,7 @@ class MerchantQaWorkflow:
 
 
 def business_scope_options() -> List[str]:
-    return ["最近7天总订单量趋势", "昨天退款明细", "商品审核拒绝原因"]
+    return ["最近7天整体经营", "最近30天退款售后", "昨天客服工单"]
 
 
 def priority_goal_options() -> List[str]:

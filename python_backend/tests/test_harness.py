@@ -87,6 +87,7 @@ from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.cache import build_ttl_cache
 from merchant_ai.services.answer import (
     AnswerComposeService,
+    DailyReportService,
     FeedbackService,
     analysis_summary_required,
     answer_skill_required,
@@ -14095,6 +14096,97 @@ def test_contextual_suggestions_for_gmv_trend_prioritize_trade_drilldowns():
     assert suggestions[0] == "GMV变化主要来自订单量还是客单价？"
     assert any("退款金额" in item for item in suggestions[:4])
     assert "我想查看保证金" not in suggestions[:3]
+
+
+def test_merchant_experience_package_surfaces_ux_helpers():
+    service = AnswerComposeService(LlmClient(get_settings()))
+    question = "最近7天GMV趋势"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_trend",
+                metric_name="order_gmv_amt_1d",
+                group_by_column="pt",
+                metric_resolution={
+                    "metricKey": "order_gmv_amt_1d",
+                    "displayName": "GMV",
+                    "formula": "SUM(order_gmv_amt_1d)",
+                    "sourceColumns": ["order_gmv_amt_1d"],
+                },
+            )
+        ]
+    )
+    bundle = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[
+            {"merchant_id": "100", "pt": "2026-07-01", "order_gmv_amt_1d": 100},
+            {"merchant_id": "100", "pt": "2026-07-07", "order_gmv_amt_1d": 60},
+        ],
+        original_row_count=2,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="gmv_trend", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    sections = service.build_sections(plan, run)
+    suggestions = service.contextual_suggestions(question, plan.intents, run_result=run, merchant=MerchantInfo(merchant_id="100"))
+
+    package = service.merchant_experience(
+        question,
+        plan,
+        run,
+        merchant=MerchantInfo(merchant_id="100", merchant_name="测试商家"),
+        sections=sections,
+        suggestions=suggestions,
+    )
+
+    assert package["businessAdvice"]
+    assert package["suggestedQuestions"]
+    assert package["anomalyAlerts"][0]["metric"] == "GMV"
+    assert package["metricDisclosures"][0]["displayName"] == "GMV"
+    assert package["traceability"]["merchantId"] == "100"
+    assert package["traceability"]["dataUpdatedAt"] == "2026-07-07"
+    assert any(action["label"] == "拆解成交变化" for action in package["drillDownActions"])
+    assert package["reportSubscriptionHint"]["enabled"] is True
+    assert isinstance(package["clarificationHints"], list)
+
+
+def test_daily_report_includes_alerts_traceability_and_drilldowns():
+    class DailyDoris:
+        def query_one(self, sql, params):
+            return {
+                "merchant_name": "测试商家",
+                "order_gmv_amt_1d": 1000,
+                "order_user_cnt_1d": 20,
+                "order_cnt_1d": 30,
+                "trade_success_order_cnt_1d": 25,
+                "refund_order_cnt_1d": 3,
+                "refund_amt_1d": 120,
+            }
+
+    report = DailyReportService(DailyDoris()).report("100")
+
+    assert report.anomaly_alerts
+    assert report.drill_down_actions[0]["label"] == "查看退款商品"
+    assert report.traceability["sourceTables"] == ["ads_merchant_profile"]
+    assert len(report.suggestions) == len(set(report.suggestions))
+    assert any("退款" in item for item in report.suggestions)
+
+
+def test_clarification_prompt_is_merchant_friendly(tmp_path):
+    workflow = create_workflow(get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)}))
+    state = workflow._initial_state("帮我看一下", "100", ChatContext(), None, "thread_clarify", "run_clarify")
+
+    prompt = workflow.build_scope_clarification_prompt(state)
+
+    assert "最近7天" in prompt
+    assert "交易、退款、客服或商品" in prompt
 
 
 def test_answer_compose_keeps_summary_metric_authoritative_when_trend_is_partial():
