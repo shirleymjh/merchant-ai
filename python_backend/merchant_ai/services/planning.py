@@ -825,6 +825,10 @@ class QueryGraphPlanner:
             if isinstance(planner_context, dict) and isinstance(planner_context.get("previousUnderstanding"), dict)
             else None
         )
+        fast_plan = compile_semantic_topn_metric_fast_graph(question, asset_pack)
+        if fast_plan.intents:
+            fast_plan.agent_trace.append("planner.semantic_fast_path=topn_metric")
+            return fast_plan, fast_plan.knowledge_requests, "SEMANTIC_FAST_PATH"
         if self.llm.configured:
             initial_tool_entry = self._initial_semantic_tool_entry(question, asset_pack, gaps, planner_context)
             start_with_workspace = bool(initial_tool_entry)
@@ -1509,6 +1513,8 @@ class QueryGraphPlanner:
                 {"content": "", "toolCalls": []},
                 timeout_seconds=self.settings.llm_planner_timeout_seconds,
             )
+            if not result.get("content") and not result.get("toolCalls") and planner_llm_terminal_error(self.llm.last_error):
+                return {}
             calls = normalize_llm_tool_calls(result.get("toolCalls") or [], round_index)
             planner_tool_calls.extend([call.model_dump(by_alias=True) for call in calls])
             emit_call = next((call for call in calls if call.name == output_tool.name), None)
@@ -2313,6 +2319,11 @@ def planner_failure_trace_reason(configured: bool, last_error: str) -> str:
     if error.startswith("empty_response:"):
         return "PLANNER_EMPTY_RESPONSE: %s" % error
     return error or "planner.no_valid_llm_understanding"
+
+
+def planner_llm_terminal_error(error: str) -> bool:
+    lowered = str(error or "").lower()
+    return any(marker in lowered for marker in ["timeout:", "provider_error:", "empty_response:"])
 
 
 def planner_failure_gap_code(plan: QueryPlan) -> str:
@@ -6730,6 +6741,226 @@ def compile_semantic_metric_fallback_graph(
     return plan
 
 
+def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+    """Compile common TopN metric questions directly from loaded semantic assets.
+
+    This is the semantic-layer-first path for governed BI questions. It does
+    not produce SQL and does not invent metrics; it emits the same structured
+    understanding the LLM planner would emit, then reuses the normal compiler.
+    """
+
+    text = normalize_text(question)
+    if not any(term in text for term in ["最高", "最低", "最多", "最少", "前", "top"]):
+        return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_not_ranking"])
+    if any(term in text for term in ["明细", "详情", "记录", "order_id_", "sub_order_id_", "refund_id_", "ticket_id_"]):
+        return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_detail"])
+    explicit_metrics = semantic_fast_path_explicit_metrics(question, asset_pack)
+    if not explicit_metrics:
+        return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_no_explicit_metric"])
+    ranking_metric = semantic_fast_path_ranking_metric(question, explicit_metrics)
+    if not ranking_metric:
+        return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_no_ranking_metric"])
+    group_by = semantic_fast_path_group_by(question, ranking_metric, asset_pack)
+    if not group_by:
+        return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_no_group_by"])
+    requested = [
+        {
+            "metricRef": metric.key,
+            "ownerTable": metric.table,
+            "sourcePhrase": semantic_fast_path_metric_phrase(metric, question),
+        }
+        for metric in explicit_metrics
+        if metric.table != ranking_metric.table or metric.key != ranking_metric.key
+    ]
+    understanding = {
+        "analysisGrain": semantic_fast_path_grain(question, group_by),
+        "analysisIntent": "risk_ranking" if any(term in text for term in ["风险", "异常", "判断"]) else "none",
+        "requiresExplanation": any(term in text for term in ["风险", "异常", "判断", "分析"]),
+        "requiredEvidenceIntents": semantic_fast_path_required_evidence(question, asset_pack),
+        "rankingObjective": {
+            "metricRef": ranking_metric.key,
+            "sourcePhrase": semantic_fast_path_metric_phrase(ranking_metric, question),
+            "ownerTable": ranking_metric.table,
+            "objectiveType": "topn_metric",
+            "groupByColumn": group_by,
+            "order": "asc" if any(term in text for term in ["最低", "最少"]) else "desc",
+            "limit": infer_limit(question),
+        },
+        "requestedMeasures": requested,
+        "filters": [],
+        "timeWindowDays": extract_days(question, 30),
+        "source": "semantic_topn_metric_fast_path",
+    }
+    plan = compile_query_graph_from_understanding(question, understanding, asset_pack)
+    if not plan.intents:
+        plan.agent_trace.append("planner.semantic_fast_path.compile_failed")
+        return plan
+    plan = attach_missing_semantic_knowledge_refs(question, plan, asset_pack, "semantic fast path selected node")
+    plan.agent_trace.append("planner=semantic_topn_metric_fast_path")
+    plan.compiler_trace.append(
+        "SEMANTIC_FAST_PATH_TOPN:%s.%s:%s"
+        % (ranking_metric.table, ranking_metric.key, ",".join("%s.%s" % (item.table, item.key) for item in explicit_metrics))
+    )
+    return plan
+
+
+def attach_missing_semantic_knowledge_refs(
+    question: str,
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+    reason: str,
+) -> QueryPlan:
+    index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
+    updated: List[QuestionIntent] = []
+    changed = False
+    for intent in plan.intents:
+        if intent.knowledge_refs or not intent.preferred_table:
+            updated.append(intent)
+            continue
+        columns = list(intent.required_evidence or intent.output_keys or [])
+        refs = index.knowledge_refs_for_table(intent.preferred_table, columns, reason=reason)
+        if refs:
+            changed = True
+            updated.append(
+                intent.model_copy(
+                    update={
+                        "knowledge_refs": refs,
+                        "knowledge_ref_ids": [ref.ref_id for ref in refs if ref.ref_id],
+                    }
+                )
+            )
+        else:
+            updated.append(intent)
+    if not changed:
+        return plan
+    trace = list(plan.compiler_trace or [])
+    trace.append("ATTACH_MISSING_KNOWLEDGE_REFS:%s" % ",".join(intent.plan_task_id for intent in updated if intent.knowledge_refs))
+    return plan.model_copy(update={"intents": updated, "compiler_trace": trace})
+
+
+def semantic_fast_path_explicit_metrics(question: str, asset_pack: PlanningAssetPack) -> List[Any]:
+    matched: List[Any] = []
+    for metric in asset_pack.metrics:
+        if semantic_fast_path_metric_score(metric, question) <= 0:
+            continue
+        if not any(item.table == metric.table and item.key == metric.key for item in matched):
+            matched.append(metric)
+    matched.sort(key=lambda metric: semantic_fast_path_metric_score(metric, question), reverse=True)
+    return matched[:6]
+
+
+def semantic_fast_path_ranking_metric(question: str, metrics: List[Any]) -> Any:
+    text = normalize_text(question)
+    ranking_window = text
+    for marker in ["最高", "最低", "最多", "最少"]:
+        idx = text.find(marker)
+        if idx > 0:
+            ranking_window = text[max(0, idx - 18) : idx + len(marker) + 8]
+            break
+    ranked = sorted(
+        metrics,
+        key=lambda metric: (
+            semantic_fast_path_metric_score(metric, ranking_window),
+            semantic_fast_path_metric_score(metric, question),
+            1 if derived_metric_requires_explicit_request(metric) else 0,
+        ),
+        reverse=True,
+    )
+    return ranked[0] if ranked and semantic_fast_path_metric_score(ranked[0], ranking_window) > 0 else None
+
+
+def semantic_fast_path_metric_score(metric: Any, question: str) -> int:
+    text = normalize_metric_match_text(question)
+    labels = [normalize_metric_match_text(label) for label in metric_label_texts(metric) if label]
+    score = 0
+    for label in labels:
+        if not label:
+            continue
+        if explicit_metric_label_text_match(label, text):
+            score = max(score, 100 + len(label))
+        elif strong_metric_label_text_match(label, text):
+            score = max(score, 80 + len(label))
+    key = str(getattr(metric, "key", "") or "").lower()
+    title = normalize_metric_match_text(getattr(metric, "title", "") or "")
+    synonym_groups = [
+        (["退款率", "退货率", "refundrate", "refundratio"], ["refund_rate", "refundratio", "退货率", "退款率"]),
+        (["下单数", "订单数", "单量"], ["order_detail_cnt", "ordercnt", "下单数", "订单量"]),
+        (["退款金额", "退货金额"], ["pay_amt", "refund_amt", "退款金额"]),
+        (["退款单量", "退款量", "退货量"], ["refund_bill_cnt", "refundcnt", "退款单量"]),
+    ]
+    for phrases, metric_tokens in synonym_groups:
+        if any(normalize_metric_match_text(phrase) in text for phrase in phrases):
+            metric_text = normalize_metric_match_text("%s %s" % (key, title))
+            if any(normalize_metric_match_text(token) in metric_text for token in metric_tokens):
+                score = max(score, 120)
+    return score
+
+
+def semantic_fast_path_metric_phrase(metric: Any, question: str) -> str:
+    text = normalize_metric_match_text(question)
+    labels = sorted(metric_label_texts(metric), key=lambda value: len(str(value or "")), reverse=True)
+    for label in labels:
+        normalized = normalize_metric_match_text(label)
+        if normalized and normalized in text:
+            return str(label)
+    key = str(getattr(metric, "key", "") or "")
+    if key == "refund_rate" and "退款率" in question:
+        return "退款率"
+    if key == "order_detail_cnt" and "下单数" in question:
+        return "下单数"
+    if key in {"pay_amt", "refund_amt"} and "退款金额" in question:
+        return "退款金额"
+    return str(getattr(metric, "title", "") or key or question[:80])
+
+
+def semantic_fast_path_group_by(question: str, ranking_metric: Any, asset_pack: PlanningAssetPack) -> str:
+    text = normalize_text(question)
+    columns = set(asset_pack.known_columns(ranking_metric.table))
+    if any(term in text for term in ["商品", "spu"]):
+        for column in ["spu_id", "sku_id", "goods_id"]:
+            if column in columns:
+                return column
+    if any(term in text for term in ["天", "日", "趋势", "走势"]) and "pt" in columns:
+        return "pt"
+    if "seller_id" in columns:
+        return "seller_id"
+    if "merchant_id" in columns:
+        return "merchant_id"
+    return ""
+
+
+def semantic_fast_path_grain(question: str, group_by: str) -> str:
+    if group_by in {"spu_id", "sku_id", "goods_id"}:
+        return "product"
+    if group_by == "pt":
+        return "day"
+    return "merchant"
+
+
+def semantic_fast_path_required_evidence(question: str, asset_pack: PlanningAssetPack) -> List[Dict[str, Any]]:
+    text = normalize_text(question)
+    intents: List[Dict[str, Any]] = []
+    if any(term in text for term in ["发布时间", "上架时间", "新品", "商品"]):
+        goods_table = best_table_for_domain("goods", asset_pack)
+        suggested_fields = [
+            field
+            for field in ["spu_id", "sku_id", "spu_name", "goods_name", "publish_time", "online_time", "created_time", "pt"]
+            if field in asset_pack.known_columns(goods_table)
+        ]
+        if goods_table and suggested_fields:
+            intents.append(
+                {
+                    "semanticLabel": "product_profile",
+                    "reason": "question asks product publish/new-product context",
+                    "requiredLevel": "required" if any(term in text for term in ["发布时间", "新品"]) else "optional",
+                    "suggestedDomains": ["goods"],
+                    "suggestedTables": [goods_table],
+                    "suggestedFields": suggested_fields,
+                }
+            )
+    return intents
+
+
 def compile_semantic_multi_metric_trend_fallback_graph(question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
     if entity_filter_from_question(question, asset_pack)[0]:
         return QueryPlan(agent_trace=["planner.semantic_trend_fallback.skipped_entity_filter"])
@@ -9752,6 +9983,9 @@ def graph_role_trace_maps(plan: QueryPlan) -> Tuple[Dict[str, str], Dict[str, st
 def root_metric_task_is_aligned(intent: QuestionIntent, scope_tasks: set[str], dependencies: List[PlanDependency]) -> bool:
     if not intent.depends_on_task_ids:
         return True
+    incoming = [dep for dep in dependencies if dep.dependent_task_id == intent.plan_task_id]
+    if incoming and all(dep.relation_type == "DERIVED_COMPONENT" for dep in incoming):
+        return True
     if any(parent in scope_tasks for parent in intent.depends_on_task_ids):
         return True
     ancestors = dependency_ancestors(dependencies, intent.plan_task_id)
@@ -10188,7 +10422,7 @@ def planner_repair_requests(
         reason = planner_repair_reason_for_issue(code)
         if not reason:
             continue
-        action = planner_repair_action(reason)
+        action = "graph_repair" if planner_issue_is_structural_anchor_repair(code) else planner_repair_action(reason)
         task_id = str(issue.get("taskId") or issue.get("task_id") or "")
         related_knowledge = [
             request
@@ -10211,6 +10445,17 @@ def planner_repair_requests(
             )
         )
     return requests[:12]
+
+
+def planner_issue_is_structural_anchor_repair(code: str) -> bool:
+    return code in {
+        "ROOT_METRIC_NOT_ROOT",
+        "ROOT_METRIC_NOT_MOST_SPECIFIC",
+        "SIBLING_METRIC_WRONGLY_DEPENDENT",
+        "FAKE_DEPENDENCY",
+        "SCOPE_NOT_NARROWING",
+        "OBJECTIVE_NOT_COMPILED",
+    }
 
 
 def planner_repair_reason_for_issue(code: str) -> str:

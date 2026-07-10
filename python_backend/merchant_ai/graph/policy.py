@@ -264,6 +264,8 @@ class V2AgentPolicy:
                 return ["retrieve_knowledge", "compact_assets", "repair_graph", "plan_graph", "answer_data"], self.repair_decision_reason(reflection, "retrieve_knowledge"), False
             if "semantic_read" in repair_actions and self.knowledge_recall_stalled(state):
                 return self.stalled_knowledge_actions(state), "PlannerCritic requested semantic knowledge but recall has no new refs; continue without another retrieve", False
+            if self.has_structural_anchor_repair_issue(reflection) and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
+                return ["repair_graph", "answer_data"], self.repair_decision_reason(reflection, "repair_graph"), False
             if "re_understand" in repair_actions and self.can_reunderstand(state):
                 return ["plan_graph", "repair_graph", "answer_data"], self.repair_decision_reason(reflection, "plan_graph"), False
             if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
@@ -376,6 +378,8 @@ class V2AgentPolicy:
 
     def repair_request_actions(self, reflection: PlannerReflectionResult) -> set[str]:
         actions = {str(item.action or "") for item in reflection.repair_requests if getattr(item, "action", "")}
+        if self.has_structural_anchor_repair_issue(reflection):
+            actions.add("graph_repair")
         if reflection.repair_reason and not actions:
             fallback = {
                 "ANCHOR_MISMATCH": "re_understand",
@@ -391,6 +395,14 @@ class V2AgentPolicy:
             if action:
                 actions.add(action)
         return actions
+
+    def has_structural_anchor_repair_issue(self, reflection: PlannerReflectionResult) -> bool:
+        issue_codes = {
+            str(issue.get("code") or "")
+            for issue in reflection.issues
+            if isinstance(issue, dict) and issue.get("code")
+        }
+        return bool(issue_codes & STRUCTURAL_ANCHOR_REPAIR_CODES)
 
     def can_reunderstand(self, state: AgentState) -> bool:
         attempts = int(state.get("query_graph_plan_attempts") or 0)
@@ -534,6 +546,16 @@ def normalize_reflection(value: object) -> Optional[PlannerReflectionResult]:
         except Exception:
             return None
     return None
+
+
+STRUCTURAL_ANCHOR_REPAIR_CODES = {
+    "ROOT_METRIC_NOT_ROOT",
+    "ROOT_METRIC_NOT_MOST_SPECIFIC",
+    "SIBLING_METRIC_WRONGLY_DEPENDENT",
+    "FAKE_DEPENDENCY",
+    "SCOPE_NOT_NARROWING",
+    "OBJECTIVE_NOT_COMPILED",
+}
 
 
 def upstream_missing_is_execution_result(task_result: object) -> bool:

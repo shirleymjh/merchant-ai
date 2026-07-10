@@ -81,18 +81,7 @@ class AnswerComposeService:
         bundle = run_result.merged_query_bundle if run_result else QueryBundle()
         if analysis_summary:
             cleaned_summary = sanitize_business_answer_text(analysis_summary, question, plan, run_result)
-            llm_answer = ""
-            if allow_llm and self.llm.configured and (bundle.rows or (run_result and run_result.evidence_gaps)):
-                llm_answer = self._compose_llm_business_answer(
-                    question,
-                    plan,
-                    run_result,
-                    rule_context,
-                    merchant,
-                    personalization_context,
-                    analysis_summary=cleaned_summary,
-                )
-            answer = llm_answer or cleaned_summary
+            answer = cleaned_summary
             return self._apply_answer_guard(
                 self._append_lightweight_metric_disclosure(
                     self._append_rule_evidence(
@@ -105,7 +94,7 @@ class AnswerComposeService:
                             run_result=run_result,
                             merchant=merchant,
                             personalization_context=personalization_context,
-                            allow_llm=allow_llm,
+                            allow_llm=False,
                         ),
                         question,
                         effective_rule_context,

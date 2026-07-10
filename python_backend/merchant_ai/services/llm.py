@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import re
+import threading
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
@@ -213,20 +215,40 @@ class LlmClient:
         return normalized
 
     def _invoke_with_timeout(self, model: Any, messages: List[Any], timeout_seconds: Optional[int] = None) -> Any:
+        timeout = max(1, int(timeout_seconds or self.settings.llm_request_timeout_seconds or 1))
+        result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+
+        def invoke_provider() -> None:
+            try:
+                result_queue.put(("ok", asyncio.run(model.ainvoke(messages))))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=invoke_provider, name="merchant-ai-llm-call", daemon=True)
+        thread.start()
         try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(self._ainvoke_with_timeout(model, messages, timeout_seconds))
-        self.record_error("provider_error: sync LLM call cannot run inside an active event loop")
-        return None
+            status, value = result_queue.get(timeout=timeout)
+        except queue.Empty:
+            if hasattr(model, "cancelled"):
+                try:
+                    setattr(model, "cancelled", True)
+                except Exception:
+                    pass
+            self.record_error("timeout: provider call exceeded %s seconds" % timeout)
+            return None
+        if status == "error":
+            raise value
+        return value
 
     async def _ainvoke_with_timeout(self, model: Any, messages: List[Any], timeout_seconds: Optional[int] = None) -> Any:
         timeout = max(1, int(timeout_seconds or self.settings.llm_request_timeout_seconds or 1))
-        try:
-            return await asyncio.wait_for(model.ainvoke(messages), timeout=timeout)
-        except asyncio.TimeoutError:
+        task = asyncio.create_task(model.ainvoke(messages))
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            task.cancel()
             self.record_error("timeout: provider call exceeded %s seconds" % timeout)
             return None
+        return task.result()
 
     def json_chat(self, system_prompt: str, user_prompt: str, fallback: Optional[Dict[str, Any]] = None, timeout_seconds: Optional[int] = None) -> Dict[str, Any]:
         text = self.chat(system_prompt, user_prompt, "", timeout_seconds=timeout_seconds)

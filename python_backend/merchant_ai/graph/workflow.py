@@ -2028,15 +2028,18 @@ class MerchantQaWorkflow:
             or len(state.get("recall_context", ""))
             + len(json.dumps(self.planning_asset_debug(state["planning_asset_pack"]), ensure_ascii=False))
         )
+        planner_used_semantic_fast_path = reason == "SEMANTIC_FAST_PATH" or any(
+            "planner.semantic_fast_path" in str(item) for item in (plan.agent_trace or [])
+        )
         self.record_span(
             state,
-            "llm",
-            "planner.question_understanding",
+            "planner" if planner_used_semantic_fast_path else "llm",
+            "planner.semantic_fast_path" if planner_used_semantic_fast_path else "planner.question_understanding",
             started,
             status="success" if plan.intents else "failed",
             model=self.settings.openai_model,
             provider=self.settings.openai_base_url,
-            estimated_prompt_chars=estimated_prompt_chars,
+            estimated_prompt_chars=0 if planner_used_semantic_fast_path else estimated_prompt_chars,
             estimated_completion_chars=len(json.dumps(plan.question_understanding or {}, ensure_ascii=False)),
             error_code=error_code,
             error_message=self.planner.llm.last_error if not plan.intents else "",
@@ -2824,8 +2827,7 @@ class MerchantQaWorkflow:
             )
             skill_trace = state.get("analysis_skill_trace") or {}
             state["answer_used_llm"] = bool(
-                state.get("analysis_summary")
-                or skill_trace.get("llmFallbackUsed")
+                skill_trace.get("llmFallbackUsed")
                 or getattr(self.answer_service, "last_compose_used_llm", False)
             )
         state["suggestions"] = self.answer_service.contextual_suggestions(
