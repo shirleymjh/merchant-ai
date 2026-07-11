@@ -96,7 +96,9 @@ from merchant_ai.services.clarification import ClarificationResolutionService
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.context_assembly import ContextAssembler, ThreadContextService, build_llm_context_blocks, context_cache_layout, context_quarantine_policy
 from merchant_ai.services.context_filesystem import add_context_uri, context_lineage_record, merchant_uri_for_artifact, merchant_uri_for_semantic_ref
+from merchant_ai.services.controlled_react import ControlledReactExplorer
 from merchant_ai.services.evidence import EvidenceVerifier
+from merchant_ai.services.latency import LatencyOptimizer
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory import create_memory_store
 from merchant_ai.services.memory_constraints import build_memory_constraints
@@ -163,6 +165,8 @@ class MerchantQaWorkflow:
         self.clarification_resolver = ClarificationResolutionService()
         self.merchant_profile_summary_service = MerchantProfileSummaryService()
         self.merchant_profile_store = MerchantProfileStore(settings)
+        self.controlled_react_explorer = ControlledReactExplorer()
+        self.latency_optimizer = LatencyOptimizer()
         self.context_manager = ContextManager(settings)
         self.context_assembler = ContextAssembler(settings)
         self.thread_context_service = ThreadContextService()
@@ -340,6 +344,10 @@ class MerchantQaWorkflow:
             open_diagnostic_intent="",
             open_diagnostic_goal="",
             open_diagnostic_seed_topics=[],
+            hypothesis_exploration={},
+            candidate_query_graphs={},
+            strategy_switch_trace=[],
+            latency_optimization={},
             answer="",
             analysis_summary="",
             analysis_skill_trace={},
@@ -814,6 +822,11 @@ class MerchantQaWorkflow:
                 "toolRuntime": state.get("tool_failures", [])[-6:],
             },
             "retrievalStrategy": state.get("recall_strategy", {}),
+            "controlledExploration": {
+                "hypotheses": (state.get("hypothesis_exploration") or {}).get("hypotheses", [])[:3],
+                "candidateGraphs": (state.get("candidate_query_graphs") or {}).get("candidates", [])[:3],
+                "budget": (state.get("hypothesis_exploration") or {}).get("budget", {}),
+            },
             "workerDispatch": state.get("worker_dispatch_context") or self.worker_dispatch_context(state),
             "skillDispatch": state.get("skill_dispatch_context") or self.skill_dispatch_context(state),
             "decisionHints": decision_hints,
@@ -1239,6 +1252,7 @@ class MerchantQaWorkflow:
             reasons=reasons,
         )
         state["fast_understanding"] = result
+        state["latency_optimization"] = self.latency_optimizer.initial_policy(result)
         state["fast_understood"] = True
         clarification = self.merchant_clarification_need(state, result)
         if clarification:
@@ -1263,6 +1277,8 @@ class MerchantQaWorkflow:
             "Fast Understanding：intent=%s complexity=%s needsPlanner=%s"
             % (result.intent_kind, result.complexity, result.needs_planner),
         )
+        if (state.get("latency_optimization") or {}).get("eligible"):
+            add_step(state, "Latency Optimizer：命中 fast path，后续可跳过反思、Skill 和 Answer LLM")
         self.record_span(
             state,
             "action",
@@ -1873,6 +1889,11 @@ class MerchantQaWorkflow:
         )
         pack.metric_compaction["indexVersion"] = knowledge_bundle.index_version
         state["planning_asset_pack"] = pack
+        state["hypothesis_exploration"] = self.controlled_react_explorer.build_hypotheses(
+            state["question"],
+            pack,
+            (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
+        )
         state["planning_assets_compacted"] = True
         state["query_graph_validation_result"] = GraphValidationResult()
         state["query_graph_validated"] = False
@@ -1883,6 +1904,11 @@ class MerchantQaWorkflow:
             state,
             "Main Agent Tool compact_assets：生成 PlanningAssetPack，tables=%d, metrics=%d, fields=%d, relationships=%d"
             % (len(pack.tables), len(pack.metrics), len(pack.fields), len(pack.relationships)),
+        )
+        add_step(
+            state,
+            "Controlled ReAct：生成受控探索假设，hypotheses=%d"
+            % len((state.get("hypothesis_exploration") or {}).get("hypotheses") or []),
         )
         self.refresh_context_snapshot(state, "compact_assets")
         self.record_span(
@@ -1956,7 +1982,17 @@ class MerchantQaWorkflow:
             planner_context,
         )
         state["plan"] = plan
+        state["candidate_query_graphs"] = self.controlled_react_explorer.evaluate_candidates(
+            state.get("hypothesis_exploration") or {},
+            state["planning_asset_pack"],
+            plan,
+        )
+        state["latency_optimization"] = self.latency_optimizer.update_after_plan(
+            state.get("latency_optimization") or {},
+            plan,
+        )
         self.planner.artifact_store.write_json("planner", "query_graph.json", plan.model_dump(by_alias=True), preview_chars=0)
+        self.planner.artifact_store.write_json("planner", "candidate_query_graphs.json", state["candidate_query_graphs"], preview_chars=0)
         plan_requests = list(getattr(plan, "knowledge_requests", []) or [])
         pending_requests = dedupe_workflow_knowledge_requests(plan_requests + list(requests or []))
         blocked_request_keys = set(state.get("blocked_knowledge_request_keys") or [])
@@ -2836,7 +2872,7 @@ class MerchantQaWorkflow:
                 state["agent_run_result"],
                 answer_context,
                 state.get("analysis_summary", ""),
-                allow_llm=True,
+                allow_llm=self.latency_optimizer.answer_allows_llm(state.get("latency_optimization") or {}),
                 rule_context=state.get("rule_recall_context", ""),
                 personalization_context=personalization_context,
             )
@@ -3615,17 +3651,17 @@ class MerchantQaWorkflow:
         action_history = state.get("action_history") or []
         lead_decisions = state.get("lead_decisions") or []
         repair_requests = state.get("planner_repair_requests") or []
+        validation = state.get("query_graph_validation_result") or GraphValidationResult()
+        run_result = state.get("agent_run_result") or AgentRunResult()
         gaps = (state.get("agent_run_result") or AgentRunResult()).evidence_gaps
-        strategy_switches: List[Dict[str, Any]] = []
-        if repair_requests:
-            strategy_switches.append({"from": "initial_query_graph", "to": "graph_repair", "reason": "planner validation or execution gap"})
-        if gaps:
-            strategy_switches.append({"from": "full_answer", "to": "partial_answer_with_disclosure", "reason": "evidence gaps require guarded answer"})
-        if state.get("analysis_skill_trace"):
-            strategy_switches.append({"from": "plain_answer", "to": "skill_workflow", "reason": "reusable merchant SOP matched"})
+        strategy_switches = self.controlled_react_explorer.strategy_switch_trace(state, validation, run_result)
+        state["strategy_switch_trace"] = strategy_switches
         return {
             "mode": "controlled_react_querygraph",
             "tradeoff": "limits free-form exploration in exchange for verifiable BI answers",
+            "exploration": state.get("hypothesis_exploration") or {},
+            "candidateQueryGraphs": state.get("candidate_query_graphs") or {},
+            "latencyOptimization": self.latency_optimizer.response_payload(state.get("latency_optimization") or {}),
             "steps": {
                 "leadDecisions": len(lead_decisions),
                 "actions": len(action_history),

@@ -4158,22 +4158,27 @@ def semantic_release_evaluation_gate(
 ) -> Dict[str, Any]:
     metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
     fields = asset.get("semanticColumns") if isinstance(asset.get("semanticColumns"), list) else []
+    schema_fields = asset.get("schemaColumns") if isinstance(asset.get("schemaColumns"), list) else []
     errors = list(validation.get("errors") or []) if isinstance(validation, dict) else []
     blocking_reasons: List[str] = []
+    warning_reasons: List[str] = []
     if errors:
         blocking_reasons.append("SEMANTIC_VALIDATION_ERRORS")
     if conflict_detection.get("conflictCount"):
         blocking_reasons.append("SEMANTIC_CONFLICTS")
     if getattr(drift, "missing_live_columns", None):
         blocking_reasons.append("SCHEMA_DRIFT_MISSING_COLUMNS")
-    if not fields:
+    if not fields and not schema_fields:
         blocking_reasons.append("NO_SEMANTIC_FIELDS")
+    elif not fields:
+        warning_reasons.append("SEMANTIC_FIELD_ANNOTATION_MISSING")
     if not metrics:
         blocking_reasons.append("NO_METRICS")
     return {
         "publishable": not blocking_reasons,
         "severity": "blocking" if blocking_reasons else "passed",
         "blockingReasons": blocking_reasons,
+        "warningReasons": warning_reasons,
         "goldenEval": {
             "enabled": True,
             "status": "passed" if not blocking_reasons else "failed",

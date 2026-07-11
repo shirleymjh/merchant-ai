@@ -28,6 +28,7 @@ from merchant_ai.models import (
     ChatRequest,
     EntitySet,
     EvidenceGap,
+    FastUnderstandingResult,
     FreshnessCheckResult,
     GoldenEvaluationRequest,
     GraphValidationGap,
@@ -112,7 +113,9 @@ from merchant_ai.services.answer import (
     render_structured_skill_answer,
 )
 from merchant_ai.services.context import ContextManager
+from merchant_ai.services.controlled_react import ControlledReactExplorer
 from merchant_ai.services.evidence import EvidenceVerifier
+from merchant_ai.services.latency import LatencyOptimizer
 from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
 from merchant_ai.services.llm import LlmClient, prompt_cache_metadata
 from merchant_ai.services.middleware import (
@@ -351,6 +354,65 @@ def test_middleware_chain_merges_partial_state_updates_and_records_trace():
     assert result["runtime_injection"] == {"a": 1, "b": 2}
     assert any(event.code == "MIDDLEWARE_CHAIN_ORDER" for event in result["middleware_events"])
     assert any(event.code == "MIDDLEWARE_STATE_DELTA" for event in result["middleware_events"])
+
+
+def test_controlled_react_explorer_scores_candidate_graphs_with_guardrails():
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "pt", "pay_amt"])],
+        metrics=[
+            PlanningAssetEntry(key="order_gmv_amt_1d", table="dwm_trade_order_detail_di"),
+            PlanningAssetEntry(key="refund_rate", table="dwm_trade_refund_detail_di"),
+        ],
+        relationships=[
+            RelationshipEntry(
+                relationship_id="order_refund_by_sub_order",
+                left_table="dwm_trade_order_detail_di",
+                right_table="dwm_trade_refund_detail_di",
+            )
+        ],
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                plan_task_id="gmv",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="order_gmv_amt_1d",
+            )
+        ]
+    )
+
+    explorer = ControlledReactExplorer()
+    hypotheses = explorer.build_hypotheses("最近7天GMV下降原因", pack, {"intentKind": "analysis"})
+    candidates = explorer.evaluate_candidates(hypotheses, pack, plan)
+
+    assert hypotheses["mode"] == "controlled_hypothesis_exploration"
+    assert len(hypotheses["hypotheses"]) == 3
+    assert candidates["mode"] == "candidate_query_graph_sandbox"
+    assert candidates["candidates"][0]["status"] == "selected"
+    assert candidates["candidates"][0]["guardrailResult"]["directSqlAllowed"] is False
+
+
+def test_latency_optimizer_marks_simple_single_node_graph_as_fast_path():
+    optimizer = LatencyOptimizer()
+    policy = optimizer.initial_policy(
+        FastUnderstandingResult(intent_kind="metric_query", complexity="simple", needs_planner=False)
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="gmv_metric",
+                preferred_table="ads_merchant_profile",
+            )
+        ]
+    )
+
+    optimized = optimizer.update_after_plan(policy, plan)
+
+    assert optimized["mode"] == "fast_path_verified_graph"
+    assert "reflect_query_graph" in optimized["skipNodes"]
+    assert optimizer.answer_allows_llm(optimized) is False
 
 
 def test_middleware_chain_fail_closed_blocks_on_critical_middleware_error():
@@ -11300,6 +11362,36 @@ def test_lead_policy_registry_selects_reflection_before_validation():
     assert "validate_graph" in decision.available_actions
 
 
+def test_lead_policy_fast_path_skips_reflection_before_validation():
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "skills_loaded": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": False,
+        "query_graph_validated": False,
+        "latency_optimization": {"eligible": True, "mode": "fast_path_verified_graph"},
+        "react_round": 4,
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question="最近7天GMV是多少",
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.METRIC,
+                    plan_task_id="gmv_metric",
+                    preferred_table="ads_merchant_profile",
+                )
+            ]
+        ),
+    }
+
+    decision = V2AgentPolicy(get_settings()).decide(state)
+
+    assert decision.selected_action == "validate_graph"
+    assert "reflect_plan" not in decision.available_actions
+
+
 def test_lead_policy_does_not_retry_plan_after_provider_timeout():
     state = {
         "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
@@ -16147,6 +16239,23 @@ def test_response_exposes_profile_freshness_and_security_audit(tmp_path):
         "defaultTimeWindowDays": 7,
         "preferredMetrics": ["GMV"],
     }
+    state["hypothesis_exploration"] = {
+        "mode": "controlled_hypothesis_exploration",
+        "hypotheses": [{"hypothesisId": "hyp_1", "title": "GMV 下跌来自交易规模变化"}],
+        "budget": {"maxHypotheses": 3, "maxCandidateGraphs": 3},
+    }
+    state["candidate_query_graphs"] = {
+        "mode": "candidate_query_graph_sandbox",
+        "selectedCandidateId": "cand_hyp_1",
+        "candidates": [{"candidateId": "cand_hyp_1", "status": "selected", "score": 80}],
+    }
+    state["latency_optimization"] = {
+        "mode": "fast_path_verified_graph",
+        "eligible": True,
+        "reason": "single-node QueryGraph with no dependencies can use fast verified path",
+        "skipNodes": ["reflect_query_graph", "run_analysis_skill", "answer_llm"],
+        "preservedGuardrails": ["query_graph_validation", "readonly_sql", "evidence_verification"],
+    }
     state["skill_lifecycle_records"] = [
         SkillLifecycleRecord(skill_name="gmv_drop_diagnosis", stage="matched", status="matched")
     ]
@@ -16165,6 +16274,10 @@ def test_response_exposes_profile_freshness_and_security_audit(tmp_path):
     assert merchant_experience["securityAudit"]["rowLevelSecurity"]["enabled"] is True
     assert merchant_experience["securityAudit"]["sqlPolicy"]["readOnlyOnly"] is True
     assert merchant_experience["controlledReact"]["mode"] == "controlled_react_querygraph"
+    assert merchant_experience["controlledReact"]["exploration"]["hypotheses"][0]["hypothesisId"] == "hyp_1"
+    assert merchant_experience["controlledReact"]["candidateQueryGraphs"]["selectedCandidateId"] == "cand_hyp_1"
+    assert merchant_experience["controlledReact"]["latencyOptimization"]["mode"] == "fast_path_verified_graph"
+    assert "answer_llm" in merchant_experience["controlledReact"]["latencyOptimization"]["skipNodes"]
     assert "evidence_verification" in merchant_experience["controlledReact"]["guardrails"]
     assert merchant_experience["skillEcosystem"]["creator"]["enabled"] is True
     assert any(item["name"] == "gmv_drop_diagnosis" for item in merchant_experience["skillEcosystem"]["market"]["items"])
@@ -18366,6 +18479,12 @@ def test_skill_draft_service_keeps_free_exploration_pending_until_review(tmp_pat
     assert reviewed["status"] == "approved"
     assert reviewed["draft"]["callable"] is True
     assert reviewed["draft"]["publishedSkillName"]
+    assert reviewed["draft"]["skillRegistry"]["status"] == "active"
+    market = service.market()
+    assert any(item["skillName"] == reviewed["draft"]["publishedSkillName"] for item in market["items"])
+    installed = service.install_skill(reviewed["draft"]["publishedSkillName"], merchant_ids=["100"], traffic_percent=25)
+    assert installed["skill"]["installScope"]["merchantIds"] == ["100"]
+    assert installed["skill"]["grayRelease"]["trafficPercent"] == 25
 
 
 def test_skill_evaluation_scores_trigger_cases(tmp_path):

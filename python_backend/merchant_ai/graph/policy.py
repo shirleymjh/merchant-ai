@@ -258,6 +258,8 @@ class V2AgentPolicy:
         if (not plan or not plan.intents) and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
             return ["plan_graph", "retrieve_knowledge"], "QueryGraph has not been planned", False
         if plan and plan.intents and not state.get("query_graph_reflected"):
+            if self.fast_path_verified_graph(state):
+                return ["validate_graph"], "fast path single-node QueryGraph skips planner reflection but still validates graph", False
             return ["reflect_plan", "validate_graph"], "QueryGraph needs planner reflection before validation", False
         reflection = normalize_reflection(state.get("planner_reflection"))
         if reflection and not reflection.passed:
@@ -468,6 +470,8 @@ class V2AgentPolicy:
         return any(result.query_bundle.failed for result in run_result.task_results)
 
     def analysis_skill_needed(self, state: AgentState) -> bool:
+        if self.fast_path_verified_graph(state):
+            return False
         if state.get("analysis_summary") or state.get("analysis_skill_trace"):
             return False
         plan = state.get("plan")
@@ -477,6 +481,10 @@ class V2AgentPolicy:
         if not state.get("evidence_graph_verified"):
             return False
         return bool(answer_skill_required(plan, run_result, bool(state.get("rule_recall_context", ""))))
+
+    def fast_path_verified_graph(self, state: AgentState) -> bool:
+        latency = state.get("latency_optimization") or {}
+        return bool(latency.get("eligible")) and str(latency.get("mode") or "") == "fast_path_verified_graph"
 
     def has_graph_repairable_execution_gap(self, state: AgentState) -> bool:
         run_result = state.get("agent_run_result")

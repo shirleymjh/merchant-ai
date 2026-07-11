@@ -187,6 +187,10 @@ class AgentState(TypedDict, total=False):
     open_diagnostic_intent: str
     open_diagnostic_goal: str
     open_diagnostic_seed_topics: List[QuestionCategory]
+    hypothesis_exploration: Dict[str, Any]
+    candidate_query_graphs: Dict[str, Any]
+    strategy_switch_trace: List[Dict[str, Any]]
+    latency_optimization: Dict[str, Any]
 
     answer: str
     analysis_summary: str
