@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping
 
@@ -10,12 +11,21 @@ class SafeFormatDict(dict):
 
 
 @dataclass(frozen=True)
+class PromptSectionSpec:
+    section_id: str
+    version: str
+    title: str
+    content: str
+
+
+@dataclass(frozen=True)
 class PromptTemplateSpec:
     prompt_id: str
     version: str
     agent: str
     description: str
     template: str
+    section_ids: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,9 @@ class PromptRender:
     agent: str
     system_prompt: str
     section_ids: List[str] = field(default_factory=list)
+    static_section_ids: List[str] = field(default_factory=list)
+    template_fingerprint: str = ""
+    render_fingerprint: str = ""
 
     def trace(self) -> Dict[str, Any]:
         return {
@@ -32,6 +45,9 @@ class PromptRender:
             "version": self.version,
             "agent": self.agent,
             "sections": self.section_ids,
+            "staticSections": self.static_section_ids,
+            "templateFingerprint": self.template_fingerprint,
+            "renderFingerprint": self.render_fingerprint,
         }
 
     def marker(self) -> str:
@@ -43,17 +59,29 @@ class PromptRegistry:
 
     def __init__(self) -> None:
         self._templates: Dict[str, PromptTemplateSpec] = {}
+        self._sections: Dict[str, PromptSectionSpec] = {}
 
     def register(self, spec: PromptTemplateSpec) -> None:
         self._templates[spec.prompt_id] = spec
+
+    def register_section(self, spec: PromptSectionSpec) -> None:
+        self._sections[spec.section_id] = spec
 
     def get(self, prompt_id: str) -> PromptTemplateSpec:
         if prompt_id not in self._templates:
             raise KeyError("Unknown prompt template: %s" % prompt_id)
         return self._templates[prompt_id]
 
+    def get_section(self, section_id: str) -> PromptSectionSpec:
+        if section_id not in self._sections:
+            raise KeyError("Unknown prompt section: %s" % section_id)
+        return self._sections[section_id]
+
     def list_specs(self) -> List[PromptTemplateSpec]:
         return list(self._templates.values())
+
+    def list_sections(self) -> List[PromptSectionSpec]:
+        return list(self._sections.values())
 
 
 class PromptAssembler:
@@ -70,6 +98,15 @@ class PromptAssembler:
     ) -> PromptRender:
         spec = self.registry.get(prompt_id)
         rendered = spec.template.format_map(SafeFormatDict({key: self._stringify(value) for key, value in (variables or {}).items()}))
+        static_section_ids: List[str] = []
+        static_section_texts: List[str] = []
+        for section_id in spec.section_ids:
+            section = self.registry.get_section(section_id)
+            static_section_ids.append(section.section_id)
+            static_section_texts.append(
+                '<static-section name="%s" version="%s" title="%s">\n%s\n</static-section>'
+                % (section.section_id, section.version, section.title, section.content.strip())
+            )
         section_ids: List[str] = []
         section_texts: List[str] = []
         for key, value in (sections or {}).items():
@@ -78,19 +115,26 @@ class PromptAssembler:
                 continue
             section_ids.append(str(key))
             section_texts.append('<runtime-section name="%s">\n%s\n</runtime-section>' % (key, text))
-        body = "\n\n".join([rendered.strip(), *section_texts]).strip()
-        body = '<prompt id="%s" version="%s" agent="%s">\n%s\n</prompt>' % (
+        template_body = "\n\n".join([*static_section_texts, rendered.strip()]).strip()
+        template_fingerprint = hashlib.sha256(template_body.encode("utf-8")).hexdigest()[:16]
+        body = "\n\n".join([template_body, *section_texts]).strip()
+        body = '<prompt id="%s" version="%s" agent="%s" templateFingerprint="%s">\n%s\n</prompt>' % (
             spec.prompt_id,
             spec.version,
             spec.agent,
+            template_fingerprint,
             body,
         )
+        render_fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
         return PromptRender(
             prompt_id=spec.prompt_id,
             version=spec.version,
             agent=spec.agent,
             system_prompt=body,
             section_ids=section_ids,
+            static_section_ids=static_section_ids,
+            template_fingerprint=template_fingerprint,
+            render_fingerprint=render_fingerprint,
         )
 
     def catalog_summary(self) -> List[Dict[str, str]]:
@@ -100,6 +144,7 @@ class PromptAssembler:
                 "version": spec.version,
                 "agent": spec.agent,
                 "description": spec.description,
+                "staticSections": ",".join(spec.section_ids),
             }
             for spec in self.registry.list_specs()
         ]
@@ -130,12 +175,71 @@ class PromptAssembler:
 
 def default_prompt_registry() -> PromptRegistry:
     registry = PromptRegistry()
+    registry.register_section(
+        PromptSectionSpec(
+            section_id="common.stable_boundary",
+            version="v1",
+            title="稳定规则和动态上下文边界",
+            content=(
+                "系统提示词只承载稳定角色、职责边界、工具边界和输出要求。"
+                "当前问题、商家、召回、记忆、节点合约、工具结果、证据缺口等运行时事实必须来自用户提示词或 runtime-section，"
+                "不得把过期的动态信息当成静态规则。"
+            ),
+        )
+    )
+    registry.register_section(
+        PromptSectionSpec(
+            section_id="common.artifact_references",
+            version="v1",
+            title="大对象引用策略",
+            content=(
+                "完整 QueryGraph、SQL、查询结果、工具输出、证据报告和 trace 优先通过 artifact/source ref 追溯。"
+                "提示词里只使用摘要、状态、行数、证据缺口和引用，不要求系统预加载全量大对象。"
+            ),
+        )
+    )
+    registry.register_section(
+        PromptSectionSpec(
+            section_id="lead.action_registry",
+            version="v1",
+            title="主智能体动作边界",
+            content="主智能体只能从动作注册表选择下一步；不能临时发明流程、跳过证据校验或让子任务共享完整全局状态。",
+        )
+    )
+    registry.register_section(
+        PromptSectionSpec(
+            section_id="planner.semantic_boundary",
+            version="v1",
+            title="规划语义边界",
+            content=(
+                "规划阶段只做问题结构理解、语义资产选择、查询图和证据需求声明。"
+                "不直接写 SQL，不根据记忆或字段名猜指标口径；指标、字段、关系以语义层为准。"
+            ),
+        )
+    )
+    registry.register_section(
+        PromptSectionSpec(
+            section_id="node.contract_boundary",
+            version="v1",
+            title="节点合约边界",
+            content="节点执行只能使用当前 nodePlanContract 中声明的表、字段、指标、商家过滤、时间范围和上游实体集合。",
+        )
+    )
+    registry.register_section(
+        PromptSectionSpec(
+            section_id="answer.verified_evidence",
+            version="v1",
+            title="回答证据边界",
+            content="回答只能基于已验证证据、结果摘要和证据缺口；缺证据要说明，不得把缺失、失败或未知解释成业务为 0。",
+        )
+    )
     registry.register(
         PromptTemplateSpec(
             prompt_id="lead.system",
             version="v1",
             agent="LeadAgent",
             description="Main harness prompt assembled with actions, skills and budgets.",
+            section_ids=["common.stable_boundary", "lead.action_registry", "common.artifact_references"],
             template=(
                 "你是 {agent_name}，负责商家 BI Agent Harness 的全局调度。\n"
                 "你保存全局目标、用户约束、任务进度和最终汇总；子 Agent 只接收与自身任务相关的局部上下文。\n"
@@ -150,6 +254,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v1",
             agent="PlannerAgent",
             description="Understand a BI question into semantic-layer bounded questionUnderstanding.",
+            section_ids=["common.stable_boundary", "planner.semantic_boundary", "common.artifact_references"],
             template=(
                 "你是商家 BI 问题理解器。只输出 JSON。\n"
                 "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、rankingObjective、requestedMeasures、scopeConstraints、filters、timeWindowDays。\n"
@@ -181,6 +286,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v1",
             agent="PlannerAgent",
             description="Re-understand a question after critic or validation feedback.",
+            section_ids=["common.stable_boundary", "planner.semantic_boundary", "common.artifact_references"],
             template=(
                 "你是商家 BI 问题重新理解 agent。只输出 JSON。\n"
                 "不要直接输出 QueryGraph 或 SQL，只输出 questionUnderstanding。\n"
@@ -196,6 +302,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v2",
             agent="NodeAgent",
             description="Draft safe one-table SQL for a single QueryGraph node.",
+            section_ids=["common.stable_boundary", "node.contract_boundary", "common.artifact_references"],
             template=(
                 "你是 SQL NodeWorker。只输出 JSON: {{\"sql\":\"...\"}}。\n"
                 "只能基于 nodePlanContract 写 SQL；只能查询 preferredTable；只能使用 allowedColumns；不要 join 其他表，不要修改 QueryGraph。\n"
@@ -214,6 +321,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v1",
             agent="NodeAgent",
             description="Repair SQL without changing QueryGraph semantics.",
+            section_ids=["common.stable_boundary", "node.contract_boundary", "common.artifact_references"],
             template=(
                 "你是 SQL repair agent。只输出 JSON: {{\"sql\":\"...\"}}。\n"
                 "只能基于 nodePlanContract 修 SQL，不能修改 QueryGraph 语义，不能新增 preferredTable 或 allowedColumns 外内容。"
@@ -226,6 +334,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v2",
             agent="AnswerAgent",
             description="Compose BI answer only from verified evidence.",
+            section_ids=["common.stable_boundary", "answer.verified_evidence", "common.artifact_references"],
             template=(
                 "你是商家经营分析助手。只基于输入的已验证数据回答，缺失证据要明确说明，不要把缺失解释成 0。\n"
                 "回答要自然、简洁、先说结论，避免研发调试口吻。\n"
@@ -239,6 +348,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v2",
             agent="AnalysisAgent",
             description="Produce business interpretation from evidence.",
+            section_ids=["common.stable_boundary", "answer.verified_evidence", "common.artifact_references"],
             template=(
                 "你是经营分析助手。基于当前数据给出商家能读懂的经营判断，不在 SQL 阶段硬编码业务假设。\n"
                 "不要输出“分析结论/关键证据/限制/口径”这类固定报告标题，不要暴露字段名、表名或 SQL。"
@@ -251,6 +361,7 @@ def default_prompt_registry() -> PromptRegistry:
             version="v1",
             agent="AnswerAgent",
             description="Answer platform rule questions from retrieved knowledge only.",
+            section_ids=["common.stable_boundary", "answer.verified_evidence", "common.artifact_references"],
             template="你是平台规则助手。只基于给定知识回答；没有依据时说需要运营补充规则。",
         )
     )

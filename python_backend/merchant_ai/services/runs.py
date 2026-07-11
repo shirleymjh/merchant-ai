@@ -24,6 +24,7 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 from merchant_ai.services.checkpoints import checkpoint_ref_for_run
+from merchant_ai.services.runtime_state import create_runtime_state_store
 
 
 ANSWER_DELTA_CHARS = 80
@@ -144,6 +145,7 @@ class AgentRunManager:
         self.threads: Dict[str, AgentThreadRecord] = {}
         self.runs: Dict[str, AgentRunRecord] = {}
         self.run_events: Dict[str, List[AgentRunEventRecord]] = {}
+        self.runtime_state_store = create_runtime_state_store(self.settings)
         self._lock = RLock()
 
     def create_thread(self, merchant_id: str, topic: str = "", context: Optional[ChatContext] = None) -> AgentThreadRecord:
@@ -281,8 +283,9 @@ class AgentRunManager:
             run.end_time = datetime.now()
             run.updated_at = datetime.now()
             self.store.save_run(run)
+            self.runtime_state_store.cancel_run(run_id, "run_manager.cancel_run")
             self.append_event(run_id, run.thread_id, "run.canceled", "RUN_MANAGER", {})
-        return run
+            return run
 
     def mark_run_running(self, run_id: str) -> Optional[AgentRunRecord]:
         run = self.runs.get(run_id) or self.store.load_run(run_id)

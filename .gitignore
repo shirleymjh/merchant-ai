@@ -25,3 +25,4 @@ venv/
 
 # Merchant AI local runtime artifacts
 python_backend/.merchant-ai/
+python_backend/resources/runtime/ops/golden_evaluation_reports/

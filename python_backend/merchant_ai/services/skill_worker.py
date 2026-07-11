@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,6 +27,76 @@ class SkillWorkerExecutor:
         self.llm = llm
         self.settings = llm.settings
 
+    def execute_answer_skills(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        skill_names: list[str],
+        outputs_path: str = "",
+        rule_context: str = "",
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
+        initial_trace: Optional[Dict[str, Any]] = None,
+    ) -> list[SkillWorkerResult]:
+        names = []
+        for name in skill_names or []:
+            normalized = str(name or "").strip()
+            if normalized and normalized not in names:
+                names.append(normalized)
+        if not names:
+            return []
+        max_workers = max(1, min(int(getattr(self.settings, "max_concurrent_skill_workers", 2) or 2), len(names)))
+        results: Dict[str, SkillWorkerResult] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for index, skill_name in enumerate(names):
+                trace = dict(initial_trace or {})
+                trace.update(
+                    {
+                        "parallelSkillBatch": True,
+                        "skillBatchIndex": index,
+                        "skillBatchSize": len(names),
+                        "maxConcurrency": max_workers,
+                    }
+                )
+                future = executor.submit(
+                    self.execute_answer_skill,
+                    question,
+                    plan,
+                    run_result,
+                    outputs_path,
+                    rule_context,
+                    skill_name,
+                    merchant,
+                    personalization_context,
+                    trace,
+                )
+                futures[future] = skill_name
+            for future in as_completed(futures):
+                skill_name = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = SkillWorkerResult(
+                        answer="",
+                        trace={
+                            "skillName": skill_name,
+                            "workerType": "SKILL_WORKER",
+                            "subAgentType": "SKILL_WORKER",
+                            "isolatedExecution": True,
+                            "parallelSkillBatch": True,
+                            "lifecycleStage": "failed",
+                            "error": str(exc)[:500],
+                            "progress": ["failed:%s" % str(exc)[:80]],
+                        },
+                    )
+                result.trace["parallelSkillBatch"] = True
+                result.trace["skillBatchSize"] = len(names)
+                result.trace["maxConcurrency"] = max_workers
+                results[skill_name] = result
+        return [results[name] for name in names if name in results]
+
     def execute_answer_skill(
         self,
         question: str,
@@ -37,6 +110,7 @@ class SkillWorkerExecutor:
         initial_trace: Optional[Dict[str, Any]] = None,
     ) -> SkillWorkerResult:
         selected_skill = skill_name or "bi_trend_attribution"
+        started = time.monotonic()
         isolated_run_id = "skill_%s_%s" % (selected_skill, uuid.uuid4().hex[:10])
         skill_dir = self.settings.resources_root / "runtime" / "agent_skills" / selected_skill
         skill_file = skill_dir / "SKILL.md"
@@ -64,6 +138,8 @@ class SkillWorkerExecutor:
             "workspacePath": str(workspace),
             "checkpointPath": str(checkpoint_path),
             "contextPackagePath": str(context_path),
+            "startedAt": datetime.now().isoformat(),
+            "_startedMonotonic": started,
             "progress": ["matched"],
             "reuseCandidate": False,
         }
@@ -211,6 +287,9 @@ class SkillWorkerExecutor:
         trace["findings"] = result.get("findings", [])[:6]
         trace["caveats"] = result.get("caveats", [])[:6]
         trace["lifecycleStage"] = "completed"
+        trace["completedAt"] = datetime.now().isoformat()
+        trace["durationMs"] = int((time.monotonic() - float(trace.get("_startedMonotonic") or time.monotonic())) * 1000)
+        trace.pop("_startedMonotonic", None)
         trace["progress"].extend(["progress_synced", "completed"])
         trace["reuseCandidate"] = bool(
             self.settings.skill_reuse_suggestion_enabled and answer_skill_reuse_candidate(str(trace.get("skillName") or ""), result)
@@ -224,6 +303,9 @@ class SkillWorkerExecutor:
     def _fail(self, trace: Dict[str, Any], checkpoint_path: Path, message: str) -> SkillWorkerResult:
         trace["error"] = message
         trace["lifecycleStage"] = "failed"
+        trace["completedAt"] = datetime.now().isoformat()
+        trace["durationMs"] = int((time.monotonic() - float(trace.get("_startedMonotonic") or time.monotonic())) * 1000)
+        trace.pop("_startedMonotonic", None)
         trace.setdefault("progress", []).append("failed:%s" % str(message)[:80])
         self._write_checkpoint(checkpoint_path, trace, status="failed")
         return SkillWorkerResult(answer="", trace=trace)

@@ -19,17 +19,26 @@ from merchant_ai.models import (
     QueryPlan,
     QuestionCategory,
     QuestionIntent,
+    VerifiedAnswerContext,
     category_display,
 )
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory import MemoryStore
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, PendingAnswerStore
+from merchant_ai.services.answer_formatting import (
+    answer_numeric_value,
+    extract_question_time_phrase,
+    format_cell,
+    format_metric_value_for_answer,
+    humanize_column_name,
+    identifier_like_column,
+)
 
 
 def answer_context_policy() -> str:
     return (
-        "AnswerAgent 只读取 question、businessContext、dataRows、dataSections、metricDisclosures、evidenceGaps、analysisDraft；不要读取或推断 QueryGraph。"
+        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft；不要读取或推断 QueryGraph。"
         "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
         "不要使用“分析结论”“关键证据”“限制”“证据门禁”“当前证据显示”“已看到的点位显示”这类报告或内部调试话术。"
         "不要说“查到几行”“使用表”“SQL”“字段名”“Doris”；不要输出 markdown 表格，表格和图表由前端结构化区域渲染。"
@@ -234,6 +243,10 @@ class AnswerComposeService:
         )
         if skill_answer:
             return skill_answer
+        deterministic = deterministic_analysis_summary(question, plan, run_result)
+        if deterministic:
+            self.last_analysis_skill_trace["deterministicAnalysisSummary"] = True
+            return deterministic
         if not self.llm.configured:
             return ""
         analysis_prompt = self.prompt_assembler.render(
@@ -320,6 +333,9 @@ class AnswerComposeService:
     ) -> str:
         candidates = answer_skill_headers(self.llm.settings.resources_root / "runtime" / "agent_skills")
         fallback = select_answer_skill(plan, run_result, has_rule_context)
+        match_mode = str(self.llm.settings.answer_skill_match_mode or "").lower()
+        if not fallback and (match_mode == "always" or bool(getattr(self.llm.settings, "skill_confirmation_required", False))):
+            fallback = deterministic_analysis_skill_fallback(plan, run_result, has_rule_context)
         trace: Dict[str, Any] = {
             "lifecycle": ["match", "confirm", "isolated_execute", "progress", "output"],
             "matchMode": self.llm.settings.answer_skill_match_mode,
@@ -331,7 +347,6 @@ class AnswerComposeService:
             trace["matchedBy"] = "deterministic_fallback"
             trace["skillName"] = fallback
             return fallback
-        match_mode = str(self.llm.settings.answer_skill_match_mode or "").lower()
         if fallback and (match_mode in {"deterministic_first", "header"} or (match_mode == "always" and fallback == "bi_trend_attribution")):
             trace["matchedBy"] = "deterministic_fallback_before_llm"
             trace["skillName"] = fallback
@@ -393,6 +408,39 @@ class AnswerComposeService:
         personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         selected_skill = skill_name or select_answer_skill(plan, run_result, bool(rule_context)) or "bi_trend_attribution"
+        if self._should_use_local_fast_structured_skill(selected_skill, plan, run_result):
+            trace = {
+                "skillName": selected_skill,
+                "matchedBy": self.last_analysis_skill_trace.get("matchedBy") or "semantic_fast_path",
+                "matchTrace": dict(self.last_analysis_skill_trace or {}),
+                "activated": True,
+                "workerType": "LOCAL_STRUCTURED_RENDERER",
+                "subAgentType": "local_fast_summary",
+                "isolatedExecution": False,
+                "deterministicRenderer": True,
+                "lifecycleStage": "completed",
+                "progress": ["matched", "local_structured_render", "completed"],
+                "reuseCandidate": False,
+            }
+            skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / selected_skill
+            skill_file = skill_dir / "SKILL.md"
+            skill_meta = load_skill_frontmatter(skill_file) if skill_file.exists() else {}
+            payload = answer_data_package(
+                question,
+                plan,
+                run_result,
+                rule_context,
+                merchant=merchant,
+                personalization_context=personalization_context,
+            )
+            payload["questionUnderstanding"] = plan.question_understanding
+            payload["skillMetadata"] = skill_meta
+            answer = render_structured_skill_answer(selected_skill, payload)
+            trace["inputRows"] = len(payload.get("dataRows") or [])
+            trace["outputRows"] = len(payload.get("dataRows") or [])
+            trace["summaryChars"] = len(answer)
+            self.last_analysis_skill_trace = trace
+            return answer
         if self._should_run_isolated_skill_worker(selected_skill):
             from merchant_ai.services.skill_worker import SkillWorkerExecutor
 
@@ -528,12 +576,82 @@ class AnswerComposeService:
             self._write_skill_checkpoint(checkpoint_path, trace, status="failed")
         return answer
 
+    def run_parallel_analysis_skills(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        skill_names: List[str],
+        outputs_path: str = "",
+        rule_context: str = "",
+        merchant: MerchantInfo | None = None,
+        personalization_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        from merchant_ai.services.skill_worker import SkillWorkerExecutor
+
+        executor = SkillWorkerExecutor(self.llm)
+        results = executor.execute_answer_skills(
+            question,
+            plan,
+            run_result,
+            skill_names,
+            outputs_path,
+            rule_context,
+            merchant=merchant,
+            personalization_context=personalization_context,
+            initial_trace=dict(self.last_analysis_skill_trace or {}),
+        )
+        successful = [result for result in results if result.answer and not result.trace.get("error")]
+        sections = []
+        for result in successful:
+            title = str(result.trace.get("skillName") or "analysis_skill")
+            sections.append("### %s\n%s" % (title, result.answer.strip()))
+        summary = "\n\n".join(sections)
+        self.last_analysis_skill_trace = {
+            "skillName": "parallel_skill_batch",
+            "skillNames": [str(name) for name in skill_names or [] if str(name).strip()],
+            "activated": bool(results),
+            "executionMode": "parallel_isolated_skill_workers",
+            "workerType": "SKILL_WORKER_BATCH",
+            "subAgentType": "SKILL_WORKER_BATCH",
+            "isolatedExecution": True,
+            "parallelExecution": True,
+            "lifecycleStage": "completed" if successful else "failed",
+            "progress": ["matched", "parallel_isolated_execute", "progress_synced", "completed" if successful else "failed"],
+            "skillBatchResults": [result.trace for result in results],
+            "completedCount": len(successful),
+            "failedCount": len(results) - len(successful),
+            "summaryChars": len(summary),
+            "reuseCandidate": any(bool(result.trace.get("reuseCandidate")) for result in results),
+        }
+        if not successful:
+            self.last_analysis_skill_trace["error"] = "all parallel skill workers failed"
+        return summary
+
     def _should_run_isolated_skill_worker(self, skill_name: str) -> bool:
         if not bool(getattr(self.llm.settings, "skill_worker_enabled", True)):
             return False
         configured = str(getattr(self.llm.settings, "skill_worker_complex_names", "") or "")
         names = {item.strip() for item in configured.split(",") if item.strip()}
         return not names or skill_name in names
+
+    def _should_use_local_fast_structured_skill(
+        self,
+        skill_name: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+    ) -> bool:
+        if skill_name not in {"risk_analysis", "new_product_risk", "ratio_analysis"}:
+            return False
+        if not run_result or not run_result.merged_query_bundle.rows:
+            return False
+        trace = " ".join(str(item or "") for item in (plan.agent_trace or []))
+        source = str((plan.question_understanding or {}).get("source") or "")
+        if "semantic_topn_metric_fast_path" not in source and "planner.semantic_fast_path" not in trace:
+            return False
+        if run_result.evidence_gaps:
+            return False
+        return True
 
     def run_structured_answer_skill(
         self,
@@ -1063,20 +1181,6 @@ def metric_value_column_for_rows(plan: QueryPlan, intent: QuestionIntent, rows: 
     return ""
 
 
-def answer_numeric_value(value: Any) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "")
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
 def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[Dict[str, Any]]:
     if not run_result:
         return []
@@ -1132,19 +1236,6 @@ def chart_hint_sentence(plan: QueryPlan, run_result: AgentRunResult | None) -> s
     return "\n\n按日趋势已整理在下方图表中。" if has_trend else ""
 
 
-def format_metric_value_for_answer(value: Any, metric_key: str, label: str = "") -> str:
-    text = format_cell(value)
-    numeric = answer_numeric_value(value)
-    if numeric is None:
-        return text
-    metric_text = "%s %s" % (metric_key or "", label or "")
-    if re.search(r"(gmv|amt|amount|金额|赔付|退款|优惠|补贴)", metric_text, flags=re.I):
-        if float(numeric).is_integer():
-            return "%s元" % int(numeric)
-        return ("%s元" % ("%.2f" % numeric)).replace(".00元", "元")
-    return text
-
-
 def primary_summary_metric_value(plan: QueryPlan, run_result: AgentRunResult) -> Dict[str, Any]:
     if not run_result:
         return {}
@@ -1167,24 +1258,6 @@ def primary_trend_points(plan: QueryPlan, run_result: AgentRunResult, metric_key
             continue
         return metric_series_rows_for_intent(plan, intent, item.query_bundle.rows) if intent else []
     return []
-
-
-def extract_question_time_phrase(question: str) -> str:
-    text = str(question or "")
-    for pattern in [
-        r"最近\s*\d+\s*[天日周月]",
-        r"近\s*\d+\s*[天日周月]",
-        r"过去\s*\d+\s*[天日周月]",
-        r"昨天",
-        r"今日",
-        r"今天",
-        r"本周",
-        r"本月",
-    ]:
-        match = re.search(pattern, text)
-        if match:
-            return re.sub(r"\s+", "", match.group(0))
-    return ""
 
 
 def primary_answer_metric_column(plan: QueryPlan, row: Dict[str, Any]) -> str:
@@ -1230,35 +1303,6 @@ def friendly_column_label(plan: QueryPlan, column: str) -> str:
         if column == str(resolution.get("metricKey") or "") and resolution.get("displayName"):
             return str(resolution.get("displayName"))
     return humanize_column_name(column)
-
-
-def humanize_column_name(column: str) -> str:
-    text = str(column or "").strip()
-    dictionary = {
-        "order": "订单",
-        "detail": "明细",
-        "cnt": "数量",
-        "amt": "金额",
-        "gmv": "GMV",
-        "refund": "退款",
-        "return": "退货",
-        "rate": "比例",
-        "pay": "支付",
-        "user": "用户",
-        "ticket": "工单",
-        "goods": "商品",
-        "spu": "商品",
-        "create": "创建",
-        "time": "时间",
-    }
-    parts = [dictionary.get(part, "") for part in re.split(r"[_\s]+", text.lower())]
-    label = "".join(part for part in parts if part)
-    return label or text
-
-
-def identifier_like_column(column: str) -> bool:
-    text = str(column or "").strip().lower()
-    return text in {"seller_id", "merchant_id", "user_id", "pt"} or text.endswith("_id") or text.endswith("_no")
 
 
 def is_ranking_plan(plan: QueryPlan) -> bool:
@@ -1729,11 +1773,6 @@ def required_evidence_refs(understanding: Dict[str, Any]) -> Dict[str, set[str]]
     return refs
 
 
-def format_cell(value: Any) -> str:
-    text = str(value if value is not None else "")
-    return text.replace("\n", " ")[:80]
-
-
 def analysis_summary_required(plan: QueryPlan) -> bool:
     understanding = plan.question_understanding or {}
     analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
@@ -1754,6 +1793,18 @@ def answer_skill_required(plan: QueryPlan, run_result: AgentRunResult | None = N
     return bool(select_answer_skill(plan, run_result, has_rule_context))
 
 
+def deterministic_analysis_skill_fallback(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> str:
+    selected = select_answer_skill(plan, run_result, has_rule_context)
+    if selected:
+        return selected
+    understanding = plan.question_understanding or {}
+    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
+    requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
+    if analysis_intent in {"trend_check", "anomaly_check", "diagnosis", "comparison", "overview"} and requires_explanation:
+        return "bi_trend_attribution"
+    return ""
+
+
 def select_answer_skill(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> str:
     understanding = plan.question_understanding or {}
     analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
@@ -1761,18 +1812,73 @@ def select_answer_skill(plan: QueryPlan, run_result: AgentRunResult | None = Non
     categories = {intent.category for intent in plan.intents}
     if plan_requires_rule_evidence(plan) and has_rule_context:
         return "rule_compliance"
-    if plan_has_ratio_calculation(plan):
-        return "ratio_analysis"
+    declared_skill = declared_skill_workflow_name(understanding)
+    if declared_skill:
+        return declared_skill
+    if not reusable_analysis_workflow_requested(understanding):
+        return ""
     if plan_has_new_product_risk_shape(plan):
         return "new_product_risk"
-    if analysis_intent in {"trend_check", "anomaly_check", "diagnosis", "comparison", "overview"} and requires_explanation:
-        return "bi_trend_attribution"
     risk_domains = {QuestionCategory.REFUND, QuestionCategory.COMPENSATION, QuestionCategory.CS_TICKET, QuestionCategory.GOODS, QuestionCategory.SCM}
     if analysis_intent in {"risk_ranking", "diagnosis", "anomaly_check"} and categories & risk_domains:
         return "risk_analysis"
+    if plan_has_ratio_calculation(plan):
+        return "ratio_analysis"
+    if analysis_intent in {"trend_check", "anomaly_check", "diagnosis", "comparison", "overview"} and requires_explanation:
+        return "bi_trend_attribution"
     if run_result and run_result.evidence_gaps and analysis_intent not in {"none", ""}:
         return "risk_analysis"
     return ""
+
+
+def deterministic_analysis_summary(question: str, plan: QueryPlan, run_result: AgentRunResult) -> str:
+    if not analysis_summary_required(plan):
+        return ""
+    rows = list(getattr(getattr(run_result, "merged_query_bundle", None), "rows", []) or [])
+    if not rows:
+        return ""
+    metric_labels: List[str] = []
+    for intent in plan.intents:
+        label = friendly_column_label(plan, intent.metric_name or intent.metric_column or "")
+        if label and label not in metric_labels:
+            metric_labels.append(label)
+    if not metric_labels:
+        for key in rows[0].keys():
+            label = friendly_column_label(plan, str(key))
+            if label and label not in metric_labels and key not in {"seller_id", "merchant_id", "pt"}:
+                metric_labels.append(label)
+    subject = "、".join(metric_labels[:4]) or "当前指标"
+    row_count = len(rows)
+    return "%s已有 %d 行已验证数据，可基于这些结果做趋势或异常判断；证据不足的原因不要扩展为确定结论。" % (subject, row_count)
+
+
+def declared_skill_workflow_name(understanding: Dict[str, Any]) -> str:
+    allowed = {"bi_trend_attribution", "risk_analysis", "rule_compliance", "ratio_analysis", "new_product_risk"}
+    for key in ["skillWorkflow", "skill_workflow", "recommendedSkill", "recommended_skill", "analysisSkill", "analysis_skill"]:
+        value = understanding.get(key)
+        if isinstance(value, dict):
+            name = str(value.get("skillName") or value.get("skill_name") or value.get("name") or "").strip()
+        else:
+            name = str(value or "").strip()
+        if name in allowed:
+            return name
+    return ""
+
+
+def reusable_analysis_workflow_requested(understanding: Dict[str, Any]) -> bool:
+    workflow = understanding.get("skillWorkflow") or understanding.get("skill_workflow") or {}
+    if isinstance(workflow, dict) and boolish(workflow.get("enabled", workflow.get("required", False))):
+        return True
+    for key in ["reusableAnalysis", "reusable_analysis", "fixedAnalysisWorkflow", "fixed_analysis_workflow"]:
+        if boolish(understanding.get(key)):
+            return True
+    for item in understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("semanticLabel") or item.get("semantic_label") or "").strip().lower()
+        if label in {"reusable_analysis_workflow", "skill_workflow", "fixed_analysis_workflow"}:
+            return True
+    return False
 
 
 def plan_has_ratio_calculation(plan: QueryPlan) -> bool:
@@ -1901,29 +2007,46 @@ def answer_data_package(
     merchant: MerchantInfo | None = None,
     personalization_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    return verified_answer_context(
+        question,
+        plan,
+        run_result,
+        rule_context=rule_context,
+        merchant=merchant,
+        personalization_context=personalization_context,
+    ).prompt_payload()
+
+
+def verified_answer_context(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    rule_context: str = "",
+    merchant: MerchantInfo | None = None,
+    personalization_context: Optional[Dict[str, Any]] = None,
+) -> VerifiedAnswerContext:
     if not run_result:
-        return {
-            "question": question,
-            "businessContext": answer_business_context(question, plan, run_result, merchant, personalization_context),
-            "dataRows": [],
-            "metricDisclosures": [],
-            "lightweightMetricDisclosures": [],
-            "evidenceGaps": [],
-            "ruleEvidence": compact_rule_evidence(question, rule_context),
-        }
+        return VerifiedAnswerContext(
+            question=question,
+            business_context=answer_business_context(question, plan, run_result, merchant, personalization_context),
+            rule_evidence=compact_rule_evidence(question, rule_context),
+        )
     verified = run_result.verified_evidence
-    return {
-        "question": question,
-        "businessContext": answer_business_context(question, plan, run_result, merchant, personalization_context),
-        "tables": run_result.merged_query_bundle.tables,
-        "rowCount": run_result.merged_query_bundle.effective_row_count(),
-        "dataRows": answer_data_rows(plan, run_result),
-        "dataSections": answer_prompt_sections(plan, run_result),
-        "metricDisclosures": metric_disclosures(plan, verified),
-        "lightweightMetricDisclosures": lightweight_metric_disclosures(question, plan, run_result),
-        "evidenceGaps": compact_evidence_gaps(run_result.evidence_gaps),
-        "ruleEvidence": compact_rule_evidence(question, rule_context),
-    }
+    return VerifiedAnswerContext(
+        question=question,
+        business_context=answer_business_context(question, plan, run_result, merchant, personalization_context),
+        tables=run_result.merged_query_bundle.tables,
+        row_count=run_result.merged_query_bundle.effective_row_count(),
+        data_rows=answer_data_rows(plan, run_result),
+        data_sections=answer_prompt_sections(plan, run_result),
+        metric_disclosures=metric_disclosures(plan, verified),
+        lightweight_metric_disclosures=lightweight_metric_disclosures(question, plan, run_result),
+        evidence_gaps=compact_evidence_gaps(run_result.evidence_gaps),
+        degraded_reasons=list(run_result.degraded_reasons or [])[:12],
+        rule_evidence=compact_rule_evidence(question, rule_context),
+        verified_passed=bool(verified.passed),
+        partial_answer_reason=run_result.partial_answer_reason or verified.partial_answer_reason,
+    )
 
 
 def answer_data_rows(plan: QueryPlan, run_result: AgentRunResult) -> List[Dict[str, Any]]:

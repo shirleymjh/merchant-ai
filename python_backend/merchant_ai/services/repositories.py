@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from contextlib import contextmanager
 from datetime import datetime
@@ -12,11 +13,37 @@ from merchant_ai.models import MerchantInfo, PendingAnswer
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
+logger = logging.getLogger(__name__)
+
+
+def degraded_reason(component: str, operation: str, exc: Exception) -> Dict[str, Any]:
+    return {
+        "component": component,
+        "operation": operation,
+        "errorType": exc.__class__.__name__,
+        "message": str(exc)[:500],
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+def log_degraded(component: str, operation: str, exc: Exception) -> Dict[str, Any]:
+    reason = degraded_reason(component, operation, exc)
+    logger.warning(
+        "%s degraded during %s: %s: %s",
+        component,
+        operation,
+        reason["errorType"],
+        reason["message"],
+    )
+    return reason
+
+
 class DatabaseClient:
     def __init__(self, jdbc_url: str, username: str, password: str, read_timeout_seconds: int = 30):
         self.kwargs = jdbc_to_pymysql_kwargs(jdbc_url, username, password)
         self.read_timeout_seconds = max(1, int(read_timeout_seconds or 30))
         self.available = True
+        self.last_degraded_reason: Dict[str, Any] = {}
 
     @contextmanager
     def connection(self):
@@ -33,6 +60,7 @@ class DatabaseClient:
             conn = pymysql.connect(**kwargs)
         except Exception as exc:
             self.available = False
+            self.last_degraded_reason = log_degraded("database", "connect", exc)
             raise RuntimeError("数据库连接不可用") from exc
         try:
             yield conn
@@ -67,6 +95,7 @@ class DorisRepository:
         self.query_cache = build_ttl_cache("doris_select", settings, settings.cache_doris_select_ttl_seconds)
         self.last_cache_hit = False
         self.last_cache_key = ""
+        self.last_degraded_reason: Dict[str, Any] = {}
 
     def query(self, sql: str, params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
         self.last_cache_hit = False
@@ -80,7 +109,11 @@ class DorisRepository:
                 self.last_cache_hit = True
                 self.last_cache_key = cache_key
                 return cached
-        rows = self.db.query(sql, params_list or None)
+        try:
+            rows = self.db.query(sql, params_list or None)
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("doris_repository", "query", exc)
+            raise
         if cache_key:
             self.query_cache.set(cache_key, rows)
             self.last_cache_key = cache_key
@@ -105,6 +138,8 @@ class DorisRepository:
         trace = self.query_cache.trace()
         trace["lastCacheHit"] = self.last_cache_hit
         trace["lastCacheKey"] = self.last_cache_key
+        if self.last_degraded_reason:
+            trace["lastDegradedReason"] = self.last_degraded_reason
         return trace
 
     def _cacheable_query(self, sql: str) -> bool:
@@ -128,6 +163,7 @@ class AnswerRepository:
         self.settings = settings
         self.db = DatabaseClient(settings.answer_jdbc_url, settings.answer_username, settings.answer_password, settings.doris_read_timeout_seconds)
         self.available = True
+        self.last_degraded_reason: Dict[str, Any] = {}
         self.init_schema()
 
     def init_schema(self) -> None:
@@ -135,8 +171,9 @@ class AnswerRepository:
         try:
             if sql_path.exists():
                 self.db.execute(sql_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
             self.available = False
+            self.last_degraded_reason = log_degraded("answer_repository", "init_schema", exc)
 
     def exists(self, answer_id: str) -> bool:
         if not self.available:
@@ -144,7 +181,8 @@ class AnswerRepository:
         try:
             rows = self.db.query("SELECT COUNT(*) AS cnt FROM merchant_ai_answer WHERE id = %s", [answer_id])
             return bool(rows and int(rows[0].get("cnt") or 0) > 0)
-        except Exception:
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("answer_repository", "exists", exc)
             return False
 
     def insert_answer(self, pending: PendingAnswer, adopted: bool = False, liked: bool = False, disliked: bool = False) -> bool:
@@ -205,7 +243,8 @@ class AnswerRepository:
                     ],
                 )
             return True
-        except Exception:
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("answer_repository", "insert_answer", exc)
             return False
 
     def update_feedback(self, answer_id: str, adopted: Optional[bool], liked: Optional[bool], disliked: Optional[bool]) -> None:
@@ -229,7 +268,8 @@ class AnswerRepository:
                     answer_id,
                 ],
             )
-        except Exception:
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("answer_repository", "update_feedback", exc)
             return
 
     def recent_answers(self, merchant_id: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -246,7 +286,8 @@ class AnswerRepository:
                 """,
                 [merchant_id, limit],
             )
-        except Exception:
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("answer_repository", "recent_answers", exc)
             return []
 
     def recent_answers_by_category(self, merchant_id: str, category_name: str, limit: int = 200) -> List[Dict[str, Any]]:
@@ -263,8 +304,15 @@ class AnswerRepository:
                 """,
                 [merchant_id, "%%%s%%" % category_name, limit],
             )
-        except Exception:
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("answer_repository", "recent_answers_by_category", exc)
             return []
+
+    def trace(self) -> Dict[str, Any]:
+        return {
+            "available": self.available,
+            "lastDegradedReason": self.last_degraded_reason,
+        }
 
 
 class PendingAnswerStore:
@@ -285,6 +333,7 @@ class MerchantService:
     def __init__(self, settings: Settings, doris_repository: DorisRepository):
         self.settings = settings
         self.doris_repository = doris_repository
+        self.last_degraded_reason: Dict[str, Any] = {}
 
     def current_merchant(self, merchant_id: str) -> MerchantInfo:
         target = merchant_id or self.settings.merchant_id
@@ -301,9 +350,14 @@ class MerchantService:
                     company_name=str(row.get("company_name") or ""),
                     rows=row,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded("merchant_service", "current_merchant", exc)
         return MerchantInfo(merchant_id=target, merchant_name="yshopping商家%s" % target)
+
+    def trace(self) -> Dict[str, Any]:
+        return {
+            "lastDegradedReason": self.last_degraded_reason,
+        }
 
 
 def safe_identifier(identifier: str) -> str:

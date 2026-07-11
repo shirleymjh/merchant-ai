@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import queue
 import re
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
@@ -23,6 +25,9 @@ class LlmClient:
         self.response_cache = build_ttl_cache("llm_response", settings, settings.cache_llm_ttl_seconds)
         self.last_cache_hit = False
         self.last_cache_key = ""
+        self._failure_count = 0
+        self._circuit_open_until_ms = 0
+        self._circuit_lock = threading.RLock()
 
     @property
     def configured(self) -> bool:
@@ -63,6 +68,8 @@ class LlmClient:
         self.error_events.append(error)
 
     def chat(self, system_prompt: str, user_prompt: str, fallback: str = "", timeout_seconds: Optional[int] = None) -> str:
+        if self._circuit_open():
+            return fallback
         model = self._chat_model(timeout_seconds)
         if model is None:
             return fallback
@@ -89,9 +96,11 @@ class LlmClient:
                 text = str(content or fallback)
             if text and text != fallback:
                 self.response_cache.set(cache_key, text)
+            self._record_success()
             return text
         except Exception as exc:
             self.record_error("provider_error: %s" % str(exc)[:300])
+            self._record_failure(self.last_error)
             return fallback
 
     def tool_chat(
@@ -103,6 +112,8 @@ class LlmClient:
         timeout_seconds: Optional[int] = None,
         tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._circuit_open():
+            return fallback or {"content": "", "toolCalls": []}
         model = self._chat_model(timeout_seconds)
         if model is None:
             return fallback or {"content": "", "toolCalls": []}
@@ -129,9 +140,11 @@ class LlmClient:
             }
             if payload.get("content") or payload.get("toolCalls"):
                 self.response_cache.set(cache_key, payload)
+            self._record_success()
             return payload
         except Exception as exc:
             self.record_error("provider_error: %s" % str(exc)[:300])
+            self._record_failure(self.last_error)
             return fallback or {"content": "", "toolCalls": []}
 
     def tool_json_chat(
@@ -235,6 +248,7 @@ class LlmClient:
                 except Exception:
                     pass
             self.record_error("timeout: provider call exceeded %s seconds" % timeout)
+            self._record_failure(self.last_error)
             return None
         if status == "error":
             raise value
@@ -247,8 +261,34 @@ class LlmClient:
         if not done:
             task.cancel()
             self.record_error("timeout: provider call exceeded %s seconds" % timeout)
+            self._record_failure(self.last_error)
             return None
         return task.result()
+
+    def _record_success(self) -> None:
+        with self._circuit_lock:
+            self._failure_count = 0
+            self._circuit_open_until_ms = 0
+
+    def _record_failure(self, error: str) -> None:
+        with self._circuit_lock:
+            self._failure_count += 1
+            threshold = max(1, int(getattr(self.settings, "llm_circuit_threshold", 3) or 3))
+            if self._failure_count >= threshold:
+                cooldown_ms = max(1, int(getattr(self.settings, "llm_circuit_cooldown_seconds", 30) or 30)) * 1000
+                self._circuit_open_until_ms = int(time.time() * 1000) + cooldown_ms
+                self.record_error("circuit_open: LLM failure threshold reached after %s failures; last_error=%s" % (self._failure_count, str(error or "")[:160]))
+
+    def _circuit_open(self) -> bool:
+        with self._circuit_lock:
+            now = int(time.time() * 1000)
+            if self._circuit_open_until_ms and self._circuit_open_until_ms > now:
+                self.record_error("circuit_open: LLM fast-fail until %s" % self._circuit_open_until_ms)
+                return True
+            if self._circuit_open_until_ms and self._circuit_open_until_ms <= now:
+                self._circuit_open_until_ms = 0
+                self._failure_count = 0
+            return False
 
     def json_chat(self, system_prompt: str, user_prompt: str, fallback: Optional[Dict[str, Any]] = None, timeout_seconds: Optional[int] = None) -> Dict[str, Any]:
         text = self.chat(system_prompt, user_prompt, "", timeout_seconds=timeout_seconds)
@@ -284,12 +324,18 @@ class LlmClient:
         timeout_seconds: Optional[int] = None,
         tool_choice: Optional[str] = None,
     ) -> str:
+        prompt_meta = prompt_cache_metadata(system_prompt)
         return stable_cache_key(
             "llm",
             {
                 "kind": kind,
                 "model": self.settings.openai_model,
                 "baseUrl": self.settings.openai_base_url,
+                "promptId": prompt_meta.get("promptId", ""),
+                "promptVersion": prompt_meta.get("promptVersion", ""),
+                "promptAgent": prompt_meta.get("promptAgent", ""),
+                "templateFingerprint": prompt_meta.get("templateFingerprint", ""),
+                "systemPromptFingerprint": prompt_meta.get("systemPromptFingerprint", ""),
                 "system": system_prompt,
                 "user": user_prompt,
                 "tools": tools or [],
@@ -302,6 +348,14 @@ class LlmClient:
         trace = self.response_cache.trace()
         trace["lastCacheHit"] = self.last_cache_hit
         trace["lastCacheKey"] = self.last_cache_key
+        with self._circuit_lock:
+            trace["circuit"] = {
+                "failureCount": self._failure_count,
+                "open": bool(self._circuit_open_until_ms and self._circuit_open_until_ms > int(time.time() * 1000)),
+                "openUntilMs": self._circuit_open_until_ms,
+                "threshold": max(1, int(getattr(self.settings, "llm_circuit_threshold", 3) or 3)),
+                "cooldownSeconds": max(1, int(getattr(self.settings, "llm_circuit_cooldown_seconds", 30) or 30)),
+            }
         return trace
 
 
@@ -311,3 +365,19 @@ def tool_call_fingerprint(item: Dict[str, Any]) -> str:
     except Exception:
         args = str(item.get("args") or {})
     return "%s:%s:%s" % (item.get("id") or "", item.get("name") or "", args)
+
+
+def prompt_cache_metadata(system_prompt: str) -> Dict[str, str]:
+    text = str(system_prompt or "")
+    match = re.search(r'<prompt\s+([^>]*)>', text)
+    attrs: Dict[str, str] = {}
+    if match:
+        for key, value in re.findall(r'([A-Za-z][A-Za-z0-9_]*)="([^"]*)"', match.group(1)):
+            attrs[key] = value
+    return {
+        "promptId": attrs.get("id", ""),
+        "promptVersion": attrs.get("version", ""),
+        "promptAgent": attrs.get("agent", ""),
+        "templateFingerprint": attrs.get("templateFingerprint", ""),
+        "systemPromptFingerprint": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] if text else "",
+    }

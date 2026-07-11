@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.models import ArtifactRef, ContextDelta, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
@@ -20,6 +21,8 @@ class ImportantFactExtractor:
         merchant = state.get("merchant")
         merchant_id = getattr(merchant, "merchant_id", "") if merchant is not None else state.get("requested_merchant_id", "")
         self._add(facts, "merchant_id", merchant_id, "scope", 95, stage)
+        self._extract_route_facts(facts, state, stage)
+        self._extract_understanding_facts(facts, state, stage)
         loaded_skills = state.get("loaded_skills") or []
         if loaded_skills:
             self._add(facts, "loaded_skills", ",".join(str(item) for item in loaded_skills), "skills", 75, stage)
@@ -32,8 +35,20 @@ class ImportantFactExtractor:
                     tables.append(intent.preferred_table)
                 if intent.plan_task_id:
                     tasks.append("%s:%s" % (intent.plan_task_id, intent.preferred_table or intent.answer_mode))
+                self._add(facts, "intent_time_window:%s" % (intent.plan_task_id or len(tasks)), getattr(intent, "days", 0), "time_window", 88, stage)
+                self._add_metric_fact(facts, "intent_metric:%s" % (intent.plan_task_id or len(tasks)), intent, stage)
+                if getattr(intent, "filter_column", "") and getattr(intent, "filter_value", ""):
+                    self._add(
+                        facts,
+                        "intent_filter:%s" % (intent.plan_task_id or len(tasks)),
+                        "%s=%s" % (intent.filter_column, intent.filter_value),
+                        "filter",
+                        92,
+                        stage,
+                    )
             self._add(facts, "plan_tables", ",".join(tables), "query_graph", 90, stage)
             self._add(facts, "plan_tasks", ";".join(tasks), "query_graph", 85, stage)
+            self._extract_plan_understanding_facts(facts, plan, stage)
         validation = state.get("query_graph_validation_result")
         gaps = getattr(validation, "gaps", []) if validation is not None else []
         if gaps:
@@ -47,11 +62,25 @@ class ImportantFactExtractor:
             ]
             if failures:
                 self._add(facts, "node_failures", " | ".join(failures[:6]), "tool_result", 90, stage)
+            self._extract_entity_set_facts(facts, run_result.task_results, stage)
+        if run_result and getattr(run_result, "evidence_gaps", None):
+            self._add(
+                facts,
+                "evidence_gaps",
+                ";".join("%s:%s:%s" % (gap.code, gap.task_id, gap.reason or gap.evidence) for gap in run_result.evidence_gaps[:8]),
+                "gap",
+                93,
+                stage,
+            )
+        self._extract_memory_constraint_facts(facts, state, stage)
+        self._extract_user_correction_facts(facts, state, stage)
         return sorted(facts, key=lambda item: item.priority, reverse=True)[:24]
 
     def _add(self, facts: List[ImportantFact], key: str, value: Any, category: str, priority: int, stage: str) -> None:
         text = str(value or "").strip()
-        if not text:
+        if not text or text == "0":
+            return
+        if any(item.key == key and item.value == text for item in facts):
             return
         facts.append(
             ImportantFact(
@@ -62,6 +91,133 @@ class ImportantFactExtractor:
                 source_refs=[SourceRef(ref_type="state", title=stage, locator=key, reason="protected context fact")],
             )
         )
+
+    def _extract_route_facts(self, facts: List[ImportantFact], state: Dict[str, Any], stage: str) -> None:
+        slots = state.get("route_slots")
+        if not slots:
+            return
+        time_window = getattr(slots, "time_window", None)
+        if isinstance(slots, dict):
+            time_window = slots.get("timeWindow") or slots.get("time_window") or {}
+        days = self._value(time_window, "days")
+        raw = self._value(time_window, "raw")
+        self._add(facts, "route_time_window", "%s天%s" % (days, ":%s" % raw if raw else ""), "time_window", 94, stage)
+        object_refs = self._value(slots, "object_refs") or self._value(slots, "objectRefs") or []
+        refs = []
+        for item in list(object_refs or [])[:12]:
+            ref_type = self._value(item, "ref_type") or self._value(item, "refType")
+            value = self._value(item, "value")
+            raw_value = self._value(item, "raw")
+            if ref_type and (value or raw_value):
+                refs.append("%s=%s" % (ref_type, value or raw_value))
+        self._add(facts, "route_object_refs", ";".join(refs), "filter", 96, stage)
+
+    def _extract_understanding_facts(self, facts: List[ImportantFact], state: Dict[str, Any], stage: str) -> None:
+        fast = state.get("fast_understanding")
+        if fast:
+            self._add(facts, "fast_time_window", self._value(fast, "time_window_days") or self._value(fast, "timeWindowDays"), "time_window", 88, stage)
+            metrics = self._value(fast, "metric_phrases") or self._value(fast, "metricPhrases") or []
+            self._add(facts, "fast_metric_phrases", ",".join(str(item) for item in list(metrics or [])[:12]), "metric", 86, stage)
+            object_refs = self._value(fast, "object_refs") or self._value(fast, "objectRefs") or {}
+            if isinstance(object_refs, dict):
+                refs = ["%s=%s" % (key, ",".join(str(v) for v in list(value or [])[:8])) for key, value in object_refs.items() if value]
+                self._add(facts, "fast_object_refs", ";".join(refs), "filter", 90, stage)
+
+    def _extract_plan_understanding_facts(self, facts: List[ImportantFact], plan: Any, stage: str) -> None:
+        understanding = getattr(plan, "question_understanding", {}) or {}
+        if not isinstance(understanding, dict):
+            return
+        self._add(facts, "understanding_time_window", understanding.get("timeWindowDays") or understanding.get("time_window_days"), "time_window", 95, stage)
+        self._add(facts, "analysis_intent", understanding.get("analysisIntent") or understanding.get("analysis_intent"), "analysis_intent", 84, stage)
+        self._extract_metric_object(facts, "ranking_objective", understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}, stage, 96)
+        for index, item in enumerate(understanding.get("requestedMeasures") or understanding.get("requested_measures") or []):
+            self._extract_metric_object(facts, "requested_measure:%d" % index, item, stage, 91)
+        filters = []
+        for item in understanding.get("filters") or []:
+            field = self._value(item, "field") or self._value(item, "column")
+            value = self._value(item, "value")
+            if field and value:
+                filters.append("%s=%s" % (field, value))
+        self._add(facts, "understanding_filters", ";".join(filters), "filter", 94, stage)
+        scopes = []
+        for item in understanding.get("scopeConstraints") or understanding.get("scope_constraints") or []:
+            scope = self._compact_dict(item, ["ownerTable", "owner_table", "field", "value", "metricRef", "metric_ref", "required"])
+            if scope:
+                scopes.append(scope)
+        self._add(facts, "scope_constraints", " | ".join(scopes), "scope", 97, stage)
+        required_evidence = understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []
+        self._add(facts, "required_evidence_intents", ",".join(str(item) for item in list(required_evidence or [])[:12]), "evidence_contract", 89, stage)
+
+    def _add_metric_fact(self, facts: List[ImportantFact], key: str, intent: Any, stage: str) -> None:
+        pieces = [
+            self._value(intent, "metric_name") or self._value(intent, "metricName"),
+            self._value(intent, "metric_column") or self._value(intent, "metricColumn"),
+            self._value(intent, "metric_formula") or self._value(intent, "metricFormula"),
+        ]
+        specs = self._value(intent, "metric_specs") or self._value(intent, "metricSpecs") or []
+        for spec in list(specs or [])[:4]:
+            text = self._compact_dict(spec, ["metricName", "metric_name", "metricRef", "metric_ref", "formula"])
+            if text:
+                pieces.append(text)
+        self._add(facts, key, " | ".join(str(item) for item in pieces if item), "metric", 90, stage)
+
+    def _extract_metric_object(self, facts: List[ImportantFact], key: str, item: Any, stage: str, priority: int) -> None:
+        text = self._compact_dict(item, ["metricRef", "metric_ref", "sourcePhrase", "source_phrase", "ownerTable", "owner_table", "groupByColumn", "group_by_column", "objectiveType", "objective_type"])
+        self._add(facts, key, text, "metric", priority, stage)
+
+    def _extract_entity_set_facts(self, facts: List[ImportantFact], task_results: Iterable[Any], stage: str) -> None:
+        rows = []
+        for item in list(task_results or [])[:12]:
+            entity = self._value(item, "entity_set") or self._value(item, "entitySet")
+            if not entity:
+                continue
+            task_id = self._value(entity, "task_id") or self._value(entity, "taskId") or self._value(item, "task_id") or self._value(item, "taskId")
+            join_key = self._value(entity, "join_key") or self._value(entity, "joinKey")
+            values = list(self._value(entity, "values") or [])[:12]
+            column_values = self._value(entity, "column_values") or self._value(entity, "columnValues") or {}
+            column_keys = ",".join(sorted(list(column_values.keys()))[:8]) if isinstance(column_values, dict) else ""
+            if values or column_keys:
+                rows.append("task=%s key=%s values=%s columns=%s" % (task_id, join_key, values, column_keys))
+        self._add(facts, "reusable_entity_sets", " | ".join(rows), "entity_set", 98, stage)
+
+    def _extract_memory_constraint_facts(self, facts: List[ImportantFact], state: Dict[str, Any], stage: str) -> None:
+        rows = []
+        for item in list(state.get("memory_constraints") or [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            enforcement = str(item.get("enforcement") or "")
+            if enforcement not in {"required", "preferred"}:
+                continue
+            rows.append(self._compact_dict(item, ["memoryType", "memory_type", "summary", "value", "metrics", "timeWindows", "enforcement"]))
+        self._add(facts, "memory_constraints", " | ".join(row for row in rows if row), "memory", 87, stage)
+
+    def _extract_user_correction_facts(self, facts: List[ImportantFact], state: Dict[str, Any], stage: str) -> None:
+        rows = []
+        for message in list(state.get("message_history") or [])[-16:]:
+            role = str(self._value(message, "role") or "").lower()
+            text = str(self._value(message, "text") or "").strip()
+            if role != "user" or not text:
+                continue
+            if re.search(r"(不是|不对|纠正|应该|不能|别按|口径)", text):
+                rows.append(re.sub(r"\s+", " ", text)[:300])
+        self._add(facts, "user_corrections", " | ".join(rows[-4:]), "correction", 99, stage)
+
+    def _compact_dict(self, item: Any, keys: List[str]) -> str:
+        if not item:
+            return ""
+        parts = []
+        for key in keys:
+            value = self._value(item, key)
+            if value not in ("", None, [], {}):
+                parts.append("%s=%s" % (key, value))
+        return ",".join(parts)
+
+    def _value(self, item: Any, key: str) -> Any:
+        if item is None:
+            return ""
+        if isinstance(item, dict):
+            return item.get(key, "")
+        return getattr(item, key, "")
 
 
 class ContextManager:

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -48,6 +47,7 @@ from merchant_ai.models import (
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.assets import (
     default_row_access_policy,
+    normalize_column_display_policy,
     normalize_masking_policy,
     normalize_row_access_policy,
     normalize_visibility_policy,
@@ -59,8 +59,49 @@ from merchant_ai.services.formulas import (
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.planning import EvidenceContractBuilder
 from merchant_ai.services.prompts import PromptAssembler
+from merchant_ai.services.query_contracts import (
+    collect_degraded_reasons,
+    contract_gaps_from_task_results,
+    tenant_scope_binding_error,
+)
 from merchant_ai.services.repositories import DorisRepository
-from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
+from merchant_ai.services.runtime_state import NodeTaskState, create_runtime_state_store, node_task_idempotency_key
+from merchant_ai.services.query_sql_binding import (
+    add_bind_values,
+    add_sql_where_condition,
+    append_note,
+    bind_node_sql_parameters,
+    bind_node_sql_parameters_ast,
+    bindable_predicate_pattern,
+    blank_entity_value,
+    has_merchant_filter_predicate,
+    is_dependent_context_column,
+    node_bind_values_by_column,
+    normalize_identifier,
+    parse_partition_date,
+    parse_sql_for_binding,
+    parse_sql_literal,
+    parse_sql_literal_values,
+    partition_is_stale_for_near_realtime,
+    quote_identifier,
+    realtime_fallback_for_table,
+    replace_sql_limit,
+    split_detail_sql_by_pt_windows,
+    split_filter_values,
+    sql_has_bound_merchant_filter,
+    sql_literal,
+)
+from merchant_ai.services.query_security import (
+    DEFAULT_ACCESS_ROLE,
+    apply_column_masks,
+    configured_contract_detail_columns,
+    configured_default_detail_columns,
+    contract_masked_columns_map,
+    role_allowed_for_column,
+    table_asset_metadata,
+    table_field_semantics,
+)
+from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService, classify_timeout_type
 from merchant_ai.services.tools import artifact_file_tool_definitions, node_runtime_tool_schemas, semantic_file_tool_definitions, sql_draft_tool, sql_repair_tool
 
 
@@ -89,80 +130,6 @@ STRICT_STRUCTURED_FALLBACK_CODES = {
     "MISSING_ENTITY_KEY_FILTER",
 }
 RESOURCE_CONSTRAINED_DORIS_ERRORS = {"MEM_ALLOC_FAILED", "TIMEOUT"}
-DEFAULT_ACCESS_ROLE = "merchant_analyst"
-
-
-def table_asset_metadata(asset_pack: PlanningAssetPack, table: str) -> Dict[str, Any]:
-    for entry in asset_pack.tables:
-        if (entry.table or entry.key) == table and isinstance(entry.metadata, dict):
-            return entry.metadata
-    return {}
-
-
-def table_field_semantics(asset_pack: PlanningAssetPack, table: str) -> Dict[str, Dict[str, Any]]:
-    result: Dict[str, Dict[str, Any]] = {}
-    for entry in asset_pack.fields:
-        if entry.table != table or not entry.key:
-            continue
-        metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
-        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else metadata
-        if isinstance(semantic, dict):
-            result[entry.key] = semantic
-    return result
-
-
-def role_allowed_for_column(policy: Dict[str, Any], access_role: str) -> bool:
-    level = str(policy.get("level") or "public")
-    roles = [str(item) for item in policy.get("allowedRoles") or [] if str(item or "").strip()]
-    if level == "public":
-        return True
-    if level == "hidden":
-        return False
-    if not roles:
-        return False
-    return str(access_role or DEFAULT_ACCESS_ROLE) in roles
-
-
-def contract_masked_columns_map(contract: NodePlanContract) -> Dict[str, str]:
-    return {
-        str(column): str(strategy)
-        for column, strategy in (contract.masked_columns or {}).items()
-        if str(column or "").strip() and str(strategy or "").strip()
-    }
-
-
-def mask_value(value: Any, strategy: str) -> Any:
-    if value is None:
-        return None
-    text = str(value)
-    kind = str(strategy or "none").lower()
-    if kind == "full":
-        return "***"
-    if kind == "hash":
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    if kind == "partial":
-        if len(text) <= 2:
-            return "*" * len(text)
-        if len(text) <= 6:
-            return text[:1] + "*" * (len(text) - 2) + text[-1:]
-        return text[:2] + "*" * max(1, len(text) - 4) + text[-2:]
-    return value
-
-
-def apply_column_masks(rows: List[Dict[str, Any]], contract: NodePlanContract) -> List[Dict[str, Any]]:
-    masked_columns = contract_masked_columns_map(contract)
-    if not rows or not masked_columns:
-        return list(rows)
-    result: List[Dict[str, Any]] = []
-    for row in rows:
-        next_row = dict(row)
-        for column, strategy in masked_columns.items():
-            if column in next_row:
-                next_row[column] = mask_value(next_row.get(column), strategy)
-        result.append(next_row)
-    return result
-
-
 class SqlValidationService:
     def validate(self, sql: str, asset_pack: PlanningAssetPack) -> SqlValidationResult:
         normalized = (sql or "").strip()
@@ -433,6 +400,7 @@ class NodeWorkerExecutor:
             failure_registry=self.tool_failure_registry,
         )
         self.artifact_store = WorkspaceArtifactStore(settings)
+        self.runtime_state_store = create_runtime_state_store(settings)
         self.node_plan_critic = NodePlanCritic()
         self._last_sql_draft_decisions: Dict[str, SqlDraftDecision] = {}
         self._last_node_file_tool_results: Dict[str, List[Dict[str, Any]]] = {}
@@ -447,13 +415,31 @@ class NodeWorkerExecutor:
         asset_pack: PlanningAssetPack,
         knowledge_context: str,
         question: str,
+        resume_task_results: Optional[List[AgentTaskResult]] = None,
+        run_id: str = "",
     ) -> AgentRunResult:
         optimize_query_plan_for_execution(plan, asset_pack)
         result = AgentRunResult()
+        execution_run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
         executable = [intent for intent in plan.intents if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE]
         tasks_by_id = {intent.plan_task_id or "node_%s" % (index + 1): intent for index, intent in enumerate(executable)}
         completed: Dict[str, AgentTaskResult] = {}
-        pending = dict(tasks_by_id)
+        for prior in resume_task_results or []:
+            if prior.task_id in tasks_by_id and prior.success and not prior.query_bundle.failed:
+                completed[prior.task_id] = prior
+        result.resumed_task_ids = list(completed.keys())
+        pending = {task_id: intent for task_id, intent in tasks_by_id.items() if task_id not in completed}
+        if completed:
+            result.node_execution_batches.append(
+                NodeExecutionBatch(
+                    batch_id="resume_%03d" % (int(time.time() * 1000) % 1000),
+                    ready_task_ids=list(completed.keys()),
+                    completed_task_ids=list(completed.keys()),
+                    resumed_task_ids=list(completed.keys()),
+                    max_concurrency=0,
+                    timeout_seconds=max(1, self.settings.agent_node_timeout_seconds),
+                )
+            )
         while pending:
             ready_ids = [
                 task_id
@@ -463,7 +449,7 @@ class NodeWorkerExecutor:
             ]
             if not ready_ids:
                 ready_ids = list(pending.keys())
-            batch_results, batch_trace = self._execute_ready_batch(ready_ids, pending, completed, plan, merchant_id, asset_pack, question, knowledge_context)
+            batch_results, batch_trace = self._execute_ready_batch(ready_ids, pending, completed, plan, merchant_id, asset_pack, question, knowledge_context, execution_run_id)
             result.node_execution_batches.append(batch_trace)
             for task_id, task_result in batch_results.items():
                 completed[task_id] = task_result
@@ -499,6 +485,7 @@ class NodeWorkerExecutor:
         result.evidence_gaps = contract_gaps_from_task_results(result.task_results) + [
             EvidenceGap(code="DEPENDENCY_GAP", task_id=gap, reason=gap) for gap in result.evidence_check.gaps
         ]
+        result.degraded_reasons = collect_degraded_reasons(result.task_results)
         return result
 
     def _execute_ready_batch(
@@ -511,9 +498,13 @@ class NodeWorkerExecutor:
         asset_pack: PlanningAssetPack,
         question: str,
         knowledge_context: str,
+        run_id: str = "",
     ) -> tuple[Dict[str, AgentTaskResult], NodeExecutionBatch]:
         started = time.perf_counter()
-        max_workers = max(1, min(self.settings.max_concurrent_sub_agents, len(ready_ids)))
+        run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
+        configured_workers = max(1, int(self.settings.max_concurrent_sub_agents or 1))
+        task_cap = max(1, int(getattr(self.settings, "max_sub_agent_tasks", configured_workers) or configured_workers))
+        max_workers = max(1, min(configured_workers, task_cap, len(ready_ids)))
         results: Dict[str, AgentTaskResult] = {}
         batch = NodeExecutionBatch(
             batch_id="batch_%03d" % (len(ready_ids) + int(time.time() * 1000) % 1000),
@@ -521,6 +512,16 @@ class NodeWorkerExecutor:
             max_concurrency=max_workers,
             timeout_seconds=max(1, self.settings.agent_node_timeout_seconds),
         )
+        if max_workers < min(configured_workers, len(ready_ids)):
+            batch.runtime_events.append(
+                {
+                    "event": "node.concurrency_limited",
+                    "requestedConcurrency": configured_workers,
+                    "effectiveConcurrency": max_workers,
+                    "maxSubAgentTasks": task_cap,
+                    "readyTaskCount": len(ready_ids),
+                }
+            )
         for start in range(0, len(ready_ids), max_workers):
             chunk_ids = ready_ids[start : start + max_workers]
             chunk_futures = {}
@@ -534,14 +535,62 @@ class NodeWorkerExecutor:
                         batch.failed_task_ids.append(task_id)
                         results[task_id] = failed_result(task_id, pending[task_id], "node_agent blocked by circuit breaker: %s" % blocked.reason)
                         continue
+                    self.runtime_state_store.enqueue_node_task(
+                        NodeTaskState(
+                            run_id=run_id,
+                            task_id=task_id,
+                            status="queued",
+                            idempotency_key=node_task_idempotency_key(run_id, task_id, pending[task_id].preferred_table),
+                            payload={
+                                "preferredTable": pending[task_id].preferred_table,
+                                "dependsOn": list(pending[task_id].depends_on_task_ids or []),
+                                "answerMode": str(pending[task_id].answer_mode),
+                            },
+                        )
+                    )
+                    claimed = self.runtime_state_store.claim_node_task(
+                        run_id,
+                        task_id,
+                        lease_owner="node_worker",
+                        lease_seconds=max(1, self.settings.agent_node_timeout_seconds),
+                    )
+                    if not claimed:
+                        batch.blocked_task_ids.append(task_id)
+                        batch.failed_task_ids.append(task_id)
+                        results[task_id] = failed_result(task_id, pending[task_id], "node task could not acquire execution lease")
+                        continue
                     context = self._node_context(task_id, pending[task_id], completed, plan, merchant_id, question, asset_pack)
                     context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
+                    context.context_package["parentRunId"] = run_id
                     future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
                     chunk_futures[future] = task_id
                     batch.submitted_task_ids.append(task_id)
                 if not chunk_futures:
                     continue
-                done, not_done = wait(chunk_futures, timeout=max(self.settings.agent_node_timeout_seconds, 1))
+                done = set()
+                not_done = set(chunk_futures.keys())
+                timeout_seconds = max(1, int(self.settings.agent_node_timeout_seconds or 1))
+                poll_interval = max(0.1, float(getattr(self.settings, "agent_node_poll_interval_seconds", 5.0) or 5.0))
+                deadline = time.perf_counter() + timeout_seconds
+                next_heartbeat_at = time.perf_counter() + poll_interval
+                while not_done and time.perf_counter() < deadline:
+                    remaining = max(0.0, deadline - time.perf_counter())
+                    wait_for = min(remaining, max(0.05, next_heartbeat_at - time.perf_counter()))
+                    just_done, still_running = wait(not_done, timeout=wait_for, return_when=FIRST_COMPLETED)
+                    done.update(just_done)
+                    not_done = set(still_running)
+                    now = time.perf_counter()
+                    if not_done and now >= next_heartbeat_at:
+                        batch.runtime_events.append(
+                            {
+                                "event": "node.heartbeat",
+                                "runningTaskIds": [chunk_futures[future] for future in not_done],
+                                "elapsedMs": int((now - started) * 1000),
+                                "timeoutSeconds": timeout_seconds,
+                                "pollIntervalSeconds": poll_interval,
+                            }
+                        )
+                        next_heartbeat_at = now + poll_interval
                 for future in done:
                     task_id = chunk_futures[future]
                     node_args = {"taskId": task_id, "table": pending[task_id].preferred_table}
@@ -550,17 +599,30 @@ class NodeWorkerExecutor:
                         if task_result.query_bundle.failed:
                             self.tool_failure_registry.record_failure("node_agent", node_args, "NODE_FAILED", task_result.query_bundle.error or task_result.summary)
                             batch.failed_task_ids.append(task_id)
+                            self.runtime_state_store.complete_node_task(run_id, task_id, "failed", {"error": task_result.query_bundle.error or task_result.summary})
                         else:
                             self.tool_failure_registry.record_success("node_agent", node_args)
                             batch.completed_task_ids.append(task_id)
+                            self.runtime_state_store.complete_node_task(run_id, task_id, "completed", {"rows": task_result.query_bundle.effective_row_count()})
                     except Exception as exc:
                         self.tool_failure_registry.record_failure("node_agent", node_args, "ERROR", str(exc))
                         task_result = failed_result(task_id, pending[task_id], "NodeWorker 执行异常: %s" % str(exc)[:200])
                         batch.failed_task_ids.append(task_id)
+                        self.runtime_state_store.complete_node_task(run_id, task_id, "failed", {"error": str(exc)[:500]})
                     task_result.task_id = task_id
                     results[task_id] = task_result
                 for future in not_done:
                     task_id = chunk_futures[future]
+                    grace_seconds = max(0, int(getattr(self.settings, "agent_node_timeout_grace_seconds", 60) or 60))
+                    batch.runtime_events.append(
+                        {
+                            "event": "node.timeout",
+                            "taskId": task_id,
+                            "timeoutSeconds": self.settings.agent_node_timeout_seconds,
+                            "timeoutType": "node_timeout",
+                            "hardStopGraceSeconds": grace_seconds,
+                        }
+                    )
                     self.tool_failure_registry.record_failure(
                         "node_agent",
                         {"taskId": task_id, "table": pending[task_id].preferred_table},
@@ -570,6 +632,7 @@ class NodeWorkerExecutor:
                     batch.timed_out_task_ids.append(task_id)
                     batch.failed_task_ids.append(task_id)
                     results[task_id] = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
+                    self.runtime_state_store.complete_node_task(run_id, task_id, "timeout", {"timeoutSeconds": self.settings.agent_node_timeout_seconds})
                     future.cancel()
             finally:
                 for future in chunk_futures:
@@ -609,6 +672,7 @@ class NodeWorkerExecutor:
             "subAgentRunId": run_id,
             "taskId": task_id,
             "taskRole": str(intent.task_role),
+            "subagentEnabled": False,
             "answerMode": str(intent.answer_mode),
             "preferredTable": intent.preferred_table,
             "allowedColumns": asset_pack.known_columns(intent.preferred_table)[:64],
@@ -994,6 +1058,25 @@ class NodeWorkerExecutor:
                 "updatedAtMs": int(time.time() * 1000),
             }
             path.write_text(json.dumps(checkpoint, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+            run_id = str(context.context_package.get("parentRunId") or context.sub_agent_run_id or "inline")
+            self.runtime_state_store.upsert_node_task(
+                NodeTaskState(
+                    run_id=run_id,
+                    task_id=intent.plan_task_id,
+                    status=status,
+                    idempotency_key=node_task_idempotency_key(run_id, intent.plan_task_id, intent.preferred_table),
+                    attempts=1,
+                    lease_owner=context.sub_agent_run_id,
+                    payload={
+                        "preferredTable": intent.preferred_table,
+                        "answerMode": str(intent.answer_mode),
+                        "summary": payload.get("summary") or "",
+                        "rows": payload.get("rows") or 0,
+                        "failed": bool(payload.get("failed")),
+                        "checkpointPath": str(path),
+                    },
+                )
+            )
         except Exception:
             return
 
@@ -1293,6 +1376,9 @@ class NodeWorkerExecutor:
                 sql = repaired.repaired_sql
                 continue
             bound_sql, sql_params, binding_error = bind_node_sql_parameters(sql, intent, asset_pack, context)
+            tenant_binding_error = tenant_scope_binding_error(bound_sql, sql_params, contract, context)
+            if tenant_binding_error:
+                binding_error = binding_error or tenant_binding_error
             if binding_error:
                 record_tool(
                     tool_traces,
@@ -1339,6 +1425,19 @@ class NodeWorkerExecutor:
                     node_plan_critique=critique,
                     sql_draft_decision=draft_decision,
                 )
+            anchored_sql, anchor_date = self._apply_partition_date_anchor(bound_sql, intent, freshness)
+            if anchor_date:
+                bound_sql = anchored_sql
+                record_tool(
+                    tool_traces,
+                    intent,
+                    "anchor_partition_date",
+                    "success",
+                    intent.preferred_table,
+                    "CURDATE anchored to max_pt=%s" % anchor_date,
+                    "PARTITION_DATE_ANCHOR",
+                    round_index,
+                )
             record_tool(
                 tool_traces,
                 intent,
@@ -1375,6 +1474,67 @@ class NodeWorkerExecutor:
                     message = "Doris 查询超时: %s" % message
                 record_tool(tool_traces, intent, "execute_sql", runtime_result.status or "failed", trim_sql(bound_sql), message, error_type, round_index, duration_ms=query_duration_ms)
                 trace.append(ReActStep(round=3 + round_index * 3, reason="Doris 执行失败", action="query_doris.failed", observation="%s: %s" % (error_type, message[:200])))
+                split_result = self._split_detail_query_fallback(
+                    bound_sql,
+                    sql_params,
+                    error_type,
+                    message,
+                    intent,
+                    asset_pack,
+                    context,
+                    validation.base_tables,
+                    contract,
+                    query_duration_ms,
+                )
+                if split_result is not None:
+                    rows = list(split_result["rows"])
+                    cache_hit = bool(split_result.get("cacheHit"))
+                    cache_key = str(split_result.get("cacheKey") or "")
+                    split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
+                    split_events = list(split_result.get("runtimeEvents") or [])
+                    display_rows = apply_column_masks(rows, contract)
+                    artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
+                    preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
+                    entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+                    record_tool(
+                        tool_traces,
+                        intent,
+                        "execute_sql_split_fallback",
+                        "success",
+                        trim_sql(bound_sql),
+                        "rows=%s chunks=%s sourceError=%s cacheHit=%s" % (len(rows), len(split_events), error_type, cache_hit),
+                        error_type,
+                        round_index,
+                        duration_ms=split_duration_ms,
+                    )
+                    trace.append(ReActStep(round=4 + round_index * 3, reason="Doris 超时/资源错误后按时间窗口拆分明细查询", action="query_doris.split_fallback", observation="rows=%s chunks=%s" % (len(rows), len(split_events))))
+                    return AgentTaskResult(
+                        success=True,
+                        summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                        query_bundle=QueryBundle(
+                            sql=bound_sql,
+                            params=sql_params,
+                            tables=validation.base_tables,
+                            rows=preview_rows,
+                            original_row_count=len(rows),
+                            summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                            offloaded_files=artifact_paths,
+                            duration_ms=split_duration_ms,
+                            cache_hit=cache_hit,
+                            cache_key=cache_key,
+                            runtime_events=split_events,
+                        ),
+                        react_trace=trace,
+                        sql_repairs=repair_attempts,
+                        validation_results=validation_results,
+                        entity_set=entity_set,
+                        node_tool_traces=tool_traces,
+                        node_task_profile=node_task_profile,
+                        freshness_reports=[freshness],
+                        node_plan_contract=contract,
+                        node_plan_critique=critique,
+                        sql_draft_decision=draft_decision,
+                    )
                 if error_type not in {"CIRCUIT_OPEN", "RATE_LIMITED", "TIMEOUT"}:
                     policy = doris_error_policy(error_type)
                     structured_attempt = self._structured_fallback_attempt(
@@ -1489,6 +1649,67 @@ class NodeWorkerExecutor:
                 self.tool_failure_registry.record_failure("execute_sql", execute_args, doris_error_code, error_text)
                 record_tool(tool_traces, intent, "execute_sql", "failed", trim_sql(bound_sql), error_text[:240], doris_error_code, round_index)
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris 失败", action="query_doris", observation=error_text[:240]))
+                split_result = self._split_detail_query_fallback(
+                    bound_sql,
+                    sql_params,
+                    doris_error_code,
+                    error_text,
+                    intent,
+                    asset_pack,
+                    context,
+                    validation.base_tables,
+                    contract,
+                    query_duration_ms,
+                )
+                if split_result is not None:
+                    rows = list(split_result["rows"])
+                    cache_hit = bool(split_result.get("cacheHit"))
+                    cache_key = str(split_result.get("cacheKey") or "")
+                    split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
+                    split_events = list(split_result.get("runtimeEvents") or [])
+                    display_rows = apply_column_masks(rows, contract)
+                    artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
+                    preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
+                    entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+                    record_tool(
+                        tool_traces,
+                        intent,
+                        "execute_sql_split_fallback",
+                        "success",
+                        trim_sql(bound_sql),
+                        "rows=%s chunks=%s sourceError=%s cacheHit=%s" % (len(rows), len(split_events), doris_error_code, cache_hit),
+                        doris_error_code,
+                        round_index,
+                        duration_ms=split_duration_ms,
+                    )
+                    trace.append(ReActStep(round=4 + round_index * 3, reason="Doris 超时/资源错误后按时间窗口拆分明细查询", action="query_doris.split_fallback", observation="rows=%s chunks=%s" % (len(rows), len(split_events))))
+                    return AgentTaskResult(
+                        success=True,
+                        summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                        query_bundle=QueryBundle(
+                            sql=bound_sql,
+                            params=sql_params,
+                            tables=validation.base_tables,
+                            rows=preview_rows,
+                            original_row_count=len(rows),
+                            summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                            offloaded_files=artifact_paths,
+                            duration_ms=split_duration_ms,
+                            cache_hit=cache_hit,
+                            cache_key=cache_key,
+                            runtime_events=split_events,
+                        ),
+                        react_trace=trace,
+                        sql_repairs=repair_attempts,
+                        validation_results=validation_results,
+                        entity_set=entity_set,
+                        node_tool_traces=tool_traces,
+                        node_task_profile=node_task_profile,
+                        freshness_reports=[freshness],
+                        node_plan_contract=contract,
+                        node_plan_critique=critique,
+                        sql_draft_decision=draft_decision,
+                    )
                 structured_attempt = self._structured_fallback_attempt(
                     sql,
                     validation.model_copy(update={"valid": False, "error_code": doris_error_code, "message": error_text}),
@@ -1922,7 +2143,8 @@ class NodeWorkerExecutor:
         columns = set(asset_pack.known_columns(table))
         if not table:
             return FreshnessCheckResult(task_id=intent.plan_task_id, table=table, status="SKIPPED", reason="no preferred table")
-        if int(intent.days or 0) > 2:
+        partition_anchor_enabled = bool(getattr(self.settings, "agent_partition_date_anchor_enabled", False))
+        if int(intent.days or 0) > 2 and not partition_anchor_enabled:
             return FreshnessCheckResult(
                 task_id=intent.plan_task_id,
                 table=table,
@@ -1975,6 +2197,21 @@ class NodeWorkerExecutor:
             max_pt=max_pt,
             reason=reason,
         )
+
+    def _apply_partition_date_anchor(self, sql: str, intent: QuestionIntent, freshness: FreshnessCheckResult) -> tuple[str, str]:
+        if not bool(getattr(self.settings, "agent_partition_date_anchor_enabled", False)):
+            return sql, ""
+        if not freshness.checked or not freshness.max_pt or "CURDATE()" not in str(sql or "").upper():
+            return sql, ""
+        anchor = parse_partition_date(freshness.max_pt)
+        if not anchor:
+            return sql, ""
+        anchor_text = anchor.isoformat()
+        anchored_sql = re.sub(r"\bCURDATE\(\)", "'%s'" % anchor_text, str(sql or ""), flags=re.I)
+        if anchored_sql == sql:
+            return sql, ""
+        freshness.reason = append_note(freshness.reason, "relative time anchored to max_pt=%s" % anchor_text)
+        return anchored_sql, anchor_text
 
     def _maybe_realtime_fallback_intent(
         self,
@@ -2066,6 +2303,135 @@ class NodeWorkerExecutor:
             success=True,
         )
 
+    def _split_detail_query_fallback(
+        self,
+        bound_sql: str,
+        sql_params: List[Any],
+        error_code: str,
+        error_text: str,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        context: NodeExecutionContext,
+        tables: List[str],
+        contract: NodePlanContract,
+        previous_duration_ms: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.settings, "agent_doris_split_query_enabled", True)):
+            return None
+        if error_code not in RESOURCE_CONSTRAINED_DORIS_ERRORS:
+            return None
+        if intent.answer_mode != AnswerMode.DETAIL:
+            return None
+        table = intent.preferred_table
+        columns = set(asset_pack.known_columns(table))
+        if "pt" not in columns or int(intent.days or 0) <= 0:
+            return None
+        safe_sql = self._draft_structured_sql(intent, asset_pack, context, contract=contract, resource_safe=True)
+        if not safe_sql:
+            return None
+        safe_bound_sql, safe_params, binding_error = bind_node_sql_parameters(safe_sql, intent, asset_pack, context)
+        if binding_error:
+            return None
+        chunk_days = max(1, int(getattr(self.settings, "agent_doris_split_chunk_days", 7) or 7))
+        max_chunks = max(1, int(getattr(self.settings, "agent_doris_split_max_chunks", 6) or 6))
+        max_concurrency = max(1, int(getattr(self.settings, "agent_doris_split_max_concurrency", 3) or 3))
+        limit = structured_limit(intent.limit, detail=True, resource_safe=True)
+        split_sqls = split_detail_sql_by_pt_windows(safe_bound_sql, int(intent.days or 0), chunk_days, max_chunks, limit)
+        if not split_sqls:
+            return None
+        events: List[Dict[str, Any]] = [
+            {
+                "event": "split_query_fallback_started",
+                "sourceErrorCode": error_code,
+                "sourceError": str(error_text or "")[:240],
+                "originalDurationMs": previous_duration_ms,
+                "chunkDays": chunk_days,
+                "maxChunks": max_chunks,
+                "chunkCount": len(split_sqls),
+                "maxConcurrency": min(max_concurrency, len(split_sqls)),
+                "executionMode": "parallel_chunks",
+                "limit": limit,
+            }
+        ]
+        cache_hit = False
+        cache_keys: List[str] = []
+        started = time.perf_counter()
+        chunk_results: Dict[int, List[Dict[str, Any]]] = {}
+
+        def query_chunk(index: int, chunk_sql: str) -> Dict[str, Any]:
+            chunk_started = time.perf_counter()
+            chunk_rows = self.doris_repository.query(chunk_sql, safe_params)
+            return {
+                "chunkIndex": index,
+                "rows": list(chunk_rows or []),
+                "cacheHit": bool(getattr(self.doris_repository, "last_cache_hit", False)),
+                "cacheKey": str(getattr(self.doris_repository, "last_cache_key", "") or ""),
+                "durationMs": int((time.perf_counter() - chunk_started) * 1000),
+                "sql": trim_sql(chunk_sql, 600),
+            }
+
+        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(split_sqls))) as executor:
+            futures = {
+                executor.submit(query_chunk, index, chunk_sql): (index, chunk_sql)
+                for index, chunk_sql in enumerate(split_sqls, start=1)
+            }
+            for future in as_completed(futures):
+                index, chunk_sql = futures[future]
+                try:
+                    payload = future.result()
+                except Exception as exc:
+                    events.append(
+                        {
+                            "event": "split_query_chunk_failed",
+                            "chunkIndex": index,
+                            "errorCode": classify_doris_error(str(exc)),
+                            "error": str(exc)[:240],
+                            "sql": trim_sql(chunk_sql, 600),
+                        }
+                    )
+                    continue
+                chunk_rows = payload["rows"]
+                chunk_results[index] = chunk_rows
+                cache_hit = cache_hit or bool(payload["cacheHit"])
+                if payload["cacheKey"]:
+                    cache_keys.append(payload["cacheKey"])
+                events.append(
+                    {
+                        "event": "split_query_chunk_succeeded",
+                        "chunkIndex": index,
+                        "rows": len(chunk_rows),
+                        "cacheHit": bool(payload["cacheHit"]),
+                        "durationMs": payload["durationMs"],
+                        "sql": payload["sql"],
+                    }
+                )
+        rows: List[Dict[str, Any]] = []
+        for index in sorted(chunk_results):
+            if len(rows) >= limit:
+                break
+            remaining = max(0, limit - len(rows))
+            rows.extend(chunk_results[index][:remaining])
+        if not rows:
+            return None
+        events.append(
+            {
+                "event": "split_query_fallback_finished",
+                "rows": len(rows),
+                "chunksAttempted": len([item for item in events if str(item.get("event")) in {"split_query_chunk_succeeded", "split_query_chunk_failed"}]),
+                "chunksSucceeded": len([item for item in events if str(item.get("event")) == "split_query_chunk_succeeded"]),
+                "chunksFailed": len([item for item in events if str(item.get("event")) == "split_query_chunk_failed"]),
+                "executionMode": "parallel_chunks",
+                "tables": tables,
+            }
+        )
+        return {
+            "rows": rows[:limit],
+            "cacheHit": cache_hit,
+            "cacheKey": ",".join(cache_keys[:3]),
+            "durationMs": int((time.perf_counter() - started) * 1000),
+            "runtimeEvents": events,
+        }
+
     def _draft_structured_sql(
         self,
         intent: QuestionIntent,
@@ -2138,6 +2504,10 @@ class NodeWorkerExecutor:
             for column in metric_spec_source_columns(spec, columns):
                 if column and column in columns and column in visible_columns and column not in preferred:
                     preferred.append(column)
+        configured = configured_contract_detail_columns(contract, columns, visible_columns)
+        for column in configured:
+            if column not in preferred:
+                preferred.append(column)
         if resource_safe:
             for column in ["seller_id", "merchant_id", "pt"]:
                 if column in visible_columns and column not in preferred:
@@ -2476,6 +2846,7 @@ class NodeWorkerExecutor:
         visible_columns: List[str] = []
         internal_only_columns: List[str] = []
         column_access_policy: Dict[str, Dict[str, Any]] = {}
+        column_display_policy: Dict[str, Dict[str, Any]] = {}
         masked_columns: Dict[str, str] = {}
         protected_internal = {merchant_filter_column, str(row_scope_policy.get("filterColumn") or "")} - {""}
         for column in allowed_columns:
@@ -2488,6 +2859,7 @@ class NodeWorkerExecutor:
                 "maskingReason": masking_policy.get("reason") or "",
             }
             column_access_policy[column] = policy
+            column_display_policy[column] = normalize_column_display_policy(semantic)
             permitted = role_allowed_for_column(visibility_policy, access_role)
             if permitted:
                 visible_columns.append(column)
@@ -2517,6 +2889,7 @@ class NodeWorkerExecutor:
             access_role=access_role,
             row_scope_policy=row_scope_policy,
             column_access_policy=column_access_policy,
+            column_display_policy=column_display_policy,
             masked_columns=masked_columns,
             answer_mode=enum_text(intent.answer_mode),
             task_role=enum_text(intent.task_role),
@@ -2548,6 +2921,10 @@ class NodeWorkerExecutor:
         for spec in metric_specs_for_intent(intent, table):
             for item in metric_spec_source_columns(spec, columns):
                 if item and item in columns and item not in requested:
+                    requested.append(item)
+        if intent.answer_mode == AnswerMode.DETAIL:
+            for item in configured_default_detail_columns(asset_pack, table, columns):
+                if item and item not in requested:
                     requested.append(item)
         for item in [
             "seller_id",
@@ -3093,20 +3470,65 @@ def serialize_tool_execution_result(result: ToolCallExecutionResult) -> Dict[str
         "status": result.status,
         "result": result.result,
         "errorType": result.error_type,
+        "errorCode": result.error_code or result.error_type,
         "errorMessage": result.error_message,
+        "retryable": result.retryable,
+        "recommendedAction": result.recommended_action,
+        "fallbackTools": list(result.fallback_tools),
+        "details": result.details,
         "durationMs": result.duration_ms,
+        "attempts": result.attempts,
         "cacheHit": result.cache_hit,
+    }
+
+
+def compact_tool_failure_for_prompt(item: Dict[str, Any], max_detail_chars: int = 1200) -> Dict[str, Any]:
+    details = item.get("details") or {}
+    if not isinstance(details, dict):
+        details = {"value": str(details)[:max_detail_chars]}
+    compact_details: Dict[str, Any] = {}
+    for key, value in details.items():
+        if value in ("", None, [], {}):
+            continue
+        text = json.dumps(value, ensure_ascii=False, default=str) if isinstance(value, (dict, list)) else str(value)
+        if key.lower() in {"sqlpreview", "messagepreview", "stderr", "stdout", "traceback"} and len(text) > 500:
+            text = text[:500]
+        compact_details[key] = text if len(text) <= max_detail_chars else text[:max_detail_chars]
+    result = item.get("result") or {}
+    artifact_ref = {}
+    if isinstance(result, dict):
+        artifact_ref = result.get("artifactRef") or result.get("artifact") or {}
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "status": item.get("status"),
+        "errorType": item.get("errorType"),
+        "errorCode": item.get("errorCode") or item.get("errorType"),
+        "errorMessage": str(item.get("errorMessage") or "")[:500],
+        "retryable": item.get("retryable"),
+        "recommendedAction": item.get("recommendedAction"),
+        "fallbackTools": item.get("fallbackTools") or [],
+        "details": compact_details,
+        "artifactRef": artifact_ref,
     }
 
 
 def compact_tool_results_for_prompt(results: List[Dict[str, Any]], max_items: int = 6, max_chars: int = 6000) -> List[Dict[str, Any]]:
     compacted: List[Dict[str, Any]] = []
     for item in results[-max_items:]:
+        if str(item.get("status") or "") in {"failed", "error", "blocked", "timeout", "rate_limited", "circuit_blocked"}:
+            compacted.append(compact_tool_failure_for_prompt(item))
+            continue
         payload = {
             "name": item.get("name"),
             "status": item.get("status"),
             "errorType": item.get("errorType"),
+            "errorCode": item.get("errorCode") or item.get("errorType"),
             "errorMessage": item.get("errorMessage"),
+            "retryable": item.get("retryable"),
+            "recommendedAction": item.get("recommendedAction"),
+            "fallbackTools": item.get("fallbackTools") or [],
+            "details": item.get("details") or {},
         }
         result = item.get("result") or {}
         if isinstance(result, dict):
@@ -3310,26 +3732,6 @@ def invalid_pt_date_filter(sql: str) -> bool:
     return "DATE_FORMAT" in upper and "%Y%M%D" in upper
 
 
-def contract_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List[EvidenceGap]:
-    gaps: List[EvidenceGap] = []
-    for task_result in task_results:
-        critique = task_result.node_plan_critique
-        if not critique or critique.valid or not critique.graph_repairable:
-            continue
-        gaps.append(
-            EvidenceGap(
-                code=critique.code or "PLAN_CONTRACT_MISMATCH",
-                task_id=task_result.task_id,
-                reason=critique.message,
-                severity="error",
-                disclosure_required=True,
-                source="node_contract_critic",
-                answer_instruction="当前 node plan contract 与执行要求不一致，应先修 QueryGraph，不要把它解释成无数据。",
-            )
-        )
-    return gaps
-
-
 def is_select_alias_reference(column: exp.Column, select_aliases: set) -> bool:
     if column.name not in select_aliases:
         return False
@@ -3402,430 +3804,6 @@ def structured_limit(limit: int, detail: bool, resource_safe: bool = False) -> i
     if resource_safe:
         return min(raw_limit, 10 if detail else 20)
     return min(raw_limit, 50 if detail else 100)
-
-
-def is_dependent_context_column(column: str) -> bool:
-    text = (column or "").lower()
-    return any(
-        token in text
-        for token in [
-            "status",
-            "create_time",
-            "close_time",
-            "priority",
-            "assignee",
-            "operator",
-            "type_code",
-            "type_name",
-        ]
-    )
-
-
-def quote_identifier(column: str) -> str:
-    return "`%s`" % str(column).replace("`", "")
-
-
-def sql_literal(value: Any) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
-    return "'%s'" % str(value).replace("'", "''")
-
-
-def normalize_identifier(value: Any) -> str:
-    return str(value or "").strip().strip("`").lower()
-
-
-def split_filter_values(value: Any, max_values: int = 200) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw_values = list(value)
-    else:
-        raw = str(value or "").strip()
-        if not raw:
-            return []
-        raw_values = [item.strip() for item in raw.split(",")] if "," in raw else [raw]
-    values: List[Any] = []
-    for item in raw_values:
-        if blank_entity_value(item):
-            continue
-        if item not in values:
-            values.append(item)
-        if len(values) >= max_values:
-            break
-    return values
-
-
-def parse_sql_literal(value: str) -> Any:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if text in {"%s", "?"} or re.match(r"^:[A-Za-z_][A-Za-z0-9_]*$", text):
-        return ""
-    if text.upper() == "NULL":
-        return None
-    if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
-        return text[1:-1].replace("''", "'")
-    if re.match(r"^-?\d+$", text):
-        try:
-            return int(text)
-        except ValueError:
-            return text
-    if re.match(r"^-?\d+\.\d+$", text):
-        try:
-            return float(text)
-        except ValueError:
-            return text
-    return text
-
-
-def parse_sql_literal_values(rhs: str) -> List[Any]:
-    text = str(rhs or "").strip()
-    if not text:
-        return []
-    if text.startswith("(") and text.endswith(")"):
-        text = text[1:-1]
-    values: List[Any] = []
-    current = []
-    in_quote = False
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char == "'":
-            current.append(char)
-            if in_quote and index + 1 < len(text) and text[index + 1] == "'":
-                current.append(text[index + 1])
-                index += 2
-                continue
-            in_quote = not in_quote
-        elif char == "," and not in_quote:
-            parsed = parse_sql_literal("".join(current).strip())
-            if not blank_entity_value(parsed):
-                values.append(parsed)
-            current = []
-        else:
-            current.append(char)
-        index += 1
-    parsed = parse_sql_literal("".join(current).strip())
-    if not blank_entity_value(parsed):
-        values.append(parsed)
-    return values
-
-
-def add_bind_values(target: Dict[str, List[Any]], column: str, values: List[Any], max_values: int = 200) -> None:
-    key = normalize_identifier(column)
-    if not key:
-        return
-    bucket = target.setdefault(key, [])
-    for value in values:
-        if blank_entity_value(value) or value in bucket:
-            continue
-        bucket.append(value)
-        if len(bucket) >= max_values:
-            break
-
-
-def node_bind_values_by_column(intent: QuestionIntent, columns: set, context: NodeExecutionContext, max_values: int = 200) -> Dict[str, List[Any]]:
-    normalized_columns = {normalize_identifier(column) for column in columns}
-    values_by_column: Dict[str, List[Any]] = {}
-    merchant_id = str(context.merchant_id or "").strip()
-    if merchant_id:
-        for column in ["seller_id", "merchant_id"]:
-            if column in normalized_columns:
-                add_bind_values(values_by_column, column, [merchant_id], 1)
-    filter_column = normalize_identifier(intent.filter_column)
-    if filter_column in normalized_columns:
-        add_bind_values(values_by_column, filter_column, split_filter_values(intent.filter_value, max_values), max_values)
-    for entity_set in context.upstream_entity_sets or []:
-        join_key = normalize_identifier(entity_set.join_key)
-        if join_key in normalized_columns:
-            add_bind_values(values_by_column, join_key, list(entity_set.values or []), max_values)
-        for column, values in (entity_set.column_values or {}).items():
-            normalized = normalize_identifier(column)
-            if normalized in normalized_columns:
-                add_bind_values(values_by_column, normalized, list(values or []), max_values)
-    return values_by_column
-
-
-def append_note(existing: str, note: str) -> str:
-    parts = [str(existing or "").strip(), str(note or "").strip()]
-    return "; ".join(part for part in parts if part)
-
-
-def realtime_fallback_for_table(asset_pack: PlanningAssetPack, table: str) -> Optional[Any]:
-    normalized_table = normalize_identifier(table)
-    known_tables = set(asset_pack.known_tables())
-    for item in asset_pack.realtime_fallbacks or []:
-        metadata = item.metadata or {}
-        fallback_table = str(
-            item.table
-            or metadata.get("realtimeTable")
-            or metadata.get("fallbackTable")
-            or metadata.get("targetTable")
-            or metadata.get("table")
-            or ""
-        )
-        source_candidates = {
-            normalize_identifier(str(item.key or "")),
-            normalize_identifier(str(metadata.get("sourceTable") or "")),
-            normalize_identifier(str(metadata.get("offlineTable") or "")),
-            normalize_identifier(str(metadata.get("baseTable") or "")),
-            normalize_identifier(str(metadata.get("ownerTable") or "")),
-        }
-        fallback_candidates = {
-            normalize_identifier(fallback_table),
-            normalize_identifier(str(item.table or "")),
-        }
-        if normalized_table in source_candidates and fallback_table in known_tables:
-            return item
-        description = ("%s %s" % (item.title, item.description)).lower()
-        if (
-            not any(source_candidates)
-            and normalized_table
-            and normalized_table not in fallback_candidates
-            and fallback_table in known_tables
-            and normalized_table in description
-        ):
-            return item
-    return None
-
-
-def partition_is_stale_for_near_realtime(max_pt: str, requested_days: int) -> bool:
-    if int(requested_days or 0) > 2:
-        return False
-    parsed = parse_partition_date(max_pt)
-    if not parsed:
-        return False
-    return parsed < (date.today() - timedelta(days=1))
-
-
-def parse_partition_date(value: str) -> Optional[date]:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    for pattern in ("%Y%m%d", "%Y-%m-%d"):
-        candidate = text[:8] if pattern == "%Y%m%d" else text[:10]
-        try:
-            return datetime.strptime(candidate, pattern).date()
-        except Exception:
-            continue
-    return None
-
-
-def bindable_predicate_pattern(columns: List[str]) -> Optional[re.Pattern[str]]:
-    names = [normalize_identifier(column) for column in columns if normalize_identifier(column)]
-    if not names:
-        return None
-    column_pattern = "|".join(re.escape(column) for column in sorted(set(names), key=len, reverse=True))
-    rhs_pattern = r"\([^)]*\)|%s|\?|:[A-Za-z_][A-Za-z0-9_]*|'(?:''|[^'])*'|-?\d+(?:\.\d+)?"
-    return re.compile(
-        r"(?P<prefix>`?(?P<column>%s)`?\s*)(?P<op>=|IN)\s*(?P<rhs>%s)" % (column_pattern, rhs_pattern),
-        re.IGNORECASE,
-    )
-
-
-def predicate_column_name(expression: Any) -> str:
-    if isinstance(expression, exp.Column):
-        return normalize_identifier(expression.name)
-    if isinstance(expression, exp.Identifier):
-        return normalize_identifier(expression.name)
-    return ""
-
-
-def parse_sql_for_binding(sql: str) -> Optional[exp.Expression]:
-    try:
-        return sqlglot.parse_one((sql or "").strip(), read="doris")
-    except Exception:
-        try:
-            return sqlglot.parse_one((sql or "").replace("%s", "?").strip(), read="mysql")
-        except Exception:
-            return None
-
-
-def placeholder_expression() -> exp.Placeholder:
-    return exp.Placeholder()
-
-
-def sql_expression_is_placeholder(expression: Any) -> bool:
-    return isinstance(expression, exp.Placeholder) or str(expression or "").strip() in {"?", "%s"}
-
-
-def has_merchant_filter_predicate(sql: str, columns: set) -> bool:
-    merchant_columns = [column for column in ["seller_id", "merchant_id", "shop_id"] if column in {normalize_identifier(item) for item in columns}]
-    parsed = parse_sql_for_binding(sql)
-    if parsed is not None:
-        for predicate in list(parsed.find_all(exp.EQ)) + list(parsed.find_all(exp.In)):
-            if predicate_column_name(predicate.this) in merchant_columns:
-                return True
-    pattern = bindable_predicate_pattern(merchant_columns)
-    return bool(pattern.search(sql or "")) if pattern else False
-
-
-def sql_has_bound_merchant_filter(sql: str, columns: set) -> bool:
-    merchant_columns = [column for column in ["seller_id", "merchant_id", "shop_id"] if column in {normalize_identifier(item) for item in columns}]
-    if not merchant_columns:
-        return False
-    parsed = parse_sql_for_binding(sql)
-    if parsed is not None:
-        for predicate in parsed.find_all(exp.EQ):
-            if predicate_column_name(predicate.this) in merchant_columns and sql_expression_is_placeholder(predicate.expression):
-                return True
-        for predicate in parsed.find_all(exp.In):
-            if predicate_column_name(predicate.this) in merchant_columns and any(sql_expression_is_placeholder(item) for item in predicate.expressions):
-                return True
-    pattern = bindable_predicate_pattern(merchant_columns)
-    if not pattern:
-        return False
-    for match in pattern.finditer(sql or ""):
-        rhs = str(match.group("rhs") or "").strip()
-        if "%s" in rhs or rhs == "?" or re.match(r"^:[A-Za-z_][A-Za-z0-9_]*$", rhs):
-            return True
-    return False
-
-
-def bind_node_sql_parameters_ast(
-    sql: str,
-    values_by_column: Dict[str, List[Any]],
-    merchant_columns: set,
-    context: NodeExecutionContext,
-) -> Tuple[str, List[Any], str, bool]:
-    parsed = parse_sql_for_binding(sql)
-    if parsed is None:
-        return sql, [], "", False
-    params: List[Any] = []
-    merchant_bound = not merchant_columns
-    bound_any = False
-
-    def values_for(column: str, original_values: List[Any]) -> List[Any]:
-        values = list(values_by_column.get(column) or original_values or [])
-        values = [value for value in values if not blank_entity_value(value)]
-        if column in merchant_columns:
-            return [context.merchant_id] if not blank_entity_value(context.merchant_id) else []
-        return values
-
-    def transform(node: exp.Expression) -> exp.Expression:
-        nonlocal merchant_bound, bound_any
-        if isinstance(node, exp.EQ):
-            column = predicate_column_name(node.this)
-            if column not in values_by_column and column not in merchant_columns:
-                return node
-            original_values = parse_ast_literal_values([node.expression])
-            values = values_for(column, original_values)
-            if not values:
-                return node
-            node.set("expression", placeholder_expression())
-            params.append(values[0])
-            bound_any = True
-            if column in merchant_columns:
-                merchant_bound = True
-            return node
-        if isinstance(node, exp.In):
-            column = predicate_column_name(node.this)
-            if column not in values_by_column and column not in merchant_columns:
-                return node
-            original_values = parse_ast_literal_values(list(node.expressions or []))
-            values = values_for(column, original_values)
-            if not values:
-                return node
-            placeholders = [placeholder_expression() for _ in values]
-            node.set("expressions", placeholders)
-            params.extend(values)
-            bound_any = True
-            if column in merchant_columns:
-                merchant_bound = True
-            return node
-        return node
-
-    bound = parsed.transform(transform, copy=True)
-    bound_sql = normalize_ast_bound_sql_text(bound.sql(dialect="mysql", identify=True).replace("?", "%s"))
-    if merchant_columns and not merchant_bound:
-        return bound_sql, params, "SQL 缺少可由后端绑定的商家过滤字段 seller_id/merchant_id/shop_id", True
-    if not bound_any:
-        return sql, [], "", True
-    return bound_sql, params, "", True
-
-
-def parse_ast_literal_values(expressions: List[Any]) -> List[Any]:
-    values: List[Any] = []
-    for expression in expressions:
-        if isinstance(expression, exp.Literal):
-            values.append(expression.this)
-        elif isinstance(expression, exp.Tuple):
-            values.extend(parse_ast_literal_values(list(expression.expressions or [])))
-        elif sql_expression_is_placeholder(expression):
-            continue
-        else:
-            parsed = parse_sql_literal(str(expression))
-            if not blank_entity_value(parsed):
-                values.append(parsed)
-    return values
-
-
-def normalize_ast_bound_sql_text(sql: str) -> str:
-    text = re.sub(
-        r"DATE_SUB\(CURRENT_DATE, INTERVAL '(\d+)' DAY\)",
-        r"DATE_SUB(CURDATE(), INTERVAL \1 DAY)",
-        sql or "",
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"NOT\s+((?:`[^`]+`\.)?`[^`]+`|[A-Za-z_][A-Za-z0-9_.]*)\s+IS\s+NULL",
-        r"\1 IS NOT NULL",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"((?:`[^`]+`\.)?`[^`]+`|[A-Za-z_][A-Za-z0-9_.]*)\s+<>\s+''",
-        r"\1 != ''",
-        text,
-    )
-    return text
-
-
-def bind_node_sql_parameters(
-    sql: str,
-    intent: QuestionIntent,
-    asset_pack: PlanningAssetPack,
-    context: NodeExecutionContext,
-) -> Tuple[str, List[Any], str]:
-    columns = {normalize_identifier(column) for column in asset_pack.known_columns(intent.preferred_table)}
-    values_by_column = node_bind_values_by_column(intent, columns, context)
-    pattern = bindable_predicate_pattern(list(values_by_column.keys()))
-    if not pattern:
-        return sql, [], ""
-    params: List[Any] = []
-    merchant_columns = {"seller_id", "merchant_id", "shop_id"} & columns
-    ast_sql, ast_params, ast_error, ast_used = bind_node_sql_parameters_ast(sql, values_by_column, merchant_columns, context)
-    if ast_used:
-        return ast_sql, ast_params, ast_error
-    merchant_bound = not merchant_columns
-
-    def replace(match: re.Match[str]) -> str:
-        nonlocal merchant_bound
-        column = normalize_identifier(match.group("column"))
-        op = str(match.group("op") or "=").upper()
-        rhs = str(match.group("rhs") or "")
-        values = list(values_by_column.get(column) or [])
-        if not values:
-            values = parse_sql_literal_values(rhs)
-        values = [value for value in values if not blank_entity_value(value)]
-        if not values:
-            return match.group(0)
-        if column in merchant_columns:
-            values = [context.merchant_id]
-            merchant_bound = True
-        if op == "IN" and len(values) > 1:
-            params.extend(values)
-            return "%sIN (%s)" % (match.group("prefix"), ", ".join(["%s"] * len(values)))
-        params.append(values[0])
-        return "%s= %%s" % match.group("prefix")
-
-    bound_sql = pattern.sub(replace, sql or "")
-    if merchant_columns and not merchant_bound:
-        return bound_sql, params, "SQL 缺少可由后端绑定的商家过滤字段 seller_id/merchant_id"
-    return bound_sql, params, ""
 
 
 def equivalent_sql(left: str, right: str) -> bool:
@@ -3991,13 +3969,6 @@ def has_non_empty_filter(sql: str, column: str) -> bool:
     )
     return has_not_null and has_not_empty
 
-
-def blank_entity_value(value: Any) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value.strip() == ""
-    return False
 
 
 def aggregate_group_key_allowed(intent: QuestionIntent, column: str) -> bool:
@@ -4218,7 +4189,16 @@ def table_access_hint(table: str, columns: set) -> Dict[str, Any]:
 
 
 def timed_out_result(task_id: str, intent: QuestionIntent, timeout_seconds: int) -> AgentTaskResult:
-    return failed_result(task_id, intent, "NodeWorker 超时：超过 %s 秒未返回" % timeout_seconds)
+    result = failed_result(task_id, intent, "NodeWorker 超时：超过 %s 秒未返回" % timeout_seconds)
+    result.query_bundle.runtime_events.append(
+        {
+            "event": "node.timeout",
+            "taskId": task_id,
+            "timeoutSeconds": timeout_seconds,
+            "timeoutType": classify_timeout_type("node execution timed out", source="node"),
+        }
+    )
+    return result
 
 
 def failed_result(task_id: str, intent: QuestionIntent, message: str) -> AgentTaskResult:

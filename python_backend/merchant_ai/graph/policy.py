@@ -203,6 +203,8 @@ class V2AgentPolicy:
     def _candidate_action_ids(self, state: AgentState) -> tuple[List[str], str, bool]:
         if state.get("run_canceled"):
             return ["cache_answer"], "run was canceled by user; stop the ReAct loop", True
+        if state.get("run_budget_exhausted"):
+            return ["answer_data"], "run budget exhausted; answer with collected results", True
         if state.get("middleware_loop_blocked"):
             return ["answer_data"], "middleware loop guard blocked repeated action pattern", True
         route = state.get("routing_decision")
@@ -474,10 +476,7 @@ class V2AgentPolicy:
             return False
         if not state.get("evidence_graph_verified"):
             return False
-        return bool(
-            analysis_summary_required(plan)
-            or answer_skill_required(plan, run_result, bool(state.get("rule_recall_context", "")))
-        )
+        return bool(answer_skill_required(plan, run_result, bool(state.get("rule_recall_context", ""))))
 
     def has_graph_repairable_execution_gap(self, state: AgentState) -> bool:
         run_result = state.get("agent_run_result")

@@ -233,6 +233,16 @@ class MemoryRecallEvaluationRequest(APIModel):
     budget_chars: int = 0
 
 
+class GoldenEvaluationRequest(APIModel):
+    merchant_id: str = ""
+    case_ids: List[str] = Field(default_factory=list)
+    limit: int = 0
+    persist_report: bool = True
+    persist_governance_items: bool = True
+    cases_path: str = ""
+    partition_date_anchor_enabled: bool = True
+
+
 class ChatResponse(APIModel):
     id: str = ""
     answer: str = ""
@@ -705,6 +715,8 @@ class MiddlewareEvent(APIModel):
     middleware: str = ""
     stage: str = ""
     status: str = "ok"
+    severity: str = "info"
+    channel: str = "trace"
     code: str = ""
     message: str = ""
     input_chars: int = 0
@@ -757,6 +769,9 @@ class ContextManifest(APIModel):
     agent: str = ""
     context_package_id: str = ""
     context_hash: str = ""
+    blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    cache_layout: Dict[str, Any] = Field(default_factory=dict)
+    quarantine_policy: Dict[str, Any] = Field(default_factory=dict)
     allowed_tables: List[str] = Field(default_factory=list)
     allowed_metrics: List[str] = Field(default_factory=list)
     memory_ids: List[str] = Field(default_factory=list)
@@ -769,6 +784,7 @@ class ContextManifest(APIModel):
 class ToolCallLedgerEntry(APIModel):
     tool_call_id: str = ""
     tool_name: str = ""
+    idempotency_key: str = ""
     stage: str = ""
     status: str = ""
     duration_ms: int = 0
@@ -1005,8 +1021,12 @@ class ToolCallExecutionResult(APIModel):
     name: str = ""
     status: str = ""
     result: Dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = ""
+    params_hash: str = ""
     error_type: str = ""
+    error_code: str = ""
     error_message: str = ""
+    timeout_type: str = ""
     duration_ms: int = 0
     attempts: int = 0
     cache_hit: bool = False
@@ -1018,8 +1038,57 @@ class ToolCallExecutionResult(APIModel):
     retryable: bool = False
     recommended_action: str = ""
     fallback_tools: List[str] = Field(default_factory=list)
+    details: Dict[str, Any] = Field(default_factory=dict)
+    contract: Dict[str, Any] = Field(default_factory=dict)
+    result_hash: str = ""
     tool_message: Dict[str, Any] = Field(default_factory=dict)
     runtime_events: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.error_code and self.error_type:
+            self.error_code = self.error_type
+        if self.status in {"failed", "blocked", "error"} and not self.details:
+            self.details = {
+                key: value
+                for key, value in {
+                    "toolCallId": self.id,
+                    "toolName": self.name,
+                    "serviceName": self.service_name,
+                    "target": self.target,
+                    "paramsHash": self.params_hash,
+                    "idempotencyKey": self.idempotency_key,
+                    "circuitKey": self.circuit_key,
+                    "timeoutType": self.timeout_type,
+                    "attempts": self.attempts,
+                    "durationMs": self.duration_ms,
+                    "cacheHit": self.cache_hit,
+                    "rateLimited": self.rate_limited,
+                }.items()
+                if value not in ("", 0, False, None, [], {})
+            }
+        if self.status in {"failed", "blocked", "error"} and not self.tool_message:
+            self.tool_message = {
+                "toolCallId": self.id,
+                "toolName": self.name,
+                "status": self.status,
+                "errorType": self.error_type,
+                "errorCode": self.error_code,
+                "message": self.error_message,
+                "retryable": self.retryable,
+                "recommendedAction": self.recommended_action,
+                "fallbackTools": list(self.fallback_tools),
+                "details": dict(self.details),
+            }
+        elif self.tool_message:
+            self.tool_message.setdefault("toolCallId", self.id)
+            self.tool_message.setdefault("toolName", self.name)
+            self.tool_message.setdefault("status", self.status)
+            if self.error_type:
+                self.tool_message.setdefault("errorType", self.error_type)
+            if self.error_code:
+                self.tool_message.setdefault("errorCode", self.error_code)
+            if self.details:
+                self.tool_message.setdefault("details", dict(self.details))
 
 
 class FreshnessCheckResult(APIModel):
@@ -1057,6 +1126,7 @@ class NodePlanContract(APIModel):
     access_role: str = "merchant_analyst"
     row_scope_policy: Dict[str, Any] = Field(default_factory=dict)
     column_access_policy: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    column_display_policy: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     masked_columns: Dict[str, str] = Field(default_factory=dict)
     answer_mode: str = ""
     task_role: str = ""
@@ -1108,10 +1178,12 @@ class NodeExecutionBatch(APIModel):
     completed_task_ids: List[str] = Field(default_factory=list)
     failed_task_ids: List[str] = Field(default_factory=list)
     timed_out_task_ids: List[str] = Field(default_factory=list)
+    resumed_task_ids: List[str] = Field(default_factory=list)
     blocked_task_ids: List[str] = Field(default_factory=list)
     max_concurrency: int = 0
     timeout_seconds: int = 0
     duration_ms: int = 0
+    runtime_events: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class SkillManifest(APIModel):
@@ -1251,13 +1323,41 @@ class NodeExecutionContext(APIModel):
 
 class EvidenceGap(APIModel):
     code: str = ""
+    gap_code: str = ""
     task_id: str = ""
+    source_node_id: str = ""
     evidence: str = ""
     reason: str = ""
     severity: str = ""
     disclosure_required: bool = False
     source: str = ""
     answer_instruction: str = ""
+    suggested_action: str = ""
+    missing_metric: str = ""
+    missing_dimension: str = ""
+    missing_time_range: str = ""
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.gap_code and self.code:
+            self.gap_code = self.code
+        if not self.source_node_id and self.task_id:
+            self.source_node_id = self.task_id
+        if not self.suggested_action and self.answer_instruction:
+            self.suggested_action = self.answer_instruction
+        if not self.details:
+            self.details = {
+                key: value
+                for key, value in {
+                    "gapCode": self.gap_code or self.code,
+                    "taskId": self.task_id,
+                    "sourceNodeId": self.source_node_id,
+                    "evidence": self.evidence,
+                    "source": self.source,
+                    "severity": self.severity,
+                }.items()
+                if value not in ("", None, [], {})
+            }
 
 
 class VerifiedEvidence(APIModel):
@@ -1270,6 +1370,39 @@ class VerifiedEvidence(APIModel):
     answer_guard_required: bool = False
     required_disclosures: List[str] = Field(default_factory=list)
     partial_answer_reason: str = ""
+
+
+class VerifiedAnswerContext(APIModel):
+    question: str = ""
+    business_context: Dict[str, Any] = Field(default_factory=dict)
+    tables: List[str] = Field(default_factory=list)
+    row_count: int = 0
+    data_rows: List[Dict[str, Any]] = Field(default_factory=list)
+    data_sections: List[Dict[str, Any]] = Field(default_factory=list)
+    metric_disclosures: List[Dict[str, Any]] = Field(default_factory=list)
+    lightweight_metric_disclosures: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence_gaps: List[Dict[str, Any]] = Field(default_factory=list)
+    degraded_reasons: List[Dict[str, Any]] = Field(default_factory=list)
+    rule_evidence: Any = ""
+    verified_passed: bool = False
+    partial_answer_reason: str = ""
+
+    def prompt_payload(self) -> Dict[str, Any]:
+        return {
+            "question": self.question,
+            "businessContext": self.business_context,
+            "tables": self.tables,
+            "rowCount": self.row_count,
+            "dataRows": self.data_rows,
+            "dataSections": self.data_sections,
+            "metricDisclosures": self.metric_disclosures,
+            "lightweightMetricDisclosures": self.lightweight_metric_disclosures,
+            "evidenceGaps": self.evidence_gaps,
+            "degradedReasons": self.degraded_reasons,
+            "ruleEvidence": self.rule_evidence,
+            "verifiedPassed": self.verified_passed,
+            "partialAnswerReason": self.partial_answer_reason,
+        }
 
 
 class PlanDependency(APIModel):
@@ -1358,6 +1491,7 @@ class QueryBundle(APIModel):
     duration_ms: int = 0
     cache_hit: bool = False
     cache_key: str = ""
+    runtime_events: List[Dict[str, Any]] = Field(default_factory=list)
 
     def effective_row_count(self) -> int:
         return self.original_row_count or len(self.rows)
@@ -1409,6 +1543,7 @@ class EvidenceCheckResult(APIModel):
 
 
 class SkillLifecycleRecord(APIModel):
+    record_id: str = ""
     skill_name: str = ""
     stage: str = ""
     status: str = ""
@@ -1420,6 +1555,11 @@ class SkillLifecycleRecord(APIModel):
     checkpoint_path: str = ""
     progress: List[str] = Field(default_factory=list)
     reuse_candidate: bool = False
+    context_hash: str = ""
+    artifact_refs: List[ArtifactRef] = Field(default_factory=list)
+    started_at: str = ""
+    completed_at: str = ""
+    duration_ms: int = 0
     summary: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -1483,6 +1623,8 @@ class AgentRunResult(APIModel):
     sql_draft_decisions: List[SqlDraftDecision] = Field(default_factory=list)
     node_execution_batches: List[NodeExecutionBatch] = Field(default_factory=list)
     skill_lifecycle_records: List[SkillLifecycleRecord] = Field(default_factory=list)
+    resumed_task_ids: List[str] = Field(default_factory=list)
+    degraded_reasons: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class PendingAnswer(APIModel):
@@ -1515,6 +1657,7 @@ class MemoryEvent(APIModel):
     correction_text: str = ""
     confidence: float = 0.5
     source: str = "answer_run"
+    source_event_id: str = ""
     hit_count: int = 0
     last_used_at: str = ""
     decay_score: float = 1.0
@@ -1527,6 +1670,8 @@ class MemoryEvent(APIModel):
     visibility: str = "merchant"
     allowed_roles: List[str] = Field(default_factory=list)
     approved_by: str = ""
+    review_status: str = "auto"
+    write_policy: Dict[str, Any] = Field(default_factory=dict)
     evidence_refs: List[str] = Field(default_factory=list)
     case_payload: Dict[str, Any] = Field(default_factory=dict)
     case_summary: str = ""
@@ -1543,6 +1688,7 @@ class MemoryFact(APIModel):
     metrics: List[str] = Field(default_factory=list)
     confidence: float = 0.5
     source: str = ""
+    source_event_id: str = ""
     hit_count: int = 0
     last_used_at: str = ""
     decay_score: float = 1.0
@@ -1555,6 +1701,8 @@ class MemoryFact(APIModel):
     visibility: str = "merchant"
     allowed_roles: List[str] = Field(default_factory=list)
     approved_by: str = ""
+    review_status: str = "auto"
+    write_policy: Dict[str, Any] = Field(default_factory=dict)
     evidence_refs: List[str] = Field(default_factory=list)
     created_at: str = ""
 

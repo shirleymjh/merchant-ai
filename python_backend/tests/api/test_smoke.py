@@ -42,4 +42,8 @@ def test_query_graph_smoke_contract():
         assert not body["debugTrace"]["taskResults"]
         assert not body["debugTrace"]["planIntents"]
     assert "PY_FALLBACK:EXPLICIT_ORDER_LOOKUP" not in str(body["debugTrace"])
-    assert body["debugTrace"].get("planIntents") or body["debugTrace"]["queryGraphValidation"]["gaps"] or body["debugTrace"].get("taskResults")
+    assert (
+        body["debugTrace"].get("planIntents")
+        or body["debugTrace"]["queryGraphValidation"]["gaps"]
+        or body["debugTrace"].get("taskResults")
+    )

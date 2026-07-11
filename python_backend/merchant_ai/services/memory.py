@@ -78,11 +78,69 @@ class MemoryStore:
         raise NotImplementedError
 
 
+class MemoryWriteGate:
+    """Govern long-term memory writes before they mutate the store."""
+
+    SENSITIVE_PATTERNS = [
+        re.compile(r"\b\d{15,19}\b"),
+        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+        re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    ]
+
+    def evaluate(self, event: Dict[str, Any], merchant_id: str) -> Dict[str, Any]:
+        memory_type = str(event.get("memoryType") or event.get("memory_type") or "query_event")
+        confidence = float(event.get("confidence") or 0.0)
+        question = str(event.get("question") or "")
+        answer_preview = str(event.get("answerPreview") or event.get("answer_preview") or "")
+        scope = event.get("scope") if isinstance(event.get("scope"), dict) else {}
+        reasons: List[str] = []
+        action = "write"
+        review_status = "auto"
+        if not question.strip():
+            action = "reject"
+            reasons.append("empty_question")
+        if merchant_id and str(scope.get("merchantId") or "") not in {"", merchant_id}:
+            action = "reject"
+            reasons.append("merchant_scope_mismatch")
+        if memory_type == "query_event" and confidence < 0.45:
+            action = "reject"
+            reasons.append("low_confidence_query_event")
+        if memory_type in {"business_fact", "correction"} and confidence < 0.7:
+            action = "review"
+            review_status = "review_required"
+            reasons.append("strong_memory_requires_review")
+        if any(pattern.search(question) or pattern.search(answer_preview) for pattern in self.SENSITIVE_PATTERNS):
+            action = "review" if action != "reject" else action
+            review_status = "review_required"
+            reasons.append("possible_sensitive_identifier")
+        if len(question) < 4 and memory_type == "query_event":
+            action = "reject"
+            reasons.append("too_short_to_remember")
+        return {
+            "action": action,
+            "allowed": action != "reject",
+            "reviewStatus": review_status,
+            "reasons": reasons or ["policy_passed"],
+            "confidence": confidence,
+            "sourceEventId": str(event.get("eventId") or event.get("event_id") or ""),
+        }
+
+    def apply(self, event: Dict[str, Any], merchant_id: str) -> Dict[str, Any]:
+        policy = self.evaluate(event, merchant_id)
+        event["writePolicy"] = policy
+        event["sourceEventId"] = event.get("sourceEventId") or event.get("eventId") or ""
+        event["reviewStatus"] = policy["reviewStatus"]
+        if policy["action"] == "review":
+            event["status"] = "review_required"
+        return event
+
+
 class MemoryIngestionService:
     """Owns long-term memory write rules and normalization side effects."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.write_gate = MemoryWriteGate()
 
     def update_store(self, store: MemoryStore, state: AgentState) -> Dict[str, Any]:
         merchant_id = merchant_id_from_state(state, self.settings)
@@ -90,7 +148,20 @@ class MemoryIngestionService:
         event = memory_event_from_state(state)
         if not event.get("question"):
             return memory
-        ingestion_trace = {"eventId": event.get("eventId"), "memoryType": event.get("memoryType"), "written": False, "preferenceUpdates": 0}
+        event = self.write_gate.apply(event, merchant_id)
+        write_policy = event.get("writePolicy") or {}
+        ingestion_trace = {
+            "eventId": event.get("eventId"),
+            "memoryType": event.get("memoryType"),
+            "written": False,
+            "preferenceUpdates": 0,
+            "writePolicy": write_policy,
+        }
+        if not write_policy.get("allowed", True):
+            memory["memoryIngestionTrace"] = ingestion_trace
+            saved = store.save(merchant_id, memory)
+            saved["memoryIngestionTrace"] = ingestion_trace
+            return saved
         events = [item for item in memory.get("events", []) if isinstance(item, dict)]
         past_case = past_case_event_from_state(state)
         if past_case and not any(event_fingerprint(item) == event_fingerprint(past_case) for item in events[-8:]):
@@ -104,7 +175,7 @@ class MemoryIngestionService:
             events.append(event)
             ingestion_trace["written"] = True
         memory["events"] = events[-MAX_EVENTS:]
-        preference_updates = 0 if event.get("memoryType") == "metric_dispute" else upsert_habit_preferences(memory, event)
+        preference_updates = 0 if event.get("memoryType") == "metric_dispute" or write_policy.get("action") == "review" else upsert_habit_preferences(memory, event)
         ingestion_trace["preferenceUpdates"] = preference_updates
         if event.get("memoryType") == "correction":
             fact = correction_fact_from_event(event)
@@ -135,13 +206,24 @@ class MemoryIngestionService:
         event = memory_event_from_feedback(pending, adopted=adopted, liked=liked, disliked=disliked)
         if not event.get("question"):
             return memory
+        event = self.write_gate.apply(event, merchant_id)
+        write_policy = event.get("writePolicy") or {}
+        if not write_policy.get("allowed", True):
+            memory["memoryIngestionTrace"] = {
+                "eventId": event.get("eventId"),
+                "memoryType": event.get("memoryType"),
+                "feedbackSignal": event.get("feedbackSignal", ""),
+                "written": False,
+                "writePolicy": write_policy,
+            }
+            return store.save(merchant_id, memory)
         events = [item for item in memory.get("events", []) if isinstance(item, dict)]
         if not events or event_fingerprint(events[-1]) != event_fingerprint(event):
             events.append(event)
         memory["events"] = events[-MAX_EVENTS:]
         if bool(disliked):
             reduce_related_memory(memory, event, reason="negative feedback")
-        else:
+        elif write_policy.get("action") != "review":
             upsert_habit_preferences(memory, event)
         memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
         memory["memoryIngestionTrace"] = {
@@ -149,6 +231,7 @@ class MemoryIngestionService:
             "memoryType": event.get("memoryType"),
             "feedbackSignal": event.get("feedbackSignal", ""),
             "written": True,
+            "writePolicy": write_policy,
         }
         return store.save(merchant_id, memory)
 
@@ -2584,6 +2667,7 @@ def normalize_events(items: Any) -> List[Dict[str, Any]]:
             correction_text=str(item.get("correctionText") or item.get("correction_text") or ""),
             confidence=float(item.get("confidence") or default_confidence(str(item.get("memoryType") or item.get("memory_type") or "query_event"), str(item.get("feedbackSignal") or ""))),
             source=str(item.get("source") or "answer_run"),
+            source_event_id=str(item.get("sourceEventId") or item.get("source_event_id") or item.get("eventId") or ""),
             hit_count=int(item.get("hitCount") or item.get("hit_count") or 0),
             last_used_at=str(item.get("lastUsedAt") or item.get("last_used_at") or ""),
             decay_score=float(item.get("decayScore") or item.get("decay_score") or 1.0),
@@ -2596,6 +2680,8 @@ def normalize_events(items: Any) -> List[Dict[str, Any]]:
             visibility=str(item.get("visibility") or default_memory_visibility(str(item.get("memoryType") or item.get("memory_type") or "query_event"))),
             allowed_roles=unique_strings(item.get("allowedRoles") or item.get("allowed_roles") or default_memory_allowed_roles(str(item.get("memoryType") or item.get("memory_type") or "query_event"))),
             approved_by=str(item.get("approvedBy") or item.get("approved_by") or ""),
+            review_status=str(item.get("reviewStatus") or item.get("review_status") or "auto"),
+            write_policy=item.get("writePolicy") if isinstance(item.get("writePolicy"), dict) else (item.get("write_policy") if isinstance(item.get("write_policy"), dict) else {}),
             evidence_refs=unique_strings(item.get("evidenceRefs") or item.get("evidence_refs") or []),
             case_payload=memory_case_payload(item),
             case_summary=str(item.get("caseSummary") or item.get("case_summary") or "")[:1000],
@@ -2665,6 +2751,7 @@ def normalize_facts(items: Any) -> List[Dict[str, Any]]:
             metrics=unique_strings(item.get("metrics") or []),
             confidence=float(item.get("confidence") or 0.6),
             source=str(item.get("source") or "memory"),
+            source_event_id=str(item.get("sourceEventId") or item.get("source_event_id") or ""),
             hit_count=int(item.get("hitCount") or item.get("hit_count") or 0),
             last_used_at=str(item.get("lastUsedAt") or item.get("last_used_at") or ""),
             decay_score=float(item.get("decayScore") or item.get("decay_score") or 1.0),
@@ -2677,6 +2764,8 @@ def normalize_facts(items: Any) -> List[Dict[str, Any]]:
             visibility=str(item.get("visibility") or default_memory_visibility(str(item.get("memoryType") or item.get("memory_type") or "business_fact"))),
             allowed_roles=unique_strings(item.get("allowedRoles") or item.get("allowed_roles") or default_memory_allowed_roles(str(item.get("memoryType") or item.get("memory_type") or "business_fact"))),
             approved_by=str(item.get("approvedBy") or item.get("approved_by") or ""),
+            review_status=str(item.get("reviewStatus") or item.get("review_status") or "auto"),
+            write_policy=item.get("writePolicy") if isinstance(item.get("writePolicy"), dict) else (item.get("write_policy") if isinstance(item.get("write_policy"), dict) else {}),
             evidence_refs=unique_strings(item.get("evidenceRefs") or item.get("evidence_refs") or []),
             created_at=str(item.get("createdAt") or item.get("created_at") or datetime.now().isoformat()),
         )
@@ -3680,12 +3769,15 @@ def correction_fact_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
         metrics=unique_strings(event.get("metrics") or []),
         confidence=0.95,
         source="correction",
+        source_event_id=str(event.get("eventId") or event.get("sourceEventId") or ""),
         scope=memory_scope_payload(event),
         status=memory_status(event),
         retention_days=default_retention_days("business_fact"),
         visibility=default_memory_visibility("business_fact"),
         allowed_roles=default_memory_allowed_roles("business_fact"),
         approved_by=str(event.get("approvedBy") or ""),
+        review_status=str(event.get("reviewStatus") or "auto"),
+        write_policy=event.get("writePolicy") if isinstance(event.get("writePolicy"), dict) else {},
         evidence_refs=unique_strings(event.get("evidenceRefs") or []),
         created_at=datetime.now().isoformat(),
     )

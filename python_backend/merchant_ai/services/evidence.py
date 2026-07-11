@@ -373,12 +373,23 @@ def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
     info_codes: Set[str] = set()
     severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"
     instruction = gap.answer_instruction or answer_instruction_for_gap(gap)
+    details = dict(gap.details or {})
+    details.setdefault("gapCode", gap.gap_code or gap.code)
+    details.setdefault("sourceNodeId", gap.source_node_id or gap.task_id)
+    details.setdefault("evidence", gap.evidence)
     return gap.model_copy(
         update={
+            "gap_code": gap.gap_code or gap.code,
+            "source_node_id": gap.source_node_id or gap.task_id,
             "severity": gap.severity or severity,
             "disclosure_required": gap.disclosure_required or severity in {"blocking", "warning"},
             "source": gap.source or evidence_gap_source(gap.code),
             "answer_instruction": instruction,
+            "suggested_action": gap.suggested_action or suggested_action_for_gap(gap),
+            "missing_metric": gap.missing_metric or missing_metric_for_gap(gap),
+            "missing_dimension": gap.missing_dimension or missing_dimension_for_gap(gap),
+            "missing_time_range": gap.missing_time_range or missing_time_range_for_gap(gap),
+            "details": {key: value for key, value in details.items() if value not in ("", None, [], {})},
         }
     )
 
@@ -415,6 +426,39 @@ def answer_instruction_for_gap(gap: EvidenceGap) -> str:
     if gap.code == "RESOURCE_DEGRADED_QUERY":
         return "说明该节点因 Doris 资源限制使用降级 SQL，结论只能按部分覆盖理解。"
     return "说明该证据缺口对回答范围的影响。"
+
+
+def suggested_action_for_gap(gap: EvidenceGap) -> str:
+    if gap.code in {"ZERO_ROWS"}:
+        return "answer_with_zero_rows_disclosure"
+    if gap.code in {"SQL_EXECUTION_FAILED", "UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT"}:
+        return "retry_repair_or_answer_with_gap"
+    if gap.code.startswith("MISSING") or gap.code.startswith("DERIVED_METRIC"):
+        return "supplement_evidence_or_answer_with_gap"
+    if gap.code.startswith("UPSTREAM") or gap.code == "JOIN_KEY_NOT_PRODUCED":
+        return "repair_dependency_or_answer_with_gap"
+    if gap.code.startswith("MEMORY_"):
+        return "disclose_memory_constraint_gap"
+    return "answer_with_gap"
+
+
+def missing_metric_for_gap(gap: EvidenceGap) -> str:
+    text = " ".join([gap.evidence or "", gap.reason or ""])
+    match = re.search(r"(metric|指标)[:=： ]+([A-Za-z0-9_\\.\\-\\u4e00-\\u9fff]+)", text)
+    return match.group(2) if match else ""
+
+
+def missing_dimension_for_gap(gap: EvidenceGap) -> str:
+    text = " ".join([gap.evidence or "", gap.reason or ""])
+    match = re.search(r"(dimension|维度|字段)[:=： ]+([A-Za-z0-9_\\.\\-\\u4e00-\\u9fff]+)", text)
+    return match.group(2) if match else ""
+
+
+def missing_time_range_for_gap(gap: EvidenceGap) -> str:
+    text = " ".join([gap.evidence or "", gap.reason or ""])
+    if "time" in text.lower() or "时间" in text or "日期" in text:
+        return gap.evidence or gap.reason
+    return ""
 
 
 def metric_resolution_disclosures(plan: QueryPlan) -> List[str]:

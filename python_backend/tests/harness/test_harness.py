@@ -2,12 +2,12 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 import pytest
 
 from merchant_ai.config import Settings, get_settings
-from merchant_ai.graph.state import emit
+from merchant_ai.graph.state import emit, merge_agent_state_update
 from merchant_ai.graph.policy import V2AgentPolicy
 from merchant_ai.graph.workflow import (
     append_knowledge_request_gaps,
@@ -57,6 +57,7 @@ from merchant_ai.models import (
     RecallBundle,
     RouteSlots,
     RoutingDecision,
+    SkillMatchState,
     SqlValidationResult,
     SqlRepairAttempt,
     SkillDraftReviewRequest,
@@ -68,6 +69,7 @@ from merchant_ai.models import (
     ToolCallExecutionResult,
     ToolCallRequest,
     ToolCachePolicy,
+    TraceSpan,
     LoadBalancerTarget,
     MemoryRetrievalCandidate,
     VerifiedEvidence,
@@ -95,6 +97,7 @@ from merchant_ai.services.answer import (
     answer_data_package,
     compact_rule_evidence,
     plan_requires_rule_evidence,
+    plan_has_ratio_calculation,
     select_answer_skill,
     sanitize_business_answer_text,
     business_summary_table,
@@ -104,7 +107,7 @@ from merchant_ai.services.answer import (
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.formulas import compile_metric_formula, reconcile_metric_formula_for_schema
-from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.llm import LlmClient, prompt_cache_metadata
 from merchant_ai.services.middleware import (
     ActionContractMiddleware,
     CancellationMiddleware,
@@ -115,8 +118,14 @@ from merchant_ai.services.middleware import (
     LoopGuardMiddleware,
     MemoryMiddleware,
     MiddlewareChain,
+    RunBudgetMiddleware,
+    SafetyFinishReasonMiddleware,
     SummarizeMiddleware,
+    TokenUsageMiddleware,
     ToolCallRecoveryMiddleware,
+    ToolOutputBudgetMiddleware,
+    append_middleware_event,
+    default_harness_middlewares,
     estimate_text_tokens,
 )
 from merchant_ai.services.context_assembly import ContextAssembler, ThreadContextService
@@ -174,9 +183,11 @@ from merchant_ai.services.query import (
     SqlValidationService,
     bind_node_sql_parameters,
     choose_entity_transfer_key,
+    compact_tool_failure_for_prompt,
     entity_set_from_rows,
     merge_task_result_bundles,
     multi_entity_transfer_values,
+    serialize_tool_execution_result,
     table_access_hint,
 )
 from merchant_ai.services.skill_worker import SkillWorkerExecutor
@@ -190,6 +201,7 @@ from merchant_ai.services.tool_runtime import (
     ToolFailureRegistry,
     ToolRuntimePolicyRegistry,
     ToolRuntimeService,
+    tool_error_details,
 )
 from merchant_ai.services.tools import (
     artifact_file_tool_schemas,
@@ -247,12 +259,191 @@ def test_prompt_assembler_builds_deerflow_style_runtime_sections():
             "loaded_skills": "- trade\n- refund",
         },
     )
-    assert '<prompt id="lead.system" version="v1" agent="LeadAgent">' in prompt.system_prompt
+    assert '<prompt id="lead.system" version="v1" agent="LeadAgent" templateFingerprint="' in prompt.system_prompt
+    assert '<static-section name="common.stable_boundary" version="v1"' in prompt.system_prompt
     assert '<runtime-section name="available_actions">' in prompt.system_prompt
     assert "plan_graph" in prompt.system_prompt
     assert "trade" in prompt.system_prompt
     assert prompt.trace()["promptId"] == "lead.system"
     assert prompt.trace()["sections"] == ["available_actions", "loaded_skills"]
+    assert "lead.action_registry" in prompt.trace()["staticSections"]
+    assert prompt.trace()["templateFingerprint"]
+    assert prompt.trace()["renderFingerprint"]
+    cache_meta = prompt_cache_metadata(prompt.system_prompt)
+    assert cache_meta["promptId"] == "lead.system"
+    assert cache_meta["templateFingerprint"] == prompt.trace()["templateFingerprint"]
+
+
+def test_harness_middlewares_are_configurable_by_registry():
+    settings = get_settings().model_copy(
+        update={
+            "harness_middleware_disabled": "memory,skill",
+            "harness_middleware_order": "dynamic_context,run_budget",
+        }
+    )
+    middlewares = default_harness_middlewares(settings, ContextManager(settings))
+    names = [item.name for item in middlewares]
+
+    assert names[:2] == ["dynamic_context", "run_budget"]
+    assert "memory" not in names
+    assert "skill" not in names
+    assert "context_snapshot" in names
+
+
+def test_agent_state_merge_dedupes_shared_runtime_lists():
+    existing = {
+        "tool_call_ledger": [{"toolCallId": "call_1", "status": "running"}],
+        "runtime_injection": {"a": 1},
+    }
+    update = {
+        "tool_call_ledger": [
+            {"toolCallId": "call_1", "status": "success"},
+            {"toolCallId": "call_2", "status": "failed"},
+        ],
+        "runtime_injection": {"b": 2},
+    }
+
+    merged = merge_agent_state_update(existing, update)
+
+    assert merged["tool_call_ledger"] == [
+        {"toolCallId": "call_1", "status": "success"},
+        {"toolCallId": "call_2", "status": "failed"},
+    ]
+    assert merged["runtime_injection"] == {"a": 1, "b": 2}
+
+
+def test_middleware_chain_merges_partial_state_updates_and_records_trace():
+    class PartialUpdateMiddleware:
+        name = "partial_update"
+
+        def before_policy(self, state):
+            return {
+                "tool_call_ledger": [
+                    {"toolCallId": "call_1", "status": "success"},
+                    {"toolCallId": "call_2", "status": "failed"},
+                ],
+                "runtime_injection": {"b": 2},
+            }
+
+        def before_action(self, state, decision):
+            return state
+
+    state = {
+        "tool_call_ledger": [{"toolCallId": "call_1", "status": "running"}],
+        "runtime_injection": {"a": 1},
+        "middleware_events": [],
+    }
+
+    result = MiddlewareChain([PartialUpdateMiddleware()]).before_policy(state)
+
+    assert result["tool_call_ledger"] == [
+        {"toolCallId": "call_1", "status": "success"},
+        {"toolCallId": "call_2", "status": "failed"},
+    ]
+    assert result["runtime_injection"] == {"a": 1, "b": 2}
+    assert any(event.code == "MIDDLEWARE_CHAIN_ORDER" for event in result["middleware_events"])
+    assert any(event.code == "MIDDLEWARE_STATE_DELTA" for event in result["middleware_events"])
+
+
+def test_middleware_chain_fail_closed_blocks_on_critical_middleware_error():
+    class BrokenPermissionMiddleware:
+        name = "permission"
+        failure_policy = "closed"
+
+        def before_policy(self, state):
+            raise RuntimeError("permission backend unavailable")
+
+        def before_action(self, state, decision):
+            return state
+
+    state = {"middleware_events": [], "safety_finish_reasons": [], "chat_bi_completed": False, "answer": ""}
+
+    result = MiddlewareChain([BrokenPermissionMiddleware()]).before_policy(state)
+
+    assert result["middleware_blocked"] is True
+    assert result["chat_bi_completed"] is True
+    assert result["safety_finish_reasons"][0]["finishReason"] == "middleware_fail_closed"
+    assert any(event.code == "MIDDLEWARE_FAIL_CLOSED" and event.channel == "audit" for event in result["middleware_events"])
+
+
+def test_middleware_events_preserve_audit_entries_when_trace_is_capped():
+    state = {"middleware_events": []}
+    append_middleware_event(state, "permission", "before_policy", status="blocked", code="WRITE_OPERATION_REQUIRES_HUMAN", message="blocked")
+    for index in range(240):
+        append_middleware_event(state, "token_usage", "before_policy", status="observed", code="TOKEN_USAGE_ESTIMATED", message=str(index))
+
+    assert len(state["middleware_events"]) == 200
+    assert any(event.code == "WRITE_OPERATION_REQUIRES_HUMAN" and event.channel == "audit" for event in state["middleware_events"])
+
+
+def test_deferred_tool_schema_loader_selects_requested_schemas_only():
+    from merchant_ai.services.tools import deferred_tool_schema_loader_tool, select_tool_schemas, semantic_file_tool_definitions, tool_schema_catalog
+
+    tools = semantic_file_tool_definitions()
+    loader = deferred_tool_schema_loader_tool([tool.name for tool in tools])
+    selected = select_tool_schemas(tools, ["semantic_read"])
+
+    assert loader.name == "load_tool_schemas"
+    assert any(item["name"] == "semantic_read" for item in tool_schema_catalog(tools))
+    assert [item["function"]["name"] for item in selected] == ["semantic_read"]
+
+
+def test_evidence_gap_has_standard_recovery_fields():
+    verified = EvidenceVerifier().verify(
+        "最近 7 天 GMV 是多少",
+        QueryPlan(),
+        AgentRunResult(
+            task_results=[
+                AgentTaskResult(
+                    task_id="gmv_node",
+                    success=False,
+                    query_bundle=QueryBundle(failed=True, error="Unknown column gmv_bad", sql="select gmv_bad from dwd_order"),
+                )
+            ]
+        ),
+    )
+
+    gap = verified.gaps[0]
+
+    assert gap.gap_code == "UNKNOWN_COLUMN"
+    assert gap.source_node_id == "gmv_node"
+    assert gap.suggested_action == "retry_repair_or_answer_with_gap"
+    assert gap.details["gapCode"] == "UNKNOWN_COLUMN"
+
+
+def test_skill_lifecycle_record_has_standard_engineering_fields(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "llm_api_key": ""})
+    workflow = create_workflow(settings)
+    state = {
+        "skill_lifecycle_records": [],
+        "agent_run_result": AgentRunResult(),
+        "thinking_steps": [],
+    }
+    checkpoint = tmp_path / "skill_checkpoint.json"
+    checkpoint.write_text("{}", encoding="utf-8")
+
+    workflow.record_skill_lifecycle(
+        state,
+        {
+            "skillName": "risk_analysis",
+            "lifecycleStage": "completed",
+            "isolatedRunId": "skill_risk_1",
+            "matchedBy": "unit",
+            "checkpointPath": str(checkpoint),
+            "contextPackage": {"contextHash": "ctx_hash"},
+            "startedAt": "2026-07-11T00:00:00",
+            "completedAt": "2026-07-11T00:00:01",
+            "durationMs": 1000,
+            "progress": ["matched", "completed"],
+        },
+    )
+
+    record = state["skill_lifecycle_records"][0]
+    assert record.record_id
+    assert record.status == "success"
+    assert record.context_hash == "ctx_hash"
+    assert record.duration_ms == 1000
+    assert record.artifact_refs
 
 
 def test_tool_schemas_define_runtime_call_format():
@@ -2371,9 +2562,8 @@ def test_answer_compose_merges_rule_evidence_with_bi_data():
     assert compact_rule_evidence("发货超时要注意什么", rule_context)
 
 
-def test_answer_skill_selects_ratio_analysis_for_scope_event_ratio(tmp_path):
+def test_answer_skill_does_not_use_skill_for_ordinary_scope_event_ratio(tmp_path):
     settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
-    service = AnswerComposeService(LlmClient(settings))
     plan = QueryPlan(
         question_understanding={
             "analysisIntent": "comparison",
@@ -2411,16 +2601,81 @@ def test_answer_skill_selects_ratio_analysis_for_scope_event_ratio(tmp_path):
         merged_query_bundle=bundle,
     )
 
+    assert select_answer_skill(plan, run, False) == ""
+
+
+def test_answer_skill_uses_declared_reusable_ratio_workflow(tmp_path):
+    settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "comparison",
+            "requiresExplanation": True,
+            "skillWorkflow": {"skillName": "ratio_analysis", "required": True},
+            "calculationIntents": [{"operation": "ratio"}],
+        },
+        intents=[
+            QuestionIntent(
+                question="固定占比分析流程",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                plan_task_id="derived_refund_share",
+                metric_name="refund_bill_cnt_share_of_order_detail_cnt",
+                metric_formula="refund_bill_cnt / order_detail_cnt",
+                metric_resolution={"computeStrategy": "scope_event_ratio", "formula": "refund_bill_cnt / order_detail_cnt"},
+            )
+        ],
+    )
+    bundle = QueryBundle(
+        rows=[{"order_detail_cnt": 10, "refund_bill_cnt": 2, "refund_bill_cnt_share_of_order_detail_cnt": 0.2}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="derived_refund_share", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+
     assert select_answer_skill(plan, run, False) == "ratio_analysis"
-    answer = service.summarize_analysis("最近10天使用优惠券的订单中，有退货的订单占多少？", plan, run, str(tmp_path))
+    answer = service.summarize_analysis("固定占比分析流程", plan, run, str(tmp_path))
 
     assert "占比分析" in answer
     assert "refund_bill_cnt / order_detail_cnt" in answer
     assert service.last_analysis_skill_trace["skillName"] == "ratio_analysis"
-    assert service.last_analysis_skill_trace["deterministicRenderer"] is True
-    assert service.last_analysis_skill_trace["workerType"] == "SKILL_WORKER"
-    assert service.last_analysis_skill_trace["isolatedExecution"] is True
-    assert Path(service.last_analysis_skill_trace["contextPackagePath"]).exists()
+
+
+def test_answer_skill_does_not_use_skill_for_ordinary_risk_ratio_metric():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "risk_ranking",
+            "requiresExplanation": True,
+            "analysisGrain": "product",
+        },
+        intents=[
+            QuestionIntent(
+                question="按风险排名",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                plan_task_id="derived_risk_metric",
+                metric_name="refund_rate",
+                metric_formula="refund_bill_cnt / order_detail_cnt",
+                metric_resolution={"computeStrategy": "component_metric_ratio", "formula": "refund_bill_cnt / order_detail_cnt"},
+                group_by_column="spu_id",
+                output_keys=["seller_id", "spu_id", "refund_rate"],
+            )
+        ],
+    )
+    bundle = QueryBundle(rows=[{"spu_id": "spu_1", "refund_rate": 0.4}], original_row_count=1)
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="derived_risk_metric", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+    )
+
+    assert plan_has_ratio_calculation(plan)
+    assert select_answer_skill(plan, run, False) == ""
 
 
 def test_answer_skill_match_can_use_llm_header_selection(tmp_path):
@@ -2443,6 +2698,7 @@ def test_answer_skill_match_can_use_llm_header_selection(tmp_path):
         question_understanding={
             "analysisIntent": "comparison",
             "requiresExplanation": True,
+            "skillWorkflow": {"enabled": True},
             "calculationIntents": [{"operation": "ratio", "numeratorMetricRef": "refund_bill_cnt", "denominatorMetricRef": "order_detail_cnt"}],
         },
         intents=[
@@ -2467,6 +2723,75 @@ def test_answer_skill_match_can_use_llm_header_selection(tmp_path):
     assert "占比分析" in answer
     assert service.last_analysis_skill_trace["matchedBy"] == "llm_skill_header_match"
     assert service.last_analysis_skill_trace["skillName"] == "ratio_analysis"
+
+
+def test_semantic_fast_path_risk_skill_uses_local_renderer(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "skill_worker_enabled": True})
+    service = AnswerComposeService(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisGrain": "product",
+            "analysisIntent": "risk_ranking",
+            "requiresExplanation": True,
+            "source": "semantic_topn_metric_fast_path",
+        },
+        agent_trace=["planner=semantic_topn_metric_fast_path", "planner.semantic_fast_path=topn_metric"],
+        intents=[
+            QuestionIntent(
+                question="退款率最高商品",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                plan_task_id="derived_refund_rate",
+                metric_name="refund_rate",
+                group_by_column="sku_id",
+                output_keys=["seller_id", "sku_id", "spu_name", "refund_rate"],
+            ),
+            QuestionIntent(
+                question="商品发布时间",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.GOODS,
+                plan_task_id="goods_lookup",
+                preferred_table="dwm_goods_detail_df",
+                output_keys=["seller_id", "spu_id", "spu_name", "spu_apply_create_time"],
+            ),
+        ],
+    )
+    bundle = QueryBundle(
+        rows=[
+            {
+                "seller_id": "100",
+                "sku_id": "5",
+                "spu_name": "Commuter Backpack Grey",
+                "refund_rate": 62.5,
+                "order_detail_cnt": 8,
+                "pay_amt": 418.65,
+                "spu_apply_create_time": "2026-03-01T10:00:00",
+            }
+        ],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="derived_refund_rate", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    answer = service.run_analysis_skill(
+        "最近30天退款率最高的前10个商品，同时看下单数、退款金额和商品发布时间，帮我判断哪些是高风险新品。",
+        plan,
+        run,
+        str(tmp_path),
+        skill_name="risk_analysis",
+    )
+
+    assert "风险分析" in answer
+    assert "Commuter Backpack Grey" in answer
+    assert service.last_analysis_skill_trace["workerType"] == "LOCAL_STRUCTURED_RENDERER"
+    assert service.last_analysis_skill_trace["isolatedExecution"] is False
+    assert service.last_analysis_skill_trace["deterministicRenderer"] is True
 
 
 def test_answer_skill_selects_rule_compliance_for_rule_plus_data(tmp_path):
@@ -2507,7 +2832,11 @@ def test_answer_skill_selects_new_product_risk_from_structured_lifecycle_evidenc
     settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
     service = AnswerComposeService(LlmClient(settings))
     plan = QueryPlan(
-        question_understanding={"analysisIntent": "risk_ranking", "requiresExplanation": True},
+        question_understanding={
+            "analysisIntent": "risk_ranking",
+            "requiresExplanation": True,
+            "skillWorkflow": {"skillName": "new_product_risk", "required": True},
+        },
         intents=[
             QuestionIntent(
                 question="最近30天退款率最高的商品，判断高风险新品。",
@@ -5345,6 +5674,37 @@ def test_llm_client_timeout_cancels_async_provider_call():
     assert model.cancelled
 
 
+def test_llm_client_opens_circuit_after_timeout_and_fast_fails():
+    class SlowModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def ainvoke(self, messages):
+            self.calls += 1
+            await asyncio.sleep(1.3)
+            return type("Msg", (), {"content": "late"})()
+
+    settings = get_settings().model_copy(
+        update={
+            "llm_request_timeout_seconds": 1,
+            "llm_circuit_threshold": 1,
+            "llm_circuit_cooldown_seconds": 30,
+        }
+    )
+    client = LlmClient(settings)
+    model = SlowModel()
+    client._chat_model = lambda timeout_seconds=None: model
+
+    first = client.chat("system", "user", fallback="fallback", timeout_seconds=1)
+    second = client.chat("system", "user again", fallback="fallback", timeout_seconds=1)
+
+    assert first == "fallback"
+    assert second == "fallback"
+    assert model.calls == 1
+    assert "circuit_open" in client.last_error
+    assert client.cache_trace()["circuit"]["open"]
+
+
 def test_llm_client_tool_json_chat_parses_native_tool_call():
     settings = get_settings()
     client = LlmClient(settings)
@@ -5507,6 +5867,7 @@ def test_middleware_chain_summarizes_and_writes_workspace_manifest(tmp_path):
     assert state["context_budget_reports"][-1].over_budget
     assert state["context_compression_events"]
     assert state["context_compression_events"][-1].summary_artifact.path
+    assert state["_runtime_context_stale"] is True
     assert (outputs / "workspace_manifest.json").exists()
     assert state["workspace_manifest"].entry_count >= 1
     assert any(event.code == "CONTEXT_SUMMARIZED" for event in state["middleware_events"])
@@ -5663,6 +6024,49 @@ def test_dynamic_context_middleware_injects_runtime_boundary(tmp_path):
     assert state["runtime_injection"]["threadContext"]["restored"]
     assert "currentDate" in state["runtime_context"]
     assert state["middleware_events"][-1].code == "RUNTIME_CONTEXT_INJECTED"
+
+
+def test_dynamic_context_injects_standard_tool_failure_feedback():
+    settings = get_settings()
+    state = {
+        "tool_call_results": [
+            ToolCallExecutionResult(
+                id="tool_bad",
+                name="semantic_read",
+                status="failed",
+                error_type="INVALID_REF",
+                error_message="semantic ref not found",
+                retryable=True,
+                recommended_action="semantic_grep",
+                fallback_tools=["semantic_grep"],
+            )
+        ],
+        "middleware_events": [],
+    }
+
+    DynamicContextMiddleware(settings).before_policy(state)
+
+    feedback = state["runtime_injection"]["toolFeedback"][0]
+    assert feedback["toolCallId"] == "tool_bad"
+    assert feedback["toolName"] == "semantic_read"
+    assert feedback["errorCode"] == "INVALID_REF"
+    assert feedback["recommendedAction"] == "semantic_grep"
+    assert "toolFeedback" in state["runtime_context"]
+
+
+def test_dynamic_context_rerenders_after_summary_compaction(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    state = {
+        "react_round": 2,
+        "thread_data": ThreadData(thread_id="thread_ctx_stale", run_id="run_ctx_stale", outputs_path=str(tmp_path / "outputs")),
+        "_runtime_context_stale": True,
+        "middleware_events": [],
+    }
+
+    DynamicContextMiddleware(settings).before_policy(state)
+
+    assert state["_runtime_context_stale"] is False
+    assert state["middleware_events"][-1].metadata["rerenderedAfterCompaction"] is True
 
 
 def test_memory_middleware_injects_and_store_writes_structured_memory(tmp_path):
@@ -7700,6 +8104,168 @@ def test_tool_call_recovery_patches_dangling_tool_result():
     assert state["tool_call_recovery_events"][0].action == "patch_missing_terminal_result"
 
 
+def test_tool_call_recovery_inserts_synthetic_result_for_missing_tool_call_result():
+    state = {
+        "tool_call_requests": [ToolCallRequest(id="tool_missing", name="semantic_read", args={"refId": "semantic:x"})],
+        "tool_call_results": [],
+        "tool_call_ledger": [],
+        "tool_call_recovery_events": [],
+        "middleware_events": [],
+    }
+
+    ToolCallRecoveryMiddleware().before_policy(state)
+
+    assert state["tool_call_results"][0].id == "tool_missing"
+    assert state["tool_call_results"][0].status == "failed"
+    assert state["tool_call_results"][0].error_type == "MISSING_TOOL_RESULT"
+    assert state["tool_call_ledger"][0].tool_call_id == "tool_missing"
+    assert state["tool_call_recovery_events"][0].action == "patch_missing_tool_result"
+    assert state["middleware_events"][0].code == "MISSING_TOOL_RESULT_PATCHED"
+
+
+def test_tool_output_budget_middleware_offloads_large_tool_result(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "middleware_tool_output_budget_chars": 1000,
+        }
+    )
+    state = {
+        "thread_data": ThreadData(thread_id="thread_tool_budget", run_id="run_tool_budget", outputs_path=str(tmp_path / "outputs")),
+        "tool_call_results": [
+            ToolCallExecutionResult(
+                id="tool_big",
+                name="artifact_read",
+                status="success",
+                result={"text": "x" * 2000},
+            )
+        ],
+        "middleware_events": [],
+    }
+
+    ToolOutputBudgetMiddleware(settings).before_policy(state)
+
+    result = state["tool_call_results"][0]
+    assert result.result["_offloaded"]
+    assert result.result["truncated"]
+    assert Path(result.result["artifactRef"]["path"]).exists()
+    assert state["tool_output_budget_reports"][0]["toolCallId"] == "tool_big"
+    assert state["middleware_events"][-1].code == "TOOL_OUTPUT_BUDGET_APPLIED"
+
+
+def test_token_usage_middleware_records_estimated_usage():
+    settings = get_settings()
+    state = {
+        "react_round": 2,
+        "question": "最近7天GMV",
+        "runtime_context": "runtime" * 20,
+        "memory_context": "memory",
+        "summary_context": "",
+        "tool_call_results": [ToolCallExecutionResult(id="tool_1", name="semantic_read", status="success")],
+        "agent_run_result": AgentRunResult(task_results=[AgentTaskResult(task_id="node_1", success=True)]),
+        "middleware_events": [],
+    }
+
+    TokenUsageMiddleware(settings).before_policy(state)
+
+    assert state["token_usage_reports"][0]["stage"] == "policy_round_2"
+    assert state["token_usage_reports"][0]["estimatedInputTokens"] > 0
+    assert state["middleware_events"][-1].code == "TOKEN_USAGE_ESTIMATED"
+
+
+def test_safety_finish_reason_middleware_records_llm_timeout_and_forced_stop():
+    state = {
+        "planner_provider_error": "timeout: provider call exceeded 8 seconds",
+        "forced_tool_loop_stop_message": "[FORCED STOP] repeated tool calls",
+        "middleware_loop_blocked": True,
+        "middleware_events": [],
+    }
+
+    SafetyFinishReasonMiddleware().before_policy(state)
+
+    reasons = {item["finishReason"] for item in state["safety_finish_reasons"]}
+    assert "timeout" in reasons
+    assert "forced_stop" in reasons or "tool_loop_hard_stop" in reasons
+    assert state["middleware_events"][-1].code == "SAFETY_FINISH_REASON_RECORDED"
+
+
+def test_run_budget_middleware_blocks_when_action_budget_exhausted():
+    settings = get_settings().model_copy(update={"run_budget_max_actions": 2})
+    state = {
+        "run_started_at_ms": int(time.time() * 1000),
+        "action_history": [AgentActionTrace(action="route_topic"), AgentActionTrace(action="retrieve_knowledge")],
+        "trace_spans": [],
+        "tool_runtime_events": [],
+        "token_usage_reports": [],
+        "middleware_events": [],
+        "safety_finish_reasons": [],
+        "chat_bi_completed": False,
+        "answer": "",
+    }
+
+    RunBudgetMiddleware(settings).before_policy(state)
+
+    assert state["run_budget_exhausted"]
+    assert state["chat_bi_completed"]
+    assert state["run_budget_report"]["breaches"] == ["actions"]
+    assert state["middleware_events"][-1].code == "RUN_BUDGET_EXHAUSTED"
+
+
+def test_run_budget_middleware_counts_llm_doris_tool_and_tokens():
+    settings = get_settings().model_copy(
+        update={
+            "run_budget_max_llm_calls": 1,
+            "run_budget_max_doris_queries": 1,
+            "run_budget_max_tool_calls": 1,
+            "run_budget_max_estimated_tokens": 100,
+        }
+    )
+    state = {
+        "run_started_at_ms": int(time.time() * 1000),
+        "action_history": [],
+        "trace_spans": [
+            TraceSpan(kind="llm", name="planner"),
+            TraceSpan(kind="sql", name="execute_sql"),
+        ],
+        "tool_runtime_events": [{"eventType": "tool.started"}],
+        "token_usage_reports": [{"estimatedInputTokens": 120}],
+        "middleware_events": [],
+        "safety_finish_reasons": [],
+        "chat_bi_completed": False,
+        "answer": "",
+    }
+
+    RunBudgetMiddleware(settings).before_policy(state)
+
+    assert state["run_budget_exhausted"]
+    assert set(state["run_budget_report"]["breaches"]) == {"llm_calls", "doris_queries", "tool_calls", "estimated_tokens"}
+
+
+def test_run_budget_middleware_uses_peak_context_tokens_not_cumulative_rounds():
+    settings = get_settings().model_copy(update={"run_budget_max_estimated_tokens": 60000})
+    state = {
+        "run_started_at_ms": int(time.time() * 1000),
+        "action_history": [],
+        "trace_spans": [],
+        "tool_runtime_events": [],
+        "token_usage_reports": [
+            {"estimatedInputTokens": 32763},
+            {"estimatedInputTokens": 37060},
+        ],
+        "middleware_events": [],
+        "safety_finish_reasons": [],
+        "chat_bi_completed": False,
+        "answer": "",
+    }
+
+    RunBudgetMiddleware(settings).before_policy(state)
+
+    assert not state.get("run_budget_exhausted")
+    assert state["run_budget_report"]["usage"]["estimatedTokens"] == 37060
+    assert state["run_budget_report"]["usage"]["peakEstimatedTokens"] == 37060
+    assert state["run_budget_report"]["breaches"] == []
+
+
 def test_clarification_middleware_intercepts_ask_human_as_virtual_tool_call():
     state = {
         "qa_id": "qa_clarify",
@@ -7759,6 +8325,111 @@ def test_loop_guard_blocks_repeated_action_pattern():
     assert state["middleware_loop_blocked"]
     assert state["query_graph_validated"]
     assert state["query_graph_validation_result"].gaps[0].code == "LOOP_DETECTED"
+
+
+def test_loop_guard_warns_and_hard_stops_repeated_tool_calls():
+    settings = get_settings().model_copy(
+        update={
+            "middleware_tool_repeat_warning_threshold": 3,
+            "middleware_tool_repeat_hard_stop_threshold": 5,
+            "middleware_tool_type_warning_threshold": 30,
+            "middleware_tool_type_hard_stop_threshold": 50,
+        }
+    )
+    warning_state = {
+        "tool_call_requests": [
+            ToolCallRequest(id="call_%d" % index, name="semantic_read", args={"refId": "metric.gmv"})
+            for index in range(3)
+        ],
+        "middleware_events": [],
+    }
+
+    LoopGuardMiddleware(settings).before_policy(warning_state)
+
+    assert not warning_state.get("middleware_loop_blocked")
+    assert "semantic_read" in warning_state["pending_tool_loop_warnings"][0]
+    assert warning_state["middleware_events"][-1].code == "TOOL_CALL_LOOP_WARNING"
+
+    hard_stop_state = {
+        "tool_call_requests": [
+            ToolCallRequest(id="call_%d" % index, name="semantic_read", args={"refId": "metric.gmv"})
+            for index in range(5)
+        ],
+        "middleware_events": [],
+    }
+
+    LoopGuardMiddleware(settings).before_policy(hard_stop_state)
+
+    assert hard_stop_state["middleware_loop_blocked"]
+    assert hard_stop_state["chat_bi_completed"]
+    assert hard_stop_state["tool_call_requests"] == []
+    assert "FORCED STOP" in hard_stop_state["forced_tool_loop_stop_message"]
+    assert hard_stop_state["query_graph_validation_result"].gaps[0].code == "TOOL_CALL_LOOP_DETECTED"
+    assert hard_stop_state["middleware_events"][-1].code == "TOOL_CALL_LOOP_HARD_STOP"
+
+
+def test_loop_guard_tracks_tool_calls_in_thread_window_across_rounds():
+    settings = get_settings().model_copy(
+        update={
+            "middleware_tool_repeat_warning_threshold": 3,
+            "middleware_tool_repeat_hard_stop_threshold": 5,
+            "middleware_tool_loop_window_size": 20,
+        }
+    )
+    state = {"thread_id": "thread_loop", "middleware_events": [], "tool_loop_history": {}}
+
+    for index in range(3):
+        state["tool_call_requests"] = [ToolCallRequest(id="call_%d" % index, name="read_file", args={"path": "/tmp/a.md", "noise": index})]
+        LoopGuardMiddleware(settings).before_policy(state)
+
+    assert not state.get("middleware_loop_blocked")
+    assert "read_file" in state["pending_tool_loop_warnings"][0]
+    assert len(state["tool_loop_history"]["thread_loop"]) == 3
+
+
+def test_loop_guard_does_not_recount_existing_planner_tool_calls_across_policy_rounds():
+    settings = get_settings().model_copy(
+        update={
+            "middleware_tool_repeat_warning_threshold": 3,
+            "middleware_tool_repeat_hard_stop_threshold": 5,
+            "middleware_tool_loop_window_size": 20,
+        }
+    )
+    state = {
+        "thread_id": "thread_planner_tool",
+        "plan": QueryPlan(
+            planner_tool_calls=[
+                {
+                    "id": "planner_call_1",
+                    "name": "emit_question_understanding",
+                    "args": {"questionUnderstanding": {"timeWindowDays": 7}},
+                }
+            ]
+        ),
+        "middleware_events": [],
+        "tool_loop_history": {},
+    }
+
+    chain = MiddlewareChain([LoopGuardMiddleware(settings)])
+    for _index in range(5):
+        state = chain.before_policy(state)
+
+    assert not state.get("middleware_loop_blocked")
+    assert state.get("pending_tool_loop_warnings", []) == []
+    assert len(state["tool_loop_history"]["thread_planner_tool"]) == 1
+
+
+def test_tool_loop_warning_is_injected_into_runtime_context():
+    settings = get_settings()
+    state = {
+        "pending_tool_loop_warnings": ["工具 semantic_read 使用相同参数已重复 3 次，请停止重复调用。"],
+        "middleware_events": [],
+    }
+
+    DynamicContextMiddleware(settings).before_policy(state)
+
+    assert "semantic_read" in state["runtime_context"]
+    assert state["pending_tool_loop_warnings"] == []
 
 
 def test_tool_failure_registry_blocks_repeated_identical_failures():
@@ -7865,9 +8536,107 @@ def test_tool_call_executor_pairs_parallel_results_and_isolates_failures():
     assert [item.id for item in results] == ["call_1", "call_2"]
     assert results[0].status == "success"
     assert results[0].result == {"value": 7}
+    assert results[0].idempotency_key
+    assert results[0].params_hash
     assert results[1].status == "failed"
     assert results[1].error_type == "INVALID_ARGUMENT"
+    assert results[1].error_code == "INVALID_ARGUMENT"
+    assert results[1].tool_message["toolCallId"] == "call_2"
+    assert results[1].tool_message["toolName"] == "bad_tool"
+    assert results[1].tool_message["errorCode"] == "INVALID_ARGUMENT"
+    assert results[1].tool_message["details"]["toolCallId"] == "call_2"
+    assert results[1].idempotency_key
     assert registry.trace()["failures"]
+
+
+def test_tool_failure_feedback_keeps_runtime_envelope_for_prompt():
+    result = ToolCallExecutionResult(
+        id="tool_1",
+        name="semantic_read",
+        status="failed",
+        error_type="TIMEOUT",
+        error_message="semantic_read timed out after 5s",
+        timeout_type="read_timeout",
+        retryable=True,
+        recommended_action="retry_or_use_semantic_grep",
+        fallback_tools=["semantic_grep"],
+        service_name="semantic",
+        params_hash="params_1",
+    )
+
+    payload = serialize_tool_execution_result(result)
+
+    assert payload["errorCode"] == "TIMEOUT"
+    assert payload["retryable"] is True
+    assert payload["recommendedAction"] == "retry_or_use_semantic_grep"
+    assert payload["fallbackTools"] == ["semantic_grep"]
+    assert payload["details"]["toolCallId"] == "tool_1"
+    assert payload["details"]["serviceName"] == "semantic"
+    assert result.tool_message["errorType"] == "TIMEOUT"
+    assert result.tool_message["details"]["timeoutType"] == "read_timeout"
+
+
+def test_tool_error_details_are_tool_specific_and_prompt_compacted():
+    details = tool_error_details(
+        "execute_sql",
+        {
+            "sql": "select * from dwd_order where seller_id = 1 " + "and order_id is not null " * 80,
+            "queryId": "query_1",
+            "failedStage": "execute",
+        },
+        "UNKNOWN_COLUMN",
+        "unknown column: bad_col",
+        call_id="sql_1",
+    )
+
+    assert details["toolKind"] == "doris"
+    assert details["toolCallId"] == "sql_1"
+    assert details["sqlHash"]
+    assert len(details["sqlPreview"]) <= 500
+    assert details["queryId"] == "query_1"
+
+    compacted = compact_tool_failure_for_prompt(
+        {
+            "id": "sql_1",
+            "name": "execute_sql",
+            "status": "failed",
+            "errorType": "UNKNOWN_COLUMN",
+            "errorMessage": "unknown column: bad_col",
+            "retryable": False,
+            "recommendedAction": "repair_sql",
+            "fallbackTools": ["answer_with_gap"],
+            "details": details,
+        }
+    )
+
+    assert compacted["errorCode"] == "UNKNOWN_COLUMN"
+    assert compacted["recommendedAction"] == "repair_sql"
+    assert len(compacted["details"]["sqlPreview"]) <= 500
+
+
+def test_tool_runtime_service_execute_many_runs_parallel_and_records_batch_events():
+    settings = get_settings().model_copy(update={"tool_max_concurrency": 2, "tool_rate_limit_enabled": False})
+    runtime = ToolRuntimeService(settings)
+
+    def slow(args):
+        time.sleep(0.2)
+        return {"value": args["value"]}
+
+    started = time.monotonic()
+    results = runtime.execute_many(
+        [
+            ToolCallRequest(id="call_1", name="semantic_read", args={"value": 1}),
+            ToolCallRequest(id="call_2", name="artifact_read", args={"value": 2}),
+        ],
+        {"semantic_read": slow, "artifact_read": slow},
+    )
+    elapsed = time.monotonic() - started
+
+    assert [item.status for item in results] == ["success", "success"]
+    assert elapsed < 0.35
+    event_types = [item["eventType"] for item in runtime.trace()["events"]]
+    assert "tool.parallel.batch_started" in event_types
+    assert "tool.parallel.batch_finished" in event_types
 
 
 def test_execute_sql_runtime_policy_leaves_repair_to_node_worker():
@@ -7898,6 +8667,68 @@ def test_tool_runtime_service_caches_successful_result():
     assert calls["count"] == 1
     metrics = runtime.trace()["metrics"]["tools"][0]
     assert metrics["cacheHits"] == 1
+
+
+def test_tool_runtime_service_exposes_stable_idempotency_key():
+    settings = get_settings().model_copy(update={"cache_enabled": False})
+    runtime = ToolRuntimeService(settings)
+
+    def handler(args):
+        return {"value": args["value"]}
+
+    first = runtime.execute("semantic_read", {"value": 7}, handler, call_id="tool_call_1")
+    second = runtime.execute("semantic_read", {"value": 7}, handler, call_id="tool_call_1")
+    changed = runtime.execute("semantic_read", {"value": 8}, handler, call_id="tool_call_1")
+
+    assert first.status == second.status == changed.status == "success"
+    assert first.idempotency_key == second.idempotency_key
+    assert first.params_hash == second.params_hash
+    assert first.idempotency_key != changed.idempotency_key
+    assert first.runtime_events[0]["eventType"] == "tool.started"
+    assert first.runtime_events[0]["payload"]["idempotencyKey"] == first.idempotency_key
+
+
+def test_tool_runtime_service_classifies_tool_timeout_and_emits_heartbeat():
+    settings = get_settings().model_copy(
+        update={
+            "tool_rate_limit_enabled": False,
+            "tool_heartbeat_interval_seconds": 0.1,
+            "doris_read_timeout_seconds": 1,
+        }
+    )
+    runtime = ToolRuntimeService(settings)
+
+    def slow_handler(args):
+        time.sleep(1.4)
+        return {"ok": True}
+
+    result = runtime.execute("execute_sql", {"sql": "SELECT 1"}, slow_handler, target_kind="doris")
+
+    assert result.status == "failed"
+    assert result.error_type == "TIMEOUT"
+    assert result.timeout_type == "tool_timeout"
+    event_types = [item["eventType"] for item in result.runtime_events]
+    assert "tool.started" in event_types
+    assert "tool.heartbeat" in event_types
+
+
+def test_tool_runtime_service_classifies_connect_and_read_timeouts():
+    settings = get_settings().model_copy(update={"tool_rate_limit_enabled": False})
+    runtime = ToolRuntimeService(settings)
+
+    def connect_timeout(args):
+        raise TimeoutError("connection timed out while connecting to Doris")
+
+    def read_timeout(args):
+        raise TimeoutError("read timed out waiting for Doris result")
+
+    connect_result = runtime.execute("execute_sql", {"sql": "SELECT 1"}, connect_timeout, target_kind="doris")
+    read_result = runtime.execute("execute_sql", {"sql": "SELECT 1"}, read_timeout, target_kind="doris")
+
+    assert connect_result.error_type == "TIMEOUT"
+    assert connect_result.timeout_type == "connect_timeout"
+    assert read_result.error_type == "TIMEOUT"
+    assert read_result.timeout_type == "read_timeout"
 
 
 def test_redis_ttl_cache_falls_back_to_memory_when_unavailable(tmp_path):
@@ -8746,6 +9577,7 @@ def test_node_worker_records_isolated_subagent_checkpoint(tmp_path):
     checkpoint = json.loads(Path(task.sub_agent_checkpoint_path).read_text(encoding="utf-8"))
     assert checkpoint["status"] == "success"
     assert checkpoint["contextPackage"]["taskId"] == "anchor_gmv"
+    assert checkpoint["contextPackage"]["subagentEnabled"] is False
 
 
 def test_node_worker_can_read_artifact_before_sql_draft(tmp_path):
@@ -8980,6 +9812,91 @@ def test_doris_mem_error_uses_resource_safe_fallback_without_llm_repair():
     assert any(item.tool_name == "draft_resource_safe_sql_fallback" for item in result.node_tool_traces)
     assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
     assert llm.calls == 1
+
+
+def test_detail_doris_resource_error_uses_split_query_fallback():
+    settings = get_settings()
+    settings.agent_sql_repair_rounds = 1
+    settings.agent_doris_split_query_enabled = True
+    settings.agent_doris_split_chunk_days = 7
+    settings.agent_doris_split_max_chunks = 3
+    settings.agent_doris_split_max_concurrency = 3
+    doris = DetailSplitFallbackDoris()
+    worker = NodeWorkerExecutor(FakeLlm(), doris, SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "pt", "order_id", "sub_order_id", "spu_name"],
+            )
+        ]
+    )
+    intent = QuestionIntent(
+        question="最近21天订单明细",
+        intent_type="VALID",
+        answer_mode=AnswerMode.DETAIL,
+        plan_task_id="detail_orders",
+        preferred_table="dwm_trade_order_detail_di",
+        sql_strategy="structured_first",
+        output_keys=["order_id", "sub_order_id"],
+        required_evidence=["spu_name", "pt"],
+        days=21,
+        limit=3,
+    )
+
+    result = worker.execute_node(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+
+    assert result.success
+    assert result.query_bundle.original_row_count == 3
+    assert result.query_bundle.runtime_events[0]["event"] == "split_query_fallback_started"
+    assert result.query_bundle.runtime_events[0]["executionMode"] == "parallel_chunks"
+    assert result.query_bundle.runtime_events[0]["maxConcurrency"] == 3
+    assert any(item.tool_name == "execute_sql_split_fallback" for item in result.node_tool_traces)
+    assert len([sql for sql in doris.sqls if "DATE_SUB(CURDATE(), INTERVAL 7 DAY)" in sql]) >= 1
+    assert len(doris.sqls) >= 2
+
+
+def test_detail_split_query_fallback_runs_chunks_in_parallel():
+    settings = get_settings()
+    settings.agent_sql_repair_rounds = 1
+    settings.agent_doris_split_query_enabled = True
+    settings.agent_doris_split_chunk_days = 7
+    settings.agent_doris_split_max_chunks = 3
+    settings.agent_doris_split_max_concurrency = 3
+    doris = SlowDetailSplitFallbackDoris(delay_seconds=0.2)
+    worker = NodeWorkerExecutor(FakeLlm(), doris, SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "pt", "order_id", "sub_order_id", "spu_name"],
+            )
+        ]
+    )
+    intent = QuestionIntent(
+        question="最近21天订单明细",
+        intent_type="VALID",
+        answer_mode=AnswerMode.DETAIL,
+        plan_task_id="detail_orders",
+        preferred_table="dwm_trade_order_detail_di",
+        sql_strategy="structured_first",
+        output_keys=["order_id", "sub_order_id"],
+        required_evidence=["spu_name", "pt"],
+        days=21,
+        limit=3,
+    )
+
+    started = time.monotonic()
+    result = worker.execute_node(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+    elapsed = time.monotonic() - started
+
+    assert result.success
+    assert elapsed < 0.5
+    events = result.query_bundle.runtime_events
+    assert events[0]["executionMode"] == "parallel_chunks"
+    assert events[0]["maxConcurrency"] == 3
+    assert events[-1]["chunksSucceeded"] == 3
+    assert events[-1]["executionMode"] == "parallel_chunks"
 
 
 def test_doris_mem_error_does_not_call_llm_repair_when_no_safe_fallback():
@@ -9381,6 +10298,59 @@ def test_node_worker_executes_independent_ready_nodes_concurrently():
     assert result.node_execution_batches[0].max_concurrency == 2
 
 
+def test_node_worker_limits_parallel_subagents_by_task_cap():
+    settings = get_settings()
+    settings.max_concurrent_sub_agents = 10
+    settings.max_sub_agent_tasks = 2
+    settings.agent_node_timeout_seconds = 5
+    worker = NodeWorkerExecutor(EmptySqlLlm(), SlowDoris(delay_seconds=0.1), SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="table_a", columns=["seller_id"]),
+            PlanningAssetEntry(table="table_b", columns=["seller_id"]),
+            PlanningAssetEntry(table="table_c", columns=["seller_id"]),
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="A",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_a",
+                preferred_table="table_a",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_a` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+            QuestionIntent(
+                question="B",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_b",
+                preferred_table="table_b",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_b` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+            QuestionIntent(
+                question="C",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_c",
+                preferred_table="table_c",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_c` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+        ]
+    )
+
+    result = worker.execute_plan("100", plan, pack, "", "并发限制测试")
+
+    assert [item.success for item in result.task_results] == [True, True, True]
+    assert result.node_execution_batches[0].max_concurrency == 2
+    assert result.node_execution_batches[0].runtime_events[0]["event"] == "node.concurrency_limited"
+    assert result.node_execution_batches[0].runtime_events[0]["requestedConcurrency"] == 10
+
+
 def test_node_worker_isolates_slow_parallel_node_timeout():
     class TableDelayDoris:
         def query(self, sql, params=None):
@@ -9391,6 +10361,7 @@ def test_node_worker_isolates_slow_parallel_node_timeout():
     settings = get_settings()
     settings.max_concurrent_sub_agents = 2
     settings.agent_node_timeout_seconds = 1
+    settings.agent_node_poll_interval_seconds = 0.1
     worker = NodeWorkerExecutor(EmptySqlLlm(), TableDelayDoris(), SqlValidationService(), settings)
     pack = PlanningAssetPack(
         tables=[
@@ -9429,6 +10400,67 @@ def test_node_worker_isolates_slow_parallel_node_timeout():
     assert "超时" in by_id["node_b"].summary
     assert result.node_execution_batches[0].completed_task_ids == ["node_a"]
     assert result.node_execution_batches[0].timed_out_task_ids == ["node_b"]
+    assert by_id["node_b"].query_bundle.runtime_events[0]["timeoutType"] == "node_timeout"
+    batch_events = [item["event"] for item in result.node_execution_batches[0].runtime_events]
+    assert "node.heartbeat" in batch_events
+    assert "node.timeout" in batch_events
+
+
+def test_node_worker_resume_skips_successful_prior_node_result():
+    class CountingDoris:
+        def __init__(self):
+            self.sqls = []
+
+        def query(self, sql, params=None):
+            self.sqls.append(sql)
+            return [{"seller_id": "100"}]
+
+    repo = CountingDoris()
+    settings = get_settings()
+    settings.max_concurrent_sub_agents = 1
+    worker = NodeWorkerExecutor(EmptySqlLlm(), repo, SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="table_a", columns=["seller_id"]),
+            PlanningAssetEntry(table="table_b", columns=["seller_id"]),
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="A",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_a",
+                preferred_table="table_a",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_a` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+            QuestionIntent(
+                question="B",
+                intent_type="VALID",
+                answer_mode="DETAIL",
+                plan_task_id="node_b",
+                preferred_table="table_b",
+                output_keys=["seller_id"],
+                sql="SELECT `seller_id` FROM `table_b` WHERE `seller_id` = '100' LIMIT 1",
+            ),
+        ]
+    )
+    prior = AgentTaskResult(
+        task_id="node_a",
+        success=True,
+        summary="cached node_a",
+        query_bundle=QueryBundle(sql="SELECT 1", tables=["table_a"], rows=[{"seller_id": "100"}]),
+    )
+
+    result = worker.execute_plan("100", plan, pack, "", "resume", resume_task_results=[prior])
+
+    assert result.resumed_task_ids == ["node_a"]
+    assert "node_a" in result.node_execution_batches[0].resumed_task_ids
+    assert [item.task_id for item in result.task_results] == ["node_a", "node_b"]
+    assert len(repo.sqls) == 1
+    assert "table_b" in repo.sqls[0]
 
 
 def test_asset_builder_caches_live_schema_lookup():
@@ -10217,7 +11249,12 @@ def test_lead_policy_can_dispatch_skill_worker_before_final_answer():
         "chat_bi_completed": False,
         "react_round": 8,
         "plan": QueryPlan(
-            question_understanding={"analysisIntent": "anomaly_check", "requiresExplanation": True, "analysisGrain": "day"},
+            question_understanding={
+                "analysisIntent": "anomaly_check",
+                "requiresExplanation": True,
+                "analysisGrain": "day",
+                "skillWorkflow": {"skillName": "bi_trend_attribution", "required": True},
+            },
             intents=[
                 QuestionIntent(
                     question="最近30天GMV是否异常？",
@@ -10248,6 +11285,51 @@ def test_lead_policy_can_dispatch_skill_worker_before_final_answer():
     assert decision.selected_action == "run_analysis_skill"
     assert decision.selected_node == "run_analysis_skill"
     assert "answer_data" in decision.available_actions
+
+
+def test_lead_policy_does_not_dispatch_skill_for_plain_analysis_summary():
+    state = {
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": True,
+        "query_graph_validated": True,
+        "sql_generated": True,
+        "evidence_graph_verified": True,
+        "chat_bi_completed": False,
+        "react_round": 8,
+        "plan": QueryPlan(
+            question_understanding={"analysisIntent": "anomaly_check", "requiresExplanation": True, "analysisGrain": "day"},
+            intents=[
+                QuestionIntent(
+                    question="最近30天GMV是否异常？",
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.GROUP_AGG,
+                    category=QuestionCategory.TRADE,
+                    plan_task_id="gmv_trend",
+                    metric_name="order_gmv_amt_1d",
+                    group_by_column="pt",
+                )
+            ],
+        ),
+        "agent_run_result": AgentRunResult(
+            task_results=[
+                AgentTaskResult(
+                    task_id="gmv_trend",
+                    success=True,
+                    query_bundle=QueryBundle(rows=[{"pt": "2026-07-01", "order_gmv_amt_1d": 100}]),
+                )
+            ],
+            merged_query_bundle=QueryBundle(rows=[{"pt": "2026-07-01", "order_gmv_amt_1d": 100}]),
+            verified_evidence=VerifiedEvidence(passed=True),
+        ),
+    }
+
+    decision = V2AgentPolicy(get_settings()).decide(state)
+
+    assert decision.selected_action == "answer_data"
+    assert "run_analysis_skill" not in decision.available_actions[:1]
 
 
 def test_lead_policy_executes_validated_graph_even_when_main_budget_exhausted():
@@ -11171,6 +12253,48 @@ def test_node_agent_records_tool_traces_and_freshness_report():
     assert "execute_sql" in tools
     assert result.freshness_reports[0].status == "AVAILABLE"
     assert result.freshness_reports[0].max_pt == "20260622"
+
+
+def test_node_agent_anchors_relative_window_to_latest_partition_date():
+    doris = CapturingFreshnessDoris("2026-06-24")
+    settings = get_settings().model_copy(update={"agent_partition_date_anchor_enabled": True})
+    worker = NodeWorkerExecutor(FakeLlm(), doris, SqlValidationService(), settings)
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="dwm_trade_order_detail_di",
+                columns=["seller_id", "sub_order_id", "pt"],
+            )
+        ]
+    )
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="最近7天订单量是多少？",
+                intent_type="VALID",
+                answer_mode="METRIC",
+                plan_task_id="anchor_order",
+                preferred_table="dwm_trade_order_detail_di",
+                sql_strategy="structured_first",
+                group_by_column="seller_id",
+                metric_column="sub_order_id",
+                metric_name="order_detail_cnt",
+                metric_formula="COUNT(DISTINCT `sub_order_id`)",
+                output_keys=["seller_id"],
+                days=7,
+                limit=1,
+            )
+        ]
+    )
+
+    result = worker.execute_plan("100", plan, pack, "", "最近7天订单量是多少？")
+
+    assert result.task_results[0].success
+    executed_sql = doris.sqls[-1]
+    assert "CURDATE()" not in executed_sql
+    assert "DATE_SUB('2026-06-24', INTERVAL 7 DAY)" in executed_sql
+    assert len(result.task_results[0].query_bundle.rows) == 1
+    assert any(item.tool_name == "anchor_partition_date" for item in result.node_tool_traces)
 
 
 def test_node_agent_switches_to_realtime_fallback_when_offline_partition_is_stale():
@@ -14606,6 +15730,65 @@ def test_merchant_experience_package_surfaces_ux_helpers():
     assert isinstance(package["clarificationHints"], list)
 
 
+def test_response_includes_csv_download_for_large_results(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "result_csv_download_min_rows": 3,
+        }
+    )
+    workflow = create_workflow(settings)
+    state = workflow._initial_state(
+        "导出最近7天GMV明细",
+        "100",
+        ChatContext(),
+        None,
+        "thread_csv_download",
+        "run_csv_download",
+    )
+    state["answer"] = "结果较多，已提供 CSV 下载。"
+    state["persisted"] = False
+    state["response_context"] = ChatContext()
+    state["plan"] = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="导出最近7天GMV明细",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_detail",
+                preferred_table="ads_merchant_profile",
+                output_keys=["merchant_id", "pt", "order_gmv_amt_1d"],
+            )
+        ]
+    )
+    rows = [
+        {"merchant_id": "100", "pt": "2026-07-01", "order_gmv_amt_1d": 100},
+        {"merchant_id": "100", "pt": "2026-07-02", "order_gmv_amt_1d": 120},
+        {"merchant_id": "100", "pt": "2026-07-03", "order_gmv_amt_1d": 90},
+    ]
+    bundle = QueryBundle(tables=["ads_merchant_profile"], rows=rows, original_row_count=len(rows))
+    state["agent_run_result"] = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="gmv_detail", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    response = workflow.to_response(state)
+
+    downloads = response.merchant_experience.get("downloadArtifacts") or []
+    assert downloads
+    assert downloads[0]["type"] == "csv"
+    assert downloads[0]["rowCount"] == 3
+    assert downloads[0]["downloadUrl"].startswith("merchant://")
+    csv_path = Path(downloads[0]["path"])
+    assert csv_path.exists()
+    content = csv_path.read_text(encoding="utf-8-sig")
+    assert "merchant_id,pt,order_gmv_amt_1d" in content
+    assert "2026-07-03" in content
+
+
 def test_daily_report_includes_alerts_traceability_and_drilldowns():
     class DailyDoris:
         def query_one(self, sql, params):
@@ -16333,6 +17516,55 @@ def test_skill_worker_executes_complex_skill_with_isolated_context_package(tmp_p
     assert context["verifiedRowCount"] == 1
 
 
+def test_skill_worker_executes_parallel_skills_with_isolated_contexts(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "llm_api_key": "",
+            "max_concurrent_skill_workers": 2,
+        }
+    )
+    worker = SkillWorkerExecutor(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={"analysisIntent": "risk_ranking", "requiresExplanation": True},
+        intents=[
+            QuestionIntent(
+                question="最近30天退款率最高的商品，判断高风险新品。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.GOODS,
+                metric_name="refund_bill_cnt",
+            )
+        ],
+    )
+    bundle = QueryBundle(
+        rows=[{"spu_id": "spu_1", "spu_apply_create_time": "2026-06-01", "refund_bill_cnt": 5}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="risk", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    results = worker.execute_answer_skills(
+        "最近30天退款率最高的商品，判断高风险新品。",
+        plan,
+        run,
+        ["new_product_risk", "risk_analysis"],
+        str(tmp_path),
+        merchant=MerchantInfo(merchant_id="100"),
+        initial_trace={"matchedBy": "unit_parallel"},
+    )
+
+    assert [result.trace["skillName"] for result in results] == ["new_product_risk", "risk_analysis"]
+    assert all(result.answer for result in results)
+    assert all(result.trace["parallelSkillBatch"] is True for result in results)
+    assert all(result.trace["maxConcurrency"] == 2 for result in results)
+    assert all(Path(result.trace["checkpointPath"]).exists() for result in results)
+
+
 def test_workflow_run_analysis_skill_is_lead_agent_dispatchable_node(tmp_path):
     settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "llm_api_key": ""})
     workflow = create_workflow(settings)
@@ -16348,7 +17580,12 @@ def test_workflow_run_analysis_skill_is_lead_agent_dispatchable_node(tmp_path):
     state["event_listener"] = lambda event_type, node, payload: events.append((event_type, node, payload))
     state["routing_decision"] = RoutingDecision(route=QuestionRoute.BUSINESS)
     state["plan"] = QueryPlan(
-        question_understanding={"analysisIntent": "anomaly_check", "requiresExplanation": True, "analysisGrain": "day"},
+        question_understanding={
+            "analysisIntent": "anomaly_check",
+            "requiresExplanation": True,
+            "analysisGrain": "day",
+            "skillWorkflow": {"skillName": "bi_trend_attribution", "required": True},
+        },
         intents=[
             QuestionIntent(
                 question="最近30天GMV和退款金额走势是否正常？",
@@ -16392,6 +17629,78 @@ def test_workflow_run_analysis_skill_is_lead_agent_dispatchable_node(tmp_path):
     assert "matched" in lifecycle_stages
     assert "isolated_execute" in lifecycle_stages
     assert "progress_synced" in lifecycle_stages
+    assert "completed" in lifecycle_stages
+
+
+def test_workflow_run_analysis_skill_can_parallel_candidate_skills(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "llm_api_key": "",
+            "skill_worker_parallel_enabled": True,
+            "max_concurrent_skill_workers": 2,
+        }
+    )
+    workflow = create_workflow(settings)
+    events = []
+    state = workflow._initial_state(
+        "最近30天退款率最高的商品，判断高风险新品。",
+        "100",
+        ChatContext(),
+        lambda event_type, node, payload: events.append((event_type, node, payload)),
+        "thread_skill_parallel",
+        "run_skill_parallel",
+    )
+    state["event_listener"] = lambda event_type, node, payload: events.append((event_type, node, payload))
+    state["routing_decision"] = RoutingDecision(route=QuestionRoute.BUSINESS)
+    state["skill_match"] = SkillMatchState(
+        skill_name="new_product_risk",
+        status="matched",
+        matched_by="unit_parallel",
+        candidate_skills=["risk_analysis", "new_product_risk"],
+        confirmed=True,
+    )
+    state["plan"] = QueryPlan(
+        question_understanding={"analysisIntent": "risk_ranking", "requiresExplanation": True},
+        intents=[
+            QuestionIntent(
+                question="最近30天退款率最高的商品，判断高风险新品。",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DETAIL,
+                category=QuestionCategory.GOODS,
+                plan_task_id="risk",
+                metric_name="refund_bill_cnt",
+            )
+        ],
+    )
+    bundle = QueryBundle(
+        rows=[{"spu_id": "spu_1", "spu_apply_create_time": "2026-06-01", "refund_bill_cnt": 5}],
+        original_row_count=1,
+    )
+    state["agent_run_result"] = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="risk", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    state["sql_generated"] = True
+    state["evidence_graph_verified"] = True
+
+    result = workflow.run_analysis_skill(state)
+
+    trace = result["analysis_skill_trace"]
+    assert result["skill_worker_completed"] is True
+    assert trace["workerType"] == "SKILL_WORKER_BATCH"
+    assert trace["parallelExecution"] is True
+    assert trace["skillNames"] == ["new_product_risk", "risk_analysis"]
+    assert trace["completedCount"] == 2
+    assert "新品风险分析" in result["analysis_summary"]
+    assert "风险分析" in result["analysis_summary"]
+    assert len(trace["skillBatchResults"]) == 2
+    assert any(record.skill_name == "new_product_risk" for record in result["skill_lifecycle_records"])
+    assert any(record.skill_name == "risk_analysis" for record in result["skill_lifecycle_records"])
+    lifecycle_stages = [payload["stage"] for event_type, _, payload in events if event_type == "skill.lifecycle"]
+    assert "parallel_isolated_execute" in lifecycle_stages
     assert "completed" in lifecycle_stages
 
 
@@ -16957,6 +18266,53 @@ class MemoryFailThenOkDoris:
         return [{"seller_id": "100", "pt": "20260620", "order_gmv_amt_1d": 100}]
 
 
+class DetailSplitFallbackDoris:
+    def __init__(self):
+        self.calls = 0
+        self.sqls = []
+
+    def query(self, sql, params=None):
+        self.calls += 1
+        self.sqls.append(sql)
+        if self.calls == 1:
+            raise RuntimeError("MEM_ALLOC_FAILED: query memory limit exceeded")
+        return [
+            {
+                "seller_id": "100",
+                "pt": "2026-06-20",
+                "order_id": "order_%d" % self.calls,
+                "sub_order_id": "sub_%d" % self.calls,
+                "spu_name": "spu_%d" % self.calls,
+            }
+        ]
+
+
+class SlowDetailSplitFallbackDoris:
+    def __init__(self, delay_seconds=0.2):
+        self.calls = 0
+        self.sqls = []
+        self.delay_seconds = delay_seconds
+        self.lock = Lock()
+
+    def query(self, sql, params=None):
+        with self.lock:
+            self.calls += 1
+            call_no = self.calls
+            self.sqls.append(sql)
+        if call_no == 1:
+            raise RuntimeError("MEM_ALLOC_FAILED: query memory limit exceeded")
+        time.sleep(self.delay_seconds)
+        return [
+            {
+                "seller_id": "100",
+                "pt": "2026-06-20",
+                "order_id": "order_%d" % call_no,
+                "sub_order_id": "sub_%d" % call_no,
+                "spu_name": "spu_%d" % call_no,
+            }
+        ]
+
+
 class AlwaysMemoryFailDoris:
     def query(self, sql, params=None):
         raise RuntimeError("MEM_ALLOC_FAILED: query memory limit exceeded")
@@ -16967,6 +18323,18 @@ class FakeDorisWithFreshness:
         if "MIN(`pt`)" in sql and "MAX(`pt`)" in sql:
             return [{"min_pt": "20260601", "max_pt": "20260622"}]
         return [{"seller_id": "100", "sub_order_id": "sub_order_id_1", "order_cnt": 1}]
+
+
+class CapturingFreshnessDoris:
+    def __init__(self, max_pt: str = "2026-06-24"):
+        self.max_pt = max_pt
+        self.sqls = []
+
+    def query(self, sql, params=None):
+        self.sqls.append(sql)
+        if "MIN(`pt`)" in sql and "MAX(`pt`)" in sql:
+            return [{"min_pt": "2026-06-01", "max_pt": self.max_pt}]
+        return [{"seller_id": "100", "order_detail_cnt": 12}]
 
 
 class ManyRowsDoris:

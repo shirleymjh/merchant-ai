@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -880,6 +881,9 @@ def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
                 "role": item.get("role"),
                 "description": item.get("description"),
                 "aliases": item.get("aliases") or [],
+                "defaultVisible": item.get("defaultVisible"),
+                "displayPriority": item.get("displayPriority"),
+                "displayScenarios": item.get("displayScenarios") or [],
                 "visibilityPolicy": item.get("visibilityPolicy") or {},
                 "maskingPolicy": item.get("maskingPolicy") or {},
             }
@@ -2880,12 +2884,14 @@ class TopicBuilderWorkflow:
         if sample_values:
             evidence.append("samples=[%s]" % ", ".join(sample_values))
         visibility_policy, masking_policy = sensitive_column_policies(name, comment)
+        display_policy = default_column_display_policy(name, role, visibility_policy)
         return {
             "columnName": name,
             "businessName": comment,
             "role": role,
             "description": comment,
             "aliases": aliases,
+            **display_policy,
             "enumValues": enum_values,
             "sampleValues": sample_values,
             "confidence": 0.62,
@@ -3191,6 +3197,9 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "sampleValues": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
             "evidence": {"type": "string"},
+            "defaultVisible": {"type": "boolean"},
+            "displayPriority": {"type": "integer"},
+            "displayScenarios": {"type": "array", "items": {"type": "string"}},
             "visibilityPolicy": visibility_policy_schema,
             "maskingPolicy": masking_policy_schema,
         },
@@ -3300,6 +3309,21 @@ def normalize_masking_policy(policy: Any) -> Dict[str, Any]:
     }
 
 
+def normalize_column_display_policy(semantic: Any) -> Dict[str, Any]:
+    if not isinstance(semantic, dict):
+        return {"defaultVisible": False, "displayPriority": 1000, "displayScenarios": []}
+    scenarios = dedupe_strings([str(item).strip() for item in semantic.get("displayScenarios") or [] if str(item or "").strip()])
+    try:
+        priority = int(semantic.get("displayPriority"))
+    except (TypeError, ValueError):
+        priority = 1000
+    return {
+        "defaultVisible": bool(semantic.get("defaultVisible", False)),
+        "displayPriority": priority,
+        "displayScenarios": scenarios,
+    }
+
+
 def normalize_row_access_policy(policy: Any) -> Dict[str, Any]:
     if not isinstance(policy, dict):
         return {}
@@ -3350,6 +3374,35 @@ def sensitive_column_policies(column_name: str, business_name: str = "") -> Tupl
     return ({"level": "public", "allowedRoles": [], "reason": ""}, {"strategy": "none", "reason": ""})
 
 
+def default_column_display_policy(column_name: str, role: str, visibility_policy: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(column_name or "").lower()
+    if normalize_visibility_level(str(visibility_policy.get("level") or "")) != "public":
+        return {"defaultVisible": False, "displayPriority": 1000, "displayScenarios": []}
+    priority_map = {
+        "seller_id": 10,
+        "merchant_id": 11,
+        "order_id": 20,
+        "sub_order_id": 21,
+        "spu_id": 30,
+        "spu_name": 31,
+        "refund_id": 40,
+        "ticket_id": 50,
+        "bill_id": 60,
+        "coupon_id": 70,
+        "discount_rel_id": 71,
+        "pay_amt": 80,
+        "repay_amt": 81,
+        "pt": 90,
+    }
+    priority = priority_map.get(name)
+    default_visible = priority is not None or str(role or "").upper() in {"KEY", "TIME"}
+    return {
+        "defaultVisible": default_visible,
+        "displayPriority": priority if priority is not None else 500,
+        "displayScenarios": ["detail"] if default_visible else [],
+    }
+
+
 class SemanticAssetGovernanceService:
     def __init__(self, settings: Settings, doris_repository: DorisRepository, topic_assets: TopicAssetService):
         self.settings = settings
@@ -3382,6 +3435,7 @@ class SemanticAssetGovernanceService:
         validation_gate = semantic_validation_gate(validation)
         release_gate = combine_release_gates(validation_gate, drift_gate)
         impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
+        rollback_snapshot = self._create_rollback_snapshot(topic, table)
         payload = {
             "success": True,
             "publishable": release_gate["publishable"],
@@ -3395,6 +3449,7 @@ class SemanticAssetGovernanceService:
             "releaseGate": release_gate,
             "impactTestPlan": impact_plan,
             "rollbackCandidate": semantic_rollback_candidate(self.topic_assets.table_asset_dir(topic, table)),
+            "rollbackSnapshot": rollback_snapshot,
         }
         payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "preflight", version.semantic_version, payload))
         return payload
@@ -3426,6 +3481,7 @@ class SemanticAssetGovernanceService:
             "publishedAt": datetime.utcnow().isoformat() + "Z",
         }
         write_json(target_dir / "semantic_version.json", version_payload)
+        manifest = self._write_version_manifest(topic, table, version_payload)
         drift_gate = schema_drift_release_gate(drift)
         validation = validate_semantic_asset(asset, self.topic_assets.load_relationships(topic))
         validation_gate = semantic_validation_gate(validation)
@@ -3443,12 +3499,86 @@ class SemanticAssetGovernanceService:
             "releaseGate": release_gate,
             "impactTestPlan": impact_plan,
             "rollbackCandidate": rollback_candidate,
+            "rollbackSnapshot": self._latest_rollback_snapshot(topic, table),
+            "versionManifest": manifest,
             "publishMode": "scoped_incremental",
             "publishScope": {"topic": topic, "table": table, "mode": "scoped_incremental"},
             "cachePolicy": "recall index manager does scoped rebuild and clears recall, asset pack, live schema, and Doris query caches after publish",
         }
         payload["reviewArtifact"] = str(self._write_governance_artifact(topic, table, "publish", version.semantic_version, payload))
         payload["publishHistoryPath"] = str(append_semantic_publish_history(target_dir, payload))
+        return payload
+
+    def impact_analysis(self, topic: str, table: str) -> Dict[str, Any]:
+        target_dir = self.topic_assets.table_asset_dir(topic, table)
+        if not target_dir.exists():
+            return {"success": False, "status": "NOT_FOUND", "topic": topic, "tableName": table}
+        asset = self._load_asset_dir(target_dir, topic, table)
+        semantic_schema = schema_columns(asset)
+        live_schema = self._live_schema(table)
+        builder = PlanningAssetPackBuilder(self.topic_assets, doris_repository=self.doris_repository)
+        version = builder._semantic_catalog_version(topic, table, semantic_schema, live_schema)
+        drift = (
+            builder._schema_drift_report(topic, table, semantic_schema, live_schema, version)
+            if live_schema
+            else SchemaDriftReport(topic=topic, table=table, semantic_version=version.semantic_version, schema_version=version.schema_version, source_hash=version.source_hash)
+        )
+        metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
+        changed_columns = set(drift.missing_live_columns or []) | {str(item.get("column") or "") for item in drift.type_changed_columns or [] if isinstance(item, dict)}
+        impacted_metrics = []
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                continue
+            source_columns = semantic_metric_source_columns(metric)
+            if changed_columns & set(source_columns):
+                impacted_metrics.append(
+                    {
+                        "metricKey": metric.get("metricKey") or metric.get("key") or "",
+                        "sourceColumns": source_columns,
+                        "impactedColumns": sorted(changed_columns & set(source_columns)),
+                    }
+                )
+        return {
+            "success": True,
+            "status": "IMPACT_ANALYZED",
+            "topic": topic,
+            "tableName": table,
+            "semanticCatalogVersion": version.model_dump(by_alias=True),
+            "schemaDriftReport": drift.model_dump(by_alias=True),
+            "impactTestPlan": semantic_asset_impact_test_plan(topic, table, asset, drift),
+            "impactedMetrics": impacted_metrics,
+            "impactCount": len(impacted_metrics),
+        }
+
+    def rollback(self, topic: str, table: str, version: str = "", reviewer: str = "", reason: str = "") -> Dict[str, Any]:
+        target_dir = self.topic_assets.table_asset_dir(topic, table)
+        snapshot = self._find_rollback_snapshot(topic, table, version)
+        if not snapshot:
+            return {"success": False, "status": "ROLLBACK_SNAPSHOT_NOT_FOUND", "topic": topic, "tableName": table, "semanticVersion": version}
+        snapshot_dir = Path(snapshot["path"])
+        restored: List[str] = []
+        for name in sorted(TopicAssetService.MANAGED_TABLE_FILENAMES | TopicAssetService.GOVERNANCE_FILENAMES):
+            source = snapshot_dir / name
+            target = target_dir / name
+            if source.exists() and source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+                restored.append(name)
+        self.topic_assets._table_asset_cache.pop((topic, table), None)
+        self.topic_assets._manifest_cache.pop(topic, None)
+        payload = {
+            "success": True,
+            "status": "ROLLED_BACK",
+            "topic": topic,
+            "tableName": table,
+            "semanticVersion": snapshot.get("semanticVersion") or "",
+            "restoredFiles": restored,
+            "reviewer": reviewer,
+            "reason": reason,
+            "rolledBackAt": datetime.utcnow().isoformat() + "Z",
+        }
+        payload["rollbackArtifact"] = str(self._write_governance_artifact(topic, table, "rollback", payload["semanticVersion"] or "unknown", payload))
+        append_semantic_publish_history(target_dir, payload)
         return payload
 
     def _load_asset_dir(self, directory: Path, topic: str, table: str) -> Dict[str, Any]:
@@ -3481,6 +3611,60 @@ class SemanticAssetGovernanceService:
         path = self.settings.resolved_workspace_path / "semantic_governance" / topic / table / ("%s-%s.json" % (stage, version or "unknown"))
         write_json(path, payload)
         return path
+
+    def _write_version_manifest(self, topic: str, table: str, version_payload: Dict[str, Any]) -> Dict[str, Any]:
+        target_dir = self.topic_assets.table_asset_dir(topic, table)
+        manifest = {
+            "topic": topic,
+            "tableName": table,
+            "activeVersion": version_payload.get("semanticVersion") or version_payload.get("semantic_version") or "",
+            "schemaVersion": version_payload.get("schemaVersion") or version_payload.get("schema_version") or "",
+            "sourceHash": version_payload.get("sourceHash") or version_payload.get("source_hash") or "",
+            "publishedAt": version_payload.get("publishedAt") or "",
+            "rollbackCandidate": semantic_rollback_candidate(target_dir),
+        }
+        write_json(target_dir / "semantic_version_manifest.json", manifest)
+        return manifest
+
+    def _create_rollback_snapshot(self, topic: str, table: str) -> Dict[str, Any]:
+        target_dir = self.topic_assets.table_asset_dir(topic, table)
+        if not target_dir.exists():
+            return {}
+        current = semantic_rollback_candidate(target_dir)
+        version = current.get("semanticVersion") or "unversioned_%s" % datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        snapshot_dir = self.settings.resolved_workspace_path / "semantic_governance" / topic / table / "rollback_snapshots" / sanitize_asset_path_part(version)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        copied: List[str] = []
+        for name in sorted(TopicAssetService.MANAGED_TABLE_FILENAMES | TopicAssetService.GOVERNANCE_FILENAMES):
+            source = target_dir / name
+            if source.exists() and source.is_file():
+                shutil.copy2(source, snapshot_dir / name)
+                copied.append(name)
+        payload = {
+            "semanticVersion": version,
+            "path": str(snapshot_dir),
+            "createdAt": datetime.utcnow().isoformat() + "Z",
+            "files": copied,
+        }
+        write_json(snapshot_dir / "snapshot.json", payload)
+        return payload
+
+    def _latest_rollback_snapshot(self, topic: str, table: str) -> Dict[str, Any]:
+        root = self.settings.resolved_workspace_path / "semantic_governance" / topic / table / "rollback_snapshots"
+        snapshots = sorted(root.glob("*/snapshot.json"), key=lambda item: item.stat().st_mtime, reverse=True) if root.exists() else []
+        for path in snapshots:
+            payload = read_json(path)
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
+    def _find_rollback_snapshot(self, topic: str, table: str, version: str = "") -> Dict[str, Any]:
+        if not version:
+            return self._latest_rollback_snapshot(topic, table)
+        root = self.settings.resolved_workspace_path / "semantic_governance" / topic / table / "rollback_snapshots"
+        path = root / sanitize_asset_path_part(version) / "snapshot.json"
+        payload = read_json(path)
+        return payload if isinstance(payload, dict) else {}
 
 
 def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3738,6 +3922,11 @@ def append_semantic_publish_history(target_dir: Path, payload: Dict[str, Any]) -
     )
     write_json(path, history[-50:])
     return path
+
+
+def sanitize_asset_path_part(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("._")
+    return text or "unknown"
 
 
 def schema_columns(asset: Dict[str, Any]) -> List[Dict[str, Any]]:

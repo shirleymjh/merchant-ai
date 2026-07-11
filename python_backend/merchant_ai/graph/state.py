@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from threading import RLock
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from merchant_ai.models import (
@@ -41,6 +42,7 @@ from merchant_ai.models import (
     ThreadData,
     ToolCallExecutionResult,
     ToolCallLedgerEntry,
+    ToolCallRequest,
     ToolCallRecoveryEvent,
     ToolFailureRecord,
     ToolRuntimePolicy,
@@ -56,16 +58,19 @@ from merchant_ai.models import (
 
 GraphEventListener = Callable[[str, str, Dict[str, Any]], None]
 _EVENT_LISTENERS: Dict[str, GraphEventListener] = {}
+_EVENT_LISTENERS_LOCK = RLock()
 
 
 def register_event_listener(run_id: str, listener: Optional[GraphEventListener]) -> None:
     if run_id and listener:
-        _EVENT_LISTENERS[run_id] = listener
+        with _EVENT_LISTENERS_LOCK:
+            _EVENT_LISTENERS[run_id] = listener
 
 
 def unregister_event_listener(run_id: str) -> None:
     if run_id:
-        _EVENT_LISTENERS.pop(run_id, None)
+        with _EVENT_LISTENERS_LOCK:
+            _EVENT_LISTENERS.pop(run_id, None)
 
 
 class AgentState(TypedDict, total=False):
@@ -132,6 +137,18 @@ class AgentState(TypedDict, total=False):
     middleware_events: List[MiddlewareEvent]
     tool_call_ledger: List[ToolCallLedgerEntry]
     tool_call_recovery_events: List[ToolCallRecoveryEvent]
+    tool_call_requests: List[ToolCallRequest]
+    tool_loop_warning: str
+    pending_tool_loop_warnings: List[str]
+    tool_loop_history: Dict[str, List[Dict[str, Any]]]
+    tool_loop_seen_call_ids: Dict[str, List[str]]
+    forced_tool_loop_stop_message: str
+    tool_output_budget_reports: List[Dict[str, Any]]
+    token_usage_reports: List[Dict[str, Any]]
+    safety_finish_reasons: List[Dict[str, Any]]
+    run_budget_report: Dict[str, Any]
+    run_budget_exhausted: bool
+    run_started_at_ms: int
     workspace_manifest: WorkspaceManifest
     run_steps: List[RunStep]
     trace_spans: List[TraceSpan]
@@ -218,7 +235,10 @@ class AgentState(TypedDict, total=False):
 
 
 def emit(state: AgentState, event_type: str, node: str, payload: Dict[str, Any]) -> None:
-    listener = _EVENT_LISTENERS.get(str(state.get("run_id") or "")) or state.get("event_listener")
+    run_id = str(state.get("run_id") or "")
+    with _EVENT_LISTENERS_LOCK:
+        listener = _EVENT_LISTENERS.get(run_id)
+    listener = listener or state.get("event_listener")
     if listener:
         listener(event_type, node, event_payload(state, event_type, node, payload))
 
@@ -270,3 +290,108 @@ def knowledge_context(state: AgentState) -> str:
         if value:
             parts.append("## %s\n%s" % (title, value))
     return "\n\n".join(parts).strip()
+
+
+STATE_LIST_MERGE_KEYS: Dict[str, str] = {
+    "context_packages": "packageId",
+    "context_manifests": "manifestId",
+    "runtime_checkpoints": "path",
+    "middleware_events": "eventId",
+    "tool_call_ledger": "toolCallId",
+    "tool_call_recovery_events": "eventId",
+    "tool_call_requests": "id",
+    "tool_call_results": "id",
+    "tool_failures": "fingerprint",
+    "circuit_breakers": "circuitKey",
+    "run_steps": "stepId",
+    "trace_spans": "spanId",
+    "skill_lifecycle_records": "recordId",
+    "freshness_reports": "reportId",
+}
+
+STATE_LIST_LIMITS: Dict[str, int] = {
+    "context_packages": 12,
+    "context_manifests": 24,
+    "runtime_checkpoints": 8,
+    "middleware_events": 200,
+    "tool_call_ledger": 200,
+    "tool_call_recovery_events": 50,
+    "tool_call_requests": 100,
+    "tool_call_results": 100,
+    "tool_failures": 100,
+    "circuit_breakers": 100,
+    "run_steps": 200,
+    "trace_spans": 400,
+    "skill_lifecycle_records": 120,
+    "freshness_reports": 50,
+}
+
+
+def merge_agent_state_update(existing: AgentState, update: Dict[str, Any]) -> AgentState:
+    """Merge partial state updates with explicit reducers for shared runtime lists."""
+
+    merged: AgentState = dict(existing)
+    for key, value in (update or {}).items():
+        if key in STATE_LIST_MERGE_KEYS:
+            merged[key] = merge_state_list(
+                existing.get(key) or [],
+                value or [],
+                id_key=STATE_LIST_MERGE_KEYS[key],
+                limit=STATE_LIST_LIMITS.get(key, 200),
+            )
+        elif isinstance(value, dict) and isinstance(existing.get(key), dict):
+            merged[key] = {**(existing.get(key) or {}), **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def merge_state_list(existing: Any, incoming: Any, id_key: str, limit: int = 200) -> List[Any]:
+    items = list(existing or []) + list(incoming or [])
+    deduped: Dict[str, Any] = {}
+    anonymous: List[Any] = []
+    for item in items:
+        item_id = state_item_id(item, id_key)
+        if item_id:
+            deduped[item_id] = item
+        else:
+            anonymous.append(item)
+    merged = [*anonymous, *deduped.values()]
+    return merged[-limit:] if limit > 0 else merged
+
+
+def state_item_id(item: Any, id_key: str) -> str:
+    candidates = [
+        id_key,
+        snake_case_key(id_key),
+        "id",
+        "taskId",
+        "task_id",
+        "toolCallId",
+        "tool_call_id",
+    ]
+    if isinstance(item, dict):
+        for key in candidates:
+            value = item.get(key)
+            if value:
+                return str(value)
+        return ""
+    for key in candidates:
+        value = getattr(item, key, "")
+        if value:
+            return str(value)
+    if hasattr(item, "model_dump"):
+        try:
+            return state_item_id(item.model_dump(by_alias=True), id_key)
+        except Exception:
+            return ""
+    return ""
+
+
+def snake_case_key(value: str) -> str:
+    chars: List[str] = []
+    for char in str(value or ""):
+        if char.isupper() and chars:
+            chars.append("_")
+        chars.append(char.lower())
+    return "".join(chars)

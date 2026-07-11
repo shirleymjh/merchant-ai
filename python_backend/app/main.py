@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import json
+import hmac
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Path as ApiPath, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from merchant_ai.config import get_settings
+from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.workflow import create_workflow
 from merchant_ai.models import (
     ChatRequest,
     FeedbackRequest,
+    GoldenEvaluationRequest,
     KnowledgeSuggestionReviewRequest,
     MemoryCleanupRequest,
     MemoryItemPatchRequest,
@@ -28,60 +30,137 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.answer import DailyReportService, FeedbackService
 from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicBuilderWorkflow
+from merchant_ai.services.evaluation import GoldenEvaluationService
 from merchant_ai.services.memory import MemoryManagementService
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, run_duration_ms, run_summary_payload
+from merchant_ai.services.security import Permission, authorize_merchant_access, merchant_principal, ops_principal
 from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.skill_evaluation import SkillEvaluationService
 
-settings = get_settings()
-workflow = create_workflow(settings)
-
-run_manager = AgentRunManager(settings)
-stream_service = AgentRunStreamService(run_manager, workflow.run, settings.merchant_id)
-async_run_service = AgentAsyncRunService(
-    run_manager,
-    workflow.run,
-    settings.merchant_id,
-    max_workers=settings.max_concurrent_sub_agents,
-)
-topic_assets = workflow.recall_service.topic_assets
-doris_repository = workflow.node_worker.doris_repository
-daily_report_service = DailyReportService(doris_repository)
-feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store, workflow.memory_store)
-memory_management_service = MemoryManagementService(settings, workflow.memory_store)
-skill_draft_service = SkillDraftService(settings)
-skill_evaluation_service = SkillEvaluationService(settings, workflow.answer_service)
-topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
-semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
-recall_index_manager = RecallIndexManager(
-    settings,
-    workflow.recall_service,
-    cache_clearers=[
-        workflow.asset_builder.clear_cache,
-        workflow.node_worker.doris_repository.clear_cache,
-    ],
-)
-
-app = FastAPI(title="yshopping Merchant AI Python", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+settings: Settings
+workflow: Any
+run_manager: AgentRunManager
+stream_service: AgentRunStreamService
+async_run_service: AgentAsyncRunService
+topic_assets: Any
+doris_repository: Any
+daily_report_service: DailyReportService
+feedback_service: FeedbackService
+memory_management_service: MemoryManagementService
+skill_draft_service: SkillDraftService
+skill_evaluation_service: SkillEvaluationService
+golden_evaluation_service: GoldenEvaluationService
+topic_builder_workflow: TopicBuilderWorkflow
+semantic_governance: SemanticAssetGovernanceService
+recall_index_manager: RecallIndexManager
 
 
-@app.get("/health")
+def _init_services(runtime_settings: Optional[Settings] = None) -> None:
+    global settings
+    global workflow
+    global run_manager
+    global stream_service
+    global async_run_service
+    global topic_assets
+    global doris_repository
+    global daily_report_service
+    global feedback_service
+    global memory_management_service
+    global skill_draft_service
+    global skill_evaluation_service
+    global golden_evaluation_service
+    global topic_builder_workflow
+    global semantic_governance
+    global recall_index_manager
+
+    settings = runtime_settings or get_settings()
+    workflow = create_workflow(settings)
+    run_manager = AgentRunManager(settings)
+    stream_service = AgentRunStreamService(run_manager, workflow.run, settings.merchant_id)
+    async_run_service = AgentAsyncRunService(
+        run_manager,
+        workflow.run,
+        settings.merchant_id,
+        max_workers=settings.max_concurrent_sub_agents,
+    )
+    topic_assets = workflow.recall_service.topic_assets
+    doris_repository = workflow.node_worker.doris_repository
+    daily_report_service = DailyReportService(doris_repository)
+    feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store, workflow.memory_store)
+    memory_management_service = MemoryManagementService(settings, workflow.memory_store)
+    skill_draft_service = SkillDraftService(settings)
+    skill_evaluation_service = SkillEvaluationService(settings, workflow.answer_service)
+    golden_evaluation_service = GoldenEvaluationService(settings)
+    topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
+    semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
+    recall_index_manager = RecallIndexManager(
+        settings,
+        workflow.recall_service,
+        cache_clearers=[
+            workflow.asset_builder.clear_cache,
+            workflow.node_worker.doris_repository.clear_cache,
+        ],
+    )
+
+
+def require_ops_token(
+    authorization: Optional[str] = Header(default=None),
+    x_ops_token: Optional[str] = Header(default=None, alias="X-Ops-Token"),
+) -> None:
+    expected = str(settings.ops_token or "").strip()
+    if not expected:
+        return
+    bearer_prefix = "Bearer "
+    provided = str(x_ops_token or "").strip()
+    if not provided and authorization and authorization.startswith(bearer_prefix):
+        provided = authorization[len(bearer_prefix) :].strip()
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid ops token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+OpsAuth = Depends(require_ops_token)
+
+
+def require_merchant_access(merchant_id: str) -> str:
+    target = str(merchant_id or settings.merchant_id).strip()
+    return authorize_merchant_access(settings, merchant_principal(target), target, Permission.CHAT_RUN)
+
+
+def require_ops_merchant_access(merchant_id: str, permission: Permission = Permission.OPS_READ) -> str:
+    return authorize_merchant_access(settings, ops_principal(), merchant_id or settings.merchant_id, permission)
+
+
+def create_app(runtime_settings: Optional[Settings] = None) -> FastAPI:
+    _init_services(runtime_settings)
+    application = FastAPI(title="yshopping Merchant AI Python", version="0.1.0")
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=bool(settings.cors_allow_credentials),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    application.include_router(router)
+    return application
+
+
+router = APIRouter()
+
+
+@router.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "UP", "service": "yshopping-merchant-ai-python"}
 
 
-@app.post("/api/chat")
+@router.post("/api/chat")
 async def chat(request: ChatRequest) -> Dict[str, Any]:
-    merchant_id = request.merchant_id or settings.merchant_id
+    merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     thread = run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
     run = run_manager.create_run(thread.thread_id, merchant_id, request.message)
 
@@ -105,13 +184,15 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
         raise
 
 
-@app.post("/api/chat/stream")
+@router.post("/api/chat/stream")
 def stream_chat(request: RunCreateRequest):
+    request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     return StreamingResponse(stream_service.stream(request), media_type="text/event-stream")
 
 
-@app.post("/api/runs/async")
+@router.post("/api/runs/async")
 def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
+    request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     run = async_run_service.submit(request)
     return {
         "success": True,
@@ -128,24 +209,26 @@ def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
     }
 
 
-@app.get("/api/runs")
+@router.get("/api/runs")
 def list_runs(
     limit: int = Query(default=50, ge=1, le=200),
     status: Optional[str] = Query(default=None),
     merchant_id: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
-    runs = run_manager.list_runs(limit=limit, status=status or "", merchant_id=merchant_id or "")
+    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    runs = run_manager.list_runs(limit=limit, status=status or "", merchant_id=effective_merchant_id)
     summaries = [run_summary_payload(run, run_duration_ms(run)) for run in runs]
     return {"success": True, "runs": jsonable_encoder(summaries, by_alias=True)}
 
 
-@app.get("/api/runs/dashboard")
+@router.get("/api/runs/dashboard")
 def runs_dashboard(
     limit: int = Query(default=50, ge=1, le=200),
     status: Optional[str] = Query(default=None),
     merchant_id: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
-    dashboard = run_manager.dashboard(limit=limit, status=status or "", merchant_id=merchant_id or "")
+    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    dashboard = run_manager.dashboard(limit=limit, status=status or "", merchant_id=effective_merchant_id)
     return {"success": True, "dashboard": jsonable_encoder(dashboard, by_alias=True)}
 
 
@@ -178,35 +261,54 @@ def _runtime_trace() -> Dict[str, Any]:
         "events": events[-200:],
         "rateLimits": rate_limits,
         "loadBalancer": load_balancer,
+        "degraded": {
+            "answerRepository": workflow.answer_repository.trace()
+            if hasattr(workflow.answer_repository, "trace")
+            else {},
+            "merchantService": workflow.merchant_service.trace()
+            if hasattr(workflow.merchant_service, "trace")
+            else {},
+            "doris": workflow.node_worker.doris_repository.cache_trace()
+            if hasattr(workflow.node_worker.doris_repository, "cache_trace")
+            else {},
+        },
+        "config": settings.grouped_summary(),
     }
 
 
-@app.get("/api/runtime/metrics")
-def runtime_metrics() -> Dict[str, Any]:
+@router.get("/api/runtime/metrics")
+def runtime_metrics(_auth: None = OpsAuth) -> Dict[str, Any]:
     trace = _runtime_trace()
-    return {"success": True, "metrics": jsonable_encoder(trace["metrics"], by_alias=True), "rateLimits": trace["rateLimits"], "loadBalancer": trace["loadBalancer"]}
+    return {
+        "success": True,
+        "metrics": jsonable_encoder(trace["metrics"], by_alias=True),
+        "rateLimits": trace["rateLimits"],
+        "loadBalancer": trace["loadBalancer"],
+        "degraded": jsonable_encoder(trace["degraded"], by_alias=True),
+        "config": jsonable_encoder(trace["config"], by_alias=True),
+    }
 
 
-@app.get("/api/runtime/alerts")
-def runtime_alerts() -> Dict[str, Any]:
+@router.get("/api/runtime/alerts")
+def runtime_alerts(_auth: None = OpsAuth) -> Dict[str, Any]:
     trace = _runtime_trace()
     return {"success": True, "alerts": jsonable_encoder(trace["alerts"], by_alias=True)}
 
 
-@app.get("/ops/runs", response_class=HTMLResponse)
-def ops_runs_dashboard() -> HTMLResponse:
+@router.get("/ops/runs", response_class=HTMLResponse)
+def ops_runs_dashboard(_auth: None = OpsAuth) -> HTMLResponse:
     return HTMLResponse(RUNS_DASHBOARD_HTML)
 
 
-@app.post("/api/threads")
+@router.post("/api/threads")
 def create_thread(request: Optional[RunCreateRequest] = None) -> Dict[str, Any]:
     safe = request or RunCreateRequest()
-    merchant_id = safe.merchant_id or settings.merchant_id
+    merchant_id = require_merchant_access(safe.merchant_id or settings.merchant_id)
     thread = run_manager.create_thread(merchant_id, safe.context.topic if safe.context else "", safe.context)
     return {"success": True, "thread": jsonable_encoder(thread, by_alias=True)}
 
 
-@app.get("/api/threads/{thread_id}")
+@router.get("/api/threads/{thread_id}")
 def get_thread(thread_id: str = ApiPath(...)) -> Dict[str, Any]:
     thread = run_manager.get_thread(thread_id)
     if not thread:
@@ -214,7 +316,7 @@ def get_thread(thread_id: str = ApiPath(...)) -> Dict[str, Any]:
     return {"success": True, "thread": jsonable_encoder(thread, by_alias=True)}
 
 
-@app.get("/api/threads/{thread_id}/runs/{run_id}")
+@router.get("/api/threads/{thread_id}/runs/{run_id}")
 def get_run(thread_id: str, run_id: str) -> Dict[str, Any]:
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread_id:
@@ -222,7 +324,7 @@ def get_run(thread_id: str, run_id: str) -> Dict[str, Any]:
     return {"success": True, "run": jsonable_encoder(run, by_alias=True)}
 
 
-@app.get("/api/threads/{thread_id}/runs/{run_id}/events")
+@router.get("/api/threads/{thread_id}/runs/{run_id}/events")
 def get_run_events(thread_id: str, run_id: str) -> Dict[str, Any]:
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread_id:
@@ -235,8 +337,8 @@ def get_run_events(thread_id: str, run_id: str) -> Dict[str, Any]:
     }
 
 
-@app.get("/api/threads/{thread_id}/runs/{run_id}/trace")
-def get_run_trace(thread_id: str, run_id: str) -> Dict[str, Any]:
+@router.get("/api/threads/{thread_id}/runs/{run_id}/trace")
+def get_run_trace(thread_id: str, run_id: str, _auth: None = OpsAuth) -> Dict[str, Any]:
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread_id:
         return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
@@ -246,8 +348,8 @@ def get_run_trace(thread_id: str, run_id: str) -> Dict[str, Any]:
     return {"success": True, "runId": run_id, "threadId": thread_id, "trace": trace}
 
 
-@app.get("/api/threads/{thread_id}/runs/{run_id}/checkpoint")
-def get_run_checkpoint(thread_id: str, run_id: str) -> Dict[str, Any]:
+@router.get("/api/threads/{thread_id}/runs/{run_id}/checkpoint")
+def get_run_checkpoint(thread_id: str, run_id: str, _auth: None = OpsAuth) -> Dict[str, Any]:
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread_id:
         return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
@@ -258,7 +360,7 @@ def get_run_checkpoint(thread_id: str, run_id: str) -> Dict[str, Any]:
     return {"success": True, "runId": run_id, "threadId": thread_id, "checkpoint": jsonable_encoder(checkpoint, by_alias=True)}
 
 
-@app.post("/api/threads/{thread_id}/runs/{run_id}/cancel")
+@router.post("/api/threads/{thread_id}/runs/{run_id}/cancel")
 def cancel_run(thread_id: str, run_id: str) -> Dict[str, Any]:
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread_id:
@@ -266,34 +368,53 @@ def cancel_run(thread_id: str, run_id: str) -> Dict[str, Any]:
     return {"success": True, "run": jsonable_encoder(async_run_service.cancel(run_id), by_alias=True)}
 
 
-@app.post("/api/answers/{answer_id}/feedback")
+@router.post("/api/answers/{answer_id}/feedback")
 def feedback(answer_id: str, request: FeedbackRequest) -> Dict[str, Any]:
     persisted = feedback_service.apply_feedback(answer_id, request.adopted, request.liked, request.disliked)
     return {"success": True, "persisted": persisted}
 
 
-@app.get("/api/memory/{merchant_id}")
-def get_memory(merchant_id: str, include_inactive: bool = Query(default=True)) -> Dict[str, Any]:
+@router.get("/api/memory/{merchant_id}")
+def get_memory(merchant_id: str, include_inactive: bool = Query(default=True), _auth: None = OpsAuth) -> Dict[str, Any]:
+    require_merchant_access(merchant_id)
     return memory_management_service.get_memory(merchant_id, include_inactive=include_inactive)
 
 
-@app.patch("/api/memory/{merchant_id}/items/{memory_id}")
-def patch_memory_item(merchant_id: str, memory_id: str, request: MemoryItemPatchRequest) -> Dict[str, Any]:
+@router.patch("/api/memory/{merchant_id}/items/{memory_id}")
+def patch_memory_item(
+    merchant_id: str,
+    memory_id: str,
+    request: MemoryItemPatchRequest,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    require_merchant_access(merchant_id)
     return memory_management_service.patch_item(merchant_id, memory_id, request)
 
 
-@app.delete("/api/memory/{merchant_id}/items/{memory_id}")
-def delete_memory_item(merchant_id: str, memory_id: str, hard_delete: bool = Query(default=False)) -> Dict[str, Any]:
+@router.delete("/api/memory/{merchant_id}/items/{memory_id}")
+def delete_memory_item(
+    merchant_id: str,
+    memory_id: str,
+    hard_delete: bool = Query(default=False),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    require_merchant_access(merchant_id)
     return memory_management_service.delete_item(merchant_id, memory_id, hard_delete=hard_delete)
 
 
-@app.post("/api/memory/{merchant_id}/cleanup")
-def cleanup_memory(merchant_id: str, request: MemoryCleanupRequest) -> Dict[str, Any]:
+@router.post("/api/memory/{merchant_id}/cleanup")
+def cleanup_memory(merchant_id: str, request: MemoryCleanupRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
+    require_merchant_access(merchant_id)
     return memory_management_service.cleanup_expired(merchant_id, hard_delete=request.hard_delete, dry_run=request.dry_run)
 
 
-@app.post("/api/memory/{merchant_id}/recall-eval")
-def evaluate_memory_recall(merchant_id: str, request: MemoryRecallEvaluationRequest) -> Dict[str, Any]:
+@router.post("/api/memory/{merchant_id}/recall-eval")
+def evaluate_memory_recall(
+    merchant_id: str,
+    request: MemoryRecallEvaluationRequest,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    require_merchant_access(merchant_id)
     return memory_management_service.evaluate_recall(
         merchant_id,
         request.cases,
@@ -302,16 +423,20 @@ def evaluate_memory_recall(merchant_id: str, request: MemoryRecallEvaluationRequ
     )
 
 
-@app.get("/api/ops/knowledge-suggestions")
-def operator_knowledge_suggestions(status: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+@router.get("/api/ops/knowledge-suggestions")
+def operator_knowledge_suggestions(status: Optional[str] = Query(default=None), _auth: None = OpsAuth) -> Dict[str, Any]:
     items = load_knowledge_suggestions()
     if status:
         items = [item for item in items if str(item.get("status", "")).lower() == status.lower()]
     return {"success": True, "items": items}
 
 
-@app.post("/api/ops/knowledge-suggestions/{item_id}/review")
-def review_operator_knowledge_suggestion(item_id: str, request: KnowledgeSuggestionReviewRequest) -> Dict[str, Any]:
+@router.post("/api/ops/knowledge-suggestions/{item_id}/review")
+def review_operator_knowledge_suggestion(
+    item_id: str,
+    request: KnowledgeSuggestionReviewRequest,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
     items = load_knowledge_suggestions()
     target = None
     for item in items:
@@ -336,28 +461,43 @@ def review_operator_knowledge_suggestion(item_id: str, request: KnowledgeSuggest
     return {"success": True, "item": target}
 
 
-@app.get("/api/ops/skill-drafts")
-def list_skill_drafts(status: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+@router.get("/api/ops/skill-drafts")
+def list_skill_drafts(status: Optional[str] = Query(default=None), _auth: None = OpsAuth) -> Dict[str, Any]:
     return {"success": True, "items": skill_draft_service.list_drafts(status or "")}
 
 
-@app.post("/api/ops/skill-drafts/{draft_id}/review")
-def review_skill_draft(draft_id: str, request: SkillDraftReviewRequest) -> Dict[str, Any]:
+@router.post("/api/ops/skill-drafts/{draft_id}/review")
+def review_skill_draft(draft_id: str, request: SkillDraftReviewRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     return skill_draft_service.review_draft(draft_id, request)
 
 
-@app.post("/api/ops/skill-evaluations")
-def evaluate_skill_triggers(request: SkillEvaluationRequest) -> Dict[str, Any]:
+@router.post("/api/ops/skill-evaluations")
+def evaluate_skill_triggers(request: SkillEvaluationRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     return skill_evaluation_service.evaluate(request)
 
 
-@app.get("/api/daily-report")
+@router.post("/api/ops/golden-evaluations")
+def evaluate_golden_cases(request: GoldenEvaluationRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
+    if bool(request.partition_date_anchor_enabled) == bool(settings.agent_partition_date_anchor_enabled):
+        return golden_evaluation_service.evaluate(request, workflow.run)
+    evaluation_settings = settings.model_copy(
+        update={"agent_partition_date_anchor_enabled": bool(request.partition_date_anchor_enabled)}
+    )
+    evaluation_workflow = create_workflow(evaluation_settings)
+    evaluation_service = GoldenEvaluationService(evaluation_settings)
+    try:
+        return evaluation_service.evaluate(request, evaluation_workflow.run)
+    finally:
+        evaluation_workflow.checkpoint_manager.close()
+
+
+@router.get("/api/daily-report")
 def daily_report(merchant_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    return daily_report_service.report(merchant_id or settings.merchant_id).model_dump(by_alias=True)
+    return daily_report_service.report(require_merchant_access(merchant_id or settings.merchant_id)).model_dump(by_alias=True)
 
 
-@app.post("/api/wiki/compress")
-def compress_wiki(request: WikiCompressRequest) -> Dict[str, Any]:
+@router.post("/api/wiki/compress")
+def compress_wiki(request: WikiCompressRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     if not request.category_name:
         paths: Dict[str, str] = {}
         for name in ["平台商家规则", "电商交易", "电商退货", "电商客服工单", "电商理赔/赔付", "商品管理"]:
@@ -370,18 +510,19 @@ def compress_wiki(request: WikiCompressRequest) -> Dict[str, Any]:
     return {"success": True, "path": str(path)}
 
 
-@app.post("/api/es/rebuild-recall-index")
-def rebuild_recall_index(merchant_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+@router.post("/api/es/rebuild-recall-index")
+def rebuild_recall_index(merchant_id: Optional[str] = Query(default=None), _auth: None = OpsAuth) -> Dict[str, Any]:
+    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
     result = recall_index_manager.rebuild(changed_only=True)
     return {
         "success": True,
-        "merchantId": merchant_id or settings.merchant_id,
+        "merchantId": effective_merchant_id,
         **result,
     }
 
 
-@app.get("/api/es/recall-mapping")
-def recall_mapping() -> Dict[str, Any]:
+@router.get("/api/es/recall-mapping")
+def recall_mapping(_auth: None = OpsAuth) -> Dict[str, Any]:
     return {
         "success": True,
         "index": settings.es_index,
@@ -400,15 +541,21 @@ def recall_mapping() -> Dict[str, Any]:
     }
 
 
-@app.post("/api/topics/build")
-def build_topic_asset(request: TopicBuildRequest) -> Dict[str, Any]:
+@router.post("/api/topics/build")
+def build_topic_asset(request: TopicBuildRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     if not request.merchant_id:
         request.merchant_id = settings.merchant_id
+    require_merchant_access(request.merchant_id)
     return topic_builder_workflow.build(request)
 
 
-@app.post("/api/topics/{topic}/tables/{table_name}/publish")
-def publish_topic_asset(topic: str, table_name: str, request: TopicReviewRequest) -> Dict[str, Any]:
+@router.post("/api/topics/{topic}/tables/{table_name}/publish")
+def publish_topic_asset(
+    topic: str,
+    table_name: str,
+    request: TopicReviewRequest,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
     preflight = semantic_governance.preflight_publish(topic, table_name) if request.approved else {}
     if request.approved and not preflight.get("publishable", False):
         return {
@@ -431,34 +578,68 @@ def publish_topic_asset(topic: str, table_name: str, request: TopicReviewRequest
     return result
 
 
-@app.post("/api/topics/{topic}/tables/{table_name}/schema-diff")
-def diff_topic_table_schema(topic: str, table_name: str, request: Optional[TopicBuildRequest] = None) -> Dict[str, Any]:
+@router.post("/api/topics/{topic}/tables/{table_name}/schema-diff")
+def diff_topic_table_schema(
+    topic: str,
+    table_name: str,
+    request: Optional[TopicBuildRequest] = None,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
     target = request or TopicBuildRequest()
     target.topic = topic
     target.table_name = table_name
     if not target.merchant_id:
         target.merchant_id = settings.merchant_id
+    require_merchant_access(target.merchant_id)
     return topic_builder_workflow.diff_schema(target)
 
 
-@app.post("/api/topics/{topic}/tables/{table_name}/refresh-incremental")
-def refresh_topic_table_incrementally(topic: str, table_name: str, request: Optional[TopicBuildRequest] = None) -> Dict[str, Any]:
+@router.get("/api/topics/{topic}/tables/{table_name}/impact")
+def semantic_asset_impact_analysis(topic: str, table_name: str, _auth: None = OpsAuth) -> Dict[str, Any]:
+    return semantic_governance.impact_analysis(topic, table_name)
+
+
+@router.post("/api/topics/{topic}/tables/{table_name}/rollback")
+def rollback_semantic_asset(
+    topic: str,
+    table_name: str,
+    version: str = Query(default=""),
+    reviewer: str = Query(default=""),
+    reason: str = Query(default=""),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    result = semantic_governance.rollback(topic, table_name, version=version, reviewer=reviewer, reason=reason)
+    if result.get("success"):
+        index_result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
+        result["recallIndex"] = index_result
+        result["cacheInvalidated"] = bool(index_result.get("cacheInvalidated"))
+    return result
+
+
+@router.post("/api/topics/{topic}/tables/{table_name}/refresh-incremental")
+def refresh_topic_table_incrementally(
+    topic: str,
+    table_name: str,
+    request: Optional[TopicBuildRequest] = None,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
     target = request or TopicBuildRequest()
     target.topic = topic
     target.table_name = table_name
     if not target.merchant_id:
         target.merchant_id = settings.merchant_id
+    require_merchant_access(target.merchant_id)
     return topic_builder_workflow.refresh_incremental(target)
 
 
-@app.post("/api/topics/{topic}/tables/{table_name}/es-upsert")
-def upsert_topic_table_recall_index(topic: str, table_name: str) -> Dict[str, Any]:
+@router.post("/api/topics/{topic}/tables/{table_name}/es-upsert")
+def upsert_topic_table_recall_index(topic: str, table_name: str, _auth: None = OpsAuth) -> Dict[str, Any]:
     result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
     return {"success": bool(result.get("success", True)), "topic": topic, "tableName": table_name, "recallIndex": result}
 
 
-@app.get("/api/topics/{topic}/assets")
-def topic_assets_endpoint(topic: str) -> Dict[str, Any]:
+@router.get("/api/topics/{topic}/assets")
+def topic_assets_endpoint(topic: str, _auth: None = OpsAuth) -> Dict[str, Any]:
     return topic_assets.list_topic(topic)
 
 
@@ -578,3 +759,6 @@ RUNS_DASHBOARD_HTML = """
 </body>
 </html>
 """
+
+
+app = create_app()

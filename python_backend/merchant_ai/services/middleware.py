@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings
-from merchant_ai.graph.state import AgentState
+from merchant_ai.graph.state import AgentState, merge_agent_state_update
 from merchant_ai.models import (
     AgentDecision,
     ArtifactRef,
@@ -21,6 +22,7 @@ from merchant_ai.models import (
     ToolCallExecutionResult,
     ToolCallLedgerEntry,
     ToolCallRecoveryEvent,
+    ToolCallRequest,
     WorkspaceManifest,
     WorkspaceManifestEntry,
 )
@@ -40,6 +42,9 @@ class HarnessMiddleware:
     """Small, composable runtime middleware around the LeadAgent loop."""
 
     name = "middleware"
+    failure_policy = "open"
+    read_keys: List[str] = []
+    write_keys: List[str] = []
 
     def before_policy(self, state: AgentState) -> AgentState:
         return state
@@ -53,20 +58,38 @@ class MiddlewareChain:
         self.middlewares = list(middlewares)
 
     def before_policy(self, state: AgentState) -> AgentState:
+        self._record_chain_order(state, "before_policy")
         for middleware in self.middlewares:
             state = self._safe_call(middleware, "before_policy", state)
         return state
 
     def before_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
+        self._record_chain_order(state, "before_action")
         for middleware in self.middlewares:
             state = self._safe_call(middleware, "before_action", state, decision)
         return state
 
     def _safe_call(self, middleware: HarnessMiddleware, method: str, state: AgentState, *args: Any) -> AgentState:
+        before_fingerprint = self._state_fingerprint(state)
         try:
             handler = getattr(middleware, method)
-            return handler(state, *args)
+            returned = handler(state, *args)
+            merged = merge_agent_state_update(state, returned or {})
+            changed_keys = self._changed_keys(before_fingerprint, self._state_fingerprint(merged))
+            if changed_keys and not (middleware.name == "context_snapshot" and method == "before_action"):
+                append_middleware_event(
+                    merged,
+                    middleware.name,
+                    method,
+                    status="observed",
+                    code="MIDDLEWARE_STATE_DELTA",
+                    message="middleware updated state",
+                    metadata={"changedKeys": changed_keys[:20], "changedKeyCount": len(changed_keys)},
+                )
+            return merged
         except Exception as exc:
+            policy = getattr(middleware, "failure_policy", "open") or "open"
+            severity = "critical" if policy == "closed" else "error"
             append_middleware_event(
                 state,
                 middleware.name,
@@ -74,8 +97,67 @@ class MiddlewareChain:
                 status="error",
                 code="MIDDLEWARE_ERROR",
                 message=str(exc),
+                metadata={"failurePolicy": policy},
             )
+            if policy == "closed":
+                state["middleware_blocked"] = True
+                state["chat_bi_completed"] = True
+                state.setdefault("safety_finish_reasons", []).append(
+                    {
+                        "source": middleware.name,
+                        "finishReason": "middleware_fail_closed",
+                        "message": str(exc)[:500],
+                    }
+                )
+                if not state.get("answer"):
+                    state["answer"] = "系统安全中间件执行失败，本轮已停止继续调用工具。"
+                append_middleware_event(
+                    state,
+                    middleware.name,
+                    method,
+                    status="blocked",
+                    code="MIDDLEWARE_FAIL_CLOSED",
+                    message=str(exc),
+                    metadata={"failurePolicy": policy, "severity": severity},
+                )
             return state
+
+    def _record_chain_order(self, state: AgentState, stage: str) -> None:
+        key = "_middleware_chain_order_recorded"
+        recorded = state.setdefault(key, {})
+        if recorded.get(stage):
+            return
+        recorded[stage] = True
+        append_middleware_event(
+            state,
+            "middleware_chain",
+            stage,
+            status="observed",
+            code="MIDDLEWARE_CHAIN_ORDER",
+            message="configured middleware order",
+            metadata={"order": [middleware.name for middleware in self.middlewares], "count": len(self.middlewares)},
+        )
+
+    def _state_fingerprint(self, state: AgentState) -> Dict[str, str]:
+        tracked = [
+            "tool_call_results",
+            "tool_call_ledger",
+            "context_packages",
+            "context_manifests",
+            "runtime_checkpoints",
+            "middleware_events",
+            "skill_lifecycle_records",
+            "memory_context",
+            "runtime_context",
+            "summary_context",
+            "answer",
+            "next_action",
+        ]
+        return {key: stable_json_hash(state.get(key)) for key in tracked if key in state}
+
+    def _changed_keys(self, before: Dict[str, str], after: Dict[str, str]) -> List[str]:
+        keys = sorted(set(before) | set(after))
+        return [key for key in keys if before.get(key) != after.get(key)]
 
 
 class CancellationMiddleware(HarnessMiddleware):
@@ -113,6 +195,7 @@ class CancellationMiddleware(HarnessMiddleware):
 
 class PermissionMiddleware(HarnessMiddleware):
     name = "permission"
+    failure_policy = "closed"
 
     def before_policy(self, state: AgentState) -> AgentState:
         slots = state.get("route_slots")
@@ -129,10 +212,48 @@ class PermissionMiddleware(HarnessMiddleware):
         return state
 
 
+class RunBudgetMiddleware(HarnessMiddleware):
+    name = "run_budget"
+    failure_policy = "closed"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def before_policy(self, state: AgentState) -> AgentState:
+        report = build_run_budget_report(state, self.settings)
+        state["run_budget_report"] = report
+        if not report.get("exhausted"):
+            return state
+        state["run_budget_exhausted"] = True
+        state["chat_bi_completed"] = True
+        state.setdefault("safety_finish_reasons", []).append(
+            {
+                "source": "run_budget",
+                "finishReason": "run_budget_exhausted",
+                "message": report.get("reason", ""),
+                "report": report,
+            }
+        )
+        state["safety_finish_reasons"] = state["safety_finish_reasons"][-50:]
+        if not state.get("answer"):
+            state["answer"] = "本轮运行已达到系统预算上限，我会基于当前已完成的结果给出回答，并标注未完成部分。"
+        append_middleware_event(
+            state,
+            self.name,
+            "before_policy",
+            status="blocked",
+            code="RUN_BUDGET_EXHAUSTED",
+            message=report.get("reason", "run budget exhausted"),
+            metadata=report,
+        )
+        return state
+
+
 class ActionContractMiddleware(HarnessMiddleware):
     """Validate the selected action against declared state contracts."""
 
     name = "action_contract"
+    failure_policy = "closed"
 
     def __init__(self):
         from merchant_ai.graph.policy import AgentActionRegistry
@@ -239,12 +360,18 @@ class DynamicContextMiddleware(HarnessMiddleware):
 
     def before_policy(self, state: AgentState) -> AgentState:
         stage = "policy_round_%s" % int(state.get("react_round") or 0)
+        stale_before_render = bool(state.get("_runtime_context_stale"))
+        pending_warnings = [str(item) for item in (state.get("pending_tool_loop_warnings") or []) if str(item).strip()]
+        if pending_warnings:
+            state["tool_loop_warning"] = "\n".join(pending_warnings)
+            state["pending_tool_loop_warnings"] = []
         injection = self.assembler.runtime_injection(state, stage=stage)
         state["runtime_injection"] = injection
         state["runtime_context"] = self.assembler.render_runtime_context(
             injection,
             budget_chars=int(self.settings.context_runtime_budget_chars or 6000),
         )
+        state["_runtime_context_stale"] = False
         append_middleware_event(
             state,
             self.name,
@@ -258,6 +385,8 @@ class DynamicContextMiddleware(HarnessMiddleware):
                 "stage": stage,
                 "artifactCount": (injection.get("workspace") or {}).get("artifactCount", 0),
                 "hasThreadContext": bool((injection.get("threadContext") or {}).get("restored")),
+                "rerenderedAfterCompaction": stale_before_render,
+                "toolFeedbackCount": len(injection.get("toolFeedback") or []),
             },
         )
         return state
@@ -304,6 +433,7 @@ class SummarizeMiddleware(HarnessMiddleware):
         state.setdefault("context_compression_events", []).append(event)
         state["context_compression_events"] = state["context_compression_events"][-12:]
         state.setdefault("_summarized_stages", []).append(stage)
+        state["_runtime_context_stale"] = True
         append_middleware_event(
             state,
             self.name,
@@ -377,11 +507,128 @@ class ArtifactOffloadMiddleware(HarnessMiddleware):
         return state
 
 
+class ToolOutputBudgetMiddleware(HarnessMiddleware):
+    name = "tool_output_budget"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def before_policy(self, state: AgentState) -> AgentState:
+        budget = max(1000, int(getattr(self.settings, "middleware_tool_output_budget_chars", 12000) or 12000))
+        reports: List[Dict[str, Any]] = []
+        for result in list(state.get("tool_call_results") or []):
+            if not isinstance(result, ToolCallExecutionResult):
+                continue
+            payload = result.result or {}
+            payload_chars = len(json.dumps(payload, ensure_ascii=False, default=str))
+            if payload_chars <= budget or payload.get("_offloaded"):
+                continue
+            artifact = write_middleware_json_artifact(state, self.settings, "tool_outputs", "%s_result.json" % sanitize_artifact_name(result.id or result.name), payload)
+            result.result = {
+                "_offloaded": True,
+                "truncated": True,
+                "toolCallId": result.id,
+                "toolName": result.name,
+                "originalChars": payload_chars,
+                "preview": json.dumps(payload, ensure_ascii=False, default=str)[: min(1000, budget)],
+                "artifactRef": artifact.model_dump(by_alias=True),
+            }
+            reports.append({"toolCallId": result.id, "toolName": result.name, "originalChars": payload_chars, "budgetChars": budget, "artifact": artifact.model_dump(by_alias=True)})
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="offloaded",
+                code="TOOL_OUTPUT_BUDGET_APPLIED",
+                message="tool result exceeded output budget and was offloaded",
+                artifact_refs=[artifact],
+                input_chars=payload_chars,
+                output_chars=len(json.dumps(result.result, ensure_ascii=False, default=str)),
+                metadata=reports[-1],
+            )
+        if reports:
+            state.setdefault("tool_output_budget_reports", []).extend(reports)
+            state["tool_output_budget_reports"] = state["tool_output_budget_reports"][-50:]
+        return state
+
+
+class TokenUsageMiddleware(HarnessMiddleware):
+    name = "token_usage"
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def before_policy(self, state: AgentState) -> AgentState:
+        stage = "policy_round_%s" % int(state.get("react_round") or 0)
+        report = {
+            "stage": stage,
+            "estimatedInputTokens": estimate_context_tokens(state),
+            "questionTokens": estimate_text_tokens(str(state.get("question") or "")),
+            "runtimeContextTokens": estimate_text_tokens(str(state.get("runtime_context") or "")),
+            "memoryContextTokens": estimate_text_tokens(str(state.get("memory_context") or "")),
+            "summaryContextTokens": estimate_text_tokens(str(state.get("summary_context") or "")),
+            "toolResultCount": len(state.get("tool_call_results") or []),
+            "nodeResultCount": len(getattr(state.get("agent_run_result"), "task_results", []) or []),
+        }
+        existing = state.get("token_usage_reports") or []
+        if existing and existing[-1].get("stage") == stage:
+            existing[-1] = report
+        else:
+            existing.append(report)
+        state["token_usage_reports"] = existing[-50:]
+        append_middleware_event(
+            state,
+            self.name,
+            "before_policy",
+            status="observed",
+            code="TOKEN_USAGE_ESTIMATED",
+            message="estimated token usage for current agent state",
+            metadata=report,
+        )
+        return state
+
+
+class SafetyFinishReasonMiddleware(HarnessMiddleware):
+    name = "safety_finish_reason"
+
+    def before_policy(self, state: AgentState) -> AgentState:
+        reasons: List[Dict[str, Any]] = []
+        for source, error in [
+            ("planner", state.get("planner_provider_error")),
+            ("planner_llm", getattr(getattr(state.get("planner"), "llm", None), "last_error", "")),
+            ("forced_tool_loop", state.get("forced_tool_loop_stop_message")),
+        ]:
+            reason = classify_finish_reason(error)
+            if reason:
+                reasons.append({"source": source, "finishReason": reason, "message": str(error or "")[:500]})
+        if state.get("middleware_loop_blocked"):
+            reasons.append({"source": "middleware", "finishReason": "tool_loop_hard_stop", "message": str(state.get("forced_tool_loop_stop_message") or "loop guard blocked repeated tool calls")[:500]})
+        if not reasons:
+            return state
+        existing = state.get("safety_finish_reasons") or []
+        fingerprints = {stable_json_hash(item) for item in existing}
+        for reason in reasons:
+            if stable_json_hash(reason) not in fingerprints:
+                existing.append(reason)
+                append_middleware_event(
+                    state,
+                    self.name,
+                    "before_policy",
+                    status="observed",
+                    code="SAFETY_FINISH_REASON_RECORDED",
+                    message=reason["message"],
+                    metadata=reason,
+                )
+        state["safety_finish_reasons"] = existing[-50:]
+        return state
+
+
 class ToolCallRecoveryMiddleware(HarnessMiddleware):
     name = "tool_call_recovery"
 
     def before_policy(self, state: AgentState) -> AgentState:
         results = state.get("tool_call_results") or []
+        results = list(results) + synthetic_missing_tool_results(state)
         ledger_keys = {
             "%s:%s" % (entry.tool_call_id, entry.status)
             for entry in state.get("tool_call_ledger", [])
@@ -448,6 +695,9 @@ class LoopGuardMiddleware(HarnessMiddleware):
     def before_policy(self, state: AgentState) -> AgentState:
         if state.get("middleware_loop_blocked"):
             return state
+        self._check_tool_call_loops(state)
+        if state.get("middleware_loop_blocked"):
+            return state
         history = state.get("action_history") or []
         threshold = max(2, int(self.settings.middleware_loop_guard_threshold or 3))
         if len(history) < threshold:
@@ -479,6 +729,114 @@ class LoopGuardMiddleware(HarnessMiddleware):
             metadata={"actions": actions},
         )
         return state
+
+    def _check_tool_call_loops(self, state: AgentState) -> None:
+        calls = collect_tool_call_requests(state)
+        if not calls:
+            return
+        thread_id = str(state.get("thread_id") or state.get("run_id") or "default")
+        seen_by_thread = state.setdefault("tool_loop_seen_call_ids", {})
+        if not isinstance(seen_by_thread, dict):
+            seen_by_thread = {}
+            state["tool_loop_seen_call_ids"] = seen_by_thread
+        seen_ids = set(seen_by_thread.get(thread_id) or [])
+        history_by_thread = state.setdefault("tool_loop_history", {})
+        if not isinstance(history_by_thread, dict):
+            history_by_thread = {}
+            state["tool_loop_history"] = history_by_thread
+        history = list(history_by_thread.get(thread_id) or [])
+        window_size = max(1, int(getattr(self.settings, "middleware_tool_loop_window_size", 20) or 20))
+        combo_counts: Dict[str, int] = {}
+        type_counts: Dict[str, int] = {}
+        combo_display: Dict[str, Dict[str, Any]] = {}
+        for call in calls:
+            call_id = str(call.get("id") or "").strip()
+            if call_id and call_id in seen_ids:
+                continue
+            if call_id:
+                seen_ids.add(call_id)
+            name = str(call.get("name") or "")
+            if not name:
+                continue
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            key_args = loop_guard_key_args(args)
+            params_hash = stable_json_hash(key_args)
+            fingerprint = "%s:%s" % (name, params_hash)
+            history.append({"toolName": name, "fingerprint": fingerprint, "paramsHash": params_hash, "keyArgs": key_args})
+            combo_display[fingerprint] = {"toolName": name, "paramsHash": params_hash, "keyArgs": key_args}
+        history = history[-window_size:]
+        history_by_thread[thread_id] = history
+        seen_by_thread[thread_id] = list(seen_ids)[-max(window_size * 3, 50):]
+        for item in history:
+            name = str(item.get("toolName") or "")
+            fingerprint = str(item.get("fingerprint") or "")
+            if not name or not fingerprint:
+                continue
+            combo_counts[fingerprint] = combo_counts.get(fingerprint, 0) + 1
+            type_counts[name] = type_counts.get(name, 0) + 1
+            combo_display.setdefault(fingerprint, {"toolName": name, "paramsHash": item.get("paramsHash", ""), "keyArgs": item.get("keyArgs", {})})
+        repeat_warning = max(1, int(getattr(self.settings, "middleware_tool_repeat_warning_threshold", 3) or 3))
+        repeat_stop = max(repeat_warning, int(getattr(self.settings, "middleware_tool_repeat_hard_stop_threshold", 5) or 5))
+        type_warning = max(1, int(getattr(self.settings, "middleware_tool_type_warning_threshold", 30) or 30))
+        type_stop = max(type_warning, int(getattr(self.settings, "middleware_tool_type_hard_stop_threshold", 50) or 50))
+        hard_combo = [(key, count) for key, count in combo_counts.items() if count >= repeat_stop]
+        hard_type = [(name, count) for name, count in type_counts.items() if count >= type_stop]
+        warn_combo = [(key, count) for key, count in combo_counts.items() if count >= repeat_warning]
+        warn_type = [(name, count) for name, count in type_counts.items() if count >= type_warning]
+        if hard_combo or hard_type:
+            reason = "repeated tool call hard stop"
+            if hard_combo:
+                item = combo_display.get(hard_combo[0][0], {})
+                reason = "same tool+params repeated %d times: %s" % (hard_combo[0][1], item.get("toolName", ""))
+            elif hard_type:
+                reason = "same tool type repeated %d times: %s" % (hard_type[0][1], hard_type[0][0])
+            state["middleware_loop_blocked"] = True
+            state["chat_bi_completed"] = True
+            state["tool_call_requests"] = []
+            state["forced_tool_loop_stop_message"] = "[FORCED STOP] Repeated tool calls exceeded the safety limit. Producing final answer with results collected so far."
+            state["query_graph_validation_result"] = GraphValidationResult(
+                valid=False,
+                gaps=[
+                    GraphValidationGap(
+                        code="TOOL_CALL_LOOP_DETECTED",
+                        reason=reason,
+                        evidence=json.dumps({"comboCounts": combo_counts, "typeCounts": type_counts}, ensure_ascii=False, default=str)[:1000],
+                    )
+                ],
+                repairable=False,
+            )
+            state["query_graph_validated"] = True
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="blocked",
+                code="TOOL_CALL_LOOP_HARD_STOP",
+                message=reason,
+                metadata={"comboCounts": combo_counts, "typeCounts": type_counts},
+            )
+            return
+        if warn_combo or warn_type:
+            warnings = []
+            for key, count in warn_combo[:5]:
+                item = combo_display.get(key, {})
+                warnings.append("工具 %s 使用相同参数已重复 %d 次，请停止重复调用，基于已有结果总结或换工具。" % (item.get("toolName", ""), count))
+            for name, count in warn_type[:5]:
+                warnings.append("工具类型 %s 已调用 %d 次，请收敛调用次数，避免工具循环。" % (name, count))
+            warning = "\n".join(warnings)
+            pending = list(state.get("pending_tool_loop_warnings") or [])
+            if warning and warning not in pending:
+                pending.append(warning)
+            state["pending_tool_loop_warnings"] = pending[-5:]
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="warning",
+                code="TOOL_CALL_LOOP_WARNING",
+                message=warning,
+                metadata={"comboCounts": combo_counts, "typeCounts": type_counts},
+            )
 
 
 class MemoryMiddleware(HarnessMiddleware):
@@ -677,24 +1035,82 @@ class ContextSnapshotMiddleware(HarnessMiddleware):
         return state
 
 
-def default_harness_middlewares(settings: Settings, context_manager: ContextManager) -> List[HarnessMiddleware]:
+MiddlewareFactory = Callable[[Settings, ContextManager], HarnessMiddleware]
+
+
+def default_middleware_registry() -> Dict[str, MiddlewareFactory]:
+    return {
+        "cancellation": lambda settings, context_manager: CancellationMiddleware(settings),
+        "run_budget": lambda settings, context_manager: RunBudgetMiddleware(settings),
+        "permission": lambda settings, context_manager: PermissionMiddleware(),
+        "action_contract": lambda settings, context_manager: ActionContractMiddleware(),
+        "provider_compatibility": lambda settings, context_manager: ProviderCompatibilityMiddleware(),
+        "clarification": lambda settings, context_manager: ClarificationMiddleware(),
+        "tool_call_recovery": lambda settings, context_manager: ToolCallRecoveryMiddleware(),
+        "tool_output_budget": lambda settings, context_manager: ToolOutputBudgetMiddleware(settings),
+        "loop_guard": lambda settings, context_manager: LoopGuardMiddleware(settings),
+        "safety_finish_reason": lambda settings, context_manager: SafetyFinishReasonMiddleware(),
+        "memory": lambda settings, context_manager: MemoryMiddleware(settings),
+        "dynamic_context": lambda settings, context_manager: DynamicContextMiddleware(settings),
+        "token_usage": lambda settings, context_manager: TokenUsageMiddleware(settings),
+        "context_budget": lambda settings, context_manager: ContextBudgetMiddleware(settings),
+        "summarize": lambda settings, context_manager: SummarizeMiddleware(settings),
+        "artifact_offload": lambda settings, context_manager: ArtifactOffloadMiddleware(settings),
+        "filesystem_context": lambda settings, context_manager: FileSystemContextMiddleware(settings),
+        "skill": lambda settings, context_manager: SkillMiddleware(),
+        "context_snapshot": lambda settings, context_manager: ContextSnapshotMiddleware(context_manager),
+    }
+
+
+def default_middleware_order() -> List[str]:
     return [
-        CancellationMiddleware(settings),
-        PermissionMiddleware(),
-        ActionContractMiddleware(),
-        ProviderCompatibilityMiddleware(),
-        ClarificationMiddleware(),
-        ToolCallRecoveryMiddleware(),
-        LoopGuardMiddleware(settings),
-        MemoryMiddleware(settings),
-        DynamicContextMiddleware(settings),
-        ContextBudgetMiddleware(settings),
-        SummarizeMiddleware(settings),
-        ArtifactOffloadMiddleware(settings),
-        FileSystemContextMiddleware(settings),
-        SkillMiddleware(),
-        ContextSnapshotMiddleware(context_manager),
+        "cancellation",
+        "run_budget",
+        "permission",
+        "action_contract",
+        "provider_compatibility",
+        "clarification",
+        "tool_call_recovery",
+        "tool_output_budget",
+        "loop_guard",
+        "safety_finish_reason",
+        "memory",
+        "context_budget",
+        "summarize",
+        "artifact_offload",
+        "filesystem_context",
+        "dynamic_context",
+        "token_usage",
+        "skill",
+        "context_snapshot",
     ]
+
+
+def middleware_names_from_config(value: str) -> List[str]:
+    return [name.strip() for name in re.split(r"[,;\s]+", str(value or "")) if name.strip()]
+
+
+def configured_middleware_order(settings: Settings, registry: Dict[str, MiddlewareFactory]) -> List[str]:
+    requested = middleware_names_from_config(getattr(settings, "harness_middleware_order", ""))
+    if not requested:
+        return default_middleware_order()
+    known = [name for name in requested if name in registry]
+    remaining = [name for name in default_middleware_order() if name in registry and name not in known]
+    return known + remaining
+
+
+def default_harness_middlewares(settings: Settings, context_manager: ContextManager) -> List[HarnessMiddleware]:
+    registry = default_middleware_registry()
+    disabled = set(middleware_names_from_config(getattr(settings, "harness_middleware_disabled", "")))
+    middlewares: List[HarnessMiddleware] = []
+    for name in configured_middleware_order(settings, registry):
+        if name in disabled:
+            continue
+        factory = registry.get(name)
+        if factory is None:
+            continue
+        middlewares.append(factory(settings, context_manager))
+    return middlewares
 
 
 def append_middleware_event(
@@ -709,11 +1125,15 @@ def append_middleware_event(
     artifact_refs: Optional[List[ArtifactRef]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
+    severity = middleware_event_severity(status, code)
+    channel = middleware_event_channel(severity, code)
     event = MiddlewareEvent(
         event_id="mw_" + uuid.uuid4().hex,
         middleware=middleware,
         stage=stage,
         status=status,
+        severity=severity,
+        channel=channel,
         code=code,
         message=message,
         input_chars=input_chars,
@@ -722,7 +1142,38 @@ def append_middleware_event(
         metadata=metadata or {},
     )
     state.setdefault("middleware_events", []).append(event)
-    state["middleware_events"] = state["middleware_events"][-200:]
+    state["middleware_events"] = retain_middleware_events(state["middleware_events"], limit=200)
+
+
+def middleware_event_severity(status: str, code: str) -> str:
+    normalized_status = str(status or "").lower()
+    normalized_code = str(code or "").upper()
+    if normalized_status in {"blocked", "error"} or "FAIL_CLOSED" in normalized_code:
+        return "critical" if normalized_status == "blocked" or "FAIL_CLOSED" in normalized_code else "error"
+    if normalized_status in {"warning", "patched", "rerouted", "offloaded", "compressed", "intercepted"}:
+        return "warning"
+    return "info"
+
+
+def middleware_event_channel(severity: str, code: str) -> str:
+    normalized_code = str(code or "").upper()
+    if severity in {"critical", "error"}:
+        return "audit"
+    if normalized_code in {"RUN_CANCELED", "RUN_BUDGET_EXHAUSTED", "WRITE_OPERATION_REQUIRES_HUMAN", "TOOL_CALL_LOOP_HARD_STOP"}:
+        return "audit"
+    if normalized_code in {"TOKEN_USAGE_ESTIMATED", "MIDDLEWARE_STATE_DELTA", "MIDDLEWARE_CHAIN_ORDER"}:
+        return "debug"
+    return "trace"
+
+
+def retain_middleware_events(events: List[MiddlewareEvent], limit: int = 200) -> List[MiddlewareEvent]:
+    if len(events or []) <= limit:
+        return events or []
+    audit = [event for event in events if getattr(event, "channel", "") == "audit" or getattr(event, "severity", "") in {"critical", "error"}]
+    tail_budget = max(0, limit - len(audit))
+    tail = [event for event in events if event not in audit][-tail_budget:] if tail_budget else []
+    merged = audit + tail
+    return merged[-limit:]
 
 
 def state_path_ready(state: AgentState, path: str) -> bool:
@@ -777,6 +1228,142 @@ def ensure_tool_ledger_entry(state: AgentState, result: ToolCallExecutionResult,
         )
     )
     state["tool_call_ledger"] = state["tool_call_ledger"][-200:]
+
+
+def stable_json_hash(value: Any) -> str:
+    try:
+        raw = json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        raw = str(value or {})
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def loop_guard_key_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    key_fields = [
+        "path",
+        "url",
+        "query",
+        "command",
+        "cmd",
+        "pattern",
+        "prompt",
+        "description",
+        "refId",
+        "artifactId",
+        "sql",
+        "taskId",
+    ]
+    normalized: Dict[str, Any] = {}
+    for field in key_fields:
+        if field in args:
+            normalized[field] = args.get(field)
+    if normalized:
+        return normalized
+    return dict(args or {})
+
+
+def sanitize_artifact_name(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "artifact").strip())
+    return text.strip("._") or "artifact"
+
+
+def classify_finish_reason(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    if "forced stop" in lower:
+        return "forced_stop"
+    if "circuit_open" in lower or "circuit open" in lower:
+        return "circuit_open"
+    if "timeout" in lower or "timed out" in lower:
+        return "timeout"
+    if "empty_response" in lower or "empty response" in lower:
+        return "empty_response"
+    if "json_parse_error" in lower or "parse" in lower:
+        return "parse_error"
+    if "provider_error" in lower or "provider" in lower:
+        return "provider_error"
+    if "length" in lower or "truncated" in lower:
+        return "length_or_truncated"
+    return ""
+
+
+def build_run_budget_report(state: AgentState, settings: Settings) -> Dict[str, Any]:
+    now = int(time.time() * 1000)
+    started = normalize_run_started_at_ms(state.get("run_started_at_ms"), now)
+    elapsed_ms = max(0, now - started)
+    spans = state.get("trace_spans") or []
+    llm_calls = sum(1 for span in spans if span_kind(span) == "llm")
+    doris_queries = sum(1 for span in spans if span_kind(span) == "sql" or "doris" in span_name(span))
+    tool_events = state.get("tool_runtime_events") or []
+    tool_calls = sum(1 for event in tool_events if str(event.get("eventType") or "") == "tool.started")
+    token_reports = [item for item in (state.get("token_usage_reports") or []) if isinstance(item, dict)]
+    current_estimated_tokens = int((token_reports[-1] or {}).get("estimatedInputTokens") or 0) if token_reports else 0
+    peak_estimated_tokens = max([current_estimated_tokens] + [int(item.get("estimatedInputTokens") or 0) for item in token_reports])
+    usage = {
+        "elapsedMs": elapsed_ms,
+        "actions": len(state.get("action_history") or []),
+        "llmCalls": llm_calls,
+        "dorisQueries": doris_queries,
+        "toolCalls": tool_calls,
+        "estimatedTokens": current_estimated_tokens,
+        "peakEstimatedTokens": peak_estimated_tokens,
+    }
+    limits = {
+        "maxDurationSeconds": max(1, int(getattr(settings, "run_budget_max_duration_seconds", 120) or 120)),
+        "maxActions": max(1, int(getattr(settings, "run_budget_max_actions", 20) or 20)),
+        "maxLlmCalls": max(1, int(getattr(settings, "run_budget_max_llm_calls", 8) or 8)),
+        "maxDorisQueries": max(1, int(getattr(settings, "run_budget_max_doris_queries", 12) or 12)),
+        "maxToolCalls": max(1, int(getattr(settings, "run_budget_max_tool_calls", 60) or 60)),
+        "maxEstimatedTokens": max(1, int(getattr(settings, "run_budget_max_estimated_tokens", 60000) or 60000)),
+    }
+    breaches: List[str] = []
+    if usage["elapsedMs"] >= limits["maxDurationSeconds"] * 1000:
+        breaches.append("duration")
+    if usage["actions"] >= limits["maxActions"]:
+        breaches.append("actions")
+    if usage["llmCalls"] >= limits["maxLlmCalls"]:
+        breaches.append("llm_calls")
+    if usage["dorisQueries"] >= limits["maxDorisQueries"]:
+        breaches.append("doris_queries")
+    if usage["toolCalls"] >= limits["maxToolCalls"]:
+        breaches.append("tool_calls")
+    if usage["peakEstimatedTokens"] >= limits["maxEstimatedTokens"]:
+        breaches.append("estimated_tokens")
+    return {
+        "usage": usage,
+        "limits": limits,
+        "breaches": breaches,
+        "exhausted": bool(breaches),
+        "reason": "run budget exhausted: %s" % ", ".join(breaches) if breaches else "",
+    }
+
+
+def normalize_run_started_at_ms(value: Any, now_ms_value: int) -> int:
+    try:
+        started = int(float(value))
+    except Exception:
+        return now_ms_value
+    if started <= 0:
+        return now_ms_value
+    if started < 1_000_000_000:
+        return now_ms_value
+    if started < 10_000_000_000:
+        return started * 1000
+    return started
+
+
+def span_kind(span: Any) -> str:
+    if isinstance(span, dict):
+        return str(span.get("kind") or "")
+    return str(getattr(span, "kind", "") or "")
+
+
+def span_name(span: Any) -> str:
+    if isinstance(span, dict):
+        return str(span.get("name") or "")
+    return str(getattr(span, "name", "") or "")
 
 
 def estimate_context_tokens(state: AgentState) -> int:
@@ -1020,3 +1607,89 @@ def normalize_tool_result(item: Any) -> ToolCallExecutionResult:
     if isinstance(item, dict):
         return ToolCallExecutionResult.model_validate(item)
     return ToolCallExecutionResult(id=str(getattr(item, "id", "")), name=str(getattr(item, "name", "")), status=str(getattr(item, "status", "")))
+
+
+def synthetic_missing_tool_results(state: AgentState) -> List[ToolCallExecutionResult]:
+    calls = collect_tool_call_requests(state)
+    if not calls:
+        return []
+    existing_ids = {
+        normalize_tool_result(item).id
+        for item in state.get("tool_call_results", []) or []
+        if normalize_tool_result(item).id
+    }
+    synthetic: List[ToolCallExecutionResult] = []
+    for call in calls:
+        call_id = str(call.get("id") or "").strip()
+        name = str(call.get("name") or "").strip()
+        if not call_id or call_id in existing_ids:
+            continue
+        synthetic.append(
+            ToolCallExecutionResult(
+                id=call_id,
+                name=name,
+                status="failed",
+                error_type="MISSING_TOOL_RESULT",
+                error_message="tool call had no matching tool result; synthetic failure inserted by recovery middleware",
+                retryable=False,
+                recommended_action="patch_missing_terminal_result",
+                tool_message={
+                    "toolName": name,
+                    "status": "failed",
+                    "errorCode": "MISSING_TOOL_RESULT",
+                    "message": "synthetic missing tool result",
+                },
+            )
+        )
+        state.setdefault("tool_call_recovery_events", []).append(
+            ToolCallRecoveryEvent(
+                tool_call_id=call_id,
+                tool_name=name,
+                stage="before_policy",
+                action="patch_missing_tool_result",
+                reason="tool call did not have a matching tool result",
+                status_before="missing",
+                status_after="failed",
+            )
+        )
+        append_middleware_event(
+            state,
+            "tool_call_recovery",
+            "before_policy",
+            status="patched",
+            code="MISSING_TOOL_RESULT_PATCHED",
+            message="inserted synthetic failed tool result for dangling tool call",
+            metadata={"toolCallId": call_id, "toolName": name},
+        )
+        existing_ids.add(call_id)
+    return synthetic
+
+
+def collect_tool_call_requests(state: AgentState) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    for item in state.get("tool_call_requests", []) or []:
+        normalized = normalize_tool_call_request(item)
+        if normalized:
+            calls.append(normalized)
+    plan = state.get("plan")
+    for item in getattr(plan, "planner_tool_calls", []) or []:
+        normalized = normalize_tool_call_request(item)
+        if normalized:
+            calls.append(normalized)
+    answer_tools = state.get("answer_file_tool_results") or {}
+    if isinstance(answer_tools, dict):
+        for item in answer_tools.get("calls") or []:
+            normalized = normalize_tool_call_request(item)
+            if normalized:
+                calls.append(normalized)
+    return calls
+
+
+def normalize_tool_call_request(item: Any) -> Dict[str, Any]:
+    if isinstance(item, ToolCallRequest):
+        return {"id": item.id, "name": item.name, "args": dict(item.args or {})}
+    if isinstance(item, dict):
+        args = item.get("args") if isinstance(item.get("args"), dict) else {}
+        return {"id": str(item.get("id") or ""), "name": str(item.get("name") or ""), "args": args}
+    args = getattr(item, "args", {})
+    return {"id": str(getattr(item, "id", "")), "name": str(getattr(item, "name", "")), "args": args if isinstance(args, dict) else {}}

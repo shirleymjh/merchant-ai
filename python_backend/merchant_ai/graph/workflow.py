@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import re
 import uuid
@@ -13,6 +14,14 @@ from langgraph.graph import END, START, StateGraph
 
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.policy import V2AgentPolicy
+from merchant_ai.graph.message_history import (
+    MAX_SHORT_TERM_CONTEXT_CHARS,
+    MAX_SHORT_TERM_MESSAGES,
+    append_context_section,
+    compact_file_tool_results_for_prompt,
+    normalize_message_history,
+    render_message_history_context,
+)
 from merchant_ai.graph.state import (
     AgentState,
     GraphEventListener,
@@ -68,11 +77,23 @@ from merchant_ai.models import (
     ThreadData,
     TopicRoutingDecision,
 )
-from merchant_ai.services.answer import AnswerComposeService, analysis_summary_required, answer_skill_headers, answer_skill_required, build_response_context, joined_categories, select_answer_skill
+from merchant_ai.services.answer import (
+    AnswerComposeService,
+    analysis_summary_required,
+    answer_result_role,
+    answer_skill_headers,
+    answer_skill_required,
+    build_response_context,
+    intent_by_task_id,
+    joined_categories,
+    section_title_for_intent,
+    select_answer_skill,
+    visible_successful_tasks,
+)
 from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService, WikiMemoryService
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.context import ContextManager
-from merchant_ai.services.context_assembly import ContextAssembler, ThreadContextService
+from merchant_ai.services.context_assembly import ContextAssembler, ThreadContextService, build_llm_context_blocks, context_cache_layout, context_quarantine_policy
 from merchant_ai.services.context_filesystem import add_context_uri, context_lineage_record, merchant_uri_for_artifact, merchant_uri_for_semantic_ref
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.llm import LlmClient
@@ -95,169 +116,6 @@ from merchant_ai.services.tools import (
     semantic_file_tool_definitions,
     semantic_file_tool_schemas,
 )
-
-MAX_SHORT_TERM_MESSAGES = 40
-MAX_SHORT_TERM_RECENT_MESSAGES = 6
-MAX_SHORT_TERM_MESSAGE_CHARS = 1200
-MAX_SHORT_TERM_CONTEXT_CHARS = 8000
-MAX_SHORT_TERM_SUMMARY_CHARS = 1800
-
-
-def normalize_message_history(messages: Optional[List[Any]]) -> List[ConversationMessage]:
-    normalized: List[ConversationMessage] = []
-    for item in list(messages or [])[-MAX_SHORT_TERM_MESSAGES:]:
-        try:
-            message = item if isinstance(item, ConversationMessage) else ConversationMessage.model_validate(item)
-        except Exception:
-            continue
-        role = str(message.role or "").strip().lower()
-        text = str(message.text or "").strip()
-        if role not in {"user", "assistant", "system", "tool"} or not text:
-            continue
-        normalized.append(
-            message.model_copy(
-                update={
-                    "role": role,
-                    "text": text[:MAX_SHORT_TERM_MESSAGE_CHARS],
-                }
-            )
-        )
-    return normalized
-
-
-def render_recent_message_history_context(messages: List[ConversationMessage]) -> str:
-    if not messages:
-        return ""
-    lines = [
-        "## 当前会话短期记忆",
-        "以下是当前上下文窗口内的最近多轮 messages 原文片段，用于指代消解、连续任务和未完成事项承接。",
-    ]
-    for index, message in enumerate(messages[-MAX_SHORT_TERM_RECENT_MESSAGES:], start=1):
-        role = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(message.role, message.role or "unknown")
-        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
-        if text:
-            lines.append("- %02d %s：%s" % (index, role, text[:MAX_SHORT_TERM_MESSAGE_CHARS]))
-    return "\n".join(lines)[-MAX_SHORT_TERM_CONTEXT_CHARS:]
-
-
-def render_rule_based_message_summary(messages: List[ConversationMessage]) -> str:
-    if not messages:
-        return ""
-    lines = [
-        "## 旧会话压缩摘要",
-        "模型摘要不可用时使用规则兜底，仅保留较早消息中的关键片段。",
-    ]
-    for index, message in enumerate(messages[-(MAX_SHORT_TERM_MESSAGES - MAX_SHORT_TERM_RECENT_MESSAGES) :], start=1):
-        role = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(message.role, message.role or "unknown")
-        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
-        if text:
-            lines.append("- %02d %s：%s" % (index, role, text[:500]))
-    return "\n".join(lines)[:MAX_SHORT_TERM_SUMMARY_CHARS]
-
-
-def summarize_message_history_context(
-    messages: List[ConversationMessage],
-    question: str,
-    llm: Optional[LlmClient] = None,
-    timeout_seconds: int = 8,
-) -> Dict[str, Any]:
-    if len(messages) <= MAX_SHORT_TERM_RECENT_MESSAGES:
-        return {"summary": "", "usedLlm": False, "sourceMessages": 0, "fallback": False}
-    older_messages = messages[:-MAX_SHORT_TERM_RECENT_MESSAGES]
-    fallback_summary = render_rule_based_message_summary(older_messages)
-    if not llm or not getattr(llm, "configured", False) or not hasattr(llm, "chat"):
-        return {"summary": fallback_summary, "usedLlm": False, "sourceMessages": len(older_messages), "fallback": bool(fallback_summary)}
-
-    rows: List[str] = []
-    for index, message in enumerate(older_messages[-(MAX_SHORT_TERM_MESSAGES - MAX_SHORT_TERM_RECENT_MESSAGES) :], start=1):
-        role = {"user": "用户", "assistant": "助手", "system": "系统", "tool": "工具"}.get(message.role, message.role or "unknown")
-        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
-        if text:
-            rows.append("%02d %s：%s" % (index, role, text[:MAX_SHORT_TERM_MESSAGE_CHARS]))
-    if not rows:
-        return {"summary": "", "usedLlm": False, "sourceMessages": len(older_messages), "fallback": False}
-
-    system_prompt = (
-        "你是商家经营问答系统的会话记忆压缩器。"
-        "请只抽取对当前追问仍有用的信息，不补充事实，不推断未出现的数据。"
-        "输出中文，控制在 800 字以内。"
-    )
-    user_prompt = "\n".join(
-        [
-            "当前用户问题：%s" % (question or ""),
-            "",
-            "请从以下较早会话消息中提炼短期会话摘要，重点保留：",
-            "1. 用户确认过的时间范围、筛选条件、指标口径；",
-            "2. 关键对象、实体集合、订单号、商品 ID、退款单号等；",
-            "3. 未完成任务、证据缺口、上一轮查询结果中可复用的对象；",
-            "4. 用户明确纠正、偏好或冲突信息。",
-            "不要复述无关寒暄、长 SQL、完整工具日志。",
-            "",
-            "较早会话消息：",
-            "\n".join(rows),
-            "",
-            "输出格式：",
-            "## 旧会话压缩摘要",
-            "- 已确认约束：...",
-            "- 关键对象：...",
-            "- 未完成任务：...",
-            "- 纠正和偏好：...",
-        ]
-    )
-    summary = str(llm.chat(system_prompt, user_prompt, fallback="", timeout_seconds=timeout_seconds) or "").strip()
-    if not summary:
-        return {"summary": fallback_summary, "usedLlm": False, "sourceMessages": len(older_messages), "fallback": bool(fallback_summary)}
-    if "旧会话压缩摘要" not in summary[:80]:
-        summary = "## 旧会话压缩摘要\n" + summary
-    return {
-        "summary": summary[:MAX_SHORT_TERM_SUMMARY_CHARS],
-        "usedLlm": True,
-        "sourceMessages": len(older_messages),
-        "fallback": False,
-    }
-
-
-def render_message_history_context(messages: List[ConversationMessage], question: str = "", llm: Optional[LlmClient] = None) -> Dict[str, Any]:
-    summary_trace = summarize_message_history_context(messages, question, llm)
-    sections = [summary_trace.get("summary") or "", render_recent_message_history_context(messages)]
-    context = "\n\n".join(section.strip() for section in sections if section and section.strip())[-MAX_SHORT_TERM_CONTEXT_CHARS:]
-    return {
-        "context": context,
-        "usedLlm": bool(summary_trace.get("usedLlm")),
-        "fallback": bool(summary_trace.get("fallback")),
-        "summarySourceMessages": int(summary_trace.get("sourceMessages") or 0),
-        "recentMessages": min(len(messages), MAX_SHORT_TERM_RECENT_MESSAGES),
-    }
-
-
-def append_context_section(existing: str, section: str, max_chars: int = MAX_SHORT_TERM_CONTEXT_CHARS) -> str:
-    parts = [part for part in [existing.strip(), section.strip()] if part]
-    return "\n\n".join(parts)[-max_chars:]
-
-
-def compact_file_tool_results_for_prompt(results: List[Dict[str, Any]], max_items: int = 6) -> List[Dict[str, Any]]:
-    compacted: List[Dict[str, Any]] = []
-    for item in results[-max_items:]:
-        result = item.get("result") or {}
-        payload = {
-            "name": item.get("name"),
-            "status": item.get("status"),
-            "errorType": item.get("errorType"),
-            "errorMessage": item.get("errorMessage"),
-        }
-        if isinstance(result, dict):
-            for key in ["relativePath", "merchantUri", "truncated", "estimatedChars", "nextContentOffsetChars"]:
-                if key in result:
-                    payload[key] = result.get(key)
-            if "content" in result:
-                payload["content"] = str(result.get("content") or "")[:1800]
-            if "items" in result and isinstance(result.get("items"), list):
-                payload["items"] = result.get("items")[:8]
-            if "hits" in result and isinstance(result.get("hits"), list):
-                payload["hits"] = result.get("hits")[:8]
-        compacted.append(payload)
-    return compacted
-
 
 class MerchantQaWorkflow:
     def __init__(
@@ -428,6 +286,18 @@ class MerchantQaWorkflow:
             middleware_events=[],
             tool_call_ledger=[],
             tool_call_recovery_events=[],
+            tool_call_requests=[],
+            tool_loop_warning="",
+            pending_tool_loop_warnings=[],
+            tool_loop_history={},
+            tool_loop_seen_call_ids={},
+            forced_tool_loop_stop_message="",
+            tool_output_budget_reports=[],
+            token_usage_reports=[],
+            safety_finish_reasons=[],
+            run_budget_report={},
+            run_budget_exhausted=False,
+            run_started_at_ms=now_ms(),
             workspace_manifest=WorkspaceManifest(),
             run_steps=[],
             trace_spans=[],
@@ -2360,6 +2230,8 @@ class MerchantQaWorkflow:
                 state["planning_asset_pack"],
                 node_knowledge_context,
                 state["question"],
+                resume_task_results=(state.get("agent_run_result") or AgentRunResult()).task_results,
+                run_id=state.get("run_id", ""),
             )
         except Exception as exc:
             run_result = AgentRunResult(
@@ -2612,17 +2484,31 @@ class MerchantQaWorkflow:
             return state
         personalization_context = self.answer_personalization_context(state)
         self.emit_skill_lifecycle_event(state, "confirmed", match, {"confirmed": True})
-        self.emit_skill_lifecycle_event(state, "isolated_execute", match, {"workerType": "SKILL_WORKER"})
-        state["analysis_summary"] = self.answer_service.run_analysis_skill(
-            state["question"],
-            state["plan"],
-            state["agent_run_result"],
-            state["thread_data"].outputs_path,
-            state.get("rule_recall_context", ""),
-            skill_name=match.skill_name,
-            merchant=state["merchant"],
-            personalization_context=personalization_context,
-        )
+        parallel_skill_names = self.parallel_skill_names(match)
+        if len(parallel_skill_names) > 1:
+            self.emit_skill_lifecycle_event(state, "parallel_isolated_execute", match, {"workerType": "SKILL_WORKER_BATCH", "skillNames": parallel_skill_names})
+            state["analysis_summary"] = self.answer_service.run_parallel_analysis_skills(
+                state["question"],
+                state["plan"],
+                state["agent_run_result"],
+                parallel_skill_names,
+                state["thread_data"].outputs_path,
+                state.get("rule_recall_context", ""),
+                merchant=state["merchant"],
+                personalization_context=personalization_context,
+            )
+        else:
+            self.emit_skill_lifecycle_event(state, "isolated_execute", match, {"workerType": "SKILL_WORKER"})
+            state["analysis_summary"] = self.answer_service.run_analysis_skill(
+                state["question"],
+                state["plan"],
+                state["agent_run_result"],
+                state["thread_data"].outputs_path,
+                state.get("rule_recall_context", ""),
+                skill_name=match.skill_name,
+                merchant=state["merchant"],
+                personalization_context=personalization_context,
+            )
         state["analysis_skill_trace"] = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
         self.record_skill_lifecycle(state, state["analysis_skill_trace"])
         trace = state.get("analysis_skill_trace") or {}
@@ -2682,6 +2568,19 @@ class MerchantQaWorkflow:
         )
         return state
 
+    def parallel_skill_names(self, match: SkillMatchState) -> List[str]:
+        if not bool(getattr(self.settings, "skill_worker_parallel_enabled", False)):
+            return [match.skill_name] if match.skill_name else []
+        names: List[str] = []
+        for candidate in [match.skill_name] + list(match.candidate_skills or []):
+            name = str(candidate or "").strip()
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            return []
+        limit = max(1, int(getattr(self.settings, "max_concurrent_skill_workers", 2) or 2))
+        return names[:limit]
+
     def match_analysis_skill(self, state: AgentState) -> SkillMatchState:
         current = state.get("skill_match")
         if isinstance(current, SkillMatchState) and current.skill_name:
@@ -2715,12 +2614,15 @@ class MerchantQaWorkflow:
         state["skill_dispatch_context"] = self.skill_dispatch_context(state)
         self.emit_skill_lifecycle_event(state, "matched", match, {"candidateSkills": match.candidate_skills, "reason": match.reason})
         record = SkillLifecycleRecord(
+            record_id=self.skill_lifecycle_record_id(match.skill_name, "matched"),
             skill_name=match.skill_name,
             stage="matched",
             status=match.status,
             matched_by=match.matched_by,
             requires_confirmation=match.requires_confirmation,
             confirmed=match.confirmed,
+            started_at=datetime.now().isoformat(),
+            completed_at=datetime.now().isoformat(),
             progress=["matched"],
             summary=match.reason,
             metadata={"confidence": match.confidence, "fallbackSkill": match.fallback_skill},
@@ -2885,12 +2787,15 @@ class MerchantQaWorkflow:
             return False
         state["skill_match"] = match.model_copy(update={"status": "waiting_confirmation", "requires_confirmation": True, "confirmed": False})
         record = SkillLifecycleRecord(
+            record_id=self.skill_lifecycle_record_id(skill_name, "confirmation_required"),
             skill_name=skill_name,
             stage="confirmation_required",
             status="waiting_confirmation",
             matched_by=match.matched_by or "skill_match",
             requires_confirmation=True,
             confirmed=False,
+            started_at=datetime.now().isoformat(),
+            completed_at=datetime.now().isoformat(),
             progress=["matched", "waiting_confirmation"],
             summary="等待用户确认是否执行分析技能",
         )
@@ -2913,11 +2818,24 @@ class MerchantQaWorkflow:
         return True
 
     def record_skill_lifecycle(self, state: AgentState, trace: Dict[str, Any]) -> None:
+        for child_trace in trace.get("skillBatchResults") or []:
+            if isinstance(child_trace, dict):
+                self.record_skill_lifecycle(state, child_trace)
         if not trace or not trace.get("skillName"):
             return
         stage = str(trace.get("lifecycleStage") or ("completed" if trace.get("activated") and not trace.get("error") else "matched"))
         status = "success" if stage == "completed" and not trace.get("error") else ("failed" if trace.get("error") else stage)
+        context_package = trace.get("contextPackage") or {}
+        checkpoint_path = str(trace.get("checkpointPath") or "")
+        artifact_refs = []
+        for path, reason in [
+            (checkpoint_path, "skill worker checkpoint"),
+            (str(trace.get("contextPackagePath") or ""), "skill worker context package"),
+        ]:
+            if path:
+                artifact_refs.append(artifact_ref_from_path(path, namespace="skill_worker", reason=reason))
         record = SkillLifecycleRecord(
+            record_id=self.skill_lifecycle_record_id(str(trace.get("skillName") or ""), stage, str(trace.get("isolatedRunId") or "")),
             skill_name=str(trace.get("skillName") or ""),
             stage=stage,
             status=status,
@@ -2926,9 +2844,14 @@ class MerchantQaWorkflow:
             confirmed=bool(trace.get("confirmed", True)),
             isolated_run_id=str(trace.get("isolatedRunId") or ""),
             workspace_path=str(trace.get("workspacePath") or ""),
-            checkpoint_path=str(trace.get("checkpointPath") or ""),
+            checkpoint_path=checkpoint_path,
             progress=[str(item) for item in (trace.get("progress") or [])],
             reuse_candidate=bool(trace.get("reuseCandidate")),
+            context_hash=str(context_package.get("contextHash") or trace.get("contextHash") or ""),
+            artifact_refs=artifact_refs,
+            started_at=str(trace.get("startedAt") or ""),
+            completed_at=str(trace.get("completedAt") or (datetime.now().isoformat() if status in {"success", "failed"} else "")),
+            duration_ms=int(trace.get("durationMs") or 0),
             summary=str(trace.get("error") or ("skill completed" if status == "success" else stage)),
             metadata={
                 "executionMode": trace.get("executionMode"),
@@ -2948,6 +2871,10 @@ class MerchantQaWorkflow:
         state.setdefault("skill_lifecycle_records", []).append(record)
         state["agent_run_result"].skill_lifecycle_records.append(record)
         add_step(state, "AnswerAgent Skill：%s lifecycle=%s status=%s" % (record.skill_name, record.stage, record.status))
+
+    def skill_lifecycle_record_id(self, skill_name: str, stage: str, isolated_run_id: str = "") -> str:
+        seed = "%s:%s:%s" % (skill_name or "unknown", stage or "unknown", isolated_run_id or uuid.uuid4().hex)
+        return "skill_lifecycle_%s" % uuid.uuid5(uuid.NAMESPACE_URL, seed).hex[:16]
 
     def answer_personalization_context(self, state: AgentState) -> Dict[str, Any]:
         answer_memory_injection = answer_safe_memory_injection(state.get("memory_injection") or {})
@@ -3202,6 +3129,10 @@ class MerchantQaWorkflow:
                 suggestions=state.get("suggestions", []),
                 personalization_context=self.answer_personalization_context(state),
             )
+        downloads = self.result_download_artifacts(state, sections)
+        if downloads:
+            state["merchant_experience"] = dict(state.get("merchant_experience") or {})
+            state["merchant_experience"]["downloadArtifacts"] = downloads
         return ChatResponse(
             id=state["qa_id"],
             answer=state.get("answer", ""),
@@ -3305,6 +3236,47 @@ class MerchantQaWorkflow:
                 "partialAnswerReason": state["agent_run_result"].partial_answer_reason,
             },
         )
+
+    def result_download_artifacts(self, state: AgentState, sections: List[ChatDataSection]) -> List[Dict[str, Any]]:
+        run_result = state.get("agent_run_result")
+        thread_data = state.get("thread_data")
+        outputs_path = getattr(thread_data, "outputs_path", "") if thread_data is not None else ""
+        if not run_result or not outputs_path:
+            return []
+        min_rows = max(1, int(getattr(self.settings, "result_csv_download_min_rows", 50) or 50))
+        intent_map = intent_by_task_id(state.get("plan") or QueryPlan())
+        section_by_role = {section.result_role: section for section in sections}
+        downloads: List[Dict[str, Any]] = []
+        root = Path(outputs_path) / "artifacts" / "downloads"
+        root.mkdir(parents=True, exist_ok=True)
+        for task in visible_successful_tasks(state.get("plan") or QueryPlan(), run_result):
+            bundle = task.query_bundle
+            rows = list(bundle.rows or [])
+            if bundle.failed or len(rows) < min_rows:
+                continue
+            intent = intent_map.get(task.task_id)
+            title = section_title_for_intent(state.get("plan") or QueryPlan(), intent, task.task_id) if intent else task.task_id
+            filename = "%s.csv" % sanitize_download_name(task.task_id or title or "query_result")
+            target = root / filename
+            write_rows_csv(target, rows)
+            relative = str(target.relative_to(Path(outputs_path) / "artifacts"))
+            merchant_uri = merchant_uri_for_artifact(relative, namespace="downloads")
+            section = section_by_role.get(answer_result_role(intent)) if intent else None
+            downloads.append(
+                {
+                    "type": "csv",
+                    "label": "下载%sCSV" % (title or "查询结果"),
+                    "taskId": task.task_id,
+                    "title": title,
+                    "rowCount": len(rows),
+                    "previewRowCount": len(section.data_rows) if section else min(len(rows), self.settings.tool_result_preview_rows),
+                    "path": str(target),
+                    "relativePath": relative,
+                    "merchantUri": merchant_uri,
+                    "downloadUrl": merchant_uri,
+                }
+            )
+        return downloads[:12]
 
     def planning_asset_debug(self, pack: PlanningAssetPack) -> Dict[str, Any]:
         return {
@@ -3553,11 +3525,15 @@ class MerchantQaWorkflow:
         artifact_refs = []
         for ref in getattr(package, "artifact_refs", [])[:12]:
             artifact_refs.append(ref if hasattr(ref, "model_dump") else ref)
+        blocks = build_llm_context_blocks(state, package, budget_report)
         manifest = ContextManifest(
             stage=str(getattr(package, "stage", "") or ""),
             agent=str(getattr(package, "agent", "") or ""),
             context_package_id=str(getattr(package, "package_id", "") or ""),
             context_hash=str(getattr(package, "context_hash", "") or ""),
+            blocks=blocks,
+            cache_layout=context_cache_layout(blocks),
+            quarantine_policy=context_quarantine_policy(blocks),
             allowed_tables=list(getattr(package, "allowed_tables", []) or [])[:12],
             allowed_metrics=list(getattr(package, "allowed_metrics", []) or [])[:24],
             memory_ids=context_memory_ids(state),
@@ -3790,7 +3766,10 @@ class MerchantQaWorkflow:
                 item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
                 for item in recoveries[-24:]
             ],
+            "runBudgetReport": state.get("run_budget_report", {}),
+            "safetyFinishReasons": state.get("safety_finish_reasons", [])[-12:],
             "runCanceled": bool(state.get("run_canceled")),
+            "runBudgetExhausted": bool(state.get("run_budget_exhausted")),
             "loopBlocked": bool(state.get("middleware_loop_blocked")),
             "actionContextHashes": state.get("middleware_action_context_hashes", {}),
         }
@@ -4475,6 +4454,28 @@ def dedupe_workflow_knowledge_requests(items: List[KnowledgeRequest]) -> List[Kn
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def write_rows_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            column = str(key)
+            if column not in seen:
+                seen.add(column)
+                columns.append(column)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def sanitize_download_name(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "query_result").strip())
+    return text.strip("._") or "query_result"
 
 
 def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:

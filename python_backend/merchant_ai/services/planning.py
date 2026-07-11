@@ -45,10 +45,37 @@ from merchant_ai.services.formulas import (
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory_constraints import memory_constraint_validation_gaps
 from merchant_ai.services.prompts import PromptAssembler
+from merchant_ai.services.planning_tooling import (
+    artifact_summary,
+    compact_memory_constraints,
+    compact_openai_tool_schema,
+    compact_planner_context,
+    compact_planner_trace,
+    compact_previous_understanding,
+    compact_tool_result_for_prompt,
+    normalize_llm_tool_calls,
+    parse_json_object,
+    payload_has_understanding,
+    planner_failure_gap_code,
+    planner_failure_reason,
+    planner_failure_trace_reason,
+    planner_llm_terminal_error,
+    planner_prompt_stats,
+    planner_repair_feedback_for_understanding,
+    planner_tool_results_for_prompt,
+)
+from merchant_ai.services.planning_layers import GraphContractValidator, PlanCompiler, PlanRepairer, UnderstandingExtractor
 from merchant_ai.services.routing import extract_days
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
-from merchant_ai.services.tools import artifact_file_tool_definitions, question_understanding_tool, semantic_file_tool_definitions
+from merchant_ai.services.tools import (
+    artifact_file_tool_definitions,
+    deferred_tool_schema_loader_tool,
+    question_understanding_tool,
+    select_tool_schemas,
+    semantic_file_tool_definitions,
+    tool_schema_catalog,
+)
 
 
 @dataclass
@@ -788,6 +815,25 @@ class QueryGraphPlanner:
         self.artifact_store = artifact_store or WorkspaceArtifactStore(self.settings)
         self.compiler = QuestionUnderstandingCompiler()
         self.coverage_critic = UnderstandingCoverageCritic()
+        self.understanding_extractor = UnderstandingExtractor(self)
+        self.plan_compiler = PlanCompiler(
+            compiler=self.compiler,
+            coverage_critic=self.coverage_critic,
+            expand_asset_pack=self._expand_asset_pack_from_understanding,
+            enrich_plan=enrich_llm_plan,
+            append_prompt_trace=append_prompt_trace,
+            attach_tool_trace=attach_planner_tool_trace,
+        )
+        self.plan_repairer = PlanRepairer(
+            llm=self.llm,
+            compiler=self.compiler,
+            root_metric_repair=repair_more_specific_root_metric,
+            dependency_key_repair=repair_dependency_key_production_gaps,
+            missing_domain_repair=repair_missing_domain_dependencies,
+            llm_repair=self._llm_repair,
+            enrich_plan=enrich_llm_plan,
+        )
+        self.graph_contract_validator = GraphContractValidator(QueryGraphValidator())
         self.prompt_assembler = PromptAssembler()
         self.tool_failure_registry = ToolFailureRegistry(
             repeat_threshold=self.settings.tool_failure_repeat_threshold,
@@ -820,29 +866,20 @@ class QueryGraphPlanner:
         trace: List[str],
         planner_context: Dict[str, Any] | None = None,
     ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
-        prior_understanding = (
-            planner_context.get("previousUnderstanding")
-            if isinstance(planner_context, dict) and isinstance(planner_context.get("previousUnderstanding"), dict)
-            else None
-        )
-        fast_plan = compile_semantic_topn_metric_fast_graph(question, asset_pack)
-        if fast_plan.intents:
+        prior_understanding = self.understanding_extractor.prior_understanding(planner_context)
+        fast_plan = self.understanding_extractor.semantic_fast_path(question, asset_pack)
+        if fast_plan.intents and (not self.llm.configured or semantic_fast_path_can_bypass_configured_llm(question, fast_plan)):
             fast_plan.agent_trace.append("planner.semantic_fast_path=topn_metric")
             return fast_plan, fast_plan.knowledge_requests, "SEMANTIC_FAST_PATH"
         if self.llm.configured:
-            initial_tool_entry = self._initial_semantic_tool_entry(question, asset_pack, gaps, planner_context)
-            start_with_workspace = bool(initial_tool_entry)
-            payload = self._llm_understand(
+            payload, start_with_workspace, prior_understanding, initial_tool_entry = self.understanding_extractor.initial_payload(
                 question,
                 asset_pack,
                 gaps,
                 trace,
                 planner_context=planner_context,
-                prior_understanding=prior_understanding,
-                use_tool_loop=start_with_workspace,
-                filesystem_context_entry=initial_tool_entry or "fast_path",
             )
-            plan = self._plan_from_payload(question, payload, asset_pack)
+            plan = self.plan_compiler.compile(question, payload, asset_pack)
             recovery_used = False
             if plan.intents:
                 if start_with_workspace:
@@ -861,7 +898,7 @@ class QueryGraphPlanner:
 
             if self._should_enter_semantic_tool_loop(payload, plan):
                 recovery_used = True
-                tool_payload = self._llm_understand(
+                tool_payload = self.understanding_extractor.recovery_payload(
                     question,
                     asset_pack,
                     gaps,
@@ -871,7 +908,7 @@ class QueryGraphPlanner:
                     prior_understanding=prior_understanding,
                     filesystem_context_entry="recovery",
                 )
-                tool_plan = self._plan_from_payload(question, tool_payload, asset_pack)
+                tool_plan = self.plan_compiler.compile(question, tool_payload, asset_pack)
                 if tool_plan.intents:
                     tool_plan.agent_trace.append("planner.semantic_tool_loop=on_demand")
                     tool_plan.agent_trace.append("planner.llm_call_budget=recovery_used")
@@ -884,7 +921,7 @@ class QueryGraphPlanner:
             if status == "NEED_MORE_KNOWLEDGE":
                 if asset_pack.known_tables() and not recovery_used:
                     recovery_used = True
-                    forced_payload = self._llm_understand(
+                    forced_payload = self.understanding_extractor.recovery_payload(
                         question,
                         asset_pack,
                         gaps,
@@ -893,7 +930,7 @@ class QueryGraphPlanner:
                         planner_context=planner_context,
                         prior_understanding=prior_understanding,
                     )
-                    forced_plan = self._plan_from_payload(question, forced_payload, asset_pack)
+                    forced_plan = self.plan_compiler.compile(question, forced_payload, asset_pack)
                     if forced_plan.intents:
                         forced_plan.agent_trace.append("planner.need_more_overridden_by_semantic_catalog")
                         forced_plan.agent_trace.append("planner.llm_call_budget=recovery_used")
@@ -923,15 +960,16 @@ class QueryGraphPlanner:
                 if semantic_metric_plan.intents:
                     return semantic_metric_plan, semantic_metric_plan.knowledge_requests, payload.get("reason", "")
         trace_reason = planner_failure_trace_reason(self.llm.configured, self.llm.last_error)
-        entity_plan = compile_entity_detail_graph_from_question_entity(question, asset_pack)
-        if entity_plan.intents:
-            entity_plan.agent_trace.extend([trace_reason, "planner.entity_id_semantic_fallback_after_llm_failure"])
-            return entity_plan, [], trace_reason
-        trend_plan = compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
-        if trend_plan.intents:
-            trend_plan.agent_trace.extend([trace_reason, "planner.multi_metric_trend_fallback_after_llm_failure"])
-            return trend_plan, [], trace_reason
-        return QueryPlan(agent_trace=[trace_reason]), [], trace_reason
+        return self.understanding_extractor.failure_fallback_plan(question, asset_pack, trace_reason)
+
+    def _semantic_fast_path(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        return compile_semantic_topn_metric_fast_graph(question, asset_pack)
+
+    def _entity_detail_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        return compile_entity_detail_graph_from_question_entity(question, asset_pack)
+
+    def _multi_metric_trend_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        return compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
 
     def _retry_compact_understanding_if_needed(
         self,
@@ -972,39 +1010,7 @@ class QueryGraphPlanner:
         return retry_payload or payload
 
     def _plan_from_payload(self, question: str, payload: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
-        understanding = payload.get("questionUnderstanding") or payload.get("question_understanding") or {}
-        if understanding:
-            expansion_trace = self._expand_asset_pack_from_understanding(asset_pack, understanding)
-            coverage = self.coverage_critic.complete(question, understanding, asset_pack)
-            understanding = coverage.understanding
-            expansion_trace.extend(self._expand_asset_pack_from_understanding(asset_pack, understanding))
-            plan = self.compiler.compile(question, understanding, asset_pack)
-            if coverage.trace:
-                plan.compiler_trace = coverage.trace + plan.compiler_trace
-            if coverage.added_measures:
-                plan.agent_trace.append("planner.understanding_coverage_critic=semantic_metric_completion")
-            if expansion_trace:
-                plan.compiler_trace.extend(expansion_trace)
-            if plan.intents:
-                plan = enrich_llm_plan(question, plan, asset_pack, payload)
-                append_prompt_trace(plan, payload)
-                attach_planner_tool_trace(plan, payload)
-                plan.agent_trace.append("planner=llm_understanding_compiled")
-                return plan
-            if plan.knowledge_requests:
-                append_prompt_trace(plan, payload)
-                attach_planner_tool_trace(plan, payload)
-                plan.agent_trace.append("planner=llm_understanding_needs_semantic_metric_evidence")
-                return plan
-        if payload.get("queryPlan"):
-            plan = QueryPlan(agent_trace=["planner.query_plan_payload_ignored"])
-            append_prompt_trace(plan, payload)
-            attach_planner_tool_trace(plan, payload)
-            return plan
-        plan = QueryPlan()
-        append_prompt_trace(plan, payload)
-        attach_planner_tool_trace(plan, payload)
-        return plan
+        return self.plan_compiler.compile(question, payload, asset_pack)
 
     def _expand_asset_pack_from_understanding(self, asset_pack: PlanningAssetPack, understanding: Dict[str, Any]) -> List[str]:
         if not self.semantic_catalog:
@@ -1021,32 +1027,8 @@ class QueryGraphPlanner:
         knowledge_context: str,
         recall_bundle: RecallBundle,
     ) -> QueryPlan:
-        if not plan.intents and self.llm.last_error.startswith("provider_error"):
-            plan.agent_trace.append("planner.repair.skipped_provider_error")
-            return plan
-        root_repaired = repair_more_specific_root_metric(question, plan, asset_pack, self.compiler)
-        if root_repaired.compiler_trace != plan.compiler_trace or root_repaired.question_understanding != plan.question_understanding:
-            root_repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=promote_more_specific_root_metric"])
-            return root_repaired
-        semantic_repaired = repair_dependency_key_production_gaps(question, plan, asset_pack, gaps)
-        if semantic_repaired.compiler_trace != plan.compiler_trace or len(semantic_repaired.dependencies) != len(plan.dependencies):
-            semantic_repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=semantic_relationship_graph_bridge"])
-            return semantic_repaired
-        semantic_repaired = repair_missing_domain_dependencies(question, plan, asset_pack)
-        if len(semantic_repaired.intents) > len(plan.intents):
-            semantic_repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=semantic_missing_domains"])
-            return semantic_repaired
-        if self.llm.configured and gaps:
-            payload = self._llm_repair(question, plan, asset_pack, gaps)
-            understanding = payload.get("questionUnderstanding") or payload.get("question_understanding") or {}
-            if understanding:
-                repaired = self.compiler.compile(question, understanding, asset_pack)
-                if repaired.intents:
-                    repaired = enrich_llm_plan(question, repaired, asset_pack, payload)
-                    repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=llm_reunderstanding"])
-                    return repaired
-        plan.agent_trace.append("planner.repair.unavailable")
-        return plan
+        return self.plan_repairer.repair(question, plan, asset_pack, gaps, history_rows, knowledge_context, recall_bundle)
+
 
     def _semantic_repair_applicable(self, gaps: List[GraphValidationGap]) -> bool:
         repairable_codes = {
@@ -1467,9 +1449,16 @@ class QueryGraphPlanner:
     ) -> Dict[str, Any]:
         if not self.semantic_catalog or not hasattr(self.llm, "tool_chat") or self.settings.agent_planner_tool_rounds <= 0:
             return {}
-        tools = [output_tool.openai_schema()] + [
-            tool.openai_schema() for tool in semantic_file_tool_definitions() + artifact_file_tool_definitions()
-        ]
+        deferred_enabled = bool(getattr(self.settings, "agent_deferred_tool_schema_enabled", False))
+        file_tool_defs = semantic_file_tool_definitions() + artifact_file_tool_definitions()
+        file_tool_by_name = {tool.name: tool for tool in file_tool_defs}
+        loader_tool = deferred_tool_schema_loader_tool(file_tool_by_name.keys())
+        loaded_tool_names: List[str] = []
+        tools = [output_tool.openai_schema()] + (
+            [loader_tool.openai_schema()]
+            if deferred_enabled
+            else [tool.openai_schema() for tool in file_tool_defs]
+        )
         planner_tool_results: List[Dict[str, Any]] = []
         planner_tool_calls: List[Dict[str, Any]] = []
         loaded_refs: List[str] = []
@@ -1505,6 +1494,13 @@ class QueryGraphPlanner:
                 "instruction": planner_tool_instruction,
                 "forceCatalog": force_catalog,
             }
+            if deferred_enabled:
+                round_payload["deferredToolCatalog"] = {
+                    "policy": "Only load schemas for semantic/artifact tools when the compact context is insufficient.",
+                    "availableTools": tool_schema_catalog(file_tool_defs),
+                    "loadedTools": loaded_tool_names,
+                }
+                tools = [output_tool.openai_schema(), loader_tool.openai_schema()] + select_tool_schemas(file_tool_defs, loaded_tool_names)
             prompt_artifact = self.artifact_store.write_json("planner", "planner_round_%d_prompt.json" % (round_index + 1), round_payload, preview_chars=0)
             result = self.llm.tool_chat(
                 system_prompt,
@@ -1533,6 +1529,27 @@ class QueryGraphPlanner:
                     continue
                 final_payload = dict(emit_call.args)
                 break
+            load_schema_calls = [call for call in calls if call.name == loader_tool.name]
+            if load_schema_calls:
+                requested_names: List[str] = []
+                for call in load_schema_calls:
+                    for name in call.args.get("toolNames") or []:
+                        if name in file_tool_by_name and name not in loaded_tool_names:
+                            loaded_tool_names.append(str(name))
+                            requested_names.append(str(name))
+                planner_tool_results.append(
+                    {
+                        "id": "deferred_tool_schema_%d" % (round_index + 1),
+                        "name": loader_tool.name,
+                        "status": "success",
+                        "round": round_index + 1,
+                        "result": {
+                            "loadedToolNames": requested_names,
+                            "loadedSchemaCount": len(requested_names),
+                        },
+                    }
+                )
+                continue
             semantic_calls = [call for call in calls if call.name.startswith("semantic_") or call.name.startswith("artifact_")]
             if semantic_calls:
                 cache_policies = {
@@ -2035,330 +2052,6 @@ def semantic_ref_ids_from_tool_result(result: Dict[str, Any]) -> List[str]:
             if value.startswith("semantic:"):
                 refs.append(value)
     return sorted(set(refs))
-
-
-def compact_openai_tool_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep function-calling structure while removing verbose descriptions."""
-
-    compact = deepcopy(schema)
-
-    def visit(value: Any, depth: int = 0) -> None:
-        if isinstance(value, dict):
-            if "description" in value:
-                description = str(value.get("description") or "")
-                value["description"] = description[:80] if depth <= 2 else ""
-            for child in value.values():
-                visit(child, depth + 1)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child, depth)
-
-    visit(compact)
-    return compact
-
-
-def planner_prompt_stats(system_prompt: str, user_prompt: str, tool_schema: Dict[str, Any]) -> Dict[str, Any]:
-    tool_chars = len(json.dumps(tool_schema, ensure_ascii=False, sort_keys=True, default=str))
-    return {
-        "systemPromptChars": len(system_prompt or ""),
-        "userPromptChars": len(user_prompt or ""),
-        "toolSchemaChars": tool_chars,
-        "totalChars": len(system_prompt or "") + len(user_prompt or "") + tool_chars,
-        "schemaMode": "compact_tool_schema",
-    }
-
-
-def compact_planner_trace(trace: List[str], gaps: List[GraphValidationGap], compact_retry: bool) -> List[str]:
-    if not trace:
-        return []
-    if not gaps and not compact_retry:
-        return []
-    markers = ("gap", "error", "invalid", "critic", "repair", "planner", "validation", "timeout", "provider", "calculation")
-    selected = [item for item in trace if any(marker in str(item).lower() for marker in markers)]
-    return selected[-3:]
-
-
-def planner_repair_feedback_for_understanding(gaps: List[GraphValidationGap], previous_understanding: Dict[str, Any]) -> Dict[str, Any]:
-    calculation_gaps = [
-        gap
-        for gap in gaps
-        if gap.code in {"CALCULATION_NUMERATOR_MISSING", "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR", "CALCULATION_NUMERATOR_NOT_EVENT_METRIC"}
-    ]
-    if not calculation_gaps:
-        return {}
-    previous_calculations = [
-        item
-        for item in previous_understanding.get("calculationIntents") or previous_understanding.get("calculation_intents") or []
-        if isinstance(item, dict)
-    ]
-    previous_ranking = previous_understanding.get("rankingObjective") or previous_understanding.get("ranking_objective") or {}
-    denominator_ref = ""
-    if isinstance(previous_ranking, dict):
-        denominator_ref = str(
-            previous_ranking.get("resolvedMetricRef")
-            or previous_ranking.get("metricRef")
-            or previous_ranking.get("metric_ref")
-            or ""
-        )
-    feedback_items: List[Dict[str, Any]] = []
-    for gap in calculation_gaps:
-        invalid = next(
-            (
-                item
-                for item in previous_calculations
-                if str(item.get("sourcePhrase") or item.get("source_phrase") or gap.evidence) == str(gap.evidence or "")
-            ),
-            previous_calculations[0] if previous_calculations else {},
-        )
-        numerator_ref = str(invalid.get("numeratorMetricRef") or invalid.get("numerator_metric_ref") or "")
-        invalid_denominator_ref = str(invalid.get("denominatorMetricRef") or invalid.get("denominator_metric_ref") or denominator_ref)
-        feedback_items.append(
-            {
-                "code": gap.code,
-                "sourcePhrase": gap.evidence,
-                "reason": gap.reason,
-                "invalidNumeratorMetricRef": numerator_ref,
-                "invalidDenominatorMetricRef": invalid_denominator_ref,
-                "instruction": (
-                    "Re-understand the ratio/proportion. numeratorMetricRef must be the event/subset being counted; "
-                    "denominatorMetricRef must be the base population. They must not resolve to the same canonical metric. "
-                    "Do not use an already-derived rate/ratio metric as the numerator. "
-                    "If semanticCatalog lacks the numerator metric, return NEED_MORE_KNOWLEDGE with a METRIC knowledge request instead of repeating the same pair."
-                ),
-            }
-        )
-    return {
-        "calculation": feedback_items,
-        "mustFixBeforePlanning": True,
-    }
-
-
-def payload_has_understanding(payload: Dict[str, Any]) -> bool:
-    understanding = payload.get("questionUnderstanding") or payload.get("question_understanding") or {}
-    return isinstance(understanding, dict) and bool(understanding)
-
-
-def normalize_llm_tool_calls(calls: List[Dict[str, Any]], round_index: int) -> List[ToolCallRequest]:
-    normalized: List[ToolCallRequest] = []
-    for index, call in enumerate(calls):
-        name = str(call.get("name") or "")
-        if not name:
-            continue
-        args = call.get("args") or {}
-        if isinstance(args, str):
-            args = parse_json_object(args)
-        normalized.append(
-            ToolCallRequest(
-                id=str(call.get("id") or "planner_round_%d_call_%d" % (round_index + 1, index + 1)),
-                name=name,
-                args=args if isinstance(args, dict) else {},
-            )
-        )
-    return normalized
-
-
-def parse_json_object(text: str) -> Dict[str, Any]:
-    raw = str(text or "").strip()
-    if not raw:
-        return {}
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", raw, flags=re.S)
-    if not match:
-        return {}
-    try:
-        parsed = json.loads(match.group(0))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
-    limit = max(1000, int(max_chars or 12000))
-    payload = json.dumps(result or {}, ensure_ascii=False, default=str)
-    if len(payload) <= limit:
-        return result or {}
-    compact = dict(result or {})
-    if "content" in compact:
-        content = str(compact.get("content") or "")
-        compact["content"] = content[:limit]
-        compact["truncated"] = True
-        compact["nextContentOffsetChars"] = min(len(content), limit)
-    elif "items" in compact:
-        compact["items"] = compact.get("items", [])[:20]
-        compact["truncated"] = True
-    elif "hits" in compact:
-        compact["hits"] = compact.get("hits", [])[:10]
-        compact["truncated"] = True
-    else:
-        compact = {"preview": payload[:limit], "truncated": True}
-    return compact
-
-
-def planner_tool_results_for_prompt(results: List[Dict[str, Any]], max_items: int = 4, max_chars: int = 12000) -> List[Dict[str, Any]]:
-    selected: List[Dict[str, Any]] = []
-    budget = max(1000, int(max_chars or 12000))
-    used = 0
-    for item in list(results or [])[-max(1, max_items) :]:
-        compact = dict(item or {})
-        if "result" in compact:
-            compact["result"] = compact_tool_result_for_prompt(compact.get("result") or {}, max(1000, int(budget / max(1, max_items))))
-        for key in ["promptArtifact", "artifact"]:
-            if key in compact and isinstance(compact[key], dict):
-                compact[key] = {
-                    "relativePath": compact[key].get("relativePath") or compact[key].get("path", ""),
-                    "sha256": compact[key].get("sha256", ""),
-                    "estimatedChars": compact[key].get("estimatedChars", 0),
-                }
-        raw = json.dumps(compact, ensure_ascii=False, default=str)
-        if used + len(raw) > budget and selected:
-            selected.append(
-                {
-                    "offloaded": True,
-                    "reason": "planner tool results exceeded prompt budget",
-                    "omittedCount": max(0, len(results or []) - len(selected)),
-                }
-            )
-            break
-        selected.append(compact)
-        used += len(raw)
-    return selected
-
-
-def compact_previous_understanding(payload: Dict[str, Any], max_items: int = 3) -> Dict[str, Any]:
-    understanding = payload.get("questionUnderstanding") or payload.get("question_understanding") or {}
-    if not isinstance(understanding, dict):
-        understanding = {}
-    compact_understanding: Dict[str, Any] = {}
-    for key, value in understanding.items():
-        if isinstance(value, list):
-            compact_understanding[key] = value[:max(1, max_items)]
-        elif isinstance(value, dict):
-            compact_understanding[key] = value
-        elif key in {"analysisIntent", "analysis_intent", "requiresExplanation", "requires_explanation", "analysisGrain", "analysis_grain"}:
-            compact_understanding[key] = value
-    return {
-        "status": str(payload.get("status") or ""),
-        "reason": str(payload.get("reason") or "")[:500],
-        "questionUnderstanding": compact_understanding,
-    }
-
-
-def artifact_summary(artifact: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "path": artifact.get("path", ""),
-        "relativePath": artifact.get("relativePath", ""),
-        "estimatedChars": artifact.get("estimatedChars", 0),
-        "sha256": artifact.get("sha256", ""),
-        "truncated": artifact.get("truncated", False),
-    }
-
-
-def compact_planner_context(planner_context: Dict[str, Any] | None) -> Dict[str, Any]:
-    if not isinstance(planner_context, dict):
-        return {}
-    diagnostic = planner_context.get("openDiagnostic") or planner_context.get("open_diagnostic") or {}
-    if not isinstance(diagnostic, dict) or not diagnostic.get("scope"):
-        return {}
-    return {
-        "scope": str(diagnostic.get("scope") or ""),
-        "intent": str(diagnostic.get("intent") or ""),
-        "goal": str(diagnostic.get("goal") or ""),
-        "seedTopics": [str(item) for item in diagnostic.get("seedTopics") or diagnostic.get("seed_topics") or [] if item][:8],
-    }
-
-
-def compact_memory_constraints(planner_context: Dict[str, Any] | None) -> List[Dict[str, Any]]:
-    if not isinstance(planner_context, dict):
-        return []
-    constraints = planner_context.get("memoryConstraints") or planner_context.get("memory_constraints") or []
-    if not isinstance(constraints, list):
-        return []
-    compacted: List[Dict[str, Any]] = []
-    for item in constraints[:12]:
-        if not isinstance(item, dict):
-            continue
-        compacted.append(
-            {
-                key: item.get(key)
-                for key in [
-                    "id",
-                    "type",
-                    "enforcement",
-                    "instruction",
-                    "targetMetrics",
-                    "topics",
-                    "timeWindows",
-                    "confidence",
-                    "governanceInstruction",
-                ]
-                if item.get(key) not in (None, "", [], {})
-            }
-        )
-    return compacted
-
-
-def planner_failure_trace_reason(configured: bool, last_error: str) -> str:
-    if not configured:
-        return "planner.no_llm_configured"
-    error = str(last_error or "")
-    if error.startswith("context_over_budget:"):
-        return "PLANNER_CONTEXT_OVER_BUDGET: %s" % error
-    if error.startswith("timeout:"):
-        return "PLANNER_LLM_TIMEOUT: %s" % error
-    if error.startswith("provider_error:"):
-        return "PLANNER_PROVIDER_ERROR: %s" % error
-    if error.startswith("json_parse_error:"):
-        return "PLANNER_JSON_PARSE_ERROR: %s" % error
-    if error.startswith("empty_response:"):
-        return "PLANNER_EMPTY_RESPONSE: %s" % error
-    return error or "planner.no_valid_llm_understanding"
-
-
-def planner_llm_terminal_error(error: str) -> bool:
-    lowered = str(error or "").lower()
-    return any(marker in lowered for marker in ["timeout:", "provider_error:", "empty_response:"])
-
-
-def planner_failure_gap_code(plan: QueryPlan) -> str:
-    trace = "\n".join(plan.agent_trace or [])
-    trace_lower = trace.lower()
-    if "planner_context_over_budget" in trace_lower or "context_over_budget:" in trace_lower:
-        return "PLANNER_CONTEXT_OVER_BUDGET"
-    if "planner.no_llm_configured" in trace:
-        return "PLANNER_LLM_NOT_CONFIGURED"
-    if "planner_llm_timeout" in trace_lower or "timeout:" in trace_lower:
-        return "PLANNER_LLM_TIMEOUT"
-    if "planner_provider_error" in trace_lower or "provider_error:" in trace_lower:
-        return "PLANNER_PROVIDER_ERROR"
-    if "planner_json_parse_error" in trace_lower or "json_parse_error:" in trace_lower:
-        return "PLANNER_JSON_PARSE_ERROR"
-    if "planner_empty_response" in trace_lower or "empty_response:" in trace_lower:
-        return "PLANNER_EMPTY_RESPONSE"
-    return ""
-
-
-def planner_failure_reason(plan: QueryPlan, code: str) -> str:
-    trace = "；".join(plan.agent_trace[-3:]) if plan.agent_trace else ""
-    if code == "PLANNER_LLM_TIMEOUT":
-        return "Planner LLM 调用超时，questionUnderstanding 未返回；不能伪装成业务无数据。%s" % trace
-    if code == "PLANNER_CONTEXT_OVER_BUDGET":
-        return "Planner questionUnderstanding 上下文超过预算，未调用 LLM；需要缩小 semantic catalog 或按需读取文件上下文。%s" % trace
-    if code == "PLANNER_LLM_NOT_CONFIGURED":
-        return "当前未配置可用 LLM，questionUnderstanding 未生成。"
-    if code == "PLANNER_PROVIDER_ERROR":
-        return "Planner LLM provider 调用失败，questionUnderstanding 未生成。%s" % trace
-    if code == "PLANNER_JSON_PARSE_ERROR":
-        return "Planner LLM 返回内容无法解析为 questionUnderstanding。%s" % trace
-    if code == "PLANNER_EMPTY_RESPONSE":
-        return "Planner LLM 返回空内容，questionUnderstanding 未生成。%s" % trace
-    return trace or "Planner 未能生成 QueryGraph。"
 
 
 @dataclass(frozen=True)
@@ -6802,6 +6495,14 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
         % (ranking_metric.table, ranking_metric.key, ",".join("%s.%s" % (item.table, item.key) for item in explicit_metrics))
     )
     return plan
+
+
+def semantic_fast_path_can_bypass_configured_llm(question: str, plan: QueryPlan) -> bool:
+    text = normalize_text(question)
+    if not any(term in text for term in ["高风险新品", "风险新品"]):
+        return False
+    tables = {intent.preferred_table for intent in plan.intents}
+    return "dwm_goods_detail_df" in tables
 
 
 def attach_missing_semantic_knowledge_refs(

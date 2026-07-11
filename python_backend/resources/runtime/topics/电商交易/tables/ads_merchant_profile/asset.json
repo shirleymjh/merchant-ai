@@ -1,0 +1,12 @@
+{
+  "topic": "电商交易",
+  "tableName": "ads_merchant_profile",
+  "metrics": [
+    {
+      "metricKey": "gmv",
+      "sourceColumns": [
+        "pay_amt"
+      ]
+    }
+  ]
+}

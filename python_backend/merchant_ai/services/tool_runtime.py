@@ -23,6 +23,7 @@ from merchant_ai.models import (
     ToolRuntimeMetrics,
     ToolRuntimePolicy,
 )
+from merchant_ai.services.tools import ToolRegistry, validate_tool_result_contract
 
 
 def now_ms() -> int:
@@ -42,11 +43,28 @@ def classify_tool_error(error: Exception | str) -> str:
         return "NOT_FOUND"
     if "permission" in lower or "forbidden" in lower or "unauthorized" in lower:
         return "PERMISSION_DENIED"
+    if "tool_contract_violation" in lower or "contract" in lower:
+        return "TOOL_CONTRACT_VIOLATION"
     if "invalid" in lower or "bad argument" in lower:
         return "INVALID_ARGUMENT"
     if "provider" in lower or "llm" in lower or "model" in lower:
         return "PROVIDER_ERROR"
     return "ERROR"
+
+
+def classify_timeout_type(error: Exception | str, service_name: str = "", source: str = "tool") -> str:
+    text = str(error or "").lower()
+    if "node" in source:
+        return "node_timeout"
+    if "run" in source:
+        return "run_timeout"
+    if "connect" in text or "connection timed out" in text or "connection timeout" in text:
+        return "connect_timeout"
+    if "read timed out" in text or "read timeout" in text or "socket read" in text:
+        return "read_timeout"
+    if service_name == "doris" and ("query timed out" in text or "read" in text):
+        return "read_timeout"
+    return "tool_timeout"
 
 
 def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", target: str = "") -> Dict[str, str]:
@@ -93,6 +111,22 @@ def tool_params_hash(args: Any) -> str:
     except Exception:
         payload = str(safe_args)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def tool_idempotency_key(tool_name: str, call_id: str, context: Dict[str, str]) -> str:
+    parts = [
+        "tool",
+        str(tool_name or ""),
+        "call",
+        str(call_id or ""),
+        "service",
+        str(context.get("serviceName") or ""),
+        "target",
+        str(context.get("target") or ""),
+        "params",
+        str(context.get("paramsHash") or ""),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
 
 
 def sanitize_tool_args(args: Any) -> Any:
@@ -207,18 +241,75 @@ def structured_tool_message(
     circuit_key: str = "",
     retryable: bool | None = None,
     fallback_tools: Optional[List[str]] = None,
+    tool_call_id: str = "",
+    error_code: str = "",
+    details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     action = recovery or recovery_action_for(tool_name, error_type)
-    return {
+    code = error_code or error_type
+    payload = {
         "toolName": tool_name,
         "status": status,
-        "errorCode": error_type,
+        "errorType": error_type,
+        "errorCode": code,
         "retryable": action.retryable if retryable is None else bool(retryable),
         "recommendedAction": action.action,
         "fallbackTools": list(fallback_tools if fallback_tools is not None else action.fallback_tools),
         "message": message or action.message,
         "circuitKey": circuit_key,
     }
+    if tool_call_id:
+        payload["toolCallId"] = tool_call_id
+    if details:
+        payload["details"] = {key: value for key, value in details.items() if value not in ("", None, [], {})}
+    return payload
+
+
+def tool_error_details(
+    tool_name: str,
+    args: Dict[str, Any] | None = None,
+    error_type: str = "",
+    error_message: str = "",
+    timeout_type: str = "",
+    context: Dict[str, Any] | None = None,
+    call_id: str = "",
+) -> Dict[str, Any]:
+    safe_args = args or {}
+    kind = infer_tool_kind(tool_name)
+    details: Dict[str, Any] = {
+        "toolCallId": call_id,
+        "toolName": tool_name,
+        "toolKind": kind,
+        "errorType": error_type,
+        "paramsHash": (context or {}).get("paramsHash") or tool_params_hash(safe_args),
+        "serviceName": (context or {}).get("serviceName") or kind,
+        "target": (context or {}).get("target") or "",
+        "circuitKey": (context or {}).get("circuitKey") or "",
+        "timeoutType": timeout_type,
+    }
+    if kind == "doris":
+        sql = str(safe_args.get("sql") or safe_args.get("query") or "")
+        if sql:
+            details["sqlHash"] = hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
+            details["sqlPreview"] = sql[:500]
+        for key in ["queryId", "query_id", "taskId", "task_id", "dorisErrorCode", "sqlState", "failedStage"]:
+            if safe_args.get(key):
+                details[key] = safe_args.get(key)
+    elif tool_name.startswith("artifact_"):
+        for key in ["path", "relativePath", "merchantUri", "pattern", "offset", "limit"]:
+            if safe_args.get(key):
+                details[key] = safe_args.get(key)
+    elif kind == "semantic":
+        for key in ["refId", "ref_id", "assetType", "asset_type", "path", "relativePath", "merchantUri", "query"]:
+            if safe_args.get(key):
+                details[key] = safe_args.get(key)
+    elif kind == "llm":
+        for key in ["model", "provider", "promptId", "promptVersion", "templateFingerprint", "renderFingerprint"]:
+            if safe_args.get(key):
+                details[key] = safe_args.get(key)
+    if error_message:
+        details["messagePreview"] = str(error_message)[:500]
+    return {key: value for key, value in details.items() if value not in ("", None, [], {})}
 
 
 class CacheStore:
@@ -994,6 +1085,7 @@ class ToolRuntimeService:
         self.load_balancer = load_balancer or default_load_balancer(settings)
         self.metrics = metrics or RuntimeMetricsAggregator()
         self.alert_manager = RuntimeAlertManager(settings, self.metrics)
+        self.tool_registry = ToolRegistry()
         self._events: List[Dict[str, Any]] = []
         self._events_lock = threading.RLock()
 
@@ -1025,10 +1117,27 @@ class ToolRuntimeService:
         service_name = target_kind or self._tool_kind(tool_name)
         selected_target = self.load_balancer.select(service_name)
         context = self.failure_registry.context(tool_name, call.args, service_name=service_name, target=selected_target.name)
+        idempotency_key = tool_idempotency_key(tool_name, call.id, context)
         blocked = self.failure_registry.should_block(tool_name, call.args, service_name=service_name, target=selected_target.name)
-        pre_runtime_events: List[Dict[str, Any]] = []
+        pre_runtime_events: List[Dict[str, Any]] = [
+            self._record_event(
+                "tool.started",
+                ToolCallExecutionResult(
+                    id=call.id,
+                    name=tool_name,
+                    status="started",
+                    idempotency_key=idempotency_key,
+                    params_hash=context["paramsHash"],
+                    target=selected_target.name,
+                    service_name=service_name,
+                    circuit_key=context["circuitKey"],
+                ),
+                {"idempotencyKey": idempotency_key, "paramsHash": context["paramsHash"]},
+            )
+        ]
         if blocked:
             recovery = recovery_action_for(tool_name, "CIRCUIT_OPEN", service_name)
+            details = tool_error_details(tool_name, call.args, "CIRCUIT_OPEN", blocked.reason, context=context, call_id=call.id)
             tool_message = structured_tool_message(
                 tool_name,
                 "blocked",
@@ -1036,11 +1145,15 @@ class ToolRuntimeService:
                 blocked.reason,
                 recovery,
                 blocked.circuit_key or context["circuitKey"],
+                tool_call_id=call.id,
+                details=details,
             )
             result = ToolCallExecutionResult(
                 id=call.id,
                 name=tool_name,
                 status="blocked",
+                idempotency_key=idempotency_key,
+                params_hash=context["paramsHash"],
                 error_type="CIRCUIT_OPEN",
                 error_message=blocked.reason,
                 target=selected_target.name,
@@ -1049,10 +1162,11 @@ class ToolRuntimeService:
                 retryable=False,
                 recommended_action=recovery.action,
                 fallback_tools=list(recovery.fallback_tools),
+                details=details,
                 tool_message=tool_message,
             )
-            event = self._record_event("tool.circuit.open", result, {"circuit": blocked.model_dump(by_alias=True)})
-            result.runtime_events.append(event)
+            result.runtime_events.extend(pre_runtime_events)
+            result.runtime_events.append(self._record_event("tool.circuit.open", result, {"circuit": blocked.model_dump(by_alias=True)}))
             self.metrics.record(tool_name, result.status, 0, result.error_type, circuit_blocked=True)
             self.alert_manager.evaluate()
             return result
@@ -1065,6 +1179,8 @@ class ToolRuntimeService:
                         id=call.id,
                         name=tool_name,
                         status="probing",
+                        idempotency_key=idempotency_key,
+                        params_hash=context["paramsHash"],
                         target=selected_target.name,
                         service_name=service_name,
                         circuit_key=context["circuitKey"],
@@ -1076,6 +1192,7 @@ class ToolRuntimeService:
             rate_key = service_name
             if not self.rate_limit_store.allow(rate_key, self._tool_qps(tool_name, rate_key)):
                 recovery = recovery_action_for(tool_name, "RATE_LIMITED", service_name)
+                details = tool_error_details(tool_name, call.args, "RATE_LIMITED", "tool rate limited: %s" % rate_key, context=context, call_id=call.id)
                 tool_message = structured_tool_message(
                     tool_name,
                     "blocked",
@@ -1083,11 +1200,15 @@ class ToolRuntimeService:
                     "tool rate limited: %s" % rate_key,
                     recovery,
                     context["circuitKey"],
+                    tool_call_id=call.id,
+                    details=details,
                 )
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
                     status="blocked",
+                    idempotency_key=idempotency_key,
+                    params_hash=context["paramsHash"],
                     error_type="RATE_LIMITED",
                     error_message="tool rate limited: %s" % rate_key,
                     rate_limited=True,
@@ -1097,7 +1218,9 @@ class ToolRuntimeService:
                     retryable=False,
                     recommended_action=recovery.action,
                     fallback_tools=list(recovery.fallback_tools),
+                    details=details,
                     tool_message=tool_message,
+                    runtime_events=list(pre_runtime_events),
                 )
                 event = self._record_event("tool.rate_limited", result, {"rateLimitKey": rate_key})
                 result.runtime_events.append(event)
@@ -1116,6 +1239,8 @@ class ToolRuntimeService:
                     name=tool_name,
                     status="success",
                     result=cached if isinstance(cached, dict) else {"value": cached},
+                    idempotency_key=idempotency_key,
+                    params_hash=context["paramsHash"],
                     cache_hit=True,
                     cache_key=cache_key,
                     attempts=0,
@@ -1127,6 +1252,9 @@ class ToolRuntimeService:
                 )
                 if closed_circuit:
                     result.runtime_events.append(self._record_event("tool.circuit.closed", result, {"circuit": closed_circuit.model_dump(by_alias=True)}))
+                contract = validate_tool_result_contract(tool_name, result.result, self.tool_registry)
+                result.contract = contract
+                result.result_hash = str(contract.get("resultHash") or "")
                 self.metrics.record(tool_name, result.status, 0, cache_hit=True)
                 return result
         started = time.monotonic()
@@ -1134,21 +1262,47 @@ class ToolRuntimeService:
         attempts = max(1, policy.max_retries + 1)
         last_error = ""
         last_error_type = "ERROR"
+        last_timeout_type = ""
+        all_attempt_events: List[Dict[str, Any]] = []
         for attempt in range(attempts):
+            attempt_events: List[Dict[str, Any]] = []
             try:
                 next_args = dict(call.args)
                 if selected_target.endpoint:
                     next_args.setdefault("_target", selected_target.model_dump(by_alias=True))
-                value = self._call_with_timeout(handler, next_args, policy.timeout_seconds)
+                value = self._call_with_timeout(
+                    handler,
+                    next_args,
+                    policy.timeout_seconds,
+                    heartbeat=lambda elapsed_ms, timeout_seconds: attempt_events.append(
+                        self._record_event(
+                            "tool.heartbeat",
+                            ToolCallExecutionResult(
+                                id=call.id,
+                                name=tool_name,
+                                status="running",
+                                idempotency_key=idempotency_key,
+                                params_hash=context["paramsHash"],
+                                target=selected_target.name,
+                                service_name=service_name,
+                                circuit_key=context["circuitKey"],
+                            ),
+                            {"elapsedMs": elapsed_ms, "timeoutSeconds": timeout_seconds, "attempt": attempt + 1},
+                        )
+                    ),
+                )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 closed_circuit = self.failure_registry.record_success(tool_name, call.args, service_name=service_name, target=selected_target.name)
                 if cache_key and cache_policy:
                     self.cache_store.set(cache_key, value or {}, cache_policy.ttl_seconds or self.settings.semantic_cache_ttl_seconds)
+                contract = validate_tool_result_contract(tool_name, value or {}, self.tool_registry)
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
                     status="success",
                     result=value or {},
+                    idempotency_key=idempotency_key,
+                    params_hash=context["paramsHash"],
                     duration_ms=duration_ms,
                     attempts=attempt + 1,
                     cache_hit=False,
@@ -1156,8 +1310,10 @@ class ToolRuntimeService:
                     target=selected_target.name,
                     service_name=service_name,
                     circuit_key=context["circuitKey"],
+                    contract=contract,
+                    result_hash=str(contract.get("resultHash") or ""),
                     tool_message={"toolName": tool_name, "status": "success", "cacheHit": False},
-                    runtime_events=list(pre_runtime_events),
+                    runtime_events=list(pre_runtime_events) + all_attempt_events + attempt_events,
                 )
                 if closed_circuit and closed_circuit.state == "closed":
                     event = self._record_event("tool.circuit.closed", result, {"circuit": closed_circuit.model_dump(by_alias=True)})
@@ -1166,8 +1322,10 @@ class ToolRuntimeService:
                 self.alert_manager.evaluate()
                 return result
             except Exception as exc:
+                all_attempt_events.extend(attempt_events)
                 last_error = str(exc)
                 last_error_type = classify_tool_error(exc)
+                last_timeout_type = classify_timeout_type(exc, service_name) if last_error_type == "TIMEOUT" else ""
                 if last_error_type in policy.non_retryable_errors or attempt >= attempts - 1:
                     break
                 if policy.retryable_errors and last_error_type not in policy.retryable_errors:
@@ -1180,8 +1338,11 @@ class ToolRuntimeService:
                         id=call.id,
                         name=tool_name,
                         status="retrying",
+                        idempotency_key=idempotency_key,
+                        params_hash=context["paramsHash"],
                         error_type=last_error_type,
                         error_message=last_error[:500],
+                        timeout_type=last_timeout_type,
                         attempts=attempt + 1,
                         target=selected_target.name,
                         service_name=service_name,
@@ -1192,13 +1353,17 @@ class ToolRuntimeService:
         duration_ms = int((time.monotonic() - started) * 1000)
         record = self.failure_registry.record_failure(tool_name, call.args, last_error_type, last_error, service_name=service_name, target=selected_target.name)
         recovery = recovery_action_for(tool_name, last_error_type, service_name)
-        tool_message = structured_tool_message(tool_name, "failed", last_error_type, last_error[:500], recovery, record.circuit_key)
+        details = tool_error_details(tool_name, call.args, last_error_type, last_error[:500], timeout_type=last_timeout_type, context=context, call_id=call.id)
+        tool_message = structured_tool_message(tool_name, "failed", last_error_type, last_error[:500], recovery, record.circuit_key, tool_call_id=call.id, details=details)
         result = ToolCallExecutionResult(
             id=call.id,
             name=tool_name,
             status="failed",
+            idempotency_key=idempotency_key,
+            params_hash=context["paramsHash"],
             error_type=last_error_type,
             error_message=last_error[:500],
+            timeout_type=last_timeout_type,
             duration_ms=duration_ms,
             attempts=attempts,
             cache_key=cache_key,
@@ -1208,8 +1373,9 @@ class ToolRuntimeService:
             retryable=recovery.retryable,
             recommended_action=recovery.action,
             fallback_tools=list(recovery.fallback_tools or policy.fallback_tools),
+            details=details,
             tool_message=tool_message,
-            runtime_events=list(pre_runtime_events),
+            runtime_events=list(pre_runtime_events) + all_attempt_events,
         )
         failed_event = self._record_event("tool.failed", result, {"failure": record.model_dump(by_alias=True)})
         result.runtime_events.append(failed_event)
@@ -1233,7 +1399,15 @@ class ToolRuntimeService:
             return []
         order = {call.id: index for index, call in enumerate(calls)}
         results: List[ToolCallExecutionResult] = []
-        with ThreadPoolExecutor(max_workers=min(max(1, self.settings.tool_max_concurrency), len(calls))) as executor:
+        max_workers = min(max(1, self.settings.tool_max_concurrency), len(calls))
+        batch_probe = ToolCallExecutionResult(id="tool_batch", name="execute_many", status="running", service_name="tool")
+        self._record_event(
+            "tool.parallel.batch_started",
+            batch_probe,
+            {"toolCallCount": len(calls), "maxConcurrency": max_workers, "toolNames": [call.name for call in calls]},
+        )
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for call in calls:
                 handler = handlers.get(call.name)
@@ -1247,6 +1421,17 @@ class ToolRuntimeService:
                 except Exception as exc:
                     call = futures[future]
                     results.append(ToolCallExecutionResult(id=call.id, name=call.name, status="failed", error_type=classify_tool_error(exc), error_message=str(exc)[:500]))
+        self._record_event(
+            "tool.parallel.batch_finished",
+            ToolCallExecutionResult(id="tool_batch", name="execute_many", status="finished", service_name="tool"),
+            {
+                "toolCallCount": len(calls),
+                "maxConcurrency": max_workers,
+                "durationMs": int((time.monotonic() - started) * 1000),
+                "successCount": sum(1 for item in results if item.status == "success"),
+                "failureCount": sum(1 for item in results if item.status != "success"),
+            },
+        )
         return sorted(results, key=lambda item: order.get(item.id, 999))
 
     def trace(self) -> Dict[str, Any]:
@@ -1271,6 +1456,7 @@ class ToolRuntimeService:
             "toolName": result.name,
             "status": result.status,
             "errorType": result.error_type,
+            "timeoutType": result.timeout_type,
             "serviceName": result.service_name,
             "target": result.target,
             "circuitKey": result.circuit_key,
@@ -1284,11 +1470,34 @@ class ToolRuntimeService:
             self._events = self._events[-300:]
         return event
 
-    def _call_with_timeout(self, handler: Callable[[Dict[str, Any]], Dict[str, Any]], args: Dict[str, Any], timeout_seconds: int) -> Dict[str, Any]:
+    def _call_with_timeout(
+        self,
+        handler: Callable[[Dict[str, Any]], Dict[str, Any]],
+        args: Dict[str, Any],
+        timeout_seconds: int,
+        heartbeat: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(handler, args)
+        timeout = max(1, int(timeout_seconds or 1))
+        started = time.monotonic()
+        heartbeat_interval = max(0.1, float(getattr(self.settings, "tool_heartbeat_interval_seconds", 5.0) or 5.0))
+        next_heartbeat_at = started + heartbeat_interval
         try:
-            return future.result(timeout=max(1, int(timeout_seconds or 1)))
+            while True:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError("tool execution timed out")
+                wait_for = min(remaining, max(0.05, next_heartbeat_at - time.monotonic()))
+                try:
+                    return future.result(timeout=wait_for)
+                except TimeoutError:
+                    if future.done():
+                        return future.result(timeout=0)
+                    now = time.monotonic()
+                    if heartbeat and now >= next_heartbeat_at:
+                        heartbeat(int((now - started) * 1000), timeout)
+                        next_heartbeat_at = now + heartbeat_interval
         except TimeoutError as exc:
             future.cancel()
             raise TimeoutError("tool execution timed out") from exc
@@ -1335,14 +1544,19 @@ class ToolCallExecutor:
         with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(calls))) as executor:
             futures = {}
             for call in calls:
+                context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+                idempotency_key = tool_idempotency_key(call.name, call.id, context)
                 blocked = self.failure_registry.should_block(call.name, call.args)
                 if blocked:
                     recovery = recovery_action_for(call.name, "CIRCUIT_OPEN", infer_tool_kind(call.name))
+                    details = tool_error_details(call.name, call.args, "CIRCUIT_OPEN", blocked.reason, context=context, call_id=call.id)
                     results.append(
                         ToolCallExecutionResult(
                             id=call.id,
                             name=call.name,
                             status="blocked",
+                            idempotency_key=idempotency_key,
+                            params_hash=context["paramsHash"],
                             error_type="CIRCUIT_OPEN",
                             error_message=blocked.reason,
                             service_name=infer_tool_kind(call.name),
@@ -1350,25 +1564,30 @@ class ToolCallExecutor:
                             retryable=False,
                             recommended_action=recovery.action,
                             fallback_tools=list(recovery.fallback_tools),
-                            tool_message=structured_tool_message(call.name, "blocked", "CIRCUIT_OPEN", blocked.reason, recovery, blocked.circuit_key),
+                            details=details,
+                            tool_message=structured_tool_message(call.name, "blocked", "CIRCUIT_OPEN", blocked.reason, recovery, blocked.circuit_key, tool_call_id=call.id, details=details),
                         )
                     )
                     continue
                 handler = handlers.get(call.name)
                 if handler is None:
                     recovery = recovery_action_for(call.name, "UNKNOWN_TOOL", infer_tool_kind(call.name))
+                    details = tool_error_details(call.name, call.args, "UNKNOWN_TOOL", "No handler registered", context=context, call_id=call.id)
                     results.append(
                         ToolCallExecutionResult(
                             id=call.id,
                             name=call.name,
                             status="failed",
+                            idempotency_key=idempotency_key,
+                            params_hash=context["paramsHash"],
                             error_type="UNKNOWN_TOOL",
                             error_message="No handler registered",
                             service_name=infer_tool_kind(call.name),
                             retryable=False,
                             recommended_action=recovery.action,
                             fallback_tools=list(recovery.fallback_tools),
-                            tool_message=structured_tool_message(call.name, "failed", "UNKNOWN_TOOL", "No handler registered", recovery),
+                            details=details,
+                            tool_message=structured_tool_message(call.name, "failed", "UNKNOWN_TOOL", "No handler registered", recovery, tool_call_id=call.id, details=details),
                         )
                     )
                     continue
@@ -1387,18 +1606,23 @@ class ToolCallExecutor:
                         except Exception as exc:
                             self.failure_registry.record_failure(call.name, call.args, "ERROR", str(exc))
                             recovery = recovery_action_for(call.name, "ERROR", infer_tool_kind(call.name))
+                            error_context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+                            details = tool_error_details(call.name, call.args, "ERROR", str(exc)[:500], context=error_context, call_id=call.id)
                             results.append(
                                 ToolCallExecutionResult(
                                     id=call.id,
                                     name=call.name,
                                     status="failed",
+                                    idempotency_key=tool_idempotency_key(call.name, call.id, error_context),
+                                    params_hash=error_context["paramsHash"],
                                     error_type="ERROR",
                                     error_message=str(exc)[:500],
                                     service_name=infer_tool_kind(call.name),
                                     retryable=recovery.retryable,
                                     recommended_action=recovery.action,
                                     fallback_tools=list(recovery.fallback_tools),
-                                    tool_message=structured_tool_message(call.name, "failed", "ERROR", str(exc)[:500], recovery),
+                                    details=details,
+                                    tool_message=structured_tool_message(call.name, "failed", "ERROR", str(exc)[:500], recovery, tool_call_id=call.id, details=details),
                                 )
                             )
                 except TimeoutError:
@@ -1409,18 +1633,25 @@ class ToolCallExecutor:
                     future.cancel()
                     self.failure_registry.record_failure(call.name, call.args, "TIMEOUT", "tool execution timed out")
                     recovery = recovery_action_for(call.name, "TIMEOUT", infer_tool_kind(call.name))
+                    timeout_context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+                    timeout_type = classify_timeout_type("tool execution timed out", infer_tool_kind(call.name))
+                    details = tool_error_details(call.name, call.args, "TIMEOUT", "tool execution timed out", timeout_type=timeout_type, context=timeout_context, call_id=call.id)
                     results.append(
                         ToolCallExecutionResult(
                             id=call.id,
                             name=call.name,
                             status="failed",
+                            idempotency_key=tool_idempotency_key(call.name, call.id, timeout_context),
+                            params_hash=timeout_context["paramsHash"],
                             error_type="TIMEOUT",
                             error_message="tool execution timed out",
+                            timeout_type=timeout_type,
                             service_name=infer_tool_kind(call.name),
                             retryable=recovery.retryable,
                             recommended_action=recovery.action,
                             fallback_tools=list(recovery.fallback_tools),
-                            tool_message=structured_tool_message(call.name, "failed", "TIMEOUT", "tool execution timed out", recovery),
+                            details=details,
+                            tool_message=structured_tool_message(call.name, "failed", "TIMEOUT", "tool execution timed out", recovery, tool_call_id=call.id, details=details),
                         )
                     )
         return sorted(results, key=lambda item: order.get(item.id, 999))
@@ -1428,25 +1659,34 @@ class ToolCallExecutor:
     def _run_one(self, call: ToolCallRequest, handler: Callable[[Dict[str, Any]], Dict[str, Any]]) -> ToolCallExecutionResult:
         started = time.monotonic()
         policy = self.policy_registry.policy_for(call.name)
+        context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+        idempotency_key = tool_idempotency_key(call.name, call.id, context)
         attempts = max(1, policy.max_retries + 1)
         last_error = ""
         last_error_type = "ERROR"
+        last_timeout_type = ""
         for attempt in range(attempts):
             try:
                 result = handler(call.args)
                 self.failure_registry.record_success(call.name, call.args)
+                contract = validate_tool_result_contract(call.name, result or {}, ToolRegistry())
                 return ToolCallExecutionResult(
                     id=call.id,
                     name=call.name,
                     status="success",
                     result=result or {},
+                    idempotency_key=idempotency_key,
+                    params_hash=context["paramsHash"],
                     duration_ms=int((time.monotonic() - started) * 1000),
                     service_name=infer_tool_kind(call.name),
+                    contract=contract,
+                    result_hash=str(contract.get("resultHash") or ""),
                     tool_message={"toolName": call.name, "status": "success"},
                 )
             except Exception as exc:
                 last_error = str(exc)
                 last_error_type = classify_tool_error(exc)
+                last_timeout_type = classify_timeout_type(exc, infer_tool_kind(call.name)) if last_error_type == "TIMEOUT" else ""
                 if last_error_type in policy.non_retryable_errors or attempt >= attempts - 1:
                     break
                 if policy.retryable_errors and last_error_type not in policy.retryable_errors:
@@ -1455,16 +1695,21 @@ class ToolCallExecutor:
                     time.sleep(policy.backoff_seconds * (attempt + 1))
         self.failure_registry.record_failure(call.name, call.args, last_error_type, last_error)
         recovery = recovery_action_for(call.name, last_error_type, infer_tool_kind(call.name))
+        details = tool_error_details(call.name, call.args, last_error_type, last_error[:500], timeout_type=last_timeout_type, context=context, call_id=call.id)
         return ToolCallExecutionResult(
             id=call.id,
             name=call.name,
             status="failed",
+            idempotency_key=idempotency_key,
+            params_hash=context["paramsHash"],
             error_type=last_error_type,
             error_message=last_error[:500],
+            timeout_type=last_timeout_type,
             duration_ms=int((time.monotonic() - started) * 1000),
             service_name=infer_tool_kind(call.name),
             retryable=recovery.retryable,
             recommended_action=recovery.action,
             fallback_tools=list(recovery.fallback_tools),
-            tool_message=structured_tool_message(call.name, "failed", last_error_type, last_error[:500], recovery),
+            details=details,
+            tool_message=structured_tool_message(call.name, "failed", last_error_type, last_error[:500], recovery, tool_call_id=call.id, details=details),
         )

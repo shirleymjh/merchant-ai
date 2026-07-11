@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping
 
 
@@ -28,6 +30,150 @@ class AgentToolDefinition:
             "description": self.description,
             "parameters": self.parameters,
         }
+
+
+@dataclass(frozen=True)
+class ToolCapability:
+    """Operational contract for a runtime tool."""
+
+    name: str
+    description: str = ""
+    permission: str = "agent.tool.execute"
+    side_effect_level: str = "none"
+    sandbox_required: bool = False
+    cache_policy: str = "disabled"
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+    output_required_keys: List[str] = field(default_factory=list)
+    failure_modes: List[str] = field(default_factory=list)
+    cost_hint: str = "low"
+
+    def trace(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "permission": self.permission,
+            "sideEffectLevel": self.side_effect_level,
+            "sandboxRequired": self.sandbox_required,
+            "cachePolicy": self.cache_policy,
+            "outputRequiredKeys": list(self.output_required_keys),
+            "failureModes": list(self.failure_modes),
+            "costHint": self.cost_hint,
+        }
+
+
+class ToolRegistry:
+    """Capability-card registry for deferred tool discovery and runtime validation."""
+
+    def __init__(self, capabilities: Iterable[ToolCapability] | None = None):
+        self._capabilities: Dict[str, ToolCapability] = {}
+        for capability in capabilities or []:
+            self.register(capability)
+
+    def register(self, capability: ToolCapability) -> None:
+        self._capabilities[capability.name] = capability
+
+    def capability(self, name: str) -> ToolCapability:
+        return self._capabilities.get(str(name or ""), default_tool_capability(str(name or "")))
+
+    def catalog(self, names: Iterable[str] | None = None) -> List[Dict[str, Any]]:
+        selected = set(names or self._capabilities.keys())
+        return [self.capability(name).trace() for name in sorted(selected) if name]
+
+
+def default_tool_capability(name: str, description: str = "") -> ToolCapability:
+    tool_name = str(name or "")
+    side_effect = "read"
+    permission = "agent.tool.read"
+    cache_policy = "ttl"
+    sandbox_required = False
+    output_required: List[str] = []
+    failure_modes = ["TIMEOUT", "INVALID_ARGUMENT", "PERMISSION_DENIED"]
+    if tool_name in {"execute_sql", "doris_query"}:
+        side_effect = "external_read"
+        permission = "agent.sql.execute"
+        cache_policy = "ttl"
+        output_required = ["rows"]
+        failure_modes += ["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "UNSAFE_SQL"]
+    elif tool_name.startswith("artifact_"):
+        permission = "agent.artifact.read"
+        cache_policy = "ttl"
+        sandbox_required = True
+    elif tool_name.startswith("semantic_"):
+        permission = "agent.semantic.read"
+        cache_policy = "versioned"
+    elif tool_name.startswith("draft_") or tool_name in {"repair_sql", "summarize_node_result", "contract_critic"}:
+        side_effect = "none"
+        permission = "agent.reasoning"
+        cache_policy = "disabled"
+    return ToolCapability(
+        name=tool_name,
+        description=description or tool_name,
+        permission=permission,
+        side_effect_level=side_effect,
+        sandbox_required=sandbox_required,
+        cache_policy=cache_policy,
+        output_required_keys=output_required,
+        failure_modes=sorted(set(failure_modes)),
+    )
+
+
+def tool_registry_from_descriptions(tool_registry: Mapping[str, str]) -> ToolRegistry:
+    registry = ToolRegistry()
+    for name, description in tool_registry.items():
+        registry.register(default_tool_capability(str(name), str(description)))
+    return registry
+
+
+def validate_tool_result_contract(tool_name: str, result: Any, registry: ToolRegistry | None = None) -> Dict[str, Any]:
+    capability = (registry or ToolRegistry()).capability(tool_name)
+    payload = result if isinstance(result, dict) else {"value": result}
+    missing = [key for key in capability.output_required_keys if key not in payload]
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return {
+        "toolName": tool_name,
+        "valid": not missing,
+        "missingKeys": missing,
+        "capability": capability.trace(),
+        "resultHash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:24],
+    }
+
+
+def tool_schema_catalog(tools: Iterable[AgentToolDefinition]) -> List[Dict[str, str]]:
+    return [
+        {
+            "name": tool.name,
+            "description": tool.description,
+        }
+        for tool in tools
+    ]
+
+
+def select_tool_schemas(tools: Iterable[AgentToolDefinition], names: Iterable[str]) -> List[Dict[str, Any]]:
+    by_name = {tool.name: tool for tool in tools}
+    selected = []
+    for name in names:
+        tool = by_name.get(str(name or ""))
+        if tool is not None:
+            selected.append(tool.openai_schema())
+    return selected
+
+
+def deferred_tool_schema_loader_tool(available_names: Iterable[str]) -> AgentToolDefinition:
+    names = sorted({str(name) for name in available_names if str(name or "").strip()})
+    return AgentToolDefinition(
+        name="load_tool_schemas",
+        description="Load full schemas for deferred runtime tools by name after inspecting the tool catalog.",
+        parameters=object_schema(
+            {
+                "toolNames": array_property(
+                    "tool names to load from the deferred catalog",
+                    string_property("tool name", names),
+                ),
+                "reason": string_property("why these tools are needed for the current step"),
+            },
+            required=["toolNames", "reason"],
+        ),
+    )
 
 
 def object_schema(properties: Mapping[str, Any], required: Iterable[str] | None = None) -> Dict[str, Any]:
@@ -375,21 +521,22 @@ def artifact_file_tool_schemas() -> List[Dict[str, Any]]:
 
 def node_runtime_tool_schemas(tool_registry: Mapping[str, str], selected_tools: Iterable[str] | None = None) -> List[Dict[str, Any]]:
     selected = set(selected_tools or tool_registry.keys())
+    capability_registry = tool_registry_from_descriptions(tool_registry)
     schemas: List[Dict[str, Any]] = []
     for name, description in tool_registry.items():
         if name not in selected:
             continue
-        schemas.append(
-            AgentToolDefinition(
-                name=name,
-                description=description,
-                parameters=object_schema(
-                    {
-                        "taskId": string_property("QueryGraph node task id"),
-                        "reason": string_property("why this tool should run now"),
-                    },
-                    required=["taskId"],
-                ),
-            ).trace_schema()
-        )
+        schema = AgentToolDefinition(
+            name=name,
+            description=description,
+            parameters=object_schema(
+                {
+                    "taskId": string_property("QueryGraph node task id"),
+                    "reason": string_property("why this tool should run now"),
+                },
+                required=["taskId"],
+            ),
+        ).trace_schema()
+        schema["capability"] = capability_registry.capability(name).trace()
+        schemas.append(schema)
     return schemas
