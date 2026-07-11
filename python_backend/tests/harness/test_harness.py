@@ -28,6 +28,7 @@ from merchant_ai.models import (
     ChatRequest,
     EntitySet,
     EvidenceGap,
+    FreshnessCheckResult,
     GoldenEvaluationRequest,
     GraphValidationGap,
     GraphValidationResult,
@@ -40,6 +41,7 @@ from merchant_ai.models import (
     KnowledgeSuggestionReviewRequest,
     MerchantInfo,
     NodeExecutionContext,
+    NodePlanContract,
     PlanDependency,
     PlanningAssetEntry,
     PlanningAssetPack,
@@ -56,7 +58,9 @@ from merchant_ai.models import (
     RecallItem,
     RecallBundle,
     RouteSlots,
+    RouteTimeWindow,
     RoutingDecision,
+    SkillLifecycleRecord,
     SkillMatchState,
     SqlValidationResult,
     SqlRepairAttempt,
@@ -86,8 +90,10 @@ from merchant_ai.services.assets import (
     TopicAssetService,
     WikiMemoryService,
 )
+from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.cache import build_ttl_cache
+from merchant_ai.services.clarification import ClarificationResolutionService
 from merchant_ai.services.answer import (
     AnswerComposeService,
     DailyReportService,
@@ -103,6 +109,7 @@ from merchant_ai.services.answer import (
     business_summary_table,
     task_evidence_sections,
     answer_skill_headers,
+    render_structured_skill_answer,
 )
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.evidence import EvidenceVerifier
@@ -144,6 +151,7 @@ from merchant_ai.services.memory import (
     truncate_memory_text_by_tokens,
 )
 from merchant_ai.services.memory_constraints import build_memory_constraints
+from merchant_ai.services.merchant_profile import MerchantProfileStore, MerchantProfileSummaryService
 from merchant_ai.services.evaluation import GOLDEN_QUESTIONS, GoldenCaseLoader, GoldenEvaluationService, evaluation_observability_record
 from merchant_ai.services.repositories import PendingAnswerStore, write_json
 from merchant_ai.services.retrieval import (
@@ -2645,6 +2653,100 @@ def test_answer_skill_uses_declared_reusable_ratio_workflow(tmp_path):
     assert service.last_analysis_skill_trace["skillName"] == "ratio_analysis"
 
 
+def test_answer_skill_selects_merchant_sop_skills_for_declared_workflows():
+    gmv_plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "diagnosis",
+            "requiresExplanation": True,
+            "skillWorkflow": {"enabled": True},
+            "question": "最近7天GMV为什么下降？",
+        },
+        intents=[
+            QuestionIntent(
+                question="最近7天GMV为什么下降？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv",
+                metric_name="gmv",
+            )
+        ],
+    )
+    refund_plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "diagnosis",
+            "requiresExplanation": True,
+            "fixedAnalysisWorkflow": True,
+            "question": "最近退款率为什么升高？",
+        },
+        intents=[
+            QuestionIntent(
+                question="最近退款率为什么升高？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                plan_task_id="refund_rate",
+                metric_name="refund_rate",
+            )
+        ],
+    )
+    briefing_plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "overview",
+            "requiresExplanation": True,
+            "reusableAnalysis": True,
+            "question": "生成今天的店铺经营简报",
+        },
+        intents=[
+            QuestionIntent(question="交易", intent_type=IntentType.VALID, answer_mode=AnswerMode.METRIC, category=QuestionCategory.TRADE),
+            QuestionIntent(question="退款", intent_type=IntentType.VALID, answer_mode=AnswerMode.METRIC, category=QuestionCategory.REFUND),
+            QuestionIntent(question="客服", intent_type=IntentType.VALID, answer_mode=AnswerMode.METRIC, category=QuestionCategory.CS_TICKET),
+        ],
+    )
+
+    assert select_answer_skill(gmv_plan, AgentRunResult(), False) == "gmv_drop_diagnosis"
+    assert select_answer_skill(refund_plan, AgentRunResult(), False) == "refund_rate_diagnosis"
+    assert select_answer_skill(briefing_plan, AgentRunResult(), False) == "merchant_daily_briefing"
+
+
+def test_answer_skill_does_not_trigger_sop_for_plain_merchant_lookup():
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "none",
+            "requiresExplanation": False,
+            "question": "最近7天GMV是多少？",
+        },
+        intents=[
+            QuestionIntent(
+                question="最近7天GMV是多少？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv",
+                metric_name="gmv",
+            )
+        ],
+    )
+
+    assert select_answer_skill(plan, AgentRunResult(), False) == ""
+
+
+def test_structured_merchant_sop_skill_answers_bind_to_evidence():
+    answer = render_structured_skill_answer(
+        "refund_rate_diagnosis",
+        {
+            "dataRows": [{"pt": "2026-07-10", "refund_bill_cnt": 12, "order_detail_cnt": 100, "refund_rate": 0.12}],
+            "metricDisclosures": [{"displayName": "退款率", "formula": "refund_bill_cnt / order_detail_cnt"}],
+            "evidenceGaps": [{"code": "MISSING_REASON_BREAKDOWN", "reason": "缺少退款原因维度"}],
+        },
+    )
+
+    assert "退款率升高归因" in answer
+    assert "refund_bill_cnt / order_detail_cnt" in answer
+    assert "缺少退款原因维度" in answer
+    assert "缺任一侧证据时只提示排查方向" in answer
+
+
 def test_answer_skill_does_not_use_skill_for_ordinary_risk_ratio_metric():
     plan = QueryPlan(
         question_understanding={
@@ -3393,6 +3495,81 @@ def test_open_priority_recommendation_continues_after_goal_clarification():
     assert {"trade", "refund", "goods", "ticket_compensation", "coupon", "scm"} <= set(state["loaded_skills"])
 
 
+def test_time_window_clarification_structurally_updates_route_slots():
+    workflow = create_workflow(get_settings())
+    pending_question = "帮我看一下订单情况"
+    state = workflow._initial_state(
+        "近30天",
+        "merchant_001",
+        ChatContext(
+            pending_clarification_stage="BUSINESS_SCOPE",
+            pending_clarification_type="time_window",
+            pending_question=pending_question,
+            pending_clarification_options=["近7天", "昨天", "近30天"],
+        ),
+        None,
+        "test_time_clarification",
+        "run_time_clarification",
+    )
+    state = workflow.inherit_context(state)
+    assert state["clarification_resolution"]["timeWindowDays"] == 30
+    assert state["request_context"].clarification_resolved is True
+    assert state["request_context"].resolved_time_window_days == 30
+
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+
+    assert state["route_slots"].time_window.days == 30
+    assert state["route_slots"].time_window.raw == "近30天"
+    assert any(item.get("type") == "time_window" for item in state["route_decision_trace"])
+
+
+def test_clarification_resolution_service_resolves_context_and_route_slots():
+    service = ClarificationResolutionService()
+    context = ChatContext(
+        pending_clarification_stage="BUSINESS_SCOPE",
+        pending_clarification_type="metric_focus",
+        pending_question="帮我分析店铺表现为什么变差",
+    )
+
+    resolution = service.resolve_context(context, "重点看退款率")
+    slots, trace = service.apply_to_route_slots(RouteSlots(), resolution)
+
+    assert resolution["metricFocus"] == "退款率"
+    assert context.clarification_resolved is True
+    assert context.metric_focus == "退款率"
+    assert "退款率" in slots.analysis_signals
+    assert trace[0]["type"] == "metric_focus"
+
+
+def test_metric_focus_clarification_structurally_updates_fast_understanding():
+    workflow = create_workflow(get_settings())
+    pending_question = "帮我分析店铺表现为什么变差"
+    state = workflow._initial_state(
+        "重点看退款率",
+        "merchant_001",
+        ChatContext(
+            pending_clarification_stage="BUSINESS_SCOPE",
+            pending_clarification_type="metric_focus",
+            pending_question=pending_question,
+            pending_clarification_options=["综合经营风险", "GMV/销售额", "退款率"],
+        ),
+        None,
+        "test_metric_clarification",
+        "run_metric_clarification",
+    )
+    state = workflow.inherit_context(state)
+    assert state["clarification_resolution"]["metricFocus"] == "退款率"
+
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    state = workflow.fast_understand(state)
+
+    assert "退款率" in state["route_slots"].analysis_signals
+    assert "退款率" in state["fast_understanding"].metric_phrases
+    assert not state["human_clarification_required"]
+
+
 def test_open_priority_recommendation_keeps_scope_for_domain_specific_goal():
     workflow = create_workflow(get_settings())
     pending_question = "我这个月只能处理两个问题，建议先处理什么最划算？"
@@ -3824,12 +4001,46 @@ def test_semantic_governance_publish_writes_version_and_drift_artifact(tmp_path)
     assert version["semanticVersion"].startswith("semantic-")
     assert governed["schemaDriftReport"]["extraLiveColumns"] == []
     assert governed["releaseGate"]["publishable"]
+    assert governed["semanticGovernance"]["owner"]
+    assert governed["approvalWorkflow"]["stage"] == "published"
+    assert governed["grayReleasePlan"]["strategy"] == "scoped_incremental"
+    assert governed["grayReleaseMonitor"]["status"] == "monitoring"
+    assert governed["conflictDetection"]["status"] == "passed"
+    assert governed["conflictRepairPlan"]["status"] == "no_conflict"
+    assert governed["evaluationGate"]["goldenEval"]["requiredBeforePublish"] is True
+    assert governed["semanticLineage"]["metrics"][0]["metricKey"] == "pay_amt"
     assert governed["driftGovernance"]["severity"] == "passed"
     assert governed["impactTestPlan"]["impactedMetrics"] == ["pay_amt"]
     assert governed["publishMode"] == "scoped_incremental"
     assert governed["publishScope"]["table"] == "dwm_trade_refund_detail_di"
     assert Path(governed["reviewArtifact"]).exists()
     assert Path(governed["publishHistoryPath"]).exists()
+
+
+def test_topic_builder_batch_build_reports_factory_status(tmp_path):
+    settings = get_settings().model_copy(update={"topic_path": str(tmp_path / "topics"), "harness_workspace_path": str(tmp_path / "workspace")})
+    topic_assets = TopicAssetService(settings)
+    doris = TopicBuilderDoris(
+        schema_rows=[
+            {"Field": "seller_id", "Type": "varchar", "Comment": "商家ID"},
+            {"Field": "pt", "Type": "date", "Comment": "业务日期"},
+            {"Field": "pay_amt", "Type": "decimal(18,2)", "Comment": "金额"},
+        ],
+        sample_rows=[{"seller_id": "100", "pt": "2026-07-01", "pay_amt": 18.3}],
+    )
+    workflow = TopicBuilderWorkflow(settings, doris, topic_assets, llm=type("DisabledBuilderLlm", (), {"configured": False})())
+
+    result = workflow.build_batch(
+        [
+            TopicBuildRequest(topic="电商退货", table_name="dwm_trade_refund_detail_di", merchant_id="100"),
+            TopicBuildRequest(topic="电商交易", table_name="dwm_trade_order_detail_di", merchant_id="100"),
+        ]
+    )
+
+    assert result["status"] == "BATCH_BUILT"
+    assert result["factoryReport"]["mode"] == "topic_asset_factory"
+    assert result["successCount"] == 2
+    assert Path(result["reportPath"]).exists()
 
 
 def test_topic_asset_publish_deletes_stale_managed_files_within_table_scope(tmp_path):
@@ -3897,13 +4108,19 @@ def test_topic_builder_build_generates_pending_assets_with_llm_and_samples(tmp_p
     assert (pending_dir / "metrics.json").exists()
     assert (pending_dir / "terms.json").exists()
     assert (pending_dir / "knowledge_rules.json").exists()
+    assert (pending_dir / "asset_production_report.json").exists()
     asset = json.loads((pending_dir / "asset.json").read_text(encoding="utf-8"))
+    production = json.loads((pending_dir / "asset_production_report.json").read_text(encoding="utf-8"))
     metrics = json.loads((pending_dir / "metrics.json").read_text(encoding="utf-8"))
     fields = json.loads((pending_dir / "semantic_columns.json").read_text(encoding="utf-8"))
     assert asset["generationMode"] == "llm"
     assert result["builderPhases"]["schemaDiscovery"]["status"] == "completed"
     assert result["builderPhases"]["semanticAnalysis"]["mode"] == "llm"
     assert asset["builderPhases"]["humanReviewPublish"]["status"] == "pending_review"
+    assert asset["semanticGovernance"]["approval"]["required"] is True
+    assert asset["approvalWorkflow"]["stage"] == "pending_review"
+    assert production["semanticDraft"]["metricCount"] >= 1
+    assert result["assetProductionReport"]["status"] == "ready_for_human_review"
     assert asset["timeColumn"] == "pt"
     assert asset["merchantFilterColumn"] == "seller_id"
     assert any(item["metricKey"] == "pay_amt" for item in metrics)
@@ -6511,6 +6728,13 @@ def test_memory_knowledge_governance_reviews_publishes_and_indexes_suggestion(tm
         KnowledgeSuggestionReviewRequest(approved=True, reviewer="tester", review_note="approve", action="approve"),
     )
     assert approved["status"] == "approved"
+    assert approved["promotedMemoryFact"]["memoryType"] == "business_fact"
+    assert approved["promotedMemoryFact"]["memoryTier"] == "core"
+    assert "refund_rate" in approved["promotedMemoryFact"]["metrics"]
+    approved_memory = store.load("seller_100")
+    assert approved_memory["facts"]
+    constraints = build_memory_constraints({"coreMemory": approved_memory["coreMemoryProfile"]})
+    assert any(item["enforcement"] == "required" and "refund_rate" in item["targetMetrics"] for item in constraints)
 
     published = service.publish_suggestion("seller_100", "ks_refund_rate", reviewer="tester", review_note="publish")
     assert published["status"] == "PUBLISHED"
@@ -8788,7 +9012,7 @@ def test_tool_runtime_service_rate_limit_blocks_without_calling_handler():
 
     def handler(args):
         calls["count"] += 1
-        return {"ok": True}
+        return {"rows": [{"ok": True}]}
 
     first = runtime.execute("execute_sql", {"sql": "SELECT 1"}, handler, target_kind="doris")
     second = runtime.execute("execute_sql", {"sql": "SELECT 2"}, handler, target_kind="doris")
@@ -15789,6 +16013,278 @@ def test_response_includes_csv_download_for_large_results(tmp_path):
     assert "2026-07-03" in content
 
 
+def test_merchant_profile_summary_combines_memory_focus_and_required_rules():
+    service = MerchantProfileSummaryService()
+
+    summary = service.summarize(
+        merchant=MerchantInfo(merchant_id="100", merchant_name="测试商家"),
+        memory_injection={
+            "source": "structured_memory",
+            "coreMemory": {
+                "recentFocus": {
+                    "topMetrics": ["GMV", "退款率"],
+                    "topCategories": ["交易", "退款"],
+                    "focusPattern": "关注 GMV 下滑和退款异常",
+                }
+            },
+        },
+        memory_constraints=[
+            {
+                "id": "fact_1",
+                "type": "business_fact",
+                "enforcement": "required",
+                "instruction": "统计 GMV 时必须排除测试订单",
+                "targetMetrics": ["GMV"],
+                "source": "merchant_approved_fact",
+            }
+        ],
+        route_slots=RouteSlots(time_window=RouteTimeWindow(days=7, raw="近7天")),
+        fast_understanding=None,
+    )
+
+    assert summary["merchantId"] == "100"
+    assert summary["defaultTimeWindowDays"] == 7
+    assert summary["defaultTimeWindow"] == 7
+    assert summary["preferredMetrics"] == ["GMV", "退款率"]
+    assert summary["businessFocus"] == ["交易", "退款"]
+    assert "退款率升高" in summary["recentRisks"]
+    assert summary["confirmedRules"][0]["instruction"] == "统计 GMV 时必须排除测试订单"
+    assert summary["confirmedRuleTexts"] == ["统计 GMV 时必须排除测试订单"]
+
+
+def test_merchant_profile_store_persists_reviews_and_merges_runtime_summary(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path / "workspace")})
+    store = MerchantProfileStore(settings)
+
+    profile = store.upsert_profile(
+        "100",
+        {
+            "defaultTimeWindow": 14,
+            "preferredMetrics": ["GMV", "退款率"],
+            "confirmedRuleTexts": ["有效订单排除已取消订单"],
+            "recentRisks": ["退款率升高"],
+            "businessFocus": ["售后"],
+            "industryTags": ["服饰"],
+        },
+        reviewer="ops",
+        review_status="reviewed",
+    )
+    approved = store.review_profile("100", approved=True, reviewer="lead", note="ok")
+    merged = store.merge_runtime_summary(
+        "100",
+        {
+            "merchantId": "100",
+            "defaultTimeWindow": 7,
+            "preferredMetrics": ["工单量"],
+            "confirmedRules": [{"instruction": "统计 GMV 使用支付成功口径"}],
+            "businessFocus": ["履约"],
+        },
+    )
+
+    assert profile["defaultTimeWindow"] == 14
+    assert approved["reviewStatus"] == "approved"
+    assert merged["defaultTimeWindow"] == 14
+    assert merged["preferredMetrics"][:3] == ["GMV", "退款率", "工单量"]
+    assert "有效订单排除已取消订单" in merged["confirmedRuleTexts"]
+    assert "退款率升高" in merged["recentRisks"]
+    assert merged["industryTags"] == ["服饰"]
+    assert merged["profileStore"]["enabled"] is True
+
+
+def test_response_exposes_profile_freshness_and_security_audit(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "allowed_merchant_ids": "100,101",
+        }
+    )
+    workflow = create_workflow(settings)
+    state = workflow._initial_state(
+        "最近7天GMV是多少",
+        "100",
+        ChatContext(),
+        None,
+        "thread_enterprise_surface",
+        "run_enterprise_surface",
+    )
+    state["answer"] = "最近7天 GMV 是 100。"
+    state["persisted"] = False
+    state["response_context"] = ChatContext()
+    state["merchant"] = MerchantInfo(merchant_id="100", merchant_name="测试商家")
+    state["plan"] = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="最近7天GMV是多少",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_metric",
+                preferred_table="ads_merchant_profile",
+            )
+        ]
+    )
+    bundle = QueryBundle(tables=["ads_merchant_profile"], rows=[{"merchant_id": "100", "gmv": 100}], original_row_count=1)
+    state["agent_run_result"] = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="gmv_metric", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    state["freshness_reports"] = [
+        FreshnessCheckResult(
+            task_id="gmv_metric",
+            table="ads_merchant_profile",
+            checked=True,
+            status="AVAILABLE",
+            requested_days=7,
+            min_pt="20260701",
+            max_pt="20260707",
+        )
+    ]
+    state["merchant_profile_summary"] = {
+        "merchantId": "100",
+        "merchantName": "测试商家",
+        "defaultTimeWindowDays": 7,
+        "preferredMetrics": ["GMV"],
+    }
+    state["skill_lifecycle_records"] = [
+        SkillLifecycleRecord(skill_name="gmv_drop_diagnosis", stage="matched", status="matched")
+    ]
+
+    response = workflow.to_response(state)
+
+    merchant_experience = response.merchant_experience
+    assert merchant_experience["merchantProfileSummary"]["preferredMetrics"] == ["GMV"]
+    assert merchant_experience["dataFreshness"]["status"] == "checked"
+    assert merchant_experience["dataFreshness"]["reports"][0]["table"] == "ads_merchant_profile"
+    assert merchant_experience["dataFreshness"]["latestDataAt"] == "20260707"
+    assert merchant_experience["dataFreshness"]["missingDataPolicy"].startswith("missing partition")
+    assert merchant_experience["securityAudit"]["policy"] == "readonly_merchant_scoped"
+    assert merchant_experience["securityAudit"]["tenantScoped"] is True
+    assert merchant_experience["securityAudit"]["allowedMerchantCount"] == 2
+    assert merchant_experience["securityAudit"]["rowLevelSecurity"]["enabled"] is True
+    assert merchant_experience["securityAudit"]["sqlPolicy"]["readOnlyOnly"] is True
+    assert merchant_experience["controlledReact"]["mode"] == "controlled_react_querygraph"
+    assert "evidence_verification" in merchant_experience["controlledReact"]["guardrails"]
+    assert merchant_experience["skillEcosystem"]["creator"]["enabled"] is True
+    assert any(item["name"] == "gmv_drop_diagnosis" for item in merchant_experience["skillEcosystem"]["market"]["items"])
+    assert merchant_experience["skillEcosystem"]["runtimeRecords"][0]["skillName"] == "gmv_drop_diagnosis"
+
+
+def test_response_exposes_realtime_fallback_freshness_disclosure(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    workflow = create_workflow(settings)
+    state = workflow._initial_state("今天订单量是多少", "100", ChatContext(), None, "thread_freshness_fallback", "run_freshness_fallback")
+    state["answer"] = "已切换实时表查看今天订单。"
+    state["persisted"] = False
+    state["response_context"] = ChatContext()
+    state["merchant"] = MerchantInfo(merchant_id="100", merchant_name="测试商家")
+    state["plan"] = QueryPlan()
+    state["agent_run_result"] = AgentRunResult()
+    state["freshness_reports"] = [
+        FreshnessCheckResult(
+            task_id="today_orders",
+            table="dwm_trade_order_detail_di",
+            checked=True,
+            status="STALE_USE_REALTIME_FALLBACK",
+            requested_days=1,
+            max_pt="20260710",
+            fallback_table="dwm_trade_order_realtime_di",
+            reason="offline table stale; switch_to_realtime=dwm_trade_order_realtime_di",
+        )
+    ]
+
+    response = workflow.to_response(state)
+
+    freshness = response.merchant_experience["dataFreshness"]
+    assert freshness["status"] == "realtime_fallback_used"
+    assert freshness["offlineDelayDetected"] is True
+    assert freshness["realtimeFallbackUsed"] is True
+    assert freshness["answerDisclosure"]["required"] is True
+    assert "不能把缺失数据直接解释为业务为 0" in "".join(freshness["notes"])
+
+
+def test_access_control_denies_columns_and_writes_audit(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path / "workspace")})
+    service = AccessControlService(settings)
+    service.policy_path.parent.mkdir(parents=True, exist_ok=True)
+    service.policy_path.write_text(
+        json.dumps(
+            {
+                "allowedMerchantIds": ["100"],
+                "tables": {
+                    "ads_merchant_profile": {
+                        "allowedRoles": ["merchant_analyst"],
+                        "columns": {
+                            "mobile": {"denied": True},
+                            "buyer_mobile": {"mask": "partial"},
+                        },
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    denied_contract = NodePlanContract(
+        task_id="profile_sensitive",
+        preferred_table="ads_merchant_profile",
+        allowed_columns=["merchant_id", "mobile", "buyer_mobile"],
+        visible_columns=["merchant_id", "mobile", "buyer_mobile"],
+        access_role="merchant_analyst",
+        merchant_id="100",
+    )
+
+    denied = service.authorize_contract(denied_contract, "SELECT mobile FROM ads_merchant_profile WHERE merchant_id = %s", run_id="run_acl")
+    allowed_contract = denied_contract.model_copy(update={"visible_columns": ["merchant_id", "buyer_mobile"]})
+    allowed = service.authorize_contract(
+        allowed_contract,
+        "SELECT buyer_mobile FROM ads_merchant_profile WHERE merchant_id = %s",
+        run_id="run_acl",
+    )
+    audit = service.record_query_audit(allowed, row_count=3, status="success")
+
+    assert denied.allowed is False
+    assert denied.code == "COLUMN_DENIED"
+    assert "mobile" in denied.denied_columns
+    assert allowed.allowed is True
+    assert allowed.masked_columns["buyer_mobile"] == "partial"
+    assert audit["rowCount"] == 3
+    assert service.audit_summary()["items"]
+
+
+def test_response_exposes_human_loop_confirmation_card(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    workflow = create_workflow(settings)
+    state = workflow._initial_state(
+        "帮我看一下店铺表现",
+        "100",
+        ChatContext(),
+        None,
+        "thread_human_loop_surface",
+        "run_human_loop_surface",
+    )
+    workflow.request_human_clarification(
+        state,
+        "你想按哪个时间范围看？",
+        "BUSINESS_SCOPE",
+        "time_window",
+        ["近7天", "昨天", "近30天"],
+    )
+    state["answer"] = "你想按哪个时间范围看？"
+    state["persisted"] = False
+    state["response_context"] = ChatContext()
+    state["merchant"] = MerchantInfo(merchant_id="100", merchant_name="测试商家")
+
+    response = workflow.to_response(state)
+
+    human_loop = response.merchant_experience["humanLoop"]
+    assert human_loop["status"] == "waiting_confirmation"
+    assert human_loop["confirmationCard"]["title"] == "确认分析时间范围"
+    assert human_loop["checkpoint"]["threadId"] == "thread_human_loop_surface"
+    assert human_loop["knowledgeFeedback"]["reviewRequiredBeforePublish"] is True
+
+
 def test_daily_report_includes_alerts_traceability_and_drilldowns():
     class DailyDoris:
         def query_one(self, sql, params):
@@ -17513,6 +18009,56 @@ def test_skill_worker_executes_complex_skill_with_isolated_context_package(tmp_p
     assert context["allowedTools"]["semantic_read"] is True
     assert context["allowedTools"]["artifact_grep"] is True
     assert context["fileContextTools"]["semantic_read"]
+    assert context["verifiedRowCount"] == 1
+
+
+def test_skill_worker_executes_merchant_sop_skill_with_isolated_context(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "llm_api_key": ""})
+    worker = SkillWorkerExecutor(LlmClient(settings))
+    plan = QueryPlan(
+        question_understanding={
+            "analysisIntent": "diagnosis",
+            "requiresExplanation": True,
+            "skillWorkflow": {"skillName": "refund_rate_diagnosis", "required": True},
+        },
+        intents=[
+            QuestionIntent(
+                question="最近7天退款率为什么升高？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.DERIVED,
+                category=QuestionCategory.REFUND,
+                metric_name="refund_rate",
+                metric_formula="refund_bill_cnt / order_detail_cnt",
+            )
+        ],
+    )
+    bundle = QueryBundle(
+        rows=[{"pt": "2026-07-10", "refund_bill_cnt": 12, "order_detail_cnt": 100, "refund_rate": 0.12}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="refund_rate", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    result = worker.execute_answer_skill(
+        "最近7天退款率为什么升高？",
+        plan,
+        run,
+        str(tmp_path),
+        skill_name="refund_rate_diagnosis",
+        merchant=MerchantInfo(merchant_id="100"),
+        initial_trace={"matchedBy": "test_sop_match"},
+    )
+
+    assert "退款率升高归因" in result.answer
+    assert result.trace["skillName"] == "refund_rate_diagnosis"
+    assert result.trace["isolatedExecution"] is True
+    assert result.trace["lifecycleStage"] == "completed"
+    context = json.loads(Path(result.trace["contextPackagePath"]).read_text(encoding="utf-8"))
+    assert context["skillName"] == "refund_rate_diagnosis"
     assert context["verifiedRowCount"] == 1
 
 

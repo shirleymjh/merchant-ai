@@ -69,6 +69,36 @@
               <span v-for="item in disclosureItems" :key="item">{{ item }}</span>
             </div>
           </section>
+          <section v-if="clarificationCard" class="confirmation-card">
+            <div class="confirmation-card-head">
+              <div>
+                <p>{{ clarificationCard.stageLabel }}</p>
+                <h3>{{ clarificationCard.title }}</h3>
+              </div>
+              <span>{{ clarificationCard.statusLabel }}</span>
+            </div>
+            <p class="confirmation-question">{{ clarificationCard.question }}</p>
+            <div v-if="clarificationMetricPreview.length || clarificationTablePreview.length" class="confirmation-preview">
+              <div v-if="clarificationMetricPreview.length">
+                <b>指标预览</b>
+                <span>{{ clarificationMetricPreview.join('、') }}</span>
+              </div>
+              <div v-if="clarificationTablePreview.length">
+                <b>数据预览</b>
+                <span>{{ clarificationTablePreview.join('、') }}</span>
+              </div>
+            </div>
+            <div v-if="clarificationOptions.length" class="confirmation-options">
+              <button
+                v-for="option in clarificationOptions"
+                :key="option"
+                type="button"
+                @click="confirmClarification(option)"
+              >
+                {{ option }}
+              </button>
+            </div>
+          </section>
           <div v-if="metricSummarySections.length" class="metric-summary-grid">
             <section
               v-for="(section, sectionIndex) in metricSummarySections"
@@ -286,13 +316,17 @@ const props = defineProps({
     type: Object,
     default: () => ({})
   },
+  clarification: {
+    type: Object,
+    default: null
+  },
   feedbackStatus: {
     type: Object,
     default: () => ({})
   }
 })
 
-const emit = defineEmits(['feedback', 'ask'])
+const emit = defineEmits(['feedback', 'ask', 'confirm-clarification'])
 
 const displayTime = new Date().toLocaleString('zh-CN', {
   year: 'numeric',
@@ -325,11 +359,71 @@ const traceabilityItems = computed(() => {
   if (traceability.sourceSummary) items.push(traceability.sourceSummary)
   return items.slice(0, 4)
 })
+const clarificationCard = computed(() => {
+  const loop = props.merchantExperience?.humanLoop || {}
+  const card = loop.confirmationCard || {}
+  const direct = props.clarification || {}
+  const question = card.question || direct.question || ''
+  if (!question) return null
+  return {
+    type: card.type || direct.type || '',
+    title: card.title || confirmationTitle(card.type || direct.type),
+    question,
+    stageLabel: direct.stage || loop.status || '需要确认',
+    statusLabel: loop.status === 'resolved' ? '已确认' : '等待选择',
+    checkpoint: loop.checkpoint || {}
+  }
+})
+const clarificationOptions = computed(() => {
+  const loopOptions = props.merchantExperience?.humanLoop?.confirmationCard?.options || []
+  const directOptions = props.clarification?.options || []
+  return [...loopOptions, ...directOptions]
+    .map(item => String(item || '').trim())
+    .filter((item, index, items) => item && items.indexOf(item) === index)
+    .slice(0, 6)
+})
+const clarificationMetricPreview = computed(() => {
+  const profile = props.merchantExperience?.merchantProfileSummary || {}
+  const constraints = props.merchantExperience?.appliedMemoryConstraints || []
+  const metrics = [
+    ...(profile.preferredMetrics || []),
+    ...constraints.flatMap(item => item?.targetMetrics || [])
+  ]
+  return metrics.map(item => String(item || '').trim()).filter(Boolean).slice(0, 5)
+})
+const clarificationTablePreview = computed(() => {
+  const freshnessTables = props.merchantExperience?.dataFreshness?.tables || []
+  const securityTables = props.merchantExperience?.securityAudit?.tables || []
+  return [...freshnessTables, ...securityTables]
+    .map(table => tableLabel(table))
+    .filter((item, index, items) => item && items.indexOf(item) === index)
+    .slice(0, 4)
+})
 
 function askFollowUp(question) {
   const text = String(question || '').trim()
   if (!text) return
   emit('ask', text)
+}
+
+function confirmClarification(option) {
+  emit('confirm-clarification', {
+    value: option,
+    type: clarificationCard.value?.type || '',
+    checkpoint: clarificationCard.value?.checkpoint || {},
+    threadId: clarificationCard.value?.checkpoint?.threadId || ''
+  })
+}
+
+function confirmationTitle(type) {
+  const mapping = {
+    time_window: '确认分析时间范围',
+    metric_focus: '确认指标口径',
+    priority_goal: '确认优化目标',
+    skill_confirm: '确认分析工作流',
+    business_scope: '确认业务范围'
+  }
+  return mapping[type] || '确认分析口径'
 }
 
 const visibleDataSections = computed(() => {

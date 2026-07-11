@@ -4,7 +4,7 @@ import json
 import hmac
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, status
 from fastapi.encoders import jsonable_encoder
@@ -204,6 +204,26 @@ def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
             "run": "/api/threads/%s/runs/%s" % (run.thread_id, run.run_id),
             "events": "/api/threads/%s/runs/%s/events" % (run.thread_id, run.run_id),
             "trace": "/api/threads/%s/runs/%s/trace" % (run.thread_id, run.run_id),
+            "checkpoint": "/api/threads/%s/runs/%s/checkpoint" % (run.thread_id, run.run_id),
+        },
+    }
+
+
+@router.post("/api/chat/resume")
+def resume_chat(request: RunCreateRequest) -> Dict[str, Any]:
+    request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    if not request.thread_id:
+        raise HTTPException(status_code=400, detail="threadId is required for resume")
+    run = async_run_service.submit(request)
+    return {
+        "success": True,
+        "mode": "resume",
+        "threadId": run.thread_id,
+        "runId": run.run_id,
+        "run": jsonable_encoder(run_summary_payload(run, run_duration_ms(run)), by_alias=True),
+        "links": {
+            "run": "/api/threads/%s/runs/%s" % (run.thread_id, run.run_id),
+            "events": "/api/threads/%s/runs/%s/events" % (run.thread_id, run.run_id),
             "checkpoint": "/api/threads/%s/runs/%s/checkpoint" % (run.thread_id, run.run_id),
         },
     }
@@ -476,6 +496,22 @@ def evaluate_skill_triggers(request: SkillEvaluationRequest, _auth: None = OpsAu
     return skill_evaluation_service.evaluate(request)
 
 
+@router.get("/api/ops/skill-market")
+def skill_market(_auth: None = OpsAuth) -> Dict[str, Any]:
+    return skill_draft_service.market()
+
+
+@router.post("/api/ops/skill-market/{skill_name}/install")
+def install_market_skill(skill_name: str, payload: Dict[str, Any], _auth: None = OpsAuth) -> Dict[str, Any]:
+    return skill_draft_service.install_skill(
+        skill_name,
+        scope=str(payload.get("scope") or "merchant"),
+        merchant_ids=payload.get("merchantIds") if isinstance(payload.get("merchantIds"), list) else [],
+        industry_tags=payload.get("industryTags") if isinstance(payload.get("industryTags"), list) else [],
+        traffic_percent=int(payload.get("trafficPercent") or 100),
+    )
+
+
 @router.post("/api/ops/golden-evaluations")
 def evaluate_golden_cases(request: GoldenEvaluationRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     if bool(request.partition_date_anchor_enabled) == bool(settings.agent_partition_date_anchor_enabled):
@@ -494,6 +530,64 @@ def evaluate_golden_cases(request: GoldenEvaluationRequest, _auth: None = OpsAut
 @router.get("/api/daily-report")
 def daily_report(merchant_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
     return daily_report_service.report(require_merchant_access(merchant_id or settings.merchant_id)).model_dump(by_alias=True)
+
+
+@router.get("/api/merchant-profile/{merchant_id}")
+def get_merchant_profile(merchant_id: str, include_expired: bool = Query(default=False)) -> Dict[str, Any]:
+    effective_merchant_id = require_merchant_access(merchant_id)
+    return {
+        "success": True,
+        "profile": workflow.merchant_profile_store.get_profile(effective_merchant_id, include_expired=include_expired),
+    }
+
+
+@router.patch("/api/merchant-profile/{merchant_id}")
+def update_merchant_profile(
+    merchant_id: str,
+    patch: Dict[str, Any],
+    reviewer: str = Query(default="ops"),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    effective_merchant_id = require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
+    profile = workflow.merchant_profile_store.upsert_profile(effective_merchant_id, patch, reviewer=reviewer, review_status="reviewed")
+    return {"success": True, "profile": profile}
+
+
+@router.post("/api/merchant-profile/{merchant_id}/review")
+def review_merchant_profile(
+    merchant_id: str,
+    approved: bool = Query(default=True),
+    reviewer: str = Query(default="ops"),
+    note: str = Query(default=""),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    effective_merchant_id = require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
+    profile = workflow.merchant_profile_store.review_profile(effective_merchant_id, approved=approved, reviewer=reviewer, note=note)
+    return {"success": True, "profile": profile}
+
+
+@router.get("/api/ops/access-control/policy")
+def get_access_control_policy(_auth: None = OpsAuth) -> Dict[str, Any]:
+    service = workflow.node_worker.access_control
+    return {
+        "success": True,
+        "path": str(service.policy_path),
+        "policy": service._load_policy(),
+    }
+
+
+@router.put("/api/ops/access-control/policy")
+def update_access_control_policy(policy: Dict[str, Any], _auth: None = OpsAuth) -> Dict[str, Any]:
+    service = workflow.node_worker.access_control
+    service.policy_path.parent.mkdir(parents=True, exist_ok=True)
+    service.policy_path.write_text(json.dumps(policy or {}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return {"success": True, "path": str(service.policy_path), "policy": service._load_policy()}
+
+
+@router.get("/api/ops/access-control/audit")
+def get_access_control_audit(limit: int = Query(default=50, ge=1, le=500), _auth: None = OpsAuth) -> Dict[str, Any]:
+    service = workflow.node_worker.access_control
+    return {"success": True, **service.audit_summary(limit=limit)}
 
 
 @router.post("/api/wiki/compress")
@@ -547,6 +641,15 @@ def build_topic_asset(request: TopicBuildRequest, _auth: None = OpsAuth) -> Dict
         request.merchant_id = settings.merchant_id
     require_merchant_access(request.merchant_id)
     return topic_builder_workflow.build(request)
+
+
+@router.post("/api/topics/build-batch")
+def build_topic_assets_batch(requests: List[TopicBuildRequest], _auth: None = OpsAuth) -> Dict[str, Any]:
+    for request in requests:
+        if not request.merchant_id:
+            request.merchant_id = settings.merchant_id
+        require_merchant_access(request.merchant_id)
+    return topic_builder_workflow.build_batch(requests)
 
 
 @router.post("/api/topics/{topic}/tables/{table_name}/publish")

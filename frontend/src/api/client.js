@@ -24,9 +24,33 @@ export async function sendMessage(message, context, messageHistory = []) {
 export async function startAsyncRun(message, context, options = {}) {
   return request('/api/runs/async', {
     method: 'POST',
-    body: JSON.stringify({ message, merchantId: DEFAULT_MERCHANT_ID, context, messageHistory: options.messageHistory || [] }),
+    body: JSON.stringify({
+      message,
+      merchantId: DEFAULT_MERCHANT_ID,
+      threadId: options.threadId || '',
+      context,
+      messageHistory: options.messageHistory || []
+    }),
     signal: options.signal
   })
+}
+
+export async function resumeChatRun(message, context, options = {}) {
+  return request('/api/chat/resume', {
+    method: 'POST',
+    body: JSON.stringify({
+      message,
+      merchantId: DEFAULT_MERCHANT_ID,
+      threadId: options.threadId || '',
+      context,
+      messageHistory: options.messageHistory || []
+    }),
+    signal: options.signal
+  })
+}
+
+export async function getMerchantProfile() {
+  return request(`/api/merchant-profile/${DEFAULT_MERCHANT_ID}`)
 }
 
 export async function getRun(threadId, runId) {

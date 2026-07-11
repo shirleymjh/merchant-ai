@@ -44,6 +44,7 @@ class ToolCapability:
     cache_policy: str = "disabled"
     input_schema: Dict[str, Any] = field(default_factory=dict)
     output_required_keys: List[str] = field(default_factory=list)
+    fail_closed: bool = False
     failure_modes: List[str] = field(default_factory=list)
     cost_hint: str = "low"
 
@@ -56,6 +57,7 @@ class ToolCapability:
             "sandboxRequired": self.sandbox_required,
             "cachePolicy": self.cache_policy,
             "outputRequiredKeys": list(self.output_required_keys),
+            "failClosed": self.fail_closed,
             "failureModes": list(self.failure_modes),
             "costHint": self.cost_hint,
         }
@@ -79,6 +81,9 @@ class ToolRegistry:
         selected = set(names or self._capabilities.keys())
         return [self.capability(name).trace() for name in sorted(selected) if name]
 
+    def names(self) -> List[str]:
+        return sorted(self._capabilities.keys())
+
 
 def default_tool_capability(name: str, description: str = "") -> ToolCapability:
     tool_name = str(name or "")
@@ -87,20 +92,32 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
     cache_policy = "ttl"
     sandbox_required = False
     output_required: List[str] = []
+    fail_closed = False
     failure_modes = ["TIMEOUT", "INVALID_ARGUMENT", "PERMISSION_DENIED"]
     if tool_name in {"execute_sql", "doris_query"}:
         side_effect = "external_read"
         permission = "agent.sql.execute"
         cache_policy = "ttl"
         output_required = ["rows"]
+        fail_closed = True
         failure_modes += ["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "UNSAFE_SQL"]
     elif tool_name.startswith("artifact_"):
         permission = "agent.artifact.read"
         cache_policy = "ttl"
         sandbox_required = True
+        if tool_name == "artifact_write":
+            side_effect = "workspace_write"
+            permission = "agent.artifact.write"
+            output_required = ["path"]
+            fail_closed = True
     elif tool_name.startswith("semantic_"):
         permission = "agent.semantic.read"
         cache_policy = "versioned"
+        if tool_name == "semantic_write":
+            side_effect = "governed_write"
+            permission = "agent.semantic.propose"
+            output_required = ["path"]
+            fail_closed = True
     elif tool_name.startswith("draft_") or tool_name in {"repair_sql", "summarize_node_result", "contract_critic"}:
         side_effect = "none"
         permission = "agent.reasoning"
@@ -113,6 +130,7 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
         sandbox_required=sandbox_required,
         cache_policy=cache_policy,
         output_required_keys=output_required,
+        fail_closed=fail_closed,
         failure_modes=sorted(set(failure_modes)),
     )
 
@@ -120,6 +138,37 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
 def tool_registry_from_descriptions(tool_registry: Mapping[str, str]) -> ToolRegistry:
     registry = ToolRegistry()
     for name, description in tool_registry.items():
+        registry.register(default_tool_capability(str(name), str(description)))
+    return registry
+
+
+RUNTIME_NODE_TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "inspect_schema": "inspect asset/live schema available for this node",
+    "resolve_columns": "resolve required columns and output keys",
+    "contract_critic": "check whether node plan contract is executable before SQL draft",
+    "check_freshness": "check pt freshness/fallback risk",
+    "choose_sql_strategy": "choose plan-bound LLM SQL or structured fallback",
+    "draft_structured_sql": "draft safe one-table structured SQL",
+    "draft_llm_sql": "draft one-table SQL with LLM bound to node plan contract",
+    "validate_sql": "validate SQL with sqlglot and node scope",
+    "execute_sql": "execute SQL in Doris",
+    "repair_sql": "repair SQL only, never QueryGraph",
+    "summarize_node_result": "summarize rows, entity set, and gaps",
+}
+
+
+def canonical_tool_registry(extra_descriptions: Mapping[str, str] | None = None) -> ToolRegistry:
+    registry = ToolRegistry()
+    definitions = (
+        semantic_file_tool_definitions()
+        + artifact_file_tool_definitions()
+        + [sql_draft_tool(), sql_repair_tool(), lead_action_selection_tool([])]
+    )
+    for definition in definitions:
+        registry.register(default_tool_capability(definition.name, definition.description))
+    for name, description in RUNTIME_NODE_TOOL_DESCRIPTIONS.items():
+        registry.register(default_tool_capability(name, description))
+    for name, description in (extra_descriptions or {}).items():
         registry.register(default_tool_capability(str(name), str(description)))
     return registry
 
@@ -134,6 +183,7 @@ def validate_tool_result_contract(tool_name: str, result: Any, registry: ToolReg
         "valid": not missing,
         "missingKeys": missing,
         "capability": capability.trace(),
+        "enforced": bool(capability.fail_closed),
         "resultHash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:24],
     }
 

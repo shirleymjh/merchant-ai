@@ -1819,6 +1819,13 @@ def select_answer_skill(plan: QueryPlan, run_result: AgentRunResult | None = Non
         return ""
     if plan_has_new_product_risk_shape(plan):
         return "new_product_risk"
+    question_text = " ".join([str(understanding.get("originalQuestion") or understanding.get("question") or "")] + [str(intent.question or "") for intent in plan.intents]).lower()
+    if analysis_intent in {"overview", "diagnosis", "store_health", "health_check"} and looks_like_merchant_daily_briefing(question_text, categories):
+        return "merchant_daily_briefing"
+    if analysis_intent in {"trend_check", "anomaly_check", "diagnosis", "comparison"} and QuestionCategory.REFUND in categories and looks_like_refund_diagnosis(question_text):
+        return "refund_rate_diagnosis"
+    if analysis_intent in {"trend_check", "anomaly_check", "diagnosis", "comparison"} and QuestionCategory.TRADE in categories and looks_like_gmv_or_order_drop(question_text):
+        return "gmv_drop_diagnosis"
     risk_domains = {QuestionCategory.REFUND, QuestionCategory.COMPENSATION, QuestionCategory.CS_TICKET, QuestionCategory.GOODS, QuestionCategory.SCM}
     if analysis_intent in {"risk_ranking", "diagnosis", "anomaly_check"} and categories & risk_domains:
         return "risk_analysis"
@@ -1853,7 +1860,16 @@ def deterministic_analysis_summary(question: str, plan: QueryPlan, run_result: A
 
 
 def declared_skill_workflow_name(understanding: Dict[str, Any]) -> str:
-    allowed = {"bi_trend_attribution", "risk_analysis", "rule_compliance", "ratio_analysis", "new_product_risk"}
+    allowed = {
+        "bi_trend_attribution",
+        "risk_analysis",
+        "rule_compliance",
+        "ratio_analysis",
+        "new_product_risk",
+        "gmv_drop_diagnosis",
+        "refund_rate_diagnosis",
+        "merchant_daily_briefing",
+    }
     for key in ["skillWorkflow", "skill_workflow", "recommendedSkill", "recommended_skill", "analysisSkill", "analysis_skill"]:
         value = understanding.get(key)
         if isinstance(value, dict):
@@ -1863,6 +1879,20 @@ def declared_skill_workflow_name(understanding: Dict[str, Any]) -> str:
         if name in allowed:
             return name
     return ""
+
+
+def looks_like_gmv_or_order_drop(text: str) -> bool:
+    return bool(re.search(r"gmv|销售额|成交额|订单|下单|支付|下降|下滑|变少|异常|波动|为什么|原因|归因", text or ""))
+
+
+def looks_like_refund_diagnosis(text: str) -> bool:
+    return bool(re.search(r"退款率|退款金额|退款|退货|售后|上升|升高|变高|异常|为什么|原因|归因", text or ""))
+
+
+def looks_like_merchant_daily_briefing(text: str, categories: set[QuestionCategory]) -> bool:
+    if re.search(r"日报|简报|经营情况|店铺情况|经营健康|整体表现|今天怎么样|昨天怎么样", text or ""):
+        return True
+    return len({item for item in categories if item != QuestionCategory.UNKNOWN}) >= 3
 
 
 def reusable_analysis_workflow_requested(understanding: Dict[str, Any]) -> bool:
@@ -2579,6 +2609,9 @@ def render_structured_skill_answer(skill_name: str, payload: Dict[str, Any]) -> 
         "rule_compliance": "规则合规分析",
         "ratio_analysis": "占比分析",
         "new_product_risk": "新品风险分析",
+        "gmv_drop_diagnosis": "GMV/订单下跌归因",
+        "refund_rate_diagnosis": "退款率升高归因",
+        "merchant_daily_briefing": "商家经营简报",
     }.get(skill_name, "分析结果")
     lines = ["%s：" % title]
     if skill_name == "ratio_analysis":
@@ -2587,6 +2620,12 @@ def render_structured_skill_answer(skill_name: str, payload: Dict[str, Any]) -> 
         lines.extend(rule_compliance_skill_lines(rule_evidence, rows))
     elif skill_name == "new_product_risk":
         lines.extend(new_product_risk_skill_lines(rows, disclosures))
+    elif skill_name == "merchant_daily_briefing":
+        lines.extend(merchant_daily_briefing_skill_lines(rows, disclosures))
+    elif skill_name == "gmv_drop_diagnosis":
+        lines.extend(gmv_drop_diagnosis_skill_lines(rows, disclosures))
+    elif skill_name == "refund_rate_diagnosis":
+        lines.extend(refund_rate_diagnosis_skill_lines(rows, disclosures))
     else:
         lines.extend(risk_skill_lines(rows, disclosures, question))
     if gaps:
@@ -3214,6 +3253,48 @@ def new_product_risk_skill_lines(rows: List[Dict[str, Any]], disclosures: List[D
     if disclosures:
         lines.append("- 指标口径：%s" % "; ".join(compact_disclosure(item) for item in disclosures[:4]))
     lines.append("- 判断：优先关注同时具备新品生命周期证据和退款/赔付/工单压力的商品。")
+    return lines
+
+
+def gmv_drop_diagnosis_skill_lines(rows: List[Dict[str, Any]], disclosures: List[Dict[str, Any]]) -> List[str]:
+    lines = ["- 流程：先判断 GMV/订单变化，再定位商品、渠道或日期集中点，最后只基于证据给出原因假设。"]
+    if rows:
+        lines.append("- 关键证据：")
+        for index, row in enumerate(rows[:6], 1):
+            lines.append("  %d. %s" % (index, compact_row_preview(row)))
+    else:
+        lines.append("- 当前没有可用于归因的 GMV/订单结果行。")
+    if disclosures:
+        lines.append("- 指标口径：%s" % "; ".join(compact_disclosure(item) for item in disclosures[:5]))
+    lines.append("- 判断：如果只有结果指标、没有结构拆解证据，只能说明下跌现象，不能断言具体原因。")
+    return lines
+
+
+def refund_rate_diagnosis_skill_lines(rows: List[Dict[str, Any]], disclosures: List[Dict[str, Any]]) -> List[str]:
+    lines = ["- 流程：先确认退款率/退款金额变化，再看商品、订单、客服/赔付是否集中，避免把单量下降误判为退款问题。"]
+    if rows:
+        lines.append("- 关键证据：")
+        for index, row in enumerate(rows[:6], 1):
+            lines.append("  %d. %s" % (index, compact_row_preview(row)))
+    else:
+        lines.append("- 当前没有可用于退款归因的结果行。")
+    if disclosures:
+        lines.append("- 指标口径：%s" % "; ".join(compact_disclosure(item) for item in disclosures[:5]))
+    lines.append("- 判断：退款率升高必须同时披露分子和分母，缺任一侧证据时只提示排查方向。")
+    return lines
+
+
+def merchant_daily_briefing_skill_lines(rows: List[Dict[str, Any]], disclosures: List[Dict[str, Any]]) -> List[str]:
+    lines = ["- 流程：按交易、退款售后、客服/赔付、商品/履约顺序汇总，只突出需要商家行动的变化。"]
+    if rows:
+        lines.append("- 今日/近期经营信号：")
+        for index, row in enumerate(rows[:8], 1):
+            lines.append("  %d. %s" % (index, compact_row_preview(row)))
+    else:
+        lines.append("- 当前没有可用于生成经营简报的结果行。")
+    if disclosures:
+        lines.append("- 使用指标：%s" % "; ".join(compact_disclosure(item) for item in disclosures[:6]))
+    lines.append("- 判断：简报只做优先级排序和行动建议，不把缺失 topic 解读为业务正常。")
     return lines
 
 

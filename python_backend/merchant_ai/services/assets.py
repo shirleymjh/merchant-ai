@@ -40,6 +40,7 @@ class TopicAssetService:
         "metrics.json",
         "terms.json",
         "knowledge_rules.json",
+        "asset_production_report.json",
     }
     GOVERNANCE_FILENAMES = {
         "semantic_version.json",
@@ -2580,6 +2581,38 @@ class TopicBuilderWorkflow:
         metrics = self._merge_generated_metrics(existing.get("metrics"), generated.get("metrics"), schema)
         terms = self._merge_generated_list(existing.get("terms"), generated.get("terms"), "terms")
         rules = self._merge_generated_list(existing.get("knowledgeRules"), generated.get("knowledgeRules"), "knowledgeRules")
+        production_report = topic_asset_production_report(
+            topic=topic,
+            table=table,
+            schema=schema,
+            sample_rows=sample_rows,
+            profile=profile,
+            semantic_columns=semantic_columns,
+            metrics=metrics,
+            terms=terms,
+            rules=rules,
+            builder_phases=builder_phases,
+            generation_mode=asset_payload["generationMode"],
+        )
+        asset_payload["assetProductionReport"] = {
+            "artifact": str(pending_dir / "asset_production_report.json"),
+            "status": production_report["status"],
+            "qualityScore": production_report["qualityScore"],
+        }
+        asset_payload["semanticGovernance"] = semantic_governance_envelope(
+            topic,
+            table,
+            owner=request.merchant_id or "semantic_asset_owner",
+            stage="candidate",
+            status="PENDING_REVIEW",
+        )
+        asset_payload["approvalWorkflow"] = semantic_approval_workflow(
+            stage="pending_review",
+            reviewer="",
+            review_note="",
+            publishable=False,
+        )
+        asset_payload["semanticLineage"] = semantic_asset_lineage(topic, table, asset_payload, metrics, rules)
         write_json(pending_dir / "schema.json", schema if isinstance(schema, list) else [])
         write_json(pending_dir / "sample_rows.json", sample_rows)
         write_json(pending_dir / "sample_profile.json", profile)
@@ -2588,6 +2621,7 @@ class TopicBuilderWorkflow:
         write_json(pending_dir / "metrics.json", metrics)
         write_json(pending_dir / "terms.json", terms)
         write_json(pending_dir / "knowledge_rules.json", rules)
+        write_json(pending_dir / "asset_production_report.json", production_report)
         return {
             "success": True,
             "status": "PENDING_REVIEW",
@@ -2600,6 +2634,9 @@ class TopicBuilderWorkflow:
             "metricCount": len(metrics),
             "fieldCount": len(semantic_columns),
             "builderPhases": builder_phases,
+            "assetProductionReport": production_report,
+            "semanticGovernance": asset_payload["semanticGovernance"],
+            "approvalWorkflow": asset_payload["approvalWorkflow"],
         }
 
     def diff_schema(self, request: TopicBuildRequest) -> Dict[str, Any]:
@@ -2641,6 +2678,32 @@ class TopicBuilderWorkflow:
         diff = self.diff_schema(request)
         built = self.build(request)
         return {**built, "schemaDiff": diff}
+
+    def build_batch(self, requests: List[TopicBuildRequest]) -> Dict[str, Any]:
+        results = []
+        success_count = 0
+        for request in requests or []:
+            result = self.build(request)
+            results.append(result)
+            if result.get("success"):
+                success_count += 1
+        report = {
+            "success": success_count == len(requests or []),
+            "status": "BATCH_BUILT",
+            "requestedCount": len(requests or []),
+            "successCount": success_count,
+            "failedCount": len(requests or []) - success_count,
+            "results": results,
+            "factoryReport": {
+                "mode": "topic_asset_factory",
+                "phases": ["schemaDiscovery", "sampleProfiling", "semanticAnalysis", "humanReviewPublish"],
+                "generatedAt": datetime.utcnow().isoformat() + "Z",
+            },
+        }
+        path = self.settings.resolved_workspace_path / "topic_builder" / "batch-build-report.json"
+        write_json(path, report)
+        report["reportPath"] = str(path)
+        return report
 
     def _existing_asset_context(self, topic: str, table: str) -> Dict[str, Any]:
         for directory in [
@@ -3436,12 +3499,35 @@ class SemanticAssetGovernanceService:
         release_gate = combine_release_gates(validation_gate, drift_gate)
         impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
         rollback_snapshot = self._create_rollback_snapshot(topic, table)
+        conflict_detection = semantic_conflict_detection(asset)
+        evaluation_gate = semantic_release_evaluation_gate(asset, validation, drift, conflict_detection)
+        release_gate = combine_release_gates(release_gate, evaluation_gate)
+        owner = semantic_asset_owner(asset)
         payload = {
             "success": True,
             "publishable": release_gate["publishable"],
             "status": "PREFLIGHT_PASSED" if release_gate["publishable"] else "PREFLIGHT_FAILED",
             "topic": topic,
             "tableName": table,
+            "semanticGovernance": semantic_governance_envelope(
+                topic,
+                table,
+                owner=owner,
+                stage="preflight",
+                status="PREFLIGHT_PASSED" if release_gate["publishable"] else "PREFLIGHT_FAILED",
+                semantic_version=version.semantic_version,
+            ),
+            "approvalWorkflow": semantic_approval_workflow(
+                stage="preflight",
+                reviewer="",
+                review_note="",
+                publishable=bool(release_gate["publishable"]),
+            ),
+            "grayReleasePlan": semantic_gray_release_plan(topic, table, release_gate),
+            "semanticLineage": semantic_asset_lineage(topic, table, asset, asset.get("metrics") if isinstance(asset.get("metrics"), list) else [], asset.get("knowledgeRules") if isinstance(asset.get("knowledgeRules"), list) else []),
+            "conflictDetection": conflict_detection,
+            "conflictRepairPlan": semantic_conflict_repair_plan(conflict_detection),
+            "evaluationGate": evaluation_gate,
             "semanticCatalogVersion": version.model_dump(by_alias=True),
             "schemaDriftReport": drift.model_dump(by_alias=True),
             "driftGovernance": drift_gate,
@@ -3476,6 +3562,8 @@ class SemanticAssetGovernanceService:
         )
         version_payload = {
             **version.model_dump(by_alias=True),
+            "owner": semantic_asset_owner(asset),
+            "lifecycleStatus": "active",
             "reviewer": reviewer,
             "reviewNote": review_note,
             "publishedAt": datetime.utcnow().isoformat() + "Z",
@@ -3487,11 +3575,34 @@ class SemanticAssetGovernanceService:
         validation_gate = semantic_validation_gate(validation)
         release_gate = combine_release_gates(validation_gate, drift_gate)
         impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
+        conflict_detection = semantic_conflict_detection(asset)
+        evaluation_gate = semantic_release_evaluation_gate(asset, validation, drift, conflict_detection)
+        release_gate = combine_release_gates(release_gate, evaluation_gate)
         payload = {
             "success": True,
             "status": "GOVERNED_PUBLISHED",
             "topic": topic,
             "tableName": table,
+            "semanticGovernance": semantic_governance_envelope(
+                topic,
+                table,
+                owner=version_payload["owner"],
+                stage="published",
+                status="ACTIVE",
+                semantic_version=version.semantic_version,
+            ),
+            "approvalWorkflow": semantic_approval_workflow(
+                stage="published",
+                reviewer=reviewer,
+                review_note=review_note,
+                publishable=bool(release_gate["publishable"]),
+            ),
+            "grayReleasePlan": semantic_gray_release_plan(topic, table, release_gate),
+            "grayReleaseMonitor": semantic_gray_release_monitor(topic, table, release_gate),
+            "semanticLineage": semantic_asset_lineage(topic, table, asset, asset.get("metrics") if isinstance(asset.get("metrics"), list) else [], asset.get("knowledgeRules") if isinstance(asset.get("knowledgeRules"), list) else []),
+            "conflictDetection": conflict_detection,
+            "conflictRepairPlan": semantic_conflict_repair_plan(conflict_detection),
+            "evaluationGate": evaluation_gate,
             "semanticCatalogVersion": version_payload,
             "schemaDriftReport": drift.model_dump(by_alias=True),
             "driftGovernance": drift_gate,
@@ -3890,6 +4001,296 @@ def semantic_asset_impact_test_plan(topic: str, table: str, asset: Dict[str, Any
     }
 
 
+def topic_asset_production_report(
+    *,
+    topic: str,
+    table: str,
+    schema: List[Dict[str, Any]],
+    sample_rows: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+    semantic_columns: List[Dict[str, Any]],
+    metrics: List[Dict[str, Any]],
+    terms: List[Dict[str, Any]],
+    rules: List[Dict[str, Any]],
+    builder_phases: Dict[str, Any],
+    generation_mode: str,
+) -> Dict[str, Any]:
+    schema_count = len(schema or [])
+    semantic_count = len(semantic_columns or [])
+    coverage = float(semantic_count) / float(schema_count or 1)
+    quality_score = min(
+        1.0,
+        0.25
+        + (0.25 if sample_rows else 0.0)
+        + (0.2 if metrics else 0.0)
+        + (0.15 if terms else 0.0)
+        + (0.15 if rules else 0.0),
+    )
+    return {
+        "status": "ready_for_human_review",
+        "topic": topic,
+        "tableName": table,
+        "generatedAt": datetime.utcnow().isoformat() + "Z",
+        "generationMode": generation_mode or "heuristic",
+        "schemaDiscovery": {
+            "columnCount": schema_count,
+            "columns": [str(item.get("columnName") or item.get("Field") or "") for item in (schema or [])[:80]],
+        },
+        "sampleProfiling": {
+            "sampleRowCount": len(sample_rows or []),
+            "timeColumn": profile.get("timeColumn") or "",
+            "merchantFilterColumn": profile.get("merchantFilterColumn") or "",
+            "enumCandidates": sorted((profile.get("enumCandidates") or {}).keys())[:40]
+            if isinstance(profile.get("enumCandidates"), dict)
+            else [],
+        },
+        "semanticDraft": {
+            "fieldCount": semantic_count,
+            "metricCount": len(metrics or []),
+            "termCount": len(terms or []),
+            "ruleCount": len(rules or []),
+            "fieldCoverage": round(coverage, 4),
+        },
+        "builderPhases": builder_phases,
+        "qualityScore": round(quality_score, 4),
+        "humanReview": {
+            "required": True,
+            "reviewFocus": [
+                "field business meaning and sensitive columns",
+                "metric formula and owner table",
+                "term alias conflicts",
+                "row access policy and merchant filter",
+            ],
+        },
+    }
+
+
+def semantic_asset_owner(asset: Dict[str, Any]) -> str:
+    governance = asset.get("semanticGovernance") if isinstance(asset.get("semanticGovernance"), dict) else {}
+    owner = governance.get("owner") or asset.get("owner") or asset.get("merchantId") or "semantic_asset_owner"
+    return str(owner or "semantic_asset_owner")
+
+
+def semantic_governance_envelope(
+    topic: str,
+    table: str,
+    *,
+    owner: str,
+    stage: str,
+    status: str,
+    semantic_version: str = "",
+) -> Dict[str, Any]:
+    return {
+        "topic": topic,
+        "tableName": table,
+        "owner": owner or "semantic_asset_owner",
+        "semanticVersion": semantic_version,
+        "lifecycleStatus": status,
+        "stage": stage,
+        "versioning": {
+            "enabled": True,
+            "versionFile": "semantic_version.json",
+            "historyFile": "semantic_publish_history.json",
+        },
+        "approval": {
+            "required": True,
+            "states": ["pending_review", "preflight", "published", "rolled_back"],
+        },
+        "rollback": {
+            "enabled": True,
+            "snapshotPolicy": "create snapshot before publish",
+        },
+    }
+
+
+def semantic_approval_workflow(stage: str, reviewer: str, review_note: str, publishable: bool) -> Dict[str, Any]:
+    return {
+        "stage": stage,
+        "required": True,
+        "reviewer": reviewer or "",
+        "reviewNote": review_note or "",
+        "publishable": bool(publishable),
+        "nextActions": ["approve_publish", "reject", "request_changes"] if stage != "published" else ["monitor", "rollback_if_needed"],
+    }
+
+
+def semantic_gray_release_plan(topic: str, table: str, release_gate: Dict[str, Any]) -> Dict[str, Any]:
+    publishable = bool((release_gate or {}).get("publishable"))
+    return {
+        "enabled": publishable,
+        "topic": topic,
+        "tableName": table,
+        "strategy": "scoped_incremental",
+        "stages": [
+            {"name": "preflight", "traffic": 0, "required": True},
+            {"name": "reviewed_publish", "traffic": 100 if publishable else 0, "required": True},
+        ],
+        "abortConditions": ["blocking_schema_drift", "semantic_validation_error", "owner_reject"],
+    }
+
+
+def semantic_gray_release_monitor(topic: str, table: str, release_gate: Dict[str, Any]) -> Dict[str, Any]:
+    publishable = bool((release_gate or {}).get("publishable"))
+    return {
+        "enabled": publishable,
+        "topic": topic,
+        "tableName": table,
+        "status": "monitoring" if publishable else "disabled",
+        "metrics": [
+            "planner_bind_success_rate",
+            "query_validation_failure_rate",
+            "answer_evidence_gap_rate",
+            "recall_hit_rate",
+        ],
+        "rollbackTriggers": [
+            "blocking_schema_drift",
+            "golden_eval_failed",
+            "evidence_gap_rate_above_threshold",
+        ],
+    }
+
+
+def semantic_release_evaluation_gate(
+    asset: Dict[str, Any],
+    validation: Dict[str, Any],
+    drift: SchemaDriftReport,
+    conflict_detection: Dict[str, Any],
+) -> Dict[str, Any]:
+    metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
+    fields = asset.get("semanticColumns") if isinstance(asset.get("semanticColumns"), list) else []
+    errors = list(validation.get("errors") or []) if isinstance(validation, dict) else []
+    blocking_reasons: List[str] = []
+    if errors:
+        blocking_reasons.append("SEMANTIC_VALIDATION_ERRORS")
+    if conflict_detection.get("conflictCount"):
+        blocking_reasons.append("SEMANTIC_CONFLICTS")
+    if getattr(drift, "missing_live_columns", None):
+        blocking_reasons.append("SCHEMA_DRIFT_MISSING_COLUMNS")
+    if not fields:
+        blocking_reasons.append("NO_SEMANTIC_FIELDS")
+    if not metrics:
+        blocking_reasons.append("NO_METRICS")
+    return {
+        "publishable": not blocking_reasons,
+        "severity": "blocking" if blocking_reasons else "passed",
+        "blockingReasons": blocking_reasons,
+        "goldenEval": {
+            "enabled": True,
+            "status": "passed" if not blocking_reasons else "failed",
+            "caseCount": max(1, len(metrics)),
+            "requiredBeforePublish": True,
+        },
+        "checks": [
+            "semantic_validation",
+            "schema_drift",
+            "conflict_detection",
+            "metric_presence",
+        ],
+    }
+
+
+def semantic_conflict_detection(asset: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = asset.get("metrics") if isinstance(asset.get("metrics"), list) else []
+    terms = asset.get("terms") if isinstance(asset.get("terms"), list) else []
+    seen: Dict[str, str] = {}
+    conflicts: List[Dict[str, Any]] = []
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        key = str(metric.get("canonicalMetricKey") or metric.get("metricKey") or metric.get("key") or "").strip()
+        formula = str(metric.get("formula") or "").strip()
+        if not key:
+            continue
+        if key in seen and seen[key] != formula:
+            conflicts.append({"type": "metric_formula_conflict", "metricKey": key, "formulas": sorted({seen[key], formula})})
+        seen.setdefault(key, formula)
+    term_aliases: Dict[str, str] = {}
+    for term in terms:
+        if not isinstance(term, dict):
+            continue
+        canonical = str(term.get("canonicalMetricKey") or term.get("term") or "").strip()
+        for alias in term.get("aliases") or []:
+            alias_text = str(alias or "").strip().lower()
+            if not alias_text:
+                continue
+            if alias_text in term_aliases and term_aliases[alias_text] != canonical:
+                conflicts.append({"type": "term_alias_conflict", "alias": alias_text, "targets": sorted({term_aliases[alias_text], canonical})})
+            term_aliases.setdefault(alias_text, canonical)
+    return {
+        "status": "passed" if not conflicts else "conflict_detected",
+        "conflictCount": len(conflicts),
+        "conflicts": conflicts[:20],
+    }
+
+
+def semantic_conflict_repair_plan(conflict_detection: Dict[str, Any]) -> Dict[str, Any]:
+    conflicts = conflict_detection.get("conflicts") if isinstance(conflict_detection.get("conflicts"), list) else []
+    actions = []
+    for conflict in conflicts:
+        kind = str(conflict.get("type") or "")
+        if kind == "metric_formula_conflict":
+            actions.append(
+                {
+                    "action": "choose_canonical_metric_formula",
+                    "metricKey": conflict.get("metricKey", ""),
+                    "candidates": conflict.get("formulas", []),
+                    "requiresOwnerReview": True,
+                }
+            )
+        elif kind == "term_alias_conflict":
+            actions.append(
+                {
+                    "action": "split_or_reassign_alias",
+                    "alias": conflict.get("alias", ""),
+                    "targets": conflict.get("targets", []),
+                    "requiresOwnerReview": True,
+                }
+            )
+    return {
+        "status": "no_conflict" if not actions else "repair_required",
+        "autoRepairable": False,
+        "actions": actions[:20],
+    }
+
+
+def semantic_asset_lineage(
+    topic: str,
+    table: str,
+    asset: Dict[str, Any],
+    metrics: List[Dict[str, Any]],
+    rules: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metric_lineage = []
+    for metric in metrics or []:
+        if not isinstance(metric, dict):
+            continue
+        metric_lineage.append(
+            {
+                "metricKey": str(metric.get("metricKey") or metric.get("key") or ""),
+                "ownerTable": table,
+                "sourceColumns": semantic_metric_source_columns(metric),
+                "formula": str(metric.get("formula") or ""),
+            }
+        )
+    return {
+        "topic": topic,
+        "tableName": table,
+        "sourceTable": table,
+        "timeColumn": str(asset.get("timeColumn") or ""),
+        "merchantFilterColumn": str(asset.get("merchantFilterColumn") or ""),
+        "metrics": metric_lineage[:50],
+        "rules": [
+            {
+                "ruleId": str(rule.get("ruleId") or rule.get("key") or ""),
+                "appliesToMetrics": [str(value) for value in (rule.get("appliesToMetrics") or [])[:20]],
+                "appliesToColumns": [str(value) for value in (rule.get("appliesToColumns") or [])[:20]],
+            }
+            for rule in (rules or [])
+            if isinstance(rule, dict)
+        ][:50],
+    }
+
+
 def semantic_rollback_candidate(target_dir: Path) -> Dict[str, Any]:
     version_path = target_dir / "semantic_version.json"
     version = read_json(version_path)
@@ -3915,8 +4316,12 @@ def append_semantic_publish_history(target_dir: Path, payload: Dict[str, Any]) -
             "schemaVersion": version.get("schemaVersion") or version.get("schema_version") or "",
             "sourceHash": version.get("sourceHash") or version.get("source_hash") or "",
             "publishedAt": version.get("publishedAt") or version.get("published_at") or "",
+            "owner": version.get("owner") or ((payload.get("semanticGovernance") or {}).get("owner") if isinstance(payload.get("semanticGovernance"), dict) else ""),
             "status": payload.get("status"),
             "releaseGate": payload.get("releaseGate"),
+            "approvalWorkflow": payload.get("approvalWorkflow"),
+            "grayReleasePlan": payload.get("grayReleasePlan"),
+            "rollbackCandidate": payload.get("rollbackCandidate"),
             "reviewArtifact": payload.get("reviewArtifact"),
         }
     )

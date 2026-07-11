@@ -840,14 +840,23 @@ class MemoryKnowledgeGovernanceService:
         suggestion["reviewedAt"] = now
         suggestion["updatedAt"] = now
         memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
+        promoted_fact = {}
+        if knowledge_suggestion_status(suggestion) == "approved":
+            promoted_fact = confirmed_fact_from_knowledge_suggestion(suggestion, merchant_id, reviewer=str(getattr(request, "reviewer", "") or ""))
+            if promoted_fact:
+                memory["facts"] = upsert_fact(memory.get("facts") or [], promoted_fact)
+                memory["coreMemoryProfile"] = build_core_memory_profile(memory)
         saved = self.memory_store.save(merchant_id, memory)
-        return {
+        result = {
             "success": True,
             "status": suggestion.get("status"),
             "merchantId": merchant_id,
             "suggestionId": suggestion_id,
             "suggestion": find_knowledge_suggestion(saved, suggestion_id),
         }
+        if promoted_fact:
+            result["promotedMemoryFact"] = promoted_fact
+        return result
 
     def publish_suggestion(
         self,
@@ -2561,11 +2570,16 @@ def memory_item_can_drive_core_profile(item: Any) -> bool:
 def compact_core_memory_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(profile, dict):
         return {"summary": "", "corePreferenceIds": [], "coreFactIds": [], "coreCorrectionIds": [], "counts": {}}
-    preference_ids = [str(item.get("id") or "") for item in profile.get("corePreferences") or [] if isinstance(item, dict) and item.get("id")]
-    fact_ids = [str(item.get("id") or "") for item in profile.get("coreFacts") or [] if isinstance(item, dict) and item.get("id")]
-    correction_ids = [str(item.get("id") or "") for item in profile.get("coreCorrections") or [] if isinstance(item, dict) and item.get("id")]
+    core_preferences = [item for item in profile.get("corePreferences") or [] if isinstance(item, dict)]
+    core_facts = [item for item in profile.get("coreFacts") or [] if isinstance(item, dict)]
+    core_corrections = [item for item in profile.get("coreCorrections") or [] if isinstance(item, dict)]
+    preference_ids = [str(item.get("id") or "") for item in core_preferences if item.get("id")]
+    fact_ids = [str(item.get("id") or "") for item in core_facts if item.get("id")]
+    correction_ids = [str(item.get("id") or "") for item in core_corrections if item.get("id")]
     return {
         "summary": str(profile.get("summary") or "")[:420],
+        "coreFacts": compact_core_constraint_payloads(core_facts, 4),
+        "coreCorrections": compact_core_constraint_payloads(core_corrections, 3),
         "corePreferenceIds": preference_ids[:6],
         "coreFactIds": fact_ids[:6],
         "coreCorrectionIds": correction_ids[:4],
@@ -2575,6 +2589,28 @@ def compact_core_memory_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
             "corrections": len(correction_ids),
         },
     }
+
+
+def compact_core_constraint_payloads(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for item in items[: max(0, int(limit or 0))]:
+        payload = {
+            "id": str(item.get("id") or ""),
+            "memoryType": str(item.get("memoryType") or ""),
+            "memoryTier": str(item.get("memoryTier") or "core"),
+            "content": str(item.get("content") or item.get("correctionText") or item.get("question") or "")[:400],
+            "correctionText": str(item.get("correctionText") or "")[:400],
+            "topics": unique_strings(item.get("topics") or [])[:8],
+            "metrics": unique_strings(item.get("metrics") or [])[:12],
+            "confidence": float(item.get("confidence") or 0.0),
+            "source": str(item.get("source") or "coreMemory"),
+            "status": memory_status(item),
+            "approvedBy": str(item.get("approvedBy") or ""),
+            "evidenceRefs": unique_strings(item.get("evidenceRefs") or [])[:8],
+        }
+        if payload["content"] or payload["metrics"] or payload["topics"]:
+            payloads.append(payload)
+    return payloads
 
 
 def core_memory_rank(item: Dict[str, Any]) -> Tuple[float, int, str]:
@@ -3779,6 +3815,49 @@ def correction_fact_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
         review_status=str(event.get("reviewStatus") or "auto"),
         write_policy=event.get("writePolicy") if isinstance(event.get("writePolicy"), dict) else {},
         evidence_refs=unique_strings(event.get("evidenceRefs") or []),
+        created_at=datetime.now().isoformat(),
+    )
+    return fact.model_dump(by_alias=True)
+
+
+def confirmed_fact_from_knowledge_suggestion(suggestion: Dict[str, Any], merchant_id: str, reviewer: str = "") -> Dict[str, Any]:
+    if not isinstance(suggestion, dict):
+        return {}
+    metric_name = str(suggestion.get("metricName") or "").strip()
+    payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+    correction_text = str(payload.get("correctionText") or "").strip()
+    question = str(payload.get("question") or "").strip()
+    topic = str(suggestion.get("topic") or "").strip()
+    content_parts = []
+    if metric_name:
+        content_parts.append("已确认商家口径/指标：%s" % metric_name)
+    if correction_text:
+        content_parts.append(correction_text)
+    elif question:
+        content_parts.append(question)
+    if not content_parts:
+        return {}
+    source_memory_id = str(suggestion.get("sourceMemoryId") or suggestion.get("suggestionId") or "")
+    fact = MemoryFact(
+        fact_id="fact_knowledge_%s" % stable_slug(str(suggestion.get("suggestionId") or source_memory_id or "|".join(content_parts))[:120]),
+        memory_type="business_fact",
+        memory_tier="core",
+        memory_class=default_memory_class("business_fact"),
+        content="；".join(unique_strings(content_parts))[:1000],
+        topics=unique_strings([topic] if topic else []),
+        metrics=unique_strings([metric_name, *[str(item) for item in suggestion.get("aliases") or [] if item]])[:12],
+        confidence=0.98,
+        source="knowledge_suggestion_review",
+        source_event_id=source_memory_id,
+        scope=memory_scope_from_terms(merchant_id, unique_strings([topic] if topic else []), unique_strings([metric_name] if metric_name else [])),
+        status="approved",
+        retention_days=default_retention_days("business_fact"),
+        visibility=default_memory_visibility("business_fact"),
+        allowed_roles=default_memory_allowed_roles("business_fact"),
+        approved_by=reviewer or str(suggestion.get("approvedBy") or suggestion.get("reviewer") or ""),
+        review_status="approved",
+        write_policy={"action": "write", "reviewStatus": "approved", "source": "knowledge_suggestion_review"},
+        evidence_refs=unique_strings(suggestion.get("sourceRefs") or []),
         created_at=datetime.now().isoformat(),
     )
     return fact.model_dump(by_alias=True)

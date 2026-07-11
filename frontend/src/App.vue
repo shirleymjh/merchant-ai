@@ -40,9 +40,11 @@
           :data-rows="message.dataRows"
           :data-sections="message.dataSections"
           :merchant-experience="message.merchantExperience"
+          :clarification="message.clarification"
           :feedback-status="message.feedbackStatus"
           @feedback="handleFeedback"
           @ask="sendSuggestion"
+          @confirm-clarification="handleClarificationConfirm"
         />
         <div v-if="loading" class="loading-card">
           <LoaderCircle :size="18" />
@@ -75,6 +77,20 @@
 
     <aside class="insight-rail">
       <DailyReportCard v-if="dailyReport" :report="dailyReport" :compact="true" @ask="sendSuggestion" />
+      <section v-if="merchantProfile" class="profile-store-card">
+        <div class="profile-store-head">
+          <span>商家画像</span>
+          <strong>{{ merchantProfile.reviewStatus || 'draft' }}</strong>
+        </div>
+        <div class="profile-store-grid">
+          <p><b>{{ merchantProfile.defaultTimeWindow || 7 }}</b><span>默认天数</span></p>
+          <p><b>{{ (merchantProfile.preferredMetrics || []).length }}</b><span>偏好指标</span></p>
+          <p><b>{{ (merchantProfile.recentRisks || []).length }}</b><span>风险记录</span></p>
+        </div>
+        <div v-if="(merchantProfile.preferredMetrics || []).length" class="profile-store-tags">
+          <span v-for="metric in merchantProfile.preferredMetrics.slice(0, 4)" :key="metric">{{ metric }}</span>
+        </div>
+      </section>
     </aside>
   </main>
 </template>
@@ -85,7 +101,7 @@ import { CircleStop, LoaderCircle, Plus, Send, Zap } from 'lucide-vue-next'
 import ChatMessage from './components/ChatMessage.vue'
 import DailyReportCard from './components/DailyReportCard.vue'
 import SuggestionList from './components/SuggestionList.vue'
-import { cancelRun, getDailyReport, getRun, getRunEvents, mockChat, mockDailyReport, sendFeedback, startAsyncRun } from './api/client'
+import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, resumeChatRun, sendFeedback, startAsyncRun } from './api/client'
 
 const input = ref('')
 const defaultRunStatusText = '正在分析问题并读取经营数据'
@@ -95,6 +111,7 @@ let newSessionTimer = null
 const chatList = ref(null)
 const inputRef = ref(null)
 const dailyReport = ref(null)
+const merchantProfile = ref(null)
 const newSessionFlash = ref(false)
 const defaultSuggestions = [
   '最近7天店铺整体经营情况怎么样？',
@@ -137,6 +154,12 @@ onMounted(async () => {
   } catch {
     dailyReport.value = mockDailyReport()
   }
+  try {
+    const profilePayload = await getMerchantProfile()
+    merchantProfile.value = profilePayload.profile || null
+  } catch {
+    merchantProfile.value = null
+  }
 })
 
 onBeforeUnmount(() => {
@@ -157,6 +180,10 @@ async function sendSuggestion(question) {
 }
 
 async function ask(message) {
+  return askWithOptions(message, {})
+}
+
+async function askWithOptions(message, options = {}) {
   const session = activeSession.value
   if (!session || isSessionRunning(session)) return
   const sessionId = session.id
@@ -178,9 +205,16 @@ async function ask(message) {
   })
   await scrollBottom()
   try {
-    const requestContext = cloneValue(session.conversationContext)
+    const requestContext = cloneValue(options.context || session.conversationContext)
     const requestHistory = buildMessageHistory(messages.value)
-    const created = await startAsyncRun(message, requestContext, { signal: controller.signal, messageHistory: requestHistory })
+    const requestOptions = {
+      signal: controller.signal,
+      messageHistory: requestHistory,
+      threadId: options.resumeThreadId || ''
+    }
+    const created = options.resumeThreadId
+      ? await resumeChatRun(message, requestContext, requestOptions)
+      : await startAsyncRun(message, requestContext, requestOptions)
     const runId = created.runId
     const threadId = created.threadId
     if (!runId || !threadId) {
@@ -216,6 +250,17 @@ async function ask(message) {
       appendAssistantToSession(sessionId, mockChat(message))
     }
   }
+}
+
+async function handleClarificationConfirm(payload) {
+  const answer = String(payload?.value || '').trim()
+  if (!answer || loading.value) return
+  const session = activeSession.value
+  const threadId = payload?.threadId || payload?.checkpoint?.threadId || payload?.checkpoint?.checkpointThreadId || session?.activeRun?.threadId || ''
+  await askWithOptions(answer, {
+    resumeThreadId: threadId,
+    context: cloneValue(session?.conversationContext)
+  })
 }
 
 function scheduleRunPoll(sessionId, token, delay = 900) {
@@ -413,6 +458,7 @@ function appendAssistantToSession(sessionId, response) {
       dataRows: section.dataRows || []
     })),
     merchantExperience: response.merchantExperience || response.merchant_experience || {},
+    clarification: response.clarification || null,
     feedbackStatus: {
       adopted: false,
       liked: false,

@@ -260,6 +260,7 @@ def default_prompt_registry() -> PromptRegistry:
                 "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、rankingObjective、requestedMeasures、scopeConstraints、filters、timeWindowDays。\n"
                 "同时必须声明 analysisIntent、requiresExplanation、requiredEvidenceIntents：简单查询/排行用 none/false/[]；需要诊断、原因解释、异常判断、风险判断、经营总结时，由你声明所需证据意图。\n"
                 "只要 analysisIntent 不是 none，requiredEvidenceIntents 必须至少 1 条；comparison/trend_check/anomaly_check/risk_ranking/overview/diagnosis 都不能返回空 evidence intents。\n"
+                "如果问题明显需要固定、可复用的商家经营 SOP，必须显式声明 skillWorkflow/reusableAnalysis/fixedAnalysisWorkflow 或 recommendedSkill；可选 Skill 仅限 gmv_drop_diagnosis、refund_rate_diagnosis、merchant_daily_briefing、bi_trend_attribution、risk_analysis、ratio_analysis、rule_compliance、new_product_risk。普通查数、排行、明细不要声明 Skill。\n"
                 "不要依赖代码关键词补规则；如果需要解释型证据，把证据需求写进 requiredEvidenceIntents，再由语义层编译和 Critic 校验。\n"
                 "metricRef 必须来自 semanticCatalog.candidateMetrics.key；ownerTable 必须使用对应 metric 的 table。\n"
                 "memoryConstraints 只能作为本轮解释偏好、历史纠错或口径争议信号；不得用 memory 改写 semanticCatalog、指标公式、表关系或字段定义。\n"

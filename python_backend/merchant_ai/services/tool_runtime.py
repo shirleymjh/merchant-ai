@@ -23,7 +23,7 @@ from merchant_ai.models import (
     ToolRuntimeMetrics,
     ToolRuntimePolicy,
 )
-from merchant_ai.services.tools import ToolRegistry, validate_tool_result_contract
+from merchant_ai.services.tools import ToolRegistry, canonical_tool_registry, validate_tool_result_contract
 
 
 def now_ms() -> int:
@@ -129,6 +129,11 @@ def tool_idempotency_key(tool_name: str, call_id: str, context: Dict[str, str]) 
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
 
 
+def tool_contract_enforced(contract: Dict[str, Any]) -> bool:
+    capability = contract.get("capability") if isinstance(contract, dict) else {}
+    return bool(contract.get("enforced") or (isinstance(capability, dict) and capability.get("failClosed")))
+
+
 def sanitize_tool_args(args: Any) -> Any:
     if not isinstance(args, dict):
         return args
@@ -155,6 +160,15 @@ def recovery_action_for(tool_name: str, error_type: str, tool_kind: str = "") ->
             retryable=False,
             fallback_tools=["structured_sql_fallback", "ask_human"],
             message="参数或 SQL 不满足工具约束，请修正参数或使用结构化兜底。",
+        )
+    if error == "TOOL_CONTRACT_VIOLATION":
+        return ToolRecoveryAction(
+            error_type=error,
+            tool_kind=kind,
+            action="repair_tool_handler_or_degrade",
+            retryable=False,
+            fallback_tools=["contract_critic", "answer_with_gap"],
+            message="工具返回结果不满足注册契约，高风险工具已 fail closed。",
         )
     if error == "MEM_ALLOC_FAILED":
         return ToolRecoveryAction(
@@ -807,7 +821,7 @@ class ToolRuntimePolicyRegistry:
                 tool_name=tool_name,
                 timeout_seconds=5,
                 max_retries=0,
-                non_retryable_errors=["INVALID_ARGUMENT", "ARTIFACT_NOT_FOUND", "SEMANTIC_REF_NOT_FOUND"],
+                non_retryable_errors=["INVALID_ARGUMENT", "ARTIFACT_NOT_FOUND", "SEMANTIC_REF_NOT_FOUND", "TOOL_CONTRACT_VIOLATION"],
                 fallback_tools=["semantic_grep", "retrieve_knowledge", "answer_with_gap"],
             )
         if tool_name in {"draft_llm_sql", "repair_sql", "emit_question_understanding", "draft_sql"}:
@@ -826,7 +840,7 @@ class ToolRuntimePolicyRegistry:
                 max_retries=0,
                 backoff_seconds=0.0,
                 retryable_errors=[],
-                non_retryable_errors=["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT", "PARSE_ERROR", "UNSAFE_SQL", "UNKNOWN_BASE_TABLE"],
+                non_retryable_errors=["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT", "PARSE_ERROR", "UNSAFE_SQL", "UNKNOWN_BASE_TABLE", "TOOL_CONTRACT_VIOLATION"],
                 fallback_tools=["use_cache", "structured_sql_fallback", "partial_answer", "answer_with_gap"],
             )
         if tool_name in {"node_agent", "node_agent_batch"}:
@@ -1072,6 +1086,7 @@ class ToolRuntimeService:
         rate_limit_store: RateLimitStore | None = None,
         load_balancer: RoundRobinLoadBalancer | None = None,
         metrics: RuntimeMetricsAggregator | None = None,
+        tool_registry: ToolRegistry | None = None,
     ):
         self.settings = settings
         self.policy_registry = policy_registry or ToolRuntimePolicyRegistry(settings)
@@ -1085,7 +1100,7 @@ class ToolRuntimeService:
         self.load_balancer = load_balancer or default_load_balancer(settings)
         self.metrics = metrics or RuntimeMetricsAggregator()
         self.alert_manager = RuntimeAlertManager(settings, self.metrics)
-        self.tool_registry = ToolRegistry()
+        self.tool_registry = tool_registry or canonical_tool_registry()
         self._events: List[Dict[str, Any]] = []
         self._events_lock = threading.RLock()
 
@@ -1293,9 +1308,11 @@ class ToolRuntimeService:
                 )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 closed_circuit = self.failure_registry.record_success(tool_name, call.args, service_name=service_name, target=selected_target.name)
+                contract = validate_tool_result_contract(tool_name, value or {}, self.tool_registry)
+                if not contract.get("valid", True) and tool_contract_enforced(contract):
+                    raise RuntimeError("TOOL_CONTRACT_VIOLATION missing=%s" % ",".join(contract.get("missingKeys") or []))
                 if cache_key and cache_policy:
                     self.cache_store.set(cache_key, value or {}, cache_policy.ttl_seconds or self.settings.semantic_cache_ttl_seconds)
-                contract = validate_tool_result_contract(tool_name, value or {}, self.tool_registry)
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
@@ -1669,7 +1686,9 @@ class ToolCallExecutor:
             try:
                 result = handler(call.args)
                 self.failure_registry.record_success(call.name, call.args)
-                contract = validate_tool_result_contract(call.name, result or {}, ToolRegistry())
+                contract = validate_tool_result_contract(call.name, result or {}, canonical_tool_registry())
+                if not contract.get("valid", True) and tool_contract_enforced(contract):
+                    raise RuntimeError("TOOL_CONTRACT_VIOLATION missing=%s" % ",".join(contract.get("missingKeys") or []))
                 return ToolCallExecutionResult(
                     id=call.id,
                     name=call.name,

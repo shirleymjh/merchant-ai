@@ -38,6 +38,7 @@ class SkillDraftService:
         self.skill_root = skill_root or (settings.resources_root / "runtime" / "agent_skills")
         self.root = settings.resolved_workspace_path / "ops" / "skill_drafts"
         self.index_path = self.root / "skill_drafts.json"
+        self.registry_path = settings.resolved_workspace_path / "ops" / "skill_market" / "skill_registry.json"
 
     def maybe_create_from_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
         if not self._eligible(state):
@@ -78,12 +79,137 @@ class SkillDraftService:
             target["status"] = "approved"
             target["callable"] = True
             target["publishedSkillName"] = skill_name
+            target["skillRegistry"] = self.register_skill(skill_name, target)
         else:
             target["status"] = "rejected"
             target["callable"] = False
         _write_json(self.root / ("%s.json" % draft_id), target)
         _write_json(self.index_path, {"items": items})
         return {"success": True, "status": target["status"], "draft": target}
+
+    def market(self) -> Dict[str, Any]:
+        registry = self._load_registry()
+        discovered = self._discover_builtin_skills()
+        items_by_name = {str(item.get("skillName") or ""): item for item in discovered if item.get("skillName")}
+        for item in registry:
+            if item.get("skillName"):
+                items_by_name[str(item.get("skillName"))] = item
+        items = sorted(items_by_name.values(), key=lambda item: (str(item.get("status") or ""), str(item.get("displayName") or item.get("skillName") or "")))
+        return {
+            "success": True,
+            "mode": "skill_market",
+            "count": len(items),
+            "items": items,
+        }
+
+    def register_skill(self, skill_name: str, draft: Dict[str, Any]) -> Dict[str, Any]:
+        registry = self._load_registry()
+        now = datetime.utcnow().isoformat() + "Z"
+        version = "skill-%s" % uuid.uuid4().hex[:10]
+        record = {
+            "skillName": skill_name,
+            "displayName": str(draft.get("title") or skill_name),
+            "version": version,
+            "status": "active",
+            "callable": True,
+            "sourceDraftId": str(draft.get("draftId") or draft.get("draft_id") or ""),
+            "merchantId": str(draft.get("merchantId") or ""),
+            "installScope": {
+                "scope": "merchant",
+                "merchantIds": [str(draft.get("merchantId") or "")] if draft.get("merchantId") else [],
+                "industryTags": [],
+            },
+            "grayRelease": {
+                "enabled": True,
+                "stage": "beta",
+                "trafficPercent": 10,
+                "abortConditions": ["skill_eval_failed", "evidence_gap_rate_above_threshold"],
+            },
+            "versions": [
+                {
+                    "version": version,
+                    "publishedAt": now,
+                    "sourceDraftId": str(draft.get("draftId") or draft.get("draft_id") or ""),
+                    "reviewer": str(draft.get("reviewer") or ""),
+                }
+            ],
+            "runtimeStats": {
+                "runCount": 0,
+                "lastRunAt": "",
+                "failureCount": 0,
+            },
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        next_registry = [item for item in registry if str(item.get("skillName") or "") != skill_name]
+        next_registry.append(record)
+        self._write_registry(next_registry)
+        return record
+
+    def install_skill(
+        self,
+        skill_name: str,
+        scope: str = "merchant",
+        merchant_ids: Optional[List[str]] = None,
+        industry_tags: Optional[List[str]] = None,
+        traffic_percent: int = 100,
+    ) -> Dict[str, Any]:
+        registry = self._load_registry()
+        target = None
+        for item in registry:
+            if str(item.get("skillName") or "") == skill_name:
+                target = item
+                break
+        if target is None:
+            target = self._builtin_market_item(skill_name)
+            registry.append(target)
+        target["installScope"] = {
+            "scope": scope or "merchant",
+            "merchantIds": [str(item) for item in (merchant_ids or []) if str(item or "").strip()],
+            "industryTags": [str(item) for item in (industry_tags or []) if str(item or "").strip()],
+        }
+        target["grayRelease"] = {
+            "enabled": True,
+            "stage": "installed",
+            "trafficPercent": max(0, min(100, int(traffic_percent or 0))),
+            "abortConditions": ["skill_eval_failed", "manual_disable"],
+        }
+        target["status"] = "active"
+        target["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+        self._write_registry(registry)
+        return {"success": True, "skill": target}
+
+    def _load_registry(self) -> List[Dict[str, Any]]:
+        payload = _read_json(self.registry_path, {"items": []})
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        return items if isinstance(items, list) else []
+
+    def _write_registry(self, items: List[Dict[str, Any]]) -> None:
+        _write_json(self.registry_path, {"items": items[-200:]})
+
+    def _discover_builtin_skills(self) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if not self.skill_root.exists():
+            return items
+        for path in sorted(self.skill_root.iterdir()):
+            if not path.is_dir() or not (path / "SKILL.md").exists():
+                continue
+            items.append(self._builtin_market_item(path.name))
+        return items
+
+    def _builtin_market_item(self, skill_name: str) -> Dict[str, Any]:
+        return {
+            "skillName": skill_name,
+            "displayName": skill_name.replace("_", " "),
+            "version": "builtin",
+            "status": "available",
+            "callable": True,
+            "sourcePath": str(self.skill_root / skill_name / "SKILL.md"),
+            "installScope": {"scope": "global_sop", "merchantIds": [], "industryTags": []},
+            "grayRelease": {"enabled": False, "stage": "available", "trafficPercent": 100, "abortConditions": []},
+            "versions": [{"version": "builtin", "publishedAt": "", "sourceDraftId": ""}],
+            "runtimeStats": {"runCount": 0, "lastRunAt": "", "failureCount": 0},
+        }
 
     def _eligible(self, state: Dict[str, Any]) -> bool:
         if not bool(state.get("evidence_graph_verified")):

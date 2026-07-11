@@ -70,6 +70,7 @@ from merchant_ai.services.context_filesystem import add_context_uri, merchant_ur
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import (
     artifact_file_tool_definitions,
+    canonical_tool_registry,
     deferred_tool_schema_loader_tool,
     question_understanding_tool,
     select_tool_schemas,
@@ -850,6 +851,7 @@ class QueryGraphPlanner:
             self.settings,
             policy_registry=self.tool_runtime_policies,
             failure_registry=self.tool_failure_registry,
+            tool_registry=canonical_tool_registry(),
         )
 
     def with_artifact_root(self, root: str) -> None:
@@ -1406,6 +1408,11 @@ class QueryGraphPlanner:
                 ],
                 "repairRule": "if repairFeedback is non-empty, fix questionUnderstanding according to it; do not repeat an invalid numerator/denominator pair",
                 "analysisRule": "analysisIntent none => requiresExplanation false and requiredEvidenceIntents []; otherwise include evidence intents",
+                "skillWorkflowRule": (
+                    "only declare skillWorkflow/reusableAnalysis/fixedAnalysisWorkflow/recommendedSkill for fixed merchant SOP analysis; "
+                    "allowed skills: gmv_drop_diagnosis, refund_rate_diagnosis, merchant_daily_briefing, bi_trend_attribution, "
+                    "risk_analysis, ratio_analysis, rule_compliance, new_product_risk"
+                ),
             },
         }
         if include_full_file_context:

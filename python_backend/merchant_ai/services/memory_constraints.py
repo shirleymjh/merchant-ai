@@ -32,6 +32,18 @@ def build_memory_constraints(memory_injection: Dict[str, Any]) -> List[Dict[str,
     if not isinstance(memory_injection, dict):
         return []
     constraints: List[Dict[str, Any]] = []
+    core_memory = memory_injection.get("coreMemory") or {}
+    if isinstance(core_memory, dict):
+        for item in core_memory.get("coreFacts") or []:
+            constraint = constraint_from_memory_payload(item, "business_fact")
+            if constraint:
+                constraint["source"] = "coreMemory"
+                constraints.append(constraint)
+        for item in core_memory.get("coreCorrections") or []:
+            constraint = constraint_from_memory_payload(item, "metric_correction")
+            if constraint:
+                constraint["source"] = "coreMemory"
+                constraints.append(constraint)
     for item in memory_injection.get("relevantCorrections") or []:
         constraint = constraint_from_memory_payload(item, "metric_correction")
         if constraint:
@@ -129,6 +141,8 @@ def memory_constraint_type(memory_type: str, fallback_type: str) -> str:
 def memory_constraint_enforcement(constraint_type: str, confidence: float, metrics: Sequence[str]) -> str:
     if constraint_type == "metric_dispute":
         return "clarify_or_disclose"
+    if constraint_type == "business_fact" and confidence >= 0.9 and metrics:
+        return "required"
     if constraint_type in REQUIRED_MEMORY_CONSTRAINT_TYPES and confidence >= 0.7 and metrics:
         return "required"
     return "advisory"

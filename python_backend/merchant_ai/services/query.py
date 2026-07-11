@@ -45,6 +45,7 @@ from merchant_ai.models import (
     ToolCallExecutionResult,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.assets import (
     default_row_access_policy,
     normalize_column_display_policy,
@@ -102,7 +103,7 @@ from merchant_ai.services.query_security import (
     table_field_semantics,
 )
 from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService, classify_timeout_type
-from merchant_ai.services.tools import artifact_file_tool_definitions, node_runtime_tool_schemas, semantic_file_tool_definitions, sql_draft_tool, sql_repair_tool
+from merchant_ai.services.tools import artifact_file_tool_definitions, canonical_tool_registry, node_runtime_tool_schemas, semantic_file_tool_definitions, sql_draft_tool, sql_repair_tool
 
 
 SQL_BUILTIN_IDENTIFIERS = {"current_date", "current_timestamp", "current_time", "curdate", "now"}
@@ -398,10 +399,12 @@ class NodeWorkerExecutor:
             settings,
             policy_registry=self.tool_runtime_policies,
             failure_registry=self.tool_failure_registry,
+            tool_registry=canonical_tool_registry(NodeAgent.TOOL_REGISTRY),
         )
         self.artifact_store = WorkspaceArtifactStore(settings)
         self.runtime_state_store = create_runtime_state_store(settings)
         self.node_plan_critic = NodePlanCritic()
+        self.access_control = AccessControlService(settings)
         self._last_sql_draft_decisions: Dict[str, SqlDraftDecision] = {}
         self._last_node_file_tool_results: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -1448,6 +1451,35 @@ class NodeWorkerExecutor:
                 "",
                 round_index,
             )
+            access_decision = self.access_control.authorize_contract(contract, bound_sql, run_id=context.sub_agent_run_id)
+            record_tool(
+                tool_traces,
+                intent,
+                "access_control",
+                "success" if access_decision.allowed else "failed",
+                intent.preferred_table,
+                access_decision.message or "ACL passed columns=%d masks=%d" % (len(access_decision.checked_columns), len(access_decision.masked_columns)),
+                access_decision.code,
+                round_index,
+            )
+            if not access_decision.allowed:
+                message = "%s：%s" % (access_decision.code or "ACCESS_DENIED", access_decision.message or "query access denied")
+                trace.append(ReActStep(round=3 + round_index * 3, reason="权限校验失败", action="access_control.failed", observation=message))
+                return AgentTaskResult(
+                    success=False,
+                    summary=message,
+                    query_bundle=QueryBundle(sql=bound_sql, tables=[intent.preferred_table] if intent.preferred_table else [], failed=True, error=message, summary=message),
+                    react_trace=trace,
+                    sql_repairs=repair_attempts,
+                    validation_results=validation_results,
+                    node_tool_traces=tool_traces,
+                    node_task_profile=node_task_profile,
+                    freshness_reports=[freshness],
+                    node_plan_contract=contract,
+                    node_plan_critique=critique,
+                    sql_draft_decision=draft_decision,
+                )
+            contract.masked_columns = dict(access_decision.masked_columns or {})
             execute_args = {
                 "taskId": intent.plan_task_id,
                 "table": intent.preferred_table,
@@ -1468,6 +1500,7 @@ class NodeWorkerExecutor:
             )
             query_duration_ms = runtime_result.duration_ms or int((time.perf_counter() - query_started) * 1000)
             if runtime_result.status != "success":
+                self.access_control.record_query_audit(access_decision, status=runtime_result.status or "failed")
                 message = runtime_result.error_message or "Doris 查询失败"
                 error_type = runtime_result.error_type or "SQL_EXECUTION_FAILED"
                 if error_type == "TIMEOUT" and "超时" not in message:
@@ -1493,6 +1526,7 @@ class NodeWorkerExecutor:
                     split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
                     split_events = list(split_result.get("runtimeEvents") or [])
                     display_rows = apply_column_masks(rows, contract)
+                    self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success_split_fallback")
                     artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                     preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
                     entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
@@ -1605,6 +1639,7 @@ class NodeWorkerExecutor:
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris", action="query_doris", observation="rows=%s" % len(rows)))
                 entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
                 display_rows = apply_column_masks(rows, contract)
+                self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success")
                 artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                 preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
                 record_tool(
@@ -1647,6 +1682,7 @@ class NodeWorkerExecutor:
                 doris_error_code = classify_doris_error(error_text)
                 policy = doris_error_policy(doris_error_code)
                 self.tool_failure_registry.record_failure("execute_sql", execute_args, doris_error_code, error_text)
+                self.access_control.record_query_audit(access_decision, status="failed_exception")
                 record_tool(tool_traces, intent, "execute_sql", "failed", trim_sql(bound_sql), error_text[:240], doris_error_code, round_index)
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris 失败", action="query_doris", observation=error_text[:240]))
                 split_result = self._split_detail_query_fallback(
@@ -1668,6 +1704,7 @@ class NodeWorkerExecutor:
                     split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
                     split_events = list(split_result.get("runtimeEvents") or [])
                     display_rows = apply_column_masks(rows, contract)
+                    self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success_split_fallback")
                     artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                     preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
                     entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)

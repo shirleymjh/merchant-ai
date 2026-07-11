@@ -408,3 +408,13 @@ def test_tool_runtime_attaches_contract_and_result_hash(tmp_path):
     assert result.status == "success"
     assert result.contract["valid"] is True
     assert result.result_hash == result.contract["resultHash"]
+
+
+def test_tool_runtime_fail_closes_high_risk_tool_contract_violation(tmp_path):
+    runtime = ToolRuntimeService(Settings(harness_workspace_path=str(tmp_path), cache_enabled=False), policy_registry=ToolRuntimePolicyRegistry(Settings()))
+
+    result = runtime.execute("execute_sql", {"sql": "select 1"}, lambda _args: {"ok": True}, call_id="call_1")
+
+    assert result.status == "failed"
+    assert result.error_type == "TOOL_CONTRACT_VIOLATION"
+    assert result.recommended_action == "repair_tool_handler_or_degrade"

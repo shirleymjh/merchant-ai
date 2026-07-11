@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     skill_worker_parallel_enabled: bool = Field(False, validation_alias="YSHOPPING_SKILL_WORKER_PARALLEL_ENABLED")
     max_concurrent_skill_workers: int = Field(2, validation_alias="YSHOPPING_MAX_CONCURRENT_SKILL_WORKERS")
     skill_worker_complex_names: str = Field(
-        "bi_trend_attribution,risk_analysis,rule_compliance,ratio_analysis,new_product_risk",
+        "bi_trend_attribution,risk_analysis,rule_compliance,ratio_analysis,new_product_risk,gmv_drop_diagnosis,refund_rate_diagnosis,merchant_daily_briefing",
         validation_alias="YSHOPPING_SKILL_WORKER_COMPLEX_NAMES",
     )
 
@@ -214,6 +214,7 @@ class Settings(BaseSettings):
     answer_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_ANSWER_FILE_TOOL_ROUNDS")
     route_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_ROUTE_LLM_MODE")
     route_force_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_ROUTE_FORCE_CLARIFICATION_ENABLED")
+    merchant_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_MERCHANT_CLARIFICATION_ENABLED")
     route_topic_min_confidence: float = Field(0.52, validation_alias="YSHOPPING_ROUTE_TOPIC_MIN_CONFIDENCE")
     route_topic_max_candidates: int = Field(4, validation_alias="YSHOPPING_ROUTE_TOPIC_MAX_CANDIDATES")
     route_mixed_rule_data_min_confidence: float = Field(0.75, validation_alias="YSHOPPING_ROUTE_MIXED_RULE_DATA_MIN_CONFIDENCE")

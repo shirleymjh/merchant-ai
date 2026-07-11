@@ -147,6 +147,10 @@ class ChatContext(APIModel):
     merchant_profile: str = ""
     context_summary: str = ""
     offloaded_files: List[str] = Field(default_factory=list)
+    clarification_resolved: bool = False
+    resolved_time_window_days: int = 0
+    metric_focus: str = ""
+    priority_goal: str = ""
     pending_clarification_stage: str = ""
     pending_clarification_type: str = ""
     pending_question: str = ""

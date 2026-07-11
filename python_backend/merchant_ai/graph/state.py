@@ -93,6 +93,7 @@ class AgentState(TypedDict, total=False):
     topic_routing_decision: TopicRoutingDecision
     route_slots: RouteSlots
     route_decision_trace: List[Dict[str, Any]]
+    clarification_resolution: Dict[str, Any]
     bounded_route_llm_trace: Dict[str, Any]
     bounded_lead_llm_trace: Dict[str, Any]
     lead_decision_context: Dict[str, Any]
@@ -181,6 +182,7 @@ class AgentState(TypedDict, total=False):
     memory_ingestion_trace: Dict[str, Any]
     memory_constraints: List[Dict[str, Any]]
     memory_constraint_trace: Dict[str, Any]
+    merchant_profile_summary: Dict[str, Any]
     open_diagnostic_scope: str
     open_diagnostic_intent: str
     open_diagnostic_goal: str
