@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+import json
 from pathlib import Path
+import sqlite3
 from typing import Any, Dict, Optional
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -127,3 +129,50 @@ def checkpoint_ref_for_run(settings: Settings, thread_id: str, run_id: str) -> D
         "storage": storage,
         "resumable": backend != "memory",
     }
+
+
+def prune_completed_sqlite_checkpoints(settings: Settings) -> int:
+    """Bound local checkpoint growth while retaining active and recent completed runs."""
+    backend = (settings.agent_checkpointer_backend or "sqlite").strip().lower()
+    path = settings.resolved_checkpointer_sqlite_path
+    if backend not in {"", "sqlite"} or not path.exists():
+        return 0
+    runs_dir = settings.resolved_workspace_path / "run_events" / "runs"
+    completed: list[tuple[str, str]] = []
+    retained_thread_ids: set[str] = set()
+    for run_path in runs_dir.glob("run_*.json"):
+        try:
+            payload = json.loads(run_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        thread_id = str(payload.get("threadId") or payload.get("thread_id") or "")
+        run_id = str(payload.get("runId") or payload.get("run_id") or "")
+        if not thread_id or not run_id:
+            continue
+        checkpoint_thread_id = "%s:%s" % (thread_id, run_id)
+        status = str(payload.get("status") or "")
+        updated_at = str(payload.get("updatedAt") or payload.get("updated_at") or "")
+        if status == "COMPLETED":
+            completed.append((updated_at, checkpoint_thread_id))
+        else:
+            retained_thread_ids.add(checkpoint_thread_id)
+    limit = max(0, int(settings.agent_completed_checkpoint_limit or 0))
+    retained_thread_ids.update(item[1] for item in sorted(completed, reverse=True)[:limit])
+    connection = sqlite3.connect(str(path), timeout=5)
+    try:
+        try:
+            rows = connection.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall()
+            removable = [str(row[0]) for row in rows if str(row[0]) not in retained_thread_ids]
+            for offset in range(0, len(removable), 200):
+                batch = removable[offset : offset + 200]
+                placeholders = ",".join("?" for _ in batch)
+                connection.execute("DELETE FROM writes WHERE thread_id IN (%s)" % placeholders, batch)
+                connection.execute("DELETE FROM checkpoints WHERE thread_id IN (%s)" % placeholders, batch)
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return len(removable)
+        except sqlite3.Error:
+            connection.rollback()
+            return 0
+    finally:
+        connection.close()

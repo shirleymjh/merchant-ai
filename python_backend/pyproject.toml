@@ -19,6 +19,11 @@ dependencies = [
   "redis>=5.0.0",
   "requests>=2.32.0",
   "sqlglot>=25.0.0",
+  "openpyxl>=3.1,<4",
+  "xlrd>=2,<3",
+  "pypdf>=5,<6",
+  "Pillow>=10,<12",
+  "rapidocr-onnxruntime>=1.4,<2",
 ]
 
 [build-system]

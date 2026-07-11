@@ -48,6 +48,8 @@ def answer_context_policy() -> str:
         "如果是趋势问题，第一段直接写“最近N天，指标从 A 变化到 B，整体上升/下降 C。”，不要写“趋势里”“点位显示”；有峰值和低点时用一句话说明。"
         "dataRows 或 dataSections 中 resultRole=summary 的行是已验证汇总结果，优先用于回答总量；resultRole=trend_context 的行只用于解释趋势。"
         "不要因为趋势只有部分日期有点位，就否定 summary 汇总；不要说“其余日期没有看到明细”。"
+        "如果用户说“结合上述明细分析”“根据上面数据给建议”或同类承接上文的问题，直接归纳原因、风险和行动建议；不要再次逐行复述明细，也不要重新输出同一批明细。"
+        "如果用户询问指标但没有显式说“给建议”，仍要基于该指标的变化、峰谷或维度差异给出简短经营判断，并给至少 2 条与本轮数据直接相关的可执行建议。"
         "如果 evidenceGaps 存在，用“说明：”简短提示，不要扩大成失败结论。"
         "最后输出“建议：”，用短横线列出最多 2 条；建议必须结合 businessContext 的商家画像、长期记忆/近期关注和本轮数据，避免泛泛说继续追问。"
     )
@@ -3597,12 +3599,25 @@ def build_response_context(
     pending_options: List[str] = None,
 ) -> ChatContext:
     primary = plan.intents[0] if plan.intents else QuestionIntent()
+    topics = plan.categories()
+    metric_keys = dedupe_strings(
+        [
+            str(intent.metric_resolution.get("metricKey") or intent.metric_name or intent.metric_column or "")
+            for intent in plan.intents
+        ]
+    )
+    dimension_keys = dedupe_strings(
+        [str(intent.group_by_column or "") for intent in plan.intents]
+    )
     return ChatContext(
         question=question,
         days=primary.days,
         category=category_display(primary.category),
         answer_mode=primary.answer_mode.value if hasattr(primary.answer_mode, "value") else str(primary.answer_mode),
         topic=joined_categories(plan),
+        topics=topics,
+        metric_keys=metric_keys,
+        dimension_keys=dimension_keys,
         data_catalog=",".join(table for section in sections for table in section.doris_tables),
         merchant_profile=merchant.profile_markdown(),
         context_summary="QueryGraph nodes=%s, sections=%s" % (len(plan.intents), len(sections)),

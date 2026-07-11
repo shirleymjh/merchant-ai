@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
+import shutil
+import time
 import uuid
 from datetime import datetime
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -23,7 +25,7 @@ from merchant_ai.models import (
     RunCreateRequest,
 )
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
-from merchant_ai.services.checkpoints import checkpoint_ref_for_run
+from merchant_ai.services.checkpoints import checkpoint_ref_for_run, prune_completed_sqlite_checkpoints
 from merchant_ai.services.runtime_state import create_runtime_state_store
 
 
@@ -48,8 +50,10 @@ def call_run_chat(
     except Exception:
         supports_history = False
     if supports_history:
-        return run_chat(message, merchant_id, context, listener, thread_id, run_id, message_history=message_history or [])
-    return run_chat(message, merchant_id, context, listener, thread_id, run_id)
+        response = run_chat(message, merchant_id, context, listener, thread_id, run_id, message_history=message_history or [])
+    else:
+        response = run_chat(message, merchant_id, context, listener, thread_id, run_id)
+    return response
 
 
 class FileRunEventStore:
@@ -61,6 +65,7 @@ class FileRunEventStore:
         self.traces_dir = self.root / "traces"
         for path in [self.threads_dir, self.runs_dir, self.events_dir, self.traces_dir]:
             path.mkdir(parents=True, exist_ok=True)
+        self.cleanup_expired(int(settings.agent_run_retention_days or 14))
 
     def save_thread(self, thread: AgentThreadRecord) -> None:
         self._write_json(self.threads_dir / ("%s.json" % thread.thread_id), thread.model_dump(by_alias=True))
@@ -124,6 +129,24 @@ class FileRunEventStore:
     def load_trace(self, run_id: str) -> Optional[Dict[str, Any]]:
         return self._read_json(self.traces_dir / ("%s.trace_replay.v2.json" % run_id))
 
+    def cleanup_expired(self, retention_days: int) -> None:
+        cutoff = time.time() - max(1, retention_days) * 86400
+        for directory in [self.runs_dir, self.events_dir, self.traces_dir]:
+            for path in directory.glob("*"):
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    continue
+        workspace_threads = self.root.parent / "threads"
+        if workspace_threads.exists():
+            for thread_dir in workspace_threads.iterdir():
+                try:
+                    if thread_dir.is_dir() and thread_dir.stat().st_mtime < cutoff:
+                        shutil.rmtree(thread_dir)
+                except OSError:
+                    continue
+
     def _write_json(self, path: Path, payload: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
@@ -147,6 +170,10 @@ class AgentRunManager:
         self.run_events: Dict[str, List[AgentRunEventRecord]] = {}
         self.runtime_state_store = create_runtime_state_store(self.settings)
         self._lock = RLock()
+        try:
+            prune_completed_sqlite_checkpoints(self.settings)
+        except (OSError, ValueError):
+            pass
 
     def create_thread(self, merchant_id: str, topic: str = "", context: Optional[ChatContext] = None) -> AgentThreadRecord:
         thread_id = "thread_" + uuid.uuid4().hex
@@ -193,7 +220,7 @@ class AgentRunManager:
         return run
 
     def append_event(self, run_id: str, thread_id: str, event_type: str, node: str = "", payload: Optional[Dict[str, Any]] = None) -> None:
-        safe_payload = payload or {}
+        safe_payload = compact_event_payload(payload or {})
         event = AgentRunEventRecord(
             event_id="event_" + uuid.uuid4().hex,
             run_id=run_id,
@@ -240,7 +267,10 @@ class AgentRunManager:
                 run.artifact_refs = artifact_refs_from_trace(replay_payload)
                 if not run.artifact_refs:
                     run.artifact_refs = [artifact_ref_from_path(str(trace_path), "trace", "persisted trace replay v2")]
-                self.store.save_run(run)
+            run.answer = ChatResponse.model_validate(public_response_payload(response))
+            self.store.save_run(run)
+            if bool(self.settings.agent_compact_success_artifacts_enabled):
+                compact_completed_thread_outputs(self.settings.resolved_workspace_path, run.thread_id)
             self.append_event(
                 run_id,
                 run.thread_id,
@@ -378,8 +408,9 @@ class AgentRunStreamService:
         q.put({"event": "run.started", "node": "RUN_STREAM", "payload": started_payload})
 
         def listener(event_type: str, node: str, payload: Dict[str, Any]) -> None:
-            self.run_manager.append_event(run.run_id, thread_id, event_type, node, payload)
-            q.put({"event": event_type, "node": node, "payload": payload})
+            safe_payload = compact_event_payload(payload)
+            self.run_manager.append_event(run.run_id, thread_id, event_type, node, safe_payload)
+            q.put({"event": event_type, "node": node, "payload": safe_payload})
 
         def worker() -> None:
             try:
@@ -410,7 +441,7 @@ class AgentRunStreamService:
                 }
                 self.run_manager.append_event(run.run_id, thread_id, "answer.completed", "ANSWER_STREAM", completed_payload)
                 q.put({"event": "answer.completed", "node": "ANSWER_STREAM", "payload": completed_payload})
-                q.put({"event": "done", "runId": run.run_id, "threadId": thread_id, "response": response.model_dump(by_alias=True)})
+                q.put({"event": "done", "runId": run.run_id, "threadId": thread_id, "response": public_response_payload(response)})
             except Exception as exc:
                 self.run_manager.fail_run(run.run_id, str(exc))
                 q.put({"event": "error", "runId": run.run_id, "threadId": thread_id, "message": str(exc)})
@@ -509,12 +540,74 @@ class AgentAsyncRunService:
                 self.run_manager.append_event(run_id, thread_id, "run.worker.finished", "ASYNC_RUN_SERVICE", {})
 
 
+def compact_completed_thread_outputs(workspace_root: Path, thread_id: str) -> None:
+    outputs = workspace_root / "threads" / thread_id / "outputs"
+    if not outputs.exists():
+        return
+    removable_directories = [outputs / "artifacts" / "context", outputs / "context_packages"]
+    for directory in removable_directories:
+        try:
+            if directory.exists():
+                shutil.rmtree(directory)
+        except OSError:
+            continue
+    removable_files = [
+        outputs / "trace_replay.json",
+        outputs / "artifacts" / "planner" / "planning_asset_pack.json",
+        outputs / "artifacts" / "planner" / "candidate_query_graphs.json",
+        outputs / "artifacts" / "recall" / "recall_bundle.json",
+    ]
+    planner_dir = outputs / "artifacts" / "planner"
+    if planner_dir.exists():
+        removable_files.extend(planner_dir.glob("planner_round_*_prompt.json"))
+    for path in removable_files:
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+        except OSError:
+            continue
+
+
 def answer_chunks(answer: str, chunk_size: int = ANSWER_DELTA_CHARS) -> List[str]:
     text = str(answer or "")
     if not text:
         return []
     size = max(1, int(chunk_size or ANSWER_DELTA_CHARS))
     return [text[index : index + size] for index in range(0, len(text), size)]
+
+
+def compact_event_payload(payload: Dict[str, Any], max_bytes: int = 65536) -> Dict[str, Any]:
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    except (TypeError, ValueError):
+        return {"summary": str(payload)[:4000], "payloadCompacted": True}
+    if len(encoded) <= max_bytes:
+        return payload
+    important_keys = {
+        "stepId",
+        "step_id",
+        "toolCallId",
+        "tool_call_id",
+        "parentId",
+        "parent_id",
+        "status",
+        "message",
+        "error",
+        "durationMs",
+        "table",
+        "taskId",
+        "intentId",
+    }
+    compacted = {key: value for key, value in payload.items() if key in important_keys}
+    compacted.update({"payloadCompacted": True, "originalBytes": len(encoded)})
+    return compacted
+
+
+def public_response_payload(response: ChatResponse) -> Dict[str, Any]:
+    payload = response.model_dump(by_alias=True)
+    payload.pop("debugTrace", None)
+    payload.pop("debug_trace", None)
+    return payload
 
 
 def run_status_value(status: Any) -> str:

@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -29,12 +29,19 @@ from merchant_ai.models import (
     WikiCompressRequest,
 )
 from merchant_ai.services.answer import DailyReportService, FeedbackService
+from merchant_ai.services.attachments import AttachmentStore
 from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicBuilderWorkflow
 from merchant_ai.services.evaluation import GoldenEvaluationService
 from merchant_ai.services.memory import MemoryManagementService
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
-from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, run_duration_ms, run_summary_payload
+from merchant_ai.services.runs import (
+    AgentAsyncRunService,
+    AgentRunManager,
+    AgentRunStreamService,
+    run_duration_ms,
+    run_summary_payload,
+)
 from merchant_ai.services.security import Permission, authorize_merchant_access, merchant_principal, ops_principal
 from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.skill_evaluation import SkillEvaluationService
@@ -55,6 +62,7 @@ golden_evaluation_service: GoldenEvaluationService
 topic_builder_workflow: TopicBuilderWorkflow
 semantic_governance: SemanticAssetGovernanceService
 recall_index_manager: RecallIndexManager
+attachment_store: AttachmentStore
 
 
 def _init_services(runtime_settings: Optional[Settings] = None) -> None:
@@ -74,6 +82,7 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     global topic_builder_workflow
     global semantic_governance
     global recall_index_manager
+    global attachment_store
 
     settings = runtime_settings or get_settings()
     workflow = create_workflow(settings)
@@ -101,17 +110,23 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
         cache_clearers=[
             workflow.asset_builder.clear_cache,
             workflow.node_worker.doris_repository.clear_cache,
+            workflow.keyword_service.reload_semantic_lexicon,
         ],
     )
+    attachment_store = AttachmentStore(settings)
 
 
 def require_ops_token(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     x_ops_token: Optional[str] = Header(default=None, alias="X-Ops-Token"),
 ) -> None:
     expected = str(settings.ops_token or "").strip()
     if not expected:
-        return
+        client_host = str(request.client.host if request.client else "")
+        if client_host in {"127.0.0.1", "::1", "localhost"}:
+            return
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="ops token is not configured")
     bearer_prefix = "Bearer "
     provided = str(x_ops_token or "").strip()
     if not provided and authorization and authorization.startswith(bearer_prefix):
@@ -161,6 +176,7 @@ def health() -> Dict[str, Any]:
 @router.post("/api/chat")
 async def chat(request: ChatRequest) -> Dict[str, Any]:
     merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.message = message_with_attachments(request.message, request.attachments, merchant_id)
     thread = run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
     run = run_manager.create_run(thread.thread_id, merchant_id, request.message)
 
@@ -187,12 +203,14 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
 @router.post("/api/chat/stream")
 def stream_chat(request: RunCreateRequest):
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     return StreamingResponse(stream_service.stream(request), media_type="text/event-stream")
 
 
 @router.post("/api/runs/async")
 def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     run = async_run_service.submit(request)
     return {
         "success": True,
@@ -212,6 +230,7 @@ def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
 @router.post("/api/chat/resume")
 def resume_chat(request: RunCreateRequest) -> Dict[str, Any]:
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     if not request.thread_id:
         raise HTTPException(status_code=400, detail="threadId is required for resume")
     run = async_run_service.submit(request)
@@ -227,6 +246,34 @@ def resume_chat(request: RunCreateRequest) -> Dict[str, Any]:
             "checkpoint": "/api/threads/%s/runs/%s/checkpoint" % (run.thread_id, run.run_id),
         },
     }
+
+
+@router.post("/api/attachments")
+async def upload_attachment(
+    request: Request,
+    name: str = Query("attachment"),
+    content_type: str = Query("application/octet-stream", alias="type"),
+    merchant_id: str = Query("", alias="merchantId"),
+) -> Dict[str, Any]:
+    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    allowed_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf", ".xls", ".xlsx", ".csv", ".txt", ".json", ".md"}
+    if Path(name).suffix.lower() not in allowed_suffixes:
+        raise HTTPException(status_code=415, detail="unsupported attachment type")
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(status_code=400, detail="empty attachment")
+    if len(payload) > int(settings.attachment_max_bytes or 20 * 1024 * 1024):
+        raise HTTPException(status_code=413, detail="attachment exceeds configured size limit")
+    try:
+        metadata = attachment_store.save(name, content_type, payload, effective_merchant_id)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="attachment parsing failed: %s" % type(exc).__name__) from exc
+    return {"success": True, **metadata}
+
+
+def message_with_attachments(message: str, attachments: List[Any], merchant_id: str = "") -> str:
+    context = attachment_store.context_for(attachments, merchant_id)
+    return str(message or "") + (("\n\n[用户附件上下文]\n" + context) if context else "")
 
 
 @router.get("/api/runs")

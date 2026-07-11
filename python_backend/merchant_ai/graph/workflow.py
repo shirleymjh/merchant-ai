@@ -15,7 +15,6 @@ from langgraph.graph import END, START, StateGraph
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.policy import V2AgentPolicy
 from merchant_ai.graph.message_history import (
-    MAX_SHORT_TERM_CONTEXT_CHARS,
     MAX_SHORT_TERM_MESSAGES,
     append_context_section,
     compact_file_tool_results_for_prompt,
@@ -39,6 +38,7 @@ from merchant_ai.models import (
     AgentRunResult,
     AnswerMode,
     ChatContext,
+    ChatDataSection,
     ChatResponse,
     ClarificationRequest,
     ContextManifest,
@@ -107,6 +107,7 @@ from merchant_ai.services.middleware import MiddlewareChain, default_harness_mid
 from merchant_ai.services.observability import append_span, artifact_ref_from_path, now_ms, performance_summary, start_step, finish_step
 from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlanner, QueryGraphValidator, semantic_workspace_manifest_from_asset_pack
 from merchant_ai.services.prompts import PromptAssembler
+from merchant_ai.services.quick_metrics import quick_metric_response
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
@@ -259,8 +260,12 @@ class MerchantQaWorkflow:
             clarification_resolution={},
             bounded_route_llm_trace={},
             bounded_lead_llm_trace={},
+            fast_gate_decision_trace={},
             main_agent_observations=[],
             fast_understanding=FastUnderstandingResult(),
+            fast_metric_attempted=False,
+            fast_metric_completed=False,
+            fast_metric_response=None,
             plan=QueryPlan(),
             recall_bundle=RecallBundle(),
             knowledge_bundle=KnowledgeBundle(),
@@ -399,6 +404,7 @@ class MerchantQaWorkflow:
         builder.add_node("policy", self.policy_node)
         builder.add_node("route_topic", self.route_topic)
         builder.add_node("fast_understand", self.fast_understand)
+        builder.add_node("try_fast_metric", self.try_fast_metric)
         builder.add_node("retrieve_knowledge", self.retrieve_knowledge)
         builder.add_node("compact_assets", self.compact_assets)
         builder.add_node("plan_query_graph", self.plan_query_graph)
@@ -423,6 +429,7 @@ class MerchantQaWorkflow:
             {
                 "route_topic": "route_topic",
                 "fast_understand": "fast_understand",
+                "try_fast_metric": "try_fast_metric",
                 "retrieve_knowledge": "retrieve_knowledge",
                 "compact_assets": "compact_assets",
                 "plan_query_graph": "plan_query_graph",
@@ -442,6 +449,7 @@ class MerchantQaWorkflow:
         for node in [
             "route_topic",
             "fast_understand",
+            "try_fast_metric",
             "retrieve_knowledge",
             "compact_assets",
             "plan_query_graph",
@@ -602,6 +610,7 @@ class MerchantQaWorkflow:
     def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
         mode = str(getattr(self.settings, "lead_action_llm_mode", "always") or "always").lower()
         allowed = [str(item) for item in decision.available_actions if item]
+        is_fast_gate = {"try_fast_metric", "retrieve_knowledge"}.issubset(set(allowed))
         observation = state.get("main_agent_observations", [{}])[-1] if state.get("main_agent_observations") else {}
         trace: Dict[str, Any] = {
             "mode": mode,
@@ -612,12 +621,14 @@ class MerchantQaWorkflow:
             "observation": observation,
         }
         state["bounded_lead_llm_trace"] = trace
+        if is_fast_gate:
+            state["fast_gate_decision_trace"] = trace
         if mode in {"off", "false", "0", "disabled"}:
             return decision
         if len(allowed) <= 1:
             trace["reason"] = "single_available_action"
             return decision
-        should_call = mode == "always" or (
+        should_call = mode == "always" or (mode == "fast_gate" and is_fast_gate) or (
             mode == "low_confidence"
             and (
                 bool(state.get("pending_knowledge_requests"))
@@ -648,7 +659,15 @@ class MerchantQaWorkflow:
             "plannerReflection": (state.get("planner_reflection") or PlannerReflectionResult()).model_dump(by_alias=True),
             "queryGraphValidation": (state.get("query_graph_validation_result") or GraphValidationResult()).model_dump(by_alias=True),
             "decisionContext": state.get("lead_decision_context", {}),
-            "instruction": "只能从 allowedActions 中选择一个 action id。不要创造新 action。返回 JSON: {selectedAction:'', reason:''}",
+            "instruction": (
+                "你是主 Agent，根据问题语义、fastUnderstanding 和 observation 自主判断下一步。"
+                "只有问题是可由已验证快速指标能力完整回答的简单查询时，才选 try_fast_metric；"
+                "直接询问 1–3 个已知指标的合计、最近N天按日趋势或变化，属于 try_fast_metric 的候选。"
+                "fastUnderstanding.needsPlanner/needsKnowledge 是通用保守提示，不是 Fast 能力判决，不应单独因为它们为 true 就拒绝 Fast。"
+                "需要占比、排名、归因、明细、非日期维度、附件上下文或指标含义不明时选 retrieve_knowledge。"
+                "只能从 allowedActions 中选择一个 action id，不要创造新 action。"
+                "返回 JSON: {selectedAction:'', reason:''}"
+            ),
         }
         try:
             if hasattr(llm, "tool_json_chat"):
@@ -682,8 +701,18 @@ class MerchantQaWorkflow:
             trace.update({"status": "ignored", "reason": "llm_selected_action_not_allowed", "payload": llm_payload or {}})
             return decision
         if selected_action == decision.selected_action:
-            trace.update({"status": "accepted", "reason": "llm_kept_deterministic_action", "payload": llm_payload or {}})
-            return decision
+            llm_reason = str((llm_payload or {}).get("reason") or "")[:300]
+            reason = "bounded Lead LLM selected %s from registry. %s" % (selected_action, llm_reason)
+            trace.update({"status": "accepted", "selectedAction": selected_action, "reason": reason, "payload": llm_payload or {}})
+            return AgentDecision(
+                selected_action=decision.selected_action,
+                selected_node=decision.selected_node,
+                available_actions=allowed,
+                reason=reason,
+                budget_exhausted=decision.budget_exhausted,
+                observation=str(observation.get("summary") or decision.observation),
+                source="lead_llm_tool",
+            )
         action = self.policy.registry.get(selected_action)
         reason = "bounded Lead LLM selected %s from registry; deterministic was %s. %s" % (
             selected_action,
@@ -1094,6 +1123,7 @@ class MerchantQaWorkflow:
             state.get("extracted_keywords", ExtractedKeywords()),
             context_topic,
             route_slots=route_slots,
+            context_topics=list(getattr(state.get("request_context"), "topics", []) or []),
         )
         decision, route_llm_trace = self.apply_bounded_route_llm_decision(state, decision, route_slots)
         state["bounded_route_llm_trace"] = route_llm_trace
@@ -1179,7 +1209,7 @@ class MerchantQaWorkflow:
             object_refs.setdefault(ref.ref_type, [])
             if ref.value not in object_refs[ref.ref_type]:
                 object_refs[ref.ref_type].append(ref.value)
-        metric_phrases = dedupe_texts(list(keywords.business_keywords or [])[:12])
+        metric_phrases = dedupe_texts(list(keywords.metric_keywords or keywords.business_keywords or [])[:12])
         clarified_metric_focus = str((state.get("clarification_resolution") or {}).get("metricFocus") or "")
         if clarified_metric_focus:
             metric_phrases = dedupe_texts([clarified_metric_focus, *metric_phrases])
@@ -1231,6 +1261,7 @@ class MerchantQaWorkflow:
             "objectRefs=%d" % sum(len(values) for values in object_refs.values()),
             "analysisSignals=%d" % len(slots.analysis_signals),
             "hasRule=%s hasData=%s" % (has_rule, has_data),
+            "analysisIntent=%s" % keywords.analysis_intent,
         ]
         if clarified_metric_focus:
             reasons.append("clarifiedMetricFocus=%s" % clarified_metric_focus)
@@ -1241,6 +1272,7 @@ class MerchantQaWorkflow:
         result = FastUnderstandingResult(
             complexity=complexity,
             intent_kind=intent_kind,
+            analysis_intent=keywords.analysis_intent,
             topics=topics,
             object_refs=object_refs,
             time_window_days=slots.time_window.days,
@@ -1293,6 +1325,64 @@ class MerchantQaWorkflow:
             output_summary="intent=%s complexity=%s" % (result.intent_kind, result.complexity),
         )
         emit(state, "node.completed", "FAST_UNDERSTAND", result.model_dump(by_alias=True))
+        return state
+
+    def try_fast_metric(self, state: AgentState) -> AgentState:
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "try_fast_metric",
+            "LeadAgent",
+            "TRY_FAST_METRIC",
+            input_summary=state.get("question", ""),
+        )
+        increment_round(state)
+        emit(state, "node.started", "TRY_FAST_METRIC", {})
+        state["fast_metric_attempted"] = True
+        merchant = state.get("merchant")
+        response = quick_metric_response(
+            state.get("question", ""),
+            getattr(merchant, "merchant_id", ""),
+            self.node_worker.doris_repository,
+            state.get("extracted_keywords"),
+        )
+        if response is None:
+            state["fast_metric_completed"] = False
+            add_step(state, "Lead Agent Fast Tool：当前问题超出 Fast 能力契约，回退语义召回和 Planner")
+            emit(state, "node.completed", "TRY_FAST_METRIC", {"supported": False, "fallback": "retrieve_knowledge"})
+            self.record_span(state, "tool", "try_fast_metric", started, status="gap", error_code="FAST_UNSUPPORTED")
+            self.finish_run_step(state, step, "gap", output_summary="unsupported -> Planner", error_code="FAST_UNSUPPORTED")
+            return state
+        response.id = state["qa_id"]
+        state["fast_metric_completed"] = True
+        state["fast_metric_response"] = response
+        state["answer"] = response.answer
+        state["suggestions"] = list(response.suggestions or [])
+        state["thinking_steps"] = list(response.thinking_steps or [])
+        state["merchant_experience"] = dict(response.merchant_experience or {})
+        state["query_bundle"] = QueryBundle(
+            tables=list(response.doris_tables or []),
+            rows=list(response.data_rows or []),
+            summary="verified fast metric result",
+            cache_hit=bool((response.debug_trace or {}).get("quickMetricCacheHit")),
+        )
+        state["should_persist"] = True
+        state["chat_bi_completed"] = True
+        add_step(state, "Lead Agent Fast Tool：能力契约完整覆盖本轮问题，采用已校验快速结果")
+        emit(
+            state,
+            "node.completed",
+            "TRY_FAST_METRIC",
+            {"supported": True, "metrics": (response.debug_trace or {}).get("metrics") or [(response.debug_trace or {}).get("metric")]},
+        )
+        self.record_span(
+            state,
+            "tool",
+            "try_fast_metric",
+            started,
+            metadata={"supported": True, "tables": response.doris_tables},
+        )
+        self.finish_run_step(state, step, "success", output_summary="fast metric accepted")
         return state
 
     def merchant_clarification_need(self, state: AgentState, fast: FastUnderstandingResult) -> Dict[str, Any]:
@@ -3063,15 +3153,24 @@ class MerchantQaWorkflow:
         emit(state, "node.started", "CACHE_ANSWER", {})
         if not state.get("answer"):
             state["answer"] = "当前没有足够证据生成回答，请补充更明确的业务范围或稍后重试。"
-        sections = self.answer_service.build_sections(state["plan"], state["agent_run_result"])
+        fast_response = state.get("fast_metric_response")
+        sections = (
+            list(getattr(fast_response, "data_sections", []) or [])
+            if fast_response is not None
+            else self.answer_service.build_sections(state["plan"], state["agent_run_result"])
+        )
         pending = PendingAnswer(
             id=state["qa_id"],
             question=state["question"],
             answer=state["answer"],
             merchant_id=state["merchant"].merchant_id,
             merchant_name=state["merchant"].merchant_name,
-            category_name=joined_categories(state["plan"]),
-            doris_tables=",".join(state["query_bundle"].tables),
+            category_name=(getattr(fast_response, "category_name", "") if fast_response is not None else joined_categories(state["plan"])),
+            doris_tables=",".join(
+                list(getattr(fast_response, "doris_tables", []) or [])
+                if fast_response is not None
+                else state["query_bundle"].tables
+            ),
             suggested_questions=json.dumps(state.get("suggestions", []), ensure_ascii=False),
             create_time=datetime.now(),
         )
@@ -3166,6 +3265,19 @@ class MerchantQaWorkflow:
             state.get("human_clarification_type", ""),
             state.get("human_clarification_options", []),
         )
+        if fast_response is not None:
+            state["response_context"].category = str(getattr(fast_response, "category_name", "") or "电商交易")
+            state["response_context"].topic = state["response_context"].category
+            state["response_context"].topics = list(
+                (state.get("topic_routing_decision") or TopicRoutingDecision()).recall_topics()
+            )
+            state["response_context"].metric_keys = [
+                str(item.get("metricKey") or "")
+                for item in (getattr(fast_response, "merchant_experience", {}) or {}).get("metricDisclosures", [])
+                if item.get("metricKey")
+            ]
+            state["response_context"].dimension_keys = ["pt"]
+            state["response_context"].data_catalog = ",".join(getattr(fast_response, "doris_tables", []) or [])
         emit(state, "node.completed", "CACHE_ANSWER", {"persisted": state["persisted"]})
         self.refresh_context_snapshot(state, "cache_answer")
         self.record_span(state, "action", "cache_answer", started, metadata={"persisted": state.get("persisted")})
@@ -3275,6 +3387,31 @@ class MerchantQaWorkflow:
             return
 
     def to_response(self, state: AgentState) -> ChatResponse:
+        fast_response = state.get("fast_metric_response")
+        if fast_response is not None:
+            response = ChatResponse.model_validate(
+                fast_response.model_dump(by_alias=True) if hasattr(fast_response, "model_dump") else fast_response
+            )
+            response.id = state["qa_id"]
+            response.answer = state.get("answer", response.answer)
+            response.persisted = bool(state.get("persisted"))
+            response.context = state.get("response_context")
+            response.suggestions = list(state.get("suggestions") or response.suggestions)
+            response.thinking_steps = list(state.get("thinking_steps") or response.thinking_steps)
+            response.merchant_experience = {
+                **dict(response.merchant_experience or {}),
+                **dict(state.get("merchant_experience") or {}),
+            }
+            response.debug_trace = {
+                **dict(response.debug_trace or {}),
+                "leadAgentFastDecision": True,
+                "boundedLeadLlmTrace": state.get("fast_gate_decision_trace", {}),
+                "actionHistory": [
+                    item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                    for item in state.get("action_history", [])
+                ],
+            }
+            return response
         sections = self.answer_service.build_sections(state["plan"], state["agent_run_result"])
         if state.get("response_context") is None:
             state["response_context"] = build_response_context(
@@ -3407,6 +3544,7 @@ class MerchantQaWorkflow:
                     "boundedRouteLlmTrace": state.get("bounded_route_llm_trace", {}),
                     "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
                     "boundedLeadLlmTrace": state.get("bounded_lead_llm_trace", {}),
+                    "fastGateDecisionTrace": state.get("fast_gate_decision_trace", {}),
                     "intentSignals": state.get("intent_signals", IntentSignals()).model_dump(by_alias=True),
                     "knowledgeRetrieval": {
                         "backend": (state.get("knowledge_bundle") or KnowledgeBundle()).backend,
@@ -5032,7 +5170,7 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
         merchant_service=MerchantService(settings, doris_repository),
         answer_repository=answer_repository,
         pending_store=pending_store,
-        keyword_service=KeywordExtractService(),
+        keyword_service=KeywordExtractService(topic_assets),
         routing_service=QuestionRoutingService(),
         topic_router=TopicRouterService(),
         wiki_memory=wiki_memory,

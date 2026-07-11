@@ -4,7 +4,6 @@ import json
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
@@ -68,27 +67,16 @@ from merchant_ai.services.query_contracts import (
 from merchant_ai.services.repositories import DorisRepository
 from merchant_ai.services.runtime_state import NodeTaskState, create_runtime_state_store, node_task_idempotency_key
 from merchant_ai.services.query_sql_binding import (
-    add_bind_values,
-    add_sql_where_condition,
     append_note,
     bind_node_sql_parameters,
-    bind_node_sql_parameters_ast,
-    bindable_predicate_pattern,
     blank_entity_value,
     has_merchant_filter_predicate,
     is_dependent_context_column,
-    node_bind_values_by_column,
-    normalize_identifier,
     parse_partition_date,
-    parse_sql_for_binding,
-    parse_sql_literal,
-    parse_sql_literal_values,
     partition_is_stale_for_near_realtime,
     quote_identifier,
     realtime_fallback_for_table,
-    replace_sql_limit,
     split_detail_sql_by_pt_windows,
-    split_filter_values,
     sql_has_bound_merchant_filter,
     sql_literal,
 )
@@ -97,7 +85,6 @@ from merchant_ai.services.query_security import (
     apply_column_masks,
     configured_contract_detail_columns,
     configured_default_detail_columns,
-    contract_masked_columns_map,
     role_allowed_for_column,
     table_asset_metadata,
     table_field_semantics,

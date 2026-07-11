@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from merchant_ai.config import Settings
 from merchant_ai.graph.state import AgentState
 from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute
-from merchant_ai.services.answer import analysis_summary_required, answer_skill_required
+from merchant_ai.services.answer import answer_skill_required
 
 
 MAX_MAIN_AGENT_ACTIONS = 16
@@ -34,6 +34,15 @@ class AgentActionRegistry:
                 required_state_flags=["topic_routed"],
                 expected_state_flags=["fast_understood"],
                 fallback_action="route_topic",
+            ),
+            AgentAction(
+                id="try_fast_metric",
+                node="try_fast_metric",
+                agent="LeadAgent",
+                description="ask the verified fast-metric capability to answer; unsupported requests fall back to Planner",
+                required_state_flags=["fast_understood"],
+                expected_state_flags=["fast_metric_attempted"],
+                fallback_action="retrieve_knowledge",
             ),
             AgentAction(
                 id="retrieve_knowledge",
@@ -236,6 +245,10 @@ class V2AgentPolicy:
             fast = state.get("fast_understanding")
             if fast and getattr(fast, "intent_kind", "") == "rule_only":
                 return ["retrieve_knowledge", "answer_rule"], "fast understanding classified rule-only; retrieve rule knowledge first", False
+            if state.get("fast_metric_completed"):
+                return ["cache_answer"], "Lead Agent accepted verified fast-metric result", False
+            if not state.get("fast_metric_attempted"):
+                return ["try_fast_metric", "retrieve_knowledge"], "Lead Agent may try the fast-metric capability or continue to semantic planning", False
             return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge has not been retrieved"), False
         if self.has_rule_recall_ready(state):
             return ["answer_rule"], "platform rule knowledge is ready; answer without BI QueryGraph", False

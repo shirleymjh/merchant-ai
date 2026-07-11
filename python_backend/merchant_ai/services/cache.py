@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pickle
 import time
 from collections import OrderedDict
 from copy import deepcopy
@@ -127,7 +126,7 @@ class RedisTTLCache:
                 self.misses += 1
                 return None
             self.hits += 1
-            return deepcopy(pickle.loads(raw))
+            return deepcopy(json_cache_loads(raw))
         except Exception as exc:
             self.last_error = str(exc)[:200]
             self.available = False
@@ -140,7 +139,7 @@ class RedisTTLCache:
             self._fallback.set(key, value)
             return
         try:
-            self._client.setex(self._key(key), self.ttl_seconds, pickle.dumps(deepcopy(value)))
+            self._client.setex(self._key(key), self.ttl_seconds, json_cache_dumps(deepcopy(value)))
             self.sets += 1
         except Exception as exc:
             self.last_error = str(exc)[:200]
@@ -215,3 +214,24 @@ def build_ttl_cache(name: str, settings: Any, ttl_seconds: int) -> Any:
 def _safe_namespace(namespace: str) -> str:
     text = str(namespace or "merchant_ai").strip()
     return "".join(ch if ch.isalnum() or ch in {"_", "-", ":"} else "_" for ch in text) or "merchant_ai"
+
+
+def json_cache_dumps(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, default=json_cache_default, separators=(",", ":")).encode("utf-8")
+
+
+def json_cache_loads(value: Any) -> Any:
+    raw = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+    return json.loads(raw)
+
+
+def json_cache_default(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "value"):
+        return value.value
+    if isinstance(value, set):
+        return sorted(value, key=str)
+    raise TypeError("unsupported cache value: %s" % type(value).__name__)

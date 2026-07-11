@@ -25,7 +25,6 @@ from merchant_ai.models import (
     QueryPlan,
     RecallBundle,
     TaskRole,
-    ToolCallRequest,
     ToolCachePolicy,
 )
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
@@ -965,7 +964,14 @@ class QueryGraphPlanner:
         return self.understanding_extractor.failure_fallback_plan(question, asset_pack, trace_reason)
 
     def _semantic_fast_path(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
-        return compile_semantic_topn_metric_fast_graph(question, asset_pack)
+        topn_plan = compile_semantic_topn_metric_fast_graph(question, asset_pack)
+        if topn_plan.intents:
+            return topn_plan
+        trend_plan = compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
+        if trend_plan.intents:
+            trend_plan.agent_trace.append("planner.semantic_fast_path=multi_metric_trend")
+            return trend_plan
+        return QueryPlan(agent_trace=["planner.semantic_fast_path=no_safe_graph"])
 
     def _entity_detail_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         return compile_entity_detail_graph_from_question_entity(question, asset_pack)
@@ -6506,10 +6512,13 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
 
 def semantic_fast_path_can_bypass_configured_llm(question: str, plan: QueryPlan) -> bool:
     text = normalize_text(question)
-    if not any(term in text for term in ["高风险新品", "风险新品"]):
+    if any(term in text for term in ["相关", "关系", "影响", "归因", "原因"]):
         return False
     tables = {intent.preferred_table for intent in plan.intents}
-    return "dwm_goods_detail_df" in tables
+    if any(term in text for term in ["高风险新品", "风险新品"]):
+        return "dwm_goods_detail_df" in tables
+    multi_metric_fast = any("semantic_fast_path=multi_metric_trend" in str(item) for item in plan.agent_trace)
+    return bool(multi_metric_fast and len(tables) == 1 and 1 < len(plan.intents) <= 3 and not plan.dependencies)
 
 
 def attach_missing_semantic_knowledge_refs(
@@ -6733,7 +6742,7 @@ def compile_semantic_multi_metric_trend_fallback_graph(question: str, asset_pack
 
 def semantic_trend_fallback_safe(question: str) -> bool:
     text = normalize_text(question)
-    return any(term in text for term in ["走势", "趋势", "波动", "变化", "是否正常", "异常", "同步上升"])
+    return any(term in text for term in ["走势", "趋势", "波动", "变化", "是否正常", "异常", "同步上升", "一起看", "对比"])
 
 
 def metric_is_unrequested_derived(metric: Any, question: str) -> bool:

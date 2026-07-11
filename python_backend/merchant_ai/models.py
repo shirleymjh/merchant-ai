@@ -142,6 +142,9 @@ class ChatContext(APIModel):
     category: str = ""
     answer_mode: str = ""
     topic: str = ""
+    topics: List[QuestionCategory] = Field(default_factory=list)
+    metric_keys: List[str] = Field(default_factory=list)
+    dimension_keys: List[str] = Field(default_factory=list)
     data_catalog: str = ""
     user_preference: str = ""
     merchant_profile: str = ""
@@ -184,11 +187,19 @@ class ClarificationRequest(APIModel):
     pending_question: str = ""
 
 
+class AttachmentReference(APIModel):
+    id: str = ""
+    name: str = ""
+    type: str = ""
+    size: int = 0
+
+
 class ChatRequest(APIModel):
     message: str
     merchant_id: str = ""
     context: Optional[ChatContext] = None
     message_history: List[ConversationMessage] = Field(default_factory=list)
+    attachments: List[AttachmentReference] = Field(default_factory=list)
 
 
 class RunCreateRequest(APIModel):
@@ -197,6 +208,7 @@ class RunCreateRequest(APIModel):
     thread_id: str = ""
     context: Optional[ChatContext] = None
     message_history: List[ConversationMessage] = Field(default_factory=list)
+    attachments: List[AttachmentReference] = Field(default_factory=list)
 
 
 class FeedbackRequest(APIModel):
@@ -384,20 +396,47 @@ class MerchantRecentFocus(APIModel):
         return not (self.top_categories or self.top_metrics or self.common_time_ranges or self.focus_pattern)
 
 
+class KeywordMention(APIModel):
+    phrase: str = ""
+    canonical_key: str = ""
+    display_name: str = ""
+    kind: str = ""
+    topic: QuestionCategory = QuestionCategory.UNKNOWN
+    score: float = 0.0
+    source: str = ""
+
+
 class ExtractedKeywords(APIModel):
+    normalized_question: str = ""
     keywords: List[str] = Field(default_factory=list)
     business_keywords: List[str] = Field(default_factory=list)
+    topic_keywords: List[str] = Field(default_factory=list)
+    metric_keywords: List[str] = Field(default_factory=list)
+    dimension_keywords: List[str] = Field(default_factory=list)
     time_keywords: List[str] = Field(default_factory=list)
     action_keywords: List[str] = Field(default_factory=list)
+    ranking_keywords: List[str] = Field(default_factory=list)
+    mentions: List[KeywordMention] = Field(default_factory=list)
+    topic_scores: Dict[str, float] = Field(default_factory=dict)
+    analysis_intent: str = "lookup"
+    confidence: float = 0.0
+    unresolved_phrases: List[str] = Field(default_factory=list)
+    excluded_topics: List[QuestionCategory] = Field(default_factory=list)
+    excluded_metric_keywords: List[str] = Field(default_factory=list)
+    ambiguous_metric_keywords: List[str] = Field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (self.keywords or self.business_keywords or self.time_keywords or self.action_keywords)
+        return not (self.keywords or self.business_keywords or self.time_keywords or self.action_keywords or self.mentions)
 
     def summary(self) -> str:
-        return "业务词=%s，时间词=%s，动作词=%s" % (
-            self.business_keywords[:8],
+        return "Topic词=%s，指标词=%s，维度词=%s，时间词=%s，动作词=%s，意图=%s，置信度=%.2f" % (
+            self.topic_keywords[:8],
+            self.metric_keywords[:8],
+            self.dimension_keywords[:6],
             self.time_keywords[:6],
             self.action_keywords[:6],
+            self.analysis_intent,
+            self.confidence,
         )
 
 
@@ -442,7 +481,7 @@ class RouteTimeWindow(APIModel):
 
 class RouteTopicCandidate(APIModel):
     topic: QuestionCategory = QuestionCategory.UNKNOWN
-    score: int = 0
+    score: float = 0.0
     evidence: List[str] = Field(default_factory=list)
 
 
@@ -495,6 +534,7 @@ class IntentSignals(APIModel):
 class FastUnderstandingResult(APIModel):
     complexity: str = "unknown"
     intent_kind: str = "unknown"
+    analysis_intent: str = "lookup"
     topics: List[QuestionCategory] = Field(default_factory=list)
     object_refs: Dict[str, List[str]] = Field(default_factory=dict)
     time_window_days: int = 0

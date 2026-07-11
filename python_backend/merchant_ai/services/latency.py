@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from merchant_ai.models import AnswerMode, FastUnderstandingResult, QueryPlan
 
@@ -12,7 +12,11 @@ class LatencyOptimizer:
     FAST_ANSWER_MODES = {AnswerMode.METRIC, AnswerMode.GROUP_AGG, AnswerMode.TOPN, AnswerMode.DETAIL}
 
     def initial_policy(self, fast: FastUnderstandingResult) -> Dict[str, Any]:
-        simple = fast.complexity == "simple" and fast.intent_kind in self.FAST_INTENTS
+        simple = (
+            fast.intent_kind == "metric_query" and fast.complexity in {"simple", "medium"}
+        ) or (
+            fast.intent_kind == "detail_lookup" and fast.complexity == "simple"
+        )
         return {
             "mode": "fast_path" if simple else "standard_path",
             "eligible": bool(simple),
@@ -31,17 +35,19 @@ class LatencyOptimizer:
             for intent in (plan.intents or [])
             if intent.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT, AnswerMode.INVALID}
         ]
+        tables = {intent.preferred_table for intent in executable if intent.preferred_table}
         simple_graph = (
-            0 < len(executable) <= 1
+            0 < len(executable) <= 3
             and not plan.dependencies
             and not plan.knowledge_requests
+            and len(tables) <= 1
             and all(intent.answer_mode in self.FAST_ANSWER_MODES for intent in executable)
         )
         next_policy = dict(policy)
         next_policy["simpleGraph"] = bool(simple_graph)
         if simple_graph:
             next_policy["mode"] = "fast_path_verified_graph"
-            next_policy["reason"] = "single-node QueryGraph with no dependencies can use fast verified path"
+            next_policy["reason"] = "small same-table QueryGraph with no dependencies can use fast verified path"
         else:
             next_policy["eligible"] = False
             next_policy["mode"] = "standard_path"

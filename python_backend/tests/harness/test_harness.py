@@ -189,6 +189,7 @@ from merchant_ai.services.planning import (
     ultra_compact_understanding_catalog,
 )
 from merchant_ai.services.prompts import PromptAssembler
+from merchant_ai.services.quick_metrics import quick_metric_response
 from merchant_ai.services.query import (
     NodeWorkerExecutor,
     SqlValidationService,
@@ -1097,8 +1098,9 @@ def test_lead_policy_has_no_standalone_load_skills_action():
         "plan": QueryPlan(),
     }
     decision = policy.decide(state)
-    assert decision.selected_action == "retrieve_knowledge"
-    assert decision.selected_node == "retrieve_knowledge"
+    assert decision.selected_action == "try_fast_metric"
+    assert decision.selected_node == "try_fast_metric"
+    assert decision.available_actions == ["try_fast_metric", "retrieve_knowledge"]
 
 
 def test_lead_policy_inserts_fast_understand_after_route_before_retrieval():
@@ -1180,8 +1182,51 @@ def test_emit_adds_standard_event_envelope_without_hiding_payload():
 
 def test_lead_agent_defaults_to_bounded_llm_orchestrated_sixteen_round_loop():
     assert Settings.model_fields["agent_main_rounds"].default == 16
-    assert Settings.model_fields["lead_action_llm_mode"].default == "off"
+    assert Settings.model_fields["lead_action_llm_mode"].default == "fast_gate"
     assert V2AgentPolicy().max_main_actions == 16
+
+
+def test_default_lead_llm_only_judges_fast_gate():
+    class FastGateLeadActionLlm:
+        configured = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def tool_json_chat(self, _system_prompt, user_prompt, _tool_schema, fallback=None, timeout_seconds=None):
+            self.calls += 1
+            payload = json.loads(user_prompt)
+            assert payload["fastUnderstanding"]["analysisIntent"] == "ratio"
+            return {"actionId": "retrieve_knowledge", "reason": "ratio needs Planner"}
+
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "fast_gate"}))
+    lead_llm = FastGateLeadActionLlm()
+    workflow.planner.llm = lead_llm
+    state = workflow._initial_state("最近7天退款金额占GMV比例", "100", ChatContext(), None, "", "")
+    state["fast_understanding"] = FastUnderstandingResult(analysis_intent="ratio")
+    state["main_agent_observations"] = [{"summary": "ratio request"}]
+    fast_decision = AgentDecision(
+        selected_action="try_fast_metric",
+        selected_node="try_fast_metric",
+        available_actions=["try_fast_metric", "retrieve_knowledge"],
+        reason="fast gate",
+    )
+
+    selected = workflow.apply_bounded_lead_llm_decision(state, fast_decision)
+
+    assert selected.selected_action == "retrieve_knowledge"
+    assert selected.source == "lead_llm_tool"
+    assert lead_llm.calls == 1
+
+    later_decision = AgentDecision(
+        selected_action="retrieve_knowledge",
+        selected_node="retrieve_knowledge",
+        available_actions=["retrieve_knowledge", "compact_assets"],
+        reason="continue workflow",
+    )
+    unchanged = workflow.apply_bounded_lead_llm_decision(state, later_decision)
+    assert unchanged.selected_action == "retrieve_knowledge"
+    assert lead_llm.calls == 1
 
 
 def test_bounded_lead_llm_cannot_select_action_outside_registry_candidates():
@@ -2314,6 +2359,143 @@ def test_first_step_topic_router_covers_trade_refund_goods_for_top_spu_refund_qu
     assert "不表示 anchor" in topic.reason
 
 
+def test_keyword_extractor_structures_metrics_dimensions_ranking_and_weighted_topics():
+    settings = get_settings()
+    service = KeywordExtractService(TopicAssetService(settings))
+
+    keywords = service.extract("最近7天退款金额最高的5个商品，同时看订单量")
+
+    assert keywords.metric_keywords == ["退款金额", "订单量"]
+    assert keywords.dimension_keywords == ["商品"]
+    assert keywords.ranking_keywords == ["最高"]
+    assert keywords.analysis_intent == "ranking"
+    assert keywords.confidence >= 0.8
+    assert keywords.topic_scores[QuestionCategory.REFUND.value] > 0
+    assert keywords.topic_scores[QuestionCategory.TRADE.value] > 0
+    assert keywords.topic_scores[QuestionCategory.GOODS.value] > 0
+    mention_keys = {(item.kind, item.canonical_key) for item in keywords.mentions}
+    assert ("metric", "pay_amt") in mention_keys
+    assert ("metric", "order_detail_cnt") in mention_keys
+    assert ("dimension", "spu_id") in mention_keys
+
+
+def test_keyword_extractor_uses_longest_metric_match_and_keeps_domain_nouns_out_of_metrics():
+    service = KeywordExtractService(TopicAssetService(get_settings()))
+
+    amount = service.extract("最近7天退款金额趋势")
+    detail = service.extract("查询这个子订单的退款情况")
+    unrelated = service.extract("证券行情怎么样")
+
+    assert amount.metric_keywords == ["退款金额"]
+    assert "退款" not in amount.metric_keywords
+    assert detail.metric_keywords == []
+    assert QuestionCategory.REFUND.value in detail.topic_scores
+    assert QuestionCategory.COUPON.value not in unrelated.topic_scores
+
+
+def test_keyword_extractor_marks_context_references_and_stays_fast():
+    service = KeywordExtractService(TopicAssetService(get_settings()))
+    started = time.perf_counter()
+
+    keywords = service.extract("结合上述明细分析原因并给建议")
+    elapsed_ms = (time.perf_counter() - started) * 1000
+
+    assert keywords.analysis_intent == "attribution"
+    assert "上述" in keywords.unresolved_phrases
+    assert keywords.confidence < 0.5
+    assert elapsed_ms < 30
+
+
+def test_structured_keywords_prevent_dimension_ranking_question_from_using_quick_metric_path():
+    service = KeywordExtractService(TopicAssetService(get_settings()))
+    question = "最近7天退款金额最高的5个商品，同时看订单量"
+    keywords = service.extract(question)
+
+    class UnexpectedRepository:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("dimension/ranking question must be handled by Planner")
+
+    assert quick_metric_response(question, "100", UnexpectedRepository(), keywords) is None
+
+
+def test_ratio_and_partial_metric_coverage_fall_back_to_planner():
+    service = KeywordExtractService(TopicAssetService(get_settings()))
+
+    class UnexpectedRepository:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("unsupported fast request must fall back before querying")
+
+    ratio = "最近7天退款金额占GMV比例"
+    coupon = "最近7天优惠券活动投入和支付订单数"
+
+    ratio_keywords = service.extract(ratio)
+    coupon_keywords = service.extract(coupon)
+    assert ratio_keywords.analysis_intent == "ratio"
+    assert quick_metric_response(ratio, "100", UnexpectedRepository(), ratio_keywords) is None
+    assert quick_metric_response(coupon, "100", UnexpectedRepository(), coupon_keywords) is None
+
+
+def test_negation_ambiguity_and_false_substring_topic_are_structured():
+    service = KeywordExtractService(TopicAssetService(get_settings()))
+
+    unrelated = service.extract("证券行情怎么样")
+    negated = service.extract("最近7天订单量，不看退款")
+    ambiguous = service.extract("最近7天支付金额趋势")
+    ambiguous_slots = RouteSlotExtractor().extract("最近7天支付金额趋势", ambiguous)
+
+    assert QuestionCategory.COUPON.value not in unrelated.topic_scores
+    assert QuestionCategory.REFUND in negated.excluded_topics
+    assert QuestionCategory.REFUND.value not in negated.topic_scores
+    assert ambiguous.ambiguous_metric_keywords == ["支付金额"]
+    assert ambiguous.confidence < 0.8
+    assert "AMBIGUOUS_METRIC" in ambiguous_slots.route_warnings
+
+
+def test_topic_router_inherits_multiple_context_topics_without_joining_them():
+    topics = [QuestionCategory.TRADE, QuestionCategory.REFUND]
+    decision = TopicRouterService().route(
+        "那最近30天呢",
+        KeywordExtractService().extract("那最近30天呢"),
+        context_topics=topics,
+    )
+
+    assert decision.candidate_topics == topics
+    assert decision.primary_topic == QuestionCategory.UNKNOWN
+
+
+def test_fast_metric_is_a_main_agent_action_and_preserves_response_sections(monkeypatch):
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    state = workflow._initial_state("最近7天GMV趋势", "100", ChatContext(), None, "fast_thread", "fast_run")
+    state = workflow.runtime_bootstrap(state)
+    state = workflow.route_topic(state)
+    state = workflow.fast_understand(state)
+
+    monkeypatch.setattr(
+        workflow.node_worker.doris_repository,
+        "query",
+        lambda *_args, **_kwargs: [
+            {"pt": "2026-07-10", "value": 100.0},
+            {"pt": "2026-07-11", "value": 120.0},
+        ],
+    )
+    decision = workflow.policy.decide(state)
+    assert decision.selected_action == "try_fast_metric"
+
+    state = workflow.policy_node(state)
+    assert state["action_history"][-1].action == "try_fast_metric"
+    state = workflow.try_fast_metric(state)
+    assert state["fast_metric_completed"]
+    assert state["fast_metric_response"].data_sections
+
+    state = workflow.cache_answer(state)
+    response = workflow.to_response(state)
+    assert response.id == state["qa_id"]
+    assert response.data_sections
+    assert response.context.metric_keys == ["order_gmv_amt_1d"]
+    assert response.context.dimension_keys == ["pt"]
+    assert response.debug_trace["leadAgentFastDecision"] is True
+
+
 def test_multi_topic_route_does_not_assign_fixed_order_primary_topic():
     question = "最近30天退款金额最高的前5个商品，同时看这些商品的下单量和商品发布时间，帮我判断哪些是高风险新品。"
     keywords = KeywordExtractService().extract(question)
@@ -2633,7 +2815,6 @@ def test_answer_compose_merges_rule_evidence_with_bi_data():
 
 
 def test_answer_skill_does_not_use_skill_for_ordinary_scope_event_ratio(tmp_path):
-    settings = get_settings().model_copy(update={"llm_api_key": "", "harness_workspace_path": str(tmp_path)})
     plan = QueryPlan(
         question_understanding={
             "analysisIntent": "comparison",

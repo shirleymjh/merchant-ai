@@ -1,5 +1,5 @@
 <template>
-  <article :class="['message', role]">
+  <article :id="anchorId || undefined" :class="['message', role]">
     <div v-if="role === 'assistant'" class="assistant-message">
       <div class="assistant-avatar">Y</div>
       <div class="assistant-stream">
@@ -8,6 +8,12 @@
           <span>· {{ displayTime }}</span>
         </div>
         <div class="assistant-card">
+          <details v-if="steps.length" class="query-runner" open>
+            <summary><span>思考完成</span><small>{{ steps.length }} 个步骤</small></summary>
+            <div class="thinking">
+              <div v-for="step in steps" :key="step" class="thinking-step"><CheckCircle2 :size="14" /><span>{{ step }}</span></div>
+            </div>
+          </details>
           <div class="answer-text">
             <section
               v-for="(block, blockIndex) in answerBlocks"
@@ -39,7 +45,7 @@
               </button>
             </div>
           </section>
-          <section v-if="businessAdvice.length || drillDownActions.length" class="experience-panel">
+          <section v-if="!workspaceMode && (businessAdvice.length || drillDownActions.length)" class="experience-panel">
             <div class="experience-head">
               <Sparkles :size="16" />
               <h3>下一步</h3>
@@ -110,7 +116,7 @@
               <strong>{{ section.value }}</strong>
             </section>
           </div>
-          <MetricLineChart
+          <MetricLineChart v-if="!workspaceMode"
             v-for="(section, sectionIndex) in chartSections"
             :key="`chart-${sectionIndex}-${section.title || section.metricName}`"
             :title="section.title || section.metricName"
@@ -283,11 +289,12 @@
 
 <script setup>
 import { computed, ref } from 'vue'
-import { AlertTriangle, ArrowRight, BookOpenCheck, Check, Copy, Download, Filter, Info, Maximize2, Sparkles, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
+import { AlertTriangle, ArrowRight, BookOpenCheck, Check, CheckCircle2, Copy, Download, Filter, Info, Maximize2, Sparkles, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
 import MetricLineChart from './MetricLineChart.vue'
 
 const props = defineProps({
   id: String,
+  anchorId: String,
   role: {
     type: String,
     required: true
@@ -323,7 +330,8 @@ const props = defineProps({
   feedbackStatus: {
     type: Object,
     default: () => ({})
-  }
+  },
+  workspaceMode: Boolean
 })
 
 const emit = defineEmits(['feedback', 'ask', 'confirm-clarification'])

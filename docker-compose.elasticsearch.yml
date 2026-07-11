@@ -24,3 +24,15 @@ services:
         condition: service_healthy
     ports:
       - "5601:5601"
+
+  elasticsearch-init:
+    image: curlimages/curl:8.12.1
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        curl -fsS -X PUT http://elasticsearch:9200/_index_template/single-node-defaults -H 'Content-Type: application/json' -d '{"index_patterns":["*"],"priority":1,"template":{"settings":{"number_of_replicas":0}}}'
+        curl -fsS -X PUT http://elasticsearch:9200/_all/_settings -H 'Content-Type: application/json' -d '{"index":{"number_of_replicas":0}}'

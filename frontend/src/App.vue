@@ -1,38 +1,56 @@
 <template>
   <main class="evan-app">
+    <header class="app-brand-header">
+      <button type="button" class="brand-menu" title="打开对话目录" @click="outlineOpen = true"><PanelLeftOpen :size="20" /></button>
+      <div class="brand-mark"><ShoppingBag :size="24" /></div>
+      <div class="brand-copy"><h1>yshopping 商家 AI 助手</h1><p>经营数据、分析与行动建议</p></div>
+      <button type="button" class="brand-new-chat" @click="resetChat"><MessageCirclePlus :size="17" />新会话</button>
+    </header>
+    <div v-if="outlineOpen" class="outline-backdrop" @click="outlineOpen = false" />
+    <aside :class="['outline-drawer', { open: outlineOpen }]" aria-label="对话目录">
+      <div class="outline-drawer-head">
+        <div><span>当前会话</span><h2>对话目录</h2></div>
+        <button type="button" title="关闭目录" @click="outlineOpen = false"><PanelLeftClose :size="20" /></button>
+      </div>
+      <div class="outline-drawer-list">
+        <button type="button" :class="{ active: !conversationOutline.length }" @click="scrollConversationTop">
+          <b>1</b><span>开始对话</span><ChevronRight :size="17" />
+        </button>
+        <button v-for="(item, index) in conversationOutline" :key="item.id" type="button" :class="{ active: index === conversationOutline.length - 1 }" @click="openOutlineItem(item.id)">
+          <b>{{ index + 2 }}</b><span>{{ item.label }}</span><ChevronRight :size="17" />
+        </button>
+      </div>
+      <p class="outline-drawer-tip"><MessageSquareText :size="15" />选择一轮对话，左右面板会同步显示对应图表与建议。</p>
+    </aside>
+    <aside class="analysis-rail">
+      <div class="rail-title-row">
+        <div class="rail-icon blue"><ChartNoAxesCombined :size="17" /></div>
+        <div><span>数据洞察</span><strong>指标图表</strong></div>
+      </div>
+      <MetricInsightPanel :message="latestAssistantMessage" />
+    </aside>
     <section class="workspace-main">
-      <header class="topic-header">
-        <div class="topic-tabs">
-          <button
-            v-for="session in sessions"
-            :key="session.id"
-            :class="['topic-tab', { active: session.id === activeSessionId, running: isSessionRunning(session) }]"
-            type="button"
-            :title="session.title"
-            @click="switchSession(session.id)"
-          >
-            <span>{{ session.title }}</span>
-          </button>
-          <button
-            :class="['topic-tab', 'new-session', { confirmed: newSessionFlash }]"
-            type="button"
-            @click="resetChat"
-          >
-            <Plus :size="15" />
-            <span>{{ newSessionFlash ? '已开启' : '新会话' }}</span>
-          </button>
-        </div>
-        <div class="topic-status">
-          <Zap :size="14" />
-          <span>经营数据已连接</span>
-        </div>
-      </header>
-
       <section class="chat-canvas" ref="chatList">
+        <section v-if="!hasConversation" class="welcome-banner">
+          <div class="welcome-icon"><Sparkles :size="22" /></div>
+          <div><h2>您好，我是您的经营助手</h2><p>可以查询经营指标、查看业务明细，也可以结合数据给出分析与建议。</p></div>
+        </section>
+        <DailyReportCard v-if="dailyReport && !hasConversation" :report="dailyReport" @ask="sendSuggestion" />
+        <section v-if="!hasConversation" class="upload-guide-card">
+          <strong>您可以直接提问，也可以上传经营报表、截图或 PDF，我会结合内容进行分析。</strong>
+          <span>内容为 AI 生成，仅供参考</span>
+        </section>
+        <nav v-if="conversationOutline.length" class="conversation-outline" aria-label="当前对话目录">
+          <span><ListTree :size="14" /> 本轮目录</span>
+          <button v-for="item in conversationOutline" :key="item.id" type="button" @click="scrollToMessage(item.id)">
+            {{ item.label }}
+          </button>
+        </nav>
         <ChatMessage
-          v-for="message in messages"
+          v-for="message in visibleMessages"
           :key="message.localId"
           :id="message.id"
+          :anchor-id="message.localId"
           :role="message.role"
           :text="message.text"
           :steps="message.steps"
@@ -42,6 +60,7 @@
           :merchant-experience="message.merchantExperience"
           :clarification="message.clarification"
           :feedback-status="message.feedbackStatus"
+          :workspace-mode="true"
           @feedback="handleFeedback"
           @ask="sendSuggestion"
           @confirm-clarification="handleClarificationConfirm"
@@ -63,8 +82,15 @@
           @select="sendSuggestion"
           @refresh="rotateSuggestions"
         />
+        <div v-if="attachments.length" class="attachment-strip">
+          <span v-for="(file, index) in attachments" :key="`${file.name}-${index}`" class="attachment-chip">
+            <FileText :size="14" /><b>{{ file.name }}</b><button type="button" title="移除附件" @click="removeAttachment(index)"><X :size="12" /></button>
+          </span>
+        </div>
         <form class="input-bar" @submit.prevent="submit">
-          <input ref="inputRef" v-model.trim="input" type="text" placeholder="说出您的疑惑吧，yshopping 帮你解决" />
+          <input ref="fileInput" class="file-input" type="file" multiple accept="image/*,.pdf,.xls,.xlsx,.csv" @change="handleFiles" />
+          <button type="button" class="attach-button" title="上传图片、Excel、PDF 或 CSV" @click="fileInput?.click()"><Paperclip :size="19" /></button>
+          <textarea ref="inputRef" v-model="input" rows="1" placeholder="输入经营问题，或上传报表、截图让我分析" @input="resizeComposer" @keydown.enter.exact.prevent="submit" />
           <button v-if="!loading" type="submit" class="send-button" title="发送" :disabled="!input">
             <Send :size="20" />
           </button>
@@ -72,36 +98,34 @@
             <CircleStop :size="20" />
           </button>
         </form>
+        <div class="composer-hint"><span>Enter 发送 · Shift + Enter 换行</span><span>支持图片、PDF、Excel、CSV</span></div>
       </div>
     </section>
 
     <aside class="insight-rail">
-      <DailyReportCard v-if="dailyReport" :report="dailyReport" :compact="true" @ask="sendSuggestion" />
-      <section v-if="merchantProfile" class="profile-store-card">
-        <div class="profile-store-head">
-          <span>商家画像</span>
-          <strong>{{ merchantProfile.reviewStatus || 'draft' }}</strong>
-        </div>
-        <div class="profile-store-grid">
-          <p><b>{{ merchantProfile.defaultTimeWindow || 7 }}</b><span>默认天数</span></p>
-          <p><b>{{ (merchantProfile.preferredMetrics || []).length }}</b><span>偏好指标</span></p>
-          <p><b>{{ (merchantProfile.recentRisks || []).length }}</b><span>风险记录</span></p>
-        </div>
-        <div v-if="(merchantProfile.preferredMetrics || []).length" class="profile-store-tags">
-          <span v-for="metric in merchantProfile.preferredMetrics.slice(0, 4)" :key="metric">{{ metric }}</span>
-        </div>
+      <div class="rail-title-row">
+        <div class="rail-icon amber"><Lightbulb :size="17" /></div>
+        <div><span>结合本轮数据</span><strong>经营行动</strong></div>
+      </div>
+      <section v-if="currentAdvice.length" class="action-list">
+        <article v-for="(advice, index) in currentAdvice" :key="advice">
+          <span>{{ index + 1 }}</span><div><b>{{ adviceTitle(advice) }}</b><p>{{ advice }}</p><button type="button" :class="{ done: executedAdvice.has(index) }" @click="toggleAdvice(index)">{{ executedAdvice.has(index) ? '已标记执行' : '标记执行' }}</button></div>
+        </article>
       </section>
+      <section v-else class="rail-empty-state"><Lightbulb :size="25" /><b>等待分析结果</b><p>提问指标后，这里会给出至少两条可执行建议。</p></section>
+      <div v-if="dataFreshness" class="data-freshness"><DatabaseZap :size="14" /><span>数据更新：{{ dataFreshness }}</span><b>已校验</b></div>
     </aside>
   </main>
 </template>
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { CircleStop, LoaderCircle, Plus, Send, Zap } from 'lucide-vue-next'
+import { ChartNoAxesCombined, ChevronRight, CircleStop, DatabaseZap, FileText, Lightbulb, ListTree, LoaderCircle, MessageCirclePlus, MessageSquareText, PanelLeftClose, PanelLeftOpen, Paperclip, Send, ShoppingBag, Sparkles, X } from 'lucide-vue-next'
 import ChatMessage from './components/ChatMessage.vue'
 import DailyReportCard from './components/DailyReportCard.vue'
+import MetricInsightPanel from './components/MetricInsightPanel.vue'
 import SuggestionList from './components/SuggestionList.vue'
-import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, resumeChatRun, sendFeedback, startAsyncRun } from './api/client'
+import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
 
 const input = ref('')
 const defaultRunStatusText = '正在分析问题并读取经营数据'
@@ -110,6 +134,10 @@ const runPollTimers = new Map()
 let newSessionTimer = null
 const chatList = ref(null)
 const inputRef = ref(null)
+const fileInput = ref(null)
+const attachments = ref([])
+const outlineOpen = ref(false)
+const executedAdvice = ref(new Set())
 const dailyReport = ref(null)
 const merchantProfile = ref(null)
 const newSessionFlash = ref(false)
@@ -144,22 +172,32 @@ const conversationContext = ref(cloneValue(initialVisibleSession.conversationCon
 
 const activeSession = computed(() => sessions.value.find(session => session.id === activeSessionId.value) || sessions.value[0])
 const hasConversation = computed(() => messages.value.some(message => message.role === 'user'))
+const visibleMessages = computed(() => hasConversation.value ? messages.value : [])
+const latestAssistantMessage = computed(() => [...messages.value].reverse().find(message => message.role === 'assistant') || null)
+const currentAdvice = computed(() => {
+  const advice = latestAssistantMessage.value?.merchantExperience?.businessAdvice || []
+  const fallback = latestAssistantMessage.value?.merchantExperience?.drillDownActions?.map(item => item.label || item.question) || []
+  const answerAdvice = extractAdviceFromAnswer(latestAssistantMessage.value?.text || '')
+  const suggested = latestAssistantMessage.value?.suggestions || []
+  const candidates = advice.length >= 2 ? advice : [...advice, ...answerAdvice, ...fallback, ...suggested]
+  return candidates
+    .filter(Boolean)
+    .filter((item, index, all) => all.indexOf(item) === index)
+    .slice(0, 2)
+})
+const dataFreshness = computed(() => latestAssistantMessage.value?.merchantExperience?.traceability?.dataUpdatedAt || '')
+const conversationOutline = computed(() => messages.value.filter(message => message.role === 'user').slice(-5).map((message, index) => ({
+  id: message.localId,
+  label: String(message.text || `问题 ${index + 1}`).slice(0, 18)
+})))
 const loading = computed(() => isSessionRunning(activeSession.value))
 const stopping = computed(() => Boolean(activeSession.value?.stopping))
 const runStatusText = computed(() => activeSession.value?.runStatusText || defaultRunStatusText)
 onMounted(async () => {
   resumeSessionRuns()
-  try {
-    dailyReport.value = await getDailyReport()
-  } catch {
-    dailyReport.value = mockDailyReport()
-  }
-  try {
-    const profilePayload = await getMerchantProfile()
-    merchantProfile.value = profilePayload.profile || null
-  } catch {
-    merchantProfile.value = null
-  }
+  const [reportResult, profileResult] = await Promise.allSettled([getDailyReport(), getMerchantProfile()])
+  dailyReport.value = reportResult.status === 'fulfilled' ? reportResult.value : mockDailyReport()
+  merchantProfile.value = profileResult.status === 'fulfilled' ? profileResult.value.profile || null : null
 })
 
 onBeforeUnmount(() => {
@@ -171,7 +209,11 @@ async function submit() {
   if (!input.value || loading.value) return
   const message = input.value
   input.value = ''
-  await ask(message)
+  const files = attachments.value.slice()
+  attachments.value = []
+  await nextTick()
+  resizeComposer()
+  await askWithOptions(message, { attachments: files })
 }
 
 async function sendSuggestion(question) {
@@ -210,11 +252,23 @@ async function askWithOptions(message, options = {}) {
     const requestOptions = {
       signal: controller.signal,
       messageHistory: requestHistory,
-      threadId: options.resumeThreadId || ''
+      threadId: options.resumeThreadId || '',
+      attachments: options.attachments || []
     }
-    const created = options.resumeThreadId
-      ? await resumeChatRun(message, requestContext, requestOptions)
-      : await startAsyncRun(message, requestContext, requestOptions)
+    if (!options.resumeThreadId) {
+      const completed = await streamChatRun(message, requestContext, requestOptions, event => handleStreamEvent(sessionId, event))
+      if (!completed?.response) throw new Error('STREAM_COMPLETED_WITHOUT_RESPONSE')
+      updateSessionRuntime(sessionId, {
+        activeRun: null,
+        submitting: false,
+        submitController: null,
+        stopping: false,
+        runStatusText: defaultRunStatusText
+      })
+      appendAssistantToSession(sessionId, completed.response)
+      return
+    }
+    const created = await resumeChatRun(message, requestContext, requestOptions)
     const runId = created.runId
     const threadId = created.threadId
     if (!runId || !threadId) {
@@ -250,6 +304,67 @@ async function askWithOptions(message, options = {}) {
       appendAssistantToSession(sessionId, mockChat(message))
     }
   }
+}
+
+function handleStreamEvent(sessionId, event) {
+  if (event.event === 'run.started') {
+    updateSessionRuntime(sessionId, {
+      activeRun: {
+        runId: event.payload?.runId || event.runId,
+        threadId: event.payload?.threadId || event.threadId,
+        token: `stream_${Date.now()}`
+      },
+      submitting: false,
+      runStatusText: '正在分析问题'
+    })
+    return
+  }
+  if (event.node) updateSessionRuntime(sessionId, { runStatusText: friendlyNodeStatus(event.node) })
+}
+
+function resizeComposer() {
+  const element = inputRef.value
+  if (!element) return
+  element.style.height = 'auto'
+  element.style.height = `${Math.min(Math.max(element.scrollHeight, 42), 180)}px`
+}
+
+async function handleFiles(event) {
+  const files = Array.from(event.target.files || []).slice(0, 6)
+  const prepared = await Promise.all(files.map(async file => {
+    try {
+      const uploaded = await uploadAttachment(file)
+      return { id: uploaded.attachmentId, name: file.name, type: file.type || 'application/octet-stream', size: file.size }
+    } catch {
+      return { name: file.name, type: file.type || 'application/octet-stream', size: file.size, uploadFailed: true }
+    }
+  }))
+  attachments.value = [...attachments.value, ...prepared].slice(0, 6)
+  event.target.value = ''
+}
+
+function removeAttachment(index) { attachments.value.splice(index, 1) }
+function adviceTitle(text) {
+  if (/退款|售后/.test(text)) return '控制退款风险'
+  if (/订单|转化|GMV|成交/.test(text)) return '提升交易表现'
+  if (/客服|工单|响应/.test(text)) return '优化服务体验'
+  return '建议立即关注'
+}
+function extractAdviceFromAnswer(text) {
+  const lines = String(text || '').split('\n').map(line => line.trim())
+  const start = lines.findIndex(line => /^建议[:：]?$/.test(line))
+  if (start < 0) return []
+  return lines.slice(start + 1).filter(line => /^[-•]/.test(line)).map(line => line.replace(/^[-•]\s*/, '')).slice(0, 3)
+}
+function scrollToMessage(id) {
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+function openOutlineItem(id) { outlineOpen.value = false; nextTick(() => scrollToMessage(id)) }
+function scrollConversationTop() { outlineOpen.value = false; nextTick(() => chatList.value?.scrollTo({ top: 0, behavior: 'smooth' })) }
+function toggleAdvice(index) {
+  const next = new Set(executedAdvice.value)
+  next.has(index) ? next.delete(index) : next.add(index)
+  executedAdvice.value = next
 }
 
 async function handleClarificationConfirm(payload) {
@@ -363,6 +478,7 @@ async function stopCurrentRun() {
   const stoppedRun = current
   updateSessionRuntime(session.id, { activeRun: null })
   try {
+    session.submitController?.abort()
     await cancelRun(stoppedRun.threadId, stoppedRun.runId)
   } catch {
     // 取消请求失败也要允许用户继续提问；后端旧结果不会再被当前 token 接收。
@@ -458,6 +574,7 @@ function appendAssistantToSession(sessionId, response) {
       dataRows: section.dataRows || []
     })),
     merchantExperience: response.merchantExperience || response.merchant_experience || {},
+    suggestions: response.suggestions || [],
     clarification: response.clarification || null,
     feedbackStatus: {
       adopted: false,
@@ -717,7 +834,7 @@ function persistSessions() {
 function toPersistedSession(session) {
   return {
     ...session,
-    messages: cloneValue(session.messages),
+    messages: compactPersistedMessages(session.messages),
     conversationContext: cloneValue(session.conversationContext),
     suggestionPool: cloneValue(session.suggestionPool),
     suggestions: cloneValue(session.suggestions),
@@ -725,6 +842,30 @@ function toPersistedSession(session) {
     submitting: false,
     stopping: false,
     stopRequested: false
+  }
+}
+
+function compactPersistedMessages(sessionMessages) {
+  return (sessionMessages || []).slice(-20).map(message => ({
+    ...message,
+    text: String(message.text || '').slice(0, 6000),
+    steps: (message.steps || []).slice(-12),
+    dataRows: (message.dataRows || []).slice(0, 60),
+    dataSections: (message.dataSections || []).slice(0, 4).map(section => ({
+      ...section,
+      dataRows: (section.dataRows || []).slice(0, 60)
+    })),
+    merchantExperience: compactMerchantExperience(message.merchantExperience || {})
+  }))
+}
+
+function compactMerchantExperience(experience) {
+  return {
+    businessAdvice: (experience.businessAdvice || []).slice(0, 4),
+    anomalyAlerts: (experience.anomalyAlerts || []).slice(0, 4),
+    drillDownActions: (experience.drillDownActions || []).slice(0, 4),
+    metricDisclosures: (experience.metricDisclosures || []).slice(0, 4),
+    traceability: experience.traceability || {}
   }
 }
 

@@ -96,6 +96,7 @@ class AgentState(TypedDict, total=False):
     clarification_resolution: Dict[str, Any]
     bounded_route_llm_trace: Dict[str, Any]
     bounded_lead_llm_trace: Dict[str, Any]
+    fast_gate_decision_trace: Dict[str, Any]
     lead_decision_context: Dict[str, Any]
     recall_strategy: Dict[str, Any]
     worker_dispatch_context: Dict[str, Any]
@@ -109,6 +110,9 @@ class AgentState(TypedDict, total=False):
     knowledge_request_lineage: Dict[str, Any]
     intent_signals: IntentSignals
     fast_understanding: FastUnderstandingResult
+    fast_metric_attempted: bool
+    fast_metric_completed: bool
+    fast_metric_response: Any
     planning_asset_pack: PlanningAssetPack
     query_graph_validation_result: GraphValidationResult
     pending_knowledge_requests: List[KnowledgeRequest]

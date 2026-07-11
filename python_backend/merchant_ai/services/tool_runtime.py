@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pickle
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
@@ -11,6 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib import request as url_request
 
 from merchant_ai.config import Settings
+from merchant_ai.services.cache import json_cache_dumps, json_cache_loads
 from merchant_ai.models import (
     CircuitBreakerState,
     LoadBalancerTarget,
@@ -429,7 +429,7 @@ class RedisCacheStore(CacheStore):
                 self._misses += 1
                 return None
             self._hits += 1
-            return pickle.loads(raw)
+            return json_cache_loads(raw)
         except Exception as exc:
             self.last_error = str(exc)[:200]
             self.available = False
@@ -443,7 +443,7 @@ class RedisCacheStore(CacheStore):
             self._fallback.set(key, value, ttl)
             return
         try:
-            self._client.setex(self._key(key), ttl, pickle.dumps(value))
+            self._client.setex(self._key(key), ttl, json_cache_dumps(value))
             self._sets += 1
         except Exception as exc:
             self.last_error = str(exc)[:200]

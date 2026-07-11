@@ -89,7 +89,10 @@ class Settings(BaseSettings):
     merchant_id: str = Field("100", validation_alias="YSHOPPING_MERCHANT_ID")
     allowed_merchant_ids: str = Field("", validation_alias="YSHOPPING_ALLOWED_MERCHANT_IDS")
     ops_token: str = Field("", validation_alias="YSHOPPING_OPS_TOKEN")
-    cors_allow_origins: str = Field("*", validation_alias="YSHOPPING_CORS_ALLOW_ORIGINS")
+    cors_allow_origins: str = Field(
+        "http://localhost:5173,http://127.0.0.1:5173",
+        validation_alias="YSHOPPING_CORS_ALLOW_ORIGINS",
+    )
     cors_allow_credentials: bool = Field(False, validation_alias="YSHOPPING_CORS_ALLOW_CREDENTIALS")
 
     llm_base_url: str = Field("https://api.openai.com/v1", validation_alias="YSHOPPING_LLM_BASE_URL")
@@ -195,6 +198,12 @@ class Settings(BaseSettings):
     agent_doris_split_max_concurrency: int = Field(3, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_MAX_CONCURRENCY")
     agent_partition_date_anchor_enabled: bool = Field(False, validation_alias="YSHOPPING_AGENT_PARTITION_DATE_ANCHOR_ENABLED")
     agent_trace_replay_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_TRACE_REPLAY_ENABLED")
+    agent_compact_success_artifacts_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_COMPACT_SUCCESS_ARTIFACTS_ENABLED")
+    agent_run_retention_days: int = Field(14, validation_alias="YSHOPPING_AGENT_RUN_RETENTION_DAYS")
+    agent_completed_checkpoint_limit: int = Field(30, validation_alias="YSHOPPING_AGENT_COMPLETED_CHECKPOINT_LIMIT")
+    attachment_retention_days: int = Field(7, validation_alias="YSHOPPING_ATTACHMENT_RETENTION_DAYS")
+    attachment_max_bytes: int = Field(20 * 1024 * 1024, validation_alias="YSHOPPING_ATTACHMENT_MAX_BYTES")
+    attachment_preview_max_chars: int = Field(12000, validation_alias="YSHOPPING_ATTACHMENT_PREVIEW_MAX_CHARS")
     agent_checkpointer_backend: str = Field("sqlite", validation_alias="YSHOPPING_AGENT_CHECKPOINTER_BACKEND")
     agent_checkpointer_sqlite_path: str = Field("", validation_alias="YSHOPPING_AGENT_CHECKPOINTER_SQLITE_PATH")
     agent_checkpointer_postgres_uri: str = Field("", validation_alias="YSHOPPING_AGENT_CHECKPOINTER_POSTGRES_URI")
@@ -205,11 +214,11 @@ class Settings(BaseSettings):
     agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
     agent_deferred_tool_schema_enabled: bool = Field(False, validation_alias="YSHOPPING_AGENT_DEFERRED_TOOL_SCHEMA_ENABLED")
     planner_filesystem_context_mode: str = Field("auto", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
-    lead_action_llm_mode: str = Field("off", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
+    lead_action_llm_mode: str = Field("fast_gate", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
     agent_planner_seed_table_limit: int = Field(4, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_TABLE_LIMIT")
     agent_planner_seed_metric_limit: int = Field(14, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_METRIC_LIMIT")
     agent_asset_field_entry_limit: int = Field(240, validation_alias="YSHOPPING_AGENT_ASSET_FIELD_ENTRY_LIMIT")
-    agent_planner_prompt_budget_chars: int = Field(14000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
+    agent_planner_prompt_budget_chars: int = Field(18000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
     agent_node_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_NODE_FILE_TOOL_ROUNDS")
     answer_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_ANSWER_FILE_TOOL_ROUNDS")
     route_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_ROUTE_LLM_MODE")

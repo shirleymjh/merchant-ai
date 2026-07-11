@@ -29,10 +29,60 @@ export async function startAsyncRun(message, context, options = {}) {
       merchantId: DEFAULT_MERCHANT_ID,
       threadId: options.threadId || '',
       context,
-      messageHistory: options.messageHistory || []
+      messageHistory: options.messageHistory || [],
+      attachments: options.attachments || []
     }),
     signal: options.signal
   })
+}
+
+export async function streamChatRun(message, context, options = {}, onEvent = () => {}) {
+  const response = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message,
+      merchantId: DEFAULT_MERCHANT_ID,
+      threadId: options.threadId || '',
+      context,
+      messageHistory: options.messageHistory || [],
+      attachments: options.attachments || []
+    }),
+    signal: options.signal
+  })
+  if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let completed = null
+  while (true) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() || ''
+    for (const frame of frames) {
+      const dataLine = frame.split('\n').find(line => line.startsWith('data:'))
+      if (!dataLine) continue
+      const event = JSON.parse(dataLine.slice(5).trim())
+      await onEvent(event)
+      if (event.event === 'done') completed = event
+      if (event.event === 'error') throw new Error(event.message || 'STREAM_FAILED')
+    }
+    if (done) break
+  }
+  return completed
+}
+
+export async function uploadAttachment(file, signal) {
+  const params = new URLSearchParams({ name: file.name, type: file.type || 'application/octet-stream', merchantId: DEFAULT_MERCHANT_ID })
+  const response = await fetch(`/api/attachments?${params}`, {
+    method: 'POST',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file,
+    signal
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return response.json()
 }
 
 export async function resumeChatRun(message, context, options = {}) {
@@ -43,7 +93,8 @@ export async function resumeChatRun(message, context, options = {}) {
       merchantId: DEFAULT_MERCHANT_ID,
       threadId: options.threadId || '',
       context,
-      messageHistory: options.messageHistory || []
+      messageHistory: options.messageHistory || [],
+      attachments: options.attachments || []
     }),
     signal: options.signal
   })

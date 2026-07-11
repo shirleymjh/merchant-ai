@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -10,6 +11,7 @@ from merchant_ai.graph.state import emit, register_event_listener, unregister_ev
 from merchant_ai.models import AgentTaskResult, NodeExecutionContext, NodePlanContract, NodePlanCritiqueResult
 from merchant_ai.models import AgentRunResult, MerchantInfo, QueryBundle, QueryPlan, QuestionIntent, VerifiedEvidence
 from merchant_ai.services.answer import answer_data_package, verified_answer_context
+from merchant_ai.services.attachments import AttachmentStore
 from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicAssetService
 from merchant_ai.services.context_assembly import build_llm_context_blocks, context_cache_layout, context_quarantine_policy
 from merchant_ai.services.memory import MemoryIngestionService, MemoryStore, MemoryWriteGate
@@ -50,6 +52,34 @@ def test_ops_token_protects_runtime_endpoints():
     metrics = client.get("/api/runtime/metrics", headers={"X-Ops-Token": "secret"}).json()
     assert metrics["config"]["security"]["opsTokenConfigured"] is True
     assert "answerRepository" in metrics["degraded"]
+
+
+def test_missing_ops_token_fails_closed_for_non_loopback_client():
+    client = TestClient(create_app(Settings(ops_token="")))
+
+    assert client.get("/api/runtime/alerts").status_code == 503
+
+
+def test_attachment_store_extracts_excel_and_enforces_merchant_scope(tmp_path):
+    from openpyxl import Workbook
+
+    settings = Settings(harness_workspace_path=str(tmp_path))
+    store = AttachmentStore(settings)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "经营日报"
+    sheet.append(["日期", "GMV"])
+    sheet.append(["2026-07-11", 1234])
+    payload = BytesIO()
+    workbook.save(payload)
+
+    metadata = store.save("日报.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", payload.getvalue(), "100")
+    reference = SimpleNamespace(id=metadata["attachmentId"])
+
+    assert metadata["parser"] == "excel"
+    assert "经营日报" in metadata["textPreview"]
+    assert "1234" in store.context_for([reference], "100")
+    assert store.context_for([reference], "200") == ""
 
 
 def test_merchant_allowlist_blocks_cross_tenant_requests():

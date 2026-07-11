@@ -5,7 +5,6 @@ import math
 import os
 import re
 import hashlib
-import pickle
 import threading
 import time
 from collections import Counter, defaultdict
@@ -17,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 from merchant_ai.config import Settings
+from merchant_ai.services.cache import json_cache_loads
 from merchant_ai.graph.state import AgentState
 from merchant_ai.models import (
     KnowledgeSuggestion,
@@ -1992,7 +1992,7 @@ def memory_cache_items(cache: Any) -> Dict[str, Any]:
                     continue
                 key_text = redis_key.decode("utf-8", errors="ignore") if isinstance(redis_key, bytes) else str(redis_key)
                 memory_key = key_text.split(":ttl:%s:" % cache.name, 1)[-1]
-                items[memory_key] = pickle.loads(raw)
+                items[memory_key] = json_cache_loads(raw)
                 client.delete(redis_key)
         except Exception:
             return items

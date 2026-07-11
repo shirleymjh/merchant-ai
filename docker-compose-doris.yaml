@@ -9,6 +9,13 @@ services:
   fe:
     image: apache/doris:fe-4.1.0
     hostname: fe
+    mem_limit: 6g
+    entrypoint:
+      - bash
+      - -lc
+      - |
+        sed -i 's/-Xmx8192m -Xms8192m/-Xmx4096m -Xms2048m/' /opt/apache-doris/fe/conf/fe.conf
+        exec /usr/local/bin/init_fe.sh
     ports:
       - 8030:8030
       - 9030:9030
@@ -23,6 +30,7 @@ services:
   be:
     image: apache/doris:be-4.1.0
     hostname: be
+    mem_limit: 5g
     ports:
       - 8040:8040
       - 9050:9050
