@@ -312,7 +312,7 @@ def default_prompt_registry() -> PromptRegistry:
                 "GROUP_AGG/TOPN 查询必须让所有非聚合 SELECT 字段同时出现在 GROUP BY 中，尤其不能丢 seller_id、pt、spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、coupon_id。\n"
                 "当 GROUP_AGG/TOPN 的 groupByColumn 是实体键（如 spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、refund_id、coupon_id）时，必须在 WHERE 里过滤 NULL 和空字符串，避免产生空实体桶。\n"
                 "dependent node 用 upstreamEntitySets 做 IN 过滤。必须按 merchant_id/seller_id 过滤商家。\n"
-                "pt 是 Doris DATE 分区列，时间窗必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N DAY)，不要使用 DATE_FORMAT('%Y%m%d')。"
+                "pt 是 Doris DATE 分区列，最近N天包含今天/最新分区在内，时间窗下界必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N-1 DAY)，例如最近7天写 INTERVAL 6 DAY，最近30天写 INTERVAL 29 DAY；不要使用 DATE_FORMAT('%Y%m%d')。"
             ),
         )
     )

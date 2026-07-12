@@ -492,10 +492,10 @@ class V2AgentPolicy:
         context = state.get("request_context")
         files = list(getattr(context, "offloaded_files", None) or [])
         question = str(state.get("question") or "").lower()
-        document_signal = bool(files) or "[用户附件上下文]" in question or any(
-            token in question for token in ("文档", "附件", "报告", "pdf", "excel", "csv")
+        document_signal = bool(files) or "[用户附件上下文]" in question
+        python_signal = any(str(path).lower().endswith(".py") for path in files) and any(
+            token in question for token in ("python", "批量分析", "批处理", "模拟计算", "运行脚本")
         )
-        python_signal = any(token in question for token in ("python", "批量分析", "批处理", "模拟计算"))
         return document_signal or python_signal
 
     def has_unresolved_planning_work(self, state: AgentState) -> bool:

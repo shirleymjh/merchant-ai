@@ -604,14 +604,18 @@ def install_market_skill(skill_name: str, payload: Dict[str, Any], _auth: None =
 @router.post("/api/ops/golden-evaluations")
 def evaluate_golden_cases(request: GoldenEvaluationRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     if bool(request.partition_date_anchor_enabled) == bool(settings.agent_partition_date_anchor_enabled):
-        return golden_evaluation_service.evaluate(request, workflow.run)
+        return golden_evaluation_service.evaluate(request, workflow.run, query_executor=doris_repository.query)
     evaluation_settings = settings.model_copy(
         update={"agent_partition_date_anchor_enabled": bool(request.partition_date_anchor_enabled)}
     )
     evaluation_workflow = create_workflow(evaluation_settings)
     evaluation_service = GoldenEvaluationService(evaluation_settings)
     try:
-        return evaluation_service.evaluate(request, evaluation_workflow.run)
+        return evaluation_service.evaluate(
+            request,
+            evaluation_workflow.run,
+            query_executor=evaluation_workflow.node_worker.doris_repository.query,
+        )
     finally:
         evaluation_workflow.checkpoint_manager.close()
 

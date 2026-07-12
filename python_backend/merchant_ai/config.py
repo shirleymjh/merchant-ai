@@ -246,6 +246,7 @@ class Settings(BaseSettings):
     route_force_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_ROUTE_FORCE_CLARIFICATION_ENABLED")
     merchant_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_MERCHANT_CLARIFICATION_ENABLED")
     route_topic_min_confidence: float = Field(0.52, validation_alias="YSHOPPING_ROUTE_TOPIC_MIN_CONFIDENCE")
+    route_topic_high_confidence: float = Field(0.75, validation_alias="YSHOPPING_ROUTE_TOPIC_HIGH_CONFIDENCE")
     route_topic_max_candidates: int = Field(4, validation_alias="YSHOPPING_ROUTE_TOPIC_MAX_CANDIDATES")
     route_mixed_rule_data_min_confidence: float = Field(0.75, validation_alias="YSHOPPING_ROUTE_MIXED_RULE_DATA_MIN_CONFIDENCE")
     context_file_inline_max_chars: int = Field(12000, validation_alias="YSHOPPING_AGENT_CONTEXT_FILE_INLINE_MAX_CHARS")

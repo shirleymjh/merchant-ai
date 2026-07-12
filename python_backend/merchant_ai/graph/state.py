@@ -94,6 +94,9 @@ class AgentState(TypedDict, total=False):
     recent_focus: MerchantRecentFocus
     routing_decision: RoutingDecision
     topic_routing_decision: TopicRoutingDecision
+    topic_workspace: Dict[str, Any]
+    analysis_scope: Dict[str, Any]
+    knowledge_refresh: Dict[str, Any]
     route_slots: RouteSlots
     route_decision_trace: List[Dict[str, Any]]
     clarification_resolution: Dict[str, Any]

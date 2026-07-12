@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -99,16 +101,21 @@ class GoldenCaseLoader:
 class GoldenEvaluationService:
     """Run end-to-end golden cases and score recall, graph, SQL, evidence and answer layers."""
 
-    LAYERS = ["recall", "queryGraph", "sql", "evidence", "answer"]
+    LAYERS = ["recall", "queryGraph", "sql", "execution", "evidence", "answer"]
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.loader = GoldenCaseLoader(settings)
 
-    def evaluate(self, request: GoldenEvaluationRequest, runner: Callable[..., Any]) -> Dict[str, Any]:
+    def evaluate(
+        self,
+        request: GoldenEvaluationRequest,
+        runner: Callable[..., Any],
+        query_executor: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
         merchant_id = request.merchant_id or self.settings.merchant_id
         cases = self._select_cases(self.loader.load(request.cases_path), request.case_ids, request.limit)
-        results = [self.evaluate_case(case, merchant_id, runner) for case in cases]
+        results = [self.evaluate_case(case, merchant_id, runner, query_executor=query_executor) for case in cases]
         summary = self._summary(results)
         report = {
             "success": True,
@@ -126,7 +133,13 @@ class GoldenEvaluationService:
             report["governancePath"] = str(self._persist_governance_items(failed_items))
         return report
 
-    def evaluate_case(self, case: Dict[str, Any], merchant_id: str, runner: Callable[..., Any]) -> Dict[str, Any]:
+    def evaluate_case(
+        self,
+        case: Dict[str, Any],
+        merchant_id: str,
+        runner: Callable[..., Any],
+        query_executor: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
         started = datetime.now()
         response: Optional[ChatResponse] = None
         error = ""
@@ -144,6 +157,7 @@ class GoldenEvaluationService:
             "recall": self._score_recall(case, trace),
             "queryGraph": self._score_query_graph(case, trace),
             "sql": self._score_sql(case, trace),
+            "execution": self._score_execution(case, trace, query_executor, merchant_id),
             "evidence": self._score_evidence(case, trace),
             "answer": self._score_answer(case, response.answer or ""),
         }
@@ -232,6 +246,95 @@ class GoldenEvaluationService:
         reasons.extend(self._missing_terms(expected_tables, blob, "table"))
         return self._layer(not reasons, reasons)
 
+    def _score_execution(
+        self,
+        case: Dict[str, Any],
+        trace: Dict[str, Any],
+        query_executor: Optional[Callable[..., List[Dict[str, Any]]]],
+        merchant_id: str,
+    ) -> Dict[str, Any]:
+        contract = case.get("expectedResult") or case.get("expected_result") or {}
+        if not isinstance(contract, dict):
+            contract = {}
+        reference_sql = str(contract.get("sql") or case.get("referenceSql") or case.get("expectedSql") or "").strip()
+        expected_rows = contract.get("rows")
+        if expected_rows is None:
+            expected_rows = case.get("expectedRows")
+        applicable = bool(reference_sql or expected_rows is not None)
+        if not applicable:
+            return self._layer(True, [], applicable=False, details={"status": "not_configured"})
+
+        if reference_sql:
+            if query_executor is None:
+                return self._layer(
+                    False,
+                    ["reference_query_executor_unavailable"],
+                    applicable=True,
+                    details={"status": "reference_not_executed"},
+                )
+            if not self._safe_reference_sql(reference_sql):
+                return self._layer(False, ["unsafe_reference_sql"], applicable=True)
+            try:
+                params = [
+                    merchant_id if str(item) == "$merchant_id" else item
+                    for item in (contract.get("params") or case.get("referenceParams") or [])
+                ]
+                expected_rows = query_executor(reference_sql, params or None)
+            except TypeError:
+                expected_rows = query_executor(reference_sql)
+            except Exception as exc:
+                return self._layer(
+                    False,
+                    ["reference_sql_failed:%s" % str(exc)[:180]],
+                    applicable=True,
+                    details={"status": "reference_failed"},
+                )
+
+        actual_rows = self._actual_execution_rows(trace, contract)
+        if actual_rows is None:
+            return self._layer(False, ["agent_result_rows_missing"], applicable=True)
+        comparison = compare_execution_rows(
+            expected_rows or [],
+            actual_rows,
+            columns=contract.get("columns") or case.get("resultColumns") or [],
+            key_columns=contract.get("keyColumns") or case.get("resultKeyColumns") or [],
+            order_sensitive=bool(contract.get("orderSensitive", case.get("resultOrderSensitive", False))),
+            numeric_tolerance=float(contract.get("numericTolerance", case.get("numericTolerance", 0.0)) or 0.0),
+        )
+        return self._layer(
+            bool(comparison.get("matched")),
+            list(comparison.get("reasons") or []),
+            applicable=True,
+            details=comparison,
+        )
+
+    def _actual_execution_rows(self, trace: Dict[str, Any], contract: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        task_results = self._task_results(trace)
+        task_id = str(contract.get("taskId") or "")
+        selected = [
+            item
+            for item in task_results
+            if isinstance(item, dict)
+            and (not task_id or str(item.get("taskId") or item.get("task_id") or "") == task_id)
+        ]
+        if task_id and not selected:
+            return None
+        rows: List[Dict[str, Any]] = []
+        for item in selected:
+            bundle = item.get("queryBundle") or item.get("query_bundle") or {}
+            bundle_rows = bundle.get("rows") if isinstance(bundle, dict) else None
+            if isinstance(bundle_rows, list):
+                rows.extend(row for row in bundle_rows if isinstance(row, dict))
+        return rows if selected else None
+
+    def _safe_reference_sql(self, sql: str) -> bool:
+        normalized = " ".join(str(sql or "").strip().lower().split())
+        if not (normalized.startswith("select ") or normalized.startswith("with ")):
+            return False
+        forbidden = [" insert ", " update ", " delete ", " drop ", " alter ", " truncate ", " create ", " grant "]
+        padded = " %s " % normalized
+        return ";" not in normalized.rstrip(";") and not any(token in padded for token in forbidden)
+
     def _score_evidence(self, case: Dict[str, Any], trace: Dict[str, Any]) -> Dict[str, Any]:
         verified = trace.get("verifiedEvidence") or trace.get("verified_evidence") or {}
         gaps = trace.get("evidenceGaps") or trace.get("evidence_gaps") or []
@@ -277,6 +380,7 @@ class GoldenEvaluationService:
     ) -> Dict[str, Any]:
         passed = all(item.get("passed") for item in layers.values())
         failed_layers = [layer for layer, item in layers.items() if not item.get("passed")]
+        first_failed_layer = failed_layers[0] if failed_layers else ""
         return {
             "caseId": case.get("id", ""),
             "question": case.get("question", ""),
@@ -284,6 +388,7 @@ class GoldenEvaluationService:
             "durationMs": duration_ms,
             "passed": passed,
             "failedLayers": failed_layers,
+            "firstFailedLayer": first_failed_layer,
             "layers": layers,
             "error": error,
             "observability": evaluation_observability_record(trace),
@@ -295,8 +400,14 @@ class GoldenEvaluationService:
         passed = sum(1 for item in results if item.get("passed"))
         layer_scores = {}
         for layer in self.LAYERS:
-            layer_passed = sum(1 for item in results if (item.get("layers") or {}).get(layer, {}).get("passed"))
-            layer_scores[layer] = round(layer_passed / total, 4) if total else 0.0
+            applicable_items = [
+                item for item in results if (item.get("layers") or {}).get(layer, {}).get("applicable", True)
+            ]
+            layer_passed = sum(1 for item in applicable_items if (item.get("layers") or {}).get(layer, {}).get("passed"))
+            layer_scores[layer] = round(layer_passed / len(applicable_items), 4) if applicable_items else None
+        first_failure_breakdown = {
+            layer: sum(1 for item in results if item.get("firstFailedLayer") == layer) for layer in self.LAYERS
+        }
         return {
             "passed": passed,
             "failed": total - passed,
@@ -304,8 +415,13 @@ class GoldenEvaluationService:
             "recallAccuracy": layer_scores["recall"],
             "queryGraphAccuracy": layer_scores["queryGraph"],
             "sqlSuccessRate": layer_scores["sql"],
+            "executionAccuracy": layer_scores["execution"],
+            "executionCaseCount": sum(
+                1 for item in results if (item.get("layers") or {}).get("execution", {}).get("applicable", True)
+            ),
             "evidenceCoverageRate": layer_scores["evidence"],
             "answerAccuracy": layer_scores["answer"],
+            "firstFailureBreakdown": first_failure_breakdown,
         }
 
     def _governance_items(self, results: List[Dict[str, Any]], merchant_id: str) -> List[Dict[str, Any]]:
@@ -358,8 +474,22 @@ class GoldenEvaluationService:
             selected = selected[:limit]
         return selected
 
-    def _layer(self, passed: bool, reasons: List[str]) -> Dict[str, Any]:
-        return {"passed": bool(passed), "score": 1.0 if passed else 0.0, "reasons": reasons}
+    def _layer(
+        self,
+        passed: bool,
+        reasons: List[str],
+        applicable: bool = True,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "passed": bool(passed),
+            "score": 1.0 if passed else 0.0,
+            "applicable": bool(applicable),
+            "reasons": reasons,
+        }
+        if details is not None:
+            payload["details"] = details
+        return payload
 
     def _plan_intents(self, trace: Dict[str, Any]) -> List[Dict[str, Any]]:
         top_level = trace.get("planIntents") or trace.get("plan_intents") or []
@@ -452,6 +582,7 @@ class GoldenEvaluationService:
             "recall": "recall_index_or_semantic_asset_gap",
             "queryGraph": "query_graph_or_semantic_relationship_gap",
             "sql": "sql_execution_or_schema_gap",
+            "execution": "sql_execution_accuracy_gap",
             "evidence": "evidence_contract_gap",
             "answer": "answer_generation_gap",
         }.get(layer, "evaluation_gap")
@@ -461,6 +592,131 @@ class GoldenEvaluationService:
             "recall": "检查 ES 召回索引、术语别名、指标定义和 source type 覆盖",
             "queryGraph": "检查 QueryGraph anchor/dependent、join key、表关系和指标编译",
             "sql": "检查 SQL 字段白名单、商家过滤、时间窗、Doris 执行和修复策略",
+            "execution": "比较标准 SQL 与 Agent 结果，检查指标口径、聚合粒度、时间窗和过滤条件",
             "evidence": "检查 EvidenceVerifier 契约、requiredEvidenceIntents 和 blocking gap",
             "answer": "检查 AnswerAgent 是否基于证据完整表达且没有遗漏 gap",
         }.get(layer, "人工复核该评测失败原因")
+
+
+def compare_execution_rows(
+    expected_rows: Iterable[Dict[str, Any]],
+    actual_rows: Iterable[Dict[str, Any]],
+    columns: Iterable[str] = (),
+    key_columns: Iterable[str] = (),
+    order_sensitive: bool = False,
+    numeric_tolerance: float = 0.0,
+) -> Dict[str, Any]:
+    """Compare result sets by values rather than SQL text."""
+    selected_columns = [str(item) for item in columns if str(item)]
+    keys = [str(item) for item in key_columns if str(item)]
+    expected = [_project_row(row, selected_columns) for row in expected_rows if isinstance(row, dict)]
+    actual = [_project_row(row, selected_columns) for row in actual_rows if isinstance(row, dict)]
+    reasons: List[str] = []
+    if len(expected) != len(actual):
+        reasons.append("row_count_mismatch:expected=%d,actual=%d" % (len(expected), len(actual)))
+    if keys:
+        expected = sorted(expected, key=lambda row: _row_key(row, keys))
+        actual = sorted(actual, key=lambda row: _row_key(row, keys))
+    elif not order_sensitive:
+        expected = sorted(expected, key=_stable_row_text)
+        actual = sorted(actual, key=_stable_row_text)
+    mismatch_count = 0
+    mismatch_samples: List[Dict[str, Any]] = []
+    for index, (expected_row, actual_row) in enumerate(zip(expected, actual)):
+        row_reasons = _compare_row(expected_row, actual_row, numeric_tolerance)
+        if row_reasons:
+            mismatch_count += 1
+            if len(mismatch_samples) < 5:
+                mismatch_samples.append(
+                    {
+                        "index": index,
+                        "reasons": row_reasons,
+                        "expected": expected_row,
+                        "actual": actual_row,
+                    }
+                )
+    if mismatch_count:
+        reasons.append("row_value_mismatch:%d" % mismatch_count)
+    return {
+        "matched": not reasons,
+        "expectedRowCount": len(expected),
+        "actualRowCount": len(actual),
+        "mismatchCount": mismatch_count,
+        "numericTolerance": numeric_tolerance,
+        "orderSensitive": order_sensitive,
+        "keyColumns": keys,
+        "reasons": reasons,
+        "mismatchSamples": mismatch_samples,
+    }
+
+
+def _project_row(row: Dict[str, Any], columns: List[str]) -> Dict[str, Any]:
+    if columns:
+        return {column: _json_safe_value(row.get(column)) for column in columns}
+    return {
+        str(key): _json_safe_value(value)
+        for key, value in sorted(row.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return value
+
+
+def _row_key(row: Dict[str, Any], keys: List[str]) -> str:
+    return json.dumps([row.get(key) for key in keys], ensure_ascii=False, default=str)
+
+
+def _stable_row_text(row: Dict[str, Any]) -> str:
+    return json.dumps(row, ensure_ascii=False, default=str, sort_keys=True)
+
+
+def _compare_row(expected: Dict[str, Any], actual: Dict[str, Any], tolerance: float) -> List[str]:
+    reasons: List[str] = []
+    if set(expected) != set(actual):
+        reasons.append("columns_mismatch")
+    for column in sorted(set(expected) | set(actual)):
+        if not _values_equal(expected.get(column), actual.get(column), tolerance):
+            reasons.append("value_mismatch:%s" % column)
+    return reasons
+
+
+def _values_equal(expected: Any, actual: Any, tolerance: float) -> bool:
+    if expected is None or actual is None:
+        return expected is actual
+    expected_number = _decimal_value(expected)
+    actual_number = _decimal_value(actual)
+    if expected_number is not None and actual_number is not None:
+        difference = abs(expected_number - actual_number)
+        return difference <= Decimal(str(max(0.0, tolerance))) or math.isclose(
+            float(expected_number), float(actual_number), abs_tol=max(0.0, tolerance), rel_tol=0.0
+        )
+    return str(expected).strip() == str(actual).strip()
+
+
+def _decimal_value(value: Any) -> Optional[Decimal]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None

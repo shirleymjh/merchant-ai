@@ -27,6 +27,24 @@
               </ul>
             </section>
           </div>
+          <section v-if="analysisScopeVisible" class="scope-disclosure">
+            <Info :size="15" />
+            <div>
+              <b>分析范围</b>
+              <span>{{ analysisScopeText }}</span>
+            </div>
+          </section>
+          <section v-if="knowledgeProposals.length" class="knowledge-proposals">
+            <div class="experience-head">
+              <BookOpenCheck :size="16" />
+              <h3>待确认的业务知识</h3>
+            </div>
+            <article v-for="item in knowledgeProposals" :key="item.suggestionId">
+              <b>{{ item.metricName || '业务口径' }}</b>
+              <p>{{ item.correctionText || '本轮对话识别到可沉淀的业务规则。' }}</p>
+              <span>将作为 Topic 公共知识，审核发布后生效</span>
+            </article>
+          </section>
           <section v-if="experienceAlerts.length" class="experience-panel alerts">
             <div class="experience-head">
               <AlertTriangle :size="16" />
@@ -352,6 +370,20 @@ let toastTimer = null
 const experienceAlerts = computed(() => (props.merchantExperience?.anomalyAlerts || []).filter(Boolean).slice(0, 3))
 const businessAdvice = computed(() => (props.merchantExperience?.businessAdvice || []).filter(Boolean).slice(0, 2))
 const drillDownActions = computed(() => (props.merchantExperience?.drillDownActions || []).filter(action => action?.question).slice(0, 4))
+const analysisScope = computed(() => props.merchantExperience?.analysisScope || {})
+const analysisScopeVisible = computed(() => Boolean(
+  analysisScope.value?.scopeDisclosureRequired || analysisScope.value?.mode === 'topic_workspace'
+))
+const analysisScopeText = computed(() => {
+  const scope = analysisScope.value || {}
+  const topics = (scope.topics || []).filter(Boolean)
+  const label = topics.length ? topics.join(' + ') : '待确认'
+  const mode = scope.mode === 'topic_workspace' ? '跨 Topic Workspace' : '单 Topic'
+  return `${mode}：${label}（置信度 ${Math.round(Number(scope.confidence || 0) * 100)}%）`
+})
+const knowledgeProposals = computed(() => (props.merchantExperience?.knowledgeSuggestions || [])
+  .filter(item => item?.suggestionId)
+  .slice(0, 3))
 const disclosureItems = computed(() => {
   return (props.merchantExperience?.metricDisclosures || [])
     .map(item => item.description || item.displayName || item.metricKey)

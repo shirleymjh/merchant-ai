@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from decimal import Decimal
 from pathlib import Path
 from threading import Event, Lock
 
@@ -72,6 +73,7 @@ from merchant_ai.models import (
     TaskRole,
     ThreadData,
     TopicBuildRequest,
+    TopicRoutingDecision,
     ToolCallExecutionResult,
     ToolCallRequest,
     ToolCachePolicy,
@@ -157,7 +159,13 @@ from merchant_ai.services.memory import (
 )
 from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.merchant_profile import MerchantProfileStore, MerchantProfileSummaryService
-from merchant_ai.services.evaluation import GOLDEN_QUESTIONS, GoldenCaseLoader, GoldenEvaluationService, evaluation_observability_record
+from merchant_ai.services.evaluation import (
+    GOLDEN_QUESTIONS,
+    GoldenCaseLoader,
+    GoldenEvaluationService,
+    compare_execution_rows,
+    evaluation_observability_record,
+)
 from merchant_ai.services.repositories import PendingAnswerStore, write_json
 from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
@@ -204,6 +212,7 @@ from merchant_ai.services.query import (
     serialize_tool_execution_result,
     table_access_hint,
 )
+from merchant_ai.services.query_sql_binding import inclusive_day_interval, normalize_inclusive_relative_window_sql
 from merchant_ai.services.skill_worker import SkillWorkerExecutor
 from merchant_ai.services.sandbox import MerchantAnalysisSandbox
 from merchant_ai.services.skill_drafts import SkillDraftService
@@ -2824,6 +2833,37 @@ def test_multi_topic_route_does_not_assign_fixed_order_primary_topic():
     assert topic.primary_topic == QuestionCategory.UNKNOWN
     assert topic.recall_topics() == [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS]
     assert "primaryTopic 保持 UNKNOWN" in topic.reason
+
+
+def test_topic_workspace_policy_isolates_explicit_multi_topic_scope():
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    decision = TopicRoutingDecision(
+        candidate_topics=[QuestionCategory.TRADE, QuestionCategory.REFUND],
+        confidence=0.86,
+    )
+    slots = RouteSlots(route_confidence=0.86, risk_level="normal", time_window=RouteTimeWindow(days=30))
+    state = {"question": "最近30天订单和退款一起看", "request_context": ChatContext(), "route_decision_trace": []}
+
+    workflow.apply_topic_workspace_policy(state, decision, slots)
+
+    assert decision.routing_mode == "topic_workspace"
+    assert decision.primary_topic == QuestionCategory.UNKNOWN
+    assert state["topic_workspace"]["isolated"] is True
+    assert state["topic_workspace"]["allowCrossTopic"] is True
+    assert state["analysis_scope"]["scopeDisclosureRequired"] is True
+
+
+def test_topic_workspace_policy_requires_confirmation_for_low_confidence_scope():
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    decision = TopicRoutingDecision(candidate_topics=[QuestionCategory.TRADE], confidence=0.4)
+    slots = RouteSlots(route_confidence=0.4)
+    state = {"question": "看看情况", "request_context": ChatContext(), "route_decision_trace": []}
+
+    workflow.apply_topic_workspace_policy(state, decision, slots)
+
+    assert decision.routing_mode == "clarification_required"
+    assert decision.clarification_required is True
+    assert state["topic_workspace"]["isolated"] is False
 
 
 def test_first_step_topic_router_covers_coupon_activity_synonym():
@@ -7448,6 +7488,64 @@ def test_golden_case_loader_reads_jsonl_catalog():
     assert all(case.get("question") for case in cases)
 
 
+def test_execution_accuracy_compares_unordered_rows_and_numeric_tolerance():
+    matched = compare_execution_rows(
+        [{"spu_id": "b", "refund_amt": 20.0}, {"spu_id": "a", "refund_amt": 10.0}],
+        [{"spu_id": "a", "refund_amt": 10.001}, {"spu_id": "b", "refund_amt": 20}],
+        key_columns=["spu_id"],
+        numeric_tolerance=0.01,
+    )
+    failed = compare_execution_rows(
+        [{"order_cnt": 12}],
+        [{"order_cnt": 11}],
+    )
+
+    assert matched["matched"] is True
+    assert failed["matched"] is False
+    assert failed["reasons"] == ["row_value_mismatch:1"]
+
+    decimal_result = compare_execution_rows(
+        [{"gmv": Decimal("10.20")}],
+        [{"gmv": Decimal("10.20")}],
+    )
+    json.dumps(decimal_result)
+
+
+def test_golden_execution_layer_runs_reference_sql_and_locates_first_failure(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
+    service = GoldenEvaluationService(settings)
+    case = {
+        "id": "execution_order_count",
+        "question": "最近7天订单量是多少？",
+        "expectedResult": {
+            "sql": "SELECT COUNT(*) AS order_cnt FROM orders WHERE merchant_id = %s",
+            "params": ["100"],
+            "columns": ["order_cnt"],
+        },
+    }
+    response = ChatResponse(
+        id="execution_eval",
+        answer="订单量为11。",
+        debug_trace={
+            "taskResults": [
+                {"taskId": "order_count", "success": True, "queryBundle": {"failed": False, "rows": [{"order_cnt": 11}]}}
+            ]
+        },
+    )
+    captured = {}
+
+    def query_executor(sql, params=None):
+        captured.update({"sql": sql, "params": params})
+        return [{"order_cnt": 12}]
+
+    result = service.evaluate_case(case, "100", lambda *args, **kwargs: response, query_executor=query_executor)
+
+    assert result["layers"]["execution"]["passed"] is False
+    assert result["layers"]["execution"]["details"]["mismatchCount"] == 1
+    assert result["firstFailedLayer"] == "execution"
+    assert captured["params"] == ["100"]
+
+
 def test_golden_evaluation_service_scores_layers_and_governance_items(tmp_path):
     settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path)})
     service = GoldenEvaluationService(settings)
@@ -10694,7 +10792,7 @@ def test_detail_doris_resource_error_uses_split_query_fallback():
     assert result.query_bundle.runtime_events[0]["executionMode"] == "parallel_chunks"
     assert result.query_bundle.runtime_events[0]["maxConcurrency"] == 3
     assert any(item.tool_name == "execute_sql_split_fallback" for item in result.node_tool_traces)
-    assert len([sql for sql in doris.sqls if "DATE_SUB(CURDATE(), INTERVAL 7 DAY)" in sql]) >= 1
+    assert len([sql for sql in doris.sqls if "DATE_SUB(CURDATE(), INTERVAL 6 DAY)" in sql]) >= 1
     assert len(doris.sqls) >= 2
 
 
@@ -10874,7 +10972,7 @@ def test_node_agent_invalid_partition_filter_uses_structured_fallback_without_ll
     result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天")
     assert result.task_results[0].success
     assert result.sql_repairs[0].error_code == "INVALID_PARTITION_FILTER"
-    assert "DATE_SUB(CURDATE(), INTERVAL 30 DAY)" in result.task_results[0].query_bundle.sql
+    assert "DATE_SUB(CURDATE(), INTERVAL 29 DAY)" in result.task_results[0].query_bundle.sql
     assert "DATE_FORMAT" not in result.task_results[0].query_bundle.sql
     assert any(item.tool_name == "draft_structured_sql_fallback" for item in result.node_tool_traces)
     assert not any(item.tool_name == "repair_sql" for item in result.node_tool_traces)
@@ -13174,9 +13272,22 @@ def test_node_agent_anchors_relative_window_to_latest_partition_date():
     assert result.task_results[0].success
     executed_sql = doris.sqls[-1]
     assert "CURDATE()" not in executed_sql
-    assert "DATE_SUB('2026-06-24', INTERVAL 7 DAY)" in executed_sql
+    assert "DATE_SUB('2026-06-24', INTERVAL 6 DAY)" in executed_sql
     assert len(result.task_results[0].query_bundle.rows) == 1
     assert any(item.tool_name == "anchor_partition_date" for item in result.node_tool_traces)
+
+
+def test_relative_window_uses_inclusive_day_count():
+    assert inclusive_day_interval(1) == 0
+    assert inclusive_day_interval(7) == 6
+    assert inclusive_day_interval(30) == 29
+    assert (
+        normalize_inclusive_relative_window_sql(
+            "SELECT * FROM t WHERE pt >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)",
+            30,
+        )
+        == "SELECT * FROM t WHERE pt >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)"
+    )
 
 
 def test_node_agent_switches_to_realtime_fallback_when_offline_partition_is_stale():

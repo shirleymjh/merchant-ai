@@ -270,6 +270,8 @@ class MerchantQaWorkflow:
             recent_focus=MerchantRecentFocus(merchant_id=merchant_id),
             routing_decision=RoutingDecision(),
             topic_routing_decision=TopicRoutingDecision(),
+            topic_workspace={},
+            analysis_scope={},
             route_slots=RouteSlots(),
             route_decision_trace=[],
             clarification_resolution={},
@@ -681,7 +683,8 @@ class MerchantQaWorkflow:
 
     def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
         mode = str(getattr(self.settings, "lead_action_llm_mode", "always") or "always").lower()
-        allowed = [str(item) for item in decision.available_actions if item]
+        policy_allowed = [str(item) for item in decision.available_actions if item]
+        allowed = self.lead_llm_action_catalog(policy_allowed)
         is_fast_gate = {"try_fast_metric", "retrieve_knowledge"}.issubset(set(allowed))
         observation = state.get("main_agent_observations", [{}])[-1] if state.get("main_agent_observations") else {}
         trace: Dict[str, Any] = {
@@ -689,6 +692,7 @@ class MerchantQaWorkflow:
             "status": "skipped",
             "reason": "lead_action_llm_disabled",
             "deterministicAction": decision.selected_action,
+            "policyAllowedActions": policy_allowed,
             "allowedActions": allowed,
             "observation": observation,
         }
@@ -801,6 +805,13 @@ class MerchantQaWorkflow:
             source="lead_llm_tool",
         )
 
+    def lead_llm_action_catalog(self, action_ids: List[str]) -> List[str]:
+        """Hide equivalent compatibility actions while retaining deterministic fallbacks."""
+        catalog = list(dict.fromkeys(action_ids))
+        if "delegate_subagent" in catalog and "run_analysis_skill" in catalog:
+            catalog.remove("run_analysis_skill")
+        return catalog
+
     def adaptive_lead_llm_needed(self, state: AgentState, allowed: List[str], is_fast_gate: bool) -> bool:
         if remaining_run_budget_seconds(state, self.settings) <= 12:
             return False
@@ -827,7 +838,8 @@ class MerchantQaWorkflow:
             "专项深度分析只在已取得并校验经营数据后选择。只能从 allowedActions 中选择一个 action id，不创造新 action。"
             "当任务适合隔离上下文、文档分析、批量 Python 或多个独立 Worker 时可选择 delegate_subagent；"
             "当问题要求原因、归因、异常诊断或优先建议，且存在多个可验证经营假设时，优先选择 explore_hypotheses；"
-            "该工具会为每个假设独立规划和查询，再按证据淘汰或扩展，不要用共享结果冒充独立验证。"
+            "explore_hypotheses 会生成并执行新的独立 QueryGraph；delegate_subagent 的 hypothesis_review 只复核已有假设和证据，两者不可互换。"
+            "run_analysis_skill 是 delegate_subagent(analysis_skill) 的兼容快捷入口，不会与通用委派同时暴露给你。"
             "返回 JSON: {selectedAction:'', reason:''}。"
         )
         if not is_fast_gate:
@@ -1258,6 +1270,7 @@ class MerchantQaWorkflow:
                     "reason": forced_clarification_reason,
                 }
             )
+        self.apply_topic_workspace_policy(state, decision, route_slots)
         state["topic_routing_decision"] = decision
         try:
             always_rules = self.recall_service.topic_assets.always_apply_rules(
@@ -1277,6 +1290,13 @@ class MerchantQaWorkflow:
             )
             for item in always_rules[:40]
         )
+        state["knowledge_refresh"] = {
+            "policy": "refresh_each_user_turn",
+            "refreshedAt": datetime.now().isoformat(),
+            "topics": list((state.get("topic_workspace") or {}).get("topics") or []),
+            "alwaysApplyRuleCount": len(always_rules),
+            "historyAuthoritative": False,
+        }
         if always_rules:
             add_step(state, "Always Apply：已绕过普通召回并强制注入 %d 条 Topic 业务规则" % len(always_rules))
         state["topic_routed"] = True
@@ -1320,6 +1340,75 @@ class MerchantQaWorkflow:
             {"topic": decision.display_summary(), "openDiagnostic": self.open_diagnostic_debug(state), "routeSlots": route_slots.model_dump(by_alias=True)},
         )
         return state
+
+    def apply_topic_workspace_policy(
+        self,
+        state: AgentState,
+        decision: TopicRoutingDecision,
+        route_slots: RouteSlots,
+    ) -> None:
+        """Freeze the per-turn semantic boundary before retrieval and planning."""
+        topics = decision.recall_topics()
+        confidence = max(float(decision.confidence or 0.0), float(route_slots.route_confidence or 0.0))
+        min_confidence = float(getattr(self.settings, "route_topic_min_confidence", 0.52) or 0.52)
+        high_confidence = float(getattr(self.settings, "route_topic_high_confidence", 0.75) or 0.75)
+        context = state.get("request_context")
+        user_confirmed = bool(
+            context
+            and (
+                getattr(context, "clarification_resolved", False)
+                or getattr(context, "topics", None)
+                or getattr(context, "topic", "")
+            )
+        )
+        open_discovery = bool(
+            is_store_health_overview_question(state.get("question", ""))
+            or is_priority_recommendation_question(state.get("question", ""))
+            or (context and context.pending_clarification_type == "priority_goal")
+        )
+        if open_discovery:
+            mode = "open_discovery"
+            decision.clarification_required = False
+        elif decision.clarification_required or not topics or confidence < min_confidence:
+            mode = "clarification_required"
+            decision.clarification_required = True
+        elif len(topics) == 1 and confidence >= high_confidence:
+            mode = "single_topic"
+        elif len(topics) > 1:
+            mode = "topic_workspace"
+        elif user_confirmed:
+            mode = "single_topic"
+        else:
+            mode = "clarification_required"
+            decision.clarification_required = True
+            decision.reason = "; ".join(
+                item for item in [decision.reason, "单 Topic 路由未达到自动进入阈值，先由用户确认分析范围"] if item
+            )
+        topic_names = self._topic_names_for_categories(topics)
+        high_risk = str(route_slots.risk_level or "") in {"high_risk", "rule_sensitive"}
+        decision.routing_mode = mode
+        decision.workspace_topics = topics if mode not in {"clarification_required", "open_discovery"} else []
+        decision.scope_disclosure_required = bool(high_risk or mode == "topic_workspace")
+        workspace = {
+            "mode": mode,
+            "topics": topic_names,
+            "topicIds": [enum_value(item) for item in topics],
+            "confidence": round(confidence, 3),
+            "confirmedByUser": user_confirmed,
+            "isolated": mode in {"single_topic", "topic_workspace"},
+            "allowCrossTopic": mode == "topic_workspace",
+            "scopeDisclosureRequired": decision.scope_disclosure_required,
+            "knowledgeRefreshPolicy": "refresh_each_user_turn",
+        }
+        state["topic_workspace"] = workspace
+        state["analysis_scope"] = {
+            **workspace,
+            "riskLevel": str(route_slots.risk_level or "normal"),
+            "timeWindow": route_slots.time_window.model_dump(by_alias=True),
+            "objectRefs": [item.model_dump(by_alias=True) for item in route_slots.object_refs],
+            "displayText": "当前分析范围：%s" % (" + ".join(topic_names) if topic_names else "待确认"),
+        }
+        state.setdefault("route_decision_trace", []).append({"stage": "topic_workspace", **workspace})
 
     def fast_understand(self, state: AgentState) -> AgentState:
         started = now_ms()
@@ -3626,14 +3715,17 @@ class MerchantQaWorkflow:
         context = state.get("request_context")
         files = list(getattr(context, "offloaded_files", None) or [])
         question = str(state.get("question") or "").lower()
-        if files or "[用户附件上下文]" in question or any(token in question for token in ("文档", "附件", "报告", "pdf", "excel", "csv")):
+        if files or "[用户附件上下文]" in question:
             kinds.append("document_analysis")
         if any(str(path).lower().endswith(".py") for path in files):
             kinds.append("python_batch")
-        if state.get("query_graph_validated") and getattr(state.get("plan"), "intents", None):
+        if state.get("query_graph_validated") and not state.get("sql_generated") and getattr(state.get("plan"), "intents", None):
             kinds.append("query_node")
-        if state.get("evidence_graph_verified") and getattr(state.get("agent_run_result"), "task_results", None):
-            kinds.extend(["analysis_skill", "hypothesis_review"])
+        if self.policy.analysis_skill_needed(state):
+            kinds.append("analysis_skill")
+        hypotheses = list((state.get("hypothesis_exploration") or {}).get("hypotheses") or [])
+        if self.policy.hypothesis_exploration_needed(state) and hypotheses and getattr(state.get("agent_run_result"), "task_results", None):
+            kinds.append("hypothesis_review")
         return list(dict.fromkeys(kinds))
 
     def _build_delegation_plan(self, state: AgentState, allowed_kinds: List[str]) -> SubAgentDelegationPlan:
@@ -3644,12 +3736,19 @@ class MerchantQaWorkflow:
         if not llm or not getattr(llm, "configured", False) or not hasattr(llm, "tool_json_chat"):
             return fallback
         tool = delegate_subagent_tool(allowed_kinds)
+        hypotheses = list((state.get("hypothesis_exploration") or {}).get("hypotheses") or [])
         payload = {
             "question": state.get("question", ""),
             "availableTaskKinds": allowed_kinds,
             "hasValidatedQueryGraph": bool(state.get("query_graph_validated")),
             "hasVerifiedEvidence": bool(state.get("evidence_graph_verified")),
             "attachmentRefs": list(getattr(state.get("request_context"), "offloaded_files", None) or []),
+            "queryTasks": [
+                {"taskId": item.plan_task_id, "question": item.question, "answerMode": item.answer_mode}
+                for item in (state.get("plan") or QueryPlan()).intents[: max(1, int(self.settings.max_sub_agent_tasks or 1))]
+            ],
+            "matchedSkill": getattr(state.get("skill_match"), "skill_name", ""),
+            "hypothesisIds": [str(item.get("hypothesisId") or "") for item in hypotheses if isinstance(item, dict)],
             "instruction": "Only delegate self-contained work that benefits from isolation. Tasks marked parallel must be independent.",
         }
         try:
@@ -3675,11 +3774,13 @@ class MerchantQaWorkflow:
 
     def _fallback_delegation_plan(self, state: AgentState, allowed_kinds: List[str]) -> SubAgentDelegationPlan:
         question = str(state.get("question") or "")
+        lowered = question.lower()
         task_kind = ""
-        if "document_analysis" in allowed_kinds:
-            task_kind = "document_analysis"
-        elif "python_batch" in allowed_kinds:
+        python_requested = any(token in lowered for token in ("python", "批量分析", "批处理", "模拟计算", "运行脚本"))
+        if "python_batch" in allowed_kinds and python_requested:
             task_kind = "python_batch"
+        elif "document_analysis" in allowed_kinds:
+            task_kind = "document_analysis"
         elif "hypothesis_review" in allowed_kinds:
             task_kind = "hypothesis_review"
         elif "analysis_skill" in allowed_kinds:
@@ -3790,7 +3891,7 @@ class MerchantQaWorkflow:
             if not state.get("query_graph_validated") or not plan.intents:
                 raise ValueError("query_node delegation requires a validated QueryGraph")
             requested_id = str(inputs.get("taskId") or "")
-            intent = next((item for item in plan.intents if item.task_id == requested_id), plan.intents[0])
+            intent = next((item for item in plan.intents if item.plan_task_id == requested_id), plan.intents[0])
             return {
                 "intent": intent.model_dump(by_alias=True),
                 "assetPack": (state.get("planning_asset_pack") or PlanningAssetPack()).model_dump(by_alias=True),
@@ -4658,6 +4759,7 @@ class MerchantQaWorkflow:
             response.merchant_experience = {
                 **dict(response.merchant_experience or {}),
                 **dict(state.get("merchant_experience") or {}),
+                "analysisScope": state.get("analysis_scope", {}),
             }
             response.debug_trace = {
                 **dict(response.debug_trace or {}),
@@ -4713,6 +4815,8 @@ class MerchantQaWorkflow:
                 suggestions=state.get("suggestions", []),
                 personalization_context=self.answer_personalization_context(state),
             )
+        state["merchant_experience"] = dict(state.get("merchant_experience") or {})
+        state["merchant_experience"]["analysisScope"] = state.get("analysis_scope", {})
         governance = self.memory_governance_debug_payload(state)
         if governance:
             state["merchant_experience"] = dict(state.get("merchant_experience") or {})
@@ -4883,6 +4987,9 @@ class MerchantQaWorkflow:
                     "metricName": str(item.get("metricName") or ""),
                     "aliases": [str(value) for value in (item.get("aliases") or [])[:6]],
                     "correctionText": str(payload.get("correctionText") or "")[:240],
+                    "proposalKind": "knowledge",
+                    "classificationRequired": False,
+                    "scope": "topic",
                     "reviewAction": "approve_or_reject_before_publish",
                 }
             )

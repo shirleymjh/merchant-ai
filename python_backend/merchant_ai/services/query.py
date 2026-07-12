@@ -74,7 +74,9 @@ from merchant_ai.services.query_sql_binding import (
     bind_node_sql_parameters,
     blank_entity_value,
     has_merchant_filter_predicate,
+    inclusive_day_interval,
     is_dependent_context_column,
+    normalize_inclusive_relative_window_sql,
     parse_partition_date,
     partition_is_stale_for_near_realtime,
     quote_identifier,
@@ -1428,6 +1430,7 @@ class NodeWorkerExecutor:
         repair_attempts: List[SqlRepairAttempt] = []
         for round_index in range(self.settings.agent_sql_repair_rounds + 1):
             sql = self._enforce_identity_scope_sql(sql, contract, context)
+            sql = normalize_inclusive_relative_window_sql(sql, intent.days)
             validation_started = time.perf_counter()
             validation = self.validator.validate(sql, asset_pack)
             validation = self._node_scope_validation(validation, intent, sql, asset_pack)
@@ -2285,7 +2288,7 @@ class NodeWorkerExecutor:
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
                     "GROUP_AGG/TOPN 必须按 outputKeys 和 groupByColumn 分组并输出，不能丢失 coupon_id/spu_id/spu_name/sub_order_id/order_id/ticket_id/bill_id 等实体键；"
                     "如果表有 pt 且不是快照维表豁免，必须使用 nodePlanContract.days 生成时间窗过滤。"
-                    "pt 是 Doris DATE 分区列，时间窗必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N DAY)，不要使用 DATE_FORMAT('%Y%m%d')。"
+                    "pt 是 Doris DATE 分区列，最近N天包含今天/最新分区在内，时间窗下界必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N-1 DAY)，例如最近7天写 INTERVAL 6 DAY，最近30天写 INTERVAL 29 DAY；不要使用 DATE_FORMAT('%Y%m%d')。"
                     "没有倒排索引时不要假设索引存在；只选择 requiredColumns 中需要字段和过滤字段；明细 LIMIT <= 20。"
                     "不能修改 contract 里的指标、粒度、依赖或证据要求。"
                 ),
@@ -2416,7 +2419,8 @@ class NodeWorkerExecutor:
         if not anchor:
             return sql, ""
         anchor_text = anchor.isoformat()
-        anchored_sql = re.sub(r"\bCURDATE\(\)", "'%s'" % anchor_text, str(sql or ""), flags=re.I)
+        normalized_sql = normalize_inclusive_relative_window_sql(str(sql or ""), intent.days)
+        anchored_sql = re.sub(r"\bCURDATE\(\)", "'%s'" % anchor_text, normalized_sql, flags=re.I)
         if anchored_sql == sql:
             return sql, ""
         freshness.reason = append_note(freshness.reason, "relative time anchored to max_pt=%s" % anchor_text)
@@ -2824,7 +2828,7 @@ class NodeWorkerExecutor:
                 merchant_filter = "`seller_id` = %s" % sql_literal(context.merchant_id) if "seller_id" in columns else "1=1"
                 where.append("`pt` = (SELECT MAX(`pt`) FROM `%s` WHERE %s)" % (table, merchant_filter))
             elif not any("`pt`" in predicate for predicate in where):
-                where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % max(intent.days or 7, 1))
+                where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(intent.days or 7))
         return where
 
     def _repair_sql(

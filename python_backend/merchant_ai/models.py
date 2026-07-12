@@ -516,6 +516,9 @@ class TopicRoutingDecision(APIModel):
     dimension_topics: List[QuestionCategory] = Field(default_factory=list)
     confidence: float = 0.0
     clarification_required: bool = False
+    routing_mode: str = "open"
+    workspace_topics: List[QuestionCategory] = Field(default_factory=list)
+    scope_disclosure_required: bool = False
     reason: str = ""
 
     def recall_topics(self) -> List[QuestionCategory]:

@@ -60,6 +60,24 @@ def test_policy_offers_general_delegation_for_attachment():
     assert "retrieve_knowledge" in decision.available_actions
 
 
+def test_policy_does_not_delegate_without_real_attachment_input():
+    settings = get_settings().model_copy(update={"lead_agent_autonomous_enabled": False})
+    decision = V2AgentPolicy(settings).decide(
+        {
+            "data_discovered": False,
+            "topic_routed": True,
+            "fast_understood": True,
+            "fast_metric_attempted": False,
+            "route_slots": RouteSlots(),
+            "request_context": ChatContext(),
+            "question": "帮我分析一份还没有上传的报告",
+        }
+    )
+
+    assert decision.selected_action == "try_fast_metric"
+    assert "delegate_subagent" not in decision.available_actions
+
+
 def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
     settings = get_settings().model_copy(
         update={
@@ -69,6 +87,10 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
         }
     )
     workflow = create_workflow(settings)
+    assert workflow.lead_llm_action_catalog(["run_analysis_skill", "delegate_subagent", "answer_data"]) == [
+        "delegate_subagent",
+        "answer_data",
+    ]
     context = ChatContext()
     state = workflow._initial_state("总结附件", "100", context, None, "thread_delegate", "run_delegate")
     document = Path(state["thread_data"].workspace_path) / "report.md"

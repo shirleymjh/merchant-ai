@@ -10,6 +10,31 @@ from sqlglot import exp
 from merchant_ai.models import NodeExecutionContext, PlanningAssetPack, QuestionIntent
 
 
+def inclusive_day_interval(days: Any) -> int:
+    try:
+        value = int(days or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return max(value - 1, 0)
+
+
+def normalize_inclusive_relative_window_sql(sql: str, days: Any) -> str:
+    text = str(sql or "")
+    try:
+        requested_days = int(days or 0)
+    except (TypeError, ValueError):
+        requested_days = 0
+    if requested_days <= 0:
+        return text
+    inclusive_interval = inclusive_day_interval(requested_days)
+    pattern = re.compile(
+        r"DATE_SUB\(\s*(CURDATE\(\)|CURRENT_DATE(?:\(\))?)\s*,\s*INTERVAL\s+'?%d'?\s+DAY\s*\)"
+        % requested_days,
+        flags=re.I,
+    )
+    return pattern.sub(lambda match: "DATE_SUB(%s, INTERVAL %d DAY)" % (match.group(1), inclusive_interval), text)
+
+
 def split_detail_sql_by_pt_windows(sql: str, days: int, chunk_days: int, max_chunks: int, limit: int) -> List[str]:
     text = str(sql or "").strip()
     if not text or re.search(r"\b(group\s+by|union|join)\b", text, flags=re.I):
@@ -26,11 +51,11 @@ def split_detail_sql_by_pt_windows(sql: str, days: int, chunk_days: int, max_chu
             break
         upper = min(total_days, offset + window_days)
         lower = offset
-        lower_bound = "`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % upper
+        lower_bound = "`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(upper)
         if lower <= 0:
             upper_bound = "`pt` < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
         else:
-            upper_bound = "`pt` < DATE_SUB(CURDATE(), INTERVAL %d DAY)" % lower
+            upper_bound = "`pt` < DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(lower)
         chunk_sql = add_sql_where_condition(text, "(%s AND %s)" % (lower_bound, upper_bound))
         chunk_sql = replace_sql_limit(chunk_sql, capped_limit)
         result.append(chunk_sql)
