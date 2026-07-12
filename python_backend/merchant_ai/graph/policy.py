@@ -154,6 +154,14 @@ class AgentActionRegistry:
                 fallback_action="verify_evidence",
             ),
             AgentAction(
+                id="delegate_subagent",
+                node="delegate_subagent",
+                agent="LeadAgent",
+                description="delegate bounded document, Python, hypothesis, Skill or query work to isolated Sub-Agents",
+                expected_state_flags=["subagent_delegation_completed"],
+                fallback_action="answer_data",
+            ),
+            AgentAction(
                 id="explore_hypotheses",
                 node="explore_hypotheses",
                 agent="LeadAgent",
@@ -286,6 +294,8 @@ class V2AgentPolicy:
                 return ["retrieve_knowledge", "answer_rule"], "fast understanding classified rule-only; retrieve rule knowledge first", False
             if state.get("fast_metric_completed"):
                 return ["cache_answer"], "Lead Agent accepted verified fast-metric result", False
+            if self.general_delegation_needed(state):
+                return ["delegate_subagent", "retrieve_knowledge"], "request contains bounded document or Python work suitable for an isolated Sub-Agent", False
             if not state.get("fast_metric_attempted"):
                 return ["try_fast_metric", "retrieve_knowledge"], "Lead Agent may try the fast-metric capability or continue to semantic planning", False
             return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge has not been retrieved"), False
@@ -378,9 +388,15 @@ class V2AgentPolicy:
                 return ["repair_graph", "answer_data"], "evidence verifier found graph-repairable dependency gaps", False
             return ["answer_data"], "graph-repairable evidence gaps remain but repair budget is exhausted", True
         if self.hypothesis_exploration_needed(state):
-            return ["explore_hypotheses", "run_analysis_skill", "answer_data"], "verified baseline evidence is ready; LeadAgent may independently test competing hypotheses", False
+            actions = ["explore_hypotheses", "run_analysis_skill", "answer_data"]
+            if not state.get("subagent_delegation_attempted"):
+                actions.insert(1, "delegate_subagent")
+            return actions, "verified baseline evidence is ready; LeadAgent may independently delegate or test competing hypotheses", False
         if self.analysis_skill_needed(state):
-            return ["run_analysis_skill", "answer_data"], "verified evidence is ready; LeadAgent may dispatch isolated SkillWorker before final answer", False
+            actions = ["run_analysis_skill", "answer_data"]
+            if not state.get("subagent_delegation_attempted"):
+                actions.insert(1, "delegate_subagent")
+            return actions, "verified evidence is ready; LeadAgent may dispatch a general or Skill Sub-Agent before final answer", False
         if not state.get("chat_bi_completed"):
             return ["answer_data"], "ready to compose BI answer", False
         return ["cache_answer"], "answer is complete and can be cached", False
@@ -399,6 +415,8 @@ class V2AgentPolicy:
         if early_understanding and not state.get("fast_understood"):
             return ["fast_understand"]
         if early_understanding and state.get("fast_understood") and not state.get("fast_metric_attempted"):
+            if self.general_delegation_needed(state):
+                return ["delegate_subagent", "retrieve_knowledge"]
             return ["try_fast_metric", "retrieve_knowledge"]
         if self.has_pending_knowledge_requests(state):
             if int(state.get("query_graph_retrieve_count") or 0) < self.max_retrieve_actions and not self.knowledge_recall_stalled(state):
@@ -457,14 +475,28 @@ class V2AgentPolicy:
                 return ["repair_graph", "answer_data"]
             return ["answer_data"]
         if state.get("evidence_graph_verified") and self.hypothesis_exploration_needed(state):
-            return ["explore_hypotheses", "run_analysis_skill", "answer_data"]
+            actions = ["explore_hypotheses", "run_analysis_skill", "answer_data"]
+            return actions if state.get("subagent_delegation_attempted") else [actions[0], "delegate_subagent"] + actions[1:]
         if state.get("evidence_graph_verified") and self.analysis_skill_needed(state):
-            return ["run_analysis_skill", "answer_data"]
+            actions = ["run_analysis_skill", "answer_data"]
+            return actions if state.get("subagent_delegation_attempted") else [actions[0], "delegate_subagent"] + actions[1:]
         if state.get("evidence_graph_verified") or state.get("planner_provider_error") or (has_plan and validation and not validation.valid):
             return ["answer_data"]
         if state.get("chat_bi_completed"):
             return ["cache_answer"]
         return []
+
+    def general_delegation_needed(self, state: AgentState) -> bool:
+        if state.get("subagent_delegation_attempted"):
+            return False
+        context = state.get("request_context")
+        files = list(getattr(context, "offloaded_files", None) or [])
+        question = str(state.get("question") or "").lower()
+        document_signal = bool(files) or "[用户附件上下文]" in question or any(
+            token in question for token in ("文档", "附件", "报告", "pdf", "excel", "csv")
+        )
+        python_signal = any(token in question for token in ("python", "批量分析", "批处理", "模拟计算"))
+        return document_signal or python_signal
 
     def has_unresolved_planning_work(self, state: AgentState) -> bool:
         plan = state.get("plan")

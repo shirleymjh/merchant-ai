@@ -77,8 +77,19 @@ def test_distributed_worker_round_trip_persists_result_artifact(tmp_path):
 
     assert result.status == "completed"
     assert result.result == {"answer": "MERCHANT INSIGHT"}
+    assert result.contract
+    assert result.contract["status"] == "completed"
+    assert result.contract["summary"] == "MERCHANT INSIGHT"
+    assert result.contract["recommendedNextAction"] == "return_to_lead_agent"
+    assert result.contract["retryable"] is False
+    assert result.contract["artifactRefs"]
     assert result.artifact_uri
     assert Path(result.artifact_uri).exists()
+
+    summary_only = client.wait("run_1", "task_1", read_artifact=False)
+    assert summary_only.result == {}
+    assert summary_only.contract["summary"] == "MERCHANT INSIGHT"
+    assert summary_only.contract["artifactRefs"]
 
 
 def test_distributed_client_waits_for_independent_worker_loop(tmp_path):

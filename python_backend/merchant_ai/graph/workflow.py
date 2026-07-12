@@ -75,6 +75,8 @@ from merchant_ai.models import (
     SkillDraft,
     SkillLifecycleRecord,
     SkillMatchState,
+    SubAgentDelegationPlan,
+    SubAgentDelegationTask,
     TOPIC_TO_CATEGORY,
     ToolCallRequest,
     ToolCachePolicy,
@@ -118,10 +120,16 @@ from merchant_ai.services.repositories import AnswerRepository, DorisRepository,
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService, route_primary_topic
 from merchant_ai.services.skill_drafts import SkillDraftService
+from merchant_ai.services.distributed_workers import (
+    DistributedSubAgentClient,
+    builtin_worker_handlers,
+    normalize_subagent_result,
+)
 from merchant_ai.services.tools import (
     artifact_file_tool_definitions,
     artifact_file_tool_schemas,
     lead_action_selection_tool,
+    delegate_subagent_tool,
     node_runtime_tool_schemas,
     semantic_file_tool_definitions,
     semantic_file_tool_schemas,
@@ -372,6 +380,10 @@ class MerchantQaWorkflow:
             answer="",
             analysis_summary="",
             analysis_skill_trace={},
+            subagent_delegation_plan={},
+            subagent_delegation_results=[],
+            subagent_delegation_attempted=False,
+            subagent_delegation_completed=False,
             confirmation_evidence_reused=False,
             analysis_skill_bypassed=False,
             skill_match=SkillMatchState(),
@@ -436,6 +448,7 @@ class MerchantQaWorkflow:
         builder.add_node("verify_evidence_graph", self.verify_evidence_graph)
         builder.add_node("explore_hypotheses", self.explore_hypotheses)
         builder.add_node("run_analysis_skill", self.run_analysis_skill)
+        builder.add_node("delegate_subagent", self.delegate_subagent)
         builder.add_node("answer_rule", self.answer_rule)
         builder.add_node("answer_analysis", self.answer_analysis)
         builder.add_node("human_in_loop", self.human_in_loop)
@@ -464,6 +477,7 @@ class MerchantQaWorkflow:
                 "verify_evidence_graph": "verify_evidence_graph",
                 "explore_hypotheses": "explore_hypotheses",
                 "run_analysis_skill": "run_analysis_skill",
+                "delegate_subagent": "delegate_subagent",
                 "answer_rule": "answer_rule",
                 "answer_analysis": "answer_analysis",
                 "human_in_loop": "human_in_loop",
@@ -487,6 +501,7 @@ class MerchantQaWorkflow:
             "verify_evidence_graph",
             "explore_hypotheses",
             "run_analysis_skill",
+            "delegate_subagent",
         ]:
             builder.add_edge(node, "policy")
         builder.add_edge("answer_rule", "cache_answer")
@@ -793,6 +808,7 @@ class MerchantQaWorkflow:
         strategic = bool(
             is_fast_gate
             or "explore_hypotheses" in allowed_set
+            or "delegate_subagent" in allowed_set
             or {"execute_graph_direct", "execute_graph_agent"}.issubset(allowed_set)
             or ("run_analysis_skill" in allowed_set and "answer_data" in allowed_set)
             or ("repair_graph" in allowed_set and bool(getattr(state.get("query_graph_validation_result"), "gaps", None)))
@@ -809,6 +825,7 @@ class MerchantQaWorkflow:
             "Harness 已经移除了不满足权限或安全前置条件的工具；不要机械遵循固定流水线，也不要重复没有新增信息的动作。"
             "在证据不足时继续检索、规划、修复或执行；只有证据已经校验或必须明确披露缺口时才回答。"
             "专项深度分析只在已取得并校验经营数据后选择。只能从 allowedActions 中选择一个 action id，不创造新 action。"
+            "当任务适合隔离上下文、文档分析、批量 Python 或多个独立 Worker 时可选择 delegate_subagent；"
             "当问题要求原因、归因、异常诊断或优先建议，且存在多个可验证经营假设时，优先选择 explore_hypotheses；"
             "该工具会为每个假设独立规划和查询，再按证据淘汰或扩展，不要用共享结果冒充独立验证。"
             "返回 JSON: {selectedAction:'', reason:''}。"
@@ -3512,6 +3529,313 @@ class MerchantQaWorkflow:
         self.finish_run_step(state, step, "success", output_summary="answerChars=%d" % len(state.get("answer", "")))
         emit(state, "node.completed", "ANSWER_RULE", {"answerReady": bool(state["answer"])})
         return state
+
+    def delegate_subagent(self, state: AgentState) -> AgentState:
+        """Formal Lead Agent action for bounded, worker-independent delegation."""
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "delegate_subagent",
+            "LeadAgent",
+            "DELEGATE_SUBAGENT",
+            input_summary=str(state.get("question") or "")[:300],
+        )
+        increment_round(state)
+        state["subagent_delegation_attempted"] = True
+        emit(state, "node.started", "DELEGATE_SUBAGENT", {})
+        allowed_kinds = self._allowed_delegation_kinds(state)
+        plan = self._build_delegation_plan(state, allowed_kinds)
+        state["subagent_delegation_plan"] = plan.model_dump(by_alias=True)
+        if not plan.tasks:
+            contract = normalize_subagent_result(
+                "delegate_subagent",
+                "failed",
+                {},
+                "no safe, bounded Sub-Agent task could be constructed",
+            )
+            contract["recommendedNextAction"] = "continue_in_lead_agent"
+            state["subagent_delegation_results"] = [contract]
+            state["subagent_delegation_completed"] = True
+            self.finish_run_step(state, step, "partial", output_summary="no delegable task", error_code="NO_DELEGABLE_TASK")
+            emit(state, "node.completed", "DELEGATE_SUBAGENT", {"completed": True, "taskCount": 0})
+            return state
+
+        tasks = list(plan.tasks)[: max(1, int(self.settings.max_sub_agent_tasks or 1))]
+        results: List[Dict[str, Any]] = []
+        if plan.parallel and len(tasks) > 1:
+            workers = min(len(tasks), max(1, int(self.settings.max_concurrent_sub_agents or 1)))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lead-delegate") as pool:
+                futures = {
+                    pool.submit(self._execute_delegation_task, state, task, plan.failure_strategy, plan.read_artifact_policy): task
+                    for task in tasks
+                }
+                for future in as_completed(futures):
+                    task = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        results.append(normalize_subagent_result(task.task_kind, "failed", {}, str(exc)))
+        else:
+            for task in tasks:
+                results.append(self._execute_delegation_task(state, task, plan.failure_strategy, plan.read_artifact_policy))
+
+        state["subagent_delegation_results"] = results
+        state["subagent_delegation_completed"] = True
+        completed = [item for item in results if item.get("status") == "completed"]
+        summaries = [str(item.get("summary") or "").strip() for item in completed if str(item.get("summary") or "").strip()]
+        if summaries:
+            delegated_summary = "\n".join("- %s" % text for text in summaries)
+            prior = str(state.get("analysis_summary") or "").strip()
+            state["analysis_summary"] = "\n".join(item for item in (prior, "Sub-Agent 结果：\n%s" % delegated_summary) if item)
+        observations = list(state.get("main_agent_observations") or [])
+        observations.append(
+            {
+                "stage": "delegate_subagent",
+                "summary": "%d/%d Sub-Agent tasks completed" % (len(completed), len(results)),
+                "plan": plan.model_dump(by_alias=True),
+                "results": results,
+            }
+        )
+        state["main_agent_observations"] = observations
+        status = "success" if len(completed) == len(results) else "partial"
+        self.record_span(
+            state,
+            "worker",
+            "lead_agent.delegate_subagent",
+            started,
+            status=status,
+            metadata={"taskKinds": [task.task_kind for task in tasks], "parallel": plan.parallel, "failureStrategy": plan.failure_strategy},
+        )
+        self.finish_run_step(
+            state,
+            step,
+            status,
+            output_summary="completed=%d total=%d" % (len(completed), len(results)),
+            error_code="" if status == "success" else "SUBAGENT_PARTIAL_FAILURE",
+        )
+        emit(
+            state,
+            "node.completed",
+            "DELEGATE_SUBAGENT",
+            {"completed": True, "taskCount": len(results), "successCount": len(completed), "parallel": plan.parallel},
+        )
+        return state
+
+    def _allowed_delegation_kinds(self, state: AgentState) -> List[str]:
+        kinds: List[str] = []
+        context = state.get("request_context")
+        files = list(getattr(context, "offloaded_files", None) or [])
+        question = str(state.get("question") or "").lower()
+        if files or "[用户附件上下文]" in question or any(token in question for token in ("文档", "附件", "报告", "pdf", "excel", "csv")):
+            kinds.append("document_analysis")
+        if any(str(path).lower().endswith(".py") for path in files):
+            kinds.append("python_batch")
+        if state.get("query_graph_validated") and getattr(state.get("plan"), "intents", None):
+            kinds.append("query_node")
+        if state.get("evidence_graph_verified") and getattr(state.get("agent_run_result"), "task_results", None):
+            kinds.extend(["analysis_skill", "hypothesis_review"])
+        return list(dict.fromkeys(kinds))
+
+    def _build_delegation_plan(self, state: AgentState, allowed_kinds: List[str]) -> SubAgentDelegationPlan:
+        fallback = self._fallback_delegation_plan(state, allowed_kinds)
+        if not allowed_kinds:
+            return fallback
+        llm = getattr(self.planner, "llm", None)
+        if not llm or not getattr(llm, "configured", False) or not hasattr(llm, "tool_json_chat"):
+            return fallback
+        tool = delegate_subagent_tool(allowed_kinds)
+        payload = {
+            "question": state.get("question", ""),
+            "availableTaskKinds": allowed_kinds,
+            "hasValidatedQueryGraph": bool(state.get("query_graph_validated")),
+            "hasVerifiedEvidence": bool(state.get("evidence_graph_verified")),
+            "attachmentRefs": list(getattr(state.get("request_context"), "offloaded_files", None) or []),
+            "instruction": "Only delegate self-contained work that benefits from isolation. Tasks marked parallel must be independent.",
+        }
+        try:
+            raw = llm.tool_json_chat(
+                "你是 Lead Agent 的受限委派规划器。只可使用给定 task kind；文件、查询和数据输入会由 Runtime 重新校验。",
+                json.dumps(payload, ensure_ascii=False, default=str),
+                tool.openai_schema(),
+                fallback.model_dump(by_alias=True),
+                timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
+            )
+            plan = SubAgentDelegationPlan.model_validate(raw or fallback.model_dump(by_alias=True))
+        except Exception:
+            return fallback
+        valid_tasks = [task for task in plan.tasks if task.task_kind in allowed_kinds and task.objective.strip()]
+        return plan.model_copy(
+            update={
+                "tasks": valid_tasks[: max(1, int(self.settings.max_sub_agent_tasks or 1))],
+                "isolation_mode": "worker",
+                "failure_strategy": plan.failure_strategy if plan.failure_strategy in {"retry", "fallback", "repair", "continue_partial"} else "continue_partial",
+                "read_artifact_policy": plan.read_artifact_policy if plan.read_artifact_policy in {"on_completion", "summary_first"} else "on_completion",
+            }
+        )
+
+    def _fallback_delegation_plan(self, state: AgentState, allowed_kinds: List[str]) -> SubAgentDelegationPlan:
+        question = str(state.get("question") or "")
+        task_kind = ""
+        if "document_analysis" in allowed_kinds:
+            task_kind = "document_analysis"
+        elif "python_batch" in allowed_kinds:
+            task_kind = "python_batch"
+        elif "hypothesis_review" in allowed_kinds:
+            task_kind = "hypothesis_review"
+        elif "analysis_skill" in allowed_kinds:
+            task_kind = "analysis_skill"
+        elif "query_node" in allowed_kinds:
+            task_kind = "query_node"
+        tasks = []
+        if task_kind:
+            tasks.append(
+                SubAgentDelegationTask(
+                    task_kind=task_kind,
+                    objective=question or "完成隔离分析并返回证据与缺口",
+                    inputs={},
+                    expected_outputs=["summary", "evidenceRefs", "gaps"],
+                    timeout=min(120, int(self.settings.distributed_worker_result_timeout_seconds or 120)),
+                )
+            )
+        return SubAgentDelegationPlan(tasks=tasks, parallel=False, reason="deterministic safe delegation fallback")
+
+    def _execute_delegation_task(
+        self,
+        state: AgentState,
+        task: SubAgentDelegationTask,
+        failure_strategy: str,
+        read_artifact_policy: str,
+    ) -> Dict[str, Any]:
+        timeout = max(1, min(int(task.timeout or 60), int(self.settings.distributed_worker_result_timeout_seconds or 180)))
+        try:
+            request = self._delegation_request(state, task, timeout)
+        except Exception as exc:
+            contract = normalize_subagent_result(task.task_kind, "failed", {}, "invalid delegation input: %s" % str(exc))
+            contract["recommendedNextAction"] = "repair_delegation"
+            return contract
+        attempts = 2 if failure_strategy == "retry" else 1
+        contract: Dict[str, Any] = {}
+        actual_attempts = 0
+        for attempt in range(attempts):
+            actual_attempts = attempt + 1
+            task_id = "delegate_%s_%s" % (re.sub(r"[^a-zA-Z0-9_-]+", "_", task.task_kind), uuid.uuid4().hex[:12])
+            if bool(self.settings.distributed_subagents_enabled):
+                result = DistributedSubAgentClient(self.settings).execute(
+                    str(state.get("run_id") or state.get("qa_id") or "delegation"),
+                    task_id,
+                    task.task_kind,
+                    request,
+                    timeout,
+                    read_artifact=read_artifact_policy == "on_completion",
+                )
+                contract = dict(result.contract or normalize_subagent_result(task.task_kind, result.status, result.result, result.error, result.artifact_uri))
+            else:
+                handler = builtin_worker_handlers(self.settings).get(task.task_kind)
+                if not handler:
+                    contract = normalize_subagent_result(task.task_kind, "failed", {}, "unsupported task kind")
+                else:
+                    try:
+                        payload = handler(request, lambda: bool(state.get("run_canceled")))
+                        contract = normalize_subagent_result(task.task_kind, "completed", payload)
+                    except Exception as exc:
+                        contract = normalize_subagent_result(task.task_kind, "failed", {}, "%s: %s" % (type(exc).__name__, str(exc)))
+            if contract.get("status") == "completed" or not contract.get("retryable") or attempt + 1 >= attempts:
+                break
+        contract["objective"] = task.objective
+        contract["expectedOutputs"] = list(task.expected_outputs)
+        contract["attempts"] = actual_attempts
+        if contract.get("status") != "completed" and failure_strategy == "fallback":
+            contract["recommendedNextAction"] = "fallback_to_lead_agent"
+        elif contract.get("status") != "completed" and failure_strategy == "repair":
+            contract["recommendedNextAction"] = "repair_delegation"
+        return contract
+
+    def _delegation_request(self, state: AgentState, task: SubAgentDelegationTask, timeout: int) -> Dict[str, Any]:
+        inputs = dict(task.inputs or {})
+        if task.task_kind == "document_analysis":
+            content = self._delegation_document_content(state)
+            if not content:
+                raise ValueError("no readable document content in current task workspace")
+            return {"content": content, "question": task.objective or state.get("question", "")}
+        if task.task_kind == "python_batch":
+            script = self._approved_delegation_script(state, str(inputs.get("scriptPath") or ""))
+            return {
+                "scriptPath": str(script),
+                "workspacePath": state["thread_data"].outputs_path,
+                "args": [str(item) for item in inputs.get("args") or []][:20],
+                "timeoutSeconds": timeout,
+            }
+        if task.task_kind == "hypothesis_review":
+            return {
+                "hypotheses": dict(state.get("hypothesis_exploration") or {}),
+                "runResult": (state.get("agent_run_result") or AgentRunResult()).model_dump(by_alias=True),
+            }
+        if task.task_kind == "analysis_skill":
+            match = state.get("skill_match") or SkillMatchState()
+            skill_name = str(inputs.get("skillName") or getattr(match, "skill_name", "") or "")
+            if not skill_name:
+                raise ValueError("no reviewed analysis skill is available")
+            return {
+                "question": task.objective or state.get("question", ""),
+                "plan": (state.get("plan") or QueryPlan()).model_dump(by_alias=True),
+                "runResult": (state.get("agent_run_result") or AgentRunResult()).model_dump(by_alias=True),
+                "outputsPath": state["thread_data"].outputs_path,
+                "ruleContext": state.get("rule_recall_context", ""),
+                "skillName": skill_name,
+                "merchant": state["merchant"].model_dump(by_alias=True),
+                "personalizationContext": self.answer_personalization_context(state),
+            }
+        if task.task_kind == "query_node":
+            plan = state.get("plan") or QueryPlan()
+            if not state.get("query_graph_validated") or not plan.intents:
+                raise ValueError("query_node delegation requires a validated QueryGraph")
+            requested_id = str(inputs.get("taskId") or "")
+            intent = next((item for item in plan.intents if item.task_id == requested_id), plan.intents[0])
+            return {
+                "intent": intent.model_dump(by_alias=True),
+                "assetPack": (state.get("planning_asset_pack") or PlanningAssetPack()).model_dump(by_alias=True),
+                "knowledgeContext": knowledge_context(state),
+                "context": {
+                    "merchantId": state.get("requested_merchant_id", ""),
+                    "effectiveUserId": str((state.get("user_identity") or {}).get("userId") or ""),
+                    "authorizedRegion": str((state.get("user_identity") or {}).get("region") or ""),
+                    "authorizedStoreIds": list((state.get("user_identity") or {}).get("storeIds") or []),
+                    "accessRole": state.get("access_role", "merchant_analyst"),
+                    "question": task.objective or state.get("question", ""),
+                    "subAgentRunId": str(state.get("run_id") or ""),
+                    "workspacePath": state["thread_data"].workspace_path,
+                },
+            }
+        raise ValueError("unsupported task kind: %s" % task.task_kind)
+
+    def _delegation_document_content(self, state: AgentState) -> str:
+        context = state.get("request_context")
+        refs = list(getattr(context, "offloaded_files", None) or [])
+        allowed_roots = [Path(state["thread_data"].workspace_path).resolve(), self.settings.resolved_workspace_path.resolve()]
+        chunks: List[str] = []
+        for ref in refs[:10]:
+            path = Path(str(ref)).expanduser().resolve()
+            if not any(path.is_relative_to(root) for root in allowed_roots) or not path.is_file():
+                continue
+            try:
+                chunks.append("## %s\n%s" % (path.name, path.read_text(encoding="utf-8", errors="replace")[:100_000]))
+            except OSError:
+                continue
+        question = str(state.get("question") or "")
+        if "[用户附件上下文]" in question:
+            chunks.append(question.split("[用户附件上下文]", 1)[1][:100_000])
+        return "\n\n".join(chunks)[:100_000]
+
+    def _approved_delegation_script(self, state: AgentState, requested: str) -> Path:
+        context = state.get("request_context")
+        refs = [Path(str(item)).expanduser().resolve() for item in (getattr(context, "offloaded_files", None) or []) if str(item).lower().endswith(".py")]
+        candidate = requested or (refs[0] if refs else "")
+        if not candidate:
+            raise ValueError("python_batch requires a .py attachment")
+        path = Path(candidate).expanduser().resolve()
+        if path.suffix.lower() != ".py" or not path.is_file() or path not in refs:
+            raise ValueError("scriptPath is not a Python attachment from the current request")
+        return path
 
     def run_analysis_skill(self, state: AgentState) -> AgentState:
         started = now_ms()

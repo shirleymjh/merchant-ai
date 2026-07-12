@@ -162,7 +162,7 @@ def canonical_tool_registry(extra_descriptions: Mapping[str, str] | None = None)
     definitions = (
         semantic_file_tool_definitions()
         + artifact_file_tool_definitions()
-        + [sql_draft_tool(), sql_repair_tool(), lead_action_selection_tool([])]
+        + [sql_draft_tool(), sql_repair_tool(), lead_action_selection_tool([]), delegate_subagent_tool([])]
     )
     for definition in definitions:
         registry.register(default_tool_capability(definition.name, definition.description))
@@ -446,6 +446,36 @@ def lead_action_selection_tool(action_ids: Iterable[str]) -> AgentToolDefinition
                 "reason": string_property("short decision reason"),
             },
             required=["actionId", "reason"],
+        ),
+    )
+
+
+def delegate_subagent_tool(task_kinds: Iterable[str]) -> AgentToolDefinition:
+    """Formal Lead Agent tool for bounded, isolated worker delegation."""
+    kinds = sorted({str(item) for item in task_kinds if str(item or "").strip()})
+    task = object_schema(
+        {
+            "taskKind": string_property("worker capability selected for this task", kinds),
+            "objective": string_property("self-contained objective for the isolated Sub-Agent"),
+            "inputs": {"type": "object", "description": "bounded task inputs; runtime validates and enriches these", "additionalProperties": True},
+            "expectedOutputs": array_property("outputs required by the Lead Agent", string_property("output name or acceptance criterion")),
+            "timeout": integer_property("hard task timeout in seconds", 1),
+        },
+        required=["taskKind", "objective", "inputs", "expectedOutputs", "timeout"],
+    )
+    return AgentToolDefinition(
+        name="delegate_subagent",
+        description="Delegate one or more independent, bounded tasks to isolated workers and return a uniform result contract.",
+        parameters=object_schema(
+            {
+                "tasks": array_property("bounded Sub-Agent tasks", task),
+                "parallel": boolean_property("run independent tasks concurrently"),
+                "isolationMode": string_property("execution isolation", ["worker"]),
+                "readArtifactPolicy": string_property("when the Lead Agent should read result artifacts", ["on_completion", "summary_first"]),
+                "failureStrategy": string_property("strategy when a task fails", ["retry", "fallback", "repair", "continue_partial"]),
+                "reason": string_property("why delegation is preferable to continuing in the Lead Agent context"),
+            },
+            required=["tasks", "parallel", "isolationMode", "readArtifactPolicy", "failureStrategy", "reason"],
         ),
     )
 

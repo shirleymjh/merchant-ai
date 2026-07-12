@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from merchant_ai.config import Settings
+from merchant_ai.models import SubAgentResultEnvelope
 from merchant_ai.services.runtime_state import NodeTaskState, RuntimeStateStore, create_runtime_state_store, safe_name
 
 
@@ -31,6 +32,62 @@ class DistributedTaskResult:
     result: Dict[str, Any]
     artifact_uri: str = ""
     error: str = ""
+    contract: Dict[str, Any] | None = None
+
+
+def normalize_subagent_result(
+    task_kind: str,
+    status: str,
+    payload: Optional[Dict[str, Any]] = None,
+    error: str = "",
+    artifact_uri: str = "",
+) -> Dict[str, Any]:
+    """Translate every worker result into the stable Lead Agent contract."""
+    body = dict(payload or {})
+    normalized_status = str(status or "failed").lower()
+    answer = str(body.get("summary") or body.get("answer") or "").strip()
+    if not answer and task_kind == "python_batch":
+        answer = str(body.get("stdout") or body.get("stderr") or "").strip()
+    if not answer and task_kind == "hypothesis_review":
+        answer = "已完成 %d 项假设复核" % len(body.get("reviews") or [])
+    if not answer and normalized_status == "completed":
+        answer = "%s task completed" % (task_kind or "sub-agent")
+    message = str(error or body.get("error") or "").strip()
+    if task_kind == "python_batch" and int(body.get("returncode") or 0) != 0:
+        message = str(body.get("stderr") or "python batch exited with return code %s" % body.get("returncode")).strip()
+    elif task_kind == "query_node" and body.get("success") is False:
+        message = str(body.get("errorMessage") or body.get("error") or "query node reported failure").strip()
+    elif task_kind == "analysis_skill" and isinstance(body.get("trace"), dict) and body["trace"].get("error"):
+        message = str(body["trace"].get("error") or "analysis skill reported failure").strip()
+    retryable = normalized_status in {"timeout", "canceled"} or any(
+        token in message.lower() for token in ("timeout", "temporar", "connection", "provider")
+    )
+    if normalized_status == "completed" and message:
+        normalized_status = "failed"
+    if normalized_status == "completed":
+        next_action = "return_to_lead_agent"
+    elif retryable:
+        next_action = "retry_or_switch_strategy"
+    else:
+        next_action = "fallback_to_lead_agent"
+    gaps = list(body.get("gaps") or [])
+    if message:
+        gaps.append({"code": "SUBAGENT_ERROR", "message": message[:1000]})
+    artifacts = list(body.get("artifactRefs") or body.get("artifact_refs") or [])
+    if artifact_uri:
+        artifacts.append({"uri": artifact_uri, "kind": "subagent_result"})
+    envelope = SubAgentResultEnvelope(
+        task_kind=task_kind,
+        status=normalized_status,
+        summary=(answer or message)[:2000],
+        evidence_refs=list(body.get("evidenceRefs") or body.get("evidence_refs") or []),
+        artifact_refs=artifacts,
+        gaps=gaps,
+        recommended_next_action=next_action,
+        retryable=retryable,
+        payload=body,
+    )
+    return envelope.model_dump(by_alias=True)
 
 
 class DistributedArtifactStore:
@@ -124,19 +181,29 @@ class DistributedSubAgentClient:
         )
         return self.state_store.enqueue_node_task(state)
 
-    def wait(self, run_id: str, task_id: str, timeout_seconds: Optional[int] = None) -> DistributedTaskResult:
+    def wait(
+        self,
+        run_id: str,
+        task_id: str,
+        timeout_seconds: Optional[int] = None,
+        read_artifact: bool = True,
+    ) -> DistributedTaskResult:
         timeout = max(1, int(timeout_seconds or self.settings.distributed_worker_result_timeout_seconds))
         deadline = time.monotonic() + timeout
         poll = max(0.05, float(self.settings.distributed_worker_poll_seconds or 0.5))
         while time.monotonic() < deadline:
             if self.state_store.run_canceled(run_id):
-                return DistributedTaskResult(run_id, task_id, "canceled", {}, error="run canceled")
+                error = "run canceled"
+                contract = normalize_subagent_result("", "canceled", {}, error)
+                return DistributedTaskResult(run_id, task_id, "canceled", {}, error=error, contract=contract)
             state = self.state_store.get_node_task(run_id, task_id)
             if state and state.status in TERMINAL_TASK_STATUSES:
-                return self._result_from_state(state)
+                return self._result_from_state(state, read_artifact=read_artifact)
             time.sleep(poll)
         self.state_store.complete_node_task(run_id, task_id, "timeout", {"error": "distributed worker result timeout"})
-        return DistributedTaskResult(run_id, task_id, "timeout", {}, error="distributed worker result timeout")
+        error = "distributed worker result timeout"
+        contract = normalize_subagent_result("", "timeout", {}, error)
+        return DistributedTaskResult(run_id, task_id, "timeout", {}, error=error, contract=contract)
 
     def execute(
         self,
@@ -145,16 +212,32 @@ class DistributedSubAgentClient:
         task_kind: str,
         request: Dict[str, Any],
         timeout_seconds: Optional[int] = None,
+        read_artifact: bool = True,
     ) -> DistributedTaskResult:
         self.submit(run_id, task_id, task_kind, request, timeout_seconds)
-        return self.wait(run_id, task_id, timeout_seconds)
+        return self.wait(run_id, task_id, timeout_seconds, read_artifact=read_artifact)
 
     def cancel_run(self, run_id: str, reason: str = "client cancellation") -> None:
         self.state_store.cancel_run(run_id, reason)
 
-    def _result_from_state(self, state: NodeTaskState) -> DistributedTaskResult:
+    def _result_from_state(self, state: NodeTaskState, read_artifact: bool = True) -> DistributedTaskResult:
         artifact_uri = str(state.payload.get("resultArtifactUri") or "")
-        result = self.artifact_store.read_json(artifact_uri) if artifact_uri else dict(state.payload.get("result") or {})
+        inline_contract = dict(state.payload.get("resultContract") or {})
+        stored = self.artifact_store.read_json(artifact_uri) if artifact_uri and read_artifact else inline_contract
+        if not stored:
+            stored = dict(state.payload.get("result") or {})
+        task_kind = str(state.payload.get("taskKind") or "")
+        if "recommendedNextAction" in stored:
+            contract = dict(stored)
+            contract.setdefault("payload", {})
+            if artifact_uri:
+                refs = list(contract.get("artifactRefs") or [])
+                if not any(str(item.get("uri") or "") == artifact_uri for item in refs if isinstance(item, dict)):
+                    refs.append({"uri": artifact_uri, "kind": "subagent_result"})
+                contract["artifactRefs"] = refs
+        else:
+            contract = normalize_subagent_result(task_kind, state.status, stored, str(state.payload.get("error") or ""), artifact_uri)
+        result = dict(contract.get("payload") or {})
         return DistributedTaskResult(
             run_id=state.run_id,
             task_id=state.task_id,
@@ -162,6 +245,7 @@ class DistributedSubAgentClient:
             result=result,
             artifact_uri=artifact_uri,
             error=str(state.payload.get("error") or ""),
+            contract=contract,
         )
 
 
@@ -234,12 +318,22 @@ class DistributedSubAgentWorker:
             if self.state_store.run_canceled(state.run_id):
                 self.state_store.complete_node_task(state.run_id, state.task_id, "canceled", {"error": "run canceled during execution"})
                 return
-            result_uri = self.artifact_store.write_json(state.run_id, state.task_id, "result", result)
+            contract = normalize_subagent_result(task_kind, "completed", result)
+            result_uri = self.artifact_store.write_json(state.run_id, state.task_id, "result", contract)
+            summary_contract = {key: value for key, value in contract.items() if key != "payload"}
+            summary_contract["artifactRefs"] = list(summary_contract.get("artifactRefs") or []) + [
+                {"uri": result_uri, "kind": "subagent_result"}
+            ]
             self.state_store.complete_node_task(
                 state.run_id,
                 state.task_id,
                 "completed",
-                {"resultArtifactUri": result_uri, "workerId": self.worker_id, "taskKind": task_kind},
+                {
+                    "resultArtifactUri": result_uri,
+                    "resultContract": summary_contract,
+                    "workerId": self.worker_id,
+                    "taskKind": task_kind,
+                },
             )
         except TimeoutError as exc:
             self.state_store.complete_node_task(
@@ -397,13 +491,17 @@ def execute_document_analysis_task(settings: Settings, request: Dict[str, Any], 
     question = str(request.get("question") or "请总结文档中的关键事实、风险与待确认项")
     if not content:
         return {"answer": "", "error": "empty document content"}
-    answer = LlmClient(settings).chat(
+    llm = LlmClient(settings)
+    answer = llm.chat(
         "你是隔离的文档分析 Sub-Agent。只基于文档内容回答，明确区分事实与推断。",
         "问题：%s\n\n文档：\n%s" % (question, content[:100_000]),
         fallback="",
         timeout_seconds=settings.llm_analysis_timeout_seconds,
     )
-    return {"answer": answer, "sourceChars": len(content), "truncated": len(content) > 100_000}
+    result = {"answer": answer, "sourceChars": len(content), "truncated": len(content) > 100_000}
+    if not str(answer or "").strip():
+        result["error"] = str(llm.last_error or "document analysis returned an empty response")
+    return result
 
 
 def execute_python_batch_task(settings: Settings, request: Dict[str, Any], canceled: Callable[[], bool]) -> Dict[str, Any]:

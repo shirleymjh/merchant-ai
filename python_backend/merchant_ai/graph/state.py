@@ -211,6 +211,10 @@ class AgentState(TypedDict, total=False):
     answer: str
     analysis_summary: str
     analysis_skill_trace: Dict[str, Any]
+    subagent_delegation_plan: Dict[str, Any]
+    subagent_delegation_results: List[Dict[str, Any]]
+    subagent_delegation_attempted: bool
+    subagent_delegation_completed: bool
     confirmation_evidence_reused: bool
     analysis_skill_bypassed: bool
     skill_match: SkillMatchState

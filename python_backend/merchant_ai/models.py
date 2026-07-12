@@ -16,6 +16,37 @@ class APIModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel, use_enum_values=True)
 
 
+class SubAgentResultEnvelope(APIModel):
+    """Worker-independent result contract consumed by the Lead Agent."""
+
+    status: str = "completed"
+    summary: str = ""
+    evidence_refs: List[Any] = Field(default_factory=list)
+    artifact_refs: List[Any] = Field(default_factory=list)
+    gaps: List[Any] = Field(default_factory=list)
+    recommended_next_action: str = ""
+    retryable: bool = False
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    task_kind: str = ""
+
+
+class SubAgentDelegationTask(APIModel):
+    task_kind: str
+    objective: str
+    inputs: Dict[str, Any] = Field(default_factory=dict)
+    expected_outputs: List[str] = Field(default_factory=list)
+    timeout: int = 60
+
+
+class SubAgentDelegationPlan(APIModel):
+    tasks: List[SubAgentDelegationTask] = Field(default_factory=list)
+    parallel: bool = False
+    isolation_mode: str = "worker"
+    read_artifact_policy: str = "on_completion"
+    failure_strategy: str = "continue_partial"
+    reason: str = ""
+
+
 class QuestionRoute(str, Enum):
     GREETING = "GREETING"
     INVALID = "INVALID"
