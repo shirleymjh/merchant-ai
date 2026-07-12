@@ -80,6 +80,7 @@ from merchant_ai.models import (
     TraceSpan,
     LoadBalancerTarget,
     MemoryRetrievalCandidate,
+    MetricDefinitionPreferenceRequest,
     VerifiedEvidence,
     WorkspaceManifest,
     UserIdentity,
@@ -4439,12 +4440,18 @@ class FakeGovernanceDoris:
 
 
 class TopicBuilderDoris:
-    def __init__(self, schema_rows=None, sample_rows=None):
+    def __init__(self, schema_rows=None, sample_rows=None, create_ddl=""):
         self.schema_rows = list(schema_rows or [])
         self.sample_rows_payload = list(sample_rows or [])
+        self.create_ddl = create_ddl
 
     def show_full_columns(self, table):
         return list(self.schema_rows)
+
+    def show_create_table(self, table):
+        if not self.create_ddl:
+            return []
+        return [{"Table": table, "Create Table": self.create_ddl}]
 
     def sample_rows(self, table, merchant_id, limit=20):
         return list(self.sample_rows_payload)[:limit]
@@ -4727,6 +4734,53 @@ def test_topic_builder_build_generates_pending_assets_with_llm_and_samples(tmp_p
     assert asset["merchantFilterColumn"] == "seller_id"
     assert any(item["metricKey"] == "pay_amt" for item in metrics)
     assert any(item["columnName"] == "refund_id" for item in fields)
+
+
+def test_topic_builder_enriches_schema_with_physical_keys_and_partitions(tmp_path):
+    settings = get_settings().model_copy(update={"topic_path": str(tmp_path / "topics"), "harness_workspace_path": str(tmp_path / "workspace")})
+    topic_assets = TopicAssetService(settings)
+    doris = TopicBuilderDoris(
+        schema_rows=[
+            {"Field": "seller_id", "Type": "varchar", "Comment": "商家ID"},
+            {"Field": "pt", "Type": "date", "Comment": "业务日期"},
+            {"Field": "sub_order_id", "Type": "varchar", "Comment": "子订单号"},
+            {"Field": "pay_amt", "Type": "decimal(18,2)", "Comment": "成交金额"},
+        ],
+        sample_rows=[{"seller_id": "100", "pt": "2026-07-01", "sub_order_id": "s1", "pay_amt": 18.3}],
+        create_ddl="""
+CREATE TABLE `dwm_trade_order_detail_di` (
+  `seller_id` varchar(64) COMMENT '商家ID',
+  `pt` date COMMENT '业务日期',
+  `sub_order_id` varchar(64) COMMENT '子订单号',
+  `pay_amt` decimal(18,2) COMMENT '成交金额'
+)
+DUPLICATE KEY(`seller_id`, `sub_order_id`)
+PARTITION BY RANGE(`pt`)()
+DISTRIBUTED BY HASH(`seller_id`) BUCKETS 8
+""",
+    )
+    workflow = TopicBuilderWorkflow(settings, doris, topic_assets, llm=type("DisabledBuilderLlm", (), {"configured": False})())
+
+    result = workflow.build(TopicBuildRequest(topic="电商交易", table_name="dwm_trade_order_detail_di", merchant_id="100"))
+
+    pending_dir = settings.resolved_topic_path / "电商交易" / "pending" / "dwm_trade_order_detail_di"
+    asset = json.loads((pending_dir / "asset.json").read_text(encoding="utf-8"))
+    schema = json.loads((pending_dir / "schema.json").read_text(encoding="utf-8"))
+    profile = json.loads((pending_dir / "sample_profile.json").read_text(encoding="utf-8"))
+    production = json.loads((pending_dir / "asset_production_report.json").read_text(encoding="utf-8"))
+    rules = json.loads((pending_dir / "knowledge_rules.json").read_text(encoding="utf-8"))
+
+    assert result["success"]
+    assert result["builderPhases"]["schemaDiscovery"]["keyModel"] == "DUPLICATE KEY"
+    assert asset["physicalMetadata"]["primaryKeyColumns"] == ["seller_id", "sub_order_id"]
+    assert asset["physicalMetadata"]["partitionColumns"] == ["pt"]
+    assert asset["physicalMetadata"]["bucketColumns"] == ["seller_id"]
+    assert profile["primaryKeyColumns"] == ["seller_id", "sub_order_id"]
+    assert production["schemaDiscovery"]["partitionColumns"] == ["pt"]
+    assert next(item for item in schema if item["columnName"] == "seller_id")["isPrimaryKey"] is True
+    assert next(item for item in schema if item["columnName"] == "pt")["isPartitionColumn"] is True
+    assert any(item["ruleId"] == "primary_key_grain_rule" for item in rules)
+    assert any(item["ruleId"] == "partition_pruning_rule" for item in rules)
 
 
 def test_topic_builder_refresh_incremental_rebuilds_pending_assets_after_schema_change(tmp_path):
@@ -6926,6 +6980,33 @@ def test_memory_middleware_injects_and_store_writes_structured_memory(tmp_path):
     assert "tool_result" not in json.dumps(memory, ensure_ascii=False)
 
 
+def test_memory_render_injection_keeps_core_only_payload(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    rendered = store.render_injection(
+        {
+            "merchantId": "seller_100",
+            "coreMemory": {
+                "summary": "稳定偏好：售后风险默认看退款率",
+                "corePreferences": [
+                    {
+                        "id": "pref_refund_rate",
+                        "memoryType": "metric_habit",
+                        "memoryTier": "core",
+                        "value": "售后风险默认看退款率",
+                        "metrics": ["refund_rate"],
+                        "confidence": 0.9,
+                        "status": "active",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert "coreMemory" in rendered
+    assert "售后风险默认看退款率" in rendered
+
+
 def test_habit_preferences_promote_to_core_only_after_repeat_or_explicit_signal(tmp_path):
     settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file", "context_memory_budget_chars": 2400})
     store = StructuredMemoryStore(settings)
@@ -6956,6 +7037,13 @@ def test_habit_preferences_promote_to_core_only_after_repeat_or_explicit_signal(
     assert second_metric_pref["memoryTier"] == "core"
     assert second_metric_pref["hitCount"] >= 2
     assert second_memory["coreMemoryProfile"]["corePreferences"]
+    selected = store.select_for_question(base_state, budget_chars=2400)
+    assert selected["coreMemory"]["corePreferences"]
+    constraints = build_memory_constraints(selected)
+    assert any(
+        item["source"] == "coreMemory" and item["type"] == "business_preference" and "refund_rate" in item["targetMetrics"]
+        for item in constraints
+    )
 
     explicit_memory = store.update_from_state(
         {
@@ -7391,6 +7479,61 @@ def test_memory_knowledge_governance_request_publish_and_run_jobs(tmp_path):
     assert suggestion["publishRequestedBy"] == "ops_reviewer"
     assert suggestion["publishedRefId"] == "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate"
     assert suggestion["indexedAt"]
+
+
+def test_metric_definition_confirmation_records_merchant_preference(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    service = MemoryManagementService(settings, memory_store=store)
+
+    result = service.record_metric_definition_preference(
+        "seller_100",
+        MetricDefinitionPreferenceRequest(
+            action="confirm_default",
+            metric_key="order_gmv_amt_1d",
+            display_name="GMV",
+            description="GMV按支付成功订单金额统计，未主动扣除后续退款",
+            semantic_ref="semantic:经营画像:ads_merchant_profile:metric:order_gmv_amt_1d",
+            reviewer="merchant_user",
+        ),
+    )
+
+    assert result["status"] == "PREFERENCE_RECORDED"
+    assert result["governance"].startswith("merchant preference only")
+    saved = store.load("seller_100")
+    preference = next(item for item in saved["preferences"] if item["preferenceId"] == "pref_metric_definition_order_gmv_amt_1d")
+    assert preference["memoryType"] == "user_preference"
+    assert preference["key"] == "metricDefinition:order_gmv_amt_1d"
+    assert preference["writePolicy"]["semanticLayerMutation"] is False
+    assert not saved["knowledgeSuggestions"]
+
+
+def test_metric_definition_question_creates_review_candidate(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    service = MemoryManagementService(settings, memory_store=store)
+
+    result = service.record_metric_definition_preference(
+        "seller_100",
+        MetricDefinitionPreferenceRequest(
+            action="question",
+            metric_key="order_gmv_amt_1d",
+            display_name="GMV",
+            description="GMV按支付成功订单金额统计，未主动扣除后续退款",
+            semantic_ref="semantic:经营画像:ads_merchant_profile:metric:order_gmv_amt_1d",
+            note="我们内部希望看扣除退款后的GMV",
+            reviewer="merchant_user",
+        ),
+    )
+
+    assert result["status"] == "QUESTION_RECORDED"
+    saved = store.load("seller_100")
+    suggestion = saved["knowledgeSuggestions"][0]
+    assert suggestion["suggestionType"] == "metric_definition_dispute"
+    assert suggestion["status"] == "candidate"
+    assert suggestion["payload"]["semanticLayerMutation"] is False
+    assert "扣除退款" in suggestion["reviewNote"]
+    assert not saved["preferences"]
 
 
 def test_context_manifest_records_memory_semantic_refs_and_observability(tmp_path):

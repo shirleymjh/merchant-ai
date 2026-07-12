@@ -130,6 +130,13 @@ export async function sendFeedback(id, payload) {
   })
 }
 
+export async function recordMetricDefinitionPreference(payload) {
+  return request('/api/merchant-preferences/metric-definition', {
+    method: 'POST',
+    body: JSON.stringify({ merchantId: DEFAULT_MERCHANT_ID, ...payload })
+  })
+}
+
 export async function getDailyReport() {
   return request(`/api/daily-report?merchantId=${DEFAULT_MERCHANT_ID}`)
 }

@@ -127,6 +127,10 @@ class DorisRepository:
         safe_table = safe_identifier(table_name)
         return self.query("SHOW FULL COLUMNS FROM `%s`" % safe_table)
 
+    def show_create_table(self, table_name: str) -> List[Dict[str, Any]]:
+        safe_table = safe_identifier(table_name)
+        return self.query("SHOW CREATE TABLE `%s`" % safe_table)
+
     def sample_rows(self, table_name: str, merchant_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         safe_table = safe_identifier(table_name)
         return self.query("SELECT * FROM `%s` LIMIT %s" % (safe_table, max(1, min(limit, 100))))

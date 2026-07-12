@@ -93,6 +93,22 @@
               <span v-for="item in disclosureItems" :key="item">{{ item }}</span>
             </div>
           </section>
+          <section v-if="metricDefinitionCards.length" class="metric-definition-panel">
+            <div class="experience-head">
+              <BookOpenCheck :size="16" />
+              <h3>口径确认</h3>
+            </div>
+            <article v-for="item in metricDefinitionCards" :key="item.metricKey || item.displayName">
+              <div>
+                <b>{{ item.displayName || item.metricKey || '当前指标' }}</b>
+                <p>{{ item.description || '本次使用已发布语义资产中的当前口径。' }}</p>
+              </div>
+              <div class="metric-definition-actions">
+                <button type="button" @click="handleMetricDefinitionAction(item, 'confirm_default')">以后默认这个口径</button>
+                <button type="button" class="secondary" @click="handleMetricDefinitionAction(item, 'question')">我对口径有疑问</button>
+              </div>
+            </article>
+          </section>
           <section v-if="clarificationCard" class="confirmation-card">
             <div class="confirmation-card-head">
               <div>
@@ -352,7 +368,7 @@ const props = defineProps({
   workspaceMode: Boolean
 })
 
-const emit = defineEmits(['feedback', 'ask', 'confirm-clarification'])
+const emit = defineEmits(['feedback', 'ask', 'confirm-clarification', 'metric-definition-action'])
 
 const displayTime = new Date().toLocaleString('zh-CN', {
   year: 'numeric',
@@ -388,6 +404,11 @@ const disclosureItems = computed(() => {
   return (props.merchantExperience?.metricDisclosures || [])
     .map(item => item.description || item.displayName || item.metricKey)
     .filter(Boolean)
+    .slice(0, 2)
+})
+const metricDefinitionCards = computed(() => {
+  return (props.merchantExperience?.metricDisclosures || [])
+    .filter(item => item?.description || item?.displayName || item?.metricKey)
     .slice(0, 2)
 })
 const traceabilityItems = computed(() => {
@@ -453,6 +474,21 @@ function confirmClarification(option) {
     checkpoint: clarificationCard.value?.checkpoint || {},
     threadId: clarificationCard.value?.checkpoint?.threadId || ''
   })
+}
+
+function handleMetricDefinitionAction(item, action) {
+  emit('metric-definition-action', {
+    action,
+    answerId: props.id || '',
+    metricKey: item?.metricKey || '',
+    displayName: item?.displayName || item?.metricKey || '',
+    description: item?.description || '',
+    formula: item?.formula || '',
+    semanticRef: item?.semanticRef || item?.semanticRefId || '',
+    sourceTable: item?.sourceTable || item?.table || '',
+    note: action === 'question' ? '商家对当前披露口径提出疑问' : ''
+  })
+  showToast(action === 'question' ? '已提交口径疑问，等待平台审核' : '已记录为本商家的默认口径偏好')
 }
 
 function confirmationTitle(type) {

@@ -42,6 +42,14 @@ def test_settings_exposes_grouped_config_views(tmp_path):
     assert settings.grouped_summary()["security"]["opsTokenConfigured"] is True
 
 
+def test_es_vector_recall_is_enabled_by_default():
+    settings = Settings()
+
+    assert settings.es_vector_enabled is True
+    assert settings.es_vector_field == "content_vector"
+    assert settings.embedding_model == "text-embedding-3-small"
+
+
 def test_ops_token_protects_runtime_endpoints():
     client = TestClient(create_app(Settings(ops_token="secret")))
 

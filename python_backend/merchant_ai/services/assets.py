@@ -2331,6 +2331,98 @@ def semantic_relationship_path(topic: str) -> str:
     return "topics/%s/relationships.json" % topic
 
 
+def normalize_physical_table_metadata(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        if any(key in payload for key in ["primaryKeyColumns", "partitionColumns", "bucketColumns", "keyModel"]):
+            return {
+                "keyModel": str(payload.get("keyModel") or ""),
+                "primaryKeyColumns": dedupe_strings([str(item) for item in payload.get("primaryKeyColumns") or []]),
+                "partitionColumns": dedupe_strings([str(item) for item in payload.get("partitionColumns") or []]),
+                "bucketColumns": dedupe_strings([str(item) for item in payload.get("bucketColumns") or []]),
+                "source": str(payload.get("source") or "metadata_provider"),
+            }
+        ddl = show_create_table_ddl_from_payload(payload)
+        return parse_doris_create_table_metadata(ddl) if ddl else {}
+    if isinstance(payload, list):
+        for item in payload:
+            ddl = show_create_table_ddl_from_payload(item)
+            if ddl:
+                return parse_doris_create_table_metadata(ddl)
+    if isinstance(payload, str):
+        return parse_doris_create_table_metadata(payload)
+    return {}
+
+
+def show_create_table_ddl_from_payload(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        return ""
+    for key, value in payload.items():
+        normalized = str(key or "").strip().lower().replace("_", " ")
+        if normalized in {"create table", "createtable", "ddl"} or "create table" in normalized:
+            return str(value or "")
+    return ""
+
+
+def parse_doris_create_table_metadata(ddl: str) -> Dict[str, Any]:
+    text = str(ddl or "")
+    if not text.strip():
+        return {}
+    key_model = ""
+    primary_key_columns: List[str] = []
+    key_match = re.search(
+        r"\b(?P<model>DUPLICATE|UNIQUE|AGGREGATE|PRIMARY)\s+KEY\s*\((?P<columns>[^)]*)\)",
+        text,
+        re.I | re.S,
+    )
+    if key_match:
+        key_model = "%s KEY" % key_match.group("model").upper()
+        primary_key_columns = parse_identifier_list(key_match.group("columns"))
+    partition_columns: List[str] = []
+    partition_match = re.search(
+        r"\bPARTITION\s+BY\s+(?:RANGE|LIST)?\s*\((?P<columns>[^)]*)\)",
+        text,
+        re.I | re.S,
+    )
+    if partition_match:
+        partition_columns = parse_identifier_list(partition_match.group("columns"))
+    if not partition_columns:
+        auto_partition_match = re.search(
+            r"\bAUTO\s+PARTITION\s+BY\s+(?:RANGE|LIST)?\s*\((?P<expr>.*?)\)\s*\(",
+            text,
+            re.I | re.S,
+        )
+        if auto_partition_match:
+            partition_columns = parse_identifier_list(auto_partition_match.group("expr"))
+    bucket_columns: List[str] = []
+    bucket_match = re.search(r"\bDISTRIBUTED\s+BY\s+HASH\s*\((?P<columns>[^)]*)\)", text, re.I | re.S)
+    if bucket_match:
+        bucket_columns = parse_identifier_list(bucket_match.group("columns"))
+    result = {
+        "keyModel": key_model,
+        "primaryKeyColumns": dedupe_strings(primary_key_columns),
+        "partitionColumns": dedupe_strings(partition_columns),
+        "bucketColumns": dedupe_strings(bucket_columns),
+        "source": "show_create_table",
+    }
+    return {key: value for key, value in result.items() if value}
+
+
+def parse_identifier_list(expression: str) -> List[str]:
+    identifiers = re.findall(r"`([^`]+)`", str(expression or ""))
+    if identifiers:
+        return dedupe_strings(identifiers)
+    values = []
+    for raw in re.split(r",", str(expression or "")):
+        token = raw.strip()
+        token = re.sub(r"\b(date_trunc|date_floor|date_ceil|to_date|cast)\s*\(", "(", token, flags=re.I)
+        match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", token)
+        if match:
+            values.append(match.group(1))
+    return dedupe_strings(values)
+
+
 def normalize_semantic_path(path: str) -> str:
     text = str(path or "").strip().lstrip("/")
     if not text:
@@ -2704,14 +2796,19 @@ class TopicBuilderWorkflow:
         pending_dir.mkdir(parents=True, exist_ok=True)
         existing = self._existing_asset_context(topic, table)
         schema = self._load_schema(table, request)
+        physical_metadata = self._load_physical_metadata(table)
+        schema = self._enrich_schema_with_physical_metadata(schema, physical_metadata)
         sample_rows = self._load_sample_rows(table, request)
-        profile = self._sample_profile(schema, sample_rows, request)
+        profile = self._sample_profile(schema, sample_rows, request, physical_metadata)
         generated = self._generate_candidate_payload(topic, table, request, schema, sample_rows, profile, existing)
         builder_phases = {
             "schemaDiscovery": {
                 "status": "completed",
                 "artifact": str(pending_dir / "schema.json"),
                 "columnCount": len(schema),
+                "primaryKeyColumns": list(physical_metadata.get("primaryKeyColumns") or []),
+                "partitionColumns": list(physical_metadata.get("partitionColumns") or []),
+                "keyModel": str(physical_metadata.get("keyModel") or ""),
             },
             "sampleProfiling": {
                 "status": "completed",
@@ -2750,6 +2847,7 @@ class TopicBuilderWorkflow:
             "businessKnowledge": request.business_knowledge or str(existing.get("businessKnowledge") or ""),
             "sampleSqls": request.sample_sqls or list(existing.get("sampleSqls") or []),
             "buildProfile": profile,
+            "physicalMetadata": physical_metadata,
             "builderPhases": builder_phases,
             "generationMode": str(generated.get("generationMode") or "heuristic"),
             "generatedAt": datetime.utcnow().isoformat() + "Z",
@@ -2770,6 +2868,7 @@ class TopicBuilderWorkflow:
             schema=schema,
             sample_rows=sample_rows,
             profile=profile,
+            physical_metadata=physical_metadata,
             semantic_columns=semantic_columns,
             metrics=metrics,
             terms=terms,
@@ -2916,6 +3015,45 @@ class TopicBuilderWorkflow:
                 payload.setdefault(field, [])
         return payload
 
+    def _load_physical_metadata(self, table: str) -> Dict[str, Any]:
+        providers = ["table_physical_metadata", "show_create_table"]
+        for name in providers:
+            provider = getattr(self.doris_repository, name, None)
+            if not callable(provider):
+                continue
+            try:
+                payload = provider(table)
+            except Exception:
+                payload = {}
+            metadata = normalize_physical_table_metadata(payload)
+            if metadata:
+                return metadata
+        return {}
+
+    def _enrich_schema_with_physical_metadata(
+        self,
+        schema: List[Dict[str, Any]],
+        physical_metadata: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not schema or not physical_metadata:
+            return schema
+        primary_keys = {str(item).lower() for item in physical_metadata.get("primaryKeyColumns") or []}
+        partition_columns = {str(item).lower() for item in physical_metadata.get("partitionColumns") or []}
+        bucket_columns = {str(item).lower() for item in physical_metadata.get("bucketColumns") or []}
+        enriched: List[Dict[str, Any]] = []
+        for column in schema:
+            next_column = dict(column)
+            name = str(next_column.get("columnName") or "").lower()
+            if name in primary_keys:
+                next_column["isPrimaryKey"] = True
+                next_column["keyType"] = next_column.get("keyType") or str(physical_metadata.get("keyModel") or "KEY")
+            if name in partition_columns:
+                next_column["isPartitionColumn"] = True
+            if name in bucket_columns:
+                next_column["isBucketColumn"] = True
+            enriched.append(next_column)
+        return enriched
+
     def _load_schema(self, table: str, request: TopicBuildRequest) -> List[Dict[str, Any]]:
         providers = ["show_full_columns", "describe_table", "datamap_columns"]
         schema: Any = []
@@ -2952,7 +3090,14 @@ class TopicBuilderWorkflow:
             normalized.append({str(key): self._json_safe(value) for key, value in row.items()})
         return normalized
 
-    def _sample_profile(self, schema: List[Dict[str, Any]], rows: List[Dict[str, Any]], request: TopicBuildRequest) -> Dict[str, Any]:
+    def _sample_profile(
+        self,
+        schema: List[Dict[str, Any]],
+        rows: List[Dict[str, Any]],
+        request: TopicBuildRequest,
+        physical_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        physical_metadata = physical_metadata or {}
         columns = [str(item.get("columnName") or "") for item in schema if str(item.get("columnName") or "")]
         enum_limit = max(1, int(request.enum_value_limit or 20))
         null_rates: Dict[str, float] = {}
@@ -2982,11 +3127,15 @@ class TopicBuilderWorkflow:
                     break
             if request.enum_discovery_enabled and 0 < len(unique_values) <= enum_limit and self._enum_candidate(column, unique_values):
                 enum_candidates[column] = unique_values
-        partition_candidates = [
+        inferred_partition_candidates = [
             column
             for column in columns
             if column.lower() in {"pt", "dt", "ds", "biz_date"} or normalize_column_type_family(str(next((item.get("dataType") for item in schema if item.get("columnName") == column), ""))) in {"date", "datetime"}
         ]
+        partition_candidates = dedupe_strings(
+            [str(item) for item in physical_metadata.get("partitionColumns") or [] if str(item) in columns]
+            + inferred_partition_candidates
+        )
         time_column = next((column for column in partition_candidates if column.lower() == "pt"), partition_candidates[0] if partition_candidates else "")
         merchant_column = next((column for column in columns if column.lower() in {"seller_id", "merchant_id", "shop_id"}), "")
         return {
@@ -2995,6 +3144,9 @@ class TopicBuilderWorkflow:
             "sampleValues": sample_values,
             "enumCandidates": enum_candidates,
             "partitionColumns": partition_candidates,
+            "primaryKeyColumns": [str(item) for item in physical_metadata.get("primaryKeyColumns") or [] if str(item) in columns],
+            "bucketColumns": [str(item) for item in physical_metadata.get("bucketColumns") or [] if str(item) in columns],
+            "keyModel": str(physical_metadata.get("keyModel") or ""),
             "timeColumn": time_column,
             "merchantFilterColumn": merchant_column,
         }
@@ -3056,6 +3208,12 @@ class TopicBuilderWorkflow:
             "schemaColumns": schema,
             "sampleRows": sample_rows[: min(len(sample_rows), 12)],
             "sampleProfile": profile,
+            "physicalTableMetadata": {
+                "keyModel": profile.get("keyModel") or "",
+                "primaryKeyColumns": profile.get("primaryKeyColumns") or [],
+                "partitionColumns": profile.get("partitionColumns") or [],
+                "bucketColumns": profile.get("bucketColumns") or [],
+            },
             "manualNotes": request.manual_notes,
             "businessKnowledge": request.business_knowledge,
             "sampleSqls": request.sample_sqls[:8],
@@ -3117,9 +3275,9 @@ class TopicBuilderWorkflow:
         comment = str(column.get("comment") or column.get("Comment") or name)
         role = "ATTRIBUTE"
         lowered = name.lower()
-        if lowered.endswith("_id") or lowered in {"id", "seller_id", "merchant_id", "shop_id"}:
+        if bool(column.get("isPrimaryKey")) or lowered.endswith("_id") or lowered in {"id", "seller_id", "merchant_id", "shop_id"}:
             role = "KEY"
-        elif lowered in {"pt", "dt", "ds"} or normalize_column_type_family(str(column.get("dataType") or "")) in {"date", "datetime"}:
+        elif bool(column.get("isPartitionColumn")) or lowered in {"pt", "dt", "ds"} or normalize_column_type_family(str(column.get("dataType") or "")) in {"date", "datetime"}:
             role = "TIME"
         elif lowered.endswith(("_name", "_status", "_type")) or lowered.startswith(("is_", "has_")) or lowered.endswith("_code"):
             role = "DIMENSION"
@@ -3127,6 +3285,12 @@ class TopicBuilderWorkflow:
         enum_values = [str(item) for item in (profile.get("enumCandidates", {}).get(name) or [])[:20]]
         sample_values = [str(item) for item in (profile.get("sampleValues", {}).get(name) or [])[:8]]
         evidence = ["schema comment=%s" % comment]
+        if column.get("isPrimaryKey"):
+            evidence.append("physical key column")
+        if column.get("isPartitionColumn"):
+            evidence.append("physical partition column")
+        if column.get("isBucketColumn"):
+            evidence.append("physical bucket/distribution column")
         if sample_values:
             evidence.append("samples=[%s]" % ", ".join(sample_values))
         visibility_policy, masking_policy = sensitive_column_policies(name, comment)
@@ -3249,6 +3413,29 @@ class TopicBuilderWorkflow:
         rules: List[Dict[str, Any]] = []
         time_column = str(profile.get("timeColumn") or "")
         merchant_column = str(profile.get("merchantFilterColumn") or "")
+        primary_key_columns = [str(item) for item in profile.get("primaryKeyColumns") or [] if str(item)]
+        partition_columns = [str(item) for item in profile.get("partitionColumns") or [] if str(item)]
+        if primary_key_columns:
+            rules.append(
+                {
+                    "ruleId": "primary_key_grain_rule",
+                    "title": "主键和数据粒度",
+                    "description": "该表物理 Key 候选为 %s；明细去重、记录数和跨表关联前应优先核对这些字段。" % "、".join(primary_key_columns[:8]),
+                    "aliases": ["主键", "数据粒度", "去重口径"],
+                    "appliesToColumns": primary_key_columns[:12],
+                    "cautions": ["Key 字段只表示物理/语义粒度候选，最终指标去重口径仍以 metrics 定义为准"],
+                }
+            )
+        if partition_columns:
+            rules.append(
+                {
+                    "ruleId": "partition_pruning_rule",
+                    "title": "分区字段过滤建议",
+                    "description": "该表分区/时间候选字段为 %s；有时间窗口的问题应优先下推这些字段以减少扫描范围。" % "、".join(partition_columns[:8]),
+                    "aliases": ["分区字段", "分区裁剪", "时间窗口"],
+                    "appliesToColumns": partition_columns[:12],
+                }
+            )
         if time_column:
             rules.append(
                 {
@@ -3330,12 +3517,18 @@ class TopicBuilderWorkflow:
     def _normalize_schema_column(self, item: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(item, dict):
             return {}
+        primary_flag = item.get("isPrimaryKey")
+        partition_flag = item.get("isPartitionColumn")
+        bucket_flag = item.get("isBucketColumn")
         return {
             "columnName": str(item.get("columnName") or item.get("Field") or item.get("name") or ""),
             "dataType": str(item.get("dataType") or item.get("Type") or item.get("type") or ""),
             "comment": str(item.get("comment") or item.get("Comment") or ""),
             "nullable": self._normalize_nullable(item),
             "keyType": str(item.get("keyType") or item.get("Key") or ""),
+            "isPrimaryKey": bool(primary_flag) if primary_flag is not None else False,
+            "isPartitionColumn": bool(partition_flag) if partition_flag is not None else False,
+            "isBucketColumn": bool(bucket_flag) if bucket_flag is not None else False,
         }
 
     def _normalize_nullable(self, item: Dict[str, Any]) -> bool:
@@ -4191,6 +4384,7 @@ def topic_asset_production_report(
     schema: List[Dict[str, Any]],
     sample_rows: List[Dict[str, Any]],
     profile: Dict[str, Any],
+    physical_metadata: Dict[str, Any],
     semantic_columns: List[Dict[str, Any]],
     metrics: List[Dict[str, Any]],
     terms: List[Dict[str, Any]],
@@ -4198,6 +4392,7 @@ def topic_asset_production_report(
     builder_phases: Dict[str, Any],
     generation_mode: str,
 ) -> Dict[str, Any]:
+    physical_metadata = physical_metadata or {}
     schema_count = len(schema or [])
     semantic_count = len(semantic_columns or [])
     coverage = float(semantic_count) / float(schema_count or 1)
@@ -4218,6 +4413,10 @@ def topic_asset_production_report(
         "schemaDiscovery": {
             "columnCount": schema_count,
             "columns": [str(item.get("columnName") or item.get("Field") or "") for item in (schema or [])[:80]],
+            "keyModel": str(physical_metadata.get("keyModel") or profile.get("keyModel") or ""),
+            "primaryKeyColumns": [str(item) for item in physical_metadata.get("primaryKeyColumns") or profile.get("primaryKeyColumns") or []],
+            "partitionColumns": [str(item) for item in physical_metadata.get("partitionColumns") or profile.get("partitionColumns") or []],
+            "bucketColumns": [str(item) for item in physical_metadata.get("bucketColumns") or profile.get("bucketColumns") or []],
         },
         "sampleProfiling": {
             "sampleRowCount": len(sample_rows or []),
@@ -4466,6 +4665,12 @@ def semantic_asset_lineage(
         "sourceTable": table,
         "timeColumn": str(asset.get("timeColumn") or ""),
         "merchantFilterColumn": str(asset.get("merchantFilterColumn") or ""),
+        "physicalMetadata": {
+            "keyModel": str((asset.get("physicalMetadata") or {}).get("keyModel") or ""),
+            "primaryKeyColumns": [str(item) for item in ((asset.get("physicalMetadata") or {}).get("primaryKeyColumns") or [])],
+            "partitionColumns": [str(item) for item in ((asset.get("physicalMetadata") or {}).get("partitionColumns") or [])],
+            "bucketColumns": [str(item) for item in ((asset.get("physicalMetadata") or {}).get("bucketColumns") or [])],
+        },
         "metrics": metric_lineage[:50],
         "rules": [
             {

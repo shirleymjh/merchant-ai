@@ -77,6 +77,7 @@
           @feedback="handleFeedback"
           @ask="sendSuggestion"
           @confirm-clarification="handleClarificationConfirm"
+          @metric-definition-action="handleMetricDefinitionAction"
         />
         <div v-if="loading" class="loading-card">
           <LoaderCircle :size="18" />
@@ -140,7 +141,7 @@ import DailyReportCard from './components/DailyReportCard.vue'
 import MetricInsightPanel from './components/MetricInsightPanel.vue'
 import GovernanceConsole from './components/GovernanceConsole.vue'
 import SuggestionList from './components/SuggestionList.vue'
-import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
+import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, recordMetricDefinitionPreference, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
 
 const input = ref('')
 const defaultRunStatusText = '正在分析问题并读取经营数据'
@@ -650,6 +651,28 @@ async function handleFeedback(payload) {
   }
 }
 
+async function handleMetricDefinitionAction(payload) {
+  const message = messages.value.find(item => item.id === payload.answerId)
+  if (message) {
+    const experience = { ...(message.merchantExperience || {}) }
+    experience.metricDefinitionPreference = {
+      status: payload.action === 'question' ? 'question_recorded' : 'preference_recorded',
+      metricKey: payload.metricKey,
+      updatedAt: new Date().toISOString()
+    }
+    message.merchantExperience = experience
+    saveActiveSessionSnapshot()
+  }
+  try {
+    await recordMetricDefinitionPreference({
+      ...payload,
+      reviewer: userIdentity.value.displayName || userIdentity.value.userId || 'merchant_user'
+    })
+  } catch {
+    // 前端演示模式下忽略偏好写入失败。
+  }
+}
+
 function nextFeedbackStatus(current, payload) {
   const next = { ...current }
   if (Object.prototype.hasOwnProperty.call(payload, 'adopted')) {
@@ -889,6 +912,7 @@ function compactMerchantExperience(experience) {
     anomalyAlerts: (experience.anomalyAlerts || []).slice(0, 4),
     drillDownActions: (experience.drillDownActions || []).slice(0, 4),
     metricDisclosures: (experience.metricDisclosures || []).slice(0, 4),
+    metricDefinitionPreference: experience.metricDefinitionPreference || {},
     traceability: experience.traceability || {}
   }
 }

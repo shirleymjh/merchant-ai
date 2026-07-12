@@ -273,6 +273,21 @@ class FeedbackRequest(APIModel):
     disliked: Optional[bool] = None
 
 
+class MetricDefinitionPreferenceRequest(APIModel):
+    action: str = "confirm_default"
+    merchant_id: str = ""
+    metric_key: str = ""
+    display_name: str = ""
+    description: str = ""
+    formula: str = ""
+    semantic_ref: str = ""
+    source_table: str = ""
+    question: str = ""
+    answer_id: str = ""
+    note: str = ""
+    reviewer: str = ""
+
+
 class MemoryItemPatchRequest(APIModel):
     status: Optional[str] = None
     confidence: Optional[float] = None
@@ -1900,6 +1915,9 @@ class MemoryPreference(APIModel):
     allowed_roles: List[str] = Field(default_factory=list)
     approved_by: str = ""
     evidence_refs: List[str] = Field(default_factory=list)
+    review_status: str = "merchant_confirmed"
+    write_policy: Dict[str, Any] = Field(default_factory=dict)
+    payload: Dict[str, Any] = Field(default_factory=dict)
     created_at: str = ""
 
 

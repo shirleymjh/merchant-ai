@@ -2119,6 +2119,64 @@ body {
 .knowledge-proposals article p { margin: 0; color: #78350f; font-size: 13px; }
 .knowledge-proposals article span { color: #92400e; font-size: 12px; }
 
+.metric-definition-panel {
+  max-width: 980px;
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.metric-definition-panel article {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid #e5edf9;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.metric-definition-panel b {
+  display: block;
+  color: #1f2937;
+  font-size: 13px;
+}
+
+.metric-definition-panel p {
+  margin: 4px 0 0;
+  color: #526071;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.metric-definition-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.metric-definition-actions button {
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid #b8cdf8;
+  border-radius: 7px;
+  color: #2457d6;
+  background: #ffffff;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.metric-definition-actions button.secondary {
+  border-color: #e5e7eb;
+  color: #4b5563;
+}
+
 .evidence-group {
   display: flex;
   flex-wrap: wrap;

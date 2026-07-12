@@ -22,6 +22,7 @@ from merchant_ai.models import (
     MemoryCleanupRequest,
     MemoryItemPatchRequest,
     MemoryRecallEvaluationRequest,
+    MetricDefinitionPreferenceRequest,
     RunCreateRequest,
     SkillDraftReviewRequest,
     SkillEvaluationRequest,
@@ -459,6 +460,12 @@ def cancel_run(thread_id: str, run_id: str) -> Dict[str, Any]:
 def feedback(answer_id: str, request: FeedbackRequest) -> Dict[str, Any]:
     persisted = feedback_service.apply_feedback(answer_id, request.adopted, request.liked, request.disliked)
     return {"success": True, "persisted": persisted}
+
+
+@router.post("/api/merchant-preferences/metric-definition")
+def record_metric_definition_preference(request: MetricDefinitionPreferenceRequest) -> Dict[str, Any]:
+    target = require_merchant_access(request.merchant_id or settings.merchant_id)
+    return memory_management_service.record_metric_definition_preference(target, request)
 
 
 @router.get("/api/memory/{merchant_id}")

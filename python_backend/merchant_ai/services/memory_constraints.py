@@ -34,6 +34,11 @@ def build_memory_constraints(memory_injection: Dict[str, Any]) -> List[Dict[str,
     constraints: List[Dict[str, Any]] = []
     core_memory = memory_injection.get("coreMemory") or {}
     if isinstance(core_memory, dict):
+        for item in core_memory.get("corePreferences") or []:
+            constraint = constraint_from_memory_payload(item, "business_preference")
+            if constraint:
+                constraint["source"] = "coreMemory"
+                constraints.append(constraint)
         for item in core_memory.get("coreFacts") or []:
             constraint = constraint_from_memory_payload(item, "business_fact")
             if constraint:

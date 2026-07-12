@@ -27,6 +27,7 @@ from merchant_ai.models import (
     MemoryInjectionTrace,
     MemoryPreference,
     MemoryRetrievalCandidate,
+    MetricDefinitionPreferenceRequest,
     PendingAnswer,
 )
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
@@ -369,6 +370,7 @@ class StructuredMemoryStore(MemoryStore):
             renderable.get(key)
             for key in [
                 "recentFocus",
+                "coreMemory",
                 "relevantCorrections",
                 "relevantMetricDisputes",
                 "relevantPreferences",
@@ -376,6 +378,8 @@ class StructuredMemoryStore(MemoryStore):
                 "relevantEvents",
             ]
         ):
+            return ""
+        if not has_renderable_memory_payload(renderable):
             return ""
         return json.dumps(renderable, ensure_ascii=False, default=str, indent=2)
 
@@ -399,6 +403,37 @@ class StructuredMemoryStore(MemoryStore):
             "updatedAt": "",
             "schemaVersion": MEMORY_SCHEMA_VERSION,
         }
+
+
+def has_renderable_memory_payload(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for key in [
+        "recentFocus",
+        "relevantCorrections",
+        "relevantMetricDisputes",
+        "relevantPreferences",
+        "relevantFacts",
+        "relevantEvents",
+    ]:
+        if payload.get(key):
+            return True
+    core_memory = payload.get("coreMemory") or {}
+    if not isinstance(core_memory, dict):
+        return False
+    if str(core_memory.get("summary") or "").strip():
+        return True
+    return any(
+        core_memory.get(key)
+        for key in [
+            "corePreferences",
+            "coreFacts",
+            "coreCorrections",
+            "corePreferenceIds",
+            "coreFactIds",
+            "coreCorrectionIds",
+        ]
+    )
 
 
 class EnterpriseMemoryStore(StructuredMemoryStore):
@@ -1251,6 +1286,77 @@ class MemoryManagementService:
             "hitCount": total_hits,
             "falsePositiveCount": total_false_positives,
             "results": results,
+        }
+
+    def record_metric_definition_preference(self, merchant_id: str, request: MetricDefinitionPreferenceRequest) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        memory = self.memory_store.load(target)
+        action = str(getattr(request, "action", "") or "confirm_default").strip().lower()
+        metric_key = str(getattr(request, "metric_key", "") or "").strip()
+        display_name = str(getattr(request, "display_name", "") or metric_key or "指标口径").strip()
+        description = str(getattr(request, "description", "") or "").strip()
+        formula = str(getattr(request, "formula", "") or "").strip()
+        semantic_ref = str(getattr(request, "semantic_ref", "") or "").strip()
+        source_table = str(getattr(request, "source_table", "") or "").strip()
+        question = str(getattr(request, "question", "") or "").strip()
+        note = str(getattr(request, "note", "") or "").strip()
+        reviewer = str(getattr(request, "reviewer", "") or "merchant_user").strip()
+        if not metric_key and not display_name:
+            return {"success": False, "status": "INVALID_METRIC", "merchantId": target}
+
+        if action in {"question", "dispute", "challenge"}:
+            suggestion = metric_definition_dispute_suggestion(
+                request,
+                metric_key=metric_key,
+                display_name=display_name,
+                description=description,
+                formula=formula,
+                semantic_ref=semantic_ref,
+                source_table=source_table,
+                question=question,
+                note=note,
+                reviewer=reviewer,
+            )
+            memory["knowledgeSuggestions"], written = upsert_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
+            memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
+            saved = self.memory_store.save(target, memory)
+            suggestion_id = str(suggestion.get("suggestionId") or "")
+            return {
+                "success": True,
+                "status": "QUESTION_RECORDED",
+                "merchantId": target,
+                "suggestionId": suggestion_id,
+                "written": written,
+                "suggestion": find_knowledge_suggestion(saved, suggestion_id),
+                "governance": "candidate only; semantic metric definition requires platform review",
+            }
+
+        preference = metric_definition_preference(
+            request,
+            metric_key=metric_key,
+            display_name=display_name,
+            description=description,
+            formula=formula,
+            semantic_ref=semantic_ref,
+            source_table=source_table,
+            question=question,
+            note=note,
+            reviewer=reviewer,
+        )
+        preferences, written = upsert_preference(memory.get("preferences") or [], preference)
+        memory["preferences"] = preferences[-MAX_PREFERENCES:]
+        memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
+        memory["coreMemoryProfile"] = build_core_memory_profile(memory)
+        saved = self.memory_store.save(target, memory)
+        preference_id = str(preference.get("preferenceId") or "")
+        return {
+            "success": True,
+            "status": "PREFERENCE_RECORDED",
+            "merchantId": target,
+            "preferenceId": preference_id,
+            "written": written,
+            "preference": next((item for item in saved.get("preferences") or [] if item.get("preferenceId") == preference_id), preference),
+            "governance": "merchant preference only; does not modify global semantic metric definition",
         }
 
 
@@ -2606,6 +2712,7 @@ def compact_core_memory_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     correction_ids = [str(item.get("id") or "") for item in core_corrections if item.get("id")]
     return {
         "summary": str(profile.get("summary") or "")[:420],
+        "corePreferences": compact_core_preference_payloads(core_preferences, 4),
         "coreFacts": compact_core_constraint_payloads(core_facts, 4),
         "coreCorrections": compact_core_constraint_payloads(core_corrections, 3),
         "corePreferenceIds": preference_ids[:6],
@@ -2617,6 +2724,29 @@ def compact_core_memory_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
             "corrections": len(correction_ids),
         },
     }
+
+
+def compact_core_preference_payloads(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for item in items[: max(0, int(limit or 0))]:
+        payload = {
+            "id": str(item.get("id") or ""),
+            "memoryType": str(item.get("memoryType") or "preference"),
+            "memoryTier": str(item.get("memoryTier") or "core"),
+            "key": str(item.get("key") or ""),
+            "value": str(item.get("value") or item.get("content") or item.get("question") or "")[:400],
+            "topics": unique_strings(item.get("topics") or [])[:8],
+            "metrics": unique_strings(item.get("metrics") or [])[:12],
+            "timeWindows": unique_ints(item.get("timeWindows") or [])[:6],
+            "confidence": float(item.get("confidence") or 0.0),
+            "source": str(item.get("source") or "coreMemory"),
+            "status": memory_status(item),
+            "approvedBy": str(item.get("approvedBy") or ""),
+            "evidenceRefs": unique_strings(item.get("evidenceRefs") or [])[:8],
+        }
+        if payload["value"] or payload["metrics"] or payload["topics"]:
+            payloads.append(payload)
+    return payloads
 
 
 def compact_core_constraint_payloads(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
@@ -2790,6 +2920,9 @@ def normalize_preferences(items: Any) -> List[Dict[str, Any]]:
             allowed_roles=unique_strings(item.get("allowedRoles") or item.get("allowed_roles") or default_memory_allowed_roles(str(item.get("memoryType") or item.get("memory_type") or "preference"))),
             approved_by=str(item.get("approvedBy") or item.get("approved_by") or ""),
             evidence_refs=unique_strings(item.get("evidenceRefs") or item.get("evidence_refs") or []),
+            review_status=str(item.get("reviewStatus") or item.get("review_status") or "merchant_confirmed"),
+            write_policy=item.get("writePolicy") if isinstance(item.get("writePolicy"), dict) else (item.get("write_policy") if isinstance(item.get("write_policy"), dict) else {}),
+            payload=item.get("payload") if isinstance(item.get("payload"), dict) else {},
             created_at=str(item.get("createdAt") or item.get("created_at") or datetime.now().isoformat()),
         )
         if pref.key and pref.value:
@@ -3102,6 +3235,140 @@ def knowledge_suggestion_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
         updated_at=datetime.now().isoformat(),
     )
     return suggestion.model_dump(by_alias=True)
+
+
+def metric_definition_preference(
+    request: MetricDefinitionPreferenceRequest,
+    *,
+    metric_key: str,
+    display_name: str,
+    description: str,
+    formula: str,
+    semantic_ref: str,
+    source_table: str,
+    question: str,
+    note: str,
+    reviewer: str,
+) -> Dict[str, Any]:
+    value = description or ("%s 使用当前已披露口径" % display_name)
+    payload = metric_definition_payload(
+        request,
+        metric_key=metric_key,
+        display_name=display_name,
+        description=description,
+        formula=formula,
+        semantic_ref=semantic_ref,
+        source_table=source_table,
+        question=question,
+        note=note,
+    )
+    topic = topic_from_semantic_ref(semantic_ref)
+    pref = MemoryPreference(
+        preference_id="pref_metric_definition_%s" % stable_slug(metric_key or display_name),
+        memory_type="user_preference",
+        memory_tier="core",
+        memory_class=default_memory_class("user_preference"),
+        key="metricDefinition:%s" % (metric_key or display_name),
+        value=value[:1000],
+        topics=unique_strings([topic]),
+        metrics=unique_strings([metric_key, display_name]),
+        confidence=0.92,
+        source="merchant_metric_definition_confirm",
+        hit_count=1,
+        scope=memory_scope_from_terms("", unique_strings([topic]), unique_strings([metric_key, display_name])),
+        status="approved",
+        retention_days=default_retention_days("user_preference"),
+        visibility=default_memory_visibility("user_preference"),
+        allowed_roles=default_memory_allowed_roles("user_preference"),
+        approved_by=reviewer,
+        evidence_refs=unique_strings([semantic_ref]),
+        review_status="merchant_confirmed",
+        write_policy={"action": "merchant_preference", "semanticLayerMutation": False},
+        payload=payload,
+        created_at=datetime.now().isoformat(),
+    )
+    return pref.model_dump(by_alias=True)
+
+
+def metric_definition_dispute_suggestion(
+    request: MetricDefinitionPreferenceRequest,
+    *,
+    metric_key: str,
+    display_name: str,
+    description: str,
+    formula: str,
+    semantic_ref: str,
+    source_table: str,
+    question: str,
+    note: str,
+    reviewer: str,
+) -> Dict[str, Any]:
+    payload = metric_definition_payload(
+        request,
+        metric_key=metric_key,
+        display_name=display_name,
+        description=description,
+        formula=formula,
+        semantic_ref=semantic_ref,
+        source_table=source_table,
+        question=question,
+        note=note,
+    )
+    topic = topic_from_semantic_ref(semantic_ref)
+    suggestion = KnowledgeSuggestion(
+        suggestion_id="ks_metric_definition_%s_%s" % (stable_slug(metric_key or display_name), datetime.now().strftime("%Y%m%d%H%M%S%f")),
+        suggestion_type="metric_definition_dispute",
+        status="candidate",
+        source="merchant_metric_definition_question",
+        source_refs=unique_strings([semantic_ref]),
+        topic=topic,
+        metric_name=metric_key or display_name,
+        aliases=unique_strings([display_name, metric_key])[:12],
+        source_table=source_table,
+        source_fields=unique_strings([metric_key]),
+        reviewer=reviewer,
+        review_note=note or "商家对当前指标口径提出疑问",
+        payload={
+            **payload,
+            "correctionText": note or "商家对当前指标口径提出疑问，需要平台/运营审核",
+            "governance": "candidate only; does not modify semantic layer until platform review",
+        },
+        created_at=datetime.now().isoformat(),
+        updated_at=datetime.now().isoformat(),
+    )
+    return suggestion.model_dump(by_alias=True)
+
+
+def metric_definition_payload(
+    request: MetricDefinitionPreferenceRequest,
+    *,
+    metric_key: str,
+    display_name: str,
+    description: str,
+    formula: str,
+    semantic_ref: str,
+    source_table: str,
+    question: str,
+    note: str,
+) -> Dict[str, Any]:
+    return {
+        "action": str(getattr(request, "action", "") or ""),
+        "metricKey": metric_key,
+        "displayName": display_name,
+        "description": description,
+        "formula": formula,
+        "semanticRef": semantic_ref,
+        "sourceTable": source_table,
+        "question": question,
+        "answerId": str(getattr(request, "answer_id", "") or ""),
+        "note": note,
+        "semanticLayerMutation": False,
+    }
+
+
+def topic_from_semantic_ref(ref: str) -> str:
+    parts = [part for part in str(ref or "").split(":") if part]
+    return parts[1] if len(parts) > 2 and parts[0] == "semantic" else ""
 
 
 def upsert_knowledge_suggestion(items: List[Dict[str, Any]], suggestion: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
