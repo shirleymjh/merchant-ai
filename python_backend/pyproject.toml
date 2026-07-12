@@ -35,6 +35,9 @@ dev = [
   "pytest>=8.0.0",
   "ruff>=0.6.0",
 ]
+distributed = [
+  "boto3>=1.35,<2",
+]
 
 [tool.ruff]
 line-length = 120

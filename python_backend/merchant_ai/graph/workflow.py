@@ -112,7 +112,7 @@ from merchant_ai.services.middleware import MiddlewareChain, default_harness_mid
 from merchant_ai.services.observability import append_span, artifact_ref_from_path, now_ms, performance_summary, start_step, finish_step
 from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlanner, QueryGraphValidator, semantic_workspace_manifest_from_asset_pack
 from merchant_ai.services.prompts import PromptAssembler
-from merchant_ai.services.quick_metrics import quick_metric_response
+from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, merge_task_result_bundles
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
@@ -1457,6 +1457,10 @@ class MerchantQaWorkflow:
             getattr(merchant, "merchant_id", ""),
             self.node_worker.doris_repository,
             state.get("extracted_keywords"),
+            published_semantic_quick_metrics(
+                self.recall_service.topic_assets,
+                self._topic_names_for_categories(self._effective_topic_categories(state)),
+            ),
         )
         if response is None:
             state["fast_metric_completed"] = False
@@ -2744,6 +2748,7 @@ class MerchantQaWorkflow:
             state["plan"],
             state["agent_run_result"],
             state.get("memory_constraints", []),
+            recall_knowledge_ref_ids(state),
         )
         state["agent_run_result"].verified_evidence = verified
         state["agent_run_result"].evidence_gaps = verified.gaps
@@ -2758,10 +2763,33 @@ class MerchantQaWorkflow:
         add_step(state, "Main Agent Tool verify_evidence_graph：" + ("证据门禁通过" if verified.passed else "证据存在缺口 %d 个" % len(verified.gaps)))
         state["evidence_graph_verified"] = True
         if not state.get("hypothesis_exploration_completed"):
-            state["hypothesis_results"] = self.controlled_react_explorer.run_parallel_evidence_reviews(
-                state.get("hypothesis_exploration") or {},
-                state.get("agent_run_result") or AgentRunResult(),
-            )
+            distributed_client = getattr(self.node_worker, "distributed_subagent_client", None)
+            if distributed_client and (state.get("hypothesis_exploration") or {}).get("hypotheses"):
+                task_id = "hypothesis_review_%s" % uuid.uuid4().hex[:10]
+                distributed = distributed_client.execute(
+                    state.get("run_id") or state.get("qa_id") or "hypothesis_run",
+                    task_id,
+                    "hypothesis_review",
+                    {
+                        "hypotheses": state.get("hypothesis_exploration") or {},
+                        "runResult": (state.get("agent_run_result") or AgentRunResult()).model_dump(by_alias=True),
+                    },
+                    timeout_seconds=max(1, int(self.settings.agent_node_timeout_seconds or 1)),
+                )
+                state["hypothesis_results"] = list(distributed.result.get("reviews") or []) if distributed.status == "completed" else []
+                state.setdefault("tool_runtime_events", []).append(
+                    {
+                        "event": "hypothesis.review.distributed",
+                        "taskId": task_id,
+                        "status": distributed.status,
+                        "resultArtifactUri": distributed.artifact_uri,
+                    }
+                )
+            else:
+                state["hypothesis_results"] = self.controlled_react_explorer.run_parallel_evidence_reviews(
+                    state.get("hypothesis_exploration") or {},
+                    state.get("agent_run_result") or AgentRunResult(),
+                )
             if state["hypothesis_results"]:
                 add_step(state, "多假设预检查：已基于基线证据判断 %d 个经营假设是否值得独立查询" % len(state["hypothesis_results"]))
         self.refresh_context_snapshot(state, "verify_evidence_graph")
@@ -2905,6 +2933,7 @@ class MerchantQaWorkflow:
                         base["plan"],
                         base["runResult"],
                         state.get("memory_constraints", []),
+                        recall_knowledge_ref_ids(state),
                     )
                 comparison = self.controlled_react_explorer.compare_independent_executions(
                     list(by_id.values()),
@@ -3154,7 +3183,7 @@ class MerchantQaWorkflow:
         for task_result in reused_result.task_results:
             task_result.task_id = task_id_mapping.get(task_result.task_id, task_result.task_id)
         reused_result.verified_evidence = self.evidence_verifier.verify(
-            state["question"], target_plan, reused_result, state.get("memory_constraints", [])
+            state["question"], target_plan, reused_result, state.get("memory_constraints", []), recall_knowledge_ref_ids(state)
         )
         reused_result.evidence_gaps = reused_result.verified_evidence.gaps
         return {
@@ -3192,6 +3221,7 @@ class MerchantQaWorkflow:
             planned["plan"],
             run_result,
             state.get("memory_constraints", []),
+            recall_knowledge_ref_ids(state),
         )
         run_result.evidence_gaps = run_result.verified_evidence.gaps
         return {**planned, "runResult": run_result}
@@ -3331,7 +3361,7 @@ class MerchantQaWorkflow:
             },
         )
         curated.verified_evidence = self.evidence_verifier.verify(
-            state["question"], curated_plan, curated, state.get("memory_constraints", [])
+            state["question"], curated_plan, curated, state.get("memory_constraints", []), recall_knowledge_ref_ids(state)
         )
         curated.evidence_gaps = curated.verified_evidence.gaps
         state["plan"] = curated_plan
@@ -3515,6 +3545,20 @@ class MerchantQaWorkflow:
             )
             emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"confirmationRequired": True})
             return state
+        match = state.get("skill_match") if isinstance(state.get("skill_match"), SkillMatchState) else match
+        if isinstance(match, SkillMatchState):
+            match = match.model_copy(update={"confirmed": True, "status": "confirmed" if match.requires_confirmation else "ready"})
+            state["skill_match"] = match
+            dispatch_trace = dict(getattr(self.answer_service, "last_analysis_skill_trace", {}) or {})
+            dispatch_trace.update(
+                {
+                    "requiresConfirmation": match.requires_confirmation,
+                    "confirmed": match.confirmed,
+                    "confirmationStatus": match.status,
+                    "parentRunId": state.get("run_id") or state.get("qa_id") or "skill_run",
+                }
+            )
+            self.answer_service.last_analysis_skill_trace = dispatch_trace
         personalization_context = self.answer_personalization_context(state)
         self.emit_skill_lifecycle_event(state, "confirmed", match, {"confirmed": True})
         parallel_skill_names = self.parallel_skill_names(match)
@@ -3803,7 +3847,10 @@ class MerchantQaWorkflow:
         return state
 
     def maybe_request_skill_confirmation(self, state: AgentState) -> bool:
-        if not bool(getattr(self.settings, "skill_confirmation_required", False)):
+        match = state.get("skill_match")
+        if not isinstance(match, SkillMatchState) or not match.skill_name:
+            match = self.match_analysis_skill(state)
+        if not isinstance(match, SkillMatchState) or not match.requires_confirmation:
             return False
         context = state.get("request_context")
         if context and context.pending_clarification_type == "skill_confirm":
@@ -3815,9 +3862,6 @@ class MerchantQaWorkflow:
                 state["skill_match"] = match.model_copy(update={"confirmed": True, "status": "confirmed"})
                 self.emit_skill_lifecycle_event(state, "confirmed", state["skill_match"], {"confirmed": True})
             return False
-        match = state.get("skill_match")
-        if not isinstance(match, SkillMatchState) or not match.skill_name:
-            match = self.match_analysis_skill(state)
         if isinstance(match, SkillMatchState) and match.confirmed:
             return False
         skill_name = match.skill_name
@@ -5998,6 +6042,25 @@ def context_semantic_ref_ids(state: AgentState) -> List[str]:
         metadata = item.metadata or {}
         refs.append(str(metadata.get("semanticRefId") or ref_id or item.doc_id or ""))
     return unique_workflow_strings(refs)
+
+
+def recall_knowledge_ref_ids(state: AgentState) -> set[str]:
+    """Return only references actually present in this run's recall result."""
+    refs: List[str] = []
+    bundle = state.get("recall_bundle") or RecallBundle()
+    for item in getattr(bundle, "items", []) or []:
+        metadata = item.metadata or {}
+        for raw in [
+            item.doc_id,
+            metadata.get("semanticRefId"),
+            metadata.get("semantic_ref_id"),
+            metadata.get("knowledgeRefId"),
+            metadata.get("knowledge_ref_id"),
+        ]:
+            value = str(raw or "").strip()
+            if value:
+                refs.append(value)
+    return set(unique_workflow_strings(refs))
 
 
 def latest_context_budget_report(state: AgentState, stage: str) -> Dict[str, Any]:

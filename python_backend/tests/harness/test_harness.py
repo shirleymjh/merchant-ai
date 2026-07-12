@@ -191,7 +191,7 @@ from merchant_ai.services.planning import (
     ultra_compact_understanding_catalog,
 )
 from merchant_ai.services.prompts import PromptAssembler
-from merchant_ai.services.quick_metrics import quick_metric_response
+from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
 from merchant_ai.services.query import (
     NodeWorkerExecutor,
     SqlValidationService,
@@ -2709,6 +2709,51 @@ def test_ratio_and_partial_metric_coverage_fall_back_to_planner():
     assert quick_metric_response(coupon, "100", UnexpectedRepository(), coupon_keywords) is None
 
 
+def test_attribution_question_never_uses_quick_metric_path():
+    service = KeywordExtractService(TopicAssetService(get_settings()))
+    question = "最近7天GMV为什么下降？"
+    keywords = service.extract(question)
+
+    class UnexpectedRepository:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("attribution must use semantic retrieval and Planner")
+
+    assert quick_metric_response(question, "100", UnexpectedRepository(), keywords) is None
+
+
+def test_quick_metric_falls_back_when_published_semantics_are_ambiguous():
+    assets = TopicAssetService(get_settings())
+    semantic_metrics = published_semantic_quick_metrics(assets)
+    keywords = KeywordExtractService(assets).extract("最近7天GMV趋势")
+
+    class UnexpectedRepository:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("ambiguous GMV semantics must fall back to Planner")
+
+    assert quick_metric_response("最近7天GMV趋势", "100", UnexpectedRepository(), keywords, semantic_metrics) is None
+
+
+def test_quick_metric_uses_unique_published_semantic_formula():
+    assets = TopicAssetService(get_settings())
+    semantic_metrics = published_semantic_quick_metrics(assets)
+    keywords = KeywordExtractService(assets).extract("最近7天总GMV趋势")
+    calls = []
+
+    class Repository:
+        def query(self, sql, params=None):
+            calls.append((sql, params))
+            return [{"pt": "2026-07-10", "value": 100.0}, {"pt": "2026-07-11", "value": 120.0}]
+
+    response = quick_metric_response("最近7天总GMV趋势", "100", Repository(), keywords, semantic_metrics)
+
+    assert response is not None
+    disclosure = response.merchant_experience["metricDisclosures"][0]
+    assert disclosure["metricKey"] == "order_gmv_amt_1d"
+    assert disclosure["formula"] == "SUM(order_gmv_amt_1d)"
+    assert "order_gmv_amt_1d" in calls[0][0]
+    assert response.debug_trace["semanticMetric"]["topic"] == "经营画像"
+
+
 def test_negation_ambiguity_and_false_substring_topic_are_structured():
     service = KeywordExtractService(TopicAssetService(get_settings()))
 
@@ -2739,7 +2784,7 @@ def test_topic_router_inherits_multiple_context_topics_without_joining_them():
 
 def test_fast_metric_is_a_main_agent_action_and_preserves_response_sections(monkeypatch):
     workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
-    state = workflow._initial_state("最近7天GMV趋势", "100", ChatContext(), None, "fast_thread", "fast_run")
+    state = workflow._initial_state("最近7天总GMV趋势", "100", ChatContext(), None, "fast_thread", "fast_run")
     state = workflow.runtime_bootstrap(state)
     state = workflow.route_topic(state)
     state = workflow.fast_understand(state)
@@ -10274,6 +10319,40 @@ def test_merge_task_result_bundles_aligns_rows_by_entity_key():
     assert by_spu["spu_2"]["order_cnt"] == 10
 
 
+def test_merge_task_result_bundles_preserves_entity_time_grain():
+    merged = merge_task_result_bundles(
+        [
+            AgentTaskResult(
+                task_id="gmv",
+                success=True,
+                query_bundle=QueryBundle(
+                    rows=[
+                        {"spu_id": "spu_1", "pt": "2026-07-10", "gmv": 10},
+                        {"spu_id": "spu_1", "pt": "2026-07-11", "gmv": 20},
+                    ]
+                ),
+            ),
+            AgentTaskResult(
+                task_id="refund",
+                success=True,
+                query_bundle=QueryBundle(
+                    rows=[
+                        {"spu_id": "spu_1", "pt": "2026-07-10", "refund_amt": 1},
+                        {"spu_id": "spu_1", "pt": "2026-07-11", "refund_amt": 2},
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    assert len(merged.rows) == 2
+    by_day = {(row["spu_id"], row["pt"]): row for row in merged.rows}
+    assert by_day[("spu_1", "2026-07-10")]["gmv"] == 10
+    assert by_day[("spu_1", "2026-07-10")]["refund_amt"] == 1
+    assert by_day[("spu_1", "2026-07-11")]["gmv"] == 20
+    assert by_day[("spu_1", "2026-07-11")]["refund_amt"] == 2
+
+
 def test_node_agent_llm_writes_plan_bound_sql_from_contract():
     settings = get_settings()
     worker = NodeWorkerExecutor(GoodPlanBoundSqlLlm(), FakeDoris(), SqlValidationService(), settings)
@@ -11119,7 +11198,11 @@ def test_node_worker_limits_parallel_subagents_by_task_cap():
 
 def test_node_worker_isolates_slow_parallel_node_timeout():
     class TableDelayDoris:
+        def __init__(self):
+            self.calls = []
+
         def query(self, sql, params=None):
+            self.calls.append(sql)
             if "table_b" in sql:
                 time.sleep(1.25)
             return [{"seller_id": "100"}]
@@ -11128,7 +11211,8 @@ def test_node_worker_isolates_slow_parallel_node_timeout():
     settings.max_concurrent_sub_agents = 2
     settings.agent_node_timeout_seconds = 1
     settings.agent_node_poll_interval_seconds = 0.1
-    worker = NodeWorkerExecutor(EmptySqlLlm(), TableDelayDoris(), SqlValidationService(), settings)
+    repository = TableDelayDoris()
+    worker = NodeWorkerExecutor(EmptySqlLlm(), repository, SqlValidationService(), settings)
     pack = PlanningAssetPack(
         tables=[
             PlanningAssetEntry(table="table_a", columns=["seller_id"]),
@@ -11170,6 +11254,8 @@ def test_node_worker_isolates_slow_parallel_node_timeout():
     batch_events = [item["event"] for item in result.node_execution_batches[0].runtime_events]
     assert "node.heartbeat" in batch_events
     assert "node.timeout" in batch_events
+    time.sleep(0.4)
+    assert len([sql for sql in repository.calls if "table_b" in sql]) == 1
 
 
 def test_node_worker_resume_skips_successful_prior_node_result():
@@ -13937,6 +14023,25 @@ def test_evidence_verifier_uses_structured_contracts_without_false_missing():
     verified = EvidenceVerifier().verify("看订单、退款和商品发布", plan, run)
     assert verified.passed
     assert not any(gap.code.startswith("MISSING_REQUIRED") for gap in verified.gaps)
+
+
+def test_evidence_verifier_rejects_knowledge_ref_not_in_recall_bundle():
+    plan = QueryPlan(
+        evidence_contracts=[
+            {
+                "taskId": "knowledge_rule",
+                "evidenceSource": "knowledge_ref",
+                "knowledgeRefs": ["invented-rule-id"],
+                "semanticLabel": "GMV business rule",
+                "requiredLevel": "required",
+            }
+        ]
+    )
+
+    verified = EvidenceVerifier().verify("GMV 口径是什么", plan, AgentRunResult(), allowed_knowledge_refs=set())
+
+    assert not verified.passed
+    assert any(gap.code == "MISSING_REQUIRED_EVIDENCE" for gap in verified.gaps)
 
 
 def test_evidence_verifier_records_derived_metric_formula_trace():
@@ -18602,6 +18707,9 @@ def test_skill_worker_executes_complex_skill_with_isolated_context_package(tmp_p
     assert result.trace["matchedBy"] == "test_match"
     assert result.trace["subAgentType"] == "SKILL_WORKER"
     assert result.trace["lifecycleStage"] == "completed"
+    assert result.trace["requiresConfirmation"] is False
+    assert result.trace["confirmed"] is True
+    assert "awaiting_confirmation" not in result.trace["progress"]
     context = json.loads(Path(result.trace["contextPackagePath"]).read_text(encoding="utf-8"))
     assert context["packageType"] == "skill_worker_context"
     assert context["merchantId"] == "100"
@@ -18906,6 +19014,14 @@ def test_workflow_skill_confirmation_gate_pauses_before_worker(tmp_path):
     assert result["skill_match"].status == "waiting_confirmation"
     assert result["analysis_summary"] == ""
     assert any(record.stage == "confirmation_required" for record in result["skill_lifecycle_records"])
+
+    result["request_context"].pending_clarification_type = "skill_confirm"
+    resumed = workflow.run_analysis_skill(result)
+
+    assert resumed["skill_worker_completed"] is True
+    assert resumed["analysis_skill_trace"]["requiresConfirmation"] is True
+    assert resumed["analysis_skill_trace"]["confirmed"] is True
+    assert "awaiting_confirmation" not in resumed["analysis_skill_trace"]["progress"]
 
 
 def test_answer_skill_headers_expose_diana_style_contract():

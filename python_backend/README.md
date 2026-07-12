@@ -51,6 +51,39 @@ export YSHOPPING_REDIS_RATE_LIMIT_ENABLED=true
 
 Redis 默认关闭。开启后，召回、语义资产包、Doris SELECT、LLM 响应、工具语义缓存会优先写 Redis；ToolRuntime 的工具缓存和限流状态也会跨实例共享。Redis 不可用时会回退到进程内内存缓存，避免本地开发环境直接启动失败。
 
+## 分布式 Sub-Agent Worker
+
+NodeWorker、SkillWorker、假设复核、文档分析和受控 Python Batch 可以提交到独立 Durable Worker。生产环境建议使用 Redis 或 Postgres 状态后端：
+
+```bash
+export YSHOPPING_DISTRIBUTED_SUBAGENTS_ENABLED=true
+export YSHOPPING_RUNTIME_STATE_BACKEND=redis
+export YSHOPPING_REDIS_URL=redis://redis:6379/0
+export YSHOPPING_DISTRIBUTED_WORKER_EXECUTION_BACKEND=process
+python -m merchant_ai.worker
+```
+
+Worker 会跨 Run 拉取队列、原子 claim、续租 heartbeat，并在租约过期后重试。每个任务在独立子进程执行；取消或超时会终止子进程，不会继续占用 LLM/Doris。可用 `--kinds query_node,analysis_skill` 限制 Worker 类型，或用 `--once` 执行单个任务。
+
+容器部署：
+
+```bash
+docker build -f Dockerfile.worker -t merchant-ai-worker .
+docker run --rm --env-file .env merchant-ai-worker
+```
+
+跨实例结果默认写共享文件系统；也可切换到 S3/MinIO：
+
+```bash
+pip install -e '.[distributed]'
+export YSHOPPING_DISTRIBUTED_ARTIFACT_BACKEND=s3
+export YSHOPPING_DISTRIBUTED_ARTIFACT_S3_BUCKET=merchant-ai-artifacts
+export YSHOPPING_DISTRIBUTED_ARTIFACT_S3_PREFIX=merchant-ai/prod
+export YSHOPPING_DISTRIBUTED_ARTIFACT_S3_ENDPOINT=http://minio:9000  # AWS S3 可不设置
+```
+
+任务请求和结果只在状态表保存 Artifact URI，完整内容保存在 Artifact Store。API 实例和 Worker 因而无需共享进程内对象。
+
 ## V2 QueryGraph 行为
 
 Python 版按附件里的 V2 思路实现：

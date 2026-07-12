@@ -411,6 +411,10 @@ class AnswerComposeService:
     ) -> str:
         selected_skill = skill_name or select_answer_skill(plan, run_result, bool(rule_context)) or "bi_trend_attribution"
         if self._should_use_local_fast_structured_skill(selected_skill, plan, run_result):
+            requires_confirmation = bool(
+                self.last_analysis_skill_trace.get("requiresConfirmation", self.llm.settings.skill_confirmation_required)
+            )
+            confirmed = bool(self.last_analysis_skill_trace.get("confirmed", not requires_confirmation))
             trace = {
                 "skillName": selected_skill,
                 "matchedBy": self.last_analysis_skill_trace.get("matchedBy") or "semantic_fast_path",
@@ -421,9 +425,22 @@ class AnswerComposeService:
                 "isolatedExecution": False,
                 "deterministicRenderer": True,
                 "lifecycleStage": "completed",
-                "progress": ["matched", "local_structured_render", "completed"],
+                "requiresConfirmation": requires_confirmation,
+                "confirmed": confirmed,
+                "confirmationStatus": "confirmed" if requires_confirmation else "not_required",
+                "progress": ["matched", "confirmed" if requires_confirmation else "ready", "local_structured_render", "completed"],
                 "reuseCandidate": False,
             }
+            if requires_confirmation and not confirmed:
+                trace.update(
+                    {
+                        "activated": False,
+                        "lifecycleStage": "awaiting_confirmation",
+                        "progress": ["matched", "awaiting_confirmation"],
+                    }
+                )
+                self.last_analysis_skill_trace = trace
+                return ""
             skill_dir = self.llm.settings.resources_root / "runtime" / "agent_skills" / selected_skill
             skill_file = skill_dir / "SKILL.md"
             skill_meta = load_skill_frontmatter(skill_file) if skill_file.exists() else {}
@@ -466,6 +483,10 @@ class AnswerComposeService:
         artifact_root = Path(outputs_path) if outputs_path else self.llm.settings.resolved_workspace_path / "analysis_skills"
         target = artifact_root / "artifacts" / "analysis_skills" / selected_skill / "runs" / isolated_run_id
         checkpoint_path = target / "skill_checkpoint.json"
+        requires_confirmation = bool(
+            self.last_analysis_skill_trace.get("requiresConfirmation", self.llm.settings.skill_confirmation_required)
+        )
+        confirmed = bool(self.last_analysis_skill_trace.get("confirmed", not requires_confirmation))
         trace: Dict[str, Any] = {
             "skillName": selected_skill,
             "matchedBy": self.last_analysis_skill_trace.get("matchedBy") or "questionUnderstanding+verifiedEvidence",
@@ -474,8 +495,8 @@ class AnswerComposeService:
             "skillPath": str(skill_file),
             "scriptPath": str(script),
             "lifecycleStage": "matched",
-            "requiresConfirmation": bool(self.llm.settings.skill_confirmation_required),
-            "confirmed": not bool(self.llm.settings.skill_confirmation_required),
+            "requiresConfirmation": requires_confirmation,
+            "confirmed": confirmed,
             "isolatedRunId": isolated_run_id,
             "workspacePath": str(target),
             "checkpointPath": str(checkpoint_path),
@@ -483,6 +504,10 @@ class AnswerComposeService:
             "reuseCandidate": False,
         }
         self.last_analysis_skill_trace = trace
+        if requires_confirmation and not confirmed:
+            trace["lifecycleStage"] = "awaiting_confirmation"
+            trace["progress"] = ["matched", "awaiting_confirmation"]
+            return ""
         if not skill_file.exists():
             trace["error"] = "skill package missing"
             trace["lifecycleStage"] = "failed"
@@ -601,6 +626,10 @@ class AnswerComposeService:
             title = str(result.trace.get("skillName") or "analysis_skill")
             sections.append("### %s\n%s" % (title, result.answer.strip()))
         summary = "\n\n".join(sections)
+        requires_confirmation = bool(
+            self.last_analysis_skill_trace.get("requiresConfirmation", self.llm.settings.skill_confirmation_required)
+        )
+        confirmed = bool(self.last_analysis_skill_trace.get("confirmed", not requires_confirmation))
         self.last_analysis_skill_trace = {
             "skillName": "parallel_skill_batch",
             "skillNames": [str(name) for name in skill_names or [] if str(name).strip()],
@@ -610,8 +639,17 @@ class AnswerComposeService:
             "subAgentType": "SKILL_WORKER_BATCH",
             "isolatedExecution": True,
             "parallelExecution": True,
+            "requiresConfirmation": requires_confirmation,
+            "confirmed": confirmed,
+            "confirmationStatus": "confirmed" if requires_confirmation else "not_required",
             "lifecycleStage": "completed" if successful else "failed",
-            "progress": ["matched", "parallel_isolated_execute", "progress_synced", "completed" if successful else "failed"],
+            "progress": [
+                "matched",
+                "confirmed" if requires_confirmation else "ready",
+                "parallel_isolated_execute",
+                "progress_synced",
+                "completed" if successful else "failed",
+            ],
             "skillBatchResults": [result.trace for result in results],
             "completedCount": len(successful),
             "failedCount": len(results) - len(successful),

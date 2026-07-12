@@ -5,6 +5,7 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
+from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
@@ -66,6 +67,7 @@ from merchant_ai.services.query_contracts import (
 )
 from merchant_ai.services.repositories import DorisRepository
 from merchant_ai.services.runtime_state import NodeTaskState, create_runtime_state_store, node_task_idempotency_key
+from merchant_ai.services.distributed_workers import DistributedSubAgentClient
 from merchant_ai.services.query_sql_binding import (
     add_sql_where_condition,
     append_note,
@@ -396,6 +398,11 @@ class NodeWorkerExecutor:
         )
         self.artifact_store = WorkspaceArtifactStore(settings)
         self.runtime_state_store = create_runtime_state_store(settings)
+        self.distributed_subagent_client = (
+            DistributedSubAgentClient(settings, state_store=self.runtime_state_store)
+            if bool(settings.distributed_subagents_enabled)
+            else None
+        )
         self.node_plan_critic = NodePlanCritic()
         self.access_control = AccessControlService(settings)
         self._last_sql_draft_decisions: Dict[str, SqlDraftDecision] = {}
@@ -546,6 +553,7 @@ class NodeWorkerExecutor:
             chunk_ids = ready_ids[start : start + max_workers]
             chunk_futures = {}
             future_modes: Dict[Any, str] = {}
+            future_cancel_events: Dict[Any, Event] = {}
             executor = ThreadPoolExecutor(max_workers=max_workers)
             try:
                 for task_id in chunk_ids:
@@ -556,32 +564,7 @@ class NodeWorkerExecutor:
                         batch.failed_task_ids.append(task_id)
                         results[task_id] = failed_result(task_id, pending[task_id], "node_agent blocked by circuit breaker: %s" % blocked.reason)
                         continue
-                    self.runtime_state_store.enqueue_node_task(
-                        NodeTaskState(
-                            run_id=run_id,
-                            task_id=task_id,
-                            status="queued",
-                            idempotency_key=node_task_idempotency_key(run_id, task_id, pending[task_id].preferred_table),
-                            payload={
-                                "preferredTable": pending[task_id].preferred_table,
-                                "dependsOn": list(pending[task_id].depends_on_task_ids or []),
-                                "answerMode": str(pending[task_id].answer_mode),
-                            },
-                        )
-                    )
                     task_mode = self._task_execution_mode(requested_execution_mode, pending[task_id], question)
-                    lease_owner = "node_subagent" if task_mode == "subagent" else "node_direct_worker"
-                    claimed = self.runtime_state_store.claim_node_task(
-                        run_id,
-                        task_id,
-                        lease_owner=lease_owner,
-                        lease_seconds=max(1, self.settings.agent_node_timeout_seconds),
-                    )
-                    if not claimed:
-                        batch.blocked_task_ids.append(task_id)
-                        batch.failed_task_ids.append(task_id)
-                        results[task_id] = failed_result(task_id, pending[task_id], "node task could not acquire execution lease")
-                        continue
                     context = self._node_context(
                         task_id,
                         pending[task_id],
@@ -593,15 +576,57 @@ class NodeWorkerExecutor:
                         access_role=access_role,
                         user_scope=user_scope,
                     )
-                    if task_mode == "subagent":
+                    context.cancel_event = Event()
+                    distributed = bool(self.distributed_subagent_client and task_mode == "subagent")
+                    if distributed:
                         context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
-                        context.context_package["parentRunId"] = run_id
-                        future = executor.submit(self._run_isolated_subagent, pending[task_id], asset_pack, knowledge_context, context)
+                        context.context_package.update({"parentRunId": run_id, "runtimeMode": "distributed_subagent", "subagentEnabled": True})
+                        future = executor.submit(
+                            self._execute_distributed_node,
+                            run_id,
+                            pending[task_id],
+                            asset_pack,
+                            knowledge_context,
+                            context,
+                        )
+                        task_mode = "distributed_subagent"
                     else:
-                        context.context_package.update({"parentRunId": run_id, "runtimeMode": "direct_node_worker", "subagentEnabled": False})
-                        future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
+                        self.runtime_state_store.enqueue_node_task(
+                            NodeTaskState(
+                                run_id=run_id,
+                                task_id=task_id,
+                                status="queued",
+                                idempotency_key=node_task_idempotency_key(run_id, task_id, pending[task_id].preferred_table),
+                                payload={
+                                    "taskKind": "query_node",
+                                    "preferredTable": pending[task_id].preferred_table,
+                                    "dependsOn": list(pending[task_id].depends_on_task_ids or []),
+                                    "answerMode": str(pending[task_id].answer_mode),
+                                },
+                            )
+                        )
+                        lease_owner = "node_subagent" if task_mode == "subagent" else "node_direct_worker"
+                        claimed = self.runtime_state_store.claim_node_task(
+                            run_id,
+                            task_id,
+                            lease_owner=lease_owner,
+                            lease_seconds=max(1, self.settings.agent_node_timeout_seconds),
+                        )
+                        if not claimed:
+                            batch.blocked_task_ids.append(task_id)
+                            batch.failed_task_ids.append(task_id)
+                            results[task_id] = failed_result(task_id, pending[task_id], "node task could not acquire execution lease")
+                            continue
+                        if task_mode == "subagent":
+                            context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
+                            context.context_package["parentRunId"] = run_id
+                            future = executor.submit(self._run_isolated_subagent, pending[task_id], asset_pack, knowledge_context, context)
+                        else:
+                            context.context_package.update({"parentRunId": run_id, "runtimeMode": "direct_node_worker", "subagentEnabled": False})
+                            future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
                     chunk_futures[future] = task_id
                     future_modes[future] = task_mode
+                    future_cancel_events[future] = context.cancel_event
                     batch.submitted_task_ids.append(task_id)
                     batch.runtime_events.append({"event": "node.task_dispatched", "taskId": task_id, "executionMode": task_mode})
                 if not chunk_futures:
@@ -621,6 +646,8 @@ class NodeWorkerExecutor:
                     now = time.perf_counter()
                     if not_done and now >= next_heartbeat_at:
                         for running_future in not_done:
+                            if future_modes.get(running_future) == "distributed_subagent":
+                                continue
                             self.runtime_state_store.heartbeat_node_task(
                                 run_id,
                                 chunk_futures[running_future],
@@ -659,6 +686,7 @@ class NodeWorkerExecutor:
                     results[task_id] = task_result
                 for future in not_done:
                     task_id = chunk_futures[future]
+                    future_cancel_events[future].set()
                     grace_seconds = max(0, int(getattr(self.settings, "agent_node_timeout_grace_seconds", 60) or 60))
                     batch.runtime_events.append(
                         {
@@ -683,6 +711,7 @@ class NodeWorkerExecutor:
             finally:
                 for future in chunk_futures:
                     if not future.done():
+                        future_cancel_events[future].set()
                         future.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
         for task_id in ready_ids:
@@ -765,6 +794,8 @@ class NodeWorkerExecutor:
         max_rounds = max(1, int(self.settings.max_sub_agent_rounds or 1))
         result = AgentTaskResult(task_id=intent.plan_task_id)
         for round_index in range(1, max_rounds + 1):
+            if context_is_cancelled(context):
+                return cancelled_result(intent)
             result = self.execute_node(intent, asset_pack, knowledge_context, context)
             observations.append(
                 {
@@ -776,6 +807,8 @@ class NodeWorkerExecutor:
             )
             if not result.query_bundle.failed or not result.query_bundle.error:
                 break
+            if context_is_cancelled(context):
+                return cancelled_result(intent)
             if not any(term in str(result.query_bundle.error).lower() for term in ["timeout", "tempor", "connection", "retry"]):
                 break
         context.context_package["observations"] = observations
@@ -787,6 +820,32 @@ class NodeWorkerExecutor:
             {"observations": observations, "roundsUsed": len(observations)},
         )
         return result
+
+    def _execute_distributed_node(
+        self,
+        run_id: str,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        knowledge_context: str,
+        context: NodeExecutionContext,
+    ) -> AgentTaskResult:
+        if not self.distributed_subagent_client:
+            return failed_result(intent.plan_task_id, intent, "distributed sub-agent client is not configured")
+        result = self.distributed_subagent_client.execute(
+            run_id,
+            intent.plan_task_id,
+            "query_node",
+            {
+                "intent": intent.model_dump(by_alias=True),
+                "assetPack": asset_pack.model_dump(by_alias=True),
+                "knowledgeContext": knowledge_context,
+                "context": context.model_dump(by_alias=True),
+            },
+            timeout_seconds=max(1, int(self.settings.agent_node_timeout_seconds or 1)),
+        )
+        if result.status != "completed":
+            return failed_result(intent.plan_task_id, intent, result.error or "distributed node failed: %s" % result.status)
+        return AgentTaskResult.model_validate(result.result)
 
     def _node_context(
         self,
@@ -903,10 +962,14 @@ class NodeWorkerExecutor:
         knowledge_context: str,
         context: NodeExecutionContext,
     ) -> AgentTaskResult:
+        if context_is_cancelled(context):
+            return cancelled_result(intent)
         if intent.answer_mode == AnswerMode.DERIVED:
             result = self._execute_derived_node(intent, asset_pack, context)
         else:
             result = self.node_agent.execute(intent, asset_pack, knowledge_context, context)
+        if context_is_cancelled(context):
+            return cancelled_result(intent)
         return self._finalize_subagent_result(result, intent, context)
 
     def _execute_derived_node(
@@ -1591,6 +1654,8 @@ class NodeWorkerExecutor:
                 "sql": trim_sql(bound_sql, 1000),
                 "paramCount": len(sql_params),
             }
+            if context_is_cancelled(context):
+                return cancelled_result(intent)
             query_started = time.perf_counter()
             runtime_result = self.tool_runtime_service.execute(
                 "execute_sql",
@@ -1604,6 +1669,8 @@ class NodeWorkerExecutor:
                 target_kind="doris",
             )
             query_duration_ms = runtime_result.duration_ms or int((time.perf_counter() - query_started) * 1000)
+            if context_is_cancelled(context):
+                return cancelled_result(intent)
             if runtime_result.status != "success":
                 self.access_control.record_query_audit(access_decision, status=runtime_result.status or "failed")
                 message = runtime_result.error_message or "Doris 查询失败"
@@ -3216,8 +3283,8 @@ ENTITY_MERGE_KEY_PRIORITY = [
 
 def merge_task_result_bundles(task_results: List[AgentTaskResult]) -> QueryBundle:
     bundles = [item.query_bundle for item in task_results]
-    merge_key = choose_merge_entity_key(task_results)
-    if not merge_key:
+    merge_keys = choose_merge_entity_keys(task_results)
+    if not merge_keys:
         return merge_query_bundles(bundles)
     tables = merged_bundle_tables(bundles)
     first_error = first_bundle_error(bundles)
@@ -3230,24 +3297,24 @@ def merge_task_result_bundles(task_results: List[AgentTaskResult]) -> QueryBundl
             continue
         task_id = task_result.task_id or task_result.node_task_profile.task_id or "node"
         for row in bundle.rows or []:
-            if merge_key not in row or blank_entity_value(row.get(merge_key)):
+            if any(key not in row or blank_entity_value(row.get(key)) for key in merge_keys):
                 if len(bundle.rows or []) == 1:
                     scalar_rows.append((task_id, row))
                 continue
-            key_value = row.get(merge_key)
+            key_value = tuple(row.get(key) for key in merge_keys)
             if key_value not in merged_by_key:
-                merged_by_key[key_value] = {merge_key: key_value}
+                merged_by_key[key_value] = {key: row.get(key) for key in merge_keys}
                 order.append(key_value)
-            merge_row_fields(merged_by_key[key_value], row, task_id, merge_key)
+            merge_row_fields(merged_by_key[key_value], row, task_id, merge_keys)
     merged_rows = [merged_by_key[key] for key in order]
     if scalar_rows and merged_rows:
         for task_id, row in scalar_rows:
             for merged in merged_rows:
-                merge_row_fields(merged, row, task_id, merge_key)
+                merge_row_fields(merged, row, task_id, merge_keys)
     elif scalar_rows:
         for task_id, row in scalar_rows:
             target: Dict[str, Any] = {}
-            merge_row_fields(target, row, task_id, merge_key)
+            merge_row_fields(target, row, task_id, merge_keys)
             if target:
                 merged_rows.append(target)
     if not merged_rows:
@@ -3258,13 +3325,18 @@ def merge_task_result_bundles(task_results: List[AgentTaskResult]) -> QueryBundl
         original_row_count=len(merged_rows),
         failed=bool(bundles) and not any(not item.failed for item in bundles),
         error=first_error,
-        summary="按实体键 %s 合并 %s 个 NodeWorker 结果" % (merge_key, len(bundles)),
+        summary="按实体键 %s 合并 %s 个 NodeWorker 结果" % ("+".join(merge_keys), len(bundles)),
         duration_ms=sum(int(bundle.duration_ms or 0) for bundle in bundles),
         cache_hit=any(bundle.cache_hit for bundle in bundles),
     )
 
 
 def choose_merge_entity_key(task_results: List[AgentTaskResult]) -> str:
+    keys = choose_merge_entity_keys(task_results)
+    return keys[0] if keys else ""
+
+
+def choose_merge_entity_keys(task_results: List[AgentTaskResult]) -> List[str]:
     key_hits: Dict[str, int] = {}
     for task_result in task_results:
         bundle = task_result.query_bundle
@@ -3278,16 +3350,19 @@ def choose_merge_entity_key(task_results: List[AgentTaskResult]) -> str:
                 key_hits[key] = key_hits.get(key, 0) + 1
     for key in ENTITY_MERGE_KEY_PRIORITY:
         if key_hits.get(key, 0) >= 2:
-            return key
+            keys = [key]
+            if key != "pt" and key_hits.get("pt", 0) >= 2:
+                keys.append("pt")
+            return keys
     for key in ENTITY_MERGE_KEY_PRIORITY:
         if key_hits.get(key, 0) == 1 and len([item for item in task_results if not item.query_bundle.failed]) == 1:
-            return key
-    return ""
+            return [key]
+    return []
 
 
-def merge_row_fields(target: Dict[str, Any], row: Dict[str, Any], task_id: str, merge_key: str) -> None:
+def merge_row_fields(target: Dict[str, Any], row: Dict[str, Any], task_id: str, merge_keys: List[str]) -> None:
     for key, value in row.items():
-        if key == merge_key:
+        if key in merge_keys:
             continue
         if key not in target or blank_entity_value(target.get(key)):
             target[key] = value
@@ -4370,6 +4445,17 @@ def timed_out_result(task_id: str, intent: QuestionIntent, timeout_seconds: int)
             "timeoutType": classify_timeout_type("node execution timed out", source="node"),
         }
     )
+    return result
+
+
+def context_is_cancelled(context: NodeExecutionContext) -> bool:
+    event = getattr(context, "cancel_event", None)
+    return bool(event is not None and event.is_set())
+
+
+def cancelled_result(intent: QuestionIntent) -> AgentTaskResult:
+    result = failed_result(intent.plan_task_id, intent, "NodeWorker 已取消，停止后续查询与重试")
+    result.query_bundle.runtime_events.append({"event": "node.cancelled", "taskId": intent.plan_task_id})
     return result
 
 

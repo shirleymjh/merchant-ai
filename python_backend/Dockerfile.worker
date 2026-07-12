@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app/python_backend
+COPY pyproject.toml README.md ./
+COPY merchant_ai ./merchant_ai
+COPY resources ./resources
+RUN pip install --no-cache-dir ".[distributed]"
+
+CMD ["python", "-m", "merchant_ai.worker"]

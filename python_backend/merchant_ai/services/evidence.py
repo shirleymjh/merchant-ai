@@ -14,14 +14,15 @@ class EvidenceVerifier:
         plan: QueryPlan,
         run_result: AgentRunResult,
         memory_constraints: List[Dict[str, Any]] | None = None,
+        allowed_knowledge_refs: Set[str] | None = None,
     ) -> VerifiedEvidence:
         gaps: List[EvidenceGap] = []
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
         table_names = set(run_result.merged_query_bundle.tables)
         if plan.evidence_contracts:
-            gaps.extend(self._contract_gaps(plan.evidence_contracts, run_result))
-            covered.update(self._covered_contract_labels(plan.evidence_contracts, run_result))
+            gaps.extend(self._contract_gaps(plan.evidence_contracts, run_result, allowed_knowledge_refs))
+            covered.update(self._covered_contract_labels(plan.evidence_contracts, run_result, allowed_knowledge_refs))
         else:
             for evidence in plan.final_required_evidence:
                 if not evidence:
@@ -126,7 +127,12 @@ class EvidenceVerifier:
             )
         return derived
 
-    def _contract_gaps(self, contracts: List[Dict[str, Any]], run_result: AgentRunResult) -> List[EvidenceGap]:
+    def _contract_gaps(
+        self,
+        contracts: List[Dict[str, Any]],
+        run_result: AgentRunResult,
+        allowed_knowledge_refs: Set[str] | None = None,
+    ) -> List[EvidenceGap]:
         gaps: List[EvidenceGap] = []
         for contract in contracts:
             level = str(contract.get("requiredLevel") or contract.get("required_level") or "required").lower()
@@ -134,7 +140,7 @@ class EvidenceVerifier:
                 continue
             evidence_source = str(contract.get("evidenceSource") or contract.get("evidence_source") or "").lower()
             if evidence_source in {"knowledge_ref", "knowledge", "rule"}:
-                if self._knowledge_contract_covered(contract):
+                if self._knowledge_contract_covered(contract, allowed_knowledge_refs):
                     continue
                 semantic_label = str(contract.get("semanticLabel") or contract.get("semantic_label") or "knowledge evidence")
                 gaps.append(
@@ -208,12 +214,17 @@ class EvidenceVerifier:
                 )
         return gaps
 
-    def _covered_contract_labels(self, contracts: List[Dict[str, Any]], run_result: AgentRunResult) -> Set[str]:
+    def _covered_contract_labels(
+        self,
+        contracts: List[Dict[str, Any]],
+        run_result: AgentRunResult,
+        allowed_knowledge_refs: Set[str] | None = None,
+    ) -> Set[str]:
         labels: Set[str] = set()
         for contract in contracts:
             evidence_source = str(contract.get("evidenceSource") or contract.get("evidence_source") or "").lower()
             if evidence_source in {"knowledge_ref", "knowledge", "rule"}:
-                if self._knowledge_contract_covered(contract):
+                if self._knowledge_contract_covered(contract, allowed_knowledge_refs):
                     label = str(contract.get("semanticLabel") or contract.get("semantic_label") or "")
                     if label:
                         labels.add(label)
@@ -237,11 +248,16 @@ class EvidenceVerifier:
                 labels.add(label)
         return labels
 
-    def _knowledge_contract_covered(self, contract: Dict[str, Any]) -> bool:
+    def _knowledge_contract_covered(self, contract: Dict[str, Any], allowed_knowledge_refs: Set[str] | None = None) -> bool:
         refs = contract.get("knowledgeRefs") or contract.get("knowledge_refs") or []
         if not isinstance(refs, list):
-            return bool(refs)
-        return any(str(ref or "").strip() for ref in refs)
+            refs = [refs] if refs else []
+        normalized = {str(ref or "").strip() for ref in refs if str(ref or "").strip()}
+        if not normalized:
+            return False
+        if allowed_knowledge_refs is None:
+            return True
+        return normalized.issubset({str(ref or "").strip() for ref in allowed_knowledge_refs if str(ref or "").strip()})
 
     def _matching_task_result(self, task_id: str, table: str, run_result: AgentRunResult):
         for task_result in run_result.task_results:

@@ -54,6 +54,14 @@ class RuntimeStateStore:
     def recover_expired_node_tasks(self, max_attempts: int = 3) -> int:
         raise NotImplementedError
 
+    def claim_next_node_task(
+        self,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        task_kinds: Optional[List[str]] = None,
+    ) -> Optional[NodeTaskState]:
+        raise NotImplementedError
+
 
 class FileRuntimeStateStore(RuntimeStateStore):
     """File-backed runtime state. It is intentionally small but external to process memory."""
@@ -153,6 +161,26 @@ class FileRuntimeStateStore(RuntimeStateStore):
                 recovered += 1
         return recovered
 
+    def claim_next_node_task(
+        self,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        task_kinds: Optional[List[str]] = None,
+    ) -> Optional[NodeTaskState]:
+        allowed = {str(item) for item in (task_kinds or []) if str(item)}
+        with self._lock:
+            for path in sorted(self.queue_dir.glob("*/*.json"), key=lambda item: item.stat().st_mtime):
+                data = self._read_json(path)
+                if not data:
+                    continue
+                state = NodeTaskState(**data)
+                if allowed and str(state.payload.get("taskKind") or "") not in allowed:
+                    continue
+                claimed = self.claim_node_task(state.run_id, state.task_id, lease_owner, lease_seconds)
+                if claimed:
+                    return claimed
+        return None
+
     def _task_path(self, run_id: str, task_id: str) -> Path:
         return self.tasks_dir / safe_name(run_id) / ("%s.json" % safe_name(task_id))
 
@@ -214,6 +242,7 @@ class RedisRuntimeStateStore(RuntimeStateStore):
         state.status = "queued" if state.status in {"", "pending"} else state.status
         self.upsert_node_task(state)
         self.client.sadd(self._queue_key(state.run_id), state.task_id)
+        self.client.sadd(self._global_queue_key(), "%s|%s" % (state.run_id, state.task_id))
         return state
 
     def claim_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> Optional[NodeTaskState]:
@@ -237,8 +266,11 @@ class RedisRuntimeStateStore(RuntimeStateStore):
             state.lease_until = lease_until
             self.upsert_node_task(state)
             self.client.srem(self._queue_key(run_id), task_id)
+            self.client.srem(self._global_queue_key(), "%s|%s" % (run_id, task_id))
             return state
         claimed = self.client.eval(script, 2, task_key, self._queue_key(run_id), lease_owner, lease_until, datetime.now().isoformat(), task_id)
+        if claimed:
+            self.client.srem(self._global_queue_key(), "%s|%s" % (run_id, task_id))
         return self.get_node_task(run_id, task_id) if claimed else None
 
     def complete_node_task(self, run_id: str, task_id: str, status: str, payload: Dict[str, Any] | None = None) -> NodeTaskState:
@@ -271,8 +303,32 @@ class RedisRuntimeStateStore(RuntimeStateStore):
             self.upsert_node_task(state)
             if state.status == "retry":
                 self.client.sadd(self._queue_key(state.run_id), state.task_id)
+                self.client.sadd(self._global_queue_key(), "%s|%s" % (state.run_id, state.task_id))
             recovered += 1
         return recovered
+
+    def claim_next_node_task(
+        self,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        task_kinds: Optional[List[str]] = None,
+    ) -> Optional[NodeTaskState]:
+        allowed = {str(item) for item in (task_kinds or []) if str(item)}
+        for encoded in sorted(self.client.smembers(self._global_queue_key()) or []):
+            run_id, separator, task_id = str(encoded).partition("|")
+            if not separator:
+                self.client.srem(self._global_queue_key(), encoded)
+                continue
+            state = self.get_node_task(run_id, task_id)
+            if not state or state.status not in {"queued", "pending", "retry"}:
+                self.client.srem(self._global_queue_key(), encoded)
+                continue
+            if allowed and str(state.payload.get("taskKind") or "") not in allowed:
+                continue
+            claimed = self.claim_node_task(run_id, task_id, lease_owner, lease_seconds)
+            if claimed:
+                return claimed
+        return None
 
     def _key(self, *parts: str) -> str:
         return ":".join([self.namespace, "runtime_state", *[safe_name(part) for part in parts]])
@@ -288,6 +344,9 @@ class RedisRuntimeStateStore(RuntimeStateStore):
 
     def _cancel_key(self, run_id: str) -> str:
         return self._key("cancel", run_id)
+
+    def _global_queue_key(self) -> str:
+        return self._key("global_queue")
 
 
 class PostgresRuntimeStateStore(RuntimeStateStore):
@@ -440,6 +499,39 @@ class PostgresRuntimeStateStore(RuntimeStateStore):
             updated = cur.rowcount
         self.conn.commit()
         return int(updated or 0)
+
+    def claim_next_node_task(
+        self,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        task_kinds: Optional[List[str]] = None,
+    ) -> Optional[NodeTaskState]:
+        lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        kinds = [str(item) for item in (task_kinds or []) if str(item)]
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT run_id, task_id
+                    FROM merchant_ai_node_task_state
+                    WHERE status IN ('queued','pending','retry')
+                      AND (%s = FALSE OR payload->>'taskKind' = ANY(%s))
+                    ORDER BY updated_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE merchant_ai_node_task_state task
+                SET status='running', attempts=task.attempts+1, lease_owner=%s, lease_until=%s, updated_at=%s
+                FROM candidate
+                WHERE task.run_id=candidate.run_id AND task.task_id=candidate.task_id
+                RETURNING task.run_id, task.task_id, task.status, task.idempotency_key, task.attempts,
+                          task.lease_owner, task.lease_until, task.updated_at, task.payload
+                """,
+                (bool(kinds), kinds, lease_owner, lease_until, datetime.now().isoformat()),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        return row_to_state(row) if row else None
 
 
 def create_runtime_state_store(settings: Settings) -> RuntimeStateStore:

@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     llm_max_tokens: int = Field(2048, validation_alias="YSHOPPING_LLM_MAX_TOKENS")
     answer_skill_match_mode: str = Field("always", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
     always_apply_rule_budget: int = Field(20, validation_alias="YSHOPPING_ALWAYS_APPLY_RULE_BUDGET")
-    skill_confirmation_required: bool = Field(True, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
+    skill_confirmation_required: bool = Field(False, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
     skill_reuse_suggestion_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_REUSE_SUGGESTION_ENABLED")
     skill_worker_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_ENABLED")
     skill_worker_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_SKILL_WORKER_TIMEOUT_SECONDS")
@@ -291,6 +291,16 @@ class Settings(BaseSettings):
     redis_rate_limit_enabled: bool = Field(True, validation_alias="YSHOPPING_REDIS_RATE_LIMIT_ENABLED")
     runtime_state_backend: str = Field("file", validation_alias="YSHOPPING_RUNTIME_STATE_BACKEND")
     runtime_state_postgres_uri: str = Field("", validation_alias="YSHOPPING_RUNTIME_STATE_POSTGRES_URI")
+    distributed_subagents_enabled: bool = Field(False, validation_alias="YSHOPPING_DISTRIBUTED_SUBAGENTS_ENABLED")
+    distributed_worker_poll_seconds: float = Field(0.5, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_POLL_SECONDS")
+    distributed_worker_lease_seconds: int = Field(120, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_LEASE_SECONDS")
+    distributed_worker_result_timeout_seconds: int = Field(180, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_RESULT_TIMEOUT_SECONDS")
+    distributed_worker_max_attempts: int = Field(3, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_MAX_ATTEMPTS")
+    distributed_worker_execution_backend: str = Field("process", validation_alias="YSHOPPING_DISTRIBUTED_WORKER_EXECUTION_BACKEND")
+    distributed_artifact_backend: str = Field("filesystem", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_BACKEND")
+    distributed_artifact_s3_bucket: str = Field("", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_BUCKET")
+    distributed_artifact_s3_prefix: str = Field("merchant-ai", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_PREFIX")
+    distributed_artifact_s3_endpoint: str = Field("", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_ENDPOINT")
     python_executable: str = Field(default_factory=lambda: sys.executable, validation_alias="YSHOPPING_PYTHON_EXECUTABLE")
 
     wiki_path: str = Field("", validation_alias="YSHOPPING_WIKI_PATH")
@@ -465,6 +475,9 @@ class Settings(BaseSettings):
                 "cacheEnabled": self.runtime.cache_enabled,
                 "redisEnabled": self.runtime.redis_enabled,
                 "stateBackend": self.runtime.state_backend,
+                "distributedSubagentsEnabled": bool(self.distributed_subagents_enabled),
+                "distributedWorkerExecutionBackend": self.distributed_worker_execution_backend,
+                "distributedArtifactBackend": self.distributed_artifact_backend,
             },
         }
 

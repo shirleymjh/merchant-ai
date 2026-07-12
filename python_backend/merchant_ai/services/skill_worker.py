@@ -111,7 +111,24 @@ class SkillWorkerExecutor:
         initial_trace: Optional[Dict[str, Any]] = None,
     ) -> SkillWorkerResult:
         selected_skill = skill_name or "bi_trend_attribution"
+        if bool(self.settings.distributed_subagents_enabled):
+            return self._execute_distributed_skill(
+                question,
+                plan,
+                run_result,
+                outputs_path,
+                rule_context,
+                selected_skill,
+                merchant,
+                personalization_context,
+                initial_trace,
+            )
         started = time.monotonic()
+        incoming_trace = dict(initial_trace or {})
+        requires_confirmation = bool(
+            incoming_trace.get("requiresConfirmation", incoming_trace.get("requires_confirmation", self.settings.skill_confirmation_required))
+        )
+        confirmed = bool(incoming_trace.get("confirmed", not requires_confirmation))
         isolated_run_id = "skill_%s_%s" % (selected_skill, uuid.uuid4().hex[:10])
         skill_dir = self.settings.resources_root / "runtime" / "agent_skills" / selected_skill
         skill_file = skill_dir / "SKILL.md"
@@ -123,8 +140,8 @@ class SkillWorkerExecutor:
         context_path = workspace / "skill_context_package.json"
         trace: Dict[str, Any] = {
             "skillName": selected_skill,
-            "matchedBy": (initial_trace or {}).get("matchedBy") or "questionUnderstanding+verifiedEvidence",
-            "matchTrace": dict(initial_trace or {}),
+            "matchedBy": incoming_trace.get("matchedBy") or "questionUnderstanding+verifiedEvidence",
+            "matchTrace": incoming_trace,
             "activated": False,
             "executionMode": "isolated_skill_worker",
             "workerType": "SKILL_WORKER",
@@ -133,8 +150,8 @@ class SkillWorkerExecutor:
             "skillPath": str(skill_file),
             "scriptPath": str(script),
             "lifecycleStage": "matched",
-            "requiresConfirmation": bool(self.settings.skill_confirmation_required),
-            "confirmed": not bool(self.settings.skill_confirmation_required),
+            "requiresConfirmation": requires_confirmation,
+            "confirmed": confirmed,
             "isolatedRunId": isolated_run_id,
             "workspacePath": str(workspace),
             "checkpointPath": str(checkpoint_path),
@@ -144,6 +161,17 @@ class SkillWorkerExecutor:
             "progress": ["matched"],
             "reuseCandidate": False,
         }
+        if requires_confirmation and not confirmed:
+            trace.update(
+                {
+                    "lifecycleStage": "awaiting_confirmation",
+                    "status": "waiting_confirmation",
+                    "progress": ["matched", "awaiting_confirmation"],
+                    "completedAt": datetime.now().isoformat(),
+                    "durationMs": int((time.monotonic() - started) * 1000),
+                }
+            )
+            return SkillWorkerResult(answer="", trace=trace)
         if not skill_file.exists():
             return self._fail(trace, checkpoint_path, "skill package missing")
 
@@ -193,6 +221,66 @@ class SkillWorkerExecutor:
         if selected_skill == "bi_trend_attribution":
             return self._execute_script_skill(script, input_path, output_path, checkpoint_path, trace)
         return self._execute_structured_skill(selected_skill, payload, output_path, checkpoint_path, trace)
+
+    def _execute_distributed_skill(
+        self,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        outputs_path: str,
+        rule_context: str,
+        skill_name: str,
+        merchant: MerchantInfo | None,
+        personalization_context: Optional[Dict[str, Any]],
+        initial_trace: Optional[Dict[str, Any]],
+    ) -> SkillWorkerResult:
+        from merchant_ai.services.distributed_workers import DistributedSubAgentClient
+
+        trace = dict(initial_trace or {})
+        run_id = str(trace.get("parentRunId") or "skill_%s" % uuid.uuid4().hex[:12])
+        task_id = "skill_%s_%s" % (skill_name, uuid.uuid4().hex[:10])
+        result = DistributedSubAgentClient(self.settings).execute(
+            run_id,
+            task_id,
+            "analysis_skill",
+            {
+                "question": question,
+                "plan": plan.model_dump(by_alias=True),
+                "runResult": run_result.model_dump(by_alias=True),
+                "outputsPath": outputs_path,
+                "ruleContext": rule_context,
+                "skillName": skill_name,
+                "merchant": merchant.model_dump(by_alias=True) if merchant else {},
+                "personalizationContext": dict(personalization_context or {}),
+                "initialTrace": {**trace, "distributedWorkerExecution": True},
+            },
+            timeout_seconds=max(1, int(self.settings.skill_worker_timeout_seconds or 1)),
+        )
+        if result.status != "completed":
+            return SkillWorkerResult(
+                answer="",
+                trace={
+                    **trace,
+                    "skillName": skill_name,
+                    "workerType": "DISTRIBUTED_SKILL_WORKER",
+                    "subAgentType": "SKILL_WORKER",
+                    "isolatedExecution": True,
+                    "lifecycleStage": result.status,
+                    "error": result.error or "distributed skill failed",
+                    "distributedTaskId": task_id,
+                    "resultArtifactUri": result.artifact_uri,
+                },
+            )
+        payload = result.result
+        child_trace = dict(payload.get("trace") or {})
+        child_trace.update(
+            {
+                "workerType": "DISTRIBUTED_SKILL_WORKER",
+                "distributedTaskId": task_id,
+                "resultArtifactUri": result.artifact_uri,
+            }
+        )
+        return SkillWorkerResult(answer=str(payload.get("answer") or ""), trace=child_trace)
 
     def _workspace(self, outputs_path: str, skill_name: str, isolated_run_id: str) -> Path:
         artifact_root = Path(outputs_path) if outputs_path else self.settings.resolved_workspace_path / "analysis_skills"

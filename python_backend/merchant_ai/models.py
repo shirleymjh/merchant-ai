@@ -1404,6 +1404,7 @@ class NodeExecutionContext(APIModel):
     checkpoint_path: str = ""
     workspace_path: str = ""
     context_package: Dict[str, Any] = Field(default_factory=dict)
+    cancel_event: Any = Field(default=None, exclude=True)
 
 
 class EvidenceGap(APIModel):
