@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +11,7 @@ from typing import Any, Dict, Optional
 
 from merchant_ai.models import AgentRunResult, MerchantInfo, QueryPlan
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.sandbox import MerchantAnalysisSandbox
 
 
 @dataclass
@@ -26,6 +26,7 @@ class SkillWorkerExecutor:
     def __init__(self, llm: LlmClient):
         self.llm = llm
         self.settings = llm.settings
+        self.sandbox = MerchantAnalysisSandbox(self.settings)
 
     def execute_answer_skills(
         self,
@@ -239,16 +240,12 @@ class SkillWorkerExecutor:
     ) -> SkillWorkerResult:
         if not script.exists():
             return self._fail(trace, checkpoint_path, "skill script missing")
-        try:
-            completed = subprocess.run(
-                [self.settings.python_executable, str(script), "--input", str(input_path), "--output", str(output_path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=max(1, int(self.settings.skill_worker_timeout_seconds or 10)),
-            )
-        except Exception as exc:
-            return self._fail(trace, checkpoint_path, str(exc))
+        completed = self.sandbox.run_python(
+            script,
+            ["--input", str(input_path), "--output", str(output_path)],
+            output_path.parent,
+            max(1, int(self.settings.skill_worker_timeout_seconds or 10)),
+        )
         trace["returnCode"] = completed.returncode
         trace["stderr"] = completed.stderr[-1000:]
         if completed.returncode != 0 or not output_path.exists():

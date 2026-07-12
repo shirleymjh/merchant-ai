@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import uuid
 from datetime import date
 from pathlib import Path
@@ -26,6 +25,7 @@ from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory import MemoryStore
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, PendingAnswerStore
+from merchant_ai.services.sandbox import MerchantAnalysisSandbox
 from merchant_ai.services.answer_formatting import (
     answer_numeric_value,
     extract_question_time_phrase,
@@ -533,20 +533,12 @@ class AnswerComposeService:
             }
         )
         self._write_skill_checkpoint(checkpoint_path, trace, status="running")
-        try:
-            completed = subprocess.run(
-                [self.llm.settings.python_executable, str(script), "--input", str(input_path), "--output", str(output_path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except Exception as exc:
-            trace["error"] = str(exc)
-            trace["lifecycleStage"] = "failed"
-            trace["progress"].append("failed:%s" % str(exc)[:80])
-            self._write_skill_checkpoint(checkpoint_path, trace, status="failed")
-            return ""
+        completed = MerchantAnalysisSandbox(self.llm.settings).run_python(
+            script,
+            ["--input", str(input_path), "--output", str(output_path)],
+            target,
+            10,
+        )
         trace["returnCode"] = completed.returncode
         trace["stderr"] = completed.stderr[-1000:]
         if completed.returncode != 0 or not output_path.exists():

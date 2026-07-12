@@ -26,6 +26,7 @@ from merchant_ai.models import (
     IntentSignals,
     KnowledgeBundle,
     KnowledgeRequest,
+    HypothesisEvidenceLedger,
     MerchantInfo,
     MerchantRecentFocus,
     MiddlewareEvent,
@@ -79,6 +80,8 @@ class AgentState(TypedDict, total=False):
     original_question: str
     requested_merchant_id: str
     request_context: Optional[ChatContext]
+    user_identity: Dict[str, Any]
+    access_role: str
     response_context: Optional[ChatContext]
     message_history: List[ConversationMessage]
     thread_id: str
@@ -172,6 +175,8 @@ class AgentState(TypedDict, total=False):
 
     base_knowledge_context: str
     topic_asset_context: str
+    always_apply_context: str
+    always_apply_rules: List[Dict[str, Any]]
     recall_context: str
     merchant_profile_context: str
     memory_context: str
@@ -192,13 +197,22 @@ class AgentState(TypedDict, total=False):
     open_diagnostic_goal: str
     open_diagnostic_seed_topics: List[QuestionCategory]
     hypothesis_exploration: Dict[str, Any]
+    hypothesis_results: List[Dict[str, Any]]
+    hypothesis_exploration_completed: bool
+    hypothesis_exploration_rounds: int
+    hypothesis_selected_ids: List[str]
+    hypothesis_evidence_ledger: HypothesisEvidenceLedger
     candidate_query_graphs: Dict[str, Any]
     strategy_switch_trace: List[Dict[str, Any]]
     latency_optimization: Dict[str, Any]
+    execution_tier_policy: Dict[str, Any]
+    node_execution_mode: str
 
     answer: str
     analysis_summary: str
     analysis_skill_trace: Dict[str, Any]
+    confirmation_evidence_reused: bool
+    analysis_skill_bypassed: bool
     skill_match: SkillMatchState
     skill_draft: SkillDraft
     skill_lifecycle_records: List[SkillLifecycleRecord]
@@ -291,6 +305,7 @@ def knowledge_context(state: AgentState) -> str:
         ("运行时注入", "runtime_context"),
         ("基础业务知识", "base_knowledge_context"),
         ("Topic资产", "topic_asset_context"),
+        ("强制业务规则（Always Apply）", "always_apply_context"),
         ("召回上下文", "recall_context"),
         ("会话上下文", "session_context"),
         ("历史摘要", "summary_context"),

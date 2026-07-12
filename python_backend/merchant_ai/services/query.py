@@ -67,6 +67,7 @@ from merchant_ai.services.query_contracts import (
 from merchant_ai.services.repositories import DorisRepository
 from merchant_ai.services.runtime_state import NodeTaskState, create_runtime_state_store, node_task_idempotency_key
 from merchant_ai.services.query_sql_binding import (
+    add_sql_where_condition,
     append_note,
     bind_node_sql_parameters,
     blank_entity_value,
@@ -94,6 +95,11 @@ from merchant_ai.services.tools import artifact_file_tool_definitions, canonical
 
 
 SQL_BUILTIN_IDENTIFIERS = {"current_date", "current_timestamp", "current_time", "curdate", "now"}
+
+
+def sql_references_filter_column(sql: str, column: str) -> bool:
+    value = str(column or "").strip().strip("`")
+    return bool(value and re.search(r"(?<![A-Za-z0-9_])`?%s`?\s*(?:=|IN\s*\()" % re.escape(value), sql or "", flags=re.I))
 STRUCTURED_FALLBACK_ERROR_CODES = {
     "SQL_EMPTY",
     "PARSE_ERROR",
@@ -407,6 +413,9 @@ class NodeWorkerExecutor:
         question: str,
         resume_task_results: Optional[List[AgentTaskResult]] = None,
         run_id: str = "",
+        access_role: str = DEFAULT_ACCESS_ROLE,
+        user_scope: Optional[Dict[str, Any]] = None,
+        execution_mode: str = "auto",
     ) -> AgentRunResult:
         optimize_query_plan_for_execution(plan, asset_pack)
         result = AgentRunResult()
@@ -439,7 +448,20 @@ class NodeWorkerExecutor:
             ]
             if not ready_ids:
                 ready_ids = list(pending.keys())
-            batch_results, batch_trace = self._execute_ready_batch(ready_ids, pending, completed, plan, merchant_id, asset_pack, question, knowledge_context, execution_run_id)
+            batch_results, batch_trace = self._execute_ready_batch(
+                ready_ids,
+                pending,
+                completed,
+                plan,
+                merchant_id,
+                asset_pack,
+                question,
+                knowledge_context,
+                execution_run_id,
+                access_role=access_role,
+                user_scope=user_scope,
+                execution_mode=execution_mode,
+            )
             result.node_execution_batches.append(batch_trace)
             for task_id, task_result in batch_results.items():
                 completed[task_id] = task_result
@@ -489,6 +511,9 @@ class NodeWorkerExecutor:
         question: str,
         knowledge_context: str,
         run_id: str = "",
+        access_role: str = DEFAULT_ACCESS_ROLE,
+        user_scope: Optional[Dict[str, Any]] = None,
+        execution_mode: str = "auto",
     ) -> tuple[Dict[str, AgentTaskResult], NodeExecutionBatch]:
         started = time.perf_counter()
         run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
@@ -496,12 +521,17 @@ class NodeWorkerExecutor:
         task_cap = max(1, int(getattr(self.settings, "max_sub_agent_tasks", configured_workers) or configured_workers))
         max_workers = max(1, min(configured_workers, task_cap, len(ready_ids)))
         results: Dict[str, AgentTaskResult] = {}
+        requested_execution_mode = str(execution_mode or "auto").lower()
         batch = NodeExecutionBatch(
             batch_id="batch_%03d" % (len(ready_ids) + int(time.time() * 1000) % 1000),
             ready_task_ids=list(ready_ids),
             max_concurrency=max_workers,
             timeout_seconds=max(1, self.settings.agent_node_timeout_seconds),
         )
+        batch.runtime_events.append({"event": "node.execution_tier", "requestedMode": requested_execution_mode})
+        recovered_tasks = self.runtime_state_store.recover_expired_node_tasks(max_attempts=3)
+        if recovered_tasks:
+            batch.runtime_events.append({"event": "node.expired_leases_recovered", "count": recovered_tasks})
         if max_workers < min(configured_workers, len(ready_ids)):
             batch.runtime_events.append(
                 {
@@ -515,6 +545,7 @@ class NodeWorkerExecutor:
         for start in range(0, len(ready_ids), max_workers):
             chunk_ids = ready_ids[start : start + max_workers]
             chunk_futures = {}
+            future_modes: Dict[Any, str] = {}
             executor = ThreadPoolExecutor(max_workers=max_workers)
             try:
                 for task_id in chunk_ids:
@@ -538,10 +569,12 @@ class NodeWorkerExecutor:
                             },
                         )
                     )
+                    task_mode = self._task_execution_mode(requested_execution_mode, pending[task_id], question)
+                    lease_owner = "node_subagent" if task_mode == "subagent" else "node_direct_worker"
                     claimed = self.runtime_state_store.claim_node_task(
                         run_id,
                         task_id,
-                        lease_owner="node_worker",
+                        lease_owner=lease_owner,
                         lease_seconds=max(1, self.settings.agent_node_timeout_seconds),
                     )
                     if not claimed:
@@ -549,12 +582,28 @@ class NodeWorkerExecutor:
                         batch.failed_task_ids.append(task_id)
                         results[task_id] = failed_result(task_id, pending[task_id], "node task could not acquire execution lease")
                         continue
-                    context = self._node_context(task_id, pending[task_id], completed, plan, merchant_id, question, asset_pack)
-                    context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
-                    context.context_package["parentRunId"] = run_id
-                    future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
+                    context = self._node_context(
+                        task_id,
+                        pending[task_id],
+                        completed,
+                        plan,
+                        merchant_id,
+                        question,
+                        asset_pack,
+                        access_role=access_role,
+                        user_scope=user_scope,
+                    )
+                    if task_mode == "subagent":
+                        context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
+                        context.context_package["parentRunId"] = run_id
+                        future = executor.submit(self._run_isolated_subagent, pending[task_id], asset_pack, knowledge_context, context)
+                    else:
+                        context.context_package.update({"parentRunId": run_id, "runtimeMode": "direct_node_worker", "subagentEnabled": False})
+                        future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
                     chunk_futures[future] = task_id
+                    future_modes[future] = task_mode
                     batch.submitted_task_ids.append(task_id)
+                    batch.runtime_events.append({"event": "node.task_dispatched", "taskId": task_id, "executionMode": task_mode})
                 if not chunk_futures:
                     continue
                 done = set()
@@ -571,6 +620,13 @@ class NodeWorkerExecutor:
                     not_done = set(still_running)
                     now = time.perf_counter()
                     if not_done and now >= next_heartbeat_at:
+                        for running_future in not_done:
+                            self.runtime_state_store.heartbeat_node_task(
+                                run_id,
+                                chunk_futures[running_future],
+                                "node_subagent" if future_modes.get(running_future) == "subagent" else "node_direct_worker",
+                                lease_seconds=max(1, self.settings.agent_node_timeout_seconds),
+                            )
                         batch.runtime_events.append(
                             {
                                 "event": "node.heartbeat",
@@ -646,6 +702,20 @@ class NodeWorkerExecutor:
         batch.duration_ms = int((time.perf_counter() - started) * 1000)
         return results, batch
 
+    def _task_execution_mode(self, requested_mode: str, intent: QuestionIntent, question: str) -> str:
+        if requested_mode in {"direct", "subagent"}:
+            return requested_mode
+        score = 0
+        if intent.task_role == TaskRole.DEPENDENT or intent.depends_on_task_ids:
+            score += 2
+        if intent.answer_mode in {AnswerMode.DERIVED, AnswerMode.DETAIL, AnswerMode.TOPN}:
+            score += 1
+        if re.search(r"原因|归因|为什么|诊断|异常|分析|建议|下钻|关联", "%s %s" % (question or "", intent.question or ""), re.I):
+            score += 2
+        if intent.answer_mode in {AnswerMode.METRIC, AnswerMode.GROUP_AGG} and not intent.depends_on_task_ids:
+            score -= 1
+        return "subagent" if score >= 2 else "direct"
+
     def _prepare_subagent_context(
         self,
         task_id: str,
@@ -659,10 +729,13 @@ class NodeWorkerExecutor:
         workspace.mkdir(parents=True, exist_ok=True)
         checkpoint_path = workspace / "checkpoint.json"
         context_package = {
+            **dict(context.context_package or {}),
             "subAgentRunId": run_id,
             "taskId": task_id,
             "taskRole": str(intent.task_role),
-            "subagentEnabled": False,
+            "subagentEnabled": True,
+            "runtimeMode": "independent_node_react",
+            "maxRounds": max(1, int(self.settings.max_sub_agent_rounds or 1)),
             "answerMode": str(intent.answer_mode),
             "preferredTable": intent.preferred_table,
             "allowedColumns": asset_pack.known_columns(intent.preferred_table)[:64],
@@ -681,6 +754,40 @@ class NodeWorkerExecutor:
         self._write_subagent_checkpoint(next_context, intent, "started", {"allowedColumns": context_package["allowedColumns"]})
         return next_context
 
+    def _run_isolated_subagent(
+        self,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        knowledge_context: str,
+        context: NodeExecutionContext,
+    ) -> AgentTaskResult:
+        observations: List[Dict[str, Any]] = []
+        max_rounds = max(1, int(self.settings.max_sub_agent_rounds or 1))
+        result = AgentTaskResult(task_id=intent.plan_task_id)
+        for round_index in range(1, max_rounds + 1):
+            result = self.execute_node(intent, asset_pack, knowledge_context, context)
+            observations.append(
+                {
+                    "round": round_index,
+                    "failed": bool(result.query_bundle.failed),
+                    "rows": result.query_bundle.effective_row_count(),
+                    "error": str(result.query_bundle.error or "")[:300],
+                }
+            )
+            if not result.query_bundle.failed or not result.query_bundle.error:
+                break
+            if not any(term in str(result.query_bundle.error).lower() for term in ["timeout", "tempor", "connection", "retry"]):
+                break
+        context.context_package["observations"] = observations
+        context.context_package["roundsUsed"] = len(observations)
+        self._write_subagent_checkpoint(
+            context,
+            intent,
+            "success" if not result.query_bundle.failed else "failed",
+            {"observations": observations, "roundsUsed": len(observations)},
+        )
+        return result
+
     def _node_context(
         self,
         task_id: str,
@@ -690,6 +797,8 @@ class NodeWorkerExecutor:
         merchant_id: str,
         question: str,
         asset_pack: PlanningAssetPack,
+        access_role: str = DEFAULT_ACCESS_ROLE,
+        user_scope: Optional[Dict[str, Any]] = None,
     ) -> NodeExecutionContext:
         upstream_rows: List[Dict[str, Any]] = []
         entity_sets: List[EntitySet] = []
@@ -759,10 +868,18 @@ class NodeWorkerExecutor:
             )
         return NodeExecutionContext(
             merchant_id=merchant_id,
-            access_role=DEFAULT_ACCESS_ROLE,
+            effective_user_id=str((user_scope or {}).get("userId") or (user_scope or {}).get("user_id") or ""),
+            authorized_region=str((user_scope or {}).get("region") or ""),
+            authorized_store_ids=[
+                str(item)
+                for item in ((user_scope or {}).get("storeIds") or (user_scope or {}).get("store_ids") or [])
+                if str(item or "").strip()
+            ],
+            access_role=access_role or DEFAULT_ACCESS_ROLE,
             question=question or intent.question,
             upstream_entity_sets=entity_sets,
             upstream_rows=upstream_rows if intent.answer_mode == AnswerMode.DERIVED else upstream_rows[: self.settings.tool_result_preview_rows],
+            context_package={"userScope": dict(user_scope or {})},
         )
 
     def _task_rows_for_context(self, task_result: AgentTaskResult, include_artifacts: bool = False) -> List[Dict[str, Any]]:
@@ -1247,6 +1364,7 @@ class NodeWorkerExecutor:
         validation_results: List[SqlValidationResult] = []
         repair_attempts: List[SqlRepairAttempt] = []
         for round_index in range(self.settings.agent_sql_repair_rounds + 1):
+            sql = self._enforce_identity_scope_sql(sql, contract, context)
             validation_started = time.perf_counter()
             validation = self.validator.validate(sql, asset_pack)
             validation = self._node_scope_validation(validation, intent, sql, asset_pack)
@@ -2865,6 +2983,12 @@ class NodeWorkerExecutor:
             elif "shop_id" in table_columns:
                 merchant_filter_column = "shop_id"
         row_scope_policy = normalize_row_access_policy(table_metadata.get("rowAccessPolicy") or default_row_access_policy(merchant_filter_column))
+        region_filter_column = str(table_metadata.get("regionFilterColumn") or "")
+        if not region_filter_column:
+            region_filter_column = next((column for column in ["region", "region_code", "country_code", "site_region"] if column in table_columns), "")
+        store_filter_column = str(table_metadata.get("storeFilterColumn") or "")
+        if not store_filter_column:
+            store_filter_column = next((column for column in ["store_id", "outlet_id", "branch_id"] if column in table_columns), "")
         access_role = str(context.access_role or DEFAULT_ACCESS_ROLE)
         field_semantics = table_field_semantics(asset_pack, table)
         visible_columns: List[str] = []
@@ -2910,6 +3034,11 @@ class NodeWorkerExecutor:
             limit=int(intent.limit or 0),
             merchant_id=context.merchant_id,
             merchant_filter_column=merchant_filter_column,
+            effective_user_id=context.effective_user_id,
+            authorized_region=context.authorized_region,
+            authorized_store_ids=list(context.authorized_store_ids),
+            region_filter_column=region_filter_column,
+            store_filter_column=store_filter_column,
             access_role=access_role,
             row_scope_policy=row_scope_policy,
             column_access_policy=column_access_policy,
@@ -2921,6 +3050,25 @@ class NodeWorkerExecutor:
             upstream_entity_sets=[item.model_dump(by_alias=True) for item in context.upstream_entity_sets],
             metric_resolution=intent.metric_resolution,
         )
+
+    def _enforce_identity_scope_sql(
+        self,
+        sql: str,
+        contract: NodePlanContract,
+        context: NodeExecutionContext,
+    ) -> str:
+        scoped_sql = str(sql or "")
+        context.context_package["regionFilterColumn"] = contract.region_filter_column
+        context.context_package["storeFilterColumn"] = contract.store_filter_column
+        conditions: List[str] = []
+        if contract.region_filter_column and context.authorized_region and not sql_references_filter_column(scoped_sql, contract.region_filter_column):
+            conditions.append("%s = %s" % (quote_identifier(contract.region_filter_column), sql_literal(context.authorized_region)))
+        if contract.store_filter_column and context.authorized_store_ids and not sql_references_filter_column(scoped_sql, contract.store_filter_column):
+            values = ", ".join(sql_literal(item) for item in context.authorized_store_ids[:200])
+            conditions.append("%s IN (%s)" % (quote_identifier(contract.store_filter_column), values))
+        for condition in conditions:
+            scoped_sql = add_sql_where_condition(scoped_sql, condition)
+        return scoped_sql
 
     def _node_contract_output_keys(self, intent: QuestionIntent, columns: set) -> List[str]:
         if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:

@@ -1310,13 +1310,21 @@ def build_run_budget_report(state: AgentState, settings: Settings) -> Dict[str, 
         "estimatedTokens": current_estimated_tokens,
         "peakEstimatedTokens": peak_estimated_tokens,
     }
+    latency_policy = state.get("latency_optimization") or {}
+    fast_budget = bool(latency_policy.get("eligible")) and str(latency_policy.get("mode") or "").startswith("fast_path")
+    duration_limit = (
+        max(1, int(getattr(settings, "run_budget_fast_duration_seconds", 25) or 25))
+        if fast_budget
+        else max(1, int(getattr(settings, "run_budget_max_duration_seconds", 90) or 90))
+    )
     limits = {
-        "maxDurationSeconds": max(1, int(getattr(settings, "run_budget_max_duration_seconds", 120) or 120)),
+        "maxDurationSeconds": duration_limit,
         "maxActions": max(1, int(getattr(settings, "run_budget_max_actions", 20) or 20)),
         "maxLlmCalls": max(1, int(getattr(settings, "run_budget_max_llm_calls", 8) or 8)),
         "maxDorisQueries": max(1, int(getattr(settings, "run_budget_max_doris_queries", 12) or 12)),
         "maxToolCalls": max(1, int(getattr(settings, "run_budget_max_tool_calls", 60) or 60)),
         "maxEstimatedTokens": max(1, int(getattr(settings, "run_budget_max_estimated_tokens", 60000) or 60000)),
+        "profile": "fast" if fast_budget else "complex",
     }
     breaches: List[str] = []
     if usage["elapsedMs"] >= limits["maxDurationSeconds"] * 1000:

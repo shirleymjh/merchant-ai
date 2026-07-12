@@ -135,6 +135,28 @@ class KnowledgeRequestType(str, Enum):
     REALTIME_FALLBACK = "REALTIME_FALLBACK"
 
 
+class UserIdentity(APIModel):
+    user_id: str = ""
+    merchant_id: str = ""
+    display_name: str = ""
+    role: str = "merchant_operator"
+    region: str = ""
+    language: str = "zh-CN"
+    store_ids: List[str] = Field(default_factory=list)
+    permissions: List[str] = Field(default_factory=list)
+
+    def prompt_markdown(self) -> str:
+        return "\n".join(
+            [
+                f"- 用户：{self.display_name or self.user_id or '当前商家用户'}",
+                f"- 角色：{self.role or 'merchant_operator'}",
+                f"- Region：{self.region or '未限定'}",
+                f"- Language：{self.language or 'zh-CN'}",
+                f"- 门店范围：{', '.join(self.store_ids) if self.store_ids else '当前商家全部授权门店'}",
+            ]
+        )
+
+
 class ChatContext(APIModel):
     question: str = ""
     time_expression: str = ""
@@ -158,6 +180,7 @@ class ChatContext(APIModel):
     pending_clarification_type: str = ""
     pending_question: str = ""
     pending_clarification_options: List[str] = Field(default_factory=list)
+    user_identity: UserIdentity = Field(default_factory=UserIdentity)
 
 
 class ConversationMessage(APIModel):
@@ -200,6 +223,7 @@ class ChatRequest(APIModel):
     context: Optional[ChatContext] = None
     message_history: List[ConversationMessage] = Field(default_factory=list)
     attachments: List[AttachmentReference] = Field(default_factory=list)
+    user_identity: UserIdentity = Field(default_factory=UserIdentity)
 
 
 class RunCreateRequest(APIModel):
@@ -209,6 +233,7 @@ class RunCreateRequest(APIModel):
     context: Optional[ChatContext] = None
     message_history: List[ConversationMessage] = Field(default_factory=list)
     attachments: List[AttachmentReference] = Field(default_factory=list)
+    user_identity: UserIdentity = Field(default_factory=UserIdentity)
 
 
 class FeedbackRequest(APIModel):
@@ -296,6 +321,14 @@ class KnowledgeSuggestionReviewRequest(APIModel):
     reviewer: str = ""
     review_note: str = ""
     action: str = "review"
+
+
+class KnowledgeSuggestionPublishRequest(APIModel):
+    reviewer: str = ""
+    review_note: str = ""
+    topic: str = ""
+    table_name: str = ""
+    auto_index: bool = True
 
 
 class SkillDraftReviewRequest(APIModel):
@@ -1167,6 +1200,11 @@ class NodePlanContract(APIModel):
     limit: int = 0
     merchant_id: str = ""
     merchant_filter_column: str = ""
+    effective_user_id: str = ""
+    authorized_region: str = ""
+    authorized_store_ids: List[str] = Field(default_factory=list)
+    region_filter_column: str = ""
+    store_filter_column: str = ""
     access_role: str = "merchant_analyst"
     row_scope_policy: Dict[str, Any] = Field(default_factory=dict)
     column_access_policy: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
@@ -1355,6 +1393,9 @@ class EntitySet(APIModel):
 
 class NodeExecutionContext(APIModel):
     merchant_id: str = ""
+    effective_user_id: str = ""
+    authorized_region: str = ""
+    authorized_store_ids: List[str] = Field(default_factory=list)
     access_role: str = "merchant_analyst"
     question: str = ""
     upstream_entity_sets: List[EntitySet] = Field(default_factory=list)
@@ -1669,6 +1710,57 @@ class AgentRunResult(APIModel):
     skill_lifecycle_records: List[SkillLifecycleRecord] = Field(default_factory=list)
     resumed_task_ids: List[str] = Field(default_factory=list)
     degraded_reasons: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class HypothesisEvidenceRecord(APIModel):
+    evidence_id: str = ""
+    hypothesis_id: str = ""
+    round: int = 1
+    task_id: str = ""
+    claim_key: str = ""
+    metric_name: str = ""
+    metric_formula: str = ""
+    table: str = ""
+    time_range: str = ""
+    sql_hash: str = ""
+    row_count: int = 0
+    status: str = "insufficient"
+    confidence: float = 0.0
+    evidence_preview: List[Dict[str, Any]] = Field(default_factory=list)
+    gaps: List[Dict[str, Any]] = Field(default_factory=list)
+    failure_reason: str = ""
+    reused_from_hypothesis_id: str = ""
+
+
+class HypothesisLedgerEntry(APIModel):
+    hypothesis_id: str = ""
+    title: str = ""
+    reason: str = ""
+    status: str = "candidate"
+    rank: int = 0
+    evidence_score: int = 0
+    semantic_score: int = 0
+    confidence: float = 0.0
+    query_graphs: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence: List[HypothesisEvidenceRecord] = Field(default_factory=list)
+    supporting_evidence_ids: List[str] = Field(default_factory=list)
+    insufficient_evidence_ids: List[str] = Field(default_factory=list)
+    failed_evidence_ids: List[str] = Field(default_factory=list)
+    evidence_gaps: List[Dict[str, Any]] = Field(default_factory=list)
+    elimination_reason: str = ""
+    followup_decision: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HypothesisEvidenceLedger(APIModel):
+    ledger_id: str = ""
+    winner_id: str = ""
+    survivor_ids: List[str] = Field(default_factory=list)
+    pruned_ids: List[str] = Field(default_factory=list)
+    entries: List[HypothesisLedgerEntry] = Field(default_factory=list)
+    rounds_used: int = 0
+    budget: Dict[str, Any] = Field(default_factory=dict)
+    comparison_policy: str = ""
+    created_at: datetime = Field(default_factory=datetime.now)
 
 
 class PendingAnswer(APIModel):

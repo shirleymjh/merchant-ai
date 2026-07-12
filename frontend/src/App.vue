@@ -4,6 +4,19 @@
       <button type="button" class="brand-menu" title="打开对话目录" @click="outlineOpen = true"><PanelLeftOpen :size="20" /></button>
       <div class="brand-mark"><ShoppingBag :size="24" /></div>
       <div class="brand-copy"><h1>yshopping 商家 AI 助手</h1><p>经营数据、分析与行动建议</p></div>
+      <label class="identity-selector" title="选择当前使用角色">
+        <span>当前身份</span>
+        <select v-model="userIdentity.role">
+          <option v-if="internalMode" value="platform_operator">平台运营管理员</option>
+          <option value="merchant_owner">店铺负责人</option>
+          <option value="merchant_operator">经营运营</option>
+          <option value="merchant_finance">财务</option>
+          <option value="merchant_customer_service">客服</option>
+          <option value="merchant_goods">商品运营</option>
+          <option value="merchant_fulfillment">履约运营</option>
+        </select>
+      </label>
+      <button v-if="internalMode" type="button" class="brand-admin" title="打开内部经营配置" @click="governanceOpen = true"><Settings2 :size="17" />经营配置</button>
       <button type="button" class="brand-new-chat" @click="resetChat"><MessageCirclePlus :size="17" />新会话</button>
     </header>
     <div v-if="outlineOpen" class="outline-backdrop" @click="outlineOpen = false" />
@@ -115,15 +128,17 @@
       <section v-else class="rail-empty-state"><Lightbulb :size="25" /><b>等待分析结果</b><p>提问指标后，这里会给出至少两条可执行建议。</p></section>
       <div v-if="dataFreshness" class="data-freshness"><DatabaseZap :size="14" /><span>数据更新：{{ dataFreshness }}</span><b>已校验</b></div>
     </aside>
+    <GovernanceConsole v-if="governanceOpen" @close="governanceOpen = false" />
   </main>
 </template>
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ChartNoAxesCombined, ChevronRight, CircleStop, DatabaseZap, FileText, Lightbulb, ListTree, LoaderCircle, MessageCirclePlus, MessageSquareText, PanelLeftClose, PanelLeftOpen, Paperclip, Send, ShoppingBag, Sparkles, X } from 'lucide-vue-next'
+import { ChartNoAxesCombined, ChevronRight, CircleStop, DatabaseZap, FileText, Lightbulb, ListTree, LoaderCircle, MessageCirclePlus, MessageSquareText, PanelLeftClose, PanelLeftOpen, Paperclip, Send, Settings2, ShoppingBag, Sparkles, X } from 'lucide-vue-next'
 import ChatMessage from './components/ChatMessage.vue'
 import DailyReportCard from './components/DailyReportCard.vue'
 import MetricInsightPanel from './components/MetricInsightPanel.vue'
+import GovernanceConsole from './components/GovernanceConsole.vue'
 import SuggestionList from './components/SuggestionList.vue'
 import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
 
@@ -137,6 +152,14 @@ const inputRef = ref(null)
 const fileInput = ref(null)
 const attachments = ref([])
 const outlineOpen = ref(false)
+const governanceOpen = ref(false)
+const internalMode = new URLSearchParams(window.location.search).get('ops') === '1'
+const userIdentity = ref({
+  userId: internalMode ? 'platform_ops' : 'merchant_user_100',
+  displayName: internalMode ? '平台运营管理员' : '当前商家用户',
+  role: internalMode ? 'platform_operator' : 'merchant_operator',
+  region: 'CN', language: 'zh-CN', storeIds: [], permissions: internalMode ? ['merchant.read', 'governance.write'] : ['merchant.read']
+})
 const executedAdvice = ref(new Set())
 const dailyReport = ref(null)
 const merchantProfile = ref(null)
@@ -253,7 +276,8 @@ async function askWithOptions(message, options = {}) {
       signal: controller.signal,
       messageHistory: requestHistory,
       threadId: options.resumeThreadId || '',
-      attachments: options.attachments || []
+      attachments: options.attachments || [],
+      userIdentity: cloneValue(userIdentity.value)
     }
     if (!options.resumeThreadId) {
       const completed = await streamChatRun(message, requestContext, requestOptions, event => handleStreamEvent(sessionId, event))

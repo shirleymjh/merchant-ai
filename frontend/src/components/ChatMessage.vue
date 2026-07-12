@@ -428,7 +428,7 @@ function confirmationTitle(type) {
     time_window: '确认分析时间范围',
     metric_focus: '确认指标口径',
     priority_goal: '确认优化目标',
-    skill_confirm: '确认分析工作流',
+    skill_confirm: '是否开始深度分析',
     business_scope: '确认业务范围'
   }
   return mapping[type] || '确认分析口径'

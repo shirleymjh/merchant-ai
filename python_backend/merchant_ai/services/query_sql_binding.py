@@ -39,14 +39,14 @@ def split_detail_sql_by_pt_windows(sql: str, days: int, chunk_days: int, max_chu
 
 def add_sql_where_condition(sql: str, condition: str) -> str:
     text = str(sql or "").strip()
-    match = re.search(r"\s+limit\s+\d+\s*$", text, flags=re.I)
-    limit_clause = match.group(0) if match else ""
+    match = re.search(r"\s+(group\s+by|having|order\s+by|limit)\b", text, flags=re.I)
+    tail = text[match.start() :] if match else ""
     head = text[: match.start()] if match else text
     if re.search(r"\swhere\s", head, flags=re.I):
         updated = "%s AND %s" % (head.rstrip(), condition)
     else:
         updated = "%s WHERE %s" % (head.rstrip(), condition)
-    return (updated + limit_clause).strip()
+    return (updated + tail).strip()
 
 
 def replace_sql_limit(sql: str, limit: int) -> str:
@@ -188,6 +188,12 @@ def node_bind_values_by_column(intent: QuestionIntent, columns: set, context: No
         for column in ["seller_id", "merchant_id"]:
             if column in normalized_columns:
                 add_bind_values(values_by_column, column, [merchant_id], 1)
+    region_column = normalize_identifier((context.context_package or {}).get("regionFilterColumn"))
+    if context.authorized_region and region_column in normalized_columns:
+        add_bind_values(values_by_column, region_column, [context.authorized_region], 1)
+    store_column = normalize_identifier((context.context_package or {}).get("storeFilterColumn"))
+    if context.authorized_store_ids and store_column in normalized_columns:
+        add_bind_values(values_by_column, store_column, list(context.authorized_store_ids), max_values)
     filter_column = normalize_identifier(intent.filter_column)
     if filter_column in normalized_columns:
         add_bind_values(values_by_column, filter_column, split_filter_values(intent.filter_value, max_values), max_values)
@@ -336,6 +342,24 @@ def sql_has_bound_merchant_filter(sql: str, columns: set) -> bool:
         if "%s" in rhs or rhs == "?" or re.match(r"^:[A-Za-z_][A-Za-z0-9_]*$", rhs):
             return True
     return False
+
+
+def sql_has_bound_column_filter(sql: str, column: str) -> bool:
+    normalized = normalize_identifier(column)
+    if not normalized:
+        return False
+    parsed = parse_sql_for_binding(sql)
+    if parsed is not None:
+        for predicate in list(parsed.find_all(exp.EQ)) + list(parsed.find_all(exp.In)):
+            if predicate_column_name(predicate.this) != normalized:
+                continue
+            expressions = [predicate.expression] if isinstance(predicate, exp.EQ) else list(predicate.expressions or [])
+            if any(sql_expression_is_placeholder(item) for item in expressions):
+                return True
+    pattern = bindable_predicate_pattern([normalized])
+    if not pattern:
+        return False
+    return any("%s" in str(match.group("rhs") or "") or "?" in str(match.group("rhs") or "") for match in pattern.finditer(sql or ""))
 
 
 def bind_node_sql_parameters_ast(

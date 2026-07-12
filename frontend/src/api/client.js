@@ -1,9 +1,11 @@
 const DEFAULT_MERCHANT_ID = '100'
+const OPS_TOKEN = import.meta.env.VITE_OPS_TOKEN || ''
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
     headers: {
       'Content-Type': 'application/json',
+      ...(OPS_TOKEN ? { 'X-Ops-Token': OPS_TOKEN } : {}),
       ...(options.headers || {})
     },
     ...options
@@ -30,7 +32,8 @@ export async function startAsyncRun(message, context, options = {}) {
       threadId: options.threadId || '',
       context,
       messageHistory: options.messageHistory || [],
-      attachments: options.attachments || []
+      attachments: options.attachments || [],
+      userIdentity: options.userIdentity || {}
     }),
     signal: options.signal
   })
@@ -39,14 +42,15 @@ export async function startAsyncRun(message, context, options = {}) {
 export async function streamChatRun(message, context, options = {}, onEvent = () => {}) {
   const response = await fetch('/api/chat/stream', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(OPS_TOKEN ? { 'X-Ops-Token': OPS_TOKEN } : {}) },
     body: JSON.stringify({
       message,
       merchantId: DEFAULT_MERCHANT_ID,
       threadId: options.threadId || '',
       context,
       messageHistory: options.messageHistory || [],
-      attachments: options.attachments || []
+      attachments: options.attachments || [],
+      userIdentity: options.userIdentity || {}
     }),
     signal: options.signal
   })
@@ -77,7 +81,7 @@ export async function uploadAttachment(file, signal) {
   const params = new URLSearchParams({ name: file.name, type: file.type || 'application/octet-stream', merchantId: DEFAULT_MERCHANT_ID })
   const response = await fetch(`/api/attachments?${params}`, {
     method: 'POST',
-    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    headers: { 'Content-Type': file.type || 'application/octet-stream', ...(OPS_TOKEN ? { 'X-Ops-Token': OPS_TOKEN } : {}) },
     body: file,
     signal
   })
@@ -94,7 +98,8 @@ export async function resumeChatRun(message, context, options = {}) {
       threadId: options.threadId || '',
       context,
       messageHistory: options.messageHistory || [],
-      attachments: options.attachments || []
+      attachments: options.attachments || [],
+      userIdentity: options.userIdentity || {}
     }),
     signal: options.signal
   })
@@ -127,6 +132,62 @@ export async function sendFeedback(id, payload) {
 
 export async function getDailyReport() {
   return request(`/api/daily-report?merchantId=${DEFAULT_MERCHANT_ID}`)
+}
+
+export async function getTopics() {
+  return request('/api/topics')
+}
+
+export async function buildTopicAsset(payload) {
+  return request('/api/topics/build', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function getTopicAssets(topic) {
+  return request(`/api/topics/${encodeURIComponent(topic)}/assets`)
+}
+
+export async function getTopicTableGovernance(topic, tableName) {
+  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/governance`)
+}
+
+export async function saveTopicTableDraft(topic, tableName, payload) {
+  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/draft`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function publishTopicTable(topic, tableName, payload) {
+  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/publish`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function rollbackTopicTable(topic, tableName, version = '') {
+  const params = new URLSearchParams({ version, reviewer: 'merchant_ops', reason: 'console rollback' })
+  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/rollback?${params}`, { method: 'POST' })
+}
+
+export async function getKnowledgeSuggestions(status = '') {
+  const suffix = status ? `?status=${encodeURIComponent(status)}&merchantId=${DEFAULT_MERCHANT_ID}` : `?merchantId=${DEFAULT_MERCHANT_ID}`
+  return request(`/api/ops/knowledge-suggestions${suffix}`)
+}
+
+export async function reviewKnowledgeSuggestion(id, payload) {
+  return request(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/review?merchantId=${DEFAULT_MERCHANT_ID}`, {
+    method: 'POST', body: JSON.stringify(payload)
+  })
+}
+
+export async function publishKnowledgeSuggestion(id, payload) {
+  return request(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/publish?merchantId=${DEFAULT_MERCHANT_ID}`, {
+    method: 'POST', body: JSON.stringify(payload)
+  })
+}
+
+export async function getAnalysisCatalog() {
+  return request('/api/ops/skill-market')
+}
+
+export async function installAnalysisPlan(name, payload = {}) {
+  return request(`/api/ops/skill-market/${encodeURIComponent(name)}/install`, {
+    method: 'POST', body: JSON.stringify(payload)
+  })
 }
 
 export function mockDailyReport() {

@@ -902,6 +902,17 @@ class MemoryKnowledgeGovernanceService:
                 self._doris_repository or DorisRepository(self.settings),
                 topic_assets,
             )
+        patch_result = topic_assets.stage_knowledge_suggestion_patch(publish_topic, publish_table, suggestion)
+        if not bool(patch_result.get("success")):
+            return {
+                "success": False,
+                "status": str(patch_result.get("status") or "PATCH_FAILED"),
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "topic": publish_topic,
+                "tableName": publish_table,
+                "assetPatch": patch_result,
+            }
         preflight = governance_service.preflight_publish(publish_topic, publish_table)
         if not bool(preflight.get("publishable")):
             return {
@@ -926,6 +937,21 @@ class MemoryKnowledgeGovernanceService:
                 "published": published,
             }
         governed = governance_service.after_publish(publish_topic, publish_table, reviewer, review_note)
+        readback = topic_assets.verify_published_suggestion(publish_topic, publish_table, suggestion_id)
+        if not readback.get("success"):
+            return {
+                "success": False,
+                "status": "PUBLISHED_READBACK_FAILED",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "topic": publish_topic,
+                "tableName": publish_table,
+                "assetPatch": patch_result,
+                "preflight": preflight,
+                "published": published,
+                "governed": governed,
+                "readback": readback,
+            }
         now = datetime.now().isoformat()
         suggestion["status"] = "published"
         effective_reviewer = reviewer or str(suggestion.get("publishRequestedBy") or suggestion.get("reviewer") or "")
@@ -956,8 +982,10 @@ class MemoryKnowledgeGovernanceService:
             "topic": publish_topic,
             "tableName": publish_table,
             "preflight": preflight,
+            "assetPatch": patch_result,
             "published": published,
             "governed": governed,
+            "readback": readback,
             "suggestion": find_knowledge_suggestion(saved, suggestion_id),
         }
 

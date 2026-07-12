@@ -1156,6 +1156,10 @@ body {
 .brand-copy h1 { margin: 0; color: #171c28; font-size: 21px; line-height: 1.2; }
 .brand-copy p { margin: 3px 0 0; color: #9199a8; font-size: 12px; }
 .brand-new-chat { margin-left: auto; height: 38px; display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; border: 1px solid #e1e6ee; border-radius: 11px; color: #40495b; background: rgba(255,255,255,.92); font-weight: 700; cursor: pointer; box-shadow: 0 7px 20px rgba(34,47,71,.05); }
+.brand-admin { height: 38px; display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; border: 1px solid #dce5f3; border-radius: 11px; color: #3562ad; background: #f7faff; font-weight: 700; cursor: pointer; }
+.identity-selector { display: flex; align-items: center; gap: 7px; margin-left: auto; color: #778195; font-size: 11px; }
+.identity-selector select { height: 36px; max-width: 118px; padding: 0 28px 0 10px; border: 1px solid #e1e6ee; border-radius: 10px; color: #40495b; background: #fff; font-weight: 700; }
+.identity-selector + .brand-admin + .brand-new-chat { margin-left: 0; }
 
 .analysis-rail,
 .insight-rail {
@@ -2573,6 +2577,8 @@ body {
   .app-brand-header { padding: 0 12px; }
   .brand-copy h1 { font-size: 17px; }
   .brand-copy p { display: none; }
+  .identity-selector span { display: none; }
+  .brand-admin { font-size: 0; width: 38px; padding: 0; justify-content: center; }
   .workspace-main { height: calc(100vh - 58px); border: 0; border-radius: 0; }
 }
 

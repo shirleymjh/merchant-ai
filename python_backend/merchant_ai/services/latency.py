@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict
 
 from merchant_ai.models import AnswerMode, FastUnderstandingResult, QueryPlan
@@ -65,4 +66,53 @@ class LatencyOptimizer:
             "reason": policy.get("reason", ""),
             "skipNodes": list(policy.get("skipNodes") or []),
             "preservedGuardrails": list(policy.get("preservedGuardrails") or []),
+        }
+
+    def execution_tier_policy(
+        self,
+        question: str,
+        plan: QueryPlan,
+        fast: FastUnderstandingResult,
+        remaining_seconds: float,
+        prior_failure_count: int = 0,
+        has_attachments: bool = False,
+    ) -> Dict[str, Any]:
+        executable = [intent for intent in plan.intents if intent.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT, AnswerMode.INVALID}]
+        tables = {intent.preferred_table for intent in executable if intent.preferred_table}
+        score = 0
+        reasons = []
+        if fast.intent_kind == "metric_query" and fast.complexity == "simple":
+            score -= 2
+            reasons.append("simple_metric_prefers_direct")
+        if len(tables) > 1 or plan.dependencies:
+            score += 2
+            reasons.append("cross_table_or_dependency")
+        if plan.knowledge_requests:
+            score += 1
+            reasons.append("semantic_gap")
+        if prior_failure_count:
+            score += 2
+            reasons.append("prior_execution_failure")
+        if has_attachments:
+            score += 2
+            reasons.append("attachment_context")
+        if re.search(r"原因|归因|为什么|诊断|异常|建议|分析|下钻|关联", question or "", re.I):
+            score += 2
+            reasons.append("analysis_or_attribution")
+        if len(executable) > 3:
+            score += 1
+            reasons.append("large_query_graph")
+        if remaining_seconds <= 18:
+            return {
+                "defaultMode": "direct",
+                "allowedModes": ["direct"],
+                "score": score,
+                "reasons": [*reasons, "remaining_budget_low"],
+            }
+        default_mode = "subagent" if score >= 2 else "direct"
+        return {
+            "defaultMode": default_mode,
+            "allowedModes": [default_mode, "direct" if default_mode == "subagent" else "subagent"],
+            "score": score,
+            "reasons": reasons or ["standard_query"],
         }

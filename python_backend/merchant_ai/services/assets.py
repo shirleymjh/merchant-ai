@@ -199,6 +199,163 @@ class TopicAssetService:
         data = self.load_table_asset(topic, table).get("knowledgeRules")
         return data if isinstance(data, list) else []
 
+    def always_apply_rules(
+        self,
+        categories: Iterable[QuestionCategory],
+        user_scope: Optional[Dict[str, Any]] = None,
+        merchant_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        rules: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        relevant_topics = set(self.topic_names_for_categories(categories))
+        scope = user_scope or {}
+        region = str(scope.get("region") or "")
+        store_ids = {str(item) for item in scope.get("storeIds") or scope.get("store_ids") or []}
+        now = datetime.utcnow()
+        for topic in self.all_topic_names():
+            for manifest_item in self.load_manifest(topic):
+                table = str(manifest_item.get("tableName") or "")
+                if not table:
+                    continue
+                for item in self.load_table_knowledge_rules(topic, table):
+                    if not isinstance(item, dict) or not bool(item.get("alwaysApply")):
+                        continue
+                    rule_scope = str(item.get("scope") or "topic").lower()
+                    if rule_scope != "global" and topic not in relevant_topics:
+                        continue
+                    if not always_apply_rule_active(item, now):
+                        continue
+                    regions = {str(value) for value in item.get("regions") or item.get("regionIds") or []}
+                    merchants = {str(value) for value in item.get("merchantIds") or []}
+                    stores = {str(value) for value in item.get("storeIds") or []}
+                    if regions and region not in regions:
+                        continue
+                    if merchants and str(merchant_id or "") not in merchants:
+                        continue
+                    if stores and not (stores & store_ids):
+                        continue
+                    content = str(item.get("content") or item.get("description") or "").strip()
+                    title = str(item.get("title") or item.get("name") or "强制业务规则").strip()
+                    fingerprint = "%s:%s:%s" % (topic, table, content)
+                    if not content or fingerprint in seen:
+                        continue
+                    seen.add(fingerprint)
+                    rules.append({**item, "topic": topic, "tableName": table, "title": title, "content": content, "priority": int(item.get("priority") or 0)})
+        rules.sort(key=lambda item: (-int(item.get("priority") or 0), str(item.get("topic") or ""), str(item.get("title") or "")))
+        winners: List[Dict[str, Any]] = []
+        conflicts: Dict[str, Dict[str, Any]] = {}
+        for rule in rules:
+            conflict_key = str(rule.get("conflictKey") or rule.get("ruleKey") or rule.get("title") or "")
+            current = conflicts.get(conflict_key)
+            if current and str(current.get("content") or "") != str(rule.get("content") or ""):
+                current.setdefault("suppressedConflicts", []).append({"ruleId": rule.get("ruleId"), "priority": rule.get("priority"), "content": rule.get("content")})
+                continue
+            conflicts[conflict_key] = rule
+            winners.append(rule)
+        budget = max(1, int(getattr(self.settings, "always_apply_rule_budget", 20) or 20))
+        return winners[:budget]
+
+    def stage_knowledge_suggestion_patch(self, topic: str, table: str, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+        """Materialize an approved suggestion into a reviewable pending semantic asset."""
+        target = self.table_asset_dir(topic, table)
+        pending = self.root / topic / "pending" / table
+        if not target.exists() and not pending.exists():
+            return {"success": False, "status": "TARGET_ASSET_NOT_FOUND", "topic": topic, "tableName": table}
+        if not pending.exists():
+            shutil.copytree(target, pending)
+        asset_path = pending / "asset.json"
+        asset = read_json(asset_path)
+        if not isinstance(asset, dict):
+            asset = self.load_table_asset(topic, table)
+        asset = {**asset, "topic": topic, "tableName": table}
+        suggestion_id = str(suggestion.get("suggestionId") or suggestion.get("suggestion_id") or "")
+        suggestion_type = str(suggestion.get("suggestionType") or suggestion.get("suggestion_type") or "rule").lower()
+        payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+        content = str(payload.get("correctionText") or payload.get("content") or payload.get("question") or "").strip()
+        metric_name = str(suggestion.get("metricName") or suggestion.get("metric_name") or "").strip()
+        aliases = [str(item) for item in suggestion.get("aliases") or [] if str(item).strip()]
+        before = {
+            "metrics": len(asset.get("metrics") or []),
+            "terms": len(asset.get("terms") or []),
+            "knowledgeRules": len(asset.get("knowledgeRules") or []),
+        }
+        patched_kind = "knowledgeRules"
+        if suggestion_type == "term":
+            patched_kind = "terms"
+            item = {
+                "term": metric_name or (aliases[0] if aliases else suggestion_id),
+                "description": content,
+                "aliases": aliases,
+                "sourceSuggestionId": suggestion_id,
+                "reviewStatus": "approved",
+            }
+            asset["terms"] = upsert_semantic_suggestion_item(asset.get("terms") or [], item, "sourceSuggestionId")
+            write_json(pending / "terms.json", asset["terms"])
+        elif suggestion_type == "metric" and (suggestion.get("sourceFields") or suggestion.get("aggregation")):
+            patched_kind = "metrics"
+            metric_key = stable_cache_key("suggested_metric", {"id": suggestion_id, "name": metric_name})[:24]
+            item = {
+                "metricKey": metric_key,
+                "businessName": metric_name or suggestion_id,
+                "aliases": aliases,
+                "sourceColumns": list(suggestion.get("sourceFields") or []),
+                "aggregation": str(suggestion.get("aggregation") or ""),
+                "filterConditions": list(suggestion.get("filterConditions") or []),
+                "description": content,
+                "sourceSuggestionId": suggestion_id,
+                "reviewStatus": "approved",
+            }
+            asset["metrics"] = upsert_semantic_suggestion_item(asset.get("metrics") or [], item, "sourceSuggestionId")
+            write_json(pending / "metrics.json", asset["metrics"])
+        else:
+            item = {
+                "ruleId": "suggestion_%s" % re.sub(r"[^a-zA-Z0-9_]+", "_", suggestion_id).strip("_"),
+                "title": metric_name or "商家确认经营规则",
+                "content": content or "商家已确认该经营口径。",
+                "keywords": list(dict.fromkeys([metric_name, *aliases]))[:12],
+                "alwaysApply": bool(payload.get("alwaysApply", True)),
+                "sourceSuggestionId": suggestion_id,
+                "reviewStatus": "approved",
+            }
+            asset["knowledgeRules"] = upsert_semantic_suggestion_item(asset.get("knowledgeRules") or [], item, "sourceSuggestionId")
+            write_json(pending / "knowledge_rules.json", asset["knowledgeRules"])
+        asset["status"] = "PENDING_REVIEW"
+        asset.setdefault("semanticGovernance", {})["lastKnowledgeSuggestionId"] = suggestion_id
+        write_json(asset_path, asset)
+        after = {
+            "metrics": len(asset.get("metrics") or []),
+            "terms": len(asset.get("terms") or []),
+            "knowledgeRules": len(asset.get("knowledgeRules") or []),
+        }
+        diff = {
+            "success": True,
+            "status": "PATCH_STAGED",
+            "topic": topic,
+            "tableName": table,
+            "suggestionId": suggestion_id,
+            "patchedKind": patched_kind,
+            "before": before,
+            "after": after,
+            "pendingPath": str(pending),
+        }
+        write_json(pending / "knowledge_suggestion_patch.json", diff)
+        return diff
+
+    def verify_published_suggestion(self, topic: str, table: str, suggestion_id: str) -> Dict[str, Any]:
+        self._table_asset_cache.pop((topic, table), None)
+        asset = self.load_table_asset(topic, table)
+        matches = []
+        for kind in ["metrics", "terms", "knowledgeRules"]:
+            for item in asset.get(kind) or []:
+                if isinstance(item, dict) and str(item.get("sourceSuggestionId") or "") == suggestion_id:
+                    matches.append({"kind": kind, "item": item})
+        return {
+            "success": bool(matches),
+            "status": "READBACK_VERIFIED" if matches else "READBACK_MISSING",
+            "suggestionId": suggestion_id,
+            "matches": matches,
+        }
+
     def load_relationships(self, topic: str) -> List[Dict[str, Any]]:
         if topic in self._relationship_cache:
             return self._relationship_cache[topic]
@@ -831,6 +988,32 @@ class HybridRecallService:
                     )
         self._documents = docs
         return docs
+
+
+def always_apply_rule_active(rule: Dict[str, Any], now: datetime) -> bool:
+    def parse(value: Any) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    effective = parse(rule.get("effectiveFrom") or rule.get("effectiveAt"))
+    expires = parse(rule.get("expiresAt") or rule.get("expiryAt"))
+    return not ((effective and now < effective) or (expires and now >= expires))
+
+
+def upsert_semantic_suggestion_item(items: List[Dict[str, Any]], candidate: Dict[str, Any], identity_key: str) -> List[Dict[str, Any]]:
+    result = [dict(item) for item in items if isinstance(item, dict)]
+    identity = str(candidate.get(identity_key) or "")
+    for index, item in enumerate(result):
+        if identity and str(item.get(identity_key) or "") == identity:
+            result[index] = {**item, **candidate}
+            return result
+    result.append(candidate)
+    return result
 
 
 def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:

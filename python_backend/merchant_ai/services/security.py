@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, Set
+from typing import Any, Dict, Iterable, Optional, Set
 
 from fastapi import HTTPException
 
 from merchant_ai.config import Settings
+from merchant_ai.models import UserIdentity
 
 
 class Permission(str, Enum):
@@ -35,6 +41,99 @@ ROLE_PERMISSIONS = {
     },
     "ops_admin": set(Permission),
 }
+
+IDENTITY_ROLES = {
+    "merchant_owner",
+    "merchant_operator",
+    "merchant_finance",
+    "merchant_customer_service",
+    "merchant_goods",
+    "merchant_fulfillment",
+    "platform_operator",
+}
+
+
+def resolve_authenticated_identity(
+    settings: Settings,
+    authorization: str = "",
+    requested_identity: Optional[UserIdentity] = None,
+) -> Optional[UserIdentity]:
+    """Resolve trusted identity from an HS256 JWT; request identity is dev-only input."""
+    token = str(authorization or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    if token:
+        if not settings.identity_jwt_secret:
+            raise HTTPException(status_code=503, detail="identity JWT secret is not configured")
+        claims = decode_hs256_jwt(token, settings)
+        return identity_from_claims(claims)
+    if settings.identity_auth_required:
+        raise HTTPException(status_code=401, detail="authenticated merchant identity is required")
+    if requested_identity is None:
+        return None
+    # Local development remains convenient, but never accepts arbitrary role names.
+    role = requested_identity.role if requested_identity.role in IDENTITY_ROLES else "merchant_operator"
+    return requested_identity.model_copy(update={"role": role})
+
+
+def decode_hs256_jwt(token: str, settings: Settings) -> Dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="invalid identity token")
+    header = decode_jwt_segment(parts[0])
+    claims = decode_jwt_segment(parts[1])
+    if header.get("alg") != "HS256":
+        raise HTTPException(status_code=401, detail="unsupported identity token algorithm")
+    expected = hmac.new(
+        settings.identity_jwt_secret.encode("utf-8"),
+        (parts[0] + "." + parts[1]).encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    try:
+        signature = base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4))
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid identity token signature") from exc
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="invalid identity token signature")
+    now = int(time.time())
+    if claims.get("exp") is not None and int(claims["exp"]) <= now:
+        raise HTTPException(status_code=401, detail="identity token expired")
+    if claims.get("nbf") is not None and int(claims["nbf"]) > now:
+        raise HTTPException(status_code=401, detail="identity token is not active")
+    if settings.identity_jwt_issuer and str(claims.get("iss") or "") != settings.identity_jwt_issuer:
+        raise HTTPException(status_code=401, detail="invalid identity token issuer")
+    audience = claims.get("aud")
+    audiences = set(audience if isinstance(audience, list) else [audience])
+    if settings.identity_jwt_audience and settings.identity_jwt_audience not in audiences:
+        raise HTTPException(status_code=401, detail="invalid identity token audience")
+    return claims
+
+
+def decode_jwt_segment(value: str) -> Dict[str, Any]:
+    try:
+        payload = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        data = json.loads(payload.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid identity token") from exc
+
+
+def identity_from_claims(claims: Dict[str, Any]) -> UserIdentity:
+    role = str(claims.get("role") or "merchant_operator")
+    if role not in IDENTITY_ROLES:
+        raise HTTPException(status_code=403, detail="identity role is not allowed")
+    store_ids = claims.get("storeIds") or claims.get("store_ids") or []
+    permissions = claims.get("permissions") or []
+    return UserIdentity(
+        user_id=str(claims.get("sub") or claims.get("userId") or ""),
+        merchant_id=str(claims.get("merchantId") or claims.get("merchant_id") or ""),
+        display_name=str(claims.get("name") or claims.get("displayName") or ""),
+        role=role,
+        region=str(claims.get("region") or claims.get("Region") or ""),
+        language=str(claims.get("language") or "zh-CN"),
+        store_ids=[str(item) for item in store_ids if str(item or "").strip()] if isinstance(store_ids, list) else [],
+        permissions=[str(item) for item in permissions if str(item or "").strip()] if isinstance(permissions, list) else [],
+    )
 
 
 @dataclass(frozen=True)

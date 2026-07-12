@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import hmac
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, Request, status
+from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -17,6 +16,8 @@ from merchant_ai.models import (
     ChatRequest,
     FeedbackRequest,
     GoldenEvaluationRequest,
+    ChatContext,
+    KnowledgeSuggestionPublishRequest,
     KnowledgeSuggestionReviewRequest,
     MemoryCleanupRequest,
     MemoryItemPatchRequest,
@@ -32,7 +33,7 @@ from merchant_ai.services.answer import DailyReportService, FeedbackService
 from merchant_ai.services.attachments import AttachmentStore
 from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicBuilderWorkflow
 from merchant_ai.services.evaluation import GoldenEvaluationService
-from merchant_ai.services.memory import MemoryManagementService
+from merchant_ai.services.memory import MemoryGovernanceService, MemoryManagementService
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
 from merchant_ai.services.runs import (
@@ -42,7 +43,13 @@ from merchant_ai.services.runs import (
     run_duration_ms,
     run_summary_payload,
 )
-from merchant_ai.services.security import Permission, authorize_merchant_access, merchant_principal, ops_principal
+from merchant_ai.services.security import (
+    Permission,
+    authorize_merchant_access,
+    merchant_principal,
+    ops_principal,
+    resolve_authenticated_identity,
+)
 from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.skill_evaluation import SkillEvaluationService
 
@@ -56,6 +63,7 @@ doris_repository: Any
 daily_report_service: DailyReportService
 feedback_service: FeedbackService
 memory_management_service: MemoryManagementService
+memory_governance_service: MemoryGovernanceService
 skill_draft_service: SkillDraftService
 skill_evaluation_service: SkillEvaluationService
 golden_evaluation_service: GoldenEvaluationService
@@ -76,6 +84,7 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     global daily_report_service
     global feedback_service
     global memory_management_service
+    global memory_governance_service
     global skill_draft_service
     global skill_evaluation_service
     global golden_evaluation_service
@@ -104,6 +113,13 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     golden_evaluation_service = GoldenEvaluationService(settings)
     topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
     semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
+    memory_governance_service = MemoryGovernanceService(
+        settings,
+        workflow.memory_store,
+        topic_assets,
+        semantic_governance,
+        doris_repository,
+    )
     recall_index_manager = RecallIndexManager(
         settings,
         workflow.recall_service,
@@ -174,7 +190,8 @@ def health() -> Dict[str, Any]:
 
 
 @router.post("/api/chat")
-async def chat(request: ChatRequest) -> Dict[str, Any]:
+async def chat(request: ChatRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    apply_request_identity(request, authorization)
     merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     request.message = message_with_attachments(request.message, request.attachments, merchant_id)
     thread = run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
@@ -201,14 +218,16 @@ async def chat(request: ChatRequest) -> Dict[str, Any]:
 
 
 @router.post("/api/chat/stream")
-def stream_chat(request: RunCreateRequest):
+def stream_chat(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)):
+    apply_request_identity(request, authorization)
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     return StreamingResponse(stream_service.stream(request), media_type="text/event-stream")
 
 
 @router.post("/api/runs/async")
-def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
+def create_async_run(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    apply_request_identity(request, authorization)
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     run = async_run_service.submit(request)
@@ -228,7 +247,8 @@ def create_async_run(request: RunCreateRequest) -> Dict[str, Any]:
 
 
 @router.post("/api/chat/resume")
-def resume_chat(request: RunCreateRequest) -> Dict[str, Any]:
+def resume_chat(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    apply_request_identity(request, authorization)
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     if not request.thread_id:
@@ -491,8 +511,14 @@ def evaluate_memory_recall(
 
 
 @router.get("/api/ops/knowledge-suggestions")
-def operator_knowledge_suggestions(status: Optional[str] = Query(default=None), _auth: None = OpsAuth) -> Dict[str, Any]:
-    items = load_knowledge_suggestions()
+def operator_knowledge_suggestions(
+    status: Optional[str] = Query(default=None),
+    merchant_id: str = Query(default=""),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    target = require_ops_merchant_access(merchant_id or settings.merchant_id)
+    memory = memory_management_service.get_memory(target).get("memory") or {}
+    items = list(memory.get("knowledgeSuggestions") or [])
     if status:
         items = [item for item in items if str(item.get("status", "")).lower() == status.lower()]
     return {"success": True, "items": items}
@@ -502,30 +528,46 @@ def operator_knowledge_suggestions(status: Optional[str] = Query(default=None), 
 def review_operator_knowledge_suggestion(
     item_id: str,
     request: KnowledgeSuggestionReviewRequest,
+    merchant_id: str = Query(default=""),
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
-    items = load_knowledge_suggestions()
-    target = None
-    for item in items:
-        if item.get("id") == item_id or item.get("suggestionId") == item_id:
-            target = item
-            break
-    if target is None:
-        target = {"id": item_id, "suggestionId": item_id}
-        items.append(target)
-    target.setdefault("id", item_id)
-    target.setdefault("suggestionId", item_id)
-    target.update(
-        {
-            "status": "approved" if request.approved else "rejected",
-            "reviewer": request.reviewer,
-            "reviewNote": request.review_note,
-            "approvedBy": request.reviewer if request.approved else "",
-            "reviewedAt": datetime.now().isoformat(),
-        }
+    target = require_ops_merchant_access(merchant_id or settings.merchant_id)
+    return memory_governance_service.review_suggestion(target, item_id, request)
+
+
+@router.post("/api/ops/knowledge-suggestions/{item_id}/request-publish")
+def request_operator_knowledge_publish(
+    item_id: str,
+    request: KnowledgeSuggestionPublishRequest,
+    merchant_id: str = Query(default=""),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    target = require_ops_merchant_access(merchant_id or settings.merchant_id)
+    return memory_governance_service.request_publish_suggestion(target, item_id, request.reviewer, request.review_note)
+
+
+@router.post("/api/ops/knowledge-suggestions/{item_id}/publish")
+def publish_operator_knowledge_suggestion(
+    item_id: str,
+    request: KnowledgeSuggestionPublishRequest,
+    merchant_id: str = Query(default=""),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    target = require_ops_merchant_access(merchant_id or settings.merchant_id)
+    result = memory_governance_service.publish_suggestion(
+        target,
+        item_id,
+        reviewer=request.reviewer,
+        review_note=request.review_note,
+        topic=request.topic,
+        table_name=request.table_name,
     )
-    save_knowledge_suggestions(items)
-    return {"success": True, "item": target}
+    if result.get("success") and request.auto_index:
+        indexed = recall_index_manager.rebuild(changed_only=True, topic=result.get("topic", ""), table_name=result.get("tableName", ""))
+        result["recallIndex"] = indexed
+        if indexed.get("success", True):
+            result["indexed"] = memory_governance_service.mark_suggestion_indexed(target, item_id, result.get("suggestion", {}).get("publishedRefId", ""))
+    return result
 
 
 @router.get("/api/ops/skill-drafts")
@@ -793,6 +835,76 @@ def topic_assets_endpoint(topic: str, _auth: None = OpsAuth) -> Dict[str, Any]:
     return topic_assets.list_topic(topic)
 
 
+@router.get("/api/topics/{topic}/tables/{table_name}/governance")
+def topic_table_governance(topic: str, table_name: str, _auth: None = OpsAuth) -> Dict[str, Any]:
+    target = topic_assets.table_asset_dir(topic, table_name)
+    pending = topic_assets.root / topic / "pending" / table_name
+    return {
+        "success": target.exists(),
+        "topic": topic,
+        "tableName": table_name,
+        "asset": topic_assets.load_table_asset(topic, table_name),
+        "pendingAsset": read_json_file(pending / "asset.json"),
+        "pendingPatch": read_json_file(pending / "knowledge_suggestion_patch.json"),
+        "publishHistory": read_json_file(target / "semantic_publish_history.json"),
+        "impact": semantic_governance.impact_analysis(topic, table_name),
+    }
+
+
+@router.post("/api/topics/{topic}/tables/{table_name}/draft")
+def stage_topic_table_draft(
+    topic: str,
+    table_name: str,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    current = topic_assets.load_table_asset(topic, table_name)
+    allowed = {"description", "schemaColumns", "semanticColumns", "metrics", "terms", "knowledgeRules"}
+    draft = {**current, **{key: payload[key] for key in allowed if key in payload}, "topic": topic, "tableName": table_name}
+    pending = topic_assets.root / topic / "pending" / table_name
+    pending.mkdir(parents=True, exist_ok=True)
+    write_json(pending / "asset.json", draft)
+    for field, file_name in {
+        "schemaColumns": "schema.json",
+        "semanticColumns": "semantic_columns.json",
+        "metrics": "metrics.json",
+        "terms": "terms.json",
+        "knowledgeRules": "knowledge_rules.json",
+    }.items():
+        write_json(pending / file_name, draft.get(field) or [])
+    write_json(
+        pending / "editor_metadata.json",
+        {"editor": str(payload.get("editor") or "merchant_ops"), "updatedAt": datetime_now_iso(), "fields": sorted(set(payload) & allowed)},
+    )
+    return {
+        "success": True,
+        "status": "DRAFT_STAGED",
+        "topic": topic,
+        "tableName": table_name,
+        "pendingPath": str(pending),
+        "preflight": semantic_governance.preflight_publish(topic, table_name),
+    }
+
+
+@router.get("/api/topics")
+def list_topics(_auth: None = OpsAuth) -> Dict[str, Any]:
+    return {"success": True, "items": topic_assets.all_topic_names()}
+
+
+def apply_request_identity(request: Any, authorization: Optional[str] = None) -> None:
+    context = request.context or ChatContext()
+    identity = resolve_authenticated_identity(settings, authorization or "", getattr(request, "user_identity", None))
+    if identity is not None:
+        requested_merchant = str(getattr(request, "merchant_id", "") or "").strip()
+        if identity.merchant_id and requested_merchant and identity.merchant_id != requested_merchant:
+            raise HTTPException(status_code=403, detail="authenticated identity cannot access requested merchantId")
+        if identity.merchant_id:
+            request.merchant_id = identity.merchant_id
+        request.user_identity = identity
+        context.user_identity = identity
+    request.context = context
+
+
 def knowledge_suggestions_path() -> Path:
     return settings.resolved_ops_path / "knowledge_suggestions.json"
 
@@ -810,6 +922,19 @@ def load_knowledge_suggestions() -> Any:
 
 def save_knowledge_suggestions(items: Any) -> None:
     write_json(knowledge_suggestions_path(), {"items": items})
+
+
+def read_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def datetime_now_iso() -> str:
+    from datetime import datetime
+
+    return datetime.utcnow().isoformat() + "Z"
 
 
 RUNS_DASHBOARD_HTML = """

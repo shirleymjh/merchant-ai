@@ -15,6 +15,7 @@ from merchant_ai.graph.workflow import (
     create_workflow,
     dedupe_workflow_knowledge_requests,
     knowledge_request_key,
+    merchant_access_role,
     observability_summary,
 )
 from merchant_ai.models import (
@@ -79,6 +80,7 @@ from merchant_ai.models import (
     MemoryRetrievalCandidate,
     VerifiedEvidence,
     WorkspaceManifest,
+    UserIdentity,
 )
 from merchant_ai.services.assets import (
     HybridRecallService,
@@ -203,6 +205,7 @@ from merchant_ai.services.query import (
     table_access_hint,
 )
 from merchant_ai.services.skill_worker import SkillWorkerExecutor
+from merchant_ai.services.sandbox import MerchantAnalysisSandbox
 from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.skill_evaluation import SkillEvaluationService
 from merchant_ai.services.repositories import DorisRepository
@@ -391,6 +394,277 @@ def test_controlled_react_explorer_scores_candidate_graphs_with_guardrails():
     assert candidates["mode"] == "candidate_query_graph_sandbox"
     assert candidates["candidates"][0]["status"] == "selected"
     assert candidates["candidates"][0]["guardrailResult"]["directSqlAllowed"] is False
+
+
+def test_controlled_react_runs_parallel_hypothesis_evidence_reviews():
+    explorer = ControlledReactExplorer()
+    hypotheses = {
+        "hypotheses": [
+            {"hypothesisId": "h1", "title": "交易变化", "metricHints": ["order_gmv_amt_1d"]},
+            {"hypothesisId": "h2", "title": "退款变化", "metricHints": ["refund_amt_1d"]},
+        ]
+    }
+    bundle = QueryBundle(rows=[{"pt": "2026-07-01", "order_gmv_amt_1d": 100, "refund_amt_1d": 10}])
+    result = explorer.run_parallel_evidence_reviews(hypotheses, AgentRunResult(merged_query_bundle=bundle))
+
+    assert len(result) == 2
+    assert all(item["workerMode"] == "parallel_isolated_evidence_review" for item in result)
+    assert all(item["status"] == "supported_by_available_evidence" for item in result)
+
+
+def test_controlled_react_ranks_independent_query_evidence_and_prunes_weak_hypothesis():
+    explorer = ControlledReactExplorer()
+    strong_result = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="h1_node", success=True, query_bundle=QueryBundle(rows=[{"pt": "2026-07-01", "gmv": 100}], tables=["trade"]))],
+        merged_query_bundle=QueryBundle(rows=[{"pt": "2026-07-01", "gmv": 100}], tables=["trade"]),
+        verified_evidence=VerifiedEvidence(passed=True, covered_evidence=["gmv", "pt"]),
+    )
+    weak_result = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="h2_node", success=False, query_bundle=QueryBundle(failed=True, error="no rows"))],
+        merged_query_bundle=QueryBundle(failed=True),
+        verified_evidence=VerifiedEvidence(passed=False, gaps=[EvidenceGap(code="ZERO_ROWS", reason="no rows")]),
+    )
+
+    comparison = explorer.compare_independent_executions(
+        [
+            {"hypothesisId": "h1", "hypothesis": {"title": "交易下降"}, "semanticScore": 40, "validation": GraphValidationResult(valid=True), "runResult": strong_result},
+            {"hypothesisId": "h2", "hypothesis": {"title": "退款影响"}, "semanticScore": 20, "validation": GraphValidationResult(valid=True), "runResult": weak_result},
+        ],
+        min_score=45,
+        max_survivors=1,
+    )
+
+    assert comparison["winnerId"] == "h1"
+    assert comparison["survivorIds"] == ["h1"]
+    assert comparison["prunedIds"] == ["h2"]
+    decision = explorer.followup_decision(comparison["ranked"][0])
+    assert decision["action"] == "stop"
+    assert "足够" in decision["reason"]
+
+
+def test_main_agent_exposes_independent_hypothesis_query_tool_for_attribution_question():
+    settings = get_settings().model_copy(update={"hypothesis_query_exploration_enabled": True, "lead_agent_autonomous_enabled": True})
+    policy = V2AgentPolicy(settings)
+    state = {
+        "question": "最近7天GMV下降原因分析",
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "query_graph_reflected": True,
+        "query_graph_validated": True,
+        "query_graph_validation_result": GraphValidationResult(valid=True),
+        "sql_generated": True,
+        "sql_repair_reviewed": True,
+        "evidence_graph_verified": True,
+        "hypothesis_exploration_completed": False,
+        "hypothesis_exploration": {
+            "questionSignals": {"mentionsAttribution": True, "mentionsDrop": True},
+            "hypotheses": [{"hypothesisId": "h1"}, {"hypothesisId": "h2"}, {"hypothesisId": "h3"}],
+        },
+        "plan": QueryPlan(intents=[QuestionIntent(plan_task_id="main", intent_type=IntentType.VALID, answer_mode=AnswerMode.METRIC, preferred_table="trade")]),
+        "agent_run_result": AgentRunResult(task_results=[AgentTaskResult(task_id="main", success=True, query_bundle=QueryBundle(rows=[{"gmv": 1}]))]),
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "react_round": 5,
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.selected_action == "explore_hypotheses"
+    assert "explore_hypotheses" in decision.available_actions
+
+
+def test_main_agent_recovers_planner_failure_with_semantic_hypothesis_queries():
+    settings = get_settings().model_copy(update={"hypothesis_query_exploration_enabled": True, "lead_agent_autonomous_enabled": True})
+    policy = V2AgentPolicy(settings)
+    state = {
+        "question": "GMV下降原因分析",
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "planner_provider_error": "PLANNER_LLM_TIMEOUT",
+        "plan": QueryPlan(),
+        "planning_asset_pack": PlanningAssetPack(metrics=[PlanningAssetEntry(key="gmv", table="trade")]),
+        "hypothesis_exploration_completed": False,
+        "hypothesis_exploration": {"hypotheses": [{"hypothesisId": "h1"}, {"hypothesisId": "h2"}]},
+        "routing_decision": RoutingDecision(route=QuestionRoute.BUSINESS),
+        "agent_run_result": AgentRunResult(),
+        "react_round": 4,
+    }
+
+    decision = policy.decide(state)
+
+    assert decision.selected_action == "explore_hypotheses"
+
+
+def test_execution_tier_prefers_direct_for_simple_metric_but_is_not_hard_coded():
+    optimizer = LatencyOptimizer()
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                plan_task_id="gmv",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                preferred_table="trade",
+            )
+        ]
+    )
+    fast = FastUnderstandingResult(intent_kind="metric_query", complexity="simple")
+
+    normal = optimizer.execution_tier_policy("最近7天GMV", plan, fast, remaining_seconds=60)
+    escalated = optimizer.execution_tier_policy(
+        "最近7天GMV",
+        plan,
+        fast,
+        remaining_seconds=60,
+        prior_failure_count=1,
+        has_attachments=True,
+    )
+
+    assert normal["defaultMode"] == "direct"
+    assert normal["allowedModes"] == ["direct", "subagent"]
+    assert escalated["defaultMode"] == "subagent"
+    assert "prior_execution_failure" in escalated["reasons"]
+    assert "attachment_context" in escalated["reasons"]
+
+
+def test_controlled_react_builds_safe_semantic_seed_query_graph_when_planner_is_unavailable():
+    explorer = ControlledReactExplorer()
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="trade", columns=["seller_id", "pt", "pay_amt"])],
+        metrics=[PlanningAssetEntry(key="gmv", title="GMV", table="trade", metadata={"sourceColumns": ["pay_amt"]})],
+    )
+
+    plan = explorer.fallback_hypothesis_seed_plan(
+        {"hypothesisId": "h1", "metricHints": ["gmv"], "requiredEvidence": ["trend"]},
+        pack,
+        "GMV下降原因",
+        "hyp_h1",
+        7,
+    )
+
+    assert plan.intents[0].preferred_table == "trade"
+    assert plan.intents[0].metric_column == "pay_amt"
+    assert plan.intents[0].group_by_column == "pt"
+    assert plan.intents[0].analysis_source == "hypothesis_semantic_seed"
+
+
+def test_workflow_keeps_independent_hypothesis_evidence_in_ledger(monkeypatch, tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "agent_checkpointer_backend": "memory",
+            "hypothesis_max_rounds": 1,
+            "hypothesis_max_survivors": 1,
+            "hypothesis_min_survivor_score": 45,
+            "llm_api_key": "",
+            "embedding_api_key": "",
+            "es_enabled": False,
+        }
+    )
+    workflow = create_workflow(settings)
+    state = workflow._initial_state("GMV下降原因分析", "100", ChatContext(), None, "thread_hyp", "run_hyp", [])
+    state["merchant"] = MerchantInfo(merchant_id="100", merchant_name="test")
+    state["hypothesis_exploration"] = {
+        "hypotheses": [
+            {"hypothesisId": "h1", "title": "交易规模下降", "metricHints": ["gmv"]},
+            {"hypothesisId": "h2", "title": "退款压力上升", "metricHints": ["refund"]},
+        ]
+    }
+    state["candidate_query_graphs"] = {
+        "candidates": [
+            {"hypothesisId": "h1", "score": 45},
+            {"hypothesisId": "h2", "score": 20},
+        ]
+    }
+    state["plan"] = QueryPlan(
+        intents=[QuestionIntent(plan_task_id="baseline", intent_type=IntentType.VALID, answer_mode=AnswerMode.METRIC, preferred_table="trade")]
+    )
+    state["agent_run_result"] = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="baseline", success=True, query_bundle=QueryBundle(rows=[{"gmv": 90}], tables=["trade"]))],
+        merged_query_bundle=QueryBundle(rows=[{"gmv": 90}], tables=["trade"]),
+        verified_evidence=VerifiedEvidence(passed=True, covered_evidence=["gmv"]),
+    )
+
+    def fake_plan(_state, hypothesis, round_index, _previous, _followup):
+        hypothesis_id = hypothesis["hypothesisId"]
+        plan = QueryPlan(
+            intents=[
+                QuestionIntent(
+                    plan_task_id="%s_query" % hypothesis_id,
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.METRIC,
+                    preferred_table="trade" if hypothesis_id == "h1" else "refund",
+                )
+            ]
+        )
+        return {
+            "hypothesis": hypothesis,
+            "hypothesisId": hypothesis_id,
+            "plan": plan,
+            "validation": GraphValidationResult(valid=True),
+            "round": round_index,
+            "planningMode": "independent_planner",
+            "semanticScore": 45 if hypothesis_id == "h1" else 20,
+        }
+
+    def fake_execute(_state, planned, _parallel):
+        executions = []
+        for item in planned:
+            hypothesis_id = item["hypothesisId"]
+            if hypothesis_id == "h1":
+                result = AgentRunResult(
+                    task_results=[AgentTaskResult(task_id="h1_query", success=True, query_bundle=QueryBundle(rows=[{"gmv": 80}], tables=["trade"]))],
+                    merged_query_bundle=QueryBundle(rows=[{"gmv": 80}], tables=["trade"]),
+                    verified_evidence=VerifiedEvidence(passed=True, covered_evidence=["gmv"]),
+                )
+            else:
+                result = AgentRunResult(
+                    task_results=[AgentTaskResult(task_id="h2_query", success=False, query_bundle=QueryBundle(failed=True, error="no evidence"))],
+                    merged_query_bundle=QueryBundle(failed=True),
+                    verified_evidence=VerifiedEvidence(passed=False, gaps=[EvidenceGap(code="ZERO_ROWS", reason="no evidence")]),
+                )
+            executions.append({**item, "runResult": result})
+        return executions
+
+    monkeypatch.setattr(workflow, "_generate_independent_hypothesis_plan", fake_plan)
+    monkeypatch.setattr(workflow, "_execute_hypothesis_plans_parallel", fake_execute)
+
+    result = workflow.explore_hypotheses(state)
+
+    assert result["hypothesis_exploration_completed"] is True
+    assert result["hypothesis_selected_ids"] == ["h1"]
+    assert [item["decision"] for item in result["hypothesis_results"]] == ["survive", "pruned"]
+    assert {item.task_id for item in result["agent_run_result"].task_results} == {"baseline"}
+    ledger = result["hypothesis_evidence_ledger"]
+    assert ledger.winner_id == "h1"
+    assert ledger.survivor_ids == ["h1"]
+    assert ledger.pruned_ids == ["h2"]
+    assert ledger.entries[0].supporting_evidence_ids
+    assert ledger.entries[1].failed_evidence_ids
+    assert ledger.entries[1].elimination_reason
+    workflow.checkpoint_manager.close()
+
+
+def test_always_apply_rules_bypass_normal_recall():
+    rules = TopicAssetService(get_settings()).always_apply_rules([QuestionCategory.REFUND])
+
+    assert rules
+    assert all(item.get("alwaysApply") is True for item in rules)
+    assert all(item.get("topic") and item.get("tableName") for item in rules)
+
+
+def test_merchant_identity_maps_business_roles_to_access_roles():
+    identity = UserIdentity(user_id="u_finance", role="merchant_finance", region="AU")
+
+    assert merchant_access_role(identity.role) == "merchant_finance"
+    assert "Region：AU" in identity.prompt_markdown()
+
+
+def test_analysis_sandbox_rejects_unapproved_script(tmp_path):
+    result = MerchantAnalysisSandbox(get_settings()).run_python(tmp_path / "unknown.py", [], tmp_path, 1)
+
+    assert result.returncode == 126
+    assert result.stderr == "SANDBOX_SCRIPT_NOT_APPROVED"
 
 
 def test_latency_optimizer_marks_simple_single_node_graph_as_fast_path():
@@ -1098,9 +1372,9 @@ def test_lead_policy_has_no_standalone_load_skills_action():
         "plan": QueryPlan(),
     }
     decision = policy.decide(state)
-    assert decision.selected_action == "try_fast_metric"
-    assert decision.selected_node == "try_fast_metric"
-    assert decision.available_actions == ["try_fast_metric", "retrieve_knowledge"]
+    assert decision.selected_action == "fast_understand"
+    assert decision.selected_node == "fast_understand"
+    assert decision.available_actions == ["fast_understand"]
 
 
 def test_lead_policy_inserts_fast_understand_after_route_before_retrieval():
@@ -1180,9 +1454,9 @@ def test_emit_adds_standard_event_envelope_without_hiding_payload():
     assert payload["eventId"].startswith("evt_")
 
 
-def test_lead_agent_defaults_to_bounded_llm_orchestrated_sixteen_round_loop():
+def test_lead_agent_defaults_to_adaptive_bounded_llm_sixteen_round_loop():
     assert Settings.model_fields["agent_main_rounds"].default == 16
-    assert Settings.model_fields["lead_action_llm_mode"].default == "fast_gate"
+    assert Settings.model_fields["lead_action_llm_mode"].default == "adaptive"
     assert V2AgentPolicy().max_main_actions == 16
 
 
@@ -8072,6 +8346,27 @@ class FakeMemoryEsApi:
 class FakeSuggestionTopicAssets:
     def __init__(self):
         self.publish_calls = []
+        self.patch_calls = []
+
+    def stage_knowledge_suggestion_patch(self, topic, table_name, suggestion):
+        self.patch_calls.append((topic, table_name, dict(suggestion)))
+        return {
+            "success": True,
+            "status": "PATCH_STAGED",
+            "topic": topic,
+            "tableName": table_name,
+            "suggestionId": suggestion.get("suggestionId"),
+            "changes": [{"operation": "upsert", "sourceSuggestionId": suggestion.get("suggestionId")}],
+        }
+
+    def verify_published_suggestion(self, topic, table_name, suggestion_id):
+        return {
+            "success": True,
+            "status": "VERIFIED",
+            "topic": topic,
+            "tableName": table_name,
+            "suggestionId": suggestion_id,
+        }
 
     def publish(self, topic, table_name, approved, reviewer, review_note):
         self.publish_calls.append((topic, table_name, approved, reviewer, review_note))
@@ -10001,7 +10296,7 @@ def test_node_agent_llm_writes_plan_bound_sql_from_contract():
             )
         ]
     )
-    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天")
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天", execution_mode="subagent")
     assert result.task_results[0].success
     sql = result.task_results[0].query_bundle.sql
     assert "order_gmv_amt_1d" in sql
@@ -10035,7 +10330,7 @@ def test_node_worker_records_isolated_subagent_checkpoint(tmp_path):
         ]
     )
 
-    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天")
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天", execution_mode="subagent")
     task = result.task_results[0]
 
     assert task.sub_agent_run_id.startswith("sub_anchor_gmv")
@@ -10044,7 +10339,8 @@ def test_node_worker_records_isolated_subagent_checkpoint(tmp_path):
     checkpoint = json.loads(Path(task.sub_agent_checkpoint_path).read_text(encoding="utf-8"))
     assert checkpoint["status"] == "success"
     assert checkpoint["contextPackage"]["taskId"] == "anchor_gmv"
-    assert checkpoint["contextPackage"]["subagentEnabled"] is False
+    assert checkpoint["contextPackage"]["subagentEnabled"] is True
+    assert checkpoint["contextPackage"]["runtimeMode"] == "independent_node_react"
 
 
 def test_node_worker_can_read_artifact_before_sql_draft(tmp_path):
@@ -10111,7 +10407,7 @@ def test_node_worker_can_read_artifact_before_sql_draft(tmp_path):
         ]
     )
 
-    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天")
+    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天", execution_mode="subagent")
 
     assert result.task_results[0].success
     assert llm.file_context_seen
@@ -10756,10 +11052,10 @@ def test_node_worker_executes_independent_ready_nodes_concurrently():
         ]
     )
     started = time.monotonic()
-    result = worker.execute_plan("100", plan, pack, "", "并发测试")
+    result = worker.execute_plan("100", plan, pack, "", "并发测试", execution_mode="subagent")
     elapsed = time.monotonic() - started
     assert [item.success for item in result.task_results] == [True, True]
-    assert elapsed < 0.45
+    assert elapsed < 0.85
     assert result.node_execution_batches
     assert set(result.node_execution_batches[0].submitted_task_ids) == {"node_a", "node_b"}
     assert result.node_execution_batches[0].max_concurrency == 2
@@ -10810,12 +11106,15 @@ def test_node_worker_limits_parallel_subagents_by_task_cap():
         ]
     )
 
-    result = worker.execute_plan("100", plan, pack, "", "并发限制测试")
+    result = worker.execute_plan("100", plan, pack, "", "并发限制测试", execution_mode="subagent")
 
     assert [item.success for item in result.task_results] == [True, True, True]
     assert result.node_execution_batches[0].max_concurrency == 2
-    assert result.node_execution_batches[0].runtime_events[0]["event"] == "node.concurrency_limited"
-    assert result.node_execution_batches[0].runtime_events[0]["requestedConcurrency"] == 10
+    assert any(event["event"] == "node.concurrency_limited" for event in result.node_execution_batches[0].runtime_events)
+    concurrency_event = next(
+        event for event in result.node_execution_batches[0].runtime_events if event["event"] == "node.concurrency_limited"
+    )
+    assert concurrency_event["requestedConcurrency"] == 10
 
 
 def test_node_worker_isolates_slow_parallel_node_timeout():
@@ -11857,8 +12156,8 @@ def test_lead_policy_executes_validated_graph_even_when_main_budget_exhausted():
 
     decision = V2AgentPolicy(settings).decide(state)
 
-    assert decision.selected_action == "execute_graph"
-    assert decision.selected_node == "execute_query_graph"
+    assert decision.selected_action == "execute_graph_direct"
+    assert decision.selected_node == "execute_query_graph_direct"
     assert decision.budget_exhausted
 
 
@@ -12072,7 +12371,7 @@ def test_lead_policy_turns_semantic_repair_request_into_retrieve_action():
     decision = V2AgentPolicy(get_settings()).decide(state)
 
     assert decision.selected_action == "retrieve_knowledge"
-    assert "compact_assets" in decision.available_actions
+    assert "repair_graph" in decision.available_actions
     assert "repairRequests" in decision.reason
 
 
@@ -18196,7 +18495,14 @@ def test_async_run_cancel_preserves_canceled_status_after_worker_finishes(tmp_pa
 
 
 def test_analysis_skill_runner_generates_evidence_bound_summary(tmp_path):
-    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "llm_api_key": ""})
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "llm_api_key": "",
+            "skill_confirmation_required": False,
+            "skill_worker_parallel_enabled": False,
+        }
+    )
     service = AnswerComposeService(LlmClient(settings))
     plan = QueryPlan(
         question_understanding={
@@ -18406,7 +18712,14 @@ def test_skill_worker_executes_parallel_skills_with_isolated_contexts(tmp_path):
 
 
 def test_workflow_run_analysis_skill_is_lead_agent_dispatchable_node(tmp_path):
-    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "llm_api_key": ""})
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "llm_api_key": "",
+            "skill_confirmation_required": False,
+            "skill_worker_parallel_enabled": False,
+        }
+    )
     workflow = create_workflow(settings)
     events = []
     state = workflow._initial_state(

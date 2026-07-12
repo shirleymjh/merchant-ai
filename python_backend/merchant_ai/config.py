@@ -21,6 +21,8 @@ class SecuritySettings:
     ops_token: str
     cors_allow_origins: list[str]
     cors_allow_credentials: bool
+    identity_auth_required: bool
+    identity_jwt_secret_configured: bool
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,10 @@ class Settings(BaseSettings):
     merchant_id: str = Field("100", validation_alias="YSHOPPING_MERCHANT_ID")
     allowed_merchant_ids: str = Field("", validation_alias="YSHOPPING_ALLOWED_MERCHANT_IDS")
     ops_token: str = Field("", validation_alias="YSHOPPING_OPS_TOKEN")
+    identity_auth_required: bool = Field(False, validation_alias="YSHOPPING_IDENTITY_AUTH_REQUIRED")
+    identity_jwt_secret: str = Field("", validation_alias="YSHOPPING_IDENTITY_JWT_SECRET")
+    identity_jwt_issuer: str = Field("", validation_alias="YSHOPPING_IDENTITY_JWT_ISSUER")
+    identity_jwt_audience: str = Field("", validation_alias="YSHOPPING_IDENTITY_JWT_AUDIENCE")
     cors_allow_origins: str = Field(
         "http://localhost:5173,http://127.0.0.1:5173",
         validation_alias="YSHOPPING_CORS_ALLOW_ORIGINS",
@@ -106,11 +112,17 @@ class Settings(BaseSettings):
     llm_circuit_cooldown_seconds: int = Field(30, validation_alias="YSHOPPING_LLM_CIRCUIT_COOLDOWN_SECONDS")
     llm_max_tokens: int = Field(2048, validation_alias="YSHOPPING_LLM_MAX_TOKENS")
     answer_skill_match_mode: str = Field("always", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
-    skill_confirmation_required: bool = Field(False, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
+    always_apply_rule_budget: int = Field(20, validation_alias="YSHOPPING_ALWAYS_APPLY_RULE_BUDGET")
+    skill_confirmation_required: bool = Field(True, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
     skill_reuse_suggestion_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_REUSE_SUGGESTION_ENABLED")
     skill_worker_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_ENABLED")
     skill_worker_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_SKILL_WORKER_TIMEOUT_SECONDS")
-    skill_worker_parallel_enabled: bool = Field(False, validation_alias="YSHOPPING_SKILL_WORKER_PARALLEL_ENABLED")
+    sandbox_backend: str = Field("local", validation_alias="YSHOPPING_SANDBOX_BACKEND")
+    sandbox_container_runtime: str = Field("docker", validation_alias="YSHOPPING_SANDBOX_CONTAINER_RUNTIME")
+    sandbox_container_image: str = Field("python:3.11-slim", validation_alias="YSHOPPING_SANDBOX_CONTAINER_IMAGE")
+    sandbox_container_memory: str = Field("512m", validation_alias="YSHOPPING_SANDBOX_CONTAINER_MEMORY")
+    sandbox_container_cpus: float = Field(1.0, validation_alias="YSHOPPING_SANDBOX_CONTAINER_CPUS")
+    skill_worker_parallel_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_PARALLEL_ENABLED")
     max_concurrent_skill_workers: int = Field(2, validation_alias="YSHOPPING_MAX_CONCURRENT_SKILL_WORKERS")
     skill_worker_complex_names: str = Field(
         "bi_trend_attribution,risk_analysis,rule_compliance,ratio_analysis,new_product_risk,gmv_drop_diagnosis,refund_rate_diagnosis,merchant_daily_briefing",
@@ -171,6 +183,14 @@ class Settings(BaseSettings):
     tool_result_preview_rows: int = Field(20, validation_alias="YSHOPPING_HARNESS_TOOL_RESULT_PREVIEW_ROWS")
     max_sub_agent_tasks: int = Field(3, validation_alias="YSHOPPING_HARNESS_MAX_SUB_AGENT_TASKS")
     max_concurrent_sub_agents: int = Field(3, validation_alias="YSHOPPING_HARNESS_MAX_CONCURRENT_SUB_AGENTS")
+    hypothesis_query_exploration_enabled: bool = Field(True, validation_alias="YSHOPPING_HYPOTHESIS_QUERY_EXPLORATION_ENABLED")
+    hypothesis_max_candidates: int = Field(2, validation_alias="YSHOPPING_HYPOTHESIS_MAX_CANDIDATES")
+    hypothesis_max_rounds: int = Field(2, validation_alias="YSHOPPING_HYPOTHESIS_MAX_ROUNDS")
+    hypothesis_max_parallel_queries: int = Field(3, validation_alias="YSHOPPING_HYPOTHESIS_MAX_PARALLEL_QUERIES")
+    hypothesis_min_survivor_score: int = Field(45, validation_alias="YSHOPPING_HYPOTHESIS_MIN_SURVIVOR_SCORE")
+    hypothesis_max_survivors: int = Field(2, validation_alias="YSHOPPING_HYPOTHESIS_MAX_SURVIVORS")
+    hypothesis_second_round_min_information_gain: float = Field(0.35, validation_alias="YSHOPPING_HYPOTHESIS_SECOND_ROUND_MIN_INFORMATION_GAIN")
+    hypothesis_answer_reserve_seconds: int = Field(15, validation_alias="YSHOPPING_HYPOTHESIS_ANSWER_RESERVE_SECONDS")
     max_sub_agent_rounds: int = Field(6, validation_alias="YSHOPPING_HARNESS_MAX_SUB_AGENT_ROUNDS")
     tool_max_concurrency: int = Field(4, validation_alias="YSHOPPING_TOOL_MAX_CONCURRENCY")
     tool_failure_repeat_threshold: int = Field(2, validation_alias="YSHOPPING_TOOL_FAILURE_REPEAT_THRESHOLD")
@@ -214,7 +234,8 @@ class Settings(BaseSettings):
     agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
     agent_deferred_tool_schema_enabled: bool = Field(False, validation_alias="YSHOPPING_AGENT_DEFERRED_TOOL_SCHEMA_ENABLED")
     planner_filesystem_context_mode: str = Field("auto", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
-    lead_action_llm_mode: str = Field("fast_gate", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
+    lead_action_llm_mode: str = Field("adaptive", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
+    lead_agent_autonomous_enabled: bool = Field(True, validation_alias="YSHOPPING_LEAD_AGENT_AUTONOMOUS_ENABLED")
     agent_planner_seed_table_limit: int = Field(4, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_TABLE_LIMIT")
     agent_planner_seed_metric_limit: int = Field(14, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_METRIC_LIMIT")
     agent_asset_field_entry_limit: int = Field(240, validation_alias="YSHOPPING_AGENT_ASSET_FIELD_ENTRY_LIMIT")
@@ -245,7 +266,8 @@ class Settings(BaseSettings):
     middleware_tool_output_budget_chars: int = Field(12000, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_OUTPUT_BUDGET_CHARS")
     harness_middleware_disabled: str = Field("", validation_alias="YSHOPPING_HARNESS_MIDDLEWARE_DISABLED")
     harness_middleware_order: str = Field("", validation_alias="YSHOPPING_HARNESS_MIDDLEWARE_ORDER")
-    run_budget_max_duration_seconds: int = Field(120, validation_alias="YSHOPPING_RUN_BUDGET_MAX_DURATION_SECONDS")
+    run_budget_max_duration_seconds: int = Field(90, validation_alias="YSHOPPING_RUN_BUDGET_MAX_DURATION_SECONDS")
+    run_budget_fast_duration_seconds: int = Field(25, validation_alias="YSHOPPING_RUN_BUDGET_FAST_DURATION_SECONDS")
     run_budget_max_actions: int = Field(20, validation_alias="YSHOPPING_RUN_BUDGET_MAX_ACTIONS")
     run_budget_max_llm_calls: int = Field(8, validation_alias="YSHOPPING_RUN_BUDGET_MAX_LLM_CALLS")
     run_budget_max_doris_queries: int = Field(12, validation_alias="YSHOPPING_RUN_BUDGET_MAX_DORIS_QUERIES")
@@ -354,6 +376,8 @@ class Settings(BaseSettings):
             ops_token=self.ops_token,
             cors_allow_origins=self.cors_origins,
             cors_allow_credentials=bool(self.cors_allow_credentials),
+            identity_auth_required=bool(self.identity_auth_required),
+            identity_jwt_secret_configured=bool(self.identity_jwt_secret),
         )
 
     @property

@@ -48,6 +48,12 @@ class RuntimeStateStore:
     def complete_node_task(self, run_id: str, task_id: str, status: str, payload: Dict[str, Any] | None = None) -> NodeTaskState:
         raise NotImplementedError
 
+    def heartbeat_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> bool:
+        raise NotImplementedError
+
+    def recover_expired_node_tasks(self, max_attempts: int = 3) -> int:
+        raise NotImplementedError
+
 
 class FileRuntimeStateStore(RuntimeStateStore):
     """File-backed runtime state. It is intentionally small but external to process memory."""
@@ -119,6 +125,34 @@ class FileRuntimeStateStore(RuntimeStateStore):
         state.lease_until = ""
         return self.upsert_node_task(state)
 
+    def heartbeat_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> bool:
+        with self._lock:
+            state = self.get_node_task(run_id, task_id)
+            if not state or state.status != "running" or state.lease_owner != lease_owner:
+                return False
+            state.lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
+            self.upsert_node_task(state)
+            return True
+
+    def recover_expired_node_tasks(self, max_attempts: int = 3) -> int:
+        recovered = 0
+        now = datetime.now()
+        with self._lock:
+            for path in self.tasks_dir.glob("*/*.json"):
+                data = self._read_json(path)
+                state = NodeTaskState(**data) if data else None
+                if not state or state.status != "running" or not lease_expired(state.lease_until, now):
+                    continue
+                state.status = "retry" if state.attempts < max(1, max_attempts) else "failed"
+                state.lease_owner = ""
+                state.lease_until = ""
+                state.payload["recoveredAfterLeaseExpiry"] = True
+                self.upsert_node_task(state)
+                if state.status == "retry":
+                    self._write_json(self._queue_path(state.run_id, state.task_id), state.__dict__)
+                recovered += 1
+        return recovered
+
     def _task_path(self, run_id: str, task_id: str) -> Path:
         return self.tasks_dir / safe_name(run_id) / ("%s.json" % safe_name(task_id))
 
@@ -183,16 +217,29 @@ class RedisRuntimeStateStore(RuntimeStateStore):
         return state
 
     def claim_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> Optional[NodeTaskState]:
-        state = self.get_node_task(run_id, task_id)
-        if not state or state.status not in {"queued", "pending", "retry"}:
-            return None
-        state.status = "running"
-        state.attempts += 1
-        state.lease_owner = lease_owner
-        state.lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
-        self.upsert_node_task(state)
-        self.client.srem(self._queue_key(run_id), task_id)
-        return state
+        task_key = self._task_key(run_id, task_id)
+        lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        script = """
+        local status = redis.call('HGET', KEYS[1], 'status')
+        if status ~= 'queued' and status ~= 'pending' and status ~= 'retry' then return 0 end
+        redis.call('HSET', KEYS[1], 'status', 'running', 'lease_owner', ARGV[1], 'lease_until', ARGV[2], 'updated_at', ARGV[3])
+        redis.call('HINCRBY', KEYS[1], 'attempts', 1)
+        redis.call('SREM', KEYS[2], ARGV[4])
+        return 1
+        """
+        if not hasattr(self.client, "eval"):
+            state = self.get_node_task(run_id, task_id)
+            if not state or state.status not in {"queued", "pending", "retry"}:
+                return None
+            state.status = "running"
+            state.attempts += 1
+            state.lease_owner = lease_owner
+            state.lease_until = lease_until
+            self.upsert_node_task(state)
+            self.client.srem(self._queue_key(run_id), task_id)
+            return state
+        claimed = self.client.eval(script, 2, task_key, self._queue_key(run_id), lease_owner, lease_until, datetime.now().isoformat(), task_id)
+        return self.get_node_task(run_id, task_id) if claimed else None
 
     def complete_node_task(self, run_id: str, task_id: str, status: str, payload: Dict[str, Any] | None = None) -> NodeTaskState:
         state = self.get_node_task(run_id, task_id) or NodeTaskState(run_id=run_id, task_id=task_id)
@@ -200,6 +247,32 @@ class RedisRuntimeStateStore(RuntimeStateStore):
         state.payload.update(payload or {})
         state.lease_until = ""
         return self.upsert_node_task(state)
+
+    def heartbeat_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> bool:
+        state = self.get_node_task(run_id, task_id)
+        if not state or state.status != "running" or state.lease_owner != lease_owner:
+            return False
+        state.lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        self.upsert_node_task(state)
+        return True
+
+    def recover_expired_node_tasks(self, max_attempts: int = 3) -> int:
+        recovered = 0
+        now = datetime.now()
+        pattern = self._key("task", "*") + ":*"
+        for key in self.client.scan_iter(match=pattern, count=200):
+            state = deserialize_state(self.client.hgetall(key))
+            if state.status != "running" or not lease_expired(state.lease_until, now):
+                continue
+            state.status = "retry" if state.attempts < max(1, max_attempts) else "failed"
+            state.lease_owner = ""
+            state.lease_until = ""
+            state.payload["recoveredAfterLeaseExpiry"] = True
+            self.upsert_node_task(state)
+            if state.status == "retry":
+                self.client.sadd(self._queue_key(state.run_id), state.task_id)
+            recovered += 1
+        return recovered
 
     def _key(self, *parts: str) -> str:
         return ":".join([self.namespace, "runtime_state", *[safe_name(part) for part in parts]])
@@ -320,14 +393,20 @@ class PostgresRuntimeStateStore(RuntimeStateStore):
         return self.upsert_node_task(state)
 
     def claim_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> Optional[NodeTaskState]:
-        state = self.get_node_task(run_id, task_id)
-        if not state or state.status not in {"queued", "pending", "retry"}:
-            return None
-        state.status = "running"
-        state.attempts += 1
-        state.lease_owner = lease_owner
-        state.lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
-        return self.upsert_node_task(state)
+        lease_until = (datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE merchant_ai_node_task_state
+                SET status='running', attempts=attempts+1, lease_owner=%s, lease_until=%s, updated_at=%s
+                WHERE run_id=%s AND task_id=%s AND status IN ('queued','pending','retry')
+                RETURNING run_id, task_id, status, idempotency_key, attempts, lease_owner, lease_until, updated_at, payload
+                """,
+                (lease_owner, lease_until, datetime.now().isoformat(), run_id, task_id),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        return row_to_state(row) if row else None
 
     def complete_node_task(self, run_id: str, task_id: str, status: str, payload: Dict[str, Any] | None = None) -> NodeTaskState:
         state = self.get_node_task(run_id, task_id) or NodeTaskState(run_id=run_id, task_id=task_id)
@@ -335,6 +414,32 @@ class PostgresRuntimeStateStore(RuntimeStateStore):
         state.payload.update(payload or {})
         state.lease_until = ""
         return self.upsert_node_task(state)
+
+    def heartbeat_node_task(self, run_id: str, task_id: str, lease_owner: str, lease_seconds: int = 300) -> bool:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE merchant_ai_node_task_state SET lease_until=%s, updated_at=%s WHERE run_id=%s AND task_id=%s AND status='running' AND lease_owner=%s",
+                ((datetime.now() + timedelta(seconds=max(1, lease_seconds))).isoformat(), datetime.now().isoformat(), run_id, task_id, lease_owner),
+            )
+            updated = cur.rowcount
+        self.conn.commit()
+        return bool(updated)
+
+    def recover_expired_node_tasks(self, max_attempts: int = 3) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE merchant_ai_node_task_state
+                SET status=CASE WHEN attempts < %s THEN 'retry' ELSE 'failed' END,
+                    lease_owner='', lease_until='', updated_at=%s,
+                    payload=payload || '{"recoveredAfterLeaseExpiry": true}'::jsonb
+                WHERE status='running' AND lease_until <> '' AND lease_until < %s
+                """,
+                (max(1, max_attempts), datetime.now().isoformat(), datetime.now().isoformat()),
+            )
+            updated = cur.rowcount
+        self.conn.commit()
+        return int(updated or 0)
 
 
 def create_runtime_state_store(settings: Settings) -> RuntimeStateStore:
@@ -421,3 +526,12 @@ def row_to_state(row: Any) -> NodeTaskState:
         updated_at=updated_at,
         payload=payload if isinstance(payload, dict) else {},
     )
+
+
+def lease_expired(value: str, now: Optional[datetime] = None) -> bool:
+    if not value:
+        return False
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None) <= (now or datetime.now()).replace(tzinfo=None)
+    except ValueError:
+        return True

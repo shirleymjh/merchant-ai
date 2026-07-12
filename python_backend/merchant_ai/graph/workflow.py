@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +50,9 @@ from merchant_ai.models import (
     FastUnderstandingResult,
     GraphValidationGap,
     GraphValidationResult,
+    HypothesisEvidenceLedger,
+    HypothesisEvidenceRecord,
+    HypothesisLedgerEntry,
     IntentSignals,
     IntentType,
     KnowledgeBundle,
@@ -108,7 +113,7 @@ from merchant_ai.services.observability import append_span, artifact_ref_from_pa
 from merchant_ai.services.planning import PlannerReflectionAgent, QueryGraphPlanner, QueryGraphValidator, semantic_workspace_manifest_from_asset_pack
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import quick_metric_response
-from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
+from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, merge_task_result_bundles
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
 from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService, route_primary_topic
@@ -238,6 +243,8 @@ class MerchantQaWorkflow:
             original_question=question or "",
             requested_merchant_id=merchant_id,
             request_context=context,
+            user_identity=(context.user_identity.model_dump(by_alias=True) if context and context.user_identity else {}),
+            access_role=merchant_access_role(context.user_identity.role if context and context.user_identity else ""),
             response_context=None,
             message_history=normalize_message_history(message_history),
             thread_id=actual_thread_id,
@@ -330,6 +337,8 @@ class MerchantQaWorkflow:
             planner_provider_error="",
             base_knowledge_context="",
             topic_asset_context="",
+            always_apply_context="",
+            always_apply_rules=[],
             recall_context="",
             merchant_profile_context="",
             memory_context="",
@@ -350,12 +359,21 @@ class MerchantQaWorkflow:
             open_diagnostic_goal="",
             open_diagnostic_seed_topics=[],
             hypothesis_exploration={},
+            hypothesis_results=[],
+            hypothesis_exploration_completed=False,
+            hypothesis_exploration_rounds=0,
+            hypothesis_selected_ids=[],
+            hypothesis_evidence_ledger=HypothesisEvidenceLedger(),
             candidate_query_graphs={},
             strategy_switch_trace=[],
             latency_optimization={},
+            execution_tier_policy={},
+            node_execution_mode="auto",
             answer="",
             analysis_summary="",
             analysis_skill_trace={},
+            confirmation_evidence_reused=False,
+            analysis_skill_bypassed=False,
             skill_match=SkillMatchState(),
             skill_draft=SkillDraft(),
             skill_lifecycle_records=[],
@@ -412,8 +430,11 @@ class MerchantQaWorkflow:
         builder.add_node("validate_query_graph", self.validate_query_graph)
         builder.add_node("repair_query_graph", self.repair_query_graph)
         builder.add_node("execute_query_graph", self.execute_query_graph)
+        builder.add_node("execute_query_graph_direct", self.execute_query_graph_direct)
+        builder.add_node("execute_query_graph_agent", self.execute_query_graph_agent)
         builder.add_node("repair_sql", self.repair_sql)
         builder.add_node("verify_evidence_graph", self.verify_evidence_graph)
+        builder.add_node("explore_hypotheses", self.explore_hypotheses)
         builder.add_node("run_analysis_skill", self.run_analysis_skill)
         builder.add_node("answer_rule", self.answer_rule)
         builder.add_node("answer_analysis", self.answer_analysis)
@@ -437,8 +458,11 @@ class MerchantQaWorkflow:
                 "validate_query_graph": "validate_query_graph",
                 "repair_query_graph": "repair_query_graph",
                 "execute_query_graph": "execute_query_graph",
+                "execute_query_graph_direct": "execute_query_graph_direct",
+                "execute_query_graph_agent": "execute_query_graph_agent",
                 "repair_sql": "repair_sql",
                 "verify_evidence_graph": "verify_evidence_graph",
+                "explore_hypotheses": "explore_hypotheses",
                 "run_analysis_skill": "run_analysis_skill",
                 "answer_rule": "answer_rule",
                 "answer_analysis": "answer_analysis",
@@ -457,8 +481,11 @@ class MerchantQaWorkflow:
             "validate_query_graph",
             "repair_query_graph",
             "execute_query_graph",
+            "execute_query_graph_direct",
+            "execute_query_graph_agent",
             "repair_sql",
             "verify_evidence_graph",
+            "explore_hypotheses",
             "run_analysis_skill",
         ]:
             builder.add_edge(node, "policy")
@@ -484,6 +511,8 @@ class MerchantQaWorkflow:
                 ),
             )
         context = state.get("request_context")
+        if context and context.pending_clarification_type == "skill_confirm":
+            self.restore_confirmation_evidence(state)
         history_payload = render_message_history_context(
             state.get("message_history") or [],
             question=state.get("question", ""),
@@ -539,6 +568,17 @@ class MerchantQaWorkflow:
         increment_round(state)
         state["merchant"] = self.merchant_service.current_merchant(state.get("requested_merchant_id", ""))
         state["merchant_profile_context"] = state["merchant"].profile_markdown()
+        identity = getattr(state.get("request_context"), "user_identity", None)
+        if identity:
+            state["merchant_profile_context"] += "\n\n## 当前用户画像\n" + identity.prompt_markdown()
+        if state.get("confirmation_evidence_reused"):
+            state["supervised"] = True
+            add_step(state, "LangGraph Runtime：已复用上一轮校验证据，跳过 Topic、召回、规划与 SQL 执行")
+            self.refresh_context_snapshot(state, "runtime_bootstrap")
+            self.record_span(state, "action", "runtime_bootstrap", started, metadata={"confirmationEvidenceReused": True})
+            self.finish_run_step(state, step, "success", output_summary="restored verified evidence")
+            emit(state, "node.completed", "LANGGRAPH_RUNTIME", {"confirmationEvidenceReused": True})
+            return state
         keywords = self.keyword_service.extract(state["question"])
         state["extracted_keywords"] = keywords
         state["routing_decision"] = self.routing_service.route(state["question"], keywords, state["recall_bundle"])
@@ -562,6 +602,7 @@ class MerchantQaWorkflow:
         started = now_ms()
         step = self.start_run_step(state, "policy", "LeadAgent", "MAIN_AGENT_POLICY", input_summary=state.get("agent_decision_reason", ""))
         state = self.middleware_chain.before_policy(state)
+        self.refresh_execution_tier_policy(state)
         observation = self.main_agent_observation(state)
         state.setdefault("main_agent_observations", []).append(observation)
         state["main_agent_observations"] = state["main_agent_observations"][-24:]
@@ -607,6 +648,22 @@ class MerchantQaWorkflow:
         self.finish_run_step(state, step, "success", output_summary="%s->%s" % (decision.selected_action, decision.selected_node))
         return state
 
+    def refresh_execution_tier_policy(self, state: AgentState) -> None:
+        plan = state.get("plan") or QueryPlan()
+        if not plan.intents:
+            return
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        prior_failures = sum(1 for item in run_result.task_results if item.query_bundle.failed)
+        context = state.get("request_context")
+        state["execution_tier_policy"] = self.latency_optimizer.execution_tier_policy(
+            state.get("question", ""),
+            plan,
+            state.get("fast_understanding") or FastUnderstandingResult(),
+            remaining_run_budget_seconds(state, self.settings),
+            prior_failure_count=prior_failures,
+            has_attachments=bool(getattr(context, "offloaded_files", None)),
+        )
+
     def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
         mode = str(getattr(self.settings, "lead_action_llm_mode", "always") or "always").lower()
         allowed = [str(item) for item in decision.available_actions if item]
@@ -637,6 +694,8 @@ class MerchantQaWorkflow:
                 or bool(getattr(state.get("query_graph_validation_result"), "gaps", None))
             )
         )
+        if mode == "adaptive":
+            should_call = self.adaptive_lead_llm_needed(state, allowed, is_fast_gate)
         if not should_call:
             trace["reason"] = "deterministic_decision_confident"
             return decision
@@ -650,6 +709,10 @@ class MerchantQaWorkflow:
             "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
             "deterministicDecision": decision.model_dump(by_alias=True),
             "allowedActions": allowed,
+            "actionCatalog": [
+                self.policy.registry.get(action_id).model_dump(by_alias=True)
+                for action_id in allowed
+            ],
             "recentActions": [
                 item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
                 for item in state.get("action_history", [])[-6:]
@@ -659,16 +722,9 @@ class MerchantQaWorkflow:
             "plannerReflection": (state.get("planner_reflection") or PlannerReflectionResult()).model_dump(by_alias=True),
             "queryGraphValidation": (state.get("query_graph_validation_result") or GraphValidationResult()).model_dump(by_alias=True),
             "decisionContext": state.get("lead_decision_context", {}),
-            "instruction": (
-                "你是主 Agent，根据问题语义、fastUnderstanding 和 observation 自主判断下一步。"
-                "只有问题是可由已验证快速指标能力完整回答的简单查询时，才选 try_fast_metric；"
-                "直接询问 1–3 个已知指标的合计、最近N天按日趋势或变化，属于 try_fast_metric 的候选。"
-                "fastUnderstanding.needsPlanner/needsKnowledge 是通用保守提示，不是 Fast 能力判决，不应单独因为它们为 true 就拒绝 Fast。"
-                "需要占比、排名、归因、明细、非日期维度、附件上下文或指标含义不明时选 retrieve_knowledge。"
-                "只能从 allowedActions 中选择一个 action id，不要创造新 action。"
-                "返回 JSON: {selectedAction:'', reason:''}"
-            ),
+            "instruction": self.lead_agent_tool_instruction(is_fast_gate),
         }
+        state["_lead_llm_decision_fingerprint"] = lead_decision_fingerprint(state, allowed)
         try:
             if hasattr(llm, "tool_json_chat"):
                 tool = lead_action_selection_tool(allowed)
@@ -728,6 +784,41 @@ class MerchantQaWorkflow:
             budget_exhausted=decision.budget_exhausted,
             observation=str(observation.get("summary") or decision.observation),
             source="lead_llm_tool",
+        )
+
+    def adaptive_lead_llm_needed(self, state: AgentState, allowed: List[str], is_fast_gate: bool) -> bool:
+        if remaining_run_budget_seconds(state, self.settings) <= 12:
+            return False
+        allowed_set = set(allowed)
+        strategic = bool(
+            is_fast_gate
+            or "explore_hypotheses" in allowed_set
+            or {"execute_graph_direct", "execute_graph_agent"}.issubset(allowed_set)
+            or ("run_analysis_skill" in allowed_set and "answer_data" in allowed_set)
+            or ("repair_graph" in allowed_set and bool(getattr(state.get("query_graph_validation_result"), "gaps", None)))
+            or ("retrieve_knowledge" in allowed_set and bool(state.get("pending_knowledge_requests")))
+        )
+        if not strategic:
+            return False
+        fingerprint = lead_decision_fingerprint(state, allowed)
+        return fingerprint != str(state.get("_lead_llm_decision_fingerprint") or "")
+
+    def lead_agent_tool_instruction(self, is_fast_gate: bool) -> str:
+        base = (
+            "你是商家经营分析主 Agent。根据用户目标、observation、工具结果、证据缺口和 actionCatalog 自主选择下一项工具。"
+            "Harness 已经移除了不满足权限或安全前置条件的工具；不要机械遵循固定流水线，也不要重复没有新增信息的动作。"
+            "在证据不足时继续检索、规划、修复或执行；只有证据已经校验或必须明确披露缺口时才回答。"
+            "专项深度分析只在已取得并校验经营数据后选择。只能从 allowedActions 中选择一个 action id，不创造新 action。"
+            "当问题要求原因、归因、异常诊断或优先建议，且存在多个可验证经营假设时，优先选择 explore_hypotheses；"
+            "该工具会为每个假设独立规划和查询，再按证据淘汰或扩展，不要用共享结果冒充独立验证。"
+            "返回 JSON: {selectedAction:'', reason:''}。"
+        )
+        if not is_fast_gate:
+            return base
+        return base + (
+            "当前同时提供快速指标与知识检索：直接询问1–3个已知指标的合计、最近N天按日趋势或变化可选择 try_fast_metric；"
+            "占比、排名、归因、明细、非日期维度、附件上下文或指标含义不明时选择 retrieve_knowledge。"
+            "fastUnderstanding.needsPlanner/needsKnowledge 是保守提示，不是 Fast 能力判决。"
         )
 
     def main_agent_observation(self, state: AgentState) -> Dict[str, Any]:
@@ -830,6 +921,7 @@ class MerchantQaWorkflow:
                 "sqlGenerated": bool(state.get("sql_generated")),
                 "sqlRepairReviewed": bool(state.get("sql_repair_reviewed")),
                 "evidenceGraphVerified": bool(state.get("evidence_graph_verified")),
+                "hypothesisExplorationCompleted": bool(state.get("hypothesis_exploration_completed")),
                 "chatBiCompleted": bool(state.get("chat_bi_completed")),
             },
             "budgets": {
@@ -1150,6 +1242,26 @@ class MerchantQaWorkflow:
                 }
             )
         state["topic_routing_decision"] = decision
+        try:
+            always_rules = self.recall_service.topic_assets.always_apply_rules(
+                decision.recall_topics(),
+                user_scope=state.get("user_identity") or {},
+                merchant_id=state.get("requested_merchant_id", ""),
+            )
+        except TypeError:
+            always_rules = self.recall_service.topic_assets.always_apply_rules(decision.recall_topics())
+        state["always_apply_rules"] = always_rules
+        state["always_apply_context"] = "\n".join(
+            "- [%s/%s] %s：%s" % (
+                item.get("topic", ""),
+                item.get("tableName", ""),
+                item.get("title", "强制规则"),
+                item.get("content", ""),
+            )
+            for item in always_rules[:40]
+        )
+        if always_rules:
+            add_step(state, "Always Apply：已绕过普通召回并强制注入 %d 条 Topic 业务规则" % len(always_rules))
         state["topic_routed"] = True
         state["context_loaded"] = True
         state["scope_clarified"] = True
@@ -2077,6 +2189,26 @@ class MerchantQaWorkflow:
             state["planning_asset_pack"],
             plan,
         )
+        for candidate in state["candidate_query_graphs"].get("candidates", []):
+            candidate_plan = QueryPlan.model_validate(candidate.get("queryGraph") or {})
+            candidate_validation = self.graph_validator.validate(
+                state["question"],
+                candidate_plan,
+                state["planning_asset_pack"],
+                state.get("memory_constraints", []),
+            )
+            candidate["validation"] = candidate_validation.model_dump(by_alias=True)
+            candidate["safeToExecute"] = bool(candidate_validation.valid)
+            if not candidate_validation.valid:
+                candidate["score"] = max(0, int(candidate.get("score") or 0) - 40)
+        state["candidate_query_graphs"]["candidates"].sort(
+            key=lambda item: (bool(item.get("safeToExecute")), int(item.get("score") or 0)),
+            reverse=True,
+        )
+        for index, candidate in enumerate(state["candidate_query_graphs"].get("candidates", [])):
+            candidate["status"] = "selected" if index == 0 else "validated_alternative"
+        if state["candidate_query_graphs"].get("candidates"):
+            state["candidate_query_graphs"]["selectedCandidateId"] = state["candidate_query_graphs"]["candidates"][0]["candidateId"]
         state["latency_optimization"] = self.latency_optimizer.update_after_plan(
             state.get("latency_optimization") or {},
             plan,
@@ -2388,6 +2520,14 @@ class MerchantQaWorkflow:
         emit(state, "node.completed", "REPAIR_QUERY_GRAPH", {"attempt": state["query_graph_repair_attempts"]})
         return state
 
+    def execute_query_graph_direct(self, state: AgentState) -> AgentState:
+        state["node_execution_mode"] = "direct"
+        return self.execute_query_graph(state)
+
+    def execute_query_graph_agent(self, state: AgentState) -> AgentState:
+        state["node_execution_mode"] = "subagent"
+        return self.execute_query_graph(state)
+
     def execute_query_graph(self, state: AgentState) -> AgentState:
         started = now_ms()
         step = self.start_run_step(state, "execute_graph", "NodeAgent", "EXECUTE_QUERY_GRAPH", input_summary="nodes=%d" % len(state["plan"].intents))
@@ -2471,6 +2611,9 @@ class MerchantQaWorkflow:
                 state["question"],
                 resume_task_results=(state.get("agent_run_result") or AgentRunResult()).task_results,
                 run_id=state.get("run_id", ""),
+                access_role=state.get("access_role", "merchant_operator"),
+                user_scope=state.get("user_identity", {}),
+                execution_mode=state.get("node_execution_mode", "auto"),
             )
         except Exception as exc:
             run_result = AgentRunResult(
@@ -2614,6 +2757,13 @@ class MerchantQaWorkflow:
             )
         add_step(state, "Main Agent Tool verify_evidence_graph：" + ("证据门禁通过" if verified.passed else "证据存在缺口 %d 个" % len(verified.gaps)))
         state["evidence_graph_verified"] = True
+        if not state.get("hypothesis_exploration_completed"):
+            state["hypothesis_results"] = self.controlled_react_explorer.run_parallel_evidence_reviews(
+                state.get("hypothesis_exploration") or {},
+                state.get("agent_run_result") or AgentRunResult(),
+            )
+            if state["hypothesis_results"]:
+                add_step(state, "多假设预检查：已基于基线证据判断 %d 个经营假设是否值得独立查询" % len(state["hypothesis_results"]))
         self.refresh_context_snapshot(state, "verify_evidence_graph")
         self.record_span(
             state,
@@ -2632,6 +2782,645 @@ class MerchantQaWorkflow:
             error_code=",".join(gap.code for gap in verified.gaps[:4]),
         )
         return state
+
+    def explore_hypotheses(self, state: AgentState) -> AgentState:
+        started = now_ms()
+        hypotheses = list((state.get("hypothesis_exploration") or {}).get("hypotheses") or [])
+        limit = max(1, min(3, int(getattr(self.settings, "hypothesis_max_candidates", 3) or 3)))
+        hypotheses = hypotheses[:limit]
+        step = self.start_run_step(
+            state,
+            "explore_hypotheses",
+            "LeadAgent",
+            "EXPLORE_HYPOTHESES",
+            input_summary="hypotheses=%d" % len(hypotheses),
+        )
+        increment_round(state)
+        emit(state, "node.started", "EXPLORE_HYPOTHESES", {"hypotheses": len(hypotheses)})
+        answer_reserve = max(5, int(getattr(self.settings, "hypothesis_answer_reserve_seconds", 15) or 15))
+        remaining_at_start = remaining_run_budget_seconds(state, self.settings)
+        if remaining_at_start <= answer_reserve + 10:
+            state["hypothesis_exploration_completed"] = True
+            state["hypothesis_evidence_ledger"] = HypothesisEvidenceLedger(
+                ledger_id="ledger_%s" % state.get("run_id", "run"),
+                budget={"remainingSeconds": remaining_at_start, "skipped": True, "reason": "INSUFFICIENT_RUN_BUDGET"},
+            )
+            self.finish_run_step(state, step, "partial", output_summary="skipped: insufficient run budget", error_code="INSUFFICIENT_RUN_BUDGET")
+            emit(state, "node.completed", "EXPLORE_HYPOTHESES", {"completed": True, "executed": 0, "budgetSkipped": True})
+            return state
+        if len(hypotheses) < 2:
+            state["hypothesis_exploration_completed"] = True
+            self.finish_run_step(state, step, "success", output_summary="not enough competing hypotheses")
+            emit(state, "node.completed", "EXPLORE_HYPOTHESES", {"completed": True, "executed": 0})
+            return state
+
+        max_parallel = max(1, min(limit, int(getattr(self.settings, "hypothesis_max_parallel_queries", 3) or 3)))
+        planned: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = {
+                executor.submit(self._generate_independent_hypothesis_plan, state, hypothesis, 1, None, None): hypothesis
+                for hypothesis in hypotheses
+            }
+            for future in as_completed(futures):
+                hypothesis = futures[future]
+                try:
+                    planned.append(future.result())
+                except Exception as exc:
+                    planned.append(
+                        {
+                            "hypothesis": hypothesis,
+                            "hypothesisId": str(hypothesis.get("hypothesisId") or ""),
+                            "plan": QueryPlan(),
+                            "validation": GraphValidationResult(valid=False),
+                            "planningError": str(exc)[:500],
+                            "round": 1,
+                        }
+                    )
+        safe_plans = [item for item in planned if item["plan"].intents and item["validation"].valid]
+        executions = self._execute_hypothesis_plans_parallel(state, safe_plans, max_parallel)
+        executed_ids = {str(item.get("hypothesisId") or "") for item in executions}
+        for item in planned:
+            if str(item.get("hypothesisId") or "") in executed_ids:
+                continue
+            executions.append(
+                {
+                    **item,
+                    "runResult": AgentRunResult(),
+                    "semanticScore": self._hypothesis_semantic_score(state, str(item.get("hypothesisId") or "")),
+                    "executionError": item.get("planningError") or "QUERY_GRAPH_VALIDATION_FAILED",
+                }
+            )
+        comparison = self.controlled_react_explorer.compare_independent_executions(
+            executions,
+            min_score=int(getattr(self.settings, "hypothesis_min_survivor_score", 45) or 45),
+            max_survivors=int(getattr(self.settings, "hypothesis_max_survivors", 2) or 2),
+        )
+        rounds_used = 1
+        max_rounds = max(1, min(2, int(getattr(self.settings, "hypothesis_max_rounds", 2) or 2)))
+        if max_rounds > 1 and comparison.get("survivorIds"):
+            survivors = [item for item in comparison["ranked"] if item.get("decision") == "survive"]
+            followup_plans: List[Dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(survivors)))) as executor:
+                futures = {}
+                for survivor in survivors:
+                    decision = self.controlled_react_explorer.followup_decision(
+                        survivor,
+                        remaining_seconds=remaining_run_budget_seconds(state, self.settings),
+                        minimum_information_gain=float(getattr(self.settings, "hypothesis_second_round_min_information_gain", 0.35) or 0.35),
+                        answer_reserve_seconds=answer_reserve,
+                    )
+                    survivor["followupDecision"] = decision
+                    if decision.get("action") == "stop":
+                        continue
+                    future = executor.submit(
+                        self._generate_independent_hypothesis_plan,
+                        state,
+                        survivor["hypothesis"],
+                        2,
+                        survivor,
+                        decision,
+                    )
+                    futures[future] = survivor
+                for future in as_completed(futures):
+                    survivor = futures[future]
+                    try:
+                        followup_plans.append(future.result())
+                    except Exception as exc:
+                        survivor["followupError"] = str(exc)[:500]
+            safe_followups = [item for item in followup_plans if item["plan"].intents and item["validation"].valid]
+            followup_executions = self._execute_hypothesis_plans_parallel(state, safe_followups, max_parallel)
+            if followup_executions:
+                rounds_used = 2
+                by_id = {str(item.get("hypothesisId") or ""): item for item in comparison["ranked"]}
+                for followup in followup_executions:
+                    hypothesis_id = str(followup.get("hypothesisId") or "")
+                    if hypothesis_id not in by_id:
+                        continue
+                    base = by_id[hypothesis_id]
+                    base.setdefault("followups", []).append(followup)
+                    base["plan"] = merge_query_plans(base["plan"], followup["plan"])
+                    base["runResult"] = merge_agent_run_results(base["runResult"], followup["runResult"])
+                    base["runResult"].verified_evidence = self.evidence_verifier.verify(
+                        state["question"],
+                        base["plan"],
+                        base["runResult"],
+                        state.get("memory_constraints", []),
+                    )
+                comparison = self.controlled_react_explorer.compare_independent_executions(
+                    list(by_id.values()),
+                    min_score=int(getattr(self.settings, "hypothesis_min_survivor_score", 45) or 45),
+                    max_survivors=int(getattr(self.settings, "hypothesis_max_survivors", 2) or 2),
+                )
+
+        selected = [item for item in comparison.get("ranked", []) if item.get("decision") == "survive" and item.get("runResult")]
+        ledger = self._build_hypothesis_evidence_ledger(state, comparison, rounds_used)
+        state["hypothesis_evidence_ledger"] = ledger
+        promoted_count = self._promote_hypothesis_winner_when_baseline_missing(state, selected)
+        state["hypothesis_exploration_completed"] = True
+        state["hypothesis_exploration_rounds"] = rounds_used
+        state["hypothesis_selected_ids"] = list(comparison.get("survivorIds") or [])
+        state["hypothesis_results"] = [self._public_hypothesis_execution(item) for item in comparison.get("ranked", [])]
+        state.setdefault("candidate_query_graphs", {})["independentExecutions"] = state["hypothesis_results"]
+        state["candidate_query_graphs"]["comparison"] = {
+            "winnerId": comparison.get("winnerId", ""),
+            "survivorIds": comparison.get("survivorIds", []),
+            "prunedIds": comparison.get("prunedIds", []),
+            "roundsUsed": rounds_used,
+            "comparisonPolicy": comparison.get("comparisonPolicy", ""),
+        }
+        state["runtime_context"] = append_context_section(
+            state.get("runtime_context") or "",
+            self._render_hypothesis_ledger_for_answer(ledger),
+            max_chars=int(self.settings.context_runtime_budget_chars or 6000),
+        )
+        if promoted_count:
+            state["sql_generated"] = True
+            state["query_graph_validated"] = True
+            state["query_graph_reflected"] = True
+            state["query_graph_validation_result"] = GraphValidationResult(valid=True, repairable=False)
+            state["planner_provider_error"] = ""
+            state["should_persist"] = True
+        state["last_action_result"] = ActionResult(
+            action="explore_hypotheses",
+            node="explore_hypotheses",
+            status="success" if selected else "partial",
+            message="independent hypotheses executed=%d survivors=%d promotedWinnerTasks=%d" % (len(executions), len(selected), promoted_count),
+        )
+        self.planner.artifact_store.write_json(
+            "planner",
+            "hypothesis_exploration.json",
+            {
+                "hypotheses": state["hypothesis_results"],
+                "comparison": state["candidate_query_graphs"]["comparison"],
+                "evidenceLedger": ledger.model_dump(by_alias=True),
+            },
+            preview_chars=0,
+        )
+        add_step(
+            state,
+            "多假设独立探索：执行 %d 个独立 QueryGraph，保留 %d 个，淘汰 %d 个，探索轮次=%d"
+            % (len(executions), len(selected), len(comparison.get("prunedIds") or []), rounds_used),
+        )
+        self.record_span(
+            state,
+            "agent",
+            "explore_hypotheses",
+            started,
+            status="success" if selected else "failed",
+            row_count=sum(int(item.get("rowCount") or 0) for item in comparison.get("ranked", [])),
+            metadata={
+                "survivorIds": comparison.get("survivorIds", []),
+                "prunedIds": comparison.get("prunedIds", []),
+                "roundsUsed": rounds_used,
+                "promotedWinnerTasks": promoted_count,
+            },
+        )
+        self.finish_run_step(
+            state,
+            step,
+            "success" if selected else "partial",
+            output_summary="executed=%d survivors=%d rounds=%d" % (len(executions), len(selected), rounds_used),
+        )
+        emit(
+            state,
+            "node.completed",
+            "EXPLORE_HYPOTHESES",
+            {
+                "completed": True,
+                "executed": len(executions),
+                "survivorIds": comparison.get("survivorIds", []),
+                "prunedIds": comparison.get("prunedIds", []),
+                "roundsUsed": rounds_used,
+            },
+        )
+        return state
+
+    def _generate_independent_hypothesis_plan(
+        self,
+        state: AgentState,
+        hypothesis: Dict[str, Any],
+        round_index: int,
+        previous: Optional[Dict[str, Any]],
+        followup: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        hypothesis_id = str(hypothesis.get("hypothesisId") or "hypothesis")
+        namespace = "hyp_%s_r%d" % (re.sub(r"[^a-zA-Z0-9_]+", "_", hypothesis_id), round_index)
+        root = Path(state["thread_data"].outputs_path) / "hypotheses" / hypothesis_id / ("round_%d" % round_index)
+        root.mkdir(parents=True, exist_ok=True)
+        planner = QueryGraphPlanner(
+            LlmClient(self.settings),
+            semantic_catalog=self.semantic_catalog,
+            artifact_store=self.planner.artifact_store.with_root(str(root)),
+            settings=self.settings,
+        )
+        previous_summary = self._hypothesis_result_summary(previous) if previous else {}
+        followup_action = str((followup or {}).get("action") or "")
+        instruction = (
+            "%s\n\n你正在独立验证一个经营假设，不得把其他假设的结论当作证据。\n"
+            "假设：%s\n依据：%s\n建议指标：%s\n所需证据：%s\n"
+            "请为这个假设单独生成可执行 QueryGraph。每个节点必须使用语义资产中的真实表和字段。"
+            % (
+                state["question"],
+                hypothesis.get("title", ""),
+                hypothesis.get("reason", ""),
+                ", ".join(str(item) for item in hypothesis.get("metricHints") or []),
+                ", ".join(str(item) for item in hypothesis.get("requiredEvidence") or []),
+            )
+        )
+        if round_index > 1:
+            instruction += (
+                "\n这是第二轮探索。上一轮证据摘要：%s。主 Agent 决定：%s（%s）。"
+                "不要原样重复上一轮 QueryGraph；优先增加业务维度、补充证据节点或切换到能够验证同一假设的其他语义表。"
+                % (json.dumps(previous_summary, ensure_ascii=False, default=str), followup_action, (followup or {}).get("reason", ""))
+            )
+        plan, requests, reason = planner.plan(
+            instruction,
+            [],
+            knowledge_context(state),
+            state["recall_bundle"],
+            state["planning_asset_pack"],
+            [],
+            ["independent_hypothesis=%s" % hypothesis_id, "exploration_round=%d" % round_index],
+            {
+                "hypothesis": hypothesis,
+                "explorationRound": round_index,
+                "previousEvidence": previous_summary,
+                "followupDecision": followup or {},
+                "memoryConstraints": state.get("memory_constraints", []),
+            },
+        )
+        planning_mode = "independent_planner"
+        if not plan.intents and previous and followup_action:
+            plan = self.controlled_react_explorer.fallback_followup_plan(
+                previous.get("plan") or QueryPlan(),
+                hypothesis,
+                state["planning_asset_pack"],
+                followup_action,
+                namespace,
+            )
+            planning_mode = "safe_semantic_followup_fallback"
+        if not plan.intents and round_index == 1:
+            plan = self.controlled_react_explorer._independent_candidate_plan(state["plan"], hypothesis)
+            planning_mode = "safe_projected_fallback"
+        if not plan.intents and round_index == 1:
+            context = state.get("request_context")
+            days = int(getattr(context, "days", 0) or 7) if context else 7
+            plan = self.controlled_react_explorer.fallback_hypothesis_seed_plan(
+                hypothesis,
+                state["planning_asset_pack"],
+                state["question"],
+                namespace,
+                days=days,
+            )
+            planning_mode = "safe_semantic_seed_fallback"
+        plan = namespace_query_plan(plan, namespace)
+        if round_index > 1 and previous and query_plan_fingerprint(plan) == query_plan_fingerprint(previous.get("plan") or QueryPlan()):
+            fallback = self.controlled_react_explorer.fallback_followup_plan(
+                previous.get("plan") or QueryPlan(),
+                hypothesis,
+                state["planning_asset_pack"],
+                followup_action,
+                namespace,
+            )
+            if fallback.intents:
+                plan = namespace_query_plan(fallback, namespace)
+                planning_mode = "safe_semantic_followup_fallback"
+        validation = self.graph_validator.validate(
+            state["question"],
+            plan,
+            state["planning_asset_pack"],
+            state.get("memory_constraints", []),
+        )
+        return {
+            "hypothesis": hypothesis,
+            "hypothesisId": hypothesis_id,
+            "plan": plan,
+            "validation": validation,
+            "round": round_index,
+            "planningMode": planning_mode,
+            "planningReason": reason,
+            "knowledgeRequests": [item.model_dump(by_alias=True) for item in requests or []],
+            "semanticScore": self._hypothesis_semantic_score(state, hypothesis_id),
+        }
+
+    def _execute_hypothesis_plans_parallel(
+        self,
+        state: AgentState,
+        planned: List[Dict[str, Any]],
+        max_parallel: int,
+    ) -> List[Dict[str, Any]]:
+        if not planned:
+            return []
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for item in planned:
+            grouped.setdefault(query_plan_fingerprint(item.get("plan") or QueryPlan()), []).append(item)
+        representatives = [items[0] for items in grouped.values()]
+        executions: List[Dict[str, Any]] = []
+        completed_by_fingerprint: Dict[str, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(representatives)))) as executor:
+            futures = {executor.submit(self._execute_hypothesis_plan, state, item): item for item in representatives}
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    execution = future.result()
+                except Exception as exc:
+                    execution = {**item, "runResult": AgentRunResult(), "executionError": str(exc)[:500]}
+                fingerprint = query_plan_fingerprint(item.get("plan") or QueryPlan())
+                completed_by_fingerprint[fingerprint] = execution
+                executions.append(execution)
+        for fingerprint, items in grouped.items():
+            representative = completed_by_fingerprint[fingerprint]
+            for duplicate in items[1:]:
+                executions.append(self._reuse_hypothesis_execution(state, representative, duplicate))
+        return executions
+
+    def _reuse_hypothesis_execution(
+        self,
+        state: AgentState,
+        source: Dict[str, Any],
+        target: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        source_plan = source.get("plan") or QueryPlan()
+        target_plan = target.get("plan") or QueryPlan()
+        source_result = source.get("runResult") or AgentRunResult()
+        reused_result = source_result.model_copy(deep=True)
+        task_id_mapping = {
+            source_intent.plan_task_id: target_intent.plan_task_id
+            for source_intent, target_intent in zip(source_plan.intents, target_plan.intents)
+        }
+        for task in reused_result.tasks:
+            task.task_id = task_id_mapping.get(task.task_id, task.task_id)
+            task.depends_on = [task_id_mapping.get(item, item) for item in task.depends_on]
+        for task_result in reused_result.task_results:
+            task_result.task_id = task_id_mapping.get(task_result.task_id, task_result.task_id)
+        reused_result.verified_evidence = self.evidence_verifier.verify(
+            state["question"], target_plan, reused_result, state.get("memory_constraints", [])
+        )
+        reused_result.evidence_gaps = reused_result.verified_evidence.gaps
+        return {
+            **target,
+            "runResult": reused_result,
+            "reusedFromHypothesisId": str(source.get("hypothesisId") or ""),
+            "executionReuse": "identical_query_plan_fingerprint",
+        }
+
+    def _execute_hypothesis_plan(self, state: AgentState, planned: Dict[str, Any]) -> Dict[str, Any]:
+        hypothesis_id = str(planned.get("hypothesisId") or "hypothesis")
+        round_index = int(planned.get("round") or 1)
+        root = Path(state["thread_data"].outputs_path) / "hypotheses" / hypothesis_id / ("round_%d" % round_index) / "worker"
+        worker = NodeWorkerExecutor(
+            LlmClient(self.settings),
+            self.node_worker.doris_repository,
+            SqlValidationService(),
+            self.settings,
+            semantic_catalog=self.semantic_catalog,
+        )
+        worker.with_artifact_root(str(root))
+        run_result = worker.execute_plan(
+            state["merchant"].merchant_id,
+            planned["plan"],
+            state["planning_asset_pack"],
+            knowledge_context(state),
+            state["question"],
+            run_id="%s_%s_r%d" % (state.get("run_id", "run"), hypothesis_id, round_index),
+            access_role=state.get("access_role", "merchant_analyst"),
+            user_scope=state.get("user_identity", {}),
+            execution_mode=str((state.get("execution_tier_policy") or {}).get("defaultMode") or "auto"),
+        )
+        run_result.verified_evidence = self.evidence_verifier.verify(
+            state["question"],
+            planned["plan"],
+            run_result,
+            state.get("memory_constraints", []),
+        )
+        run_result.evidence_gaps = run_result.verified_evidence.gaps
+        return {**planned, "runResult": run_result}
+
+    def _build_hypothesis_evidence_ledger(
+        self,
+        state: AgentState,
+        comparison: Dict[str, Any],
+        rounds_used: int,
+    ) -> HypothesisEvidenceLedger:
+        entries: List[HypothesisLedgerEntry] = []
+        for execution in comparison.get("ranked", []):
+            hypothesis = execution.get("hypothesis") or {}
+            hypothesis_id = str(execution.get("hypothesisId") or "")
+            plan = execution.get("plan") or QueryPlan()
+            run_result = execution.get("runResult") or AgentRunResult()
+            intents = {intent.plan_task_id: intent for intent in plan.intents}
+            records: List[HypothesisEvidenceRecord] = []
+            for task_result in run_result.task_results:
+                bundle = task_result.query_bundle
+                intent = intents.get(task_result.task_id) or QuestionIntent()
+                matching_gaps = [
+                    gap.model_dump(by_alias=True)
+                    for gap in run_result.verified_evidence.gaps
+                    if not gap.task_id or gap.task_id == task_result.task_id
+                ][:8]
+                if bundle.failed:
+                    status = "failed"
+                elif bundle.effective_row_count() <= 0:
+                    status = "insufficient"
+                else:
+                    status = "supporting"
+                evidence_id = "evidence_%s" % hashlib.sha256(
+                    ("%s|%s|%s|%s" % (hypothesis_id, task_result.task_id, bundle.sql, bundle.effective_row_count())).encode("utf-8")
+                ).hexdigest()[:16]
+                records.append(
+                    HypothesisEvidenceRecord(
+                        evidence_id=evidence_id,
+                        hypothesis_id=hypothesis_id,
+                        round=2 if "_r2_" in task_result.task_id else 1,
+                        task_id=task_result.task_id,
+                        claim_key=intent.analysis_note or intent.metric_name or intent.metric_column or hypothesis.get("title", ""),
+                        metric_name=intent.metric_name or intent.metric_column,
+                        metric_formula=intent.metric_formula,
+                        table=intent.preferred_table or (bundle.tables[0] if bundle.tables else ""),
+                        time_range="最近%d天" % int(intent.days or 0) if int(intent.days or 0) else "",
+                        sql_hash=hashlib.sha256(str(bundle.sql or "").encode("utf-8")).hexdigest()[:16] if bundle.sql else "",
+                        row_count=bundle.effective_row_count(),
+                        status=status,
+                        confidence=(float(execution.get("evidenceScore") or 0) / 100.0) if status == "supporting" else 0.0,
+                        evidence_preview=list(bundle.rows or [])[:3] if status == "supporting" else [],
+                        gaps=matching_gaps,
+                        failure_reason=bundle.error or task_result.summary if status in {"failed", "insufficient"} else "",
+                        reused_from_hypothesis_id=str(execution.get("reusedFromHypothesisId") or ""),
+                    )
+                )
+            supporting = [item.evidence_id for item in records if item.status == "supporting"]
+            insufficient = [item.evidence_id for item in records if item.status == "insufficient"]
+            failed = [item.evidence_id for item in records if item.status == "failed"]
+            decision = str(execution.get("decision") or "pruned")
+            elimination_reason = ""
+            if decision == "pruned":
+                if execution.get("executionError"):
+                    elimination_reason = str(execution.get("executionError"))[:300]
+                elif not supporting:
+                    elimination_reason = "没有取得可支持该假设的独立查询证据"
+                else:
+                    elimination_reason = "与其他假设相比证据得分或覆盖度较低"
+            entries.append(
+                HypothesisLedgerEntry(
+                    hypothesis_id=hypothesis_id,
+                    title=str(hypothesis.get("title") or ""),
+                    reason=str(hypothesis.get("reason") or ""),
+                    status=decision,
+                    rank=int(execution.get("rank") or 0),
+                    evidence_score=int(execution.get("evidenceScore") or 0),
+                    semantic_score=int(execution.get("semanticScore") or 0),
+                    confidence=float(execution.get("evidenceScore") or 0) / 100.0,
+                    query_graphs=[plan.model_dump(by_alias=True)],
+                    evidence=records,
+                    supporting_evidence_ids=supporting,
+                    insufficient_evidence_ids=insufficient,
+                    failed_evidence_ids=failed,
+                    evidence_gaps=[gap.model_dump(by_alias=True) for gap in run_result.verified_evidence.gaps[:12]],
+                    elimination_reason=elimination_reason,
+                    followup_decision=dict(execution.get("followupDecision") or {}),
+                )
+            )
+        budget = dict(state.get("run_budget_report") or {})
+        budget["remainingSeconds"] = remaining_run_budget_seconds(state, self.settings)
+        return HypothesisEvidenceLedger(
+            ledger_id="ledger_%s" % state.get("run_id", "run"),
+            winner_id=str(comparison.get("winnerId") or ""),
+            survivor_ids=list(comparison.get("survivorIds") or []),
+            pruned_ids=list(comparison.get("prunedIds") or []),
+            entries=entries,
+            rounds_used=rounds_used,
+            budget=budget,
+            comparison_policy=str(comparison.get("comparisonPolicy") or ""),
+        )
+
+    def _promote_hypothesis_winner_when_baseline_missing(self, state: AgentState, selected: List[Dict[str, Any]]) -> int:
+        baseline = state.get("agent_run_result") or AgentRunResult()
+        if any(not item.query_bundle.failed and item.query_bundle.effective_row_count() > 0 for item in baseline.task_results):
+            return 0
+        winner_id = str((state.get("hypothesis_evidence_ledger") or HypothesisEvidenceLedger()).winner_id or "")
+        winner = next((item for item in selected if str(item.get("hypothesisId") or "") == winner_id), None)
+        if not winner:
+            return 0
+        source_result = winner.get("runResult") or AgentRunResult()
+        successful = [
+            item.model_copy(deep=True)
+            for item in source_result.task_results
+            if not item.query_bundle.failed and item.query_bundle.effective_row_count() > 0
+        ]
+        if not successful:
+            return 0
+        curated = AgentRunResult(
+            task_results=successful,
+            query_bundles=[item.query_bundle for item in successful],
+            node_tool_traces=[trace for item in successful for trace in item.node_tool_traces],
+            freshness_reports=[report for item in successful for report in item.freshness_reports],
+            reflection_notes=["promoted from verified hypothesis evidence ledger winner=%s" % winner_id],
+        )
+        curated.merged_query_bundle = merge_task_result_bundles(curated.task_results)
+        winner_plan = winner.get("plan") or QueryPlan()
+        successful_ids = {item.task_id for item in successful}
+        curated_plan = winner_plan.model_copy(
+            deep=True,
+            update={
+                "intents": [intent.model_copy(deep=True) for intent in winner_plan.intents if intent.plan_task_id in successful_ids],
+                "dependencies": [
+                    dep.model_copy(deep=True)
+                    for dep in winner_plan.dependencies
+                    if dep.anchor_task_id in successful_ids and dep.dependent_task_id in successful_ids
+                ],
+            },
+        )
+        curated.verified_evidence = self.evidence_verifier.verify(
+            state["question"], curated_plan, curated, state.get("memory_constraints", [])
+        )
+        curated.evidence_gaps = curated.verified_evidence.gaps
+        state["plan"] = curated_plan
+        state["agent_run_result"] = curated
+        state["query_bundle"] = curated.merged_query_bundle
+        state["query_bundles"] = curated.query_bundles
+        state["node_tool_traces"] = curated.node_tool_traces
+        state["freshness_reports"] = curated.freshness_reports
+        return len(successful)
+
+    def _render_hypothesis_ledger_for_answer(self, ledger: HypothesisEvidenceLedger) -> str:
+        payload = {
+            "winnerId": ledger.winner_id,
+            "survivorIds": ledger.survivor_ids,
+            "hypotheses": [],
+        }
+        for entry in ledger.entries:
+            item = {
+                "hypothesisId": entry.hypothesis_id,
+                "title": entry.title,
+                "status": entry.status,
+                "confidence": entry.confidence,
+                "eliminationReason": entry.elimination_reason,
+                "supportingEvidence": [],
+                "evidenceGaps": entry.evidence_gaps[:4],
+            }
+            if entry.status == "survive":
+                item["supportingEvidence"] = [
+                    {
+                        "evidenceId": evidence.evidence_id,
+                        "claimKey": evidence.claim_key,
+                        "metric": evidence.metric_name,
+                        "table": evidence.table,
+                        "timeRange": evidence.time_range,
+                        "rowCount": evidence.row_count,
+                        "confidence": evidence.confidence,
+                        "preview": evidence.evidence_preview,
+                    }
+                    for evidence in entry.evidence
+                    if evidence.status == "supporting"
+                ][:6]
+            payload["hypotheses"].append(item)
+        return "假设—证据账本（最终回答只能引用 survive 假设的 supportingEvidence，pruned/failed 只能解释淘汰原因）：\n%s" % json.dumps(
+            payload, ensure_ascii=False, default=str
+        )
+
+    def _hypothesis_semantic_score(self, state: AgentState, hypothesis_id: str) -> int:
+        for candidate in (state.get("candidate_query_graphs") or {}).get("candidates", []):
+            if str(candidate.get("hypothesisId") or "") == hypothesis_id:
+                return int(candidate.get("score") or 0)
+        return 30
+
+    def _hypothesis_result_summary(self, execution: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not execution:
+            return {}
+        run_result = execution.get("runResult") or AgentRunResult()
+        bundle = run_result.merged_query_bundle
+        return {
+            "tables": list(bundle.tables or []),
+            "rowCount": bundle.effective_row_count(),
+            "rowsPreview": list(bundle.rows or [])[:5],
+            "verifiedPassed": bool(run_result.verified_evidence.passed),
+            "coveredEvidence": list(run_result.verified_evidence.covered_evidence or [])[:20],
+            "gaps": [gap.model_dump(by_alias=True) for gap in run_result.verified_evidence.gaps[:8]],
+        }
+
+    def _public_hypothesis_execution(self, execution: Dict[str, Any]) -> Dict[str, Any]:
+        run_result = execution.get("runResult") or AgentRunResult()
+        plan = execution.get("plan") or QueryPlan()
+        return {
+            "hypothesisId": execution.get("hypothesisId", ""),
+            "title": (execution.get("hypothesis") or {}).get("title", ""),
+            "rank": execution.get("rank", 0),
+            "decision": execution.get("decision", ""),
+            "evidenceScore": execution.get("evidenceScore", 0),
+            "semanticScore": execution.get("semanticScore", 0),
+            "rowCount": execution.get("rowCount", 0),
+            "verifiedPassed": execution.get("verifiedPassed", False),
+            "gapCount": execution.get("gapCount", 0),
+            "planningMode": execution.get("planningMode", ""),
+            "round": execution.get("round", 1),
+            "tables": list(run_result.merged_query_bundle.tables or []),
+            "queryGraph": plan.model_dump(by_alias=True),
+            "evidencePreview": list(run_result.merged_query_bundle.rows or [])[:5],
+            "evidenceGaps": [gap.model_dump(by_alias=True) for gap in run_result.verified_evidence.gaps[:8]],
+            "followupDecision": execution.get("followupDecision") or {},
+            "followupCount": len(execution.get("followups") or []),
+            "executionError": execution.get("executionError", ""),
+        }
 
     def answer_rule(self, state: AgentState) -> AgentState:
         started = now_ms()
@@ -2706,6 +3495,11 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "RUN_ANALYSIS_SKILL", {})
         match = self.match_analysis_skill(state)
+        if state.get("analysis_skill_bypassed"):
+            state["skill_worker_completed"] = False
+            self.finish_run_step(state, step, "success", output_summary="merchant chose current verified result")
+            emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"completed": False, "bypassed": True})
+            return state
         if not match.skill_name:
             state["skill_worker_completed"] = False
             self.finish_run_step(state, step, "partial", output_summary="no matched skill", error_code="NO_MATCHED_SKILL")
@@ -3013,6 +3807,9 @@ class MerchantQaWorkflow:
             return False
         context = state.get("request_context")
         if context and context.pending_clarification_type == "skill_confirm":
+            if skill_confirmation_declined(state.get("original_question") or state.get("question") or ""):
+                state["analysis_skill_bypassed"] = True
+                return False
             match = state.get("skill_match")
             if isinstance(match, SkillMatchState):
                 state["skill_match"] = match.model_copy(update={"confirmed": True, "status": "confirmed"})
@@ -3021,6 +3818,8 @@ class MerchantQaWorkflow:
         match = state.get("skill_match")
         if not isinstance(match, SkillMatchState) or not match.skill_name:
             match = self.match_analysis_skill(state)
+        if isinstance(match, SkillMatchState) and match.confirmed:
+            return False
         skill_name = match.skill_name
         if not skill_name:
             return False
@@ -3040,6 +3839,7 @@ class MerchantQaWorkflow:
         )
         state.setdefault("skill_lifecycle_records", []).append(record)
         state["agent_run_result"].skill_lifecycle_records.append(record)
+        self.persist_confirmation_evidence(state)
         self.emit_skill_lifecycle_event(
             state,
             "confirmation_required",
@@ -3048,12 +3848,98 @@ class MerchantQaWorkflow:
         )
         self.request_human_clarification(
             state,
-            "这个问题适合执行“%s”分析技能。是否确认执行？" % skill_name,
-            "ANSWER_SKILL",
+            "为了让结论更可靠，建议继续进行“%s”。系统会基于已校验的经营数据做专项拆解，不会修改任何业务数据。是否开始？"
+            % merchant_analysis_action_label(skill_name),
+            "DEEP_ANALYSIS",
             "skill_confirm",
-            ["确认执行", "改为普通回答"],
+            ["开始深度分析", "先看当前结果"],
         )
-        add_step(state, "AnswerAgent Skill：命中 %s，已进入执行前确认门" % skill_name)
+        add_step(state, "专项分析确认：命中 %s，等待商家确认是否继续深挖" % merchant_analysis_action_label(skill_name))
+        return True
+
+    def confirmation_evidence_path(self, state: AgentState) -> Path:
+        return Path(state["thread_data"].outputs_path) / "confirmation_evidence.json"
+
+    def persist_confirmation_evidence(self, state: AgentState) -> None:
+        payload = {
+            "version": 1,
+            "merchantId": state.get("requested_merchant_id", ""),
+            "userIdentity": state.get("user_identity") or {},
+            "originalQuestion": state.get("original_question") or state.get("question") or "",
+            "routingDecision": state["routing_decision"].model_dump(by_alias=True),
+            "topicRoutingDecision": state["topic_routing_decision"].model_dump(by_alias=True),
+            "plan": state["plan"].model_dump(by_alias=True),
+            "planningAssetPack": state["planning_asset_pack"].model_dump(by_alias=True),
+            "queryGraphValidation": state["query_graph_validation_result"].model_dump(by_alias=True),
+            "agentRunResult": state["agent_run_result"].model_dump(by_alias=True),
+            "skillMatch": state["skill_match"].model_dump(by_alias=True),
+            "ruleRecallContext": state.get("rule_recall_context", ""),
+            "ruleRecallRefs": state.get("rule_recall_refs") or [],
+            "baseKnowledgeContext": state.get("base_knowledge_context", ""),
+            "topicAssetContext": state.get("topic_asset_context", ""),
+            "alwaysApplyContext": state.get("always_apply_context", ""),
+            "latencyOptimization": state.get("latency_optimization") or {},
+            "hypothesisExplorationCompleted": bool(state.get("hypothesis_exploration_completed")),
+            "hypothesisExplorationRounds": int(state.get("hypothesis_exploration_rounds") or 0),
+            "hypothesisSelectedIds": list(state.get("hypothesis_selected_ids") or []),
+            "hypothesisResults": list(state.get("hypothesis_results") or []),
+            "hypothesisEvidenceLedger": (state.get("hypothesis_evidence_ledger") or HypothesisEvidenceLedger()).model_dump(by_alias=True),
+            "savedAt": datetime.now().isoformat(),
+        }
+        path = self.confirmation_evidence_path(state)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+
+    def restore_confirmation_evidence(self, state: AgentState) -> bool:
+        path = self.confirmation_evidence_path(state)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            payload = {}
+        if not payload or str(payload.get("merchantId") or "") != str(state.get("requested_merchant_id") or ""):
+            return False
+        stored_identity = payload.get("userIdentity") or {}
+        current_identity = state.get("user_identity") or {}
+        stored_user = str(stored_identity.get("userId") or stored_identity.get("user_id") or "")
+        current_user = str(current_identity.get("userId") or current_identity.get("user_id") or "")
+        if stored_user and current_user and stored_user != current_user:
+            return False
+        run_result = AgentRunResult.model_validate(payload.get("agentRunResult") or {})
+        if not run_result.task_results or not run_result.verified_evidence.passed:
+            return False
+        state["routing_decision"] = RoutingDecision.model_validate(payload.get("routingDecision") or {})
+        state["topic_routing_decision"] = TopicRoutingDecision.model_validate(payload.get("topicRoutingDecision") or {})
+        state["plan"] = QueryPlan.model_validate(payload.get("plan") or {})
+        state["planning_asset_pack"] = PlanningAssetPack.model_validate(payload.get("planningAssetPack") or {})
+        state["query_graph_validation_result"] = GraphValidationResult.model_validate(payload.get("queryGraphValidation") or {})
+        state["agent_run_result"] = run_result
+        state["query_bundle"] = run_result.merged_query_bundle
+        state["query_bundles"] = run_result.query_bundles
+        state["skill_match"] = SkillMatchState.model_validate(payload.get("skillMatch") or {})
+        state["rule_recall_context"] = str(payload.get("ruleRecallContext") or "")
+        state["rule_recall_refs"] = list(payload.get("ruleRecallRefs") or [])
+        state["base_knowledge_context"] = str(payload.get("baseKnowledgeContext") or "")
+        state["topic_asset_context"] = str(payload.get("topicAssetContext") or "")
+        state["always_apply_context"] = str(payload.get("alwaysApplyContext") or "")
+        state["latency_optimization"] = dict(payload.get("latencyOptimization") or {})
+        state["hypothesis_exploration_completed"] = bool(payload.get("hypothesisExplorationCompleted"))
+        state["hypothesis_exploration_rounds"] = int(payload.get("hypothesisExplorationRounds") or 0)
+        state["hypothesis_selected_ids"] = list(payload.get("hypothesisSelectedIds") or [])
+        state["hypothesis_results"] = list(payload.get("hypothesisResults") or [])
+        state["hypothesis_evidence_ledger"] = HypothesisEvidenceLedger.model_validate(payload.get("hypothesisEvidenceLedger") or {})
+        state["question"] = str(payload.get("originalQuestion") or state.get("question") or "")
+        state["confirmation_evidence_reused"] = True
+        state["analysis_skill_bypassed"] = skill_confirmation_declined(state.get("original_question") or "")
+        state["topic_routed"] = True
+        state["fast_understood"] = True
+        state["data_discovered"] = True
+        state["planning_assets_compacted"] = True
+        state["query_graph_reflected"] = True
+        state["query_graph_validated"] = bool(state["query_graph_validation_result"].valid)
+        state["sql_generated"] = True
+        state["sql_repair_reviewed"] = True
+        state["evidence_graph_verified"] = True
+        add_step(state, "确认续跑：恢复已验证 QueryGraph、数据结果与专项分析选择")
         return True
 
     def record_skill_lifecycle(self, state: AgentState, trace: Dict[str, Any]) -> None:
@@ -3265,6 +4151,9 @@ class MerchantQaWorkflow:
             state.get("human_clarification_type", ""),
             state.get("human_clarification_options", []),
         )
+        request_context = state.get("request_context")
+        if request_context and getattr(request_context, "user_identity", None):
+            state["response_context"].user_identity = request_context.user_identity
         if fast_response is not None:
             state["response_context"].category = str(getattr(fast_response, "category_name", "") or "电商交易")
             state["response_context"].topic = state["response_context"].category
@@ -3409,6 +4298,10 @@ class MerchantQaWorkflow:
                 "actionHistory": [
                     item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
                     for item in state.get("action_history", [])
+                ],
+                "leadDecisions": [
+                    item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                    for item in state.get("lead_decisions", [])
                 ],
             }
             return response
@@ -3798,7 +4691,10 @@ class MerchantQaWorkflow:
             "mode": "controlled_react_querygraph",
             "tradeoff": "limits free-form exploration in exchange for verifiable BI answers",
             "exploration": state.get("hypothesis_exploration") or {},
+            "parallelHypothesisResults": state.get("hypothesis_results") or [],
             "candidateQueryGraphs": state.get("candidate_query_graphs") or {},
+            "hypothesisEvidenceLedger": (state.get("hypothesis_evidence_ledger") or HypothesisEvidenceLedger()).model_dump(by_alias=True),
+            "executionTierPolicy": state.get("execution_tier_policy") or {},
             "latencyOptimization": self.latency_optimizer.response_payload(state.get("latency_optimization") or {}),
             "steps": {
                 "leadDecisions": len(lead_decisions),
@@ -3839,7 +4735,8 @@ class MerchantQaWorkflow:
             "time_window": "确认分析时间范围",
             "metric_focus": "确认指标口径",
             "priority_goal": "确认优化目标",
-            "skill_confirmation": "确认分析工作流",
+            "skill_confirmation": "是否开始深度分析",
+            "skill_confirm": "是否开始深度分析",
             "business_scope": "确认业务范围",
             "write_operation_blocked": "确认危险操作",
         }
@@ -4686,6 +5583,36 @@ def business_scope_options() -> List[str]:
     return ["最近7天整体经营", "最近30天退款售后", "昨天客服工单"]
 
 
+def merchant_analysis_action_label(skill_name: str) -> str:
+    return {
+        "bi_trend_attribution": "指标波动原因深挖",
+        "gmv_drop_diagnosis": "GMV下降原因诊断",
+        "merchant_daily_briefing": "店铺经营体检",
+        "new_product_risk": "新品经营风险排查",
+        "ratio_analysis": "占比口径核验",
+        "refund_rate_diagnosis": "退款压力专项诊断",
+        "risk_analysis": "经营风险优先级分析",
+        "rule_compliance": "平台规则影响核对",
+    }.get(str(skill_name or ""), "经营专项分析")
+
+
+def skill_confirmation_declined(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    return any(term in normalized for term in ["先看当前结果", "暂不", "不用", "取消", "不开始", "先不", "no"])
+
+
+def merchant_access_role(role: str) -> str:
+    return {
+        "platform_operator": "merchant_admin",
+        "merchant_owner": "merchant_admin",
+        "merchant_operator": "merchant_analyst",
+        "merchant_finance": "merchant_finance",
+        "merchant_customer_service": "merchant_service",
+        "merchant_goods": "merchant_goods",
+        "merchant_fulfillment": "merchant_fulfillment",
+    }.get(str(role or ""), "merchant_analyst")
+
+
 def priority_goal_options() -> List[str]:
     return ["综合经营风险", "降低退款/赔付损失", "稳住 GMV 和下单", "降低客服压力"]
 
@@ -5112,6 +6039,160 @@ def unique_workflow_strings(values: List[Any]) -> List[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def remaining_run_budget_seconds(state: AgentState, settings: Settings) -> float:
+    now = now_ms()
+    started = int(state.get("run_started_at_ms") or now)
+    elapsed_seconds = max(0, now - started) / 1000.0
+    limit_seconds = int(getattr(settings, "run_budget_max_duration_seconds", 90) or 90)
+    latency = state.get("latency_optimization") or {}
+    if latency.get("eligible") and str(latency.get("mode") or "").startswith("fast_path"):
+        limit_seconds = int(getattr(settings, "run_budget_fast_duration_seconds", 25) or 25)
+    return max(0.0, float(limit_seconds) - elapsed_seconds)
+
+
+def lead_decision_fingerprint(state: AgentState, allowed: List[str]) -> str:
+    validation = state.get("query_graph_validation_result") or GraphValidationResult()
+    run_result = state.get("agent_run_result") or AgentRunResult()
+    last_action = state.get("last_action_result") or ActionResult()
+    payload = {
+        "allowedActions": sorted(str(item) for item in allowed if item),
+        "validationGapCodes": sorted(str(item.code) for item in (validation.gaps or [])),
+        "evidenceGapCodes": sorted(str(item.code) for item in (run_result.evidence_gaps or [])),
+        "pendingKnowledgeCount": len(state.get("pending_knowledge_requests") or []),
+        "repairRequestCount": len(state.get("planner_repair_requests") or []),
+        "flags": {
+            "fastMetricAttempted": bool(state.get("fast_metric_attempted")),
+            "graphValidated": bool(state.get("query_graph_validated")),
+            "evidenceVerified": bool(state.get("evidence_graph_verified")),
+            "hypothesisExplored": bool(state.get("hypothesis_exploration_completed")),
+            "analysisCompleted": bool(state.get("analysis_skill_completed")),
+        },
+        "lastAction": {
+            "action": last_action.action,
+            "status": last_action.status,
+            "message": last_action.message,
+        },
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def namespace_query_plan(plan: QueryPlan, namespace: str) -> QueryPlan:
+    if not plan.intents:
+        return plan
+    mapping: Dict[str, str] = {}
+    for index, intent in enumerate(plan.intents, start=1):
+        old_id = str(intent.plan_task_id or "node_%d" % index)
+        mapping[old_id] = "%s_%s" % (namespace, re.sub(r"[^a-zA-Z0-9_]+", "_", old_id))
+    intents = []
+    for index, intent in enumerate(plan.intents, start=1):
+        old_id = str(intent.plan_task_id or "node_%d" % index)
+        intents.append(
+            intent.model_copy(
+                deep=True,
+                update={
+                    "plan_task_id": mapping[old_id],
+                    "depends_on_task_ids": [mapping.get(str(item), str(item)) for item in intent.depends_on_task_ids],
+                },
+            )
+        )
+    dependencies = [
+        dependency.model_copy(
+            deep=True,
+            update={
+                "anchor_task_id": mapping.get(dependency.anchor_task_id, dependency.anchor_task_id),
+                "dependent_task_id": mapping.get(dependency.dependent_task_id, dependency.dependent_task_id),
+            },
+        )
+        for dependency in plan.dependencies
+    ]
+    contracts = []
+    for contract in plan.evidence_contracts:
+        next_contract = dict(contract)
+        task_id = str(next_contract.get("taskId") or next_contract.get("task_id") or "")
+        if task_id in mapping:
+            next_contract["taskId"] = mapping[task_id]
+            next_contract.pop("task_id", None)
+        contracts.append(next_contract)
+    return plan.model_copy(
+        deep=True,
+        update={
+            "intents": intents,
+            "dependencies": dependencies,
+            "evidence_contracts": contracts,
+            "agent_trace": list(plan.agent_trace or []) + ["query_graph.namespace=%s" % namespace],
+        },
+    )
+
+
+def query_plan_fingerprint(plan: QueryPlan) -> str:
+    payload = [
+        {
+            "table": intent.preferred_table,
+            "metric": intent.metric_name or intent.metric_column,
+            "mode": str(intent.answer_mode),
+            "group": intent.group_by_column,
+            "filter": [intent.filter_column, intent.filter_value],
+        }
+        for intent in plan.intents
+    ]
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def merge_query_plans(left: QueryPlan, right: QueryPlan) -> QueryPlan:
+    merged = left.model_copy(deep=True)
+    existing = {intent.plan_task_id for intent in merged.intents}
+    merged.intents.extend(intent.model_copy(deep=True) for intent in right.intents if intent.plan_task_id not in existing)
+    dependency_keys = {
+        (item.anchor_task_id, item.dependent_task_id, item.join_key, item.anchor_column, item.dependent_column)
+        for item in merged.dependencies
+    }
+    for dependency in right.dependencies:
+        key = (dependency.anchor_task_id, dependency.dependent_task_id, dependency.join_key, dependency.anchor_column, dependency.dependent_column)
+        if key not in dependency_keys:
+            merged.dependencies.append(dependency.model_copy(deep=True))
+            dependency_keys.add(key)
+    contract_keys = {
+        (str(item.get("taskId") or item.get("task_id") or ""), str(item.get("semanticLabel") or item.get("semantic_label") or ""))
+        for item in merged.evidence_contracts
+    }
+    for contract in right.evidence_contracts:
+        key = (str(contract.get("taskId") or contract.get("task_id") or ""), str(contract.get("semanticLabel") or contract.get("semantic_label") or ""))
+        if key not in contract_keys:
+            merged.evidence_contracts.append(dict(contract))
+            contract_keys.add(key)
+    merged.final_required_evidence = list(dict.fromkeys([*merged.final_required_evidence, *right.final_required_evidence]))
+    merged.agent_trace = list(dict.fromkeys([*merged.agent_trace, *right.agent_trace]))
+    return merged
+
+
+def merge_agent_run_results(left: AgentRunResult, right: AgentRunResult) -> AgentRunResult:
+    merged = left.model_copy(deep=True)
+    list_fields = [
+        "tasks",
+        "task_results",
+        "query_bundles",
+        "sql_repairs",
+        "evidence_gaps",
+        "reflection_notes",
+        "node_tool_traces",
+        "node_task_profiles",
+        "freshness_reports",
+        "node_plan_contracts",
+        "node_plan_critiques",
+        "sql_draft_decisions",
+        "node_execution_batches",
+        "skill_lifecycle_records",
+        "resumed_task_ids",
+        "degraded_reasons",
+    ]
+    for field in list_fields:
+        current = list(getattr(merged, field) or [])
+        current.extend(item.model_copy(deep=True) if hasattr(item, "model_copy") else dict(item) if isinstance(item, dict) else item for item in getattr(right, field) or [])
+        setattr(merged, field, current)
+    merged.merged_query_bundle = merge_task_result_bundles(merged.task_results)
+    return merged
 
 
 def dedupe_workflow_knowledge_requests(items: List[KnowledgeRequest]) -> List[KnowledgeRequest]:
