@@ -48,7 +48,6 @@ def test_policy_offers_general_delegation_for_attachment():
         "data_discovered": False,
         "topic_routed": True,
         "fast_understood": True,
-        "fast_metric_attempted": False,
         "route_slots": RouteSlots(),
         "request_context": ChatContext(offloaded_files=["report.md"]),
         "question": "分析附件里的经营问题",
@@ -67,14 +66,13 @@ def test_policy_does_not_delegate_without_real_attachment_input():
             "data_discovered": False,
             "topic_routed": True,
             "fast_understood": True,
-            "fast_metric_attempted": False,
             "route_slots": RouteSlots(),
             "request_context": ChatContext(),
             "question": "帮我分析一份还没有上传的报告",
         }
     )
 
-    assert decision.selected_action == "try_fast_metric"
+    assert decision.selected_action == "retrieve_knowledge"
     assert "delegate_subagent" not in decision.available_actions
 
 

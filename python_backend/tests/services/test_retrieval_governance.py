@@ -6,6 +6,7 @@ from merchant_ai.services.context import ContextManager
 from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     business_rerank_recall_items,
+    canonical_metric_family_owner,
     filter_recall_items_by_governance,
     limit_recall_items_by_source_type,
     metric_candidate_fusion_score,
@@ -107,6 +108,48 @@ def test_metric_resolver_score_is_bounded_and_penalizes_lower_rank():
     third = metric_candidate_fusion_score(0.96, "exact_business_name", 3)
 
     assert 0.0 <= third < first <= 1.0
+
+
+def test_shared_alias_resolves_to_published_canonical_family_owner():
+    owner = {
+        "topic": "profile",
+        "tableName": "merchant_profile",
+        "metricKey": "order_amount",
+        "canonicalMetricKey": "order_amount",
+        "aliasOf": "",
+    }
+    variant = {
+        "topic": "profile",
+        "tableName": "merchant_profile",
+        "metricKey": "paid_amount",
+        "canonicalMetricKey": "order_amount",
+        "aliasOf": "order_amount",
+    }
+
+    resolved, aliases = canonical_metric_family_owner([owner, variant])
+
+    assert resolved is owner
+    assert aliases == [variant]
+
+
+def test_shared_alias_stays_ambiguous_across_independent_canonical_families():
+    first = {
+        "topic": "profile",
+        "tableName": "merchant_profile",
+        "metricKey": "order_amount",
+        "canonicalMetricKey": "order_amount",
+    }
+    second = {
+        "topic": "profile",
+        "tableName": "merchant_profile",
+        "metricKey": "net_amount",
+        "canonicalMetricKey": "net_amount",
+    }
+
+    resolved, aliases = canonical_metric_family_owner([first, second])
+
+    assert resolved is None
+    assert aliases == []
 
 
 def test_es_search_uses_active_profile_hybrid_top_k(monkeypatch):

@@ -165,7 +165,7 @@ from merchant_ai.services.memory import (
     truncate_memory_text_by_tokens,
 )
 from merchant_ai.services.llm import TaskModelRouter
-from merchant_ai.services.memory_constraints import build_memory_constraints
+from merchant_ai.services.memory_constraints import build_memory_constraints, memory_constraint_validation_gaps
 from merchant_ai.services.merchant_profile import MerchantProfileStore, MerchantProfileSummaryService
 from merchant_ai.services.evaluation import (
     GOLDEN_QUESTIONS,
@@ -196,6 +196,8 @@ from merchant_ai.services.planning import (
     compact_understanding_catalog,
     compact_openai_tool_schema,
     compile_semantic_entity_chain_graph,
+    compile_entity_detail_graph_from_question_entity,
+    compile_semantic_multi_metric_trend_fallback_graph,
     compile_semantic_metric_fallback_graph,
     compile_query_graph_from_understanding,
     planner_prompt_stats,
@@ -204,10 +206,12 @@ from merchant_ai.services.planning import (
     repair_more_specific_root_metric,
     scope_ratio_numerator_knowledge_request,
     semantic_workspace_manifest_from_asset_pack,
+    semantic_fast_path_can_bypass_configured_llm,
     ultra_compact_understanding_catalog,
 )
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
+from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution
 from merchant_ai.services.query import (
     NodeWorkerExecutor,
     SqlValidationService,
@@ -218,7 +222,7 @@ from merchant_ai.services.query import (
     merge_task_result_bundles,
     multi_entity_transfer_values,
     serialize_tool_execution_result,
-    table_access_hint,
+    semantic_table_access_hint,
 )
 from merchant_ai.services.query_sql_binding import inclusive_day_interval, normalize_inclusive_relative_window_sql
 from merchant_ai.services.skill_worker import SkillWorkerExecutor
@@ -1887,7 +1891,7 @@ def test_llm_understanding_compiler_builds_graph_for_extended_risk_cases():
         assert not any("knowledge_grounded" in item or "pattern:" in item for item in plan.agent_trace)
 
 
-def test_planner_uses_ultra_catalog_and_surfaces_timeout_gap():
+def test_planner_uses_semantic_topn_fast_graph_before_timeout_prone_llm():
     settings = get_settings()
     builder = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings))
     question = "最近 7 天下单最多的前 5 个 SPU，同时看它们的退款量和退款金额。"
@@ -1899,12 +1903,11 @@ def test_planner_uses_ultra_catalog_and_surfaces_timeout_gap():
     llm = FakeTimeoutThenCompactUnderstandingLlm()
     plan, requests, _ = QueryGraphPlanner(llm).plan(question, [], "", recall_bundle_empty(), pack, [], [])
     assert not requests
-    assert not plan.intents
-    assert llm.calls == 1
-    assert llm.catalog_sizes[0] == len(json.dumps(ultra_compact_understanding_catalog(pack, question), ensure_ascii=False))
-    assert any("PLANNER_LLM_TIMEOUT" in item for item in plan.agent_trace)
+    assert plan.intents
+    assert llm.calls == 0
+    assert any("planner.semantic_fast_path" in item for item in plan.agent_trace)
     validation = QueryGraphValidator().validate(question, plan, pack)
-    assert [gap.code for gap in validation.gaps] == ["PLANNER_LLM_TIMEOUT"]
+    assert validation.valid
 
 
 def test_llm_understanding_nodes_carry_refs_and_no_declared_extended_patterns():
@@ -2726,6 +2729,20 @@ def test_ratio_and_partial_metric_coverage_fall_back_to_planner():
     assert quick_metric_response(coupon, "100", UnexpectedRepository(), coupon_keywords) is None
 
 
+def test_multiple_published_metrics_never_use_quick_metric_path():
+    assets = TopicAssetService(get_settings())
+    semantic_metrics = published_semantic_quick_metrics(assets)
+    question = "最近7天总GMV和支付订单量趋势"
+    keywords = KeywordExtractService(assets).extract(question)
+
+    class UnexpectedRepository:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("multi-metric requests must fall back before querying")
+
+    assert len(keywords.metric_keywords) >= 2
+    assert quick_metric_response(question, "100", UnexpectedRepository(), keywords, semantic_metrics) is None
+
+
 def test_attribution_question_never_uses_quick_metric_path():
     service = KeywordExtractService(TopicAssetService(get_settings()))
     question = "最近7天GMV为什么下降？"
@@ -2759,7 +2776,9 @@ def test_quick_metric_uses_unique_published_semantic_formula():
     class Repository:
         def query(self, sql, params=None):
             calls.append((sql, params))
-            return [{"pt": "2026-07-10", "value": 100.0}, {"pt": "2026-07-11", "value": 120.0}]
+            if "GROUP BY" in sql:
+                return [{"pt": "2026-07-10", "value": 100.0}, {"pt": "2026-07-11", "value": 120.0}]
+            return [{"value": 220.0}]
 
     response = quick_metric_response("最近7天总GMV趋势", "100", Repository(), keywords, semantic_metrics)
 
@@ -2769,7 +2788,36 @@ def test_quick_metric_uses_unique_published_semantic_formula():
     assert disclosure["formula"] == "SUM(order_gmv_amt_1d)"
     assert "SUM(`order_gmv_amt_1d`) AS value" in calls[0][0]
     assert "GROUP BY" in calls[0][0]
+    assert "SUM(`order_gmv_amt_1d`) AS value" in calls[1][0]
+    assert "GROUP BY" not in calls[1][0]
+    assert response.data_sections[1].data_rows[0]["value"] == 220.0
     assert response.debug_trace["semanticMetric"]["topic"] == "经营画像"
+
+
+def test_quick_metric_executes_governed_count_distinct_without_daily_rollup():
+    assets = TopicAssetService(get_settings())
+    semantic_metrics = published_semantic_quick_metrics(assets)
+    keywords = KeywordExtractService(assets).extract("最近7天订单量是多少？")
+    calls = []
+
+    class Repository:
+        def query(self, sql, params=None):
+            calls.append((sql, params))
+            if "GROUP BY" in sql:
+                return [{"pt": "2026-07-10", "value": 8}, {"pt": "2026-07-11", "value": 9}]
+            # One order may occur on more than one partition, so this is not
+            # assumed to equal the sum of the two daily distinct counts.
+            return [{"value": 15}]
+
+    response = quick_metric_response("最近7天订单量是多少？", "100", Repository(), keywords, semantic_metrics)
+
+    assert response is not None
+    assert response.debug_trace["semanticMetric"]["metricKey"] == "order_detail_cnt"
+    assert "COUNT(DISTINCT `sub_order_id`) AS value" in calls[0][0]
+    assert "GROUP BY" in calls[0][0]
+    assert "COUNT(DISTINCT `sub_order_id`) AS value" in calls[1][0]
+    assert "GROUP BY" not in calls[1][0]
+    assert response.data_sections[1].data_rows[0]["value"] == 15.0
 
 
 def test_quick_metric_respects_yesterday_time_expression():
@@ -2781,7 +2829,7 @@ def test_quick_metric_respects_yesterday_time_expression():
     class Repository:
         def query(self, sql, params=None):
             calls.append((sql, params))
-            return [{"pt": "2026-07-11", "value": 298.0}]
+            return [{"pt": "2026-07-11", "value": 298.0}] if "GROUP BY" in sql else [{"value": 298.0}]
 
     response = quick_metric_response("昨天退款金额是多少？", "100", Repository(), keywords, semantic_metrics)
 
@@ -2795,16 +2843,63 @@ def test_quick_metric_respects_yesterday_time_expression():
     assert response.answer.startswith("昨天，")
 
 
+def test_multi_metric_trend_graph_backfills_explicit_metric_from_another_table():
+    assets = TopicAssetService(get_settings())
+    pack = PlanningAssetPack()
+    for topic, table in [
+        ("电商交易", "dwm_trade_order_detail_di"),
+        ("电商退货", "dwm_trade_refund_detail_di"),
+    ]:
+        columns = [
+            str(item.get("name") or item.get("columnName") or "")
+            for item in assets.load_table_schema(topic, table)
+            if str(item.get("name") or item.get("columnName") or "")
+        ]
+        pack.tables.append(
+            PlanningAssetEntry(
+                key=table,
+                table=table,
+                topic=topic,
+                columns=columns,
+                source_ref_id=f"semantic:{topic}:{table}:table",
+            )
+        )
+        for metric in assets.load_table_metrics(topic, table):
+            key = str(metric.get("metricKey") or "")
+            pack.metrics.append(
+                PlanningAssetEntry(
+                    key=key,
+                    table=table,
+                    topic=topic,
+                    title=str(metric.get("businessName") or key),
+                    columns=[str(item) for item in metric.get("sourceColumns") or []],
+                    aliases=[str(item) for item in metric.get("aliases") or []],
+                    metadata=metric,
+                    source_ref_id=f"semantic:{topic}:{table}:metric:{key}",
+                )
+            )
+
+    plan = compile_semantic_multi_metric_trend_fallback_graph("最近7天订单量和退款金额有什么变化？", pack)
+    plan.agent_trace.append("planner.semantic_fast_path=multi_metric_trend")
+
+    assert {(intent.preferred_table, intent.metric_name) for intent in plan.intents} == {
+        ("dwm_trade_refund_detail_di", "pay_amt"),
+        ("dwm_trade_order_detail_di", "order_detail_cnt"),
+    }
+    assert all(intent.group_by_column == "pt" for intent in plan.intents)
+    assert semantic_fast_path_can_bypass_configured_llm("最近7天订单量和退款金额有什么变化？", plan)
+
+
 def test_quick_metric_answers_published_metric_definition_without_querying():
     assets = TopicAssetService(get_settings())
     semantic_metrics = published_semantic_quick_metrics(assets)
-    keywords = KeywordExtractService(assets).extract("GMV口径是什么，是否扣退款？")
+    keywords = KeywordExtractService(assets).extract("总GMV口径是什么，是否扣退款？")
 
     class UnexpectedRepository:
         def query(self, *_args, **_kwargs):
             raise AssertionError("metric definition should not query Doris")
 
-    response = quick_metric_response("GMV口径是什么，是否扣退款？", "100", UnexpectedRepository(), keywords, semantic_metrics)
+    response = quick_metric_response("总GMV口径是什么，是否扣退款？", "100", UnexpectedRepository(), keywords, semantic_metrics)
 
     assert response is not None
     assert response.debug_trace["definitionOnly"] is True
@@ -2921,7 +3016,7 @@ def test_fast_gate_forces_retrieval_for_attribution_or_rule_sensitive_questions(
     state = workflow.fast_understand(state)
 
     deterministic = workflow.policy.decide(state)
-    assert deterministic.selected_action == "try_fast_metric"
+    assert deterministic.selected_action == "retrieve_knowledge"
 
     state = workflow.policy_node(state)
     assert state["_next_action"] == "retrieve_knowledge"
@@ -6854,6 +6949,7 @@ def test_detail_lookup_metric_resolution_does_not_bind_missing_formula_columns()
     assert goods.metric_column == ""
     assert goods.metric_formula == ""
     assert "spu_apply_create_time" in goods.required_evidence
+    assert goods.days == 0
     assert QueryGraphValidator().validate(question, plan, pack).valid
 
 
@@ -7482,6 +7578,30 @@ def test_memory_middleware_injects_and_store_writes_structured_memory(tmp_path):
     assert not state["memory_injection"]["coreMemory"]["corePreferenceIds"]
     assert "answerPreview" in json.dumps(memory["events"][0], ensure_ascii=False)
     assert "tool_result" not in json.dumps(memory, ensure_ascii=False)
+
+
+def test_memory_middleware_reuses_one_request_scoped_snapshot():
+    class CountingMemoryStore:
+        def __init__(self):
+            self.calls = 0
+
+        def select_for_question(self, state, budget_tokens=0):
+            self.calls += 1
+            return {"memoryInjectionTrace": {"selectedIds": []}, "relevantEvents": []}
+
+        def render_injection(self, injection):
+            return ""
+
+    middleware = MemoryMiddleware(get_settings())
+    store = CountingMemoryStore()
+    middleware.memory_store = store
+    state = {"question": "最近7天订单量", "middleware_events": []}
+
+    middleware.before_policy(state)
+    middleware.before_policy(state)
+
+    assert store.calls == 1
+    assert state["_memory_middleware_snapshot_ready"] is True
 
 
 def test_memory_render_injection_keeps_core_only_payload(tmp_path):
@@ -8982,6 +9102,50 @@ def test_memory_constraints_block_unapplied_metric_correction(tmp_path):
     )
     fixed_result = QueryGraphValidator().validate("最近售后风险怎么看", fixed_plan, asset_pack, constraints)
     assert not any(gap.code == "MEMORY_CONSTRAINT_UNAPPLIED" for gap in fixed_result.gaps)
+
+
+def test_unrelated_required_memory_does_not_pollute_another_metric_or_empty_graph():
+    constraints = build_memory_constraints(
+        {
+            "coreMemory": {
+                "coreCorrections": [
+                    {
+                        "id": "mem_refund_alert",
+                        "memoryType": "correction",
+                        "correctionText": "退款预警，本店退款率超过8%时提醒。",
+                        "topics": ["REFUND"],
+                        "metrics": ["refund_rate"],
+                        "confidence": 0.95,
+                    }
+                ]
+            }
+        }
+    )
+    order_plan = QueryPlan(
+        question_understanding={"analysisIntent": "metric"},
+        intents=[
+            QuestionIntent(
+                question="最近7天订单量是多少？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.METRIC,
+                category=QuestionCategory.TRADE,
+                plan_task_id="order_count",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_column="sub_order_id",
+                metric_name="下单数",
+                metric_resolution={"metricKey": "order_detail_cnt"},
+            )
+        ],
+    )
+
+    assert not any(
+        gap.code == "MEMORY_CONSTRAINT_UNAPPLIED"
+        for gap in memory_constraint_validation_gaps("最近7天订单量是多少？", order_plan, constraints)
+    )
+    assert not any(
+        gap.code == "MEMORY_CONSTRAINT_UNAPPLIED"
+        for gap in memory_constraint_validation_gaps("最近7天订单量是多少？", QueryPlan(), constraints)
+    )
 
 
 def test_evidence_verifier_reports_memory_constraint_and_metric_dispute():
@@ -11072,14 +11236,14 @@ def test_planner_timeout_can_fallback_to_semantic_entity_id_graph():
     plan, requests, reason = QueryGraphPlanner(TimeoutLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
 
     assert not requests
-    assert "PLANNER_LLM_TIMEOUT" in reason
+    assert reason == "SEMANTIC_FAST_PATH"
     assert plan.intents
     assert plan.intents[0].preferred_table == "dwm_trade_order_detail_di"
     assert plan.intents[0].filter_column == "order_id"
     assert plan.intents[0].filter_value == "order_id_100"
     tables = {intent.preferred_table for intent in plan.intents}
-    assert tables == {"dwm_trade_order_detail_di"}
-    assert "planner=entity_id_semantic_fallback" in plan.agent_trace
+    assert tables == {"dwm_trade_order_detail_di", "dwm_trade_refund_detail_di", "dwm_goods_detail_df"}
+    assert any("planner.semantic_fast_path" in item for item in plan.agent_trace)
 
 
 def test_planner_uses_semantic_fast_path_for_topn_metric_question_without_llm():
@@ -11243,6 +11407,48 @@ def test_planner_timeout_can_fallback_to_multi_metric_trend_graph():
     assert any(item.startswith("PLANNER_LLM_TIMEOUT:") for item in plan.agent_trace)
 
 
+def test_planner_provider_failure_promotes_canonical_recalled_metric_before_hypotheses():
+    class ProviderFailureLlm:
+        configured = True
+        last_error = "provider_error: upstream returned 500"
+        error_events = []
+
+        def json_chat(self, system_prompt, user_prompt, fallback=None, **kwargs):
+            return {}
+
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    question = "最近30天GMV为什么下降？"
+    keywords = KeywordExtractService().extract(question)
+    recall = HybridRecallService(settings, topic_assets).recall(
+        question,
+        keywords,
+        [],
+        "",
+        "100",
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+    pack = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings)).compact(
+        question,
+        recall,
+        [QuestionCategory.TRADE, QuestionCategory.REFUND],
+    )
+
+    plan, requests, reason = QueryGraphPlanner(
+        ProviderFailureLlm(),
+        SemanticCatalogService(topic_assets),
+    ).plan(question, [], "", recall, pack, [], [])
+
+    assert not requests
+    assert reason == "SEMANTIC_FAST_PATH"
+    assert plan.intents
+    assert plan.intents[0].preferred_table == "ads_merchant_profile"
+    assert plan.intents[0].metric_name == "order_gmv_amt_1d"
+    assert plan.question_understanding["analysisIntent"] == "diagnosis"
+    assert plan.question_understanding["reusableAnalysis"] is True
+    assert any("canonical_recalled_metric_diagnostic_fallback" in item for item in plan.agent_trace)
+
+
 def test_structured_formula_uses_semantic_metric_formula_not_sum_first_column():
     settings = get_settings()
     worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
@@ -11265,6 +11471,30 @@ def test_structured_formula_uses_semantic_metric_formula_not_sum_first_column():
     assert "AVG(`refund_rate_1d`) AS `refund_rate_1d`" in sql
     assert "SUM(`refund_rate_1d`)" not in sql
     assert SqlValidationService().validate(sql, pack).valid
+
+
+def test_trend_context_structured_sql_orders_by_time_instead_of_metric_rank():
+    settings = get_settings()
+    worker = NodeWorkerExecutor(FakeLlm(), FakeDoris(), SqlValidationService(), settings)
+    pack = profile_daily_pack()
+    intent = QuestionIntent(
+        question="最近30天指标为什么下降",
+        intent_type="VALID",
+        answer_mode=AnswerMode.GROUP_AGG,
+        plan_task_id="trend_metric",
+        preferred_table="ads_merchant_profile",
+        group_by_column="pt",
+        metric_column="order_gmv_amt_1d",
+        metric_name="order_gmv_amt_1d",
+        metric_formula="SUM(order_gmv_amt_1d)",
+        output_keys=["merchant_id", "pt"],
+        metric_resolution={"metricKey": "order_gmv_amt_1d", "displayRole": "trend_context"},
+    )
+
+    sql = worker._draft_sql(intent, pack, "", NodeExecutionContext(merchant_id="100"))
+
+    assert "ORDER BY `pt` ASC" in sql
+    assert "ORDER BY `order_gmv_amt_1d` DESC" not in sql
 
 
 def test_simple_metric_node_uses_structured_fast_path_without_llm_sql():
@@ -14052,13 +14282,16 @@ def test_planner_reflection_flags_low_confidence_metric_resolution():
                 group_by_column="pt",
                 output_keys=["pt"],
                 knowledge_refs=[ref],
-                metric_resolution={
+                metric_resolution=seal_semantic_metric_resolution({
                     "requestedMetricRef": "unknown_amt",
                     "metricKey": "pay_amt",
                     "ownerTable": "dwm_trade_refund_detail_di",
+                    "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt",
+                    "formula": "SUM(pay_amt)",
+                    "sourceColumns": ["pay_amt"],
                     "confidence": 0.4,
                     "resolutionSource": "semantic_weak_match",
-                },
+                }),
             )
         ],
         evidence_contracts=[{"taskId": "anchor_refund", "table": "dwm_trade_refund_detail_di", "columns": ["pt", "pay_amt"]}],
@@ -14515,24 +14748,49 @@ def test_node_agent_switches_to_realtime_fallback_when_offline_partition_is_stal
     worker = NodeWorkerExecutor(FakeLlm(), doris, SqlValidationService(), get_settings())
     pack = PlanningAssetPack(
         tables=[
-            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "sub_order_id", "pt"]),
-            PlanningAssetEntry(table="dwm_trade_order_realtime_di", columns=["seller_id", "sub_order_id", "pt"]),
+                PlanningAssetEntry(
+                    table="dwm_trade_order_detail_di",
+                    columns=["seller_id", "sub_order_id", "pt"],
+                    metadata={"merchantFilterColumn": "seller_id", "timeColumn": "pt"},
+                ),
+                PlanningAssetEntry(
+                    table="dwm_trade_order_realtime_di",
+                    columns=["seller_id", "sub_order_id", "pt"],
+                    metadata={"merchantFilterColumn": "seller_id", "timeColumn": "pt"},
+                ),
         ],
-        metrics=[
-            PlanningAssetEntry(
-                key="order_detail_cnt",
-                table="dwm_trade_order_realtime_di",
-                columns=["sub_order_id"],
-                title="下单量",
-                metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
-            )
+            metrics=[
+                PlanningAssetEntry(
+                    key="order_detail_cnt",
+                    table="dwm_trade_order_detail_di",
+                    columns=["sub_order_id"],
+                    title="下单量",
+                    source_ref_id="semantic:trade:dwm_trade_order_detail_di:metric:order_detail_cnt",
+                    metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+                ),
+                PlanningAssetEntry(
+                    key="order_detail_cnt",
+                    table="dwm_trade_order_realtime_di",
+                    columns=["sub_order_id"],
+                    title="下单量",
+                    source_ref_id="semantic:trade:dwm_trade_order_realtime_di:metric:order_detail_cnt",
+                    metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+                )
         ],
         realtime_fallbacks=[
             PlanningAssetEntry(
                 key="dwm_trade_order_detail_di",
                 table="dwm_trade_order_realtime_di",
                 title="订单实时明细兜底",
-                metadata={"sourceTable": "dwm_trade_order_detail_di"},
+                    metadata={
+                        "sourceTable": "dwm_trade_order_detail_di",
+                        "metricMappings": [
+                            {
+                                "sourceSemanticRefId": "semantic:trade:dwm_trade_order_detail_di:metric:order_detail_cnt",
+                                "targetSemanticRefId": "semantic:trade:dwm_trade_order_realtime_di:metric:order_detail_cnt",
+                            }
+                        ],
+                    },
             )
         ],
     )
@@ -14549,15 +14807,24 @@ def test_node_agent_switches_to_realtime_fallback_when_offline_partition_is_stal
                 metric_column="sub_order_id",
                 metric_formula="COUNT(DISTINCT sub_order_id)",
                 group_by_column="sub_order_id",
-                output_keys=["seller_id", "sub_order_id"],
-                days=1,
-            )
+                    output_keys=["seller_id", "sub_order_id"],
+                    days=1,
+                    metric_resolution=seal_semantic_metric_resolution(
+                        {
+                            "semanticRefId": "semantic:trade:dwm_trade_order_detail_di:metric:order_detail_cnt",
+                            "metricKey": "order_detail_cnt",
+                            "ownerTable": "dwm_trade_order_detail_di",
+                            "formula": "COUNT(DISTINCT sub_order_id)",
+                            "sourceColumns": ["sub_order_id"],
+                        }
+                    ),
+                )
         ]
     )
 
     result = worker.execute_plan("100", plan, pack, "", "今天下单量")
 
-    assert result.task_results[0].success
+    assert result.task_results[0].success, result.task_results[0].summary
     assert result.freshness_reports[0].status == "STALE_USE_REALTIME_FALLBACK"
     assert result.freshness_reports[0].fallback_table == "dwm_trade_order_realtime_di"
     assert any("dwm_trade_order_realtime_di" in sql for sql in doris.sqls if "MIN(`pt`)" not in sql)
@@ -15196,9 +15463,24 @@ def test_multi_column_relationship_validation_accepts_token_set():
     assert not any(gap.code == "MISSING_RELATIONSHIP" for gap in result.gaps)
 
 
-def test_goods_snapshot_lookup_does_not_inherit_question_window():
-    hint = table_access_hint("dwm_goods_detail_df", {"seller_id", "spu_id", "pt", "spu_apply_create_time"})
-    assert hint["timeWindowPolicy"].startswith("do_not_apply_question_window")
+def test_table_access_policy_comes_from_semantic_asset():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                table="semantic_table",
+                columns=["merchant_id", "entity_id", "pt"],
+                metadata={
+                    "merchantFilterColumn": "merchant_id",
+                    "timeColumn": "pt",
+                    "timeWindowPolicy": "latest_partition_for_dependent_lookup",
+                    "primaryKeyColumns": ["entity_id", "pt"],
+                },
+            )
+        ],
+        entity_keys=[PlanningAssetEntry(table="semantic_table", key="entity_id")],
+    )
+    hint = semantic_table_access_hint(pack, "semantic_table", {"merchant_id", "entity_id", "pt"})
+    assert hint["timeWindowPolicy"] == "latest_partition_for_dependent_lookup"
 
 
 def test_node_worker_repairs_validation_failure():
@@ -15403,7 +15685,12 @@ def test_semantic_metric_resolver_maps_refund_amt_alias_to_pay_amt():
                 columns=["pay_amt"],
                 title="退款金额",
                 aliases=["pay_amt", "refund_amt", "退款金额"],
-                metadata={"sourceColumns": ["pay_amt"], "formula": "SUM(pay_amt)", "aliases": ["refund_amt", "退款金额"]},
+                metadata={
+                    "sourceColumns": ["pay_amt"],
+                    "formula": "SUM(pay_amt)",
+                    "aliases": ["refund_amt", "退款金额"],
+                    "fieldWarning": "pay_amt 使用已发布退款金额语义口径。",
+                },
                 source_ref_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt",
             )
         ],
@@ -15897,6 +16184,34 @@ def test_query_graph_validator_accepts_explicit_object_ref_detail_filter():
     validation = QueryGraphValidator().validate(question, plan, pack)
 
     assert not any(gap.code == "OBJECT_REF_FILTER_MISSING" for gap in validation.gaps)
+
+
+def test_entity_id_semantic_fast_graph_preserves_requested_cross_domain_evidence():
+    settings = get_settings()
+    question = (
+        "最近7天查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、"
+        "退款金额，再看对应SPU什么时候发布。"
+    )
+    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
+        question,
+        recall_bundle_empty(),
+        [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
+    )
+
+    plan = compile_entity_detail_graph_from_question_entity(question, pack)
+
+    assert {intent.preferred_table for intent in plan.intents} >= {
+        "dwm_trade_order_detail_di",
+        "dwm_trade_refund_detail_di",
+        "dwm_goods_detail_df",
+    }
+    refund = next(intent for intent in plan.intents if intent.preferred_table == "dwm_trade_refund_detail_di")
+    goods = next(intent for intent in plan.intents if intent.preferred_table == "dwm_goods_detail_df")
+    assert refund.metric_name == "pay_amt"
+    assert {"refund_create_time", "buyer_id", "pay_amt"} <= set(refund.required_evidence)
+    assert "spu_apply_create_time" in goods.required_evidence
+    assert {dep.dependent_task_id for dep in plan.dependencies} >= {refund.plan_task_id, goods.plan_task_id}
+    assert QueryGraphValidator().validate(question, plan, pack).valid
 
 
 def test_compiler_preserves_parallel_detail_branches_with_topn_metric():
@@ -18411,12 +18726,11 @@ def test_answer_compose_keeps_summary_metric_authoritative_when_trend_is_partial
 
     answer = AnswerComposeService(MisreadingAnswerLlm()).compose("最近7天咨询工单量", MerchantInfo(merchant_id="100"), plan, run, "")
 
-    assert "最近7天咨询工单量是 5 单" in answer
+    assert "最近7天，咨询工单量为 5" in answer
     assert "其余日期" not in answer
     assert "未带日期" not in answer
     assert "建议优先" not in answer
-    assert "建议：" in answer
-    assert "- 优先回看 6月24日工单上升的咨询类型。" in answer
+    assert "按日趋势明细已同步到图表区域" in answer
 
 
 def recall_bundle_empty():
@@ -20245,6 +20559,7 @@ def test_workflow_run_analysis_skill_can_parallel_candidate_skills(tmp_path):
         matched_by="unit_parallel",
         candidate_skills=["risk_analysis", "new_product_risk"],
         confirmed=True,
+        trace={"parallelSkillNames": ["risk_analysis"]},
     )
     state["plan"] = QueryPlan(
         question_understanding={"analysisIntent": "risk_ranking", "requiresExplanation": True},

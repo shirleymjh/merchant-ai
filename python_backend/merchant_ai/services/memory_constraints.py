@@ -232,14 +232,44 @@ def memory_dispute_applies(question: str, plan: QueryPlan, constraint: Dict[str,
 
 def memory_constraint_applies(question: str, plan: QueryPlan, constraint: Dict[str, Any], plan_metrics: Set[str]) -> bool:
     metrics = target_metrics(constraint)
-    if any(metric and metric in question for metric in metrics):
+    normalized_question = normalize_token(question)
+    if any(metric and normalize_token(metric) in normalized_question for metric in metrics):
         return True
-    if analysis_intent(plan) not in {"", "none"}:
+    if any(metric in plan_metrics for metric in metrics):
+        return True
+    constraint_topics = {normalize_token(topic) for topic in constraint.get("topics") or [] if normalize_token(topic)}
+    if constraint_topics & plan_topic_tokens(plan):
         return True
     overlap = significant_term_overlap(question, str(constraint.get("instruction") or ""))
-    if overlap & FOCUS_TERMS:
+    if overlap & FOCUS_TERMS or len(overlap) >= 2:
         return True
-    return not plan_metrics
+    # An empty/incomplete graph is not evidence that every merchant memory is
+    # relevant. Applying all required memories here creates cross-domain
+    # pollution and can prevent a valid graph from ever being planned.
+    return False
+
+
+def plan_topic_tokens(plan: QueryPlan) -> Set[str]:
+    topics: Set[str] = set()
+    for intent in getattr(plan, "intents", []) or []:
+        category = getattr(intent, "category", "")
+        value = getattr(category, "value", category)
+        normalized = normalize_token(value)
+        if normalized:
+            topics.add(normalized)
+    understanding = getattr(plan, "question_understanding", {}) or {}
+    if isinstance(understanding, dict):
+        for key in ["topics", "candidateTopics", "candidate_topics", "primaryTopic", "primary_topic"]:
+            values = understanding.get(key) or []
+            if not isinstance(values, list):
+                values = [values]
+            for value in values:
+                if isinstance(value, dict):
+                    value = value.get("topic") or value.get("name") or value.get("key")
+                normalized = normalize_token(value)
+                if normalized:
+                    topics.add(normalized)
+    return topics
 
 
 def plan_metric_tokens(plan: QueryPlan) -> Set[str]:

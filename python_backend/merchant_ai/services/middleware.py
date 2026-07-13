@@ -847,6 +847,24 @@ class MemoryMiddleware(HarnessMiddleware):
         self.memory_store = create_memory_store(settings)
 
     def before_policy(self, state: AgentState) -> AgentState:
+        if state.get("_memory_middleware_snapshot_ready"):
+            return state
+        # Memory is immutable during the request and is written only after the
+        # answer is finalized. Re-reading ES/JSON before every ReAct decision
+        # adds network tail latency and can even change constraints mid-run.
+        # Reuse the governed snapshot loaded by the dedicated recall stage.
+        if state.get("memory_injection_trace"):
+            state["_memory_middleware_snapshot_ready"] = True
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="reused",
+                code="MEMORY_REQUEST_SNAPSHOT_REUSED",
+                message="request-scoped governed memory snapshot reused",
+                metadata={"constraintCount": len(state.get("memory_constraints") or [])},
+            )
+            return state
         injection = self.memory_store.select_for_question(
             state,
             budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
@@ -889,6 +907,7 @@ class MemoryMiddleware(HarnessMiddleware):
                 "memoryConstraintCount": len(constraints),
             },
         )
+        state["_memory_middleware_snapshot_ready"] = True
         return state
 
 

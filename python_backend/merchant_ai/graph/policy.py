@@ -39,7 +39,7 @@ class AgentActionRegistry:
                 id="try_fast_metric",
                 node="try_fast_metric",
                 agent="LeadAgent",
-                description="ask the verified fast-metric capability to answer; unsupported requests fall back to Planner",
+                description="answer one uniquely matched published semantic metric; unsupported requests fall back to Planner",
                 required_state_flags=["fast_understood"],
                 expected_state_flags=["fast_metric_attempted"],
                 fallback_action="retrieve_knowledge",
@@ -293,11 +293,11 @@ class V2AgentPolicy:
             if fast and getattr(fast, "intent_kind", "") == "rule_only":
                 return ["retrieve_knowledge", "answer_rule"], "fast understanding classified rule-only; retrieve rule knowledge first", False
             if state.get("fast_metric_completed"):
-                return ["cache_answer"], "Lead Agent accepted verified fast-metric result", False
+                return ["cache_answer"], "Lead Agent accepted a verified single semantic metric result", False
             if self.general_delegation_needed(state):
                 return ["delegate_subagent", "retrieve_knowledge"], "request contains bounded document or Python work suitable for an isolated Sub-Agent", False
             if not state.get("fast_metric_attempted"):
-                return ["try_fast_metric", "retrieve_knowledge"], "Lead Agent may try the fast-metric capability or continue to semantic planning", False
+                return ["try_fast_metric", "retrieve_knowledge"], "Lead Agent may try the governed single-metric fast capability or continue to semantic planning", False
             return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge has not been retrieved"), False
         if self.has_rule_recall_ready(state):
             return ["answer_rule"], "platform rule knowledge is ready; answer without BI QueryGraph", False
@@ -681,6 +681,14 @@ class V2AgentPolicy:
         if not complex_signal:
             return False
         plan = state.get("plan")
+        understanding = getattr(plan, "question_understanding", {}) or {} if plan else {}
+        if str(understanding.get("source") or "") == "canonical_recalled_metric_diagnostic_fallback":
+            driver_contracts = understanding.get("diagnosticDriverContracts") or understanding.get("diagnostic_driver_contracts") or []
+            if not driver_contracts:
+                # A verified result-metric trend is enough to validate the
+                # user's premise, but not enough to launch unrelated causal
+                # probes. Only governed driver contracts may widen this path.
+                return False
         return bool(plan and getattr(plan, "intents", None))
 
     def hypothesis_recovery_needed(self, state: AgentState) -> bool:

@@ -166,6 +166,15 @@ class KnowledgeCuratorService:
             trace["fallback"] = "rule_extractor"
             return [], trace
 
+        if not reusable_knowledge_assertion_present(state, event):
+            # Ordinary one-shot BI questions are not knowledge-authoring
+            # events.  Calling a curator model synchronously for every answer
+            # adds tail latency and cannot produce an admissible candidate
+            # because the user supplied no reusable assertion.
+            trace["status"] = "skipped_no_reusable_user_assertion"
+            trace["fallback"] = "none"
+            return [], trace
+
         user_messages = curator_user_messages(state)
         current_question = str(state.get("question") or "").strip()
         if current_question and (not user_messages or user_messages[-1] != current_question):
@@ -246,6 +255,25 @@ class KnowledgeCuratorService:
                 break
         trace["candidateCount"] = len(suggestions)
         return suggestions, trace
+
+
+def reusable_knowledge_assertion_present(state: AgentState, event: Dict[str, Any]) -> bool:
+    memory_type = str(event.get("memoryType") or event.get("memory_type") or "query_event").strip().lower()
+    if memory_type in {"correction", "metric_dispute", "business_fact", "merchant_preference", "merchant_rule"}:
+        return True
+    messages = curator_user_messages(state)
+    question = str(state.get("question") or "").strip()
+    if question and (not messages or messages[-1] != question):
+        messages.append(question)
+    text = "\n".join(messages[-8:])
+    return bool(
+        re.search(
+            r"(请记住|记住这个|以后(?:都|默认|请)|默认使用|我(?:更)?希望|我(?:更)?喜欢|我们(?:店|公司|团队).{0,24}(规定|要求|口径|默认|定义)|"
+            r"(?:这个|该|指标|规则).{0,16}(?:定义|口径).{0,8}(?:是|为)|不是.{0,30}而是|你说错了|纠正一下|长期使用|固定使用)",
+            text,
+            flags=re.I,
+        )
+    )
 
 
 class MemoryIngestionService:

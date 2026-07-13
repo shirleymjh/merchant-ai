@@ -117,7 +117,7 @@ class ImportantFactExtractor:
         if fast:
             self._add(facts, "fast_time_window", self._value(fast, "time_window_days") or self._value(fast, "timeWindowDays"), "time_window", 88, stage)
             metrics = self._value(fast, "metric_phrases") or self._value(fast, "metricPhrases") or []
-            self._add(facts, "fast_metric_phrases", ",".join(str(item) for item in list(metrics or [])[:12]), "metric", 86, stage)
+            self._add(facts, "semantic_metric_phrases", ",".join(str(item) for item in list(metrics or [])[:12]), "metric", 86, stage)
             object_refs = self._value(fast, "object_refs") or self._value(fast, "objectRefs") or {}
             if isinstance(object_refs, dict):
                 refs = ["%s=%s" % (key, ",".join(str(v) for v in list(value or [])[:8])) for key, value in object_refs.items() if value]

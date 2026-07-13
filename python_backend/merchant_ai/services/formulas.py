@@ -68,7 +68,10 @@ def compile_metric_formula(formula: str, columns: Set[str] | set) -> str:
     text = str(formula or "").strip()
     if not text:
         return ""
-    return _compile_formula_text(text, set(columns)) or _compile_formula_text(_prune_formula_for_schema(text, set(columns)), set(columns))
+    # Metric formulas are governed semantic contracts.  If the live schema no
+    # longer satisfies the published formula, execution must stop and surface
+    # schema drift instead of silently deleting predicates or source columns.
+    return _compile_formula_text(text, set(columns))
 
 
 def reconcile_metric_formula_for_schema(
@@ -84,15 +87,15 @@ def reconcile_metric_formula_for_schema(
     missing_sources = [column for column in sources if column not in available]
     original = str(formula or "").strip()
     compiled = compile_metric_formula(original, available)
-    rewritten = bool(compiled and original and not equivalent_formula_text(compiled, original))
+    rewritten = False
     warning = ""
-    if compiled and missing_sources and rewritten:
+    if original and not compiled:
         label = metric_key or "metric"
         location = " on %s" % table if table else ""
         warning = (
-            "指标 %s%s 的语义公式引用了当前 live schema 不存在的字段 %s；"
-            "本次只使用可用字段 %s 收敛计算。"
-            % (label, location, ",".join(missing_sources), ",".join(available_sources or formula_columns(compiled, available)))
+            "指标 %s%s 的已发布语义公式无法在当前 live schema 上完整执行；"
+            "缺失字段 %s。已禁止自动改写口径，请修复并重新发布语义资产。"
+            % (label, location, ",".join(missing_sources) or "unknown")
         )
     return FormulaReconciliation(
         original_formula=original,
@@ -148,60 +151,3 @@ def _compile_formula_text(text: str, columns: Set[str]) -> str:
     if not parsed_columns.issubset(columns):
         return ""
     return compiled
-
-
-def _prune_formula_for_schema(formula: str, columns: Set[str]) -> str:
-    if not formula:
-        return ""
-    try:
-        select = sqlglot.parse_one("SELECT %s AS metric_value FROM x" % formula, read="doris")
-    except Exception:
-        return ""
-    expressions = list(select.expressions or [])
-    if not expressions:
-        return ""
-    expression = expressions[0]
-    if isinstance(expression, exp.Alias):
-        expression = expression.this
-    pruned = _prune_expression(expression.copy(), columns)
-    if not pruned:
-        return ""
-    return pruned.sql(dialect="doris")
-
-
-def _prune_expression(expression: exp.Expression, columns: Set[str]) -> exp.Expression | None:
-    for case in list(expression.find_all(exp.Case)):
-        new_ifs = []
-        for item in case.args.get("ifs") or []:
-            predicate = item.this
-            pruned_predicate = _prune_predicate(predicate, columns)
-            if pruned_predicate is None:
-                continue
-            new_item = item.copy()
-            new_item.set("this", pruned_predicate)
-            new_ifs.append(new_item)
-        if not new_ifs:
-            return None
-        case.set("ifs", new_ifs)
-    return expression if _expression_columns(expression).issubset(columns) else None
-
-
-def _prune_predicate(predicate: exp.Expression, columns: Set[str]) -> exp.Expression | None:
-    if _expression_columns(predicate).issubset(columns):
-        return predicate.copy()
-    if isinstance(predicate, exp.Or):
-        left = _prune_predicate(predicate.this, columns)
-        right = _prune_predicate(predicate.expression, columns)
-        if left and right:
-            return exp.Or(this=left, expression=right)
-        return left or right
-    if isinstance(predicate, exp.Paren):
-        inner = _prune_predicate(predicate.this, columns)
-        return exp.Paren(this=inner) if inner else None
-    if isinstance(predicate, exp.And):
-        return None
-    return None
-
-
-def _expression_columns(expression: exp.Expression) -> Set[str]:
-    return {column.name for column in expression.find_all(exp.Column) if column.name}

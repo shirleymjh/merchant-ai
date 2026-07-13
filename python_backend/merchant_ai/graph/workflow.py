@@ -842,6 +842,7 @@ class MerchantQaWorkflow:
             "instruction": self.lead_agent_tool_instruction(is_fast_gate),
         }
         state["_lead_llm_decision_fingerprint"] = lead_decision_fingerprint(state, allowed)
+        lead_llm_started = now_ms()
         try:
             if hasattr(llm, "tool_json_chat"):
                 tool = lead_action_selection_tool(allowed)
@@ -861,8 +862,29 @@ class MerchantQaWorkflow:
                     timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
                 )
         except Exception as exc:
+            self.record_span(
+                state,
+                "llm",
+                "lead_action.select",
+                lead_llm_started,
+                status="failed",
+                error_code="LEAD_LLM_FAILED",
+                error_message=str(exc)[:300],
+                model=self.settings.openai_model,
+                provider=self.settings.openai_base_url,
+            )
             trace.update({"status": "failed", "errorCode": "LEAD_LLM_FAILED", "errorMessage": str(exc)[:300]})
             return decision
+        self.record_span(
+            state,
+            "llm",
+            "lead_action.select",
+            lead_llm_started,
+            model=self.settings.openai_model,
+            provider=self.settings.openai_base_url,
+            estimated_prompt_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
+            estimated_completion_chars=len(json.dumps(llm_payload or {}, ensure_ascii=False, default=str)),
+        )
         selected_action = str(
             (llm_payload or {}).get("actionId")
             or (llm_payload or {}).get("action_id")
@@ -954,13 +976,13 @@ class MerchantQaWorkflow:
         if remaining_run_budget_seconds(state, self.settings) <= 12:
             return False
         allowed_set = set(allowed)
+        # Deterministic policy already knows whether the governed fast metric
+        # can be attempted, which execution tier is cheapest, and whether a
+        # matched Skill is required.  Asking an LLM to repeat those decisions
+        # adds several network round trips without improving correctness.
+        # Keep the bounded Lead LLM only for genuinely ambiguous recovery.
         strategic = bool(
-            is_fast_gate
-            or "explore_hypotheses" in allowed_set
-            or "delegate_subagent" in allowed_set
-            or {"execute_graph_direct", "execute_graph_agent"}.issubset(allowed_set)
-            or ("run_analysis_skill" in allowed_set and "answer_data" in allowed_set)
-            or ("repair_graph" in allowed_set and bool(getattr(state.get("query_graph_validation_result"), "gaps", None)))
+            ("repair_graph" in allowed_set and bool(getattr(state.get("query_graph_validation_result"), "gaps", None)))
             or ("retrieve_knowledge" in allowed_set and bool(state.get("pending_knowledge_requests")))
         )
         if not strategic:
@@ -983,8 +1005,8 @@ class MerchantQaWorkflow:
         if not is_fast_gate:
             return base
         return base + (
-            "当前同时提供快速指标与知识检索：直接询问1–3个已知指标的合计、最近N天按日趋势或变化可选择 try_fast_metric；"
-            "占比、排名、归因、明细、非日期维度、附件上下文或指标含义不明时选择 retrieve_knowledge。"
+            "当前同时提供快速指标与知识检索：只有一个已发布语义指标的合计、最近N天按日趋势、变化或单指标口径说明可选择 try_fast_metric；"
+            "多指标、占比、排名、归因、明细、非日期维度、附件上下文、指标歧义或非语义层指标必须选择 retrieve_knowledge。"
             "fastUnderstanding.needsPlanner/needsKnowledge 是保守提示，不是 Fast 能力判决。"
         )
 
@@ -1683,6 +1705,7 @@ class MerchantQaWorkflow:
         return state
 
     def try_fast_metric(self, state: AgentState) -> AgentState:
+        """Try the deterministic path for one published semantic metric only."""
         started = now_ms()
         step = self.start_run_step(
             state,
@@ -1695,22 +1718,36 @@ class MerchantQaWorkflow:
         emit(state, "node.started", "TRY_FAST_METRIC", {})
         state["fast_metric_attempted"] = True
         merchant = state.get("merchant")
+        semantic_metrics = published_semantic_quick_metrics(
+            self.recall_service.topic_assets,
+            self._topic_names_for_categories(self._effective_topic_categories(state)),
+        )
         response = quick_metric_response(
             state.get("question", ""),
             getattr(merchant, "merchant_id", ""),
             self.node_worker.doris_repository,
             state.get("extracted_keywords"),
-            published_semantic_quick_metrics(
-                self.recall_service.topic_assets,
-                self._topic_names_for_categories(self._effective_topic_categories(state)),
-            ),
+            semantic_metrics,
         )
         if response is None:
             state["fast_metric_completed"] = False
-            add_step(state, "Lead Agent Fast Tool：当前问题超出 Fast 能力契约，回退语义召回和 Planner")
-            emit(state, "node.completed", "TRY_FAST_METRIC", {"supported": False, "fallback": "retrieve_knowledge"})
+            add_step(state, "Lead Agent Fast Tool：未唯一命中一个已发布语义指标，回退语义召回和 Planner")
+            emit(
+                state,
+                "node.completed",
+                "TRY_FAST_METRIC",
+                {"supported": False, "fallback": "retrieve_knowledge", "publishedSemanticMetricCount": len(semantic_metrics)},
+            )
             self.record_span(state, "tool", "try_fast_metric", started, status="gap", error_code="FAST_UNSUPPORTED")
             self.finish_run_step(state, step, "gap", output_summary="unsupported -> Planner", error_code="FAST_UNSUPPORTED")
+            return state
+        semantic_identity = dict((response.debug_trace or {}).get("semanticMetric") or {})
+        if not semantic_identity.get("semanticRefId") or semantic_identity.get("governanceStatus") != "published":
+            state["fast_metric_completed"] = False
+            add_step(state, "Lead Agent Fast Tool：结果缺少已发布语义指标血缘，拒绝快速回答并回退 Planner")
+            emit(state, "node.completed", "TRY_FAST_METRIC", {"supported": False, "fallback": "retrieve_knowledge", "reason": "semantic_lineage_missing"})
+            self.record_span(state, "tool", "try_fast_metric", started, status="gap", error_code="FAST_SEMANTIC_LINEAGE_MISSING")
+            self.finish_run_step(state, step, "gap", output_summary="semantic lineage missing -> Planner", error_code="FAST_SEMANTIC_LINEAGE_MISSING")
             return state
         self.apply_turn_knowledge_refresh_to_fast_response(state, response)
         response.id = state["qa_id"]
@@ -1723,26 +1760,26 @@ class MerchantQaWorkflow:
         state["query_bundle"] = QueryBundle(
             tables=list(response.doris_tables or []),
             rows=list(response.data_rows or []),
-            summary="verified fast metric result",
+            summary="verified published semantic single-metric result",
             cache_hit=bool((response.debug_trace or {}).get("quickMetricCacheHit")),
         )
         state["should_persist"] = True
         state["chat_bi_completed"] = True
-        add_step(state, "Lead Agent Fast Tool：能力契约完整覆盖本轮问题，采用已校验快速结果")
+        add_step(state, "Lead Agent Fast Tool：唯一已发布语义指标完整覆盖本轮问题，采用已校验快速结果")
         emit(
             state,
             "node.completed",
             "TRY_FAST_METRIC",
-            {"supported": True, "metrics": (response.debug_trace or {}).get("metrics") or [(response.debug_trace or {}).get("metric")]},
+            {"supported": True, "metric": semantic_identity},
         )
         self.record_span(
             state,
             "tool",
             "try_fast_metric",
             started,
-            metadata={"supported": True, "tables": response.doris_tables},
+            metadata={"supported": True, "tables": response.doris_tables, "semanticMetric": semantic_identity},
         )
-        self.finish_run_step(state, step, "success", output_summary="fast metric accepted")
+        self.finish_run_step(state, step, "success", output_summary="single published semantic metric accepted")
         return state
 
     def apply_turn_knowledge_refresh_to_fast_response(self, state: AgentState, response: ChatResponse) -> None:
@@ -3124,11 +3161,19 @@ class MerchantQaWorkflow:
         emit(state, "node.started", "EXPLORE_HYPOTHESES", {"hypotheses": len(hypotheses)})
         answer_reserve = max(5, int(getattr(self.settings, "hypothesis_answer_reserve_seconds", 15) or 15))
         remaining_at_start = remaining_run_budget_seconds(state, self.settings)
-        if remaining_at_start <= answer_reserve + 10:
+        planner_allowance = max(5, min(25, int(getattr(self.settings, "llm_planner_timeout_seconds", 25) or 25)))
+        minimum_stage_budget = answer_reserve + planner_allowance + 5
+        if remaining_at_start <= minimum_stage_budget:
             state["hypothesis_exploration_completed"] = True
             state["hypothesis_evidence_ledger"] = HypothesisEvidenceLedger(
                 ledger_id="ledger_%s" % state.get("run_id", "run"),
-                budget={"remainingSeconds": remaining_at_start, "skipped": True, "reason": "INSUFFICIENT_RUN_BUDGET"},
+                budget={
+                    "remainingSeconds": remaining_at_start,
+                    "requiredSeconds": minimum_stage_budget,
+                    "answerReserveSeconds": answer_reserve,
+                    "skipped": True,
+                    "reason": "INSUFFICIENT_RUN_BUDGET",
+                },
             )
             self.finish_run_step(state, step, "partial", output_summary="skipped: insufficient run budget", error_code="INSUFFICIENT_RUN_BUDGET")
             emit(state, "node.completed", "EXPLORE_HYPOTHESES", {"completed": True, "executed": 0, "budgetSkipped": True})
@@ -3653,6 +3698,22 @@ class MerchantQaWorkflow:
         curated.merged_query_bundle = merge_task_result_bundles(curated.task_results)
         winner_plan = winner.get("plan") or QueryPlan()
         successful_ids = {item.task_id for item in successful}
+        promoted_understanding = dict(winner_plan.question_understanding or {})
+        fast = state.get("fast_understanding") or FastUnderstandingResult()
+        diagnostic_intent = str(getattr(fast, "analysis_intent", "") or state.get("open_diagnostic_intent") or "").strip().lower()
+        if diagnostic_intent and diagnostic_intent not in {"none", "metric_query", "detail_lookup"}:
+            # A hypothesis winner is supporting evidence, not a replacement
+            # for the user's original analysis objective. Preserve a governed
+            # diagnosis contract so the matched Skill runs after promotion.
+            promoted_understanding.update(
+                {
+                    "originalQuestion": state.get("question", ""),
+                    "analysisIntent": "diagnosis",
+                    "requiresExplanation": True,
+                    "reusableAnalysis": True,
+                    "hypothesisEvidenceOnly": True,
+                }
+            )
         curated_plan = winner_plan.model_copy(
             deep=True,
             update={
@@ -3662,6 +3723,7 @@ class MerchantQaWorkflow:
                     for dep in winner_plan.dependencies
                     if dep.anchor_task_id in successful_ids and dep.dependent_task_id in successful_ids
                 ],
+                "question_understanding": promoted_understanding,
             },
         )
         curated.verified_evidence = self.evidence_verifier.verify(
@@ -4272,7 +4334,8 @@ class MerchantQaWorkflow:
         if not bool(getattr(self.settings, "skill_worker_parallel_enabled", False)):
             return [match.skill_name] if match.skill_name else []
         names: List[str] = []
-        for candidate in [match.skill_name] + list(match.candidate_skills or []):
+        reviewed_parallel = list((match.trace or {}).get("parallelSkillNames") or (match.trace or {}).get("parallel_skill_names") or [])
+        for candidate in [match.skill_name] + reviewed_parallel:
             name = str(candidate or "").strip()
             if name and name not in names:
                 names.append(name)
@@ -4358,6 +4421,18 @@ class MerchantQaWorkflow:
         emit(state, "node.started", "ANSWER_ANALYSIS", {})
         personalization_context = self.answer_personalization_context(state)
         route = state["routing_decision"].route
+        allow_answer_llm = self.latency_optimizer.answer_allows_llm(state.get("latency_optimization") or {})
+        answer_llm_reserve = max(3, int(getattr(self.settings, "llm_answer_timeout_seconds", 15) or 15) + 2)
+        if remaining_run_budget_seconds(state, self.settings) <= answer_llm_reserve:
+            allow_answer_llm = False
+            state.setdefault("route_decision_trace", []).append(
+                {
+                    "stage": "answer_latency_budget",
+                    "decision": "structured_answer_only",
+                    "remainingSeconds": remaining_run_budget_seconds(state, self.settings),
+                    "requiredSeconds": answer_llm_reserve,
+                }
+            )
         if route == QuestionRoute.GREETING:
             state["plan"] = QueryPlan(
                 intents=[
@@ -4423,7 +4498,7 @@ class MerchantQaWorkflow:
                 state["agent_run_result"],
                 answer_context,
                 state.get("analysis_summary", ""),
-                allow_llm=self.latency_optimizer.answer_allows_llm(state.get("latency_optimization") or {}),
+                allow_llm=allow_answer_llm,
                 rule_context=state.get("rule_recall_context", ""),
                 personalization_context=personalization_context,
             )
@@ -4953,6 +5028,7 @@ class MerchantQaWorkflow:
             response.debug_trace = {
                 **dict(response.debug_trace or {}),
                 "leadAgentFastDecision": True,
+                "singleMetricOnly": True,
                 "boundedLeadLlmTrace": state.get("fast_gate_decision_trace", {}),
                 "actionHistory": [
                     item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
@@ -5808,6 +5884,23 @@ class MerchantQaWorkflow:
         max_rounds = int(getattr(self.settings, "answer_file_tool_rounds", 0) or 0)
         llm = getattr(self.answer_service, "llm", None)
         if max_rounds <= 0 or not llm or not getattr(llm, "configured", False) or not hasattr(llm, "tool_chat"):
+            return ""
+        request_context = state.get("request_context")
+        has_attachments = bool(getattr(request_context, "offloaded_files", None))
+        has_offloaded_output = bool(state.get("tool_output_budget_reports") or state.get("_middleware_offloaded_tasks"))
+        task_results = list(getattr(state.get("agent_run_result"), "task_results", []) or [])
+        large_result = any(
+            len(getattr(getattr(item, "query_bundle", None), "rows", []) or [])
+            > int(getattr(self.settings, "context_artifact_inline_max_rows", 20) or 20)
+            for item in task_results
+        )
+        if not (has_attachments or has_offloaded_output or large_result):
+            # Small verified query results are already inline.  A model call to
+            # decide that no file needs reading is pure latency and was hidden
+            # inside the structured-answer span.
+            state.setdefault("route_decision_trace", []).append(
+                {"stage": "answer_file_context", "decision": "skip", "reason": "verified_results_inline"}
+            )
             return ""
         tools = semantic_file_tool_definitions() + artifact_file_tool_definitions()
         tool_schemas = [tool.openai_schema() for tool in tools]

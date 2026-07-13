@@ -893,7 +893,9 @@ class HybridRecallService:
             item = doc.model_copy(update={"fusion_score": score, "metadata": metadata})
             scored.append(item)
         scored.sort(key=lambda item: item.fusion_score, reverse=True)
-        items = scored[:4] if not allowed_topics else scored[:12]
+        protected_metrics = exact_semantic_metric_recall_items(question, scored)
+        recall_limit = 4 if not allowed_topics else 12
+        items = dedupe_recall_items([*protected_metrics, *scored])[:recall_limit]
         merged = "\n\n".join(
             "召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items
         )
@@ -2971,6 +2973,103 @@ def is_strong_label_text_match(normalized_label: str, normalized_phrase: str) ->
     return normalized_label == normalized_phrase
 
 
+def exact_semantic_metric_recall_items(question: str, scored: List[RecallItem]) -> List[RecallItem]:
+    """Protect exact governed metric matches from lexical top-k displacement."""
+    normalized_question = normalize_for_match(question)
+    if not normalized_question:
+        return []
+    groups: Dict[str, List[RecallItem]] = {}
+    for item in scored:
+        if str(item.source_type or "").upper() != "SEMANTIC_METRIC":
+            continue
+        metadata = dict(item.metadata or {})
+        labels = [
+            str(metadata.get("businessName") or ""),
+            str(metadata.get("metricKey") or ""),
+            *[str(alias) for alias in metadata.get("aliases") or []],
+        ]
+        matched = [
+            label
+            for label in labels
+            if is_strong_label_text_match(normalize_for_match(label), normalized_question)
+        ]
+        if not matched:
+            continue
+        matched_label = max(matched, key=lambda label: len(normalize_for_match(label)))
+        metadata.update(
+            {
+                "matchedMetricLabel": matched_label,
+                "metricResolutionType": "exact_semantic_label",
+                "metricResolutionReason": "matched_published_semantic_label:%s" % matched_label,
+                "metricResolutionConfidence": 0.97,
+                "metricResolutionAmbiguous": False,
+            }
+        )
+        protected = item.model_copy(update={"metadata": metadata})
+        groups.setdefault(normalize_for_match(matched_label), []).append(protected)
+
+    selected: List[RecallItem] = []
+    for label, group in groups.items():
+        if len(group) == 1:
+            selected.extend(group)
+            continue
+        family_keys = {
+            (
+                str(item.topic or ""),
+                str(item.table or ""),
+                str((item.metadata or {}).get("canonicalMetricKey") or (item.metadata or {}).get("aliasOf") or (item.metadata or {}).get("metricKey") or ""),
+            )
+            for item in group
+        }
+        if len(family_keys) == 1:
+            canonical_key = next(iter(family_keys))[2]
+            owners = [
+                item
+                for item in group
+                if str((item.metadata or {}).get("metricKey") or "") == canonical_key
+                and not str((item.metadata or {}).get("aliasOf") or "")
+            ]
+            if len(owners) == 1:
+                owner = owners[0]
+                metadata = dict(owner.metadata or {})
+                metadata["metricResolutionReason"] = "%s; canonical_family_owner=%s" % (
+                    str(metadata.get("metricResolutionReason") or ""),
+                    canonical_key,
+                )
+                selected.append(owner.model_copy(update={"metadata": metadata}))
+                continue
+        for item in group:
+            metadata = dict(item.metadata or {})
+            metadata["metricResolutionAmbiguous"] = True
+            metadata["metricResolutionConfidence"] = 0.79
+            metadata["metricResolutionReason"] = "%s; ambiguous_label=%s" % (
+                str(metadata.get("metricResolutionReason") or ""),
+                label,
+            )
+            selected.append(item.model_copy(update={"metadata": metadata}))
+    return sorted(
+        selected,
+        key=lambda item: (
+            bool((item.metadata or {}).get("metricResolutionAmbiguous")) is False,
+            float((item.metadata or {}).get("metricResolutionConfidence") or 0.0),
+            float(item.fusion_score or 0.0),
+        ),
+        reverse=True,
+    )
+
+
+def dedupe_recall_items(items: List[RecallItem]) -> List[RecallItem]:
+    deduped: List[RecallItem] = []
+    seen: Set[str] = set()
+    for item in items:
+        identity = str(item.doc_id or "")
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(item)
+    return deduped
+
+
 class TopicBuilderWorkflow:
     def __init__(
         self,
@@ -3495,7 +3594,10 @@ class TopicBuilderWorkflow:
         existing: Dict[str, Any],
     ) -> Dict[str, Any]:
         semantic_columns = [self._heuristic_semantic_column(topic, item, profile) for item in schema]
-        metrics = self._heuristic_metrics(topic, table, schema, profile)
+        # Schema inspection may propose fields and dimensions, but it must not
+        # invent business metrics. Keep only previously governed definitions;
+        # new metrics must come from business knowledge/LLM draft and review.
+        metrics = [dict(item) for item in existing.get("metrics") or [] if isinstance(item, dict)]
         terms = self._heuristic_terms(metrics, semantic_columns, request)
         rules = self._heuristic_rules(topic, profile, request)
         return {
@@ -3599,82 +3701,6 @@ class TopicBuilderWorkflow:
             "visibilityPolicy": visibility_policy,
             "maskingPolicy": masking_policy,
         }
-
-    def _heuristic_metrics(self, topic: str, table: str, schema: List[Dict[str, Any]], profile: Dict[str, Any]) -> List[Dict[str, Any]]:
-        metrics: List[Dict[str, Any]] = []
-        for item in schema:
-            name = str(item.get("columnName") or "")
-            if not name:
-                continue
-            dtype = normalize_column_type_family(str(item.get("dataType") or ""))
-            comment = str(item.get("comment") or item.get("Comment") or name)
-            lowered = name.lower()
-            if dtype in {"int", "bigint", "float", "double", "decimal"} and not lowered.endswith("_id"):
-                formula = "SUM(%s)" % name
-                unit = "%" if "rate" in lowered else ("元" if any(token in lowered for token in ["amt", "amount", "price", "fee"]) else "")
-                metrics.append(
-                    {
-                        "metricKey": name,
-                        "canonicalMetricKey": name,
-                        "businessName": comment,
-                        "formula": formula,
-                        "unit": unit,
-                        "currency": "CNY" if unit == "元" else "",
-                        "aggregation": "SUM",
-                        "timeColumn": str(profile.get("timeColumn") or ""),
-                        "requiredFilters": [],
-                        "conflictsWith": [],
-                        "clarificationQuestion": "",
-                        "description": comment,
-                        "sourceColumns": [name],
-                        "aliases": dedupe_strings([comment, name]),
-                        "confidence": 0.58,
-                        "evidence": "heuristic numeric column metric",
-                    }
-                )
-            if lowered in {"refund_id", "order_id", "sub_order_id", "ticket_id", "bill_id"}:
-                metric_key = self._count_metric_key_for_id(topic, lowered)
-                business_name = self._count_metric_name_for_id(topic, comment, lowered)
-                metrics.append(
-                    {
-                        "metricKey": metric_key,
-                        "businessName": business_name,
-                        "formula": "COUNT(DISTINCT %s)" % name,
-                        "unit": "单",
-                        "aggregation": "COUNT_DISTINCT",
-                        "timeColumn": str(profile.get("timeColumn") or ""),
-                        "requiredFilters": [],
-                        "conflictsWith": [],
-                        "clarificationQuestion": "",
-                        "description": "按%s去重计数" % comment,
-                        "sourceColumns": [name],
-                        "aliases": dedupe_strings([business_name, comment, metric_key]),
-                        "confidence": 0.6,
-                        "evidence": "heuristic id distinct count",
-                    }
-                )
-        if not metrics and schema:
-            first_key = next((str(item.get("columnName") or "") for item in schema if str(item.get("columnName") or "").endswith("_id")), "")
-            if first_key:
-                metrics.append(
-                    {
-                        "metricKey": "row_cnt",
-                        "businessName": "记录数",
-                        "formula": "COUNT(DISTINCT %s)" % first_key,
-                        "unit": "条",
-                        "aggregation": "COUNT_DISTINCT",
-                        "timeColumn": str(profile.get("timeColumn") or ""),
-                        "requiredFilters": [],
-                        "conflictsWith": [],
-                        "clarificationQuestion": "",
-                        "description": "按主键候选去重计数",
-                        "sourceColumns": [first_key],
-                        "aliases": ["记录数", "条数", "row_cnt"],
-                        "confidence": 0.45,
-                        "evidence": "heuristic fallback metric",
-                    }
-                )
-        return dedupe_semantic_items(metrics, "metrics")
 
     def _heuristic_terms(self, metrics: List[Dict[str, Any]], semantic_columns: List[Dict[str, Any]], request: TopicBuildRequest) -> List[Dict[str, Any]]:
         terms: List[Dict[str, Any]] = []
@@ -3906,27 +3932,6 @@ class TopicBuilderWorkflow:
         if "seller_id" in columns:
             return "商家粒度"
         return "明细粒度"
-
-    def _count_metric_key_for_id(self, topic: str, column: str) -> str:
-        mapping = {
-            "refund_id": "refund_bill_cnt",
-            "sub_order_id": "order_detail_cnt",
-            "order_id": "order_cnt",
-            "ticket_id": "ticket_cnt",
-            "bill_id": "bill_cnt",
-        }
-        return mapping.get(column, "%s_cnt" % column.removesuffix("_id"))
-
-    def _count_metric_name_for_id(self, topic: str, comment: str, column: str) -> str:
-        mapping = {
-            "refund_id": "退款单量" if "退" in topic else "单量",
-            "sub_order_id": "订单量",
-            "order_id": "订单量",
-            "ticket_id": "工单量",
-            "bill_id": "账单量",
-        }
-        return mapping.get(column, "%s数量" % comment)
-
 
 def semantic_asset_builder_tool() -> AgentToolDefinition:
     visibility_policy_schema = {

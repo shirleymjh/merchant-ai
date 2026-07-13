@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import queue as queue_module
 import sys
 import time
 from pathlib import Path
@@ -109,8 +110,12 @@ def run_case_with_timeout(python_backend: Path, question: str, merchant_id: str,
         args=(str(python_backend), question, merchant_id, case_index, queue),
     )
     process.start()
-    process.join(timeout_seconds)
-    if process.is_alive():
+    # Read before join: large debug traces may exceed the multiprocessing pipe
+    # buffer, in which case the worker cannot finish queue.put() until the
+    # parent drains it. Joining first therefore creates a false case timeout.
+    try:
+        result = queue.get(timeout=timeout_seconds)
+    except queue_module.Empty:
         process.terminate()
         process.join(5)
         if process.is_alive():
@@ -122,14 +127,11 @@ def run_case_with_timeout(python_backend: Path, question: str, merchant_id: str,
             "elapsedSeconds": round(time.time() - started, 2),
             "error": "CASE_TIMEOUT after %s seconds" % timeout_seconds,
         }
-    if not queue.empty():
-        return queue.get()
-    return {
-        "case": case_index,
-        "question": question,
-        "elapsedSeconds": round(time.time() - started, 2),
-        "error": "CASE_WORKER_EXITED_WITHOUT_RESULT",
-    }
+    process.join(5)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+    return result
 
 
 def main() -> int:
@@ -137,12 +139,19 @@ def main() -> int:
     parser.add_argument("--merchant-id", default="100")
     parser.add_argument("--output", default="python_backend/.merchant-ai/agent_case_results.json")
     parser.add_argument("--suite", choices=["core", "extended", "all"], default="core")
+    parser.add_argument("--questions-file", default="", help="Optional JSON array of questions; overrides --suite.")
     parser.add_argument("--case-timeout-seconds", type=int, default=240)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
     python_backend = repo_root / "python_backend"
     cases = CORE_CASES if args.suite == "core" else EXTENDED_CASES if args.suite == "extended" else CORE_CASES + EXTENDED_CASES
+    if args.questions_file:
+        questions_path = Path(args.questions_file).expanduser().resolve()
+        payload = json.loads(questions_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list) or not all(isinstance(item, str) and item.strip() for item in payload):
+            raise ValueError("--questions-file must contain a non-empty JSON string array")
+        cases = [item.strip() for item in payload]
     results = []
     output = repo_root / args.output
     output.parent.mkdir(parents=True, exist_ok=True)

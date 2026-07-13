@@ -12,6 +12,48 @@
   "reviewedAt": "2026-06-15T18:08:36",
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
+  "dailyReportProfile": {
+    "profileKey": "merchant_daily_report",
+    "metrics": [
+      {"metricRef": "order_gmv_amt_1d", "displayName": "昨日总GMV金额", "role": "gmv"},
+      {"metricRef": "order_user_cnt_1d", "displayName": "昨日下单用户量", "role": "order_users"},
+      {"metricRef": "order_cnt_1d", "displayName": "昨日总订单量", "role": "orders"},
+      {"metricRef": "trade_success_order_cnt_1d", "displayName": "昨日交易成功订单量", "role": "successful_orders"},
+      {"metricRef": "return_cnt_1d", "displayName": "昨日退货量", "role": "returns"},
+      {"metricRef": "refund_amt_1d", "displayName": "昨日退款金额", "role": "refund_amount"}
+    ],
+    "alerts": [
+      {
+        "type": "refund_attention",
+        "severity": "warning",
+        "conditions": [{"role": "refund_amount", "operator": ">", "value": 0}],
+        "metricRole": "refund_amount",
+        "messageTemplate": "{displayName}为 {formattedValue}，建议下钻退款商品和退款原因。",
+        "drillDownQuestion": "昨日退款金额最高的商品有哪些？"
+      },
+      {
+        "type": "trade_flat",
+        "severity": "warning",
+        "conditions": [
+          {"role": "orders", "operator": "==", "value": 0},
+          {"role": "gmv", "operator": "==", "value": 0}
+        ],
+        "metricRole": "orders",
+        "messageTemplate": "昨日订单和GMV均为 0，建议确认是否为休店、流量异常或数据未产出。",
+        "drillDownQuestion": "最近7天订单量和GMV按日趋势如何？"
+      }
+    ],
+    "drillDownActions": [
+      {"label": "查看退款商品", "question": "昨日退款金额最高的商品有哪些？", "actionType": "follow_up_question"},
+      {"label": "查看订单趋势", "question": "最近7天订单量和GMV按日趋势如何？", "actionType": "follow_up_question"},
+      {"label": "查看客服工单", "question": "昨日客服工单最多的问题类型有哪些？", "actionType": "follow_up_question"}
+    ],
+    "suggestions": [
+      "优先处理日报里的异常提醒，并下钻到对应业务维度。",
+      "关注核心指标是否在同一时间段同步波动。",
+      "把重点指标加入持续监控，跟踪异常变化。"
+    ]
+  },
   "manualNotes": "商家日粒度经营指标画像，承载订单、GMV、退款、工单、履约、商品、优惠、保证金等核心指标",
   "schemaColumns": [
     {

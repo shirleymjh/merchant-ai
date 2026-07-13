@@ -65,6 +65,7 @@ from merchant_ai.services.planning_tooling import (
 )
 from merchant_ai.services.planning_layers import GraphContractValidator, PlanCompiler, PlanRepairer, UnderstandingExtractor
 from merchant_ai.services.routing import extract_days
+from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution, semantic_metric_contract_issue
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import (
@@ -1027,8 +1028,9 @@ class QueryGraphPlanner:
     ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
         prior_understanding = self.understanding_extractor.prior_understanding(planner_context)
         fast_plan = self.understanding_extractor.semantic_fast_path(question, asset_pack)
-        if fast_plan.intents and (not self.llm.configured or semantic_fast_path_can_bypass_configured_llm(question, fast_plan)):
-            fast_plan.agent_trace.append("planner.semantic_fast_path=topn_metric")
+        if fast_plan.intents and (not self.llm.configured or semantic_fast_path_can_bypass_configured_llm(question, fast_plan, asset_pack)):
+            if not any("planner.semantic_fast_path=" in str(item) for item in fast_plan.agent_trace):
+                fast_plan.agent_trace.append("planner.semantic_fast_path=bypassed_llm")
             return fast_plan, fast_plan.knowledge_requests, "SEMANTIC_FAST_PATH"
         if self.llm.configured:
             payload, start_with_workspace, prior_understanding, initial_tool_entry = self.understanding_extractor.initial_payload(
@@ -1122,8 +1124,17 @@ class QueryGraphPlanner:
         return self.understanding_extractor.failure_fallback_plan(question, asset_pack, trace_reason)
 
     def _semantic_fast_path(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        entity_plan = compile_entity_detail_graph_from_question_entity(question, asset_pack)
+        if entity_plan.intents:
+            entity_plan.agent_trace.append("planner.semantic_fast_path=entity_detail")
+            return entity_plan
+        diagnostic_plan = self._recalled_metric_diagnostic_fallback(question, asset_pack)
+        if diagnostic_plan.intents:
+            diagnostic_plan.agent_trace.append("planner.semantic_fast_path=canonical_recalled_diagnostic")
+            return diagnostic_plan
         topn_plan = compile_semantic_topn_metric_fast_graph(question, asset_pack)
         if topn_plan.intents:
+            topn_plan.agent_trace.append("planner.semantic_fast_path=topn_metric")
             return topn_plan
         trend_plan = compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
         if trend_plan.intents:
@@ -1136,6 +1147,51 @@ class QueryGraphPlanner:
 
     def _multi_metric_trend_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         return compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
+
+    def _recalled_metric_diagnostic_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        evidence = canonical_recalled_metric_evidence_for_question(question, asset_pack)
+        if not evidence or not diagnostic_metric_fallback_safe(question):
+            return QueryPlan(agent_trace=["planner.recalled_metric_diagnostic_fallback.no_safe_metric"])
+        metric_key = str(evidence.get("metricKey") or "")
+        owner_table = str(evidence.get("ownerTable") or "")
+        source_phrase = str(evidence.get("matchedMetricLabel") or evidence.get("businessName") or metric_key)
+        understanding = {
+            "originalQuestion": question,
+            "analysisGrain": "day",
+            "analysisIntent": "diagnosis",
+            "requiresExplanation": True,
+            "reusableAnalysis": True,
+            "rankingObjective": {
+                "metricRef": metric_key,
+                "ownerTable": owner_table,
+                "sourcePhrase": source_phrase,
+                "objectiveType": "trend_anchor",
+                "groupByColumn": "pt",
+                "order": "desc",
+                "limit": max(2, extract_days(question, 30)),
+                "displayRole": "trend_context",
+                "visualization": "line_chart",
+            },
+            "requiredEvidenceIntents": [
+                {
+                    "semanticLabel": source_phrase or metric_key,
+                    "sourcePhrase": source_phrase or metric_key,
+                    "requiredLevel": "required",
+                    "suggestedTables": [owner_table],
+                    "suggestedMetricRefs": [metric_key],
+                    "semanticRefId": str(evidence.get("semanticRefId") or ""),
+                    "reason": "canonical semantic metric trend is required before any decline attribution",
+                }
+            ],
+            "timeWindowDays": extract_days(question, 30),
+            "source": "canonical_recalled_metric_diagnostic_fallback",
+        }
+        expansion_trace = self._expand_asset_pack_from_understanding(asset_pack, understanding)
+        plan = self.compiler.compile(question, understanding, asset_pack)
+        if plan.intents:
+            plan.compiler_trace.extend(expansion_trace)
+            plan.agent_trace.append("planner=canonical_recalled_metric_diagnostic_fallback")
+        return plan
 
     def _retry_compact_understanding_if_needed(
         self,
@@ -1307,7 +1363,11 @@ class QueryGraphPlanner:
             if use_tool_loop
             else {}
         )
-        if not payload:
+        provider_failed_in_tool_loop = bool(
+            use_tool_loop
+            and str(getattr(self.llm, "last_error", "") or "").startswith(("timeout:", "provider_error:"))
+        )
+        if not payload and not provider_failed_in_tool_loop:
             if hasattr(self.llm, "tool_json_chat"):
                 try:
                     payload = self.llm.tool_json_chat(
@@ -1332,9 +1392,11 @@ class QueryGraphPlanner:
                         raise
                     payload = self.llm.json_chat(prompt.system_prompt, user, {})
             payload["_promptStats"] = stats
-        else:
+        elif payload:
             payload["_usedSemanticToolLoop"] = True
             payload["_promptStats"] = stats
+        else:
+            payload = {"_promptStats": stats, "_plannerFailFast": True}
         payload["_promptTrace"] = prompt.trace()
         payload["_toolSchema"] = tool.trace_schema()
         payload["_plannerBudgetTrace"] = budget_trace
@@ -2623,10 +2685,6 @@ class EvidenceContractBuilder:
                 metric = self._metric_contract_column(intent)
                 if metric and metric not in columns:
                     columns.append(metric)
-                if not metric:
-                    count_alias = self._count_alias_for_table(intent.preferred_table)
-                    if count_alias not in columns:
-                        columns.append(count_alias)
                 if columns:
                     contract["columns"] = columns[:8]
                 aliases = self._semantic_aliases_for_contract(intent)
@@ -2682,14 +2740,9 @@ class EvidenceContractBuilder:
         metric_alias = self._metric_contract_column(intent)
         if metric_alias and intent.metric_column:
             aliases[metric_alias] = dedupe_strings([metric_alias, intent.metric_column, "sum_%s" % intent.metric_column])
-        count_alias = self._count_alias_for_table(intent.preferred_table)
-        aliases[count_alias] = [count_alias, "cnt", "count"]
         if intent.metric_name and intent.metric_name.endswith(("_cnt", "_count")):
             aliases[intent.metric_name] = dedupe_strings([intent.metric_name, "cnt", "count"])
         return aliases
-
-    def _count_alias_for_table(self, table: str) -> str:
-        return "record_cnt"
 
     def _semantic_label(self, intent: QuestionIntent) -> str:
         if intent.metric_name:
@@ -4708,6 +4761,7 @@ def annotate_understanding_metric_resolution(item: Dict[str, Any], resolution: "
         return
     item["resolvedMetricRef"] = metric.key
     item["resolvedOwnerTable"] = metric.table
+    item["semanticRefId"] = metric.source_ref_id
     item["metricResolutionSource"] = resolution.resolution_source
 
 
@@ -5546,14 +5600,10 @@ def shortest_dependency_distance(dependencies: List[PlanDependency], root_task_i
 
 
 def metric_aliases_for_projection(metric_name: str, metric_column: str) -> List[str]:
-    aliases = [metric_name, metric_column]
-    if metric_name == "repay_bill_cnt":
-        aliases.extend(["repay_bill_cnt", "repay_cnt", "cnt", "count"])
-    elif metric_name == "refund_bill_cnt":
-        aliases.extend(["refund_bill_cnt", "refund_cnt", "cnt", "count"])
-    elif metric_name == "order_detail_cnt":
-        aliases.extend(["order_detail_cnt", "order_cnt", "sub_order_cnt", "cnt", "count"])
-    return dedupe_strings([alias for alias in aliases if alias])
+    # Projection aliases must come from the resolved semantic contract.  Do
+    # not infer metric-specific synonyms in code: those belong in published
+    # metric metadata and are already carried by metric_resolution.
+    return dedupe_strings([alias for alias in [metric_name, metric_column] if alias])
 
 
 class MetricDAGCompiler:
@@ -6295,19 +6345,38 @@ def compile_entity_detail_graph_from_question_entity(question: str, asset_pack: 
     filter_column, filter_value = entity_filter_from_question(question, asset_pack)
     if not filter_column or not filter_value:
         return QueryPlan(agent_trace=["planner.entity_id_semantic_fallback.no_entity_filter"])
+    requested_measures = [
+        {
+            "metricRef": metric.key,
+            "ownerTable": metric.table,
+            "sourcePhrase": semantic_fast_path_metric_phrase(metric, question),
+        }
+        for metric in semantic_fast_path_explicit_metrics(question, asset_pack)
+    ]
     understanding = {
         "analysisGrain": semantic_grain_for_filter_column(filter_column),
         "analysisIntent": "none",
         "requiresExplanation": False,
-        "requiredEvidenceIntents": [],
+        # Explicit entity questions still need the full semantic relationship
+        # closure. Preserve every directly named metric and field so the same
+        # finalizer used by LLM understanding adds refund/goods/etc. branches
+        # instead of returning only the anchor table.
+        "requiredEvidenceIntents": semantic_fast_path_required_evidence(question, asset_pack),
         "rankingObjective": {},
-        "requestedMeasures": [],
+        "requestedMeasures": requested_measures,
         "filters": [{"field": filter_column, "value": filter_value}],
         "timeWindowDays": extract_days(question, 30),
         "source": "entity_id_semantic_fallback",
     }
     plan = compile_entity_detail_graph_from_understanding(question, understanding, asset_pack)
     if plan.intents:
+        plan = finalize_compiled_query_plan(question, plan, understanding, asset_pack)
+        plan = attach_missing_semantic_knowledge_refs(
+            question,
+            plan,
+            asset_pack,
+            "entity-id semantic fast graph selected node",
+        )
         plan.agent_trace.append("planner=entity_id_semantic_fallback")
     return plan
 
@@ -6633,15 +6702,55 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
     return plan
 
 
-def semantic_fast_path_can_bypass_configured_llm(question: str, plan: QueryPlan) -> bool:
+def semantic_fast_path_can_bypass_configured_llm(
+    question: str,
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack | None = None,
+) -> bool:
     text = normalize_text(question)
+    governed_diagnostic_graph = any(
+        "semantic_fast_path=canonical_recalled_diagnostic" in str(item)
+        for item in plan.agent_trace
+    )
+    if governed_diagnostic_graph:
+        return bool(len(plan.intents) == 1 and not plan.dependencies)
     if any(term in text for term in ["相关", "关系", "影响", "归因", "原因"]):
         return False
-    tables = {intent.preferred_table for intent in plan.intents}
-    if any(term in text for term in ["高风险新品", "风险新品"]):
-        return "dwm_goods_detail_df" in tables
+    entity_fast_path = any("semantic_fast_path=entity_detail" in str(item) for item in plan.agent_trace)
+    if entity_fast_path:
+        pack_tables = {
+            str(intent.preferred_table or "")
+            for intent in plan.intents
+            if intent.preferred_table
+        }
+        covered_domains = {semantic_domain_for_table(table) for table in pack_tables}
+        # The plan was compiled from the same compact pack, so all explicitly
+        # requested available domains must remain represented before an LLM is
+        # bypassed. This prevents a one-table entity fast path from truncating
+        # a cross-domain detail question.
+        available_pack = asset_pack or PlanningAssetPack(
+            tables=[PlanningAssetEntry(key=table, table=table) for table in pack_tables]
+        )
+        requested_domains = set(requested_semantic_domains(question, available_pack))
+        if requested_domains - covered_domains:
+            return False
+    deterministic_graph = any(
+        marker in str(item)
+        for item in plan.agent_trace
+        for marker in [
+            "planner.semantic_fast_path=entity_detail",
+            "planner.semantic_fast_path=topn_metric",
+            "planner=semantic_topn_metric_fast_path",
+        ]
+    )
+    if deterministic_graph:
+        return bool(plan.intents)
     multi_metric_fast = any("semantic_fast_path=multi_metric_trend" in str(item) for item in plan.agent_trace)
-    return bool(multi_metric_fast and len(tables) == 1 and 1 < len(plan.intents) <= 3 and not plan.dependencies)
+    # This still executes a fully validated QueryGraph (one governed node per
+    # metric); it is not the single-metric direct-answer path. Independent
+    # cross-table trends do not need an LLM or a join merely to align daily
+    # series, so a transient provider failure must not erase the graph.
+    return bool(multi_metric_fast and 1 < len(plan.intents) <= 3 and not plan.dependencies)
 
 
 def attach_missing_semantic_knowledge_refs(
@@ -6777,6 +6886,54 @@ def semantic_fast_path_required_evidence(question: str, asset_pack: PlanningAsse
     return intents
 
 
+def diagnostic_metric_fallback_safe(question: str) -> bool:
+    text = normalize_text(question)
+    return bool(
+        re.search(
+            r"为什么|原因|归因|诊断|下降|下滑|降低|减少|异常|波动|趋势|走势|变化|是否正常",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def canonical_recalled_metric_evidence_for_question(
+    question: str,
+    asset_pack: PlanningAssetPack,
+) -> Dict[str, Any]:
+    """Resolve one recalled metric using only published canonical-family metadata."""
+    matches = [
+        item
+        for item in asset_pack.metric_compaction.get("recalledMetricEvidence") or []
+        if isinstance(item, dict) and recalled_metric_evidence_matches_phrase(item, question)
+    ]
+    if not matches:
+        return {}
+    unambiguous = [item for item in matches if not bool(item.get("metricResolutionAmbiguous"))]
+    if len(unambiguous) == 1:
+        return dict(unambiguous[0])
+
+    families: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for item in matches:
+        table = str(item.get("ownerTable") or "").strip()
+        metric_key = str(item.get("metricKey") or "").strip()
+        canonical_key = str(item.get("canonicalMetricKey") or item.get("aliasOf") or metric_key).strip()
+        if not table or not metric_key or not canonical_key:
+            continue
+        families.setdefault((table, canonical_key), []).append(item)
+    owners: List[Dict[str, Any]] = []
+    for (_, canonical_key), family in families.items():
+        family_owners = [
+            item
+            for item in family
+            if str(item.get("metricKey") or "").strip() == canonical_key
+            and not str(item.get("aliasOf") or "").strip()
+        ]
+        if len(family_owners) == 1:
+            owners.append(family_owners[0])
+    return dict(owners[0]) if len(owners) == 1 else {}
+
+
 def compile_semantic_multi_metric_trend_fallback_graph(question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
     if entity_filter_from_question(question, asset_pack)[0]:
         return QueryPlan(agent_trace=["planner.semantic_trend_fallback.skipped_entity_filter"])
@@ -6860,9 +7017,13 @@ def select_trend_fallback_metrics(candidates: List[Any], limit: int = 4) -> List
     for item in candidates:
         table_counts[item.metric.table] = table_counts.get(item.metric.table, 0) + 1
     preferred_table = max(table_counts, key=lambda table: (table_counts[table], "profile" in table))
+    # Prefer a table that covers several requested metrics, then backfill from
+    # other owner tables. Previously the preferred-table-only pool could
+    # collapse to one item after metric-family deduplication (for example
+    # refund amount + refund count) and silently drop an explicitly requested
+    # order metric from another table.
     pool = [item for item in candidates if item.metric.table == preferred_table]
-    if len(pool) < 2:
-        pool = candidates
+    pool.extend(item for item in candidates if item.metric.table != preferred_table)
     selected: List[Any] = []
     seen_metric_families: set[str] = set()
     for item in pool:
@@ -7785,7 +7946,7 @@ def required_evidence_lookup_intent(
         plan_task_id=task_id,
         task_role=TaskRole.DEPENDENT,
         preferred_table=table,
-        days=parent.days,
+        days=required_evidence_lookup_days(table, field, parent, asset_pack),
         limit=parent.limit or 20,
         required_evidence=required,
         output_keys=output_keys,
@@ -7794,6 +7955,32 @@ def required_evidence_lookup_intent(
         analysis_note="requiredField=%s" % field,
         sql_strategy="llm_plan_bound_first",
     )
+
+
+def required_evidence_lookup_days(
+    table: str,
+    field: str,
+    parent: QuestionIntent,
+    asset_pack: PlanningAssetPack,
+) -> int:
+    table_entry = next((item for item in asset_pack.tables if item.table == table), None)
+    metadata = table_entry.metadata if table_entry and isinstance(table_entry.metadata, dict) else {}
+    semantic_text = normalize_text(
+        " ".join(
+            [
+                str(metadata.get("dataGrain") or metadata.get("data_grain") or ""),
+                str(metadata.get("tableComment") or metadata.get("table_comment") or ""),
+                str(getattr(table_entry, "title", "") or ""),
+            ]
+        )
+    )
+    time_column = str(metadata.get("timeColumn") or metadata.get("time_column") or "pt")
+    # A lifecycle attribute on a published full/snapshot entity table describes
+    # the entity's history, not the fact query's relative window. Keep tenant
+    # and relationship filters but do not hide an older attribute record.
+    if field and field != time_column and any(marker in semantic_text for marker in ["全量", "快照", "snapshot", "dimension"]):
+        return 0
+    return int(parent.days or 0)
 
 
 def add_rule_evidence_branch(
@@ -8046,9 +8233,6 @@ def attach_metric_resolutions_from_understanding(
     updated_intents: List[QuestionIntent] = []
     changed = False
     for intent in plan.intents:
-        if intent.metric_resolution:
-            updated_intents.append(intent)
-            continue
         resolution = metric_resolution_for_intent(intent, resolutions)
         if not resolution:
             updated_intents.append(intent)
@@ -8063,19 +8247,22 @@ def attach_metric_resolutions_from_understanding(
             intent.preferred_table,
         )
         available_source_columns = reconciliation.available_source_columns
-        updates: Dict[str, Any] = {"metric_resolution": reconciled_metric_resolution_payload(resolution.payload(), reconciliation)}
+        canonical_resolution = reconciled_metric_resolution_payload(resolution.payload(), reconciliation)
+        updates: Dict[str, Any] = {"metric_resolution": canonical_resolution}
         if intent.answer_mode == AnswerMode.DETAIL and not intent.metric_name and not intent.metric_column:
             evidence = dedupe_strings(list(intent.required_evidence) + available_source_columns)
             output_keys = dedupe_strings(list(intent.output_keys) + available_source_columns)
             updates["required_evidence"] = evidence[:18]
             updates["output_keys"] = output_keys[:18]
         else:
-            if not intent.metric_name:
-                updates["metric_name"] = metric.key
-            if not intent.metric_column and available_source_columns:
+            # Once a semantic metric is resolved, planner-provided metric fields
+            # are no longer authoritative.  Re-bind every executable field to
+            # the same sealed contract so later repair stages cannot retain a
+            # stale metric name, column, formula, or table-local interpretation.
+            updates["metric_name"] = metric.key
+            updates["metric_formula"] = reconciliation.formula or metric_formula_for_entry(metric)
+            if available_source_columns:
                 updates["metric_column"] = available_source_columns[0]
-            if not intent.metric_formula:
-                updates["metric_formula"] = reconciliation.formula or metric_formula_for_entry(metric)
         updated_intents.append(intent.model_copy(update=updates))
         changed = True
     if not changed:
@@ -8091,6 +8278,10 @@ def metric_resolution_for_intent(intent: QuestionIntent, resolutions: List[Seman
         metric = resolution.metric
         if not metric or metric.table != intent.preferred_table:
             continue
+        existing = intent.metric_resolution or {}
+        existing_ref = str(existing.get("semanticRefId") or existing.get("semantic_ref_id") or "")
+        if existing_ref and existing_ref == metric.source_ref_id:
+            return resolution
         metadata = getattr(metric, "metadata", {}) or {}
         source_columns = {str(item) for item in metadata.get("sourceColumns") or metadata.get("source_columns") or metric.columns if item}
         if intent.metric_name and intent.metric_name == metric.key:
@@ -8272,7 +8463,7 @@ class SemanticMetricResolution:
         metadata = getattr(metric, "metadata", {}) or {}
         source_columns = [str(item) for item in metadata.get("sourceColumns") or metadata.get("source_columns") or getattr(metric, "columns", []) or [] if item]
         formula = str(metadata.get("formula") or metadata.get("metricFormula") or metric_formula_for_entry(metric) or "")
-        return {
+        return seal_semantic_metric_resolution({
             "requestedMetricRef": self.requested_metric_ref,
             "sourcePhrase": self.source_phrase,
             "metricKey": metric.key,
@@ -8281,6 +8472,7 @@ class SemanticMetricResolution:
             "sourceMetricRefs": [],
             "formula": formula,
             "unit": str(metadata.get("unit") or ""),
+            "description": str(metadata.get("description") or ""),
             "displayName": metric.title or metadata.get("businessName") or metric.key,
             "confidence": self.confidence,
             "resolutionSource": self.resolution_source,
@@ -8292,7 +8484,7 @@ class SemanticMetricResolution:
             "metricEvidenceCandidates": self.candidate_evidence[:5],
             "candidateScores": self.candidate_evidence[:5],
             "knowledgeRequests": [item.model_dump(by_alias=True) for item in self.knowledge_requests],
-        }
+        })
 
 
 @dataclass
@@ -8741,9 +8933,8 @@ def metric_resolution_trace_markers(resolution: SemanticMetricResolution) -> Lis
 
 
 def semantic_metric_field_warning(metric: Any) -> str:
-    if semantic_domain_for_table(getattr(metric, "table", "")) == "refund" and getattr(metric, "key", "") == "pay_amt":
-        return "退款金额按 dwm_trade_refund_detail_di.pay_amt 统计，表示退款明细关联订单的支付金额口径。"
-    return ""
+    metadata = getattr(metric, "metadata", {}) or {}
+    return str(metadata.get("fieldWarning") or metadata.get("field_warning") or "")
 
 
 def expand_measure_items_with_metric_dependencies(
@@ -8877,7 +9068,14 @@ def compiled_metric_intent(
     if not source_column:
         source_column = next((column for column in getattr(metric, "columns", []) if column in columns), "")
     metric_formula = reconciliation.formula
-    metric_resolution = reconciled_metric_resolution_payload(metric_resolution or {}, reconciliation)
+    if not metric_formula:
+        return None
+    metric_resolution = canonical_metric_resolution_payload(
+        metric,
+        metric_resolution or {},
+        reconciliation,
+        resolution_source="semantic_metric_compiler",
+    )
     group_column = metric_group_by_column(grain, columns, group_by)
     output_keys = [column for column in ["seller_id", "merchant_id", group_column, "spu_name"] if column and column in columns]
     required = [column for column in [group_column] + metric_formula_columns(metric_formula, columns) + [source_column] if column and column in columns]
@@ -9297,7 +9495,14 @@ def compiled_domain_lookup_intent(
         analysis_source="semantic_missing_domain_repair",
         analysis_note="missingDomain=%s" % domain,
         sql_strategy="llm_plan_bound_first",
-        metric_resolution=reconciled_metric_resolution_payload({}, reconciliation) if reconciliation else {},
+        metric_resolution=canonical_metric_resolution_payload(
+            metric,
+            {},
+            reconciliation,
+            resolution_source="semantic_domain_repair",
+        )
+        if metric and reconciliation and reconciliation.formula
+        else {},
     )
 
 
@@ -9374,7 +9579,10 @@ def compiled_goods_lookup_intent(question: str, table: str, asset_pack: Planning
         plan_task_id="goods_lookup",
         task_role=TaskRole.DEPENDENT,
         preferred_table=table,
-        days=extract_days(question, 30),
+        # This is an entity/dimension lookup for lifecycle attributes, not a
+        # fact-window query. Restricting it to the order's recent time window
+        # can hide an older SPU publication record.
+        days=0,
         limit=200,
         required_evidence=output_keys,
         output_keys=output_keys,
@@ -9500,7 +9708,16 @@ def enrich_llm_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPac
             if metric.table and metric.table != intent.preferred_table:
                 updates["preferred_table"] = metric.table
             updates["category"] = category_for_metric(metric, metric.table or intent.preferred_table)
-            updates["metric_resolution"] = reconciled_metric_resolution_payload(intent.metric_resolution or {}, reconciliation)
+            existing_resolution = intent.metric_resolution or {}
+            canonical_resolution = SemanticMetricResolution(
+                requested_metric_ref=str(existing_resolution.get("requestedMetricRef") or intent.metric_name or intent.metric_column or ""),
+                source_phrase=str(existing_resolution.get("sourcePhrase") or intent.metric_name or intent.metric_column or ""),
+                metric=metric,
+                confidence=1.0,
+                resolution_source="semantic_asset_enrichment",
+                field_warning=semantic_metric_field_warning(metric),
+            ).payload()
+            updates["metric_resolution"] = reconciled_metric_resolution_payload(canonical_resolution, reconciliation)
         if updates:
             intent = intent.model_copy(update=updates)
         if intent.preferred_table and known_tables and intent.preferred_table not in known_tables:
@@ -9534,7 +9751,10 @@ def enrich_llm_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPac
                     "question": intent.question or question,
                     "intent_type": intent.intent_type or IntentType.VALID,
                     "category": updates.get("category") or category_for_table(table),
-                    "days": int(intent.days or extract_days(question, 30)),
+                    # Zero is an explicit semantic contract for snapshot or
+                    # lifecycle lookups: do not turn it into the fact query's
+                    # relative window merely because zero is falsey.
+                    "days": int(intent.days if intent.days is not None else extract_days(question, 30)),
                     "limit": int(intent.limit or infer_limit(question)),
                     "required_evidence": required[:18],
                     "output_keys": output_keys[:18],
@@ -9592,6 +9812,10 @@ def aggregate_entity_output_keys(intent: QuestionIntent, columns: set) -> List[s
 
 
 def metric_entry_for_intent(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> Any:
+    semantic_ref = str((intent.metric_resolution or {}).get("semanticRefId") or "")
+    if semantic_ref:
+        exact = [metric for metric in asset_pack.metrics if metric.source_ref_id == semantic_ref]
+        return exact[0] if len(exact) == 1 else None
     candidate_groups: List[set[str]] = []
     if intent.metric_name:
         candidate_groups.append({str(intent.metric_name)})
@@ -9615,8 +9839,18 @@ def metric_entry_for_intent(intent: QuestionIntent, asset_pack: PlanningAssetPac
             if candidates & {str(item) for item in metric.columns if item}:
                 return metric
     if intent.preferred_table:
-        fallback_intent = intent.model_copy(update={"preferred_table": ""})
-        return metric_entry_for_intent(fallback_intent, asset_pack)
+        # Cross-table rebinding is allowed only when the semantic name/alias is
+        # globally unique.  Picking the first same-named metric silently mixes
+        # business domains and is forbidden.
+        for candidates in candidate_groups:
+            matches = []
+            for metric in asset_pack.metrics:
+                names = {metric.key, metric.title, metric.source_ref_id, *metric.aliases}
+                if candidates & {str(item) for item in names if item}:
+                    matches.append(metric)
+            identities = {(metric.table, metric.key, metric.source_ref_id) for metric in matches}
+            if len(identities) == 1:
+                return matches[0]
     return None
 
 
@@ -10058,12 +10292,49 @@ def boolish(value: Any) -> bool:
 
 def metric_resolution_issue(intent: QuestionIntent) -> Dict[str, Any]:
     resolution = intent.metric_resolution or {}
-    if not resolution:
-        return {}
     task_id = intent.plan_task_id or intent.preferred_table
+    metric_required = bool(
+        intent.metric_name
+        or intent.metric_column
+        or intent.metric_formula
+        or intent.metric_specs
+        or intent.answer_mode in {AnswerMode.METRIC, AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.DERIVED}
+    )
+    if not metric_required:
+        return {}
+    if not resolution:
+        return {
+            "code": "UNGOVERNED_METRIC",
+            "severity": "error",
+            "taskId": task_id,
+            "table": intent.preferred_table,
+            "reason": "metric node has no semantic-layer resolution contract",
+        }
     requested = str(resolution.get("requestedMetricRef") or resolution.get("requested_metric_ref") or "")
     metric_key = str(resolution.get("metricKey") or resolution.get("metric_key") or "")
     confidence = float(resolution.get("confidence") or 0)
+    components = [item for item in resolution.get("componentMetrics") or [] if isinstance(item, dict)]
+    contract_issue = semantic_metric_contract_issue(
+        resolution,
+        intent.preferred_table if intent.preferred_table else "",
+    )
+    components_governed = not components or all(
+        str(item.get("semanticRefId") or "").startswith("semantic:")
+        and item.get("metricKey")
+        and item.get("ownerTable")
+        and item.get("formula")
+        and item.get("sourceColumns")
+        for item in components
+    )
+    if contract_issue or not components_governed:
+        return {
+            "code": "UNGOVERNED_METRIC",
+            "severity": "error",
+            "taskId": task_id,
+            "table": intent.preferred_table,
+            "metricRef": requested or metric_key or intent.metric_name or intent.metric_column,
+            "reason": contract_issue or "derived metric components require complete governed semantic references",
+        }
     if requested and not metric_key:
         return {
             "code": "METRIC_RESOLUTION_NEEDED",
@@ -10434,7 +10705,58 @@ def reconciled_metric_resolution_payload(payload: Dict[str, Any], reconciliation
             existing = str(updated.get("fieldWarning") or "")
             if reconciliation.warning not in existing:
                 updated["fieldWarning"] = "；".join([item for item in [existing, reconciliation.warning] if item])
-    return updated
+    return seal_semantic_metric_resolution(updated)
+
+
+def canonical_metric_resolution_payload(
+    metric: Any,
+    existing: Dict[str, Any],
+    reconciliation: Any,
+    resolution_source: str,
+) -> Dict[str, Any]:
+    """Bind planner annotations to canonical semantic fields without trusting LLM metric fields."""
+    prior = dict(existing or {})
+    prior_resolution_source = str(prior.get("resolutionSource") or prior.get("resolution_source") or "").strip()
+    governed_resolution_source = (
+        prior_resolution_source
+        if prior_resolution_source
+        in {
+            "semantic_recall_evidence",
+            "semantic_phrase_override",
+            "semantic_metric_ref",
+            "semantic_event_component_from_derived_metric",
+        }
+        else resolution_source
+    )
+    candidate_evidence = prior.get("metricEvidenceCandidates") or prior.get("candidateScores") or []
+    canonical = SemanticMetricResolution(
+        requested_metric_ref=str(prior.get("requestedMetricRef") or prior.get("requested_metric_ref") or metric.key),
+        source_phrase=str(prior.get("sourcePhrase") or prior.get("source_phrase") or metric.title or metric.key),
+        metric=metric,
+        confidence=float(prior.get("confidence") or 1.0),
+        resolution_source=governed_resolution_source,
+        field_warning=semantic_metric_field_warning(metric),
+        candidate_evidence=[item for item in candidate_evidence if isinstance(item, dict)],
+    ).payload()
+    annotation_keys = {
+        "displayRole",
+        "visualization",
+        "groupByColumn",
+        "computeStrategy",
+        "derivedMetric",
+        "componentMetrics",
+        "componentMetricKeys",
+        "sourceMetricRefs",
+        "sourceMetricTaskId",
+        "bridgeTaskId",
+        "projectionDimensions",
+        "supportOnly",
+        "internalOnly",
+    }
+    for key in annotation_keys:
+        if key in prior:
+            canonical[key] = prior[key]
+    return reconciled_metric_resolution_payload(canonical, reconciliation)
 
 
 def metric_dependency_refs(metric: Any) -> List[str]:

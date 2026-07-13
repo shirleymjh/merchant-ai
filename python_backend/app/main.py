@@ -106,7 +106,7 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     )
     topic_assets = workflow.recall_service.topic_assets
     doris_repository = workflow.node_worker.doris_repository
-    daily_report_service = DailyReportService(doris_repository, settings.merchant_id)
+    daily_report_service = DailyReportService(doris_repository, settings.merchant_id, topic_assets)
     feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store, workflow.memory_store)
     memory_management_service = MemoryManagementService(settings, workflow.memory_store)
     skill_draft_service = SkillDraftService(settings)

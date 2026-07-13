@@ -55,6 +55,7 @@ from merchant_ai.services.assets import (
 )
 from merchant_ai.services.formulas import (
     compile_metric_formula as compile_reconciled_metric_formula,
+    equivalent_formula_text,
     formula_columns as reconciled_formula_columns,
 )
 from merchant_ai.services.llm import LlmClient
@@ -66,6 +67,7 @@ from merchant_ai.services.query_contracts import (
     tenant_scope_binding_error,
 )
 from merchant_ai.services.repositories import DorisRepository
+from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution, semantic_metric_contract_issue
 from merchant_ai.services.runtime_state import NodeTaskState, create_runtime_state_store, node_task_idempotency_key
 from merchant_ai.services.distributed_workers import DistributedSubAgentClient
 from merchant_ai.services.query_sql_binding import (
@@ -287,6 +289,12 @@ class NodePlanCritic:
         if not allowed:
             issues.append(issue("PLAN_CONTRACT_MISMATCH", "node contract has no allowed columns"))
         if self._metric_required(contract):
+            semantic_issue = governed_metric_contract_issue(contract.metric_resolution, contract.preferred_table)
+            if semantic_issue:
+                issues.append(issue("UNGOVERNED_METRIC", semantic_issue, contract.metric_name or contract.metric_column))
+            binding_issue = semantic_metric_binding_issue(contract)
+            if binding_issue:
+                issues.append(issue("SEMANTIC_METRIC_BINDING_DRIFT", binding_issue, contract.metric_name or contract.metric_column))
             metric_columns = formula_columns(contract.metric_formula, allowed)
             if contract.metric_column and contract.metric_column not in allowed:
                 issues.append(issue("MISSING_METRIC_COLUMN", "metricColumn is not available in node schema", contract.metric_column))
@@ -362,7 +370,9 @@ class NodePlanCritic:
             contract.metric_column
             or contract.metric_formula
             or contract.metric_name
-            or contract.answer_mode == AnswerMode.METRIC.value
+            or contract.metric_specs
+            or contract.answer_mode
+            in {AnswerMode.METRIC.value, AnswerMode.TOPN.value, AnswerMode.GROUP_AGG.value, AnswerMode.DERIVED.value}
         )
 
     def _group_required(self, contract: NodePlanContract) -> bool:
@@ -2446,8 +2456,16 @@ class NodeWorkerExecutor:
         if not partition_is_stale_for_near_realtime(freshness.max_pt, int(intent.days or 0)):
             return None
         updated_resolution = dict(intent.metric_resolution or {})
-        if updated_resolution.get("ownerTable") == intent.preferred_table:
-            updated_resolution["ownerTable"] = fallback_table
+        if updated_resolution:
+            updated_resolution = governed_realtime_metric_resolution(
+                updated_resolution,
+                intent.preferred_table,
+                fallback_table,
+                fallback.metadata or {},
+                asset_pack,
+            )
+            if not updated_resolution:
+                return None
         return intent.model_copy(
             update={
                 "preferred_table": fallback_table,
@@ -2694,15 +2712,19 @@ class NodeWorkerExecutor:
         metric_parts = structured_metric_select_parts(intent, table, columns)
         if metric_parts is None:
             return ""
-        if metric_parts:
-            for index, (metric_expr, metric_alias) in enumerate(metric_parts):
-                select_parts.append("%s AS `%s`" % (metric_expr, metric_alias))
-                if index == 0:
-                    order_expr = "`%s` DESC" % metric_alias
-        else:
-            count_alias = count_alias_for_table(table)
-            select_parts.append("COUNT(*) AS `%s`" % count_alias)
-            order_expr = "`%s` DESC" % count_alias
+        if not metric_parts:
+            return ""
+        for index, (metric_expr, metric_alias) in enumerate(metric_parts):
+            select_parts.append("%s AS `%s`" % (metric_expr, metric_alias))
+            if index == 0:
+                order_expr = "`%s` DESC" % metric_alias
+        resolution = intent.metric_resolution or {}
+        if (
+            str(resolution.get("displayRole") or resolution.get("display_role") or "").lower() == "trend_context"
+            and intent.group_by_column
+            and intent.group_by_column in group_columns
+        ):
+            order_expr = "%s ASC" % quote_identifier(intent.group_by_column)
         if not resource_safe:
             for column in self._structured_context_columns(intent, columns, group_columns, contract):
                 select_parts.append("MAX(`%s`) AS `%s`" % (column, column))
@@ -2833,12 +2855,9 @@ class NodeWorkerExecutor:
             if entity.values and entity.join_key in columns and entity.join_key not in applied_entity_columns:
                 where.append("`%s` IN (%s)" % (entity.join_key, ", ".join(sql_literal(value) for value in entity.values[:entity_value_limit])))
                 applied_entity_columns.add(entity.join_key)
-        if "pt" in columns:
-            if table == "dwm_goods_detail_df" and intent.task_role == TaskRole.DEPENDENT:
-                merchant_filter = "`seller_id` = %s" % sql_literal(context.merchant_id) if "seller_id" in columns else "1=1"
-                where.append("`pt` = (SELECT MAX(`pt`) FROM `%s` WHERE %s)" % (table, merchant_filter))
-            elif not any("`pt`" in predicate for predicate in where):
-                where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(intent.days or 7))
+        if "pt" in columns and int(intent.days or 0) > 0:
+            if not any("`pt`" in predicate for predicate in where):
+                where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(intent.days))
         return where
 
     def _repair_sql(
@@ -2937,7 +2956,7 @@ class NodeWorkerExecutor:
                     "message": "Node SQL 必须包含可绑定的 seller_id / merchant_id / shop_id 商家过滤",
                 }
             )
-        if "pt" in columns and not self._pt_safety_exempt(intent) and "pt" not in normalized:
+        if "pt" in columns and "pt" not in normalized:
             return validation.model_copy(
                 update={
                     "valid": False,
@@ -3026,9 +3045,6 @@ class NodeWorkerExecutor:
                     }
                 )
         return validation
-
-    def _pt_safety_exempt(self, intent: QuestionIntent) -> bool:
-        return intent.preferred_table == "dwm_goods_detail_df" and intent.task_role == TaskRole.DEPENDENT
 
     def _node_plan_contract(
         self,
@@ -3179,22 +3195,14 @@ class NodeWorkerExecutor:
             for item in configured_default_detail_columns(asset_pack, table, columns):
                 if item and item not in requested:
                     requested.append(item)
-        for item in [
-            "seller_id",
-            "merchant_id",
-            "pt",
-            "sub_order_id",
-            "order_id",
-            "spu_id",
-            "spu_name",
-            "refund_id",
-            "ticket_id",
-            "bill_id",
-            "coupon_id",
-            "discount_rel_id",
-            "pay_amt",
-            "repay_amt",
-        ]:
+        table_asset = next((item for item in asset_pack.tables if item.table == table), None)
+        metadata = dict(getattr(table_asset, "metadata", {}) or {})
+        semantic_defaults = [
+            str(metadata.get("merchantFilterColumn") or ""),
+            str(metadata.get("timeColumn") or ""),
+            *[entry.key for entry in asset_pack.entity_keys if entry.table == table],
+        ]
+        for item in semantic_defaults:
             if item in columns and item not in requested:
                 requested.append(item)
         if not requested:
@@ -3205,7 +3213,7 @@ class NodeWorkerExecutor:
         hints: Dict[str, Dict[str, Any]] = {}
         for table in self._node_table_names(intent, asset_pack):
             columns = set(asset_pack.known_columns(table))
-            hints[table] = table_access_hint(table, columns)
+            hints[table] = semantic_table_access_hint(asset_pack, table, columns)
         return hints
 
     def _node_relationships(self, intent: QuestionIntent, asset_pack: PlanningAssetPack) -> List[Dict[str, Any]]:
@@ -3375,9 +3383,16 @@ def choose_merge_entity_keys(task_results: List[AgentTaskResult]) -> List[str]:
 
 
 def merge_row_fields(target: Dict[str, Any], row: Dict[str, Any], task_id: str, merge_keys: List[str]) -> None:
+    lineage = target.setdefault("__fieldLineage", {})
+    conflicts = target.setdefault("__fieldConflicts", {})
     for key, value in row.items():
+        if str(key).startswith("__"):
+            continue
         if key in merge_keys:
             continue
+        owners = lineage.setdefault(str(key), [])
+        if task_id not in owners:
+            owners.append(task_id)
         if key not in target or blank_entity_value(target.get(key)):
             target[key] = value
             continue
@@ -3386,6 +3401,13 @@ def merge_row_fields(target: Dict[str, Any], row: Dict[str, Any], task_id: str, 
         namespaced = "%s__%s" % (task_id, key)
         if namespaced not in target:
             target[namespaced] = value
+        conflict_values = conflicts.setdefault(str(key), [])
+        existing = {str(item.get("taskId") or ""): item for item in conflict_values if isinstance(item, dict)}
+        first_owner = next((owner for owner in owners if owner != task_id), "")
+        if first_owner and first_owner not in existing:
+            conflict_values.append({"taskId": first_owner, "value": target.get(key)})
+        if task_id not in existing:
+            conflict_values.append({"taskId": task_id, "value": value})
 
 
 def merged_bundle_tables(bundles: List[QueryBundle]) -> List[str]:
@@ -3624,12 +3646,10 @@ def structured_metric_select_parts(intent: QuestionIntent, table: str, columns: 
         if metric_expr:
             parts.append((metric_expr, metric_alias or "metric_value"))
             continue
-        if metric_column and metric_column in columns:
-            alias = metric_alias or metric_alias_for_values(metric_column, table)
-            if is_count_metric_alias(alias):
-                parts.append(("COUNT(DISTINCT `%s`)" % metric_column, alias))
-            else:
-                parts.append(("SUM(`%s`)" % metric_column, alias))
+        if metric_column:
+            # Aggregation is a governed part of the semantic metric contract.
+            # A bare column must never be upgraded to SUM/COUNT by convention.
+            return None
     return parts
 
 
@@ -3821,6 +3841,98 @@ def metric_resolution_aliases(resolution: Dict[str, Any]) -> Set[str]:
         if column:
                 aliases.add(str(column))
     return aliases
+
+
+def governed_metric_contract_issue(resolution: Dict[str, Any], table: str = "") -> str:
+    payload = resolution or {}
+    components = [item for item in payload.get("componentMetrics") or [] if isinstance(item, dict)]
+    if components:
+        if not all(
+            str(item.get("semanticRefId") or "").startswith("semantic:")
+            and item.get("metricKey")
+            and item.get("ownerTable")
+            and item.get("sourceColumns")
+            and item.get("formula")
+            for item in components
+        ):
+            return "derived metric components are missing governed semantic references"
+    return semantic_metric_contract_issue(payload, table)
+
+
+def semantic_metric_binding_issue(contract: NodePlanContract) -> str:
+    resolution = contract.metric_resolution or {}
+    if len(contract.metric_specs or []) > 1:
+        return ""
+    metric_key = str(resolution.get("metricKey") or "")
+    formula = str(resolution.get("formula") or "")
+    source_columns = {str(item) for item in resolution.get("sourceColumns") or [] if str(item)}
+    if contract.metric_name and metric_key and contract.metric_name != metric_key:
+        return "node metricName differs from the sealed semantic metricKey"
+    if contract.metric_formula and formula and not equivalent_formula_text(contract.metric_formula, formula):
+        return "node metricFormula differs from the sealed semantic formula"
+    if contract.metric_column and source_columns and contract.metric_column not in source_columns:
+        return "node metricColumn is outside the sealed semantic sourceColumns"
+    return ""
+
+
+def governed_realtime_metric_resolution(
+    resolution: Dict[str, Any],
+    source_table: str,
+    fallback_table: str,
+    fallback_metadata: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> Dict[str, Any]:
+    """Switch a metric table only through an explicit semantic metric mapping."""
+    source_ref = str(resolution.get("semanticRefId") or "")
+    metric_key = str(resolution.get("metricKey") or "")
+    raw_mappings = fallback_metadata.get("metricMappings") or fallback_metadata.get("semanticMetricMappings") or []
+    if isinstance(raw_mappings, dict):
+        raw_mappings = [
+            {"sourceSemanticRefId": key, "targetSemanticRefId": value}
+            for key, value in raw_mappings.items()
+        ]
+    mapping = next(
+        (
+            item
+            for item in raw_mappings
+            if isinstance(item, dict)
+            and str(item.get("sourceSemanticRefId") or item.get("sourceMetricRef") or "") in {source_ref, metric_key}
+        ),
+        None,
+    )
+    if not mapping:
+        return {}
+    target_ref = str(mapping.get("targetSemanticRefId") or mapping.get("targetMetricRef") or "")
+    target = next(
+        (
+            item
+            for item in asset_pack.metrics
+            if item.table == fallback_table and target_ref in {item.source_ref_id, item.key}
+        ),
+        None,
+    )
+    if not target:
+        return {}
+    metadata = dict(target.metadata or {})
+    source_columns = [str(item) for item in metadata.get("sourceColumns") or target.columns or [] if str(item)]
+    formula = str(metadata.get("formula") or metadata.get("metricFormula") or "")
+    if not source_columns or not formula:
+        return {}
+    updated = {
+        **resolution,
+        "metricKey": target.key,
+        "ownerTable": fallback_table,
+        "sourceColumns": source_columns,
+        "formula": formula,
+        "unit": str(metadata.get("unit") or resolution.get("unit") or ""),
+        "displayName": target.title or str(metadata.get("businessName") or target.key),
+        "description": str(metadata.get("description") or ""),
+        "semanticRefId": target.source_ref_id,
+        "fallbackFromSemanticRefId": source_ref,
+        "fallbackFromTable": source_table,
+        "resolutionSource": "%s+governed_realtime_fallback" % str(resolution.get("resolutionSource") or "semantic"),
+    }
+    return seal_semantic_metric_resolution(updated, force=True)
 
 
 def contract_metric_aliases(contract: NodePlanContract) -> Set[str]:
@@ -4066,10 +4178,6 @@ def filter_predicate(column: str, value: Any) -> str:
         values = [item.strip() for item in raw.split(",") if item.strip()]
         return "`%s` IN (%s)" % (column, ", ".join(sql_literal(item) for item in values))
     return "`%s` = %s" % (column, sql_literal(value))
-
-
-def count_alias_for_table(table: str) -> str:
-    return "record_cnt"
 
 
 FORMULA_ALLOWED_TOKENS = {
@@ -4355,69 +4463,26 @@ def is_repairable_doris_error(error_text: str) -> bool:
     return doris_error_policy(classify_doris_error(error_text)).get("llm_repair", False)
 
 
-def table_access_hint(table: str, columns: set) -> Dict[str, Any]:
-    catalog: Dict[str, Dict[str, Any]] = {
-        "dwm_trade_order_detail_di": {
-            "uniqueKeys": ["sub_order_id", "pt"],
-            "distributionKeys": ["sub_order_id"],
-            "bestEqualityFilters": ["seller_id", "sub_order_id", "pt"],
-            "fallbackFilters": ["seller_id", "order_id", "pt"],
-            "invertedIndexes": [],
-        },
-        "dwm_trade_refund_detail_di": {
-            "uniqueKeys": ["refund_id", "pt"],
-            "distributionKeys": ["refund_id"],
-            "bestEqualityFilters": ["seller_id", "refund_id", "pt"],
-            "fallbackFilters": ["seller_id", "sub_order_id", "order_id", "pt"],
-            "invertedIndexes": [],
-        },
-        "dwm_goods_detail_df": {
-            "tableKind": "snapshot_dimension",
-            "uniqueKeys": ["spu_id", "pt"],
-            "distributionKeys": ["spu_id"],
-            "bestEqualityFilters": ["seller_id", "spu_id", "pt"],
-            "fallbackFilters": ["seller_id", "spu_name", "pt"],
-            "invertedIndexes": [],
-            "timeWindowPolicy": "do_not_apply_question_window_for_dependent_lookup; use latest pt for seller_id + spu_id",
-        },
-        "dwm_cs_ticket_detail_di": {
-            "uniqueKeys": ["ticket_id", "pt"],
-            "distributionKeys": ["ticket_id"],
-            "bestEqualityFilters": ["seller_id", "ticket_id", "pt"],
-            "fallbackFilters": ["seller_id", "sub_order_id", "order_id", "pt"],
-            "invertedIndexes": [],
-        },
-        "dwm_cs_repay_detail_df": {
-            "tableKind": "snapshot_fact",
-            "uniqueKeys": ["bill_id", "pt"],
-            "distributionKeys": ["bill_id"],
-            "bestEqualityFilters": ["seller_id", "bill_id", "pt"],
-            "fallbackFilters": ["seller_id", "sub_order_id", "order_id", "pt"],
-            "invertedIndexes": [],
-        },
-        "dwm_coupon_detail_di": {
-            "uniqueKeys": ["coupon_id", "pt"],
-            "distributionKeys": ["coupon_id"],
-            "bestEqualityFilters": ["seller_id", "coupon_id", "pt"],
-            "fallbackFilters": ["seller_id", "order_id", "sub_order_id", "pt"],
-            "invertedIndexes": [],
-        },
-        "dwm_scm_detail_di": {
-            "uniqueKeys": ["scm_id", "pt"],
-            "distributionKeys": ["scm_id"],
-            "bestEqualityFilters": ["seller_id", "scm_id", "pt"],
-            "fallbackFilters": ["seller_id", "spu_id", "pt"],
-            "invertedIndexes": [],
-        },
+def semantic_table_access_hint(asset_pack: PlanningAssetPack, table: str, columns: set) -> Dict[str, Any]:
+    entry = next((item for item in asset_pack.tables if item.table == table), None)
+    metadata = dict(getattr(entry, "metadata", {}) or {})
+    physical = dict(metadata.get("physicalTableMetadata") or {})
+    usage = dict(metadata.get("tableUsageProfile") or {})
+    primary = list(physical.get("primaryKeyColumns") or metadata.get("primaryKeyColumns") or [])
+    partition = list(physical.get("partitionColumns") or metadata.get("partitionColumns") or [])
+    bucket = list(physical.get("bucketColumns") or metadata.get("bucketColumns") or [])
+    tenant = str(metadata.get("merchantFilterColumn") or "")
+    time_column = str(metadata.get("timeColumn") or "")
+    entity_keys = [item.key for item in asset_pack.entity_keys if item.table == table]
+    return {
+        "tableKind": str(usage.get("businessLayer") or metadata.get("dataGrain") or ""),
+        "uniqueKeys": [item for item in dedupe_strings(primary + entity_keys + partition) if item in columns],
+        "distributionKeys": [item for item in dedupe_strings(bucket) if item in columns],
+        "bestEqualityFilters": [item for item in dedupe_strings([tenant, *primary, *entity_keys, time_column]) if item in columns],
+        "fallbackFilters": [item for item in dedupe_strings([tenant, *partition, time_column]) if item in columns],
+        "invertedIndexes": [item for item in physical.get("invertedIndexColumns") or [] if item in columns],
+        "timeWindowPolicy": str(metadata.get("timeWindowPolicy") or usage.get("timeWindowPolicy") or ""),
     }
-    hint = catalog.get(table, {"uniqueKeys": ["pt"], "distributionKeys": [], "bestEqualityFilters": ["pt"], "fallbackFilters": [], "invertedIndexes": []})
-    payload: Dict[str, Any] = {}
-    for key, value in hint.items():
-        if isinstance(value, list):
-            payload[key] = [column for column in value if column in columns]
-        else:
-            payload[key] = value
-    return payload
 
 
 def timed_out_result(task_id: str, intent: QuestionIntent, timeout_seconds: int) -> AgentTaskResult:

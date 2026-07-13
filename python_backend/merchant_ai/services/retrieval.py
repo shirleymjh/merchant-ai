@@ -532,6 +532,7 @@ class EsKnowledgeRetrievalService:
             label_key = normalize_recall_label(str(candidate.get("matchedMetricLabel") or ""))
             if label_key:
                 label_groups.setdefault(label_key, []).append(candidate)
+        suppressed_alias_candidates: set[str] = set()
         for label_key, group in label_groups.items():
             unique_metrics = {
                 (str(item.get("topic") or ""), str(item.get("tableName") or ""), str(item.get("metricKey") or ""))
@@ -539,10 +540,34 @@ class EsKnowledgeRetrievalService:
             }
             if len(unique_metrics) <= 1:
                 continue
+            canonical_owner, canonical_aliases = canonical_metric_family_owner(group)
+            if canonical_owner is not None:
+                canonical_key = str(canonical_owner.get("metricKey") or "")
+                canonical_owner["metricResolutionAmbiguous"] = False
+                canonical_owner["metricResolutionReason"] = "%s; canonical_family_owner=%s" % (
+                    str(canonical_owner.get("metricResolutionReason") or ""),
+                    canonical_key,
+                )
+                canonical_owner["metricResolutionConfidence"] = max(
+                    0.9,
+                    round(float(canonical_owner.get("metricResolutionConfidence") or 0.0), 3),
+                )
+                suppressed_alias_candidates.update(
+                    str(item.get("semanticRefId") or "")
+                    for item in canonical_aliases
+                    if str(item.get("semanticRefId") or "")
+                )
+                continue
             for item in group:
                 item["metricResolutionAmbiguous"] = True
                 item["metricResolutionConfidence"] = max(0.4, round(float(item.get("metricResolutionConfidence") or 0.0) - 0.18, 3))
                 item["metricResolutionReason"] = "%s; ambiguous_label=%s" % (str(item.get("metricResolutionReason") or ""), label_key)
+        if suppressed_alias_candidates:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("semanticRefId") or "") not in suppressed_alias_candidates
+            ]
         candidates.sort(
             key=lambda item: (
                 float(item.get("metricResolutionConfidence") or 0.0),
@@ -745,6 +770,43 @@ def build_metric_candidate(
         "metricResolutionAmbiguous": False,
         "fusionScore": score,
     }
+
+
+def canonical_metric_family_owner(
+    candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Return the governed owner when every candidate belongs to one alias family.
+
+    A shared user label is not a real ambiguity when the semantic layer explicitly
+    declares every variant as an alias of one canonical metric and publishes that
+    canonical metric in the same owner table.  Keeping this rule metadata-driven
+    avoids teaching retrieval any business-specific metric names.
+    """
+    if len(candidates) <= 1:
+        return None, []
+    families: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        metric_key = str(candidate.get("metricKey") or "").strip()
+        canonical_key = str(candidate.get("canonicalMetricKey") or candidate.get("aliasOf") or metric_key).strip()
+        topic = str(candidate.get("topic") or "").strip()
+        table = str(candidate.get("tableName") or "").strip()
+        if not metric_key or not canonical_key or not table:
+            return None, []
+        families.add((topic, table, canonical_key))
+    if len(families) != 1:
+        return None, []
+    _, _, canonical_key = next(iter(families))
+    owners = [
+        candidate
+        for candidate in candidates
+        if str(candidate.get("metricKey") or "").strip() == canonical_key
+        and not str(candidate.get("aliasOf") or "").strip()
+    ]
+    if len(owners) != 1:
+        return None, []
+    owner = owners[0]
+    aliases = [candidate for candidate in candidates if candidate is not owner]
+    return owner, aliases
 
 
 def compare_metric_candidate(left: dict[str, Any], right: dict[str, Any]) -> int:

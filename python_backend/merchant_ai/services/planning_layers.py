@@ -72,6 +72,10 @@ class UnderstandingExtractor:
         if entity_plan.intents:
             entity_plan.agent_trace.extend([trace_reason, "planner.entity_id_semantic_fallback_after_llm_failure"])
             return entity_plan, [], trace_reason
+        recalled_metric_plan = self.planner._recalled_metric_diagnostic_fallback(question, asset_pack)
+        if recalled_metric_plan.intents:
+            recalled_metric_plan.agent_trace.extend([trace_reason, "planner.recalled_metric_diagnostic_fallback_after_llm_failure"])
+            return recalled_metric_plan, [], trace_reason
         trend_plan = self.planner._multi_metric_trend_fallback(question, asset_pack)
         if trend_plan.intents:
             trend_plan.agent_trace.extend([trace_reason, "planner.multi_metric_trend_fallback_after_llm_failure"])
