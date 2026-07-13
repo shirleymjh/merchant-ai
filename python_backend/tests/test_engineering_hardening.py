@@ -127,13 +127,17 @@ def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
 
     response = client.post(
         "/api/merchant/knowledge-suggestions/ks_store_rule/action",
-        json={"action": "accept", "merchantId": "100", "actor": "merchant_user"},
+        json={"action": "confirm_use", "merchantId": "100", "actor": "merchant_user"},
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "MERCHANT_ACTIVE"
-    assert payload["suggestion"]["scopeType"] == "merchant"
+    assert payload["noticeType"] == "merchant_rule_confirmed"
+    assert payload["requestedAction"] == "confirm_use"
+    assert payload["ruleText"] == "本店退款率超过8%时提醒"
+    assert "suggestion" not in payload
+    assert "scopeType" not in payload
 
 
 def test_event_listener_registry_is_safe_for_parallel_runs():

@@ -1693,6 +1693,7 @@ class NodeWorkerExecutor:
                     validation.base_tables,
                     contract,
                     query_duration_ms,
+                    freshness,
                 )
                 if split_result is not None:
                     rows = list(split_result["rows"])
@@ -2283,7 +2284,7 @@ class NodeWorkerExecutor:
                     "如果字段在 nodePlanContract.maskedColumns 里，不要试图规避或还原脱敏策略。"
                     "必须使用 nodePlanContract.merchantFilterColumn 做商家过滤；"
                     "如果 nodePlanContract.metricSpecs 不为空，SELECT 必须输出每个 metricSpec 的 metricName；公式只能使用 metricSpec.sourceColumns/metricFormula。"
-                    "如果问题或 upstreamEntitySets 提供了 sub_order_id/spu_id/refund_id/ticket_id/bill_id，必须用这些分桶/主键过滤；"
+                    "如果问题或 upstreamEntitySets 提供了 sub_order_id/spu_id/refund_id/ticket_id/bill_id，必须用对应分桶/主键过滤；"
                     "selectMustInclude 是强制 SELECT 输出列，必须逐个原样出现在 SELECT 中；"
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
                     "GROUP_AGG/TOPN 必须按 outputKeys 和 groupByColumn 分组并输出，不能丢失 coupon_id/spu_id/spu_name/sub_order_id/order_id/ticket_id/bill_id 等实体键；"
@@ -2528,6 +2529,7 @@ class NodeWorkerExecutor:
         tables: List[str],
         contract: NodePlanContract,
         previous_duration_ms: int,
+        freshness: FreshnessCheckResult,
     ) -> Optional[Dict[str, Any]]:
         if not bool(getattr(self.settings, "agent_doris_split_query_enabled", True)):
             return None
@@ -2552,6 +2554,13 @@ class NodeWorkerExecutor:
         split_sqls = split_detail_sql_by_pt_windows(safe_bound_sql, int(intent.days or 0), chunk_days, max_chunks, limit)
         if not split_sqls:
             return None
+        anchor_date = ""
+        anchored_split_sqls: List[str] = []
+        for split_sql in split_sqls:
+            anchored_sql, split_anchor_date = self._apply_partition_date_anchor(split_sql, intent, freshness)
+            anchored_split_sqls.append(anchored_sql)
+            anchor_date = anchor_date or split_anchor_date
+        split_sqls = anchored_split_sqls
         events: List[Dict[str, Any]] = [
             {
                 "event": "split_query_fallback_started",
@@ -2564,6 +2573,7 @@ class NodeWorkerExecutor:
                 "maxConcurrency": min(max_concurrency, len(split_sqls)),
                 "executionMode": "parallel_chunks",
                 "limit": limit,
+                "anchorPartitionDate": anchor_date,
             }
         ]
         cache_hit = False
@@ -3635,12 +3645,6 @@ def metric_spec_source_columns(spec: Dict[str, Any], columns: set) -> List[str]:
 
 
 def metric_alias_for_values(metric_column: str, table: str) -> str:
-    if metric_column == "pay_amt" and "refund" in table:
-        return "refund_related_pay_amt"
-    if metric_column == "pay_amt":
-        return "order_pay_amt"
-    if metric_column == "repay_amt":
-        return "repay_amt"
     if metric_column:
         return "sum_%s" % metric_column
     return "metric_value"
@@ -3648,13 +3652,8 @@ def metric_alias_for_values(metric_column: str, table: str) -> str:
 
 def metric_alias_candidates(metric_key: str) -> List[str]:
     text = str(metric_key or "")
-    aliases = {
-        "order_detail_cnt": ["order_detail_cnt", "order_cnt", "sub_order_cnt", "cnt", "count"],
-        "refund_bill_cnt": ["refund_bill_cnt", "refund_cnt", "cnt", "count"],
-        "ticket_bill_cnt": ["ticket_bill_cnt", "ticket_cnt", "cnt", "count"],
-        "repay_bill_cnt": ["repay_bill_cnt", "repay_cnt", "cnt", "count"],
-    }
-    return dedupe_strings([text] + aliases.get(text, []))
+    aliases = ["cnt", "count"] if text.endswith("_cnt") or text.endswith("_count") else []
+    return dedupe_strings([text] + aliases)
 
 
 def first_present_value(row: Dict[str, Any], aliases: List[str]) -> Any:
@@ -4070,19 +4069,7 @@ def filter_predicate(column: str, value: Any) -> str:
 
 
 def count_alias_for_table(table: str) -> str:
-    if "refund" in table:
-        return "refund_cnt"
-    if "ticket" in table:
-        return "ticket_cnt"
-    if "repay" in table:
-        return "repay_cnt"
-    if "coupon" in table:
-        return "coupon_cnt"
-    if "scm" in table:
-        return "scm_cnt"
-    if "goods" in table:
-        return "goods_cnt"
-    return "order_cnt"
+    return "record_cnt"
 
 
 FORMULA_ALLOWED_TOKENS = {
@@ -4124,12 +4111,6 @@ def compile_metric_formula(formula: str, columns: set) -> str:
 def metric_alias_for_intent(intent: QuestionIntent, table: str) -> str:
     if intent.metric_name:
         return intent.metric_name
-    if intent.metric_column == "pay_amt" and "refund" in table:
-        return "refund_related_pay_amt"
-    if intent.metric_column == "pay_amt":
-        return "order_pay_amt"
-    if intent.metric_column == "repay_amt":
-        return "repay_amt"
     if intent.metric_column:
         return "sum_%s" % intent.metric_column
     return "metric_value"

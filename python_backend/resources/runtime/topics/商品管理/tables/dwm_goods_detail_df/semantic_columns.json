@@ -6,7 +6,9 @@
     "description": "spu ID",
     "aliases": [
       "spu ID",
-      "spu_id"
+      "spu_id",
+      "SPU",
+      "商品"
     ],
     "enumValues": [],
     "metricFormula": "",
@@ -20,7 +22,8 @@
     "description": "商品名称",
     "aliases": [
       "商品名称",
-      "spu_name"
+      "spu_name",
+      "商品"
     ],
     "enumValues": [
       "spu_name_1",

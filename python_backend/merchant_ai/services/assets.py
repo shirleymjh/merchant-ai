@@ -1127,6 +1127,7 @@ def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
         "merchantFilterColumn": asset.get("merchantFilterColumn"),
         "rowAccessPolicy": asset.get("rowAccessPolicy") or {},
         "manualNotes": asset.get("manualNotes"),
+        "tableUsageProfile": normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, str(asset.get("tableName") or "")),
         "metrics": [
             {
                 "metricKey": item.get("metricKey"),
@@ -1193,6 +1194,12 @@ def compact_metric_for_recall(topic: str, table: str, metric: Dict[str, Any]) ->
         "aliases": metric.get("aliases") or [],
         "description": metric.get("description"),
         "unit": metric.get("unit"),
+        "currency": metric.get("currency"),
+        "aggregation": metric.get("aggregation"),
+        "timeColumn": metric.get("timeColumn"),
+        "requiredFilters": metric.get("requiredFilters") or [],
+        "conflictsWith": metric.get("conflictsWith") or [],
+        "clarificationQuestion": metric.get("clarificationQuestion"),
         "evidence": metric.get("evidence"),
     }
     return json.dumps(payload, ensure_ascii=False)[:4000]
@@ -1209,8 +1216,44 @@ def compact_table_metadata(asset: Dict[str, Any]) -> Dict[str, Any]:
         "merchantFilterColumn": asset.get("merchantFilterColumn"),
         "rowAccessPolicy": asset.get("rowAccessPolicy") or {},
         "manualNotes": asset.get("manualNotes"),
+        "tableUsageProfile": normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, str(asset.get("tableName") or "")),
         "status": asset.get("status"),
         "version": asset.get("version"),
+    }
+
+
+def infer_business_layer(table: str) -> str:
+    prefix = str(table or "").strip().lower().split("_", 1)[0]
+    return prefix.upper() if prefix in {"ods", "dwd", "dwm", "ads", "dim", "tmp", "stg"} else "UNKNOWN"
+
+
+def default_table_queryable(table: str, business_layer: str = "") -> bool:
+    layer = str(business_layer or infer_business_layer(table)).upper()
+    lowered = str(table or "").lower()
+    return layer not in {"ODS", "TMP", "STG"} and not re.search(r"(^|_)(tmp|temp|backup|bak|stg)(_|$)", lowered)
+
+
+def normalize_table_usage_profile(profile: Any, table: str = "") -> Dict[str, Any]:
+    raw = profile if isinstance(profile, dict) else {}
+    layer = str(raw.get("businessLayer") or infer_business_layer(table)).upper()
+    authority_defaults = {"ADS": 95, "DWM": 90, "DWD": 80, "DIM": 75, "UNKNOWN": 60, "ODS": 20, "STG": 10, "TMP": 0}
+    try:
+        authority = max(0, min(100, int(raw.get("authorityLevel", authority_defaults.get(layer, 60)))))
+    except (TypeError, ValueError):
+        authority = authority_defaults.get(layer, 60)
+    queryable = raw.get("queryableByAgent")
+    if not isinstance(queryable, bool):
+        queryable = default_table_queryable(table, layer)
+    return {
+        "businessLayer": layer,
+        "queryableByAgent": queryable,
+        "authorityLevel": authority,
+        "supportedIntents": dedupe_strings([str(item).upper() for item in raw.get("supportedIntents") or []]),
+        "supportedMetrics": dedupe_strings([str(item) for item in raw.get("supportedMetrics") or []]),
+        "supportedDimensions": dedupe_strings([str(item) for item in raw.get("supportedDimensions") or []]),
+        "recommendedFor": dedupe_strings([str(item) for item in raw.get("recommendedFor") or []]),
+        "notRecommendedFor": dedupe_strings([str(item) for item in raw.get("notRecommendedFor") or []]),
+        "exclusionReason": str(raw.get("exclusionReason") or ("technical/non-serving table" if not queryable else "")),
     }
 
 
@@ -1447,7 +1490,7 @@ class PlanningAssetPackBuilder:
                     continue
                 dep_table = dep_metric.table
                 topic = table_topic.get(dep_table)
-                if not topic or not self._table_allowed_for_question(question, dep_table, allow_profile=allow_profile):
+                if not topic or not self._table_allowed_for_topic_question(topic, question, dep_table, allow_profile=allow_profile):
                     continue
                 pack_tables.add(dep_table)
                 self._append_table_assets(pack, topic, dep_table)
@@ -1648,7 +1691,7 @@ class PlanningAssetPackBuilder:
             for topic in topics:
                 for manifest_item in self.topic_assets.load_manifest(topic):
                     table = str(manifest_item.get("tableName") or "")
-                    if not table or not self._table_allowed_for_question(question, table, allow_profile=allow_profile):
+                    if not table or not self._table_allowed_for_topic_question(topic, question, table, allow_profile=allow_profile):
                         continue
                     candidate_tables.append((topic, table, manifest_item))
         existing_candidates = {table for _, table, _ in candidate_tables}
@@ -1707,6 +1750,7 @@ class PlanningAssetPackBuilder:
             "targeted_seed_tables:%s"
             % ",".join("%s=%s" % (item["table"], item["score"]) for item in score_preview[:limit])
         ]
+        traces.append("table_selection_explanations:%s" % json.dumps(score_preview[: max(limit, 6)], ensure_ascii=False, separators=(",", ":")))
         if has_precise_recall_evidence:
             traces.append("targeted_seed_source=recall_source_refs")
         else:
@@ -1834,6 +1878,43 @@ class PlanningAssetPackBuilder:
             if field_score:
                 score += field_score
                 detail["fieldScore"] = field_score
+            usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
+            usage_match = int(score_document(terms, json.dumps(usage, ensure_ascii=False)))
+            if usage_match:
+                score += min(usage_match, 60)
+                detail["usageScore"] = min(usage_match, 60)
+            requested_intents = infer_table_selection_intents(question)
+            supported_intents = {str(item).upper() for item in usage.get("supportedIntents") or []}
+            matched_intents = sorted(requested_intents & supported_intents)
+            missing_intents = sorted(requested_intents - supported_intents) if supported_intents else []
+            if matched_intents:
+                score += 12 * len(matched_intents)
+                detail["matchedIntents"] = matched_intents
+            if missing_intents:
+                score -= 8 * len(missing_intents)
+                detail["missingIntents"] = missing_intents
+            authority_boost = round(int(usage.get("authorityLevel") or 0) / 10)
+            score += authority_boost
+            detail["authorityLevel"] = int(usage.get("authorityLevel") or 0)
+            recommendation_score = int(score_document(terms, " ".join(str(item) for item in usage.get("recommendedFor") or [])))
+            if recommendation_score:
+                score += min(recommendation_score, 30)
+                detail["recommendationScore"] = min(recommendation_score, 30)
+            caution_score = int(score_document(terms, " ".join(str(item) for item in usage.get("notRecommendedFor") or [])))
+            if caution_score:
+                score -= min(caution_score, 30)
+                detail["notRecommendedPenalty"] = min(caution_score, 30)
+            reasons: List[str] = []
+            if recall_score:
+                reasons.append("召回证据命中")
+            if detail.get("metricScore"):
+                reasons.append("指标覆盖匹配")
+            if field_score:
+                reasons.append("字段或维度匹配")
+            if matched_intents:
+                reasons.append("支持分析意图:%s" % ",".join(matched_intents))
+            reasons.append("业务权威度:%s" % usage.get("authorityLevel"))
+            detail["selectionReasons"] = reasons
         if "profile" in table.lower() and not explicit and not recalled:
             score -= 40
         return table, score, detail
@@ -1847,7 +1928,8 @@ class PlanningAssetPackBuilder:
     ) -> bool:
         if not table:
             return False
-        if self._table_allowed_for_question(question, table, allow_profile=allow_profile):
+        topic = str(item.topic or (item.metadata or {}).get("topic") or "")
+        if self._table_allowed_for_topic_question(topic, question, table, allow_profile=allow_profile):
             return True
         return False
 
@@ -1896,7 +1978,7 @@ class PlanningAssetPackBuilder:
                 for table in path[1:-1]:
                     if table in seed_tables or table in extras:
                         continue
-                    if not self._table_allowed_for_question("", table, allow_profile=allow_profile):
+                    if not self._table_allowed_for_topic_question(table_topic.get(table, ""), "", table, allow_profile=allow_profile):
                         continue
                     if table not in table_topic:
                         continue
@@ -2311,14 +2393,14 @@ class PlanningAssetPackBuilder:
         relevant = [
             str(item.get("tableName") or "")
             for item in manifest
-            if self._table_relevant(question, item) and self._table_allowed_for_question(question, str(item.get("tableName") or ""), allow_profile=allow_profile)
+            if self._table_relevant(question, item) and self._table_allowed_for_topic_question(topic, question, str(item.get("tableName") or ""), allow_profile=allow_profile)
         ]
         if relevant:
             return {table for table in relevant if table}
         return {
             table
             for table in [str(item.get("tableName") or "") for item in manifest]
-            if table and self._table_allowed_for_question(question, table, allow_profile=allow_profile)
+            if table and self._table_allowed_for_topic_question(topic, question, table, allow_profile=allow_profile)
         }
 
     def _table_allowed_for_question(self, question: str, table: str, allow_profile: bool = False) -> bool:
@@ -2326,7 +2408,21 @@ class PlanningAssetPackBuilder:
             return False
         if "profile" in table.lower():
             return allow_profile
-        return True
+        return default_table_queryable(table)
+
+    def _table_allowed_for_topic_question(self, topic: str, question: str, table: str, allow_profile: bool = False) -> bool:
+        if not self._table_allowed_for_question(question, table, allow_profile=allow_profile):
+            return False
+        if not topic:
+            return True
+        try:
+            asset = self.topic_assets.load_table_asset(topic, table)
+        except Exception:
+            asset = {}
+        if not asset or "tableUsageProfile" not in asset:
+            return True
+        usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
+        return bool(usage.get("queryableByAgent"))
 
 
 def relationship_entry(topic: str, rel: Dict[str, Any]) -> RelationshipEntry:
@@ -2900,7 +2996,7 @@ class TopicBuilderWorkflow:
         physical_metadata = self._load_physical_metadata(table)
         schema = self._enrich_schema_with_physical_metadata(schema, physical_metadata)
         sample_rows = self._load_sample_rows(table, request)
-        profile = self._sample_profile(schema, sample_rows, request, physical_metadata)
+        profile = self._sample_profile(table, schema, sample_rows, request, physical_metadata)
         generated = self._generate_candidate_payload(topic, table, request, schema, sample_rows, profile, existing)
         builder_phases = {
             "schemaDiscovery": {
@@ -2921,6 +3017,11 @@ class TopicBuilderWorkflow:
                 "mode": str(generated.get("generationMode") or "heuristic"),
                 "artifact": str(pending_dir / "asset.json"),
                 "llmUsed": str(generated.get("generationMode") or "").lower() == "llm",
+            },
+            "tableUsageGovernance": {
+                "status": "completed",
+                "artifact": str(pending_dir / "asset.json"),
+                "reviewRequired": True,
             },
             "humanReviewPublish": {
                 "status": "pending_review",
@@ -2963,6 +3064,16 @@ class TopicBuilderWorkflow:
         metrics = self._merge_generated_metrics(existing.get("metrics"), generated.get("metrics"), schema)
         terms = self._merge_generated_list(existing.get("terms"), generated.get("terms"), "terms")
         rules = self._merge_generated_list(existing.get("knowledgeRules"), generated.get("knowledgeRules"), "knowledgeRules")
+        heuristic_usage = self._heuristic_table_usage_profile(table, schema, semantic_columns, metrics, asset_payload["dataGrain"])
+        asset_payload["tableUsageProfile"] = normalize_table_usage_profile(
+            {
+                **heuristic_usage,
+                **(existing.get("tableUsageProfile") if isinstance(existing.get("tableUsageProfile"), dict) else {}),
+                **(generated.get("tableUsageProfile") if isinstance(generated.get("tableUsageProfile"), dict) else {}),
+                **(request.table_usage_overrides or {}),
+            },
+            table,
+        )
         production_report = topic_asset_production_report(
             topic=topic,
             table=table,
@@ -3193,6 +3304,7 @@ class TopicBuilderWorkflow:
 
     def _sample_profile(
         self,
+        table: str,
         schema: List[Dict[str, Any]],
         rows: List[Dict[str, Any]],
         request: TopicBuildRequest,
@@ -3204,6 +3316,8 @@ class TopicBuilderWorkflow:
         null_rates: Dict[str, float] = {}
         sample_values: Dict[str, List[Any]] = {}
         enum_candidates: Dict[str, List[Any]] = {}
+        enum_candidate_profiles: Dict[str, Dict[str, Any]] = {}
+        global_enum_profiles = self._load_global_enum_profiles(table, columns, request, enum_limit)
         for column in columns:
             values = [row.get(column) for row in rows if isinstance(row, dict)]
             total = len(values)
@@ -3226,8 +3340,29 @@ class TopicBuilderWorkflow:
                     unique_values.append(value)
                 if len(unique_values) > enum_limit:
                     break
-            if request.enum_discovery_enabled and 0 < len(unique_values) <= enum_limit and self._enum_candidate(column, unique_values):
-                enum_candidates[column] = unique_values
+            global_profile = global_enum_profiles.get(column) if isinstance(global_enum_profiles, dict) else None
+            global_values = []
+            if isinstance(global_profile, dict):
+                global_values = list(global_profile.get("values") or [])[:enum_limit]
+            elif isinstance(global_profile, list):
+                global_values = list(global_profile)[:enum_limit]
+            candidate_values = global_values or unique_values
+            non_null_count = max(0, total - missing)
+            if request.enum_discovery_enabled and 0 < len(candidate_values) <= enum_limit and (
+                bool(global_values) or self._enum_candidate(column, candidate_values, non_null_count)
+            ):
+                enum_candidates[column] = candidate_values
+                distinct_ratio = round(len(unique_values) / non_null_count, 4) if non_null_count else 0.0
+                enum_candidate_profiles[column] = {
+                    "discoverySource": "global_profile" if global_values else "sample",
+                    "distinctCount": len(candidate_values),
+                    "sampleDistinctRatio": distinct_ratio,
+                    "sampleRowCount": non_null_count,
+                    "exhaustive": bool(isinstance(global_profile, dict) and global_profile.get("exhaustive")),
+                    "coverage": float(global_profile.get("coverage") or 0.0) if isinstance(global_profile, dict) else 0.0,
+                    "reviewStatus": str(global_profile.get("reviewStatus") or "UNREVIEWED") if isinstance(global_profile, dict) else "UNREVIEWED",
+                    "confidence": round(0.9 if global_values else (0.72 if self._explicit_enum_column(column) else 0.5), 2),
+                }
         inferred_partition_candidates = [
             column
             for column in columns
@@ -3244,6 +3379,7 @@ class TopicBuilderWorkflow:
             "nullRates": null_rates,
             "sampleValues": sample_values,
             "enumCandidates": enum_candidates,
+            "enumCandidateProfiles": enum_candidate_profiles,
             "partitionColumns": partition_candidates,
             "primaryKeyColumns": [str(item) for item in physical_metadata.get("primaryKeyColumns") or [] if str(item) in columns],
             "bucketColumns": [str(item) for item in physical_metadata.get("bucketColumns") or [] if str(item) in columns],
@@ -3328,6 +3464,7 @@ class TopicBuilderWorkflow:
                 "metrics": existing.get("metrics") or [],
                 "terms": existing.get("terms") or [],
                 "knowledgeRules": existing.get("knowledgeRules") or [],
+                "tableUsageProfile": existing.get("tableUsageProfile") or {},
             },
             "heuristicDraft": heuristic,
         }
@@ -3338,6 +3475,8 @@ class TopicBuilderWorkflow:
             "指标必须引用真实存在的 sourceColumns；派生指标可以引用其他 metricKey。"
             "如果字段疑似手机号、邮箱、身份证、地址等敏感信息，请补充 visibilityPolicy 和 maskingPolicy；"
             "如果表有明确租户过滤列，请补充 rowAccessPolicy。"
+            "同时生成 tableUsageProfile，说明该表是否允许 Agent 查询、业务分层、权威度、"
+            "支持的分析意图/指标/维度，以及适合和不适合回答的问题。ODS、TMP、STG 技术表默认不可查询。"
         )
         try:
             payload = self.llm.tool_json_chat(system_prompt, json.dumps(prompt_payload, ensure_ascii=False), semantic_asset_builder_tool().openai_schema(), {})
@@ -3369,7 +3508,55 @@ class TopicBuilderWorkflow:
             "metrics": metrics,
             "terms": terms,
             "knowledgeRules": rules,
+            "tableUsageProfile": self._heuristic_table_usage_profile(table, schema, semantic_columns, metrics, str(existing.get("dataGrain") or self._infer_data_grain(schema))),
         }
+
+    def _heuristic_table_usage_profile(
+        self,
+        table: str,
+        schema: List[Dict[str, Any]],
+        semantic_columns: List[Dict[str, Any]],
+        metrics: List[Dict[str, Any]],
+        data_grain: str,
+    ) -> Dict[str, Any]:
+        layer = infer_business_layer(table)
+        metric_keys = [str(item.get("metricKey") or "") for item in metrics if isinstance(item, dict) and item.get("metricKey")]
+        dimensions = [
+            str(item.get("columnName") or "")
+            for item in semantic_columns
+            if isinstance(item, dict) and str(item.get("role") or "").upper() == "DIMENSION" and item.get("columnName")
+        ]
+        intents = ["DETAIL", "GROUP_AGG", "TREND"]
+        if metrics:
+            intents.extend(["METRIC", "TOPN"])
+        if metrics and dimensions:
+            intents.append("ROOT_CAUSE")
+        if "profile" in table.lower() or "画像" in data_grain:
+            intents.append("PROFILE")
+        recommended: List[str] = []
+        if metrics:
+            recommended.append("指标查询与趋势分析")
+        if metrics and dimensions:
+            recommended.append("按业务维度分组、TopN与原因下钻")
+        if "明细" in data_grain:
+            recommended.append("明细查询")
+        not_recommended: List[str] = []
+        if layer in {"ODS", "TMP", "STG"}:
+            not_recommended.append("面向商家的正式业务分析")
+        if "profile" in table.lower():
+            not_recommended.append("历史趋势与明细归因")
+        return normalize_table_usage_profile(
+            {
+                "businessLayer": layer,
+                "queryableByAgent": default_table_queryable(table, layer),
+                "supportedIntents": intents,
+                "supportedMetrics": metric_keys,
+                "supportedDimensions": dimensions,
+                "recommendedFor": recommended,
+                "notRecommendedFor": not_recommended,
+            },
+            table,
+        )
 
     def _heuristic_semantic_column(self, topic: str, column: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
         name = str(column.get("columnName") or "")
@@ -3384,6 +3571,7 @@ class TopicBuilderWorkflow:
             role = "DIMENSION"
         aliases = dedupe_strings([name, comment])
         enum_values = [str(item) for item in (profile.get("enumCandidates", {}).get(name) or [])[:20]]
+        enum_metadata = dict((profile.get("enumCandidateProfiles", {}) or {}).get(name) or {})
         sample_values = [str(item) for item in (profile.get("sampleValues", {}).get(name) or [])[:8]]
         evidence = ["schema comment=%s" % comment]
         if column.get("isPrimaryKey"):
@@ -3404,6 +3592,7 @@ class TopicBuilderWorkflow:
             "aliases": aliases,
             **display_policy,
             "enumValues": enum_values,
+            "enumMetadata": enum_metadata,
             "sampleValues": sample_values,
             "confidence": 0.62,
             "evidence": "; ".join(evidence),
@@ -3430,6 +3619,12 @@ class TopicBuilderWorkflow:
                         "businessName": comment,
                         "formula": formula,
                         "unit": unit,
+                        "currency": "CNY" if unit == "元" else "",
+                        "aggregation": "SUM",
+                        "timeColumn": str(profile.get("timeColumn") or ""),
+                        "requiredFilters": [],
+                        "conflictsWith": [],
+                        "clarificationQuestion": "",
                         "description": comment,
                         "sourceColumns": [name],
                         "aliases": dedupe_strings([comment, name]),
@@ -3446,6 +3641,11 @@ class TopicBuilderWorkflow:
                         "businessName": business_name,
                         "formula": "COUNT(DISTINCT %s)" % name,
                         "unit": "单",
+                        "aggregation": "COUNT_DISTINCT",
+                        "timeColumn": str(profile.get("timeColumn") or ""),
+                        "requiredFilters": [],
+                        "conflictsWith": [],
+                        "clarificationQuestion": "",
                         "description": "按%s去重计数" % comment,
                         "sourceColumns": [name],
                         "aliases": dedupe_strings([business_name, comment, metric_key]),
@@ -3462,6 +3662,11 @@ class TopicBuilderWorkflow:
                         "businessName": "记录数",
                         "formula": "COUNT(DISTINCT %s)" % first_key,
                         "unit": "条",
+                        "aggregation": "COUNT_DISTINCT",
+                        "timeColumn": str(profile.get("timeColumn") or ""),
+                        "requiredFilters": [],
+                        "conflictsWith": [],
+                        "clarificationQuestion": "",
                         "description": "按主键候选去重计数",
                         "sourceColumns": [first_key],
                         "aliases": ["记录数", "条数", "row_cnt"],
@@ -3652,13 +3857,41 @@ class TopicBuilderWorkflow:
             return {str(key): self._json_safe(item) for key, item in value.items()}
         return str(value)
 
-    def _enum_candidate(self, column: str, values: List[Any]) -> bool:
+    def _load_global_enum_profiles(
+        self,
+        table: str,
+        columns: List[str],
+        request: TopicBuildRequest,
+        enum_limit: int,
+    ) -> Dict[str, Any]:
+        provider = getattr(self.doris_repository, "profile_enum_candidates", None)
+        if not callable(provider) or not request.enum_discovery_enabled:
+            return {}
+        candidate_columns = [column for column in columns if self._explicit_enum_column(column)][:24]
+        if not candidate_columns:
+            return {}
+        try:
+            payload = provider(table, request.merchant_id or self.settings.merchant_id, candidate_columns, enum_limit)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _explicit_enum_column(self, column: str) -> bool:
         lowered = column.lower()
-        if lowered.endswith(("_status", "_status_name", "_type", "_type_name", "_code", "_name")):
+        tokens = ("status", "state", "type", "code", "flag", "level", "category", "reason", "channel", "source")
+        return lowered.startswith(("is_", "has_")) or any(token in lowered for token in tokens)
+
+    def _enum_candidate(self, column: str, values: List[Any], observed_count: int = 0) -> bool:
+        lowered = column.lower()
+        if lowered.endswith(("_id", "_url", "_uri", "_text", "_desc", "_description", "_remark", "_amount", "_amt", "_time", "_date")):
+            return False
+        if lowered.endswith("_name") and not self._explicit_enum_column(column):
+            return False
+        if self._explicit_enum_column(column):
             return True
-        if len(values) <= 8:
-            return True
-        return False
+        if not values or len(values) > 8 or observed_count < 4:
+            return False
+        return (len(values) / max(observed_count, 1)) <= 0.5
 
     def _infer_data_grain(self, schema: List[Dict[str, Any]]) -> str:
         columns = {str(item.get("columnName") or "").lower() for item in schema}
@@ -3734,6 +3967,20 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "description": {"type": "string"},
             "aliases": {"type": "array", "items": {"type": "string"}},
             "enumValues": {"type": "array", "items": {"type": "string"}},
+            "enumMetadata": {
+                "type": "object",
+                "properties": {
+                    "discoverySource": {"type": "string"},
+                    "distinctCount": {"type": "integer"},
+                    "sampleDistinctRatio": {"type": "number"},
+                    "sampleRowCount": {"type": "integer"},
+                    "exhaustive": {"type": "boolean"},
+                    "coverage": {"type": "number"},
+                    "reviewStatus": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "additionalProperties": False,
+            },
             "sampleValues": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
             "evidence": {"type": "string"},
@@ -3755,6 +4002,12 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "businessName": {"type": "string"},
             "formula": {"type": "string"},
             "unit": {"type": "string"},
+            "currency": {"type": "string"},
+            "aggregation": {"type": "string"},
+            "timeColumn": {"type": "string"},
+            "requiredFilters": {"type": "array", "items": {"type": "string"}},
+            "conflictsWith": {"type": "array", "items": {"type": "string"}},
+            "clarificationQuestion": {"type": "string"},
             "description": {"type": "string"},
             "sourceColumns": {"type": "array", "items": {"type": "string"}},
             "aliases": {"type": "array", "items": {"type": "string"}},
@@ -3790,6 +4043,21 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
         "required": ["title", "description"],
         "additionalProperties": False,
     }
+    table_usage_profile_schema = {
+        "type": "object",
+        "properties": {
+            "businessLayer": {"type": "string", "enum": ["ODS", "DWD", "DWM", "ADS", "DIM", "TMP", "STG", "UNKNOWN"]},
+            "queryableByAgent": {"type": "boolean"},
+            "authorityLevel": {"type": "integer"},
+            "supportedIntents": {"type": "array", "items": {"type": "string"}},
+            "supportedMetrics": {"type": "array", "items": {"type": "string"}},
+            "supportedDimensions": {"type": "array", "items": {"type": "string"}},
+            "recommendedFor": {"type": "array", "items": {"type": "string"}},
+            "notRecommendedFor": {"type": "array", "items": {"type": "string"}},
+            "exclusionReason": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
     return AgentToolDefinition(
         name="propose_semantic_asset",
         description="Generate candidate semantic-layer assets from schema, sample rows, and business notes.",
@@ -3801,6 +4069,7 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
                 "timeColumn": {"type": "string"},
                 "merchantFilterColumn": {"type": "string"},
                 "rowAccessPolicy": row_access_policy_schema,
+                "tableUsageProfile": table_usage_profile_schema,
                 "semanticColumns": {"type": "array", "items": semantic_column_schema},
                 "metrics": {"type": "array", "items": metric_schema},
                 "terms": {"type": "array", "items": term_schema},
@@ -4284,6 +4553,10 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_ALLOWED_ROLES", "column": column_name})
         if visibility.get("level") == "restricted" and masking.get("strategy") == "none":
             warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_MASKING", "column": column_name})
+        enum_values = field.get("enumValues") or []
+        enum_metadata = field.get("enumMetadata") if isinstance(field.get("enumMetadata"), dict) else {}
+        if enum_values and str(enum_metadata.get("reviewStatus") or "UNREVIEWED").upper() != "APPROVED":
+            warnings.append({"code": "ENUM_VALUES_NOT_BUSINESS_APPROVED", "column": column_name})
     for metric in metrics:
         if not isinstance(metric, dict):
             continue
@@ -4308,6 +4581,9 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             warnings.append({"code": "ALIAS_TARGET_NOT_IN_SAME_ASSET", "metricKey": metric_key, "aliasOf": alias_of})
         if canonical and canonical != metric_key:
             warnings.append({"code": "CANONICAL_METRIC_EXTERNAL_OR_ALIAS", "metricKey": metric_key, "canonicalMetricKey": canonical})
+        time_column = str(metric.get("timeColumn") or "").strip()
+        if time_column and time_column not in columns:
+            errors.append({"code": "METRIC_TIME_COLUMN_MISSING", "metricKey": metric_key, "column": time_column})
     for relationship in relationships:
         if not isinstance(relationship, dict):
             continue
@@ -4982,6 +5258,26 @@ def targeted_recall_terms(question: str) -> List[str]:
         if term and term not in terms:
             terms.append(term)
     return terms
+
+
+def infer_table_selection_intents(question: str) -> Set[str]:
+    text = str(question or "").lower()
+    intents: Set[str] = set()
+    if any(token in text for token in ["明细", "详情", "具体订单", "detail"]):
+        intents.add("DETAIL")
+    if any(token in text for token in ["趋势", "变化", "最近", "同比", "环比", "trend"]):
+        intents.add("TREND")
+    if any(token in text for token in ["为什么", "原因", "归因", "下钻", "影响", "root cause"]):
+        intents.add("ROOT_CAUSE")
+    if any(token in text for token in ["最高", "最低", "前", "top", "排名"]):
+        intents.add("TOPN")
+    if any(token in text for token in ["按", "分组", "各", "分别", "group"]):
+        intents.add("GROUP_AGG")
+    if any(token in text for token in ["画像", "概况", "当前状态", "profile"]):
+        intents.add("PROFILE")
+    if any(token in text for token in ["gmv", "金额", "数量", "订单量", "退款率", "客单价", "metric"]):
+        intents.add("METRIC")
+    return intents
 
 
 def table_seed_terms(question: str) -> List[str]:

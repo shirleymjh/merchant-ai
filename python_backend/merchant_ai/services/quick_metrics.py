@@ -8,8 +8,9 @@ from merchant_ai.models import ChatDataSection, ChatResponse
 from merchant_ai.services.cache import TTLCache, stable_cache_key
 
 
-COMPLEX_TERMS = ["哪些商品", "哪个商品", "类目", "渠道", "订单明细", "对应订单", "拆解", "归因"]
+COMPLEX_TERMS = ["明细", "详情", "列表", "记录", "对应", "关联", "拆解", "归因"]
 ANALYSIS_TERMS = ["为什么", "原因", "分析", "归因", "诊断", "异常", "建议"]
+DEFINITION_TERMS = ["口径", "定义", "含义", "什么意思", "是否扣", "怎么算", "计算方式"]
 SIMPLE_FORMULA = re.compile(r"^\s*(SUM|AVG|MAX|MIN)\s*\(\s*`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\)\s*$", re.I)
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 QUICK_RESPONSE_CACHE = TTLCache("quick_metric_response", max_entries=512, ttl_seconds=30)
@@ -24,6 +25,10 @@ def quick_metric_response(
 ) -> Optional[ChatResponse]:
     metric_phrases = list(getattr(extracted_keywords, "metric_keywords", None) or [])
     matched_metrics = resolve_metrics(question, semantic_metrics or [], metric_phrases)
+    if any(term in question for term in DEFINITION_TERMS):
+        if not matched_metrics:
+            matched_metrics = resolve_definition_metrics(question, semantic_metrics or [], metric_phrases)
+        return quick_metric_definition_response(question, merchant_id, matched_metrics)
     if structured_keywords_require_planner(extracted_keywords, matched_metrics) or "[用户附件上下文]" in question:
         return None
     if any(term in question for term in ANALYSIS_TERMS):
@@ -54,10 +59,23 @@ def quick_metric_response(
     time_column = metric["time_column"]
     tenant_column = metric["tenant_column"]
     rows = repository.query(
-        "SELECT `%s` AS pt, `%s` AS value FROM `%s` "
+        "SELECT `%s` AS pt, %s(`%s`) AS value FROM `%s` "
         "WHERE `%s`=%%s AND `%s` >= DATE_SUB((SELECT MAX(`%s`) FROM `%s` WHERE `%s`=%%s), INTERVAL %d DAY) "
-        "ORDER BY `%s`"
-        % (time_column, column, table, tenant_column, time_column, time_column, table, tenant_column, max(0, days - 1), time_column),
+        "GROUP BY `%s` ORDER BY `%s`"
+        % (
+            time_column,
+            aggregate,
+            column,
+            table,
+            tenant_column,
+            time_column,
+            time_column,
+            table,
+            tenant_column,
+            max(0, days - 1),
+            time_column,
+            time_column,
+        ),
         [merchant_id, merchant_id],
     )
     if not rows:
@@ -72,8 +90,9 @@ def quick_metric_response(
     peak = normalized_rows[peak_index]
     total_text = format_value(total, metric)
     advice = metric_advice(metric["label"])
+    time_label = time_range_label(question, days)
     answer = (
-        f"最近{days}天，店铺{metric['label']}合计为 {total_text}。\n\n"
+        f"{time_label}，店铺{metric['label']}合计为 {total_text}。\n\n"
         f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，整体{direction} {format_value(delta, metric)}；"
         f"峰值出现在 {peak['pt']}，为 {format_value(peak['value'], metric)}。\n\n"
         "建议：\n"
@@ -84,7 +103,7 @@ def quick_metric_response(
     traceability = {
         "sourceSummary": "Doris 快速指标查询",
         "merchantId": merchant_id,
-        "timeRange": f"最近{days}天",
+        "timeRange": time_label,
         "dataUpdatedAt": normalized_rows[-1]["pt"],
         "rowCount": len(normalized_rows),
         "sourceTables": [table],
@@ -93,7 +112,7 @@ def quick_metric_response(
     response = ChatResponse(
         id="quick_" + uuid.uuid4().hex,
         answer=answer,
-        category_name="电商交易",
+        category_name=metric_category_name(metric),
         persisted=False,
         doris_tables=[table],
         suggestions=suggestions,
@@ -112,10 +131,118 @@ def quick_metric_response(
             "traceability": traceability,
             "drillDownActions": [{"label": "继续下钻", "question": suggestions[0], "actionType": "follow_up_question"}],
         },
-        debug_trace={"quickMetricPath": True, "days": days, "metric": metric["label"], "semanticMetric": semantic_metric_identity(metric)},
+        debug_trace={
+            "quickMetricPath": True,
+            "days": days,
+            "metric": metric["label"],
+            "metricTerms": metric.get("terms") or [],
+            "semanticMetric": semantic_metric_identity(metric),
+        },
     )
     QUICK_RESPONSE_CACHE.set(cache_key, response.model_dump(by_alias=True))
     return response
+
+
+def quick_metric_definition_response(question: str, merchant_id: str, metrics: list[Dict[str, Any]]) -> Optional[ChatResponse]:
+    if not metrics:
+        return None
+    selected = metrics[:3]
+    disclosures = [semantic_metric_disclosure(metric) for metric in selected]
+    lines = ["当前语义层里，%s 的口径如下：" % "、".join(metric["label"] for metric in selected)]
+    for metric in selected:
+        lines.append(
+            "- %s：公式 `%s`，来源表 `%s`。%s"
+            % (
+                metric["label"],
+                metric["formula"],
+                metric["table"],
+                metric.get("description") or "暂无更细业务说明",
+            )
+        )
+    suggestions = metric_definition_suggestions(selected)
+    advice = metric_definition_advice(question, selected)
+    return ChatResponse(
+        id="quick_" + uuid.uuid4().hex,
+        answer="\n".join(lines),
+        category_name=metric_definition_category_name(selected),
+        persisted=False,
+        doris_tables=dedupe_texts([metric["table"] for metric in selected]),
+        suggestions=suggestions,
+        thinking_steps=["识别指标口径问题", "读取已发布语义指标", "生成口径说明"],
+        data_rows=[],
+        data_sections=[],
+        merchant_experience={
+            "version": "v1",
+            "businessAdvice": advice,
+            "suggestedQuestions": suggestions,
+            "anomalyAlerts": [],
+            "metricDisclosures": disclosures,
+            "traceability": {
+                "sourceSummary": "已发布语义指标口径",
+                "merchantId": merchant_id,
+                "sourceTables": dedupe_texts([metric["table"] for metric in selected]),
+                "evidenceStatus": "semantic_definition",
+            },
+            "drillDownActions": [{"label": "按该口径看趋势", "question": suggestions[0], "actionType": "follow_up_question"}],
+        },
+        debug_trace={
+            "quickMetricPath": True,
+            "definitionOnly": True,
+            "metricTerms": [term for metric in selected for term in (metric.get("terms") or [])],
+            "semanticMetrics": [semantic_metric_identity(metric) for metric in selected],
+        },
+    )
+
+
+def metric_definition_category_name(metrics: list[Dict[str, Any]]) -> str:
+    categories = dedupe_texts(metric_category_name(metric) for metric in metrics)
+    return "、".join(categories) if categories else "经营指标"
+
+
+def metric_definition_suggestions(metrics: list[Dict[str, Any]]) -> list[str]:
+    metric = metrics[0] if metrics else {}
+    label = str(metric.get("label") or metric.get("key") or "该指标").strip()
+    return [
+        "最近7天%s趋势" % label,
+        "昨天%s是多少？" % label,
+        "最近30天%s按天走势" % label,
+    ]
+
+
+def metric_definition_advice(question: str, metrics: list[Dict[str, Any]]) -> list[str]:
+    label = str((metrics[0] if metrics else {}).get("label") or "该指标").strip()
+    return ["后续分析请沿用“%s”的已发布语义口径。" % label, "把来源表、公式和单位一起展示，避免不同报表口径混用。"]
+
+
+def resolve_definition_metrics(
+    question: str,
+    semantic_metrics: list[Dict[str, Any]],
+    metric_phrases: Optional[list[str]] = None,
+) -> list[Dict[str, Any]]:
+    phrases = [str(item or "").strip() for item in (metric_phrases or []) if str(item or "").strip()]
+    if not phrases:
+        return []
+    candidates: list[tuple[int, Dict[str, Any]]] = []
+    for phrase in phrases[:3]:
+        for metric in semantic_metrics:
+            score = semantic_phrase_score(metric, phrase)
+            if score <= 0:
+                continue
+            candidates.append((score, metric))
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    result: list[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for _score, metric in candidates:
+        identity = (metric["table"], metric["key"], metric["formula"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(metric)
+        if len(result) >= 1:
+            break
+    return result
 
 
 def structured_keywords_require_planner(keywords: Any, matched_metrics: Optional[list[Dict[str, Any]]] = None) -> bool:
@@ -170,12 +297,24 @@ def quick_multi_metric_response(question: str, merchant_id: str, repository: Any
     cached = QUICK_RESPONSE_CACHE.get(cache_key)
     if isinstance(cached, dict):
         return fresh_cached_response(cached)
-    projections = ", ".join("`%s` AS `m%d`" % (metric["column"], index) for index, metric in enumerate(metrics))
+    projections = ", ".join("%s(`%s`) AS `m%d`" % (metric["agg"], metric["column"], index) for index, metric in enumerate(metrics))
     rows = repository.query(
         "SELECT `%s` AS pt, %s FROM `%s` "
         "WHERE `%s`=%%s AND `%s` >= DATE_SUB((SELECT MAX(`%s`) FROM `%s` WHERE `%s`=%%s), INTERVAL %d DAY) "
-        "ORDER BY `%s`"
-        % (time_column, projections, table, tenant_column, time_column, time_column, table, tenant_column, max(0, days - 1), time_column),
+        "GROUP BY `%s` ORDER BY `%s`"
+        % (
+            time_column,
+            projections,
+            table,
+            tenant_column,
+            time_column,
+            time_column,
+            table,
+            tenant_column,
+            max(0, days - 1),
+            time_column,
+            time_column,
+        ),
         [merchant_id, merchant_id],
     )
     if not rows:
@@ -199,13 +338,14 @@ def quick_multi_metric_response(question: str, merchant_id: str, repository: Any
         direction = "上升" if values[-1] > values[0] else "下降" if values[-1] < values[0] else "持平"
         summaries.append(f"{metric['label']}为 {format_value(total, metric)}，期末较期初{direction} {format_value(abs(values[-1] - values[0]), metric)}")
     labels = "、".join(metric["label"] for metric in metrics)
-    advice = [f"将{labels}放在同一时间轴观察，优先排查不同步变化的日期。", "对波动最大的日期下钻商品、订单和活动来源，确认变化是否来自交易增长或售后压力。"]
-    suggestions = [f"{labels}波动最大的日期有哪些？", f"最近{days}天哪些商品影响了{metrics[0]['label']}？", f"{labels}异常时客服工单有什么变化？"]
-    answer = f"最近{days}天，" + "；".join(summaries) + "。\n\n建议：\n- " + advice[0] + "\n- " + advice[1]
+    advice = [f"将{labels}放在同一时间轴观察，优先排查不同步变化的日期。", "对波动最大的日期按语义维度下钻，确认主要变化来源。"]
+    suggestions = [f"{labels}波动最大的日期有哪些？", f"最近{days}天{metrics[0]['label']}按维度拆解", f"{labels}异常原因是什么？"]
+    time_label = time_range_label(question, days)
+    answer = f"{time_label}，" + "；".join(summaries) + "。\n\n建议：\n- " + advice[0] + "\n- " + advice[1]
     response = ChatResponse(
         id="quick_" + uuid.uuid4().hex,
         answer=answer,
-        category_name="电商交易",
+        category_name=metric_category_name(metrics[0]),
         doris_tables=[table],
         suggestions=suggestions,
         thinking_steps=["识别多指标问题", "匹配统一数据表", "并行读取指标", "校验时间范围", "生成联动建议"],
@@ -220,7 +360,7 @@ def quick_multi_metric_response(question: str, merchant_id: str, repository: Any
             "traceability": {
                 "sourceSummary": "Doris 多指标快速查询",
                 "merchantId": merchant_id,
-                "timeRange": f"最近{days}天",
+                "timeRange": time_label,
                 "dataUpdatedAt": str(rows[-1].get("pt") or ""),
                 "rowCount": len(rows),
                 "sourceTables": [table],
@@ -233,6 +373,7 @@ def quick_multi_metric_response(question: str, merchant_id: str, repository: Any
             "multiMetric": True,
             "days": days,
             "metrics": [item["label"] for item in metrics],
+            "metricTerms": [term for item in metrics for term in (item.get("terms") or [])],
             "semanticMetrics": [semantic_metric_identity(item) for item in metrics],
         },
     )
@@ -309,10 +450,15 @@ def compile_semantic_quick_metric(
 def semantic_metric_identity(metric: Dict[str, Any]) -> Dict[str, str]:
     return {
         "topic": str(metric.get("topic") or ""),
+        "category": metric_topic_category(metric),
         "table": str(metric.get("table") or ""),
         "metricKey": str(metric.get("key") or ""),
         "formula": str(metric.get("formula") or ""),
     }
+
+
+def metric_topic_category(metric: Dict[str, Any]) -> str:
+    return str(metric.get("topic") or "")
 
 
 def semantic_metric_disclosure(metric: Dict[str, Any]) -> Dict[str, Any]:
@@ -323,6 +469,15 @@ def semantic_metric_disclosure(metric: Dict[str, Any]) -> Dict[str, Any]:
         "description": metric.get("description") or "来自已发布语义资产",
         "semanticRef": "%s/%s/%s" % (metric["topic"], metric["table"], metric["key"]),
     }
+
+
+def dedupe_texts(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def aggregate_values(values: list[float], aggregate: str) -> float:
@@ -398,8 +553,24 @@ def semantic_phrase_score(metric: Dict[str, Any], phrase: str) -> int:
 
 
 def extract_days(question: str) -> int:
+    if "昨天" in question or "昨日" in question:
+        return 1
+    if "今天" in question or "今日" in question:
+        return 1
     match = re.search(r"(?:最近|近)?\s*(\d{1,3})\s*天", question)
     return max(1, min(int(match.group(1)), 180)) if match else 7
+
+
+def time_range_label(question: str, days: int) -> str:
+    if "昨天" in question or "昨日" in question:
+        return "昨天"
+    if "今天" in question or "今日" in question:
+        return "今天"
+    return "最近%d天" % days
+
+
+def metric_category_name(metric: Dict[str, Any]) -> str:
+    return str(metric.get("topic") or "").strip() or "经营指标"
 
 
 def normalize_question(question: str) -> str:
@@ -424,19 +595,12 @@ def format_value(value: float, metric: Dict[str, Any]) -> str:
 
 
 def metric_advice(label: str) -> list[str]:
-    if "退款" in label:
-        return ["优先排查退款金额或退款率最高的商品和原因。", "同步查看客服工单与履约情况，处理集中出现的售后问题。"]
-    if "工单" in label:
-        return ["优先处理数量最多且仍在增长的工单类型。", "将高频问题沉淀为客服话术和商品说明，减少重复咨询。"]
-    if "订单量" in label:
-        return ["复盘订单量峰值日期对应的商品、活动和流量来源。", "将订单量与GMV、客单价和退款情况联动观察，判断变化来自流量还是转化。"]
-    return [f"复盘{label}峰值日期对应的商品、活动和流量来源。", f"建立{label}连续下滑预警，并与订单、退款指标联动观察。"]
+    return [f"复盘{label}峰值日期对应的主要维度。", f"将{label}与语义层中相关指标联动观察，确认变化来源。"]
 
 
 def metric_suggestions(label: str, days: int) -> list[str]:
-    comparison_metric = "GMV" if "订单量" in label else "订单量"
     return [
-        f"{label}波动最大的日期对应哪些商品？",
-        f"最近{days}天{label}和{comparison_metric}一起看",
-        f"{label}下降时退款和工单有什么变化？",
+        f"{label}波动最大的日期有哪些？",
+        f"最近{days}天{label}按维度拆解",
+        f"{label}异常原因是什么？",
     ]

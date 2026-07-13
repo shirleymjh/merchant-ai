@@ -270,6 +270,7 @@ class MerchantQaWorkflow:
             topic_routing_decision=TopicRoutingDecision(),
             topic_workspace={},
             analysis_scope={},
+            knowledge_refresh={},
             route_slots=RouteSlots(),
             route_decision_trace=[],
             clarification_resolution={},
@@ -774,6 +775,28 @@ class MerchantQaWorkflow:
         state["bounded_lead_llm_trace"] = trace
         if is_fast_gate:
             state["fast_gate_decision_trace"] = trace
+            fast_guard_reason = self.fast_gate_retrieval_guard_reason(state)
+            if fast_guard_reason:
+                action = self.policy.registry.get("retrieve_knowledge")
+                trace.update(
+                    {
+                        "status": "forced",
+                        "reason": fast_guard_reason,
+                        "selectedAction": "retrieve_knowledge",
+                        "historyAuthoritative": False,
+                        "knowledgeRefreshPolicy": "refresh_each_business_turn",
+                    }
+                )
+                state["fast_gate_decision_trace"] = trace
+                return AgentDecision(
+                    selected_action=action.id,
+                    selected_node=action.node,
+                    available_actions=allowed,
+                    reason=fast_guard_reason,
+                    budget_exhausted=decision.budget_exhausted,
+                    observation=str(observation.get("summary") or decision.observation),
+                    source="knowledge_refresh_guard",
+                )
         if mode in {"off", "false", "0", "disabled"}:
             return decision
         if len(allowed) <= 1:
@@ -879,6 +902,46 @@ class MerchantQaWorkflow:
             observation=str(observation.get("summary") or decision.observation),
             source="lead_llm_tool",
         )
+
+    def fast_gate_retrieval_guard_reason(self, state: AgentState) -> str:
+        route = state.get("routing_decision") or RoutingDecision()
+        if route.route != QuestionRoute.BUSINESS:
+            return ""
+        fast = state.get("fast_understanding") or FastUnderstandingResult()
+        slots = state.get("route_slots") or RouteSlots()
+        question = str(state.get("question") or "")
+        knowledge_sensitive_terms = [
+            "为什么",
+            "原因",
+            "归因",
+            "诊断",
+            "异常",
+            "建议",
+            "口径",
+            "规则",
+            "含义",
+            "什么意思",
+            "状态",
+            "status",
+            "枚举",
+        ]
+        if re.search(r"口径|定义|含义|什么意思|是否扣|怎么算|计算方式", question) and re.search(
+            r"gmv|销售额|成交额|订单|退款|退款率|工单|客诉|赔付",
+            question.lower(),
+        ):
+            return ""
+        if str(getattr(slots, "risk_level", "") or "") in {"rule_sensitive", "high_risk"}:
+            return "本轮问题涉及平台规则或业务口径，必须先刷新 Topic 知识，history 不作为权威依据"
+        topic_values = {enum_value(topic) for topic in list(getattr(fast, "topics", []) or [])}
+        if QuestionCategory.PLATFORM_RULE.value in topic_values:
+            return "本轮问题命中平台规则 Topic，必须走最新知识检索"
+        if str(getattr(fast, "intent_kind", "") or "") in {"rule_only", "rule_data_mix", "multi_hop"}:
+            return "本轮问题不是简单指标查询，必须走最新知识检索后再分析"
+        if str(getattr(fast, "intent_kind", "") or "") in {"analysis", "unknown"} and any(term in question for term in knowledge_sensitive_terms):
+            return "本轮问题涉及归因、口径或规则解释，必须走最新知识检索后再分析"
+        if str(getattr(fast, "complexity", "") or "") == "complex" and any(term in question for term in knowledge_sensitive_terms):
+            return "本轮问题复杂度较高，必须走最新知识检索后再规划"
+        return ""
 
     def lead_llm_action_catalog(self, action_ids: List[str]) -> List[str]:
         """Hide equivalent compatibility actions while retaining deterministic fallbacks."""
@@ -1365,7 +1428,7 @@ class MerchantQaWorkflow:
             for item in always_rules[:40]
         )
         state["knowledge_refresh"] = {
-            "policy": "refresh_each_user_turn",
+            "policy": "refresh_each_business_turn",
             "refreshedAt": datetime.now().isoformat(),
             "topics": list((state.get("topic_workspace") or {}).get("topics") or []),
             "alwaysApplyRuleCount": len(always_rules),
@@ -1472,7 +1535,7 @@ class MerchantQaWorkflow:
             "isolated": mode in {"single_topic", "topic_workspace"},
             "allowCrossTopic": mode == "topic_workspace",
             "scopeDisclosureRequired": decision.scope_disclosure_required,
-            "knowledgeRefreshPolicy": "refresh_each_user_turn",
+            "knowledgeRefreshPolicy": "refresh_each_business_turn",
         }
         state["topic_workspace"] = workspace
         state["analysis_scope"] = {
@@ -1649,6 +1712,7 @@ class MerchantQaWorkflow:
             self.record_span(state, "tool", "try_fast_metric", started, status="gap", error_code="FAST_UNSUPPORTED")
             self.finish_run_step(state, step, "gap", output_summary="unsupported -> Planner", error_code="FAST_UNSUPPORTED")
             return state
+        self.apply_turn_knowledge_refresh_to_fast_response(state, response)
         response.id = state["qa_id"]
         state["fast_metric_completed"] = True
         state["fast_metric_response"] = response
@@ -1680,6 +1744,48 @@ class MerchantQaWorkflow:
         )
         self.finish_run_step(state, step, "success", output_summary="fast metric accepted")
         return state
+
+    def apply_turn_knowledge_refresh_to_fast_response(self, state: AgentState, response: ChatResponse) -> None:
+        rules = list(state.get("always_apply_rules") or [])
+        refresh = {
+            **dict(state.get("knowledge_refresh") or {}),
+            "policy": "refresh_each_business_turn",
+            "historyAuthoritative": False,
+            "fastPathUsesLatestMandatoryRules": True,
+        }
+        public_rules = [
+            {
+                "topic": str(item.get("topic") or ""),
+                "tableName": str(item.get("tableName") or ""),
+                "title": str(item.get("title") or "强制规则"),
+                "content": str(item.get("content") or "")[:500],
+            }
+            for item in rules[:8]
+            if str(item.get("content") or "").strip()
+        ]
+        response.merchant_experience = dict(response.merchant_experience or {})
+        response.merchant_experience["knowledgeRefresh"] = refresh
+        if public_rules:
+            response.merchant_experience["platformRules"] = public_rules
+        response.debug_trace = dict(response.debug_trace or {})
+        response.debug_trace["knowledgeRefresh"] = {
+            **refresh,
+            "alwaysApplyRuleCount": len(rules),
+            "ruleRefs": [
+                "%s/%s/%s"
+                % (
+                    str(item.get("topic") or ""),
+                    str(item.get("tableName") or ""),
+                    str(item.get("ruleId") or item.get("title") or "rule"),
+                )
+                for item in rules[:12]
+            ],
+        }
+        steps = list(response.thinking_steps or [])
+        if "刷新本轮平台/Topic 强制规则" not in steps:
+            response.thinking_steps = ["刷新本轮平台/Topic 强制规则", *steps]
+        if rules:
+            add_step(state, "Fast Metric Knowledge Refresh：已将 %d 条本轮 Topic 强制规则注入快速指标答案" % len(rules))
 
     def merchant_clarification_need(self, state: AgentState, fast: FastUnderstandingResult) -> Dict[str, Any]:
         if not bool(getattr(self.settings, "merchant_clarification_enabled", True)):
@@ -1742,6 +1848,10 @@ class MerchantQaWorkflow:
     def question_needs_time_clarification(self, text: str, fast: FastUnderstandingResult) -> bool:
         lowered = (text or "").lower()
         if re.search(r"今天|昨日|昨天|近\d+天|最近\d+天|本周|上周|本月|上月|\d{4}[-/年]\d{1,2}", lowered):
+            return False
+        if re.search(r"口径|定义|含义|什么意思|是否扣|规则|枚举|status|状态", lowered):
+            return False
+        if fast.object_refs and re.search(r"明细|详情|记录|单号|流水|状态", lowered):
             return False
         if fast.intent_kind in {"detail_lookup"} and not re.search(r"趋势|变化|下降|上升|异常|表现|为什么|原因|归因|分析|多少|情况", lowered):
             return False
@@ -3334,18 +3444,25 @@ class MerchantQaWorkflow:
         executions: List[Dict[str, Any]] = []
         completed_by_fingerprint: Dict[str, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=max(1, min(max_parallel, len(representatives)))) as executor:
-            futures = {executor.submit(self._execute_hypothesis_plan, state, item): item for item in representatives}
+            futures = {
+                executor.submit(self._execute_hypothesis_plan, state, item): (
+                    item,
+                    query_plan_fingerprint(item.get("plan") or QueryPlan()),
+                )
+                for item in representatives
+            }
             for future in as_completed(futures):
-                item = futures[future]
+                item, fingerprint = futures[future]
                 try:
                     execution = future.result()
                 except Exception as exc:
                     execution = {**item, "runResult": AgentRunResult(), "executionError": str(exc)[:500]}
-                fingerprint = query_plan_fingerprint(item.get("plan") or QueryPlan())
                 completed_by_fingerprint[fingerprint] = execution
                 executions.append(execution)
         for fingerprint, items in grouped.items():
-            representative = completed_by_fingerprint[fingerprint]
+            representative = completed_by_fingerprint.get(fingerprint)
+            if representative is None:
+                continue
             for duplicate in items[1:]:
                 executions.append(self._reuse_hypothesis_execution(state, representative, duplicate))
         return executions
@@ -4696,7 +4813,7 @@ class MerchantQaWorkflow:
         if request_context and getattr(request_context, "user_identity", None):
             state["response_context"].user_identity = request_context.user_identity
         if fast_response is not None:
-            state["response_context"].category = str(getattr(fast_response, "category_name", "") or "电商交易")
+            state["response_context"].category = str(getattr(fast_response, "category_name", "") or joined_categories(state["plan"]))
             state["response_context"].topic = state["response_context"].category
             state["response_context"].topics = list(
                 (state.get("topic_routing_decision") or TopicRoutingDecision()).recall_topics()
@@ -4877,6 +4994,13 @@ class MerchantQaWorkflow:
         if not sections:
             data_rows = state["query_bundle"].rows
             tables = state["query_bundle"].tables
+        if not tables:
+            for task_result in (state.get("agent_run_result") or AgentRunResult()).task_results:
+                if task_result.query_bundle.failed:
+                    continue
+                for table in task_result.query_bundle.tables:
+                    if table and table not in tables:
+                        tables.append(table)
         if not state.get("merchant_experience"):
             state["merchant_experience"] = self.answer_service.merchant_experience(
                 state["question"],
@@ -5055,26 +5179,34 @@ class MerchantQaWorkflow:
             proposed_scope = str(item.get("scopeType") or payload.get("proposedScope") or "merchant").lower()
             if str(payload.get("memoryType") or "") == "metric_dispute":
                 proposed_scope = "platform"
-            allowed_actions = ["suggest", "skip"] if proposed_scope == "platform" else ["accept", "suggest", "skip"]
+            correction_text = str(payload.get("correctionText") or payload.get("question") or "")[:240]
+            title = str(payload.get("title") or item.get("metricName") or "业务知识")
+            if proposed_scope == "platform":
+                prompt = "这条内容涉及平台指标或公共口径，提交后需要平台审核。"
+                user_actions = [
+                    {"actionId": "submit_feedback", "label": "提交反馈", "style": "primary"},
+                    {"actionId": "dismiss", "label": "取消", "style": "secondary"},
+                ]
+                notice_type = "platform_feedback"
+            else:
+                prompt = "是否将这条规则用于本商家后续分析？"
+                user_actions = [
+                    {"actionId": "confirm_use", "label": "确认使用", "style": "primary"},
+                    {"actionId": "dismiss", "label": "暂不使用", "style": "secondary"},
+                ]
+                notice_type = "merchant_rule_confirmation"
             result.append(
                 {
                     "suggestionId": str(item.get("suggestionId") or ""),
-                    "type": str(item.get("suggestionType") or ""),
+                    "noticeType": notice_type,
                     "status": status,
                     "topic": str(item.get("topic") or ""),
                     "metricName": str(item.get("metricName") or ""),
-                    "title": str(payload.get("title") or item.get("metricName") or "业务知识"),
-                    "aliases": [str(value) for value in (item.get("aliases") or [])[:6]],
-                    "correctionText": str(payload.get("correctionText") or payload.get("question") or "")[:240],
+                    "title": title,
+                    "message": prompt,
+                    "ruleText": correction_text,
                     "evidenceQuote": str(payload.get("evidenceQuote") or "")[:240],
-                    "confidence": float(payload.get("confidence") or 0.0),
-                    "extractionMode": str(payload.get("extractionMode") or "rule"),
-                    "proposalKind": "knowledge",
-                    "classificationRequired": False,
-                    "scope": proposed_scope,
-                    "scopeType": proposed_scope,
-                    "allowedActions": allowed_actions,
-                    "reviewAction": "merchant_confirm_or_platform_suggest",
+                    "userActions": user_actions,
                 }
             )
             if len(result) >= limit:
@@ -6388,7 +6520,7 @@ def rule_recall_item(item: Any) -> bool:
     title = str(getattr(item, "title", "") or "")
     doc_id = str(getattr(item, "doc_id", "") or "")
     answer_modes = {part.strip() for part in re.split(r"[,|/]", answer_mode) if part.strip()}
-    if answer_modes & {"RULE", "RULE_ANSWER", "PLATFORM_RULE"}:
+    if answer_modes & {"RULE", "RULE_ANSWER", "PLATFORM_RULE", "RULE_REFERENCE"}:
         return True
     return source_type == "GOVERNED_RULE" and ("rule" in doc_id.lower() or "规则" in title)
 

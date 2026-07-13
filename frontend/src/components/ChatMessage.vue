@@ -323,6 +323,11 @@
               </tbody>
             </table>
           </div>
+          <button v-if="canBuildReport" type="button" class="analysis-report-entry" @click="reportOpen = true">
+            <span class="analysis-report-icon"><FileChartColumnIncreasing :size="20" /></span>
+            <span><b>生成经营分析报告</b><small>把本轮结果整理成可汇报、可下载的 HTML</small></span>
+            <ArrowRight :size="17" />
+          </button>
           <div v-if="id" class="message-actions">
             <button
               type="button"
@@ -385,6 +390,7 @@
           </div>
         </section>
       </div>
+      <MerchantAnalysisReport v-if="reportOpen" :report="analysisReport" @close="reportOpen = false" />
       <div v-if="toastMessage" class="app-toast">{{ toastMessage }}</div>
     </Teleport>
   </article>
@@ -392,7 +398,9 @@
 
 <script setup>
 import { computed, ref } from 'vue'
-import { AlertTriangle, ArrowRight, BookOpenCheck, Check, CheckCircle2, Copy, Download, Filter, Info, Maximize2, Sparkles, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
+import { AlertTriangle, ArrowRight, BookOpenCheck, Check, CheckCircle2, Copy, Download, FileChartColumnIncreasing, Filter, Info, Maximize2, Sparkles, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
+import { buildAnalysisReport, hasAnalysisReportContent } from '../api/analysisReport'
+import MerchantAnalysisReport from './MerchantAnalysisReport.vue'
 import MetricLineChart from './MetricLineChart.vue'
 
 const props = defineProps({
@@ -405,6 +413,10 @@ const props = defineProps({
   text: {
     type: String,
     required: true
+  },
+  question: {
+    type: String,
+    default: ''
   },
   steps: {
     type: Array,
@@ -449,12 +461,22 @@ const displayTime = new Date().toLocaleString('zh-CN', {
 
 const toastMessage = ref('')
 const expandedTable = ref(null)
+const reportOpen = ref(false)
 const tableFilters = ref({})
 let toastTimer = null
 
 const experienceAlerts = computed(() => (props.merchantExperience?.anomalyAlerts || []).filter(Boolean).slice(0, 3))
 const businessAdvice = computed(() => (props.merchantExperience?.businessAdvice || []).filter(Boolean).slice(0, 2))
 const drillDownActions = computed(() => (props.merchantExperience?.drillDownActions || []).filter(action => action?.question).slice(0, 4))
+const analysisReport = computed(() => buildAnalysisReport({
+  question: props.question,
+  answer: props.text,
+  tables: props.tables,
+  dataRows: props.dataRows,
+  dataSections: props.dataSections,
+  merchantExperience: props.merchantExperience
+}))
+const canBuildReport = computed(() => hasAnalysisReportContent(analysisReport.value))
 const analysisScope = computed(() => props.merchantExperience?.analysisScope || {})
 const analysisScopeVisible = computed(() => Boolean(
   analysisScope.value?.scopeDisclosureRequired || analysisScope.value?.mode === 'topic_workspace'

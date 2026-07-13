@@ -135,6 +135,48 @@ class DorisRepository:
         safe_table = safe_identifier(table_name)
         return self.query("SELECT * FROM `%s` LIMIT %s" % (safe_table, max(1, min(limit, 100))))
 
+    def profile_enum_candidates(
+        self,
+        table_name: str,
+        merchant_id: str,
+        columns: List[str],
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """Discover low-cardinality values from a bounded Doris table sample.
+
+        Business meanings are deliberately not inferred here; discovered values stay
+        UNREVIEWED until the semantic asset is enriched from governed business knowledge.
+        """
+        safe_table = safe_identifier(table_name)
+        value_limit = max(1, min(int(limit or 20), 100))
+        result: Dict[str, Any] = {}
+        for raw_column in list(columns or [])[:24]:
+            safe_column = safe_identifier(str(raw_column))
+            sample_source = "`%s` TABLESAMPLE(10 PERCENT)" % safe_table
+            stats = self.query_one(
+                "SELECT COUNT(`%s`) AS scanned_rows, COUNT(DISTINCT `%s`) AS distinct_count FROM %s"
+                % (safe_column, safe_column, sample_source)
+            )
+            distinct_count = int(stats.get("distinct_count") or 0)
+            scanned_rows = int(stats.get("scanned_rows") or 0)
+            if distinct_count <= 0 or distinct_count > value_limit:
+                continue
+            rows = self.query(
+                "SELECT `%s` AS enum_value, COUNT(*) AS value_count FROM %s "
+                "WHERE `%s` IS NOT NULL GROUP BY `%s` ORDER BY value_count DESC LIMIT %s"
+                % (safe_column, sample_source, safe_column, safe_column, value_limit)
+            )
+            result[str(raw_column)] = {
+                "values": [row.get("enum_value") for row in rows if row.get("enum_value") is not None],
+                "counts": {str(row.get("enum_value")): int(row.get("value_count") or 0) for row in rows if row.get("enum_value") is not None},
+                "scannedRows": scanned_rows,
+                "distinctCount": distinct_count,
+                "coverage": 0.1,
+                "exhaustive": False,
+                "reviewStatus": "UNREVIEWED",
+            }
+        return result
+
     def clear_cache(self) -> None:
         self.query_cache.clear()
 

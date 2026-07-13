@@ -444,6 +444,7 @@ class TopicBuildRequest(APIModel):
     enum_discovery_enabled: bool = True
     enum_value_limit: int = 20
     schema_ddl: str = ""
+    table_usage_overrides: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TopicReviewRequest(APIModel):

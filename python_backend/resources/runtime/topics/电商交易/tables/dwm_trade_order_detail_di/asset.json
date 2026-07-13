@@ -5451,6 +5451,20 @@
       "evidence": "来自字段 `sku_spec` 的语义注释"
     },
     {
+      "term": "订单",
+      "description": "交易订单、子订单及下单记录",
+      "aliases": [
+        "订单",
+        "子订单",
+        "下单"
+      ],
+      "relatedColumns": [
+        "sub_order_id",
+        "order_id"
+      ],
+      "evidence": "语义层业务对象"
+    },
+    {
       "term": "GMV",
       "description": "交易成交金额，优先使用语义层中的 GMV 指标字段或公式",
       "aliases": [

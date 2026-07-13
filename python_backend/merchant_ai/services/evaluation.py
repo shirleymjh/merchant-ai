@@ -189,6 +189,10 @@ class GoldenEvaluationService:
                 trace.get("planningAssetPack") or {},
                 trace.get("plannerLoadedRefs") or [],
                 trace.get("metricResolution") or {},
+                trace.get("semanticMetric") or {},
+                trace.get("semanticMetrics") or [],
+                trace.get("metricTerms") or [],
+                {"quickMetricPath": trace.get("quickMetricPath"), "metric": trace.get("metric"), "days": trace.get("days")},
             ]
         )
         reasons = []
@@ -201,7 +205,13 @@ class GoldenEvaluationService:
         intents = self._plan_intents(trace)
         deps = self._dependencies(trace)
         understanding = self._question_understanding(trace)
-        blob = self._trace_blob([intents, deps, understanding])
+        quick_context = [
+            trace.get("semanticMetric") or {},
+            trace.get("semanticMetrics") or [],
+            trace.get("metricTerms") or [],
+            {"quickMetricPath": trace.get("quickMetricPath"), "metric": trace.get("metric"), "days": trace.get("days")},
+        ]
+        blob = self._trace_blob([intents, deps, understanding, *quick_context])
         reasons = []
         reasons.extend(self._missing_terms(case.get("expectedTables") or [], blob, "table"))
         reasons.extend(self._missing_terms(case.get("expectedMetrics") or [], blob, "metric"))
@@ -209,7 +219,7 @@ class GoldenEvaluationService:
         if expected_days and str(expected_days) not in blob:
             reasons.append("missing_time_window:%s" % expected_days)
         for item in case.get("expectedFilters") or []:
-            if self._normalize(item) not in blob:
+            if self._normalize(item) not in blob and not self._expected_filter_present(item, [intents, deps, understanding, self._task_results(trace)]):
                 reasons.append("missing_filter:%s" % item)
         expected_graph = case.get("expectedGraph") or {}
         if expected_graph.get("hasAnchor") and not intents:
@@ -234,6 +244,18 @@ class GoldenEvaluationService:
         if not task_results and not expects_data_execution:
             return self._layer(True, [])
         reasons = []
+        if expects_data_execution and not task_results and bool(trace.get("quickMetricPath")):
+            blob = self._trace_blob(
+                [
+                    trace.get("semanticMetric") or {},
+                    trace.get("semanticMetrics") or [],
+                    trace.get("metricTerms") or [],
+                    {"quickMetricPath": True, "metric": trace.get("metric"), "days": trace.get("days")},
+                ]
+            )
+            reasons.extend(self._missing_terms(expected_tables, blob, "table"))
+            reasons.extend(self._missing_terms(case.get("expectedMetrics") or [], blob, "metric"))
+            return self._layer(not reasons, reasons)
         if expects_data_execution and not task_results:
             reasons.append("missing_task_results")
         for item in task_results:
@@ -570,6 +592,16 @@ class GoldenEvaluationService:
 
     def _missing_terms(self, terms: Iterable[Any], blob: str, label: str) -> List[str]:
         return ["missing_%s:%s" % (label, term) for term in terms if self._normalize(term) not in blob]
+
+    def _expected_filter_present(self, expected_filter: Any, values: List[Any]) -> bool:
+        text = str(expected_filter or "")
+        if "=" not in text:
+            return False
+        column, value = [self._normalize(item) for item in text.split("=", 1)]
+        if not column or not value:
+            return False
+        blob = self._trace_blob(values)
+        return column in blob and value in blob
 
     def _trace_blob(self, values: List[Any]) -> str:
         return self._normalize(json.dumps(values, ensure_ascii=False, default=str, sort_keys=True))

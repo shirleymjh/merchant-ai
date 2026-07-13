@@ -24,10 +24,21 @@ def format_metric_value_for_answer(value: Any, metric_key: str, label: str = "")
     if numeric is None:
         return text
     metric_text = "%s %s" % (metric_key or "", label or "")
+    if re.search(r"(rate|ratio|比例|占比|率)", metric_text, flags=re.I):
+        percent = numeric * 100 if abs(numeric) <= 1 else numeric
+        if float(percent).is_integer():
+            return "%s%%" % int(percent)
+        return ("%.2f%%" % percent).replace(".00%", "%")
+    if re.search(r"(cnt|count|num|数量|单量|订单量|工单量|用户量|件数|人数)", metric_text, flags=re.I):
+        if float(numeric).is_integer():
+            return str(int(numeric))
+        return text
     if re.search(r"(gmv|amt|amount|金额|赔付|退款|优惠|补贴)", metric_text, flags=re.I):
         if float(numeric).is_integer():
             return "%s元" % int(numeric)
         return ("%s元" % ("%.2f" % numeric)).replace(".00元", "元")
+    if float(numeric).is_integer():
+        return str(int(numeric))
     return text
 
 

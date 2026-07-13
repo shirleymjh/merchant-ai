@@ -1319,5 +1319,19 @@
     ],
     "relatedColumns": [],
     "evidence": "由表名/字段语义自动沉淀"
+  },
+  {
+    "term": "退款率",
+    "description": "退款或退货占订单基数的比例",
+    "aliases": [
+      "退款率",
+      "退货率",
+      "整体退款率"
+    ],
+    "relatedColumns": [
+      "refund_id",
+      "sub_order_id"
+    ],
+    "evidence": "语义层业务对象"
   }
 ]

@@ -1517,6 +1517,10 @@ class ToolRuntimeService:
                         next_heartbeat_at = now + heartbeat_interval
         except TimeoutError as exc:
             future.cancel()
+            if future.done():
+                original = future.exception()
+                if isinstance(original, TimeoutError):
+                    raise original
             raise TimeoutError("tool execution timed out") from exc
         finally:
             executor.shutdown(wait=False, cancel_futures=True)

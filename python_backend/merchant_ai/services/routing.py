@@ -21,39 +21,6 @@ from merchant_ai.models import (
 )
 
 
-BUSINESS_KEYWORDS: Dict[QuestionCategory, List[str]] = {
-    QuestionCategory.TRADE: [
-        "订单",
-        "子订单",
-        "下单",
-        "下单数",
-        "下单量",
-        "订单数",
-        "订单量",
-        "order",
-        "order_detail_cnt",
-        "销量",
-        "交易",
-        "gmv",
-        "GMV",
-        "支付",
-        "成交",
-        "客单价",
-        "签收",
-        "发货超时",
-        "物流超时",
-    ],
-    QuestionCategory.REFUND: ["退款", "退货", "售后", "退款率", "退货率", "refund", "refund_rate", "refund_bill_cnt"],
-    QuestionCategory.CS_TICKET: ["工单", "客服", "催单", "二次开启", "评价分", "ticket", "cs_ticket"],
-    QuestionCategory.COMPENSATION: ["赔付", "赔款", "理赔", "补偿", "repay", "compensation"],
-    QuestionCategory.COUPON: ["优惠", "优惠券", "券", "券活动", "折扣", "补贴", "coupon", "activity"],
-    QuestionCategory.GOODS: ["商品", "审核", "上架", "spu", "sku", "类目", "资质", "新发布", "goods"],
-    QuestionCategory.SCM: ["供应链", "履约", "入库", "质检", "鉴定", "出库", "仓库", "scm"],
-    QuestionCategory.MERCHANT_OTHER: ["保证金", "申诉", "处罚", "费率", "结算"],
-    QuestionCategory.IDENTITY: ["营业执照", "统一社会信用代码", "公司名称", "联系人", "地址", "银行卡", "开户行", "发票"],
-    QuestionCategory.PLATFORM_RULE: ["规则", "处罚规则", "平台规则", "要求", "标准"],
-}
-
 ACTION_KEYWORDS = [
     "为什么",
     "原因",
@@ -89,47 +56,11 @@ ACTION_KEYWORDS = [
     "最多",
     "最少",
 ]
-DIMENSION_KEYWORDS: Dict[str, Dict[str, Any]] = {
-    "商品": {"key": "spu_id", "topic": QuestionCategory.GOODS},
-    "spu": {"key": "spu_id", "topic": QuestionCategory.GOODS},
-    "sku": {"key": "sku_id", "topic": QuestionCategory.GOODS},
-    "类目": {"key": "category", "topic": QuestionCategory.GOODS},
-    "渠道": {"key": "channel", "topic": QuestionCategory.TRADE},
-    "日期": {"key": "pt", "topic": QuestionCategory.UNKNOWN},
-    "每天": {"key": "pt", "topic": QuestionCategory.UNKNOWN},
-    "按天": {"key": "pt", "topic": QuestionCategory.UNKNOWN},
-    "退款原因": {"key": "refund_reason", "topic": QuestionCategory.REFUND},
-    "退货原因": {"key": "refund_reason", "topic": QuestionCategory.REFUND},
-    "工单类型": {"key": "ticket_type", "topic": QuestionCategory.CS_TICKET},
-    "处罚类型": {"key": "punish_type", "topic": QuestionCategory.MERCHANT_OTHER},
-}
 RANKING_PATTERNS = [
     re.compile(r"前\s*\d+"),
     re.compile(r"top\s*\d+", re.I),
     re.compile(r"最高|最低|最多|最少|排名|排行"),
 ]
-GENERIC_METRIC_ALIASES = {
-    "金额",
-    "数量",
-    "次数",
-    "总量",
-    "占比",
-    "比例",
-    "平均值",
-    "最大值",
-    "最小值",
-    "订单",
-    "支付",
-    "交易",
-    "退款",
-    "退货",
-    "商品",
-    "优惠",
-    "工单",
-    "客服",
-    "赔付",
-    "保证金",
-}
 TIME_PATTERNS = [
     re.compile(r"(最近|近|过去|前)?\s*\d{1,3}\s*[天日]"),
     re.compile(r"(最近|近|过去|前)?\s*\d{1,2}\s*(周|星期|礼拜)"),
@@ -137,15 +68,33 @@ TIME_PATTERNS = [
 ]
 
 
+def default_topic_assets() -> Any:
+    try:
+        from merchant_ai.config import get_settings
+        from merchant_ai.services.assets import TopicAssetService
+
+        return TopicAssetService(get_settings())
+    except Exception:
+        return None
+
+
 class KeywordExtractService:
     def __init__(self, topic_assets: Any = None):
-        self.topic_assets = topic_assets
-        self._semantic_metrics = self._build_semantic_metric_lexicon(topic_assets)
+        self.topic_assets = topic_assets or default_topic_assets()
+        self._semantic_metrics = self._build_semantic_metric_lexicon(self.topic_assets)
         self._semantic_matcher = PhraseMatcher(list(self._semantic_metrics))
+        self._semantic_topics = self._build_semantic_topic_lexicon(self.topic_assets)
+        self._semantic_topic_matcher = PhraseMatcher(list(self._semantic_topics))
+        self._semantic_dimensions = self._build_semantic_dimension_lexicon(self.topic_assets)
+        self._semantic_dimension_matcher = PhraseMatcher(list(self._semantic_dimensions))
 
     def reload_semantic_lexicon(self) -> None:
         self._semantic_metrics = self._build_semantic_metric_lexicon(self.topic_assets)
         self._semantic_matcher = PhraseMatcher(list(self._semantic_metrics))
+        self._semantic_topics = self._build_semantic_topic_lexicon(self.topic_assets)
+        self._semantic_topic_matcher = PhraseMatcher(list(self._semantic_topics))
+        self._semantic_dimensions = self._build_semantic_dimension_lexicon(self.topic_assets)
+        self._semantic_dimension_matcher = PhraseMatcher(list(self._semantic_dimensions))
 
     def extract(self, question: str) -> ExtractedKeywords:
         text = question or ""
@@ -157,7 +106,7 @@ class KeywordExtractService:
         time_words: List[str] = []
         for pattern in TIME_PATTERNS:
             time_words.extend(match.group(0).strip() for match in pattern.finditer(text))
-        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月", "这个月"]:
+        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]:
             if word in text and word not in time_words:
                 time_words.append(word)
         ranking = [match.group(0).strip() for pattern in RANKING_PATTERNS for match in pattern.finditer(normalized)]
@@ -180,22 +129,18 @@ class KeywordExtractService:
         dimension_keywords = dedupe_ordered([item.phrase for item in dimension_mentions])
         business = (
             dedupe_ordered([*metric_keywords, *dimension_keywords, *topic_keywords])
-            if self._semantic_metrics
-            else legacy_business_matches(text)
+            if (self._semantic_metrics or self._semantic_topics or self._semantic_dimensions)
+            else []
         )
         keywords: List[str] = []
-        keyword_actions = action if self._semantic_metrics else legacy_recall_actions(action)
-        keyword_ranking = ranking if self._semantic_metrics else []
+        keyword_actions = action if business else []
+        keyword_ranking = ranking if business else []
         for item in business + time_words + keyword_actions + keyword_ranking:
             if item and item not in keywords:
                 keywords.append(item)
         analysis_intent = classify_analysis_intent(normalized, action, ranking)
         confidence = keyword_confidence(topic_scores, metric_mentions, dimension_mentions, normalized, ambiguous_metrics)
-        unresolved = [
-            phrase
-            for phrase in ["上面", "上述", "这个", "那个", "它们", "这些", "前面"]
-            if phrase in normalized and not metric_mentions
-        ]
+        unresolved: List[str] = []
         return ExtractedKeywords(
             normalized_question=normalized,
             keywords=keywords,
@@ -221,18 +166,23 @@ class KeywordExtractService:
         )
 
     def _topic_mentions(self, normalized: str) -> List[KeywordMention]:
+        if self._semantic_topics:
+            return self._semantic_topic_mentions(normalized)
+        return []
+
+    def _semantic_topic_mentions(self, normalized: str) -> List[KeywordMention]:
         mentions: List[KeywordMention] = []
-        for category, words in BUSINESS_KEYWORDS.items():
-            for phrase in longest_distinct_matches(normalized, words):
+        for phrase in self._semantic_topic_matcher.match(normalized):
+            for entry in self._semantic_topics.get(normalize_keyword_text(phrase), [])[:6]:
                 mentions.append(
                     KeywordMention(
                         phrase=phrase,
-                        canonical_key=category.value,
+                        canonical_key=str(entry.get("topic") or QuestionCategory.UNKNOWN.value),
                         display_name=phrase,
                         kind="topic",
-                        topic=category,
-                        score=1.5,
-                        source="routing_lexicon",
+                        topic=entry.get("category") or QuestionCategory.UNKNOWN,
+                        score=float(entry.get("score") or 1.5),
+                        source="semantic_topic",
                     )
                 )
         return mentions
@@ -258,20 +208,26 @@ class KeywordExtractService:
         return mentions
 
     def _dimension_mentions(self, normalized: str) -> List[KeywordMention]:
+        if self._semantic_dimensions:
+            return self._semantic_dimension_mentions(normalized)
+        return []
+
+    def _semantic_dimension_mentions(self, normalized: str) -> List[KeywordMention]:
         mentions: List[KeywordMention] = []
-        for phrase in longest_distinct_matches(normalized, list(DIMENSION_KEYWORDS)):
-            entry = DIMENSION_KEYWORDS[phrase.lower() if phrase.lower() in DIMENSION_KEYWORDS else phrase]
-            mentions.append(
-                KeywordMention(
-                    phrase=phrase,
-                    canonical_key=str(entry["key"]),
-                    display_name=phrase,
-                    kind="dimension",
-                    topic=entry["topic"],
-                    score=2.0,
-                    source="dimension_lexicon",
+        for phrase in self._semantic_dimension_matcher.match(normalized):
+            for entry in self._semantic_dimensions.get(normalize_keyword_text(phrase), [])[:6]:
+                topic = entry.get("category") or QuestionCategory.UNKNOWN
+                mentions.append(
+                    KeywordMention(
+                        phrase=phrase,
+                        canonical_key=str(entry.get("column") or ""),
+                        display_name=phrase,
+                        kind="dimension",
+                        topic=topic,
+                        score=float(entry.get("score") or 2.0),
+                        source="semantic_column",
+                    )
                 )
-            )
         return mentions
 
     def _topic_scores(self, mentions: List[KeywordMention]) -> Dict[str, float]:
@@ -318,6 +274,78 @@ class KeywordExtractService:
                             for item in lexicon[phrase]
                         ):
                             lexicon[phrase].append(payload)
+        return dict(lexicon)
+
+    def _build_semantic_topic_lexicon(self, topic_assets: Any) -> Dict[str, List[Dict[str, Any]]]:
+        if topic_assets is None:
+            return {}
+        lexicon: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for topic_name in topic_assets.all_topic_names():
+            category = TOPIC_TO_CATEGORY.get(topic_name, QuestionCategory.UNKNOWN)
+            for phrase in semantic_alias_phrases([topic_name]):
+                add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "score": 1.8})
+            for manifest_item in topic_assets.load_manifest(topic_name):
+                table = str(manifest_item.get("tableName") or "")
+                labels = [
+                    table,
+                    str(manifest_item.get("tableComment") or ""),
+                    str(manifest_item.get("dataGrain") or ""),
+                ]
+                for phrase in semantic_alias_phrases(labels):
+                    add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "table": table, "score": 1.6})
+                for metric in topic_assets.load_table_metrics(topic_name, table):
+                    labels = [
+                        str(metric.get("businessName") or ""),
+                        str(metric.get("metricKey") or ""),
+                        *[str(alias) for alias in metric.get("aliases") or []],
+                    ]
+                    for phrase in semantic_alias_phrases(labels):
+                        add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "table": table, "score": 1.4})
+                for field in topic_assets.load_table_semantic_columns(topic_name, table):
+                    labels = [
+                        str(field.get("businessName") or ""),
+                        str(field.get("columnName") or ""),
+                        *[str(alias) for alias in field.get("aliases") or []],
+                    ]
+                    for phrase in semantic_alias_phrases(labels):
+                        add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "table": table, "score": 1.2})
+                for term in topic_assets.load_table_terms(topic_name, table):
+                    labels = [
+                        str(term.get("term") or ""),
+                        *[str(alias) for alias in term.get("aliases") or []],
+                    ]
+                    for phrase in semantic_alias_phrases(labels):
+                        add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "table": table, "score": 1.5})
+        return dict(lexicon)
+
+    def _build_semantic_dimension_lexicon(self, topic_assets: Any) -> Dict[str, List[Dict[str, Any]]]:
+        if topic_assets is None:
+            return {}
+        lexicon: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for topic_name in topic_assets.all_topic_names():
+            category = TOPIC_TO_CATEGORY.get(topic_name, QuestionCategory.UNKNOWN)
+            for manifest_item in topic_assets.load_manifest(topic_name):
+                table = str(manifest_item.get("tableName") or "")
+                for field in topic_assets.load_table_semantic_columns(topic_name, table):
+                    column = str(field.get("columnName") or "")
+                    if not column:
+                        continue
+                    role = str(field.get("role") or "").upper()
+                    if role not in {"KEY", "DIMENSION", "TIME"}:
+                        continue
+                    labels = [
+                        str(field.get("businessName") or ""),
+                        column,
+                        str(field.get("description") or ""),
+                        *[str(alias) for alias in field.get("aliases") or []],
+                    ]
+                    score = 2.2
+                    for phrase in semantic_alias_phrases(labels):
+                        add_semantic_lexicon_entry(
+                            lexicon,
+                            phrase,
+                            {"topic": topic_name, "category": category, "table": table, "column": column, "score": score},
+                        )
         return dict(lexicon)
 
 
@@ -377,10 +405,42 @@ def valid_phrase_boundary(text: str, start: int, end: int, phrase: str) -> bool:
 
 
 def valid_metric_alias(phrase: str) -> bool:
-    if not phrase or phrase in GENERIC_METRIC_ALIASES:
+    if not phrase:
         return False
     compact = phrase.replace("_", "").replace(" ", "")
     return len(compact) >= 2
+
+
+def add_semantic_lexicon_entry(lexicon: Dict[str, List[Dict[str, Any]]], phrase: str, payload: Dict[str, Any]) -> None:
+    key = normalize_keyword_text(phrase)
+    if not valid_metric_alias(key):
+        return
+    identity = (
+        str(payload.get("topic") or ""),
+        str(payload.get("table") or ""),
+        str(payload.get("column") or payload.get("metricKey") or ""),
+    )
+    if any(
+        (
+            str(item.get("topic") or ""),
+            str(item.get("table") or ""),
+            str(item.get("column") or item.get("metricKey") or ""),
+        )
+        == identity
+        for item in lexicon[key]
+    ):
+        return
+    lexicon[key].append(payload)
+
+
+def semantic_alias_phrases(labels: List[str]) -> List[str]:
+    phrases: List[str] = []
+    for label in labels:
+        text = normalize_keyword_text(str(label or ""))
+        if not text:
+            continue
+        phrases.append(text)
+    return dedupe_ordered(phrases)
 
 
 def phrase_spans(text: str, phrase: str) -> List[tuple[int, int]]:
@@ -422,21 +482,6 @@ def dedupe_ordered(items: List[str]) -> List[str]:
         if value and value not in result:
             result.append(value)
     return result
-
-
-def legacy_business_matches(text: str) -> List[str]:
-    matches: List[str] = []
-    lowered = str(text or "").lower()
-    for words in BUSINESS_KEYWORDS.values():
-        for word in words:
-            if word.lower() in lowered and word not in matches:
-                matches.append(word)
-    return matches
-
-
-def legacy_recall_actions(actions: List[str]) -> List[str]:
-    added_actions = {"建议", "优化", "改善", "怎么办", "排查", "明细", "详情", "最高", "最低", "最多", "最少"}
-    return [action for action in actions if action not in added_actions]
 
 
 def dedupe_mentions(items: List[KeywordMention]) -> List[KeywordMention]:
@@ -534,8 +579,6 @@ class QuestionRoutingService:
             return RoutingDecision(route=QuestionRoute.INVALID, reason="空问题")
         if re.match(r"^(你好|您好|hi|hello|hey|在吗|嗨|哈喽|早上好|下午好|晚上好)[!！。,.，\s]*$", normalized, re.I):
             return RoutingDecision(route=QuestionRoute.GREETING, reason="寒暄问题")
-        if self._is_store_overview_question(normalized):
-            return RoutingDecision(route=QuestionRoute.BUSINESS, complex=True, reason="店铺整体经营问题")
         if self._is_ambiguous_question(normalized, keywords, recall_bundle):
             return RoutingDecision(route=QuestionRoute.INVALID, reason="问题表达不明确，建议补充业务对象或查询目标")
         simple_detail = self._is_simple_detail_lookup(normalized, keywords, recall_bundle)
@@ -560,28 +603,23 @@ class QuestionRoutingService:
         )
         if has_signal:
             return False
-        if len(question) <= 2:
-            return True
-        if re.match(r"^(这个|那个|这个呢|那个呢|在吗|看下|看一下|帮我看下|帮我看看)[!！。,.，\s]*$", question):
-            return True
-        if not keywords.business_keywords and question in {"分析", "分析问题", "原因", "看看原因", "看下原因", "是否异常"}:
-            return True
-        if any(item in question for item in ["我最近怎么样", "经营情况怎么样", "帮我看看经营情况", "店铺最近怎么样"]):
-            return True
-        return bool(re.match(r"^(什么情况|啥情况|怎么回事|什么意思|怎么看|怎么办|怎么弄|为什么|有问题|异常了?)[!！。,.，\s]*$", question))
+        if keywords and keywords.time_keywords and keywords.action_keywords:
+            return False
+        return True
 
     def _has_multiple_time_ranges(self, question: str) -> bool:
         return sum(1 for pattern in TIME_PATTERNS for _ in pattern.finditer(question)) >= 2
 
     def _has_any_time_range(self, question: str) -> bool:
         return self._has_multiple_time_ranges(question) or any(pattern.search(question) for pattern in TIME_PATTERNS) or any(
-            word in question for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月", "这个月"]
+            word in question for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]
         )
 
     def _is_simple_detail_lookup(self, question: str, keywords: ExtractedKeywords, recall_bundle: RecallBundle) -> bool:
         if not any(word in question for word in ["明细", "详情", "列表", "记录", "单号", "流水"]):
             return False
-        if not self._has_any_time_range(question) or self._has_multiple_time_ranges(question):
+        has_object_ref = any(pattern.search(question) for _ref_type, pattern in RouteSlotExtractor.OBJECT_PATTERNS)
+        if (not self._has_any_time_range(question) and not has_object_ref) or self._has_multiple_time_ranges(question):
             return False
         if any(word in question for word in ACTION_KEYWORDS):
             return False
@@ -591,16 +629,10 @@ class QuestionRoutingService:
             return False
         return not recall_bundle or not recall_bundle.items or all((item.answer_mode or "").upper() == "DETAIL" for item in recall_bundle.items)
 
-    def _is_store_overview_question(self, question: str) -> bool:
-        return any(word in question for word in ["店铺整体", "整体经营", "经营概况", "经营情况", "店铺情况", "店铺概况"]) or (
-            any(word in question for word in ["店铺", "商家", "我店"])
-            and any(word in question for word in ["整体", "经营", "概况", "情况", "怎么样", "异常", "关注"])
-        )
-
     def _matched_domain_count(self, question: str, keywords: Optional[ExtractedKeywords] = None) -> int:
         if keywords and keywords.topic_scores:
             return len([score for score in keywords.topic_scores.values() if score > 0])
-        return sum(1 for words in BUSINESS_KEYWORDS.values() if any(word.lower() in question.lower() for word in words))
+        return 0
 
 
 class RouteSlotExtractor:
@@ -682,13 +714,46 @@ class RouteSlotExtractor:
             match = pattern.search(text)
             if match:
                 return match.group(0).strip()
-        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月", "这个月"]:
+        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]:
             if word in text:
                 return word
         return ""
 
     def _analysis_signals(self, keywords: ExtractedKeywords) -> List[str]:
-        if keywords and keywords.action_keywords:
+        analysis_actions = {
+            "为什么",
+            "原因",
+            "影响",
+            "分析",
+            "对比",
+            "环比",
+            "同比",
+            "同时",
+            "分别",
+            "并且",
+            "综合",
+            "关联",
+            "对应",
+            "趋势",
+            "走势",
+            "变化",
+            "同步",
+            "上升",
+            "下降",
+            "波动",
+            "异常",
+            "风险",
+            "建议",
+            "优化",
+            "改善",
+            "怎么办",
+            "排查",
+            "最高",
+            "最低",
+            "最多",
+            "最少",
+        }
+        if keywords and any(action in analysis_actions for action in keywords.action_keywords):
             return ["weak_analysis_hint"]
         return []
 
@@ -699,7 +764,6 @@ class RouteSlotExtractor:
         keywords: Optional[ExtractedKeywords] = None,
     ) -> List[RouteTopicCandidate]:
         by_topic: Dict[QuestionCategory, Dict[str, object]] = {}
-        lowered = text.lower()
         if keywords is not None:
             for category_value, score in keywords.topic_scores.items():
                 try:
@@ -712,12 +776,13 @@ class RouteSlotExtractor:
                     if item.topic == category and item.phrase
                 ]
                 by_topic[category] = {"score": float(score), "evidence": dedupe_ordered(evidence)[:8]}
-        else:
-            for category, words in BUSINESS_KEYWORDS.items():
-                evidence = [word for word in words if word.lower() in lowered]
-                if not evidence:
-                    continue
-                by_topic[category] = {"score": float(len(evidence)), "evidence": evidence[:8]}
+        if self._risk_level(text, "read") == "rule_sensitive":
+            payload = by_topic.setdefault(QuestionCategory.PLATFORM_RULE, {"score": 0, "evidence": []})
+            payload["score"] = max(float(payload.get("score") or 0), 2.0)
+            evidence = list(payload.get("evidence") or [])
+            if "rule_sensitive" not in evidence:
+                evidence.append("rule_sensitive")
+            payload["evidence"] = evidence[:8]
         for ref in object_refs:
             for category in self.OBJECT_TOPICS.get(ref.ref_type, []):
                 payload = by_topic.setdefault(category, {"score": 0, "evidence": []})
@@ -789,7 +854,6 @@ class TopicRouterService:
         route_slots: Optional[RouteSlots] = None,
         context_topics: Optional[List[QuestionCategory]] = None,
     ) -> TopicRoutingDecision:
-        text = question or ""
         inherited_topics = dedupe_topics(list(context_topics or []))
         if not inherited_topics and context_topic:
             for item in re.split(r"[、,，|/]", context_topic):
@@ -812,9 +876,6 @@ class TopicRouterService:
                     scores[QuestionCategory(category_value)] = float(score)
                 except ValueError:
                     continue
-        else:
-            for category, words in BUSINESS_KEYWORDS.items():
-                scores[category] = float(sum(1 for word in words if word.lower() in text.lower()))
         if route_slots:
             for candidate in route_slots.topic_candidates:
                 try:

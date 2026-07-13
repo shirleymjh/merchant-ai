@@ -727,6 +727,61 @@ button {
   padding-top: 12px;
 }
 
+.analysis-report-entry {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 42px 1fr auto;
+  gap: 12px;
+  align-items: center;
+  margin: 18px 0 4px;
+  padding: 14px 15px;
+  border: 1px solid #cde6df;
+  border-radius: 14px;
+  color: #173a38;
+  background: linear-gradient(135deg, #f2fbf8, #f5f9ff);
+  text-align: left;
+  cursor: pointer;
+  transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+
+.analysis-report-entry:hover {
+  transform: translateY(-1px);
+  border-color: #81c8b7;
+  box-shadow: 0 10px 28px rgba(34, 112, 96, .12);
+}
+
+.analysis-report-entry > span:nth-child(2) {
+  min-width: 0;
+}
+
+.analysis-report-entry b,
+.analysis-report-entry small {
+  display: block;
+}
+
+.analysis-report-entry b {
+  margin-bottom: 4px;
+  font-size: 14px;
+}
+
+.analysis-report-entry small {
+  overflow: hidden;
+  color: #71817f;
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.analysis-report-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  color: #fff;
+  background: #167d6d;
+}
+
 .message-actions button {
   min-width: 32px;
   height: 32px;
@@ -1104,6 +1159,10 @@ body {
     radial-gradient(circle at 8% 5%, rgba(75, 119, 255, .09), transparent 26%),
     radial-gradient(circle at 94% 4%, rgba(36, 193, 160, .08), transparent 24%),
     #f4f6fa;
+}
+
+.evan-app.compact-workspace {
+  grid-template-columns: minmax(680px, 1040px) 300px;
 }
 
 .app-brand-header {

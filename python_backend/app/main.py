@@ -106,7 +106,7 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     )
     topic_assets = workflow.recall_service.topic_assets
     doris_repository = workflow.node_worker.doris_repository
-    daily_report_service = DailyReportService(doris_repository)
+    daily_report_service = DailyReportService(doris_repository, settings.merchant_id)
     feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store, workflow.memory_store)
     memory_management_service = MemoryManagementService(settings, workflow.memory_store)
     skill_draft_service = SkillDraftService(settings)
@@ -468,6 +468,56 @@ def record_metric_definition_preference(request: MetricDefinitionPreferenceReque
     return memory_management_service.record_metric_definition_preference(target, request)
 
 
+def merchant_public_knowledge_action_result(result: Dict[str, Any], requested_action: str = "") -> Dict[str, Any]:
+    suggestion = result.get("suggestion") if isinstance(result.get("suggestion"), dict) else {}
+    payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+    scope = str(suggestion.get("scopeType") or payload.get("scopeType") or payload.get("proposedScope") or "merchant").lower()
+    rule_text = str(payload.get("correctionText") or payload.get("question") or "")[:240]
+    title = str(payload.get("title") or suggestion.get("metricName") or "业务知识")
+    status_value = str(result.get("status") or "")
+    if status_value == "MERCHANT_ACTIVE":
+        message = "已用于本商家后续分析。"
+        notice_type = "merchant_rule_confirmed"
+    elif status_value == "PLATFORM_SUGGESTED" or scope == "platform":
+        message = "已提交反馈，平台审核通过后才会进入公共知识。"
+        notice_type = "platform_feedback_submitted"
+    elif status_value in {"DISMISSED", "EXISTING_KNOWLEDGE_REUSED"}:
+        message = "已取消本次知识更新。"
+        notice_type = "knowledge_suggestion_dismissed"
+    elif status_value == "CONFLICT_CONFIRMATION_REQUIRED":
+        message = "已有相似或冲突规则，需要先确认处理方式。"
+        notice_type = "knowledge_conflict_confirmation"
+    else:
+        message = "知识建议已处理。"
+        notice_type = "knowledge_action_processed"
+    public_result = {
+        "success": bool(result.get("success")),
+        "status": status_value,
+        "suggestionId": str(result.get("suggestionId") or suggestion.get("suggestionId") or ""),
+        "noticeType": notice_type,
+        "title": title,
+        "message": message,
+        "ruleText": rule_text,
+        "requestedAction": str(requested_action or ""),
+    }
+    if result.get("conflictCheck"):
+        public_result["conflictCheck"] = result.get("conflictCheck")
+    if result.get("allowedResolutions"):
+        public_result["resolutionActions"] = [
+            {
+                "actionId": str(item),
+                "label": {"use_existing": "沿用已有规则", "keep_both": "保留两条", "replace": "替换旧规则", "cancel": "取消"}.get(str(item), str(item)),
+            }
+            for item in result.get("allowedResolutions") or []
+        ]
+    if not result.get("success") and result.get("allowedActions"):
+        public_result["userActions"] = [
+            {"actionId": "submit_feedback", "label": "提交反馈"},
+            {"actionId": "dismiss", "label": "取消"},
+        ]
+    return public_result
+
+
 @router.post("/api/merchant/knowledge-suggestions/{item_id}/action")
 def merchant_knowledge_suggestion_action(item_id: str, request: KnowledgeSuggestionActionRequest) -> Dict[str, Any]:
     target = require_merchant_access(request.merchant_id or settings.merchant_id)
@@ -481,8 +531,8 @@ def merchant_knowledge_suggestion_action(item_id: str, request: KnowledgeSuggest
     )
     if not result.get("success"):
         status_code = 404 if result.get("status") == "NOT_FOUND" else 422
-        raise HTTPException(status_code=status_code, detail=result)
-    return result
+        raise HTTPException(status_code=status_code, detail=merchant_public_knowledge_action_result(result, request.action))
+    return merchant_public_knowledge_action_result(result, request.action)
 
 
 @router.get("/api/memory/{merchant_id}")

@@ -1256,14 +1256,14 @@ class MemoryKnowledgeGovernanceService:
         Platform suggestions remain pending until the existing ops review and
         semantic publish workflow approves them.
         """
-        selected_action = str(action or "").strip().lower()
+        selected_action = normalize_merchant_knowledge_action(action)
         if selected_action not in {"accept", "suggest", "skip"}:
             return {
                 "success": False,
                 "status": "INVALID_ACTION",
                 "merchantId": merchant_id,
                 "suggestionId": suggestion_id,
-                "allowedActions": ["accept", "suggest", "skip"],
+                "allowedActions": ["confirm_use", "submit_feedback", "dismiss"],
             }
         memory = self.memory_store.load(merchant_id)
         suggestion = find_knowledge_suggestion(memory, suggestion_id)
@@ -3316,6 +3316,23 @@ def memory_case_payload(item: Dict[str, Any]) -> Dict[str, Any]:
 def knowledge_suggestion_status(item: Dict[str, Any]) -> str:
     value = str((item or {}).get("status") or "").strip()
     return value.lower() if value else "candidate"
+
+
+def normalize_merchant_knowledge_action(action: Any) -> str:
+    value = str(action or "").strip().lower()
+    mapping = {
+        "confirm_use": "accept",
+        "confirm": "accept",
+        "use": "accept",
+        "use_for_merchant": "accept",
+        "submit_feedback": "suggest",
+        "submit": "suggest",
+        "send_feedback": "suggest",
+        "dismiss": "skip",
+        "cancel": "skip",
+        "not_now": "skip",
+    }
+    return mapping.get(value, value)
 
 
 def knowledge_suggestion_proposed_scope(item: Dict[str, Any]) -> str:

@@ -230,7 +230,7 @@ class Settings(BaseSettings):
     agent_doris_split_chunk_days: int = Field(7, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_CHUNK_DAYS")
     agent_doris_split_max_chunks: int = Field(6, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_MAX_CHUNKS")
     agent_doris_split_max_concurrency: int = Field(3, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_MAX_CONCURRENCY")
-    agent_partition_date_anchor_enabled: bool = Field(False, validation_alias="YSHOPPING_AGENT_PARTITION_DATE_ANCHOR_ENABLED")
+    agent_partition_date_anchor_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_PARTITION_DATE_ANCHOR_ENABLED")
     agent_trace_replay_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_TRACE_REPLAY_ENABLED")
     agent_compact_success_artifacts_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_COMPACT_SUCCESS_ARTIFACTS_ENABLED")
     agent_run_retention_days: int = Field(14, validation_alias="YSHOPPING_AGENT_RUN_RETENTION_DAYS")

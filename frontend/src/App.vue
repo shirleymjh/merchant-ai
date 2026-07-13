@@ -1,5 +1,5 @@
 <template>
-  <main class="evan-app">
+  <main :class="['evan-app', { 'compact-workspace': !showAnalysisRail }]">
     <header class="app-brand-header">
       <button type="button" class="brand-menu" title="打开对话目录" @click="outlineOpen = true"><PanelLeftOpen :size="20" /></button>
       <div class="brand-mark"><ShoppingBag :size="24" /></div>
@@ -33,9 +33,9 @@
           <b>{{ index + 2 }}</b><span>{{ item.label }}</span><ChevronRight :size="17" />
         </button>
       </div>
-      <p class="outline-drawer-tip"><MessageSquareText :size="15" />选择一轮对话，左右面板会同步显示对应图表与建议。</p>
+      <p class="outline-drawer-tip"><MessageSquareText :size="15" />选择一轮对话，相关图表与经营建议会同步更新。</p>
     </aside>
-    <aside class="analysis-rail">
+    <aside v-if="showAnalysisRail" class="analysis-rail">
       <div class="rail-title-row">
         <div class="rail-icon blue"><ChartNoAxesCombined :size="17" /></div>
         <div><span>数据洞察</span><strong>指标图表</strong></div>
@@ -66,6 +66,7 @@
           :anchor-id="message.localId"
           :role="message.role"
           :text="message.text"
+          :question="message.question"
           :steps="message.steps"
           :tables="message.tables"
           :data-rows="message.dataRows"
@@ -170,7 +171,7 @@ const defaultSuggestions = [
   '最近7天店铺整体经营情况怎么样？',
   '最近7天订单量和退款金额有什么变化？',
   '最近30天 GMV 为什么下降？',
-  '退款金额最高的前5个商品有哪些？',
+  '最近30天退款金额最高的前5个商品有哪些？',
   '退款率高的商品是否也带来较多工单？',
   '工单最多的问题类型有哪些？',
   '最近7天客服工单量按天趋势如何？',
@@ -199,6 +200,7 @@ const activeSession = computed(() => sessions.value.find(session => session.id =
 const hasConversation = computed(() => messages.value.some(message => message.role === 'user'))
 const visibleMessages = computed(() => hasConversation.value ? messages.value : [])
 const latestAssistantMessage = computed(() => [...messages.value].reverse().find(message => message.role === 'assistant') || null)
+const showAnalysisRail = computed(() => hasConversation.value && hasMetricInsightChart(latestAssistantMessage.value))
 const currentAdvice = computed(() => {
   const advice = latestAssistantMessage.value?.merchantExperience?.businessAdvice || []
   const fallback = latestAssistantMessage.value?.merchantExperience?.drillDownActions?.map(item => item.label || item.question) || []
@@ -375,6 +377,21 @@ function adviceTitle(text) {
   if (/订单|转化|GMV|成交/.test(text)) return '提升交易表现'
   if (/客服|工单|响应/.test(text)) return '优化服务体验'
   return '建议立即关注'
+}
+function hasMetricInsightChart(message) {
+  if (!message) return false
+  const sections = message.dataSections?.length ? message.dataSections : [{ dataRows: message.dataRows || [] }]
+  return sections.some(section => {
+    const rows = section.dataRows || []
+    const timeRows = rows
+      .map(row => ({ pt: row.pt || row.date || row.dt, value: Number(row.value ?? row.metric_value ?? row.cnt) }))
+      .filter(row => row.pt && Number.isFinite(row.value))
+    if (timeRows.length > 1) return true
+    const dimensionRows = rows
+      .map(row => ({ label: String(row.group_value ?? row.name ?? row.category ?? ''), value: Number(row.metric_value ?? row.value ?? row.cnt) }))
+      .filter(row => row.label && Number.isFinite(row.value))
+    return dimensionRows.length > 1
+  })
 }
 function extractAdviceFromAnswer(text) {
   const lines = String(text || '').split('\n').map(line => line.trim())
@@ -586,10 +603,12 @@ function appendAssistant(response) {
 
 function appendAssistantToSession(sessionId, response) {
   const targetMessages = sessionId === activeSessionId.value ? messages.value : cloneValue(findSession(sessionId)?.messages || [])
+  const sourceQuestion = [...targetMessages].reverse().find(message => message.role === 'user')?.text || ''
   targetMessages.push({
     localId: `a_${Date.now()}_${Math.random().toString(16).slice(2)}`,
     id: response.id || `local_${Date.now()}`,
     role: 'assistant',
+    question: sourceQuestion,
     text: response.answer,
     steps: response.thinkingSteps || [],
     tables: (response.dorisTables || []).filter(table => table !== 'dim_merchant_df'),

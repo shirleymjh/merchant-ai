@@ -328,6 +328,27 @@ class UnderstandingCoverageCritic:
                 evidence_items.append(evidence)
                 issues.append("MISSING_STRUCTURED_FIELD:%s.%s" % (field.table, field.key))
                 trace.append("UNDERSTANDING_FIELD_EVIDENCE_COMPLETION:%s:%s:%s" % (field.table, field.key, matched_label))
+        table_candidates = semantic_table_evidence_candidates(asset_pack, understanding_field_coverage_text(question, updated), updated)
+        if table_candidates:
+            evidence_items = updated.setdefault("requiredEvidenceIntents", [])
+            if not isinstance(evidence_items, list):
+                evidence_items = []
+                updated["requiredEvidenceIntents"] = evidence_items
+            for table, matched_label, fields in table_candidates[: self.MAX_COMPLETIONS]:
+                domain = semantic_domain_for_table(table)
+                evidence = {
+                    "semanticLabel": matched_label,
+                    "sourcePhrase": matched_label,
+                    "requiredLevel": "required",
+                    "suggestedDomains": [domain] if domain != "unknown" else [],
+                    "suggestedTables": [table],
+                    "suggestedFields": fields,
+                    "reason": "Question matches published semantic table evidence connected by semantic relationships",
+                    "completionSource": "semantic_relationship_evidence_critic",
+                }
+                evidence_items.append(evidence)
+                issues.append("MISSING_STRUCTURED_TABLE_EVIDENCE:%s" % table)
+                trace.append("UNDERSTANDING_TABLE_EVIDENCE_COMPLETION:%s:%s:%s" % (table, matched_label, ",".join(fields[:6])))
         if not trace:
             trace.append("understanding_coverage_critic.no_missing_metrics")
         return UnderstandingCoverageResult(updated, added, issues, trace)
@@ -633,6 +654,143 @@ def semantic_field_matched_label(field: PlanningAssetEntry, text: str) -> str:
         if len(normalized) >= 4 and normalized in normalized_text:
             return str(label)
     return ""
+
+
+def semantic_table_evidence_candidates(
+    asset_pack: PlanningAssetPack,
+    text: str,
+    understanding: Dict[str, Any],
+) -> List[Tuple[str, str, List[str]]]:
+    source_tables = semantic_source_tables_from_understanding(understanding)
+    if not source_tables:
+        return []
+    existing_tables = semantic_evidence_tables_from_understanding(understanding) | source_tables
+    index = SemanticLayerIndex(text, RecallBundle(), asset_pack)
+    candidates: List[Tuple[int, str, str, List[str]]] = []
+    for table in asset_pack.known_tables():
+        if table in existing_tables:
+            continue
+        if not any(index.relationship_edge_path(source, table) for source in source_tables if source != table):
+            continue
+        score, matched = semantic_table_evidence_score(asset_pack, table, text)
+        if score < 4 or not matched:
+            continue
+        fields = semantic_table_evidence_fields(asset_pack, table, text)
+        if not fields:
+            continue
+        candidates.append((score, table, matched, fields))
+    candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
+    return [(table, matched, fields) for score, table, matched, fields in candidates[:4]]
+
+
+def semantic_source_tables_from_understanding(understanding: Dict[str, Any]) -> set[str]:
+    tables: set[str] = set()
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
+    if isinstance(ranking, dict):
+        table = str(
+            ranking.get("resolvedOwnerTable")
+            or ranking.get("resolved_owner_table")
+            or ranking.get("ownerTable")
+            or ranking.get("owner_table")
+            or ""
+        )
+        if table:
+            tables.add(table)
+    for item in understanding.get("requestedMeasures") or understanding.get("requested_measures") or []:
+        if not isinstance(item, dict):
+            continue
+        table = str(
+            item.get("resolvedOwnerTable")
+            or item.get("resolved_owner_table")
+            or item.get("ownerTable")
+            or item.get("owner_table")
+            or ""
+        )
+        if table:
+            tables.add(table)
+    for item in understanding.get("scopeConstraints") or understanding.get("scope_constraints") or []:
+        if not isinstance(item, dict):
+            continue
+        table = str(item.get("ownerTable") or item.get("owner_table") or "")
+        if table:
+            tables.add(table)
+    return tables
+
+
+def semantic_evidence_tables_from_understanding(understanding: Dict[str, Any]) -> set[str]:
+    tables: set[str] = set()
+    for item in understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []:
+        if not isinstance(item, dict):
+            continue
+        tables.update(str(table) for table in item.get("suggestedTables") or item.get("suggested_tables") or [] if table)
+    return tables
+
+
+def semantic_table_evidence_score(asset_pack: PlanningAssetPack, table: str, text: str) -> Tuple[int, str]:
+    normalized_text = normalize_semantic_text(text)
+    if not normalized_text:
+        return 0, ""
+    question_terms = [term for term in semantic_phrase_terms(normalized_text) if len(term) >= 2]
+    if not question_terms:
+        return 0, ""
+    labels = semantic_table_evidence_labels(asset_pack, table)
+    label_text = normalize_semantic_text(" ".join(labels))
+    best_score = 0
+    best_term = ""
+    for term in question_terms:
+        if term not in label_text:
+            continue
+        score = len(term)
+        if semantic_table_term_repeats(asset_pack, table, term):
+            score += 3
+        if score > best_score:
+            best_score = score
+            best_term = term
+    return best_score, best_term
+
+
+def semantic_table_term_repeats(asset_pack: PlanningAssetPack, table: str, term: str) -> bool:
+    count = 0
+    for label in semantic_table_evidence_labels(asset_pack, table):
+        if term and term in normalize_semantic_text(label):
+            count += 1
+        if count >= 2:
+            return True
+    return False
+
+
+def semantic_table_evidence_labels(asset_pack: PlanningAssetPack, table: str) -> List[str]:
+    labels: List[str] = []
+    for entry in asset_pack.tables:
+        if (entry.table or entry.key) == table:
+            labels.extend(table_semantic_labels(entry))
+            labels.append(entry.topic)
+    for collection in [asset_pack.fields, asset_pack.metrics, asset_pack.terms]:
+        for entry in collection:
+            if entry.table != table:
+                continue
+            labels.extend([entry.key, entry.title, entry.description, *entry.aliases])
+    return [str(label) for label in labels if str(label or "").strip()]
+
+
+def semantic_table_evidence_fields(asset_pack: PlanningAssetPack, table: str, text: str) -> List[str]:
+    columns = set(asset_pack.known_columns(table))
+    fields = [field for field in asset_pack.fields if field.table == table and field.key in columns]
+    if not fields:
+        return generic_output_keys(QuestionIntent(preferred_table=table), columns)[:8]
+    normalized_text = normalize_semantic_text(text)
+    scored: List[Tuple[int, str]] = []
+    for field in fields:
+        metadata = field.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        role = str(semantic.get("role") or "").upper()
+        labels = normalize_semantic_text(" ".join([field.key, field.title, field.description, *field.aliases]))
+        overlap = sum(len(term) for term in semantic_phrase_terms(normalized_text) if len(term) >= 2 and term in labels)
+        role_bonus = {"KEY": 8, "DIMENSION": 6, "TIME": 5, "METRIC": 4, "OTHER": 2}.get(role, 1)
+        scored.append((overlap + role_bonus, field.key))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = dedupe_strings(generic_output_keys(QuestionIntent(preferred_table=table), columns) + [key for _, key in scored])[:12]
+    return selected
 
 
 def semantic_metric_label_present(metric: Any, text: str) -> bool:
@@ -1291,7 +1449,6 @@ class QueryGraphPlanner:
             "并且",
             "再看",
             "关联",
-            "这些",
             "判断",
             "分析",
             "原因",
@@ -2514,64 +2671,30 @@ class EvidenceContractBuilder:
         return deduped
 
     def _metric_contract_column(self, intent: QuestionIntent) -> str:
-        if intent.metric_column == "pay_amt" and "refund" in intent.preferred_table:
-            return "refund_related_pay_amt"
-        if intent.metric_name == "pay_amt" and "refund" in intent.preferred_table:
-            return "refund_related_pay_amt"
         if intent.metric_name:
             return intent.metric_name
-        if intent.metric_column == "pay_amt":
-            return "order_pay_amt"
-        if intent.metric_column == "repay_amt":
-            return "repay_amt"
         if intent.metric_column:
             return "sum_%s" % intent.metric_column
         return ""
 
     def _semantic_aliases_for_contract(self, intent: QuestionIntent) -> Dict[str, List[str]]:
-        aliases: Dict[str, List[str]] = {
-            "refund_related_pay_amt": ["refund_related_pay_amt", "refund_related_pay_amt_raw", "pay_amt", "sum_pay_amt"],
-            "order_pay_amt": ["order_pay_amt", "pay_amt", "sum_pay_amt"],
-            "repay_amt": ["repay_amt", "sum_repay_amt"],
-            "order_cnt": ["order_cnt", "cnt", "count", "sub_order_cnt"],
-            "refund_cnt": ["refund_cnt", "cnt", "count", "refund_bill_cnt"],
-            "ticket_cnt": ["ticket_cnt", "cnt", "count", "ticket_bill_cnt"],
-            "repay_cnt": ["repay_cnt", "cnt", "count", "repay_bill_cnt"],
-            "coupon_cnt": ["coupon_cnt", "cnt", "count"],
-            "scm_cnt": ["scm_cnt", "cnt", "count"],
-            "goods_cnt": ["goods_cnt", "cnt", "count"],
-        }
-        wanted = {self._metric_contract_column(intent), self._count_alias_for_table(intent.preferred_table), intent.metric_name}
-        return {key: value for key, value in aliases.items() if key in wanted}
+        aliases: Dict[str, List[str]] = {}
+        metric_alias = self._metric_contract_column(intent)
+        if metric_alias and intent.metric_column:
+            aliases[metric_alias] = dedupe_strings([metric_alias, intent.metric_column, "sum_%s" % intent.metric_column])
+        count_alias = self._count_alias_for_table(intent.preferred_table)
+        aliases[count_alias] = [count_alias, "cnt", "count"]
+        if intent.metric_name and intent.metric_name.endswith(("_cnt", "_count")):
+            aliases[intent.metric_name] = dedupe_strings([intent.metric_name, "cnt", "count"])
+        return aliases
 
     def _count_alias_for_table(self, table: str) -> str:
-        if "refund" in table:
-            return "refund_cnt"
-        if "ticket" in table:
-            return "ticket_cnt"
-        if "repay" in table:
-            return "repay_cnt"
-        if "coupon" in table:
-            return "coupon_cnt"
-        if "scm" in table:
-            return "scm_cnt"
-        if "goods" in table:
-            return "goods_cnt"
-        return "order_cnt"
+        return "record_cnt"
 
     def _semantic_label(self, intent: QuestionIntent) -> str:
-        category = str(intent.category)
         if intent.metric_name:
             return intent.metric_name
-        if category == QuestionCategory.GOODS.value:
-            return "goods_publish_or_audit_evidence"
-        if category == QuestionCategory.REFUND.value:
-            return "refund_evidence"
-        if category == QuestionCategory.COMPENSATION.value:
-            return "repay_evidence"
-        if category == QuestionCategory.CS_TICKET.value:
-            return "ticket_evidence"
-        return intent.preferred_table
+        return str(getattr(intent, "semantic_label", "") or intent.preferred_table or "")
 
     def final_evidence_labels(self, intents: List[QuestionIntent]) -> List[str]:
         labels: List[str] = []
@@ -6597,19 +6720,6 @@ def semantic_fast_path_metric_score(metric: Any, question: str) -> int:
             score = max(score, 100 + len(label))
         elif strong_metric_label_text_match(label, text):
             score = max(score, 80 + len(label))
-    key = str(getattr(metric, "key", "") or "").lower()
-    title = normalize_metric_match_text(getattr(metric, "title", "") or "")
-    synonym_groups = [
-        (["退款率", "退货率", "refundrate", "refundratio"], ["refund_rate", "refundratio", "退货率", "退款率"]),
-        (["下单数", "订单数", "单量"], ["order_detail_cnt", "ordercnt", "下单数", "订单量"]),
-        (["退款金额", "退货金额"], ["pay_amt", "refund_amt", "退款金额"]),
-        (["退款单量", "退款量", "退货量"], ["refund_bill_cnt", "refundcnt", "退款单量"]),
-    ]
-    for phrases, metric_tokens in synonym_groups:
-        if any(normalize_metric_match_text(phrase) in text for phrase in phrases):
-            metric_text = normalize_metric_match_text("%s %s" % (key, title))
-            if any(normalize_metric_match_text(token) in metric_text for token in metric_tokens):
-                score = max(score, 120)
     return score
 
 
@@ -6621,12 +6731,6 @@ def semantic_fast_path_metric_phrase(metric: Any, question: str) -> str:
         if normalized and normalized in text:
             return str(label)
     key = str(getattr(metric, "key", "") or "")
-    if key == "refund_rate" and "退款率" in question:
-        return "退款率"
-    if key == "order_detail_cnt" and "下单数" in question:
-        return "下单数"
-    if key in {"pay_amt", "refund_amt"} and "退款金额" in question:
-        return "退款金额"
     return str(getattr(metric, "title", "") or key or question[:80])
 
 
@@ -6655,26 +6759,21 @@ def semantic_fast_path_grain(question: str, group_by: str) -> str:
 
 
 def semantic_fast_path_required_evidence(question: str, asset_pack: PlanningAssetPack) -> List[Dict[str, Any]]:
-    text = normalize_text(question)
     intents: List[Dict[str, Any]] = []
-    if any(term in text for term in ["发布时间", "上架时间", "新品", "商品"]):
-        goods_table = best_table_for_domain("goods", asset_pack)
-        suggested_fields = [
-            field
-            for field in ["spu_id", "sku_id", "spu_name", "goods_name", "publish_time", "online_time", "created_time", "pt"]
-            if field in asset_pack.known_columns(goods_table)
-        ]
-        if goods_table and suggested_fields:
-            intents.append(
-                {
-                    "semanticLabel": "product_profile",
-                    "reason": "question asks product publish/new-product context",
-                    "requiredLevel": "required" if any(term in text for term in ["发布时间", "新品"]) else "optional",
-                    "suggestedDomains": ["goods"],
-                    "suggestedTables": [goods_table],
-                    "suggestedFields": suggested_fields,
-                }
-            )
+    for field, matched_label in semantic_field_evidence_candidates(asset_pack, question, {"requiredEvidenceIntents": []}):
+        domain = semantic_domain_for_table(field.table)
+        intents.append(
+            {
+                "semanticLabel": field.title or field.key,
+                "sourcePhrase": matched_label,
+                "requiredLevel": "required",
+                "suggestedDomains": [domain] if domain != "unknown" else [],
+                "suggestedTables": [field.table],
+                "suggestedFields": [field.key],
+                "semanticRefId": field.source_ref_id,
+                "reason": "Question matches semantic field evidence from published semantic assets",
+            }
+        )
     return intents
 
 
