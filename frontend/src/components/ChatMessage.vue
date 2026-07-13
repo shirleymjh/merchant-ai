@@ -40,9 +40,78 @@
               <h3>待确认的业务知识</h3>
             </div>
             <article v-for="item in knowledgeProposals" :key="item.suggestionId">
-              <b>{{ item.metricName || '业务口径' }}</b>
+              <b>{{ item.title || item.metricName || '业务知识' }}</b>
               <p>{{ item.correctionText || '本轮对话识别到可沉淀的业务规则。' }}</p>
-              <span>将作为 Topic 公共知识，审核发布后生效</span>
+              <span>{{ knowledgeProposalStatusText(item) }}</span>
+              <div v-if="item.conflictCheck?.status === 'confirmation_required'" class="knowledge-conflict-card">
+                <strong>发现相似或冲突知识</strong>
+                <p>{{ item.conflictCheck.message || '保存前需要确认如何处理已有知识。' }}</p>
+                <ul>
+                  <li v-for="match in (item.conflictCheck.matches || []).slice(0, 3)" :key="match.existingKnowledgeId">
+                    {{ match.title }}：{{ match.existingText }}
+                  </li>
+                </ul>
+                <div class="knowledge-proposal-actions">
+                  <button
+                    v-if="conflictResolutionAllows(item, 'replace')"
+                    type="button"
+                    :disabled="item.actionPending"
+                    @click="handleKnowledgeProposalAction(item, 'accept', 'replace')"
+                  >使用新知识</button>
+                  <button
+                    v-if="conflictResolutionAllows(item, 'merge')"
+                    type="button"
+                    class="secondary"
+                    :disabled="item.actionPending"
+                    @click="handleKnowledgeProposalAction(item, 'accept', 'merge')"
+                  >融合两条</button>
+                  <button
+                    v-if="conflictResolutionAllows(item, 'use_existing')"
+                    type="button"
+                    class="secondary"
+                    :disabled="item.actionPending"
+                    @click="handleKnowledgeProposalAction(item, 'accept', 'use_existing')"
+                  >使用已有知识</button>
+                  <button
+                    v-if="conflictResolutionAllows(item, 'keep_both')"
+                    type="button"
+                    class="ghost"
+                    :disabled="item.actionPending"
+                    @click="handleKnowledgeProposalAction(item, 'accept', 'keep_both')"
+                  >保留两条</button>
+                  <button
+                    v-if="conflictResolutionAllows(item, 'suggest')"
+                    type="button"
+                    class="secondary"
+                    :disabled="item.actionPending"
+                    @click="handleKnowledgeProposalAction(item, 'suggest')"
+                  >提交平台审核</button>
+                  <button type="button" class="ghost" :disabled="item.actionPending" @click="handleKnowledgeProposalAction(item, 'skip')">取消</button>
+                </div>
+              </div>
+              <div v-else-if="knowledgeProposalActionable(item)" class="knowledge-proposal-actions">
+                <button
+                  v-if="knowledgeProposalAllows(item, 'accept')"
+                  type="button"
+                  :disabled="item.actionPending"
+                  @click="handleKnowledgeProposalAction(item, 'accept')"
+                >保存为本店设置</button>
+                <button
+                  v-if="knowledgeProposalAllows(item, 'suggest')"
+                  type="button"
+                  class="secondary"
+                  :disabled="item.actionPending"
+                  @click="handleKnowledgeProposalAction(item, 'suggest')"
+                >提交给平台</button>
+                <button
+                  v-if="knowledgeProposalAllows(item, 'skip')"
+                  type="button"
+                  class="ghost"
+                  :disabled="item.actionPending"
+                  @click="handleKnowledgeProposalAction(item, 'skip')"
+                >忽略</button>
+              </div>
+              <small v-if="item.actionError" class="knowledge-proposal-error">{{ item.actionError }}</small>
             </article>
           </section>
           <section v-if="experienceAlerts.length" class="experience-panel alerts">
@@ -368,7 +437,7 @@ const props = defineProps({
   workspaceMode: Boolean
 })
 
-const emit = defineEmits(['feedback', 'ask', 'confirm-clarification', 'metric-definition-action'])
+const emit = defineEmits(['feedback', 'ask', 'confirm-clarification', 'metric-definition-action', 'knowledge-proposal-action'])
 
 const displayTime = new Date().toLocaleString('zh-CN', {
   year: 'numeric',
@@ -489,6 +558,41 @@ function handleMetricDefinitionAction(item, action) {
     note: action === 'question' ? '商家对当前披露口径提出疑问' : ''
   })
   showToast(action === 'question' ? '已提交口径疑问，等待平台审核' : '已记录为本商家的默认口径偏好')
+}
+
+function handleKnowledgeProposalAction(item, action, conflictResolution = '') {
+  emit('knowledge-proposal-action', {
+    action,
+    conflictResolution,
+    answerId: props.id || '',
+    suggestionId: item?.suggestionId || '',
+    scopeType: item?.scopeType || item?.scope || 'merchant'
+  })
+}
+
+function conflictResolutionAllows(item, resolution) {
+  return (item?.conflictCheck?.resolutionOptions || []).includes(resolution)
+}
+
+function knowledgeProposalAllows(item, action) {
+  const configured = Array.isArray(item?.allowedActions) ? item.allowedActions : []
+  if (configured.length) return configured.includes(action)
+  if ((item?.scopeType || item?.scope) === 'platform') return ['suggest', 'skip'].includes(action)
+  return ['accept', 'suggest', 'skip'].includes(action)
+}
+
+function knowledgeProposalActionable(item) {
+  return ['candidate', 'review_required', 'pending', 'reviewed', ''].includes(String(item?.status || '').toLowerCase())
+}
+
+function knowledgeProposalStatusText(item) {
+  const status = String(item?.status || '').toLowerCase()
+  if (status === 'merchant_active') return '已保存为本店设置，后续对话会按此执行'
+  if (status === 'platform_suggested') return '已提交给得物平台，审核通过后更新公共口径'
+  if (status === 'dismissed') return '已忽略，本条内容不会保存'
+  if (item?.actionPending) return '正在处理…'
+  if ((item?.scopeType || item?.scope) === 'platform') return '涉及平台口径，只能提交给平台审核'
+  return '可保存为本店设置，也可以反馈给得物平台'
 }
 
 function confirmationTitle(type) {

@@ -326,6 +326,7 @@ class ContextManager:
         summary = snapshot.summary[:4000]
         input_chars = len(question) + len(summary) + sum(len(str(fact.value)) for fact in snapshot.protected_facts)
         artifact_refs = artifact_refs or self.artifact_refs(state)
+        agent_context_policy = self.context_policy(agent)
         hash_payload = {
             "stage": stage,
             "agent": agent,
@@ -335,6 +336,7 @@ class ContextManager:
             "metrics": allowed_metrics or [],
             "sourceRefs": [ref.locator or ref.path or ref.title for ref in snapshot.source_refs[:12]],
             "artifactRefs": [ref.relative_path or ref.path for ref in artifact_refs],
+            "agentContextPolicy": agent_context_policy,
         }
         context_hash = hashlib.sha256(json.dumps(hash_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
         return ContextPackage(
@@ -351,12 +353,14 @@ class ContextManager:
                 "single-node SQL must stay within node plan contract",
                 "answer agent may use verified evidence only",
                 "large objects are referenced by artifact path",
+                "agent context must follow the declared includePriority and exclude sections",
             ],
             protected_facts=snapshot.protected_facts[:18],
             source_refs=snapshot.source_refs[:12],
             artifact_refs=artifact_refs,
             allowed_tables=allowed_tables or [],
             allowed_metrics=allowed_metrics or [],
+            agent_context_policy=agent_context_policy,
             evidence_gaps=gaps,
             summary=summary,
             inline_budget_chars=int(getattr(self.settings, "context_file_inline_max_chars", 0) or 0),
@@ -370,6 +374,41 @@ class ContextManager:
                 artifact_refs=[ref.relative_path or ref.path for ref in artifact_refs],
             ),
         )
+
+    def context_policy(self, agent: str) -> Dict[str, Any]:
+        normalized = str(agent or "LeadAgent")
+        policies: Dict[str, Dict[str, Any]] = {
+            "PlannerAgent": {
+                "includePriority": ["semanticMetrics", "tableAssets", "relationships", "businessRules", "planningCases"],
+                "exclude": ["rawDataRows", "fullSqlLogs"],
+                "budgetChars": int(getattr(self.settings, "context_planner_budget_chars", 12000) or 12000),
+            },
+            "NodeAgent": {
+                "includePriority": ["allowedTables", "fields", "partitionColumns", "joinKeys", "rowAccessPolicy"],
+                "exclude": ["longTermNarratives", "unverifiedBusinessAdvice", "unscopedTables"],
+                "budgetChars": int(getattr(self.settings, "context_runtime_budget_chars", 6000) or 6000),
+            },
+            "EvidenceVerifierAgent": {
+                "includePriority": ["queryGraph", "executedSql", "queryResults", "ruleRefs", "evidenceContracts"],
+                "exclude": ["unverifiedRecallClaims", "unexecutedSql"],
+                "budgetChars": int(getattr(self.settings, "context_runtime_budget_chars", 6000) or 6000),
+            },
+            "AnswerAgent": {
+                "includePriority": ["verifiedEvidence", "queryResultSummary", "ruleEvidence", "evidenceGaps"],
+                "exclude": ["rawSchema", "unverifiedRecallClaims", "fullToolLogs"],
+                "budgetChars": int(getattr(self.settings, "context_answer_budget_chars", 10000) or 10000),
+            },
+            "RuleAnswerAgent": {
+                "includePriority": ["publishedRules", "ruleRefs", "effectiveDates", "evidenceGaps"],
+                "exclude": ["unverifiedDataClaims", "rawSchema"],
+                "budgetChars": int(getattr(self.settings, "context_answer_budget_chars", 10000) or 10000),
+            },
+        }
+        return {"agent": normalized, **policies.get(normalized, {
+            "includePriority": ["question", "routeSlots", "governedMemory", "recallSummary"],
+            "exclude": ["oversizedToolLogs"],
+            "budgetChars": int(getattr(self.settings, "context_runtime_budget_chars", 6000) or 6000),
+        })}
 
     def artifact_refs(self, state: Dict[str, Any]) -> List[ArtifactRef]:
         refs: List[ArtifactRef] = []

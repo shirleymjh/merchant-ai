@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 import requests
@@ -39,8 +41,9 @@ class HybridKnowledgeRetrievalService:
         self.recall_service = recall_service
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
+        rewritten_query = rewrite_retrieval_query(request)
         recall_bundle = self.recall_service.recall(
-            request.query,
+            rewritten_query,
             ExtractedKeywords(keywords=request.keywords),
             request.history_rows,
             request.knowledge_context,
@@ -49,7 +52,7 @@ class HybridKnowledgeRetrievalService:
         )
         if request.topic_categories and not request.knowledge_request:
             broad_bundle = self.recall_service.recall(
-                request.query,
+                rewritten_query,
                 ExtractedKeywords(keywords=request.keywords),
                 request.history_rows,
                 request.knowledge_context,
@@ -57,6 +60,22 @@ class HybridKnowledgeRetrievalService:
                 [],
             )
             recall_bundle = merge_recall_bundles(recall_bundle, broad_bundle)
+        governed_items, filtered = filter_recall_items_by_governance(recall_bundle.items, request)
+        reranked_items = business_rerank_recall_items(governed_items, rewritten_query, request)
+        source_caps = source_type_top_k_policy(
+            include_rules=route_is_rule_sensitive(request),
+            query_text=rewritten_query,
+            topics=[str(item.value if hasattr(item, "value") else item) for item in request.topic_categories],
+        )
+        reranked_items = limit_recall_items_by_source_type(reranked_items, source_caps, limit=24)
+        recall_bundle = RecallBundle(
+            items=reranked_items,
+            top_score=reranked_items[0].fusion_score if reranked_items else 0.0,
+            merged_context="\n\n".join(
+                "召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200])
+                for item in reranked_items
+            ),
+        )
         source_refs = unique_source_refs(recall_bundle.items)
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
         trace = RecallRoundTrace(
@@ -67,6 +86,10 @@ class HybridKnowledgeRetrievalService:
             recall_queries=recall_queries_from_items(recall_bundle.items),
             source_refs=source_refs,
             item_count=len(recall_bundle.items),
+            rewritten_query=rewritten_query,
+            governance_filtered=filtered,
+            rerank_applied=bool(reranked_items),
+            source_type_top_k=source_caps,
         )
         return KnowledgeBundle(
             recall_bundle=recall_bundle,
@@ -109,22 +132,23 @@ class EsKnowledgeRetrievalService:
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
-        query_text = retrieval_query_text(request)
+        rewritten_query = rewrite_retrieval_query(request)
+        query_text = retrieval_query_text(request, rewritten_query=rewritten_query)
         normalized_categories = [category for category in [normalize_question_category(item) for item in request.topic_categories] if category]
         topics = self._allowed_topics(normalized_categories)
-        include_base_wiki = QuestionCategory.PLATFORM_RULE in set(normalized_categories) or route_is_rule_sensitive(request)
+        include_rules = QuestionCategory.PLATFORM_RULE in set(normalized_categories) or route_is_rule_sensitive(request)
         metric_candidates = self._resolve_metric_candidates(query_text, topics)
         retrieval_profile = build_retrieval_profile(
             query_text=query_text,
             topics=topics,
-            include_base_wiki=include_base_wiki,
+            include_rules=include_rules,
             metric_candidates=metric_candidates,
             intent_kind=request.intent_kind,
             complexity=request.complexity,
             settings=self.settings,
         )
         source_type_top_k = source_type_top_k_policy(
-            include_base_wiki=include_base_wiki,
+            include_rules=include_rules,
             query_text=query_text,
             topics=topics,
             metric_candidates=metric_candidates,
@@ -135,8 +159,10 @@ class EsKnowledgeRetrievalService:
             {
                 "query": query_text,
                 "merchantId": request.merchant_id,
+                "accessRole": request.access_role,
+                "permissions": sorted(request.permissions),
                 "topics": topics,
-                "includeBaseWiki": include_base_wiki,
+                "includeRules": include_rules,
                 "requestKey": str(request_key or ""),
                 "indexVersion": self._index_version(),
                 "vectorEnabled": self._vector_enabled(),
@@ -152,14 +178,23 @@ class EsKnowledgeRetrievalService:
         self._active_retrieval_profile = retrieval_profile
         try:
             try:
-                items = self._search(query_text, topics, include_base_wiki=include_base_wiki)
+                items = self._search(query_text, topics, include_rules=include_rules)
                 if topics and not request.knowledge_request and bool(retrieval_profile.get("broadSearchEnabled", True)):
                     try:
-                        items = merge_recall_items(items, self._search(query_text, [], include_base_wiki=False))
+                        broad_items = self._search(query_text, [], include_rules=False)
+                        items = rrf_fuse_recall_items(
+                            [("topic_scope", items), ("broad_scope", broad_items)],
+                            rrf_k=self.settings.es_rrf_k,
+                            score_scale=self.settings.es_rrf_score_scale,
+                            limit=max(1, int(retrieval_profile.get("hybridTopK") or self.settings.es_hybrid_top_k or 24)),
+                        )
                     except Exception:
                         pass
                 items = merge_recall_items(items, self._metric_candidate_items(query_text, metric_candidates))
                 items = merge_recall_items(items, self._exact_metric_evidence(query_text, topics))
+                items = self._attach_current_asset_governance(items)
+                items, governance_filtered = filter_recall_items_by_governance(items, request)
+                items = business_rerank_recall_items(items, query_text, request)
                 items = limit_recall_items_by_source_type(
                     items,
                     source_type_top_k,
@@ -168,6 +203,7 @@ class EsKnowledgeRetrievalService:
                 blocked_reason = ""
             except Exception as exc:
                 items = []
+                governance_filtered = {}
                 blocked_reason = "ES_RETRIEVAL_FAILED:%s" % str(exc)[:240]
         finally:
             self._active_retrieval_profile = None
@@ -193,10 +229,13 @@ class EsKnowledgeRetrievalService:
             retrieval_lanes=retrieval_lane_trace(
                 retrieval_profile=retrieval_profile,
                 vector_enabled=self._vector_enabled(),
-                include_base_wiki=include_base_wiki,
+                include_rules=include_rules,
                 has_metric_candidates=bool(metric_candidates),
                 broad_enabled=bool(topics),
             ),
+            rewritten_query=rewritten_query,
+            governance_filtered=governance_filtered,
+            rerank_applied=bool(items),
         )
         merged = "\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items)
         bundle = KnowledgeBundle(
@@ -226,29 +265,78 @@ class EsKnowledgeRetrievalService:
                 names.append(display)
         return names
 
-    def _search(self, query_text: str, topics: list[str], include_base_wiki: bool = False) -> list[RecallItem]:
-        text_items = self._text_search(query_text, topics, include_base_wiki=include_base_wiki)
+    def _attach_current_asset_governance(self, items: list[RecallItem]) -> list[RecallItem]:
+        """Recheck ES hits against the live published semantic asset.
+
+        This keeps role/status/version checks effective even before an older ES
+        index has been rebuilt with the latest governance metadata.
+        """
+        governed: list[RecallItem] = []
+        asset_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in items or []:
+            metadata = dict(item.metadata or {})
+            topic = str(item.topic or metadata.get("topic") or "")
+            table = str(item.table or metadata.get("tableName") or "")
+            if not topic or not table:
+                governed.append(item)
+                continue
+            key = (topic, table)
+            if key not in asset_cache:
+                asset = self.topic_assets.load_table_asset(topic, table)
+                current = recall_governance_metadata(asset)
+                current_version = str(asset.get("version") or asset.get("semanticVersion") or "") if isinstance(asset, dict) else ""
+                if current_version:
+                    current["activeVersion"] = current_version
+                asset_cache[key] = current
+            current = asset_cache[key]
+            merged = {
+                **current,
+                **metadata,
+                "activeVersion": current.get("activeVersion") or metadata.get("activeVersion") or "",
+                "assetStatus": current.get("status") or "",
+                "assetMerchantId": current.get("merchantId") or "",
+                "assetAllowedRoles": current.get("allowedRoles") or [],
+                "assetRequiredPermissions": current.get("requiredPermissions") or [],
+                "assetVisibilityPolicy": current.get("visibilityPolicy") or {},
+                "assetExpiresAt": current.get("expiresAt") or "",
+            }
+            governed.append(item.model_copy(update={"metadata": merged}))
+        return governed
+
+    def _search(self, query_text: str, topics: list[str], include_rules: bool = False) -> list[RecallItem]:
+        text_items = self._text_search(query_text, topics, include_rules=include_rules)
+        vector_items: list[RecallItem] = []
         if not self._vector_enabled() or not query_text:
-            return text_items
+            return rrf_fuse_recall_items(
+                [("bm25", text_items)],
+                rrf_k=self.settings.es_rrf_k,
+                score_scale=self.settings.es_rrf_score_scale,
+                limit=self._hybrid_size(),
+            )
         try:
             vector = self._embed_text(query_text)
-            vector_items = self._vector_search(query_text, vector, topics, include_base_wiki=include_base_wiki) if vector else []
+            vector_items = self._vector_search(query_text, vector, topics, include_rules=include_rules) if vector else []
         except Exception:
             vector_items = []
         if not vector_items:
-            return text_items
+            return rrf_fuse_recall_items(
+                [("bm25", text_items)],
+                rrf_k=self.settings.es_rrf_k,
+                score_scale=self.settings.es_rrf_score_scale,
+                limit=self._hybrid_size(),
+            )
         return rrf_fuse_recall_items(
             [("bm25", text_items), ("vector", vector_items)],
             rrf_k=self.settings.es_rrf_k,
             score_scale=self.settings.es_rrf_score_scale,
-            limit=self.settings.es_hybrid_top_k,
+            limit=self._hybrid_size(),
         )
 
-    def _text_search(self, query_text: str, topics: list[str], include_base_wiki: bool = False) -> list[RecallItem]:
+    def _text_search(self, query_text: str, topics: list[str], include_rules: bool = False) -> list[RecallItem]:
         if not self.settings.es_base_url:
             raise RuntimeError("ES_BASE_URL_MISSING")
         size = self._text_size(topics)
-        query = self._text_query(query_text, topics, include_base_wiki=include_base_wiki)
+        query = self._text_query(query_text, topics, include_rules=include_rules)
         response = requests.post(
             "%s/%s/_search" % (self.settings.es_base_url.rstrip("/"), self.settings.es_index),
             headers=self._headers(),
@@ -260,13 +348,13 @@ class EsKnowledgeRetrievalService:
         hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
         return [es_hit_to_recall_item(hit, query_text, channel="bm25") for hit in hits]
 
-    def _vector_search(self, query_text: str, query_vector: list[float], topics: list[str], include_base_wiki: bool = False) -> list[RecallItem]:
+    def _vector_search(self, query_text: str, query_vector: list[float], topics: list[str], include_rules: bool = False) -> list[RecallItem]:
         if not self.settings.es_base_url:
             raise RuntimeError("ES_BASE_URL_MISSING")
         if not query_vector:
             return []
         size = self._vector_size(topics)
-        filters = self._filters(topics, include_base_wiki=include_base_wiki)
+        filters = self._filters(topics, include_rules=include_rules)
         knn: dict[str, object] = {
             "field": self.settings.es_vector_field,
             "query_vector": query_vector,
@@ -286,7 +374,7 @@ class EsKnowledgeRetrievalService:
         hits = ((response.json() or {}).get("hits") or {}).get("hits") or []
         return [es_hit_to_recall_item(hit, query_text, channel="vector") for hit in hits]
 
-    def _text_query(self, query_text: str, topics: list[str], include_base_wiki: bool = False) -> dict[str, object]:
+    def _text_query(self, query_text: str, topics: list[str], include_rules: bool = False) -> dict[str, object]:
         must: list[dict[str, object]] = []
         if query_text:
             must.append(
@@ -305,12 +393,12 @@ class EsKnowledgeRetrievalService:
                     }
                 }
             )
-        filters = self._filters(topics, include_base_wiki=include_base_wiki)
+        filters = self._filters(topics, include_rules=include_rules)
         if must or filters:
             return {"bool": {"must": must or [{"match_all": {}}], "filter": filters}}
         return {"match_all": {}}
 
-    def _filters(self, topics: list[str], include_base_wiki: bool = False) -> list[dict[str, object]]:
+    def _filters(self, topics: list[str], include_rules: bool = False) -> list[dict[str, object]]:
         filters: list[dict[str, object]] = []
         if topics:
             topic_should: list[dict[str, object]] = [
@@ -319,11 +407,11 @@ class EsKnowledgeRetrievalService:
                 {"terms": {"metadata.topic": topics}},
                 {"terms": {"metadata.topic.keyword": topics}},
             ]
-            if include_base_wiki:
-                topic_should.append({"term": {"source_type": "BASE_WIKI"}})
+            if include_rules:
+                topic_should.append({"term": {"source_type": "GOVERNED_RULE"}})
             filters.append({"bool": {"should": topic_should, "minimum_should_match": 1}})
-        elif include_base_wiki:
-            filters.append({"term": {"source_type": "BASE_WIKI"}})
+        elif include_rules:
+            filters.append({"term": {"source_type": "GOVERNED_RULE"}})
         return filters
 
     def _text_size(self, topics: list[str]) -> int:
@@ -337,6 +425,10 @@ class EsKnowledgeRetrievalService:
         key = "vectorTopK" if topics else "broadVectorTopK"
         fallback = self.settings.es_vector_top_k if topics else self.settings.es_broad_vector_top_k
         return max(1, int(profile.get(key) or fallback))
+
+    def _hybrid_size(self) -> int:
+        profile = self._active_retrieval_profile or {}
+        return max(1, int(profile.get("hybridTopK") or self.settings.es_hybrid_top_k or 24))
 
     def _vector_enabled(self) -> bool:
         return bool(self.settings.es_vector_enabled and self.settings.es_vector_field and self.settings.embedding_model and self._embedding_api_key())
@@ -409,6 +501,8 @@ class EsKnowledgeRetrievalService:
                 if not table:
                     continue
                 metrics = [metric for metric in self.topic_assets.load_table_metrics(topic, table) if isinstance(metric, dict)]
+                table_asset = self.topic_assets.load_table_asset(topic, table)
+                table_governance = recall_governance_metadata(table_asset)
                 metrics_by_key = {
                     str(metric.get("metricKey") or ""): metric
                     for metric in metrics
@@ -418,6 +512,7 @@ class EsKnowledgeRetrievalService:
                     candidate = resolve_metric_candidate(metric, topic, table, query)
                     if candidate is None:
                         continue
+                    candidate["governance"] = {**table_governance, **recall_governance_metadata(metric)}
                     semantic_ref_id = str(candidate["semanticRefId"])
                     current = by_id.get(semantic_ref_id)
                     if current is None or float(candidate.get("metricResolutionConfidence") or 0.0) > float(current.get("metricResolutionConfidence") or 0.0):
@@ -426,6 +521,7 @@ class EsKnowledgeRetrievalService:
                     candidate = resolve_term_metric_candidate(term, metrics_by_key, topic, table, query)
                     if candidate is None:
                         continue
+                    candidate["governance"] = {**table_governance, **recall_governance_metadata(metric)}
                     semantic_ref_id = str(candidate["semanticRefId"])
                     current = by_id.get(semantic_ref_id)
                     if current is None or float(candidate.get("metricResolutionConfidence") or 0.0) > float(current.get("metricResolutionConfidence") or 0.0):
@@ -470,7 +566,7 @@ class EsKnowledgeRetrievalService:
             metric_key = str(candidate.get("metricKey") or "")
             confidence = float(candidate.get("metricResolutionConfidence") or 0.0)
             resolution_type = str(candidate.get("metricResolutionType") or "")
-            score = float(candidate.get("fusionScore") or metric_candidate_fusion_score(confidence, resolution_type, rank))
+            score = metric_candidate_fusion_score(confidence, resolution_type, rank)
             metadata = {
                 "semanticSource": "metrics",
                 "semanticKind": "METRIC",
@@ -494,7 +590,9 @@ class EsKnowledgeRetrievalService:
                 "metricResolutionConfidence": confidence,
                 "metricResolutionAmbiguous": bool(candidate.get("metricResolutionAmbiguous") or False),
                 "metricCandidateRank": rank,
+                "metricResolverScore": score,
                 "recallSupplement": "metric_candidate_resolution",
+                **dict(candidate.get("governance") or {}),
             }
             items.append(
                 RecallItem(
@@ -531,7 +629,6 @@ class EsKnowledgeRetrievalService:
             metadata["matchedExactMetricLabel"] = metadata.get("matchedMetricLabel") or ""
             metadata["recallSupplement"] = "exact_metric_evidence"
             item.metadata = metadata
-            item.fusion_score = round(float(item.fusion_score or 0.0) - 50.0, 6)
         return items
 
     def _headers(self) -> dict[str, str]:
@@ -669,14 +766,16 @@ def compare_metric_candidate(left: dict[str, Any], right: dict[str, Any]) -> int
 
 
 def metric_candidate_fusion_score(confidence: float, resolution_type: str, rank: int) -> float:
-    base = {
-        "exact_business_name": 12000.0,
-        "exact_alias": 11800.0,
-        "exact_term": 11600.0,
-        "exact_metric_key": 11400.0,
-    }.get(str(resolution_type or ""), 11000.0)
+    type_score = {
+        "exact_business_name": 1.0,
+        "exact_alias": 0.98,
+        "exact_term": 0.96,
+        "exact_metric_key": 0.94,
+    }.get(str(resolution_type or ""), 0.72)
     bounded_rank = max(1, int(rank or 1))
-    return round(base + float(confidence or 0.0) * 100.0 - bounded_rank, 6)
+    confidence_score = max(0.0, min(float(confidence or 0.0), 1.0))
+    rank_penalty = min(0.15, (bounded_rank - 1) * 0.02)
+    return round(max(0.0, min(1.0, type_score * 0.55 + confidence_score * 0.45 - rank_penalty)), 6)
 
 
 def metric_trace_payload(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -702,7 +801,7 @@ def metric_trace_payload(candidates: list[dict[str, Any]]) -> list[dict[str, Any
 def build_retrieval_profile(
     query_text: str,
     topics: list[str],
-    include_base_wiki: bool,
+    include_rules: bool,
     metric_candidates: list[dict[str, Any]],
     settings: Settings,
     intent_kind: str = "",
@@ -714,12 +813,12 @@ def build_retrieval_profile(
     query_type = query_type_from_fast_understanding(
         intent_kind=intent_kind,
         complexity=complexity,
-        include_base_wiki=include_base_wiki,
+        include_rules=include_rules,
     )
     if query_type:
         reasons.append("fast_understanding:%s/%s" % (intent_kind or "unknown", complexity or "unknown"))
     else:
-        query_type = classify_query_type(query=query, topics=topics, metric_candidates=metric_candidates, include_base_wiki=include_base_wiki, reasons=reasons)
+        query_type = classify_query_type(query=query, topics=topics, metric_candidates=metric_candidates, include_rules=include_rules, reasons=reasons)
     profile_templates = configured_retrieval_profiles(settings)
     selected = dict(profile_templates.get(query_type) or profile_templates.get("multi_hop_analysis") or {})
     profile_kind = str(selected.get("profileKind") or "balanced")
@@ -728,7 +827,7 @@ def build_retrieval_profile(
     broad_text_top_k = int(selected.get("broadTextTopK") or settings.es_broad_text_top_k or 4)
     broad_vector_top_k = int(selected.get("broadVectorTopK") or settings.es_broad_vector_top_k or 4)
     hybrid_top_k = int(selected.get("hybridTopK") or settings.es_hybrid_top_k or 24)
-    complexity_score = int(selected.get("complexityScore") or estimate_query_complexity(query, topics, metric_candidates, include_base_wiki))
+    complexity_score = int(selected.get("complexityScore") or estimate_query_complexity(query, topics, metric_candidates, include_rules))
     if any(str(item.get("metricResolutionType") or "").startswith("exact") for item in metric_candidates):
         reasons.append("explicit_metric_candidate")
     return {
@@ -749,10 +848,10 @@ def build_retrieval_profile(
     }
 
 
-def query_type_from_fast_understanding(intent_kind: str, complexity: str, include_base_wiki: bool) -> str:
+def query_type_from_fast_understanding(intent_kind: str, complexity: str, include_rules: bool) -> str:
     kind = str(intent_kind or "").strip().lower()
     level = str(complexity or "").strip().lower()
-    if kind == "rule_only" or (include_base_wiki and kind not in {"rule_data_mix", "mixed_rule_data"}):
+    if kind == "rule_only" or (include_rules and kind not in {"rule_data_mix", "mixed_rule_data"}):
         return "rule_qa"
     if kind in {"rule_data_mix", "mixed_rule_data"}:
         return "mixed_rule_data"
@@ -803,7 +902,7 @@ def default_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
             "hybridTopK": max(12, min(int(settings.es_hybrid_top_k or 24), 16)),
             "broadSearchEnabled": True,
             "complexityScore": 1,
-            "sourceTypeCaps": {"SEMANTIC_METRIC": 10, "SEMANTIC_RELATIONSHIP": 5, "SEMANTIC_TABLE_ASSET": 4, "BASE_WIKI": 2},
+            "sourceTypeCaps": {"SEMANTIC_METRIC": 10, "SEMANTIC_RELATIONSHIP": 5, "SEMANTIC_TABLE_ASSET": 4, "GOVERNED_RULE": 2},
         },
         "multi_metric": {
             "profileKind": "balanced",
@@ -814,7 +913,7 @@ def default_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
             "hybridTopK": int(settings.es_hybrid_top_k or 24),
             "broadSearchEnabled": True,
             "complexityScore": 2,
-            "sourceTypeCaps": {"SEMANTIC_METRIC": 12, "SEMANTIC_RELATIONSHIP": 7, "SEMANTIC_TABLE_ASSET": 6, "BASE_WIKI": 3},
+            "sourceTypeCaps": {"SEMANTIC_METRIC": 12, "SEMANTIC_RELATIONSHIP": 7, "SEMANTIC_TABLE_ASSET": 6, "GOVERNED_RULE": 3},
         },
         "multi_hop_analysis": {
             "profileKind": "broad",
@@ -825,7 +924,7 @@ def default_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
             "hybridTopK": min(max(int(settings.es_hybrid_top_k or 24), 24) + 4, 32),
             "broadSearchEnabled": True,
             "complexityScore": 5,
-            "sourceTypeCaps": {"SEMANTIC_METRIC": 14, "SEMANTIC_RELATIONSHIP": 10, "SEMANTIC_TABLE_ASSET": 8, "BASE_WIKI": 4},
+            "sourceTypeCaps": {"SEMANTIC_METRIC": 14, "SEMANTIC_RELATIONSHIP": 10, "SEMANTIC_TABLE_ASSET": 8, "GOVERNED_RULE": 4},
         },
         "rule_qa": {
             "profileKind": "balanced",
@@ -836,7 +935,7 @@ def default_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
             "hybridTopK": max(12, min(int(settings.es_hybrid_top_k or 24), 18)),
             "broadSearchEnabled": True,
             "complexityScore": 3,
-            "sourceTypeCaps": {"SEMANTIC_METRIC": 8, "SEMANTIC_RELATIONSHIP": 4, "SEMANTIC_TABLE_ASSET": 4, "BASE_WIKI": 6},
+            "sourceTypeCaps": {"SEMANTIC_METRIC": 8, "SEMANTIC_RELATIONSHIP": 4, "SEMANTIC_TABLE_ASSET": 4, "GOVERNED_RULE": 6},
         },
         "mixed_rule_data": {
             "profileKind": "broad",
@@ -847,7 +946,7 @@ def default_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
             "hybridTopK": min(max(int(settings.es_hybrid_top_k or 24), 24) + 2, 28),
             "broadSearchEnabled": True,
             "complexityScore": 4,
-            "sourceTypeCaps": {"SEMANTIC_METRIC": 12, "SEMANTIC_RELATIONSHIP": 9, "SEMANTIC_TABLE_ASSET": 7, "BASE_WIKI": 6},
+            "sourceTypeCaps": {"SEMANTIC_METRIC": 12, "SEMANTIC_RELATIONSHIP": 9, "SEMANTIC_TABLE_ASSET": 7, "GOVERNED_RULE": 6},
         },
         "detail_lookup": {
             "profileKind": "focused",
@@ -858,7 +957,7 @@ def default_retrieval_profiles(settings: Settings) -> dict[str, dict[str, Any]]:
             "hybridTopK": max(10, min(int(settings.es_hybrid_top_k or 24), 14)),
             "broadSearchEnabled": True,
             "complexityScore": 2,
-            "sourceTypeCaps": {"SEMANTIC_METRIC": 8, "SEMANTIC_RELATIONSHIP": 6, "SEMANTIC_TABLE_ASSET": 5, "BASE_WIKI": 2},
+            "sourceTypeCaps": {"SEMANTIC_METRIC": 8, "SEMANTIC_RELATIONSHIP": 6, "SEMANTIC_TABLE_ASSET": 5, "GOVERNED_RULE": 2},
         },
     }
 
@@ -867,7 +966,7 @@ def classify_query_type(
     query: str,
     topics: list[str],
     metric_candidates: list[dict[str, Any]],
-    include_base_wiki: bool,
+    include_rules: bool,
     reasons: list[str] | None = None,
 ) -> str:
     out = reasons if reasons is not None else []
@@ -878,10 +977,10 @@ def classify_query_type(
     has_relationship = any(token in query for token in relationship_tokens)
     has_analysis = any(token in query for token in analysis_tokens)
     has_detail = any(token in query for token in detail_tokens)
-    if include_base_wiki and (has_analysis or len(topics) >= 2):
+    if include_rules and (has_analysis or len(topics) >= 2):
         out.append("mixed_rule_data")
         return "mixed_rule_data"
-    if include_base_wiki:
+    if include_rules:
         out.append("rule_qa")
         return "rule_qa"
     if has_detail:
@@ -901,7 +1000,7 @@ def estimate_query_complexity(
     query: str,
     topics: list[str],
     metric_candidates: list[dict[str, Any]],
-    include_base_wiki: bool,
+    include_rules: bool,
 ) -> int:
     score = 0
     if len(query or "") >= 24:
@@ -912,7 +1011,7 @@ def estimate_query_complexity(
         score += 1
     if any(token in query for token in ["同时", "并且", "关联", "分别", "趋势", "最高", "最低", "top", "前", "分析", "对比"]):
         score += 1
-    if include_base_wiki:
+    if include_rules:
         score += 1
     return score
 
@@ -933,13 +1032,24 @@ def merge_recall_items(primary: list[RecallItem], secondary: list[RecallItem]) -
         if not key:
             continue
         current = by_id.get(key)
-        if current is None or item.fusion_score >= current.fusion_score:
+        if current is None:
             by_id[key] = item
-    return sorted(by_id.values(), key=lambda item: item.fusion_score, reverse=True)
+            continue
+        preferred = item if recall_item_sort_key(item) > recall_item_sort_key(current) else current
+        other = current if preferred is item else item
+        merged = merge_recall_item_metadata(preferred, other)
+        has_final_score = any((candidate.metadata or {}).get("finalScore") is not None for candidate in [current, item])
+        merged_score = float(preferred.fusion_score or 0.0) if has_final_score else max(float(current.fusion_score or 0.0), float(item.fusion_score or 0.0))
+        by_id[key] = merged.model_copy(
+            update={
+                "fusion_score": merged_score,
+            }
+        )
+    return sorted(by_id.values(), key=recall_item_sort_key, reverse=True)
 
 
 def source_type_top_k_policy(
-    include_base_wiki: bool = False,
+    include_rules: bool = False,
     query_text: str = "",
     topics: list[str] | None = None,
     metric_candidates: list[dict[str, Any]] | None = None,
@@ -952,7 +1062,7 @@ def source_type_top_k_policy(
             "SEMANTIC_METRIC": int(configured_caps.get("SEMANTIC_METRIC") or 12),
             "SEMANTIC_RELATIONSHIP": int(configured_caps.get("SEMANTIC_RELATIONSHIP") or 8),
             "SEMANTIC_TABLE_ASSET": int(configured_caps.get("SEMANTIC_TABLE_ASSET") or 6),
-            "BASE_WIKI": int(configured_caps.get("BASE_WIKI") or (6 if include_base_wiki else 3)),
+            "GOVERNED_RULE": int(configured_caps.get("GOVERNED_RULE") or (6 if include_rules else 3)),
         }
     else:
         profile_kind = str(profile.get("profileKind") or "balanced")
@@ -961,21 +1071,21 @@ def source_type_top_k_policy(
                 "SEMANTIC_METRIC": 10,
                 "SEMANTIC_RELATIONSHIP": 5,
                 "SEMANTIC_TABLE_ASSET": 4,
-                "BASE_WIKI": 4 if include_base_wiki else 2,
+                "GOVERNED_RULE": 4 if include_rules else 2,
             }
         elif profile_kind == "broad":
             policy = {
                 "SEMANTIC_METRIC": 14,
                 "SEMANTIC_RELATIONSHIP": 10,
                 "SEMANTIC_TABLE_ASSET": 8,
-                "BASE_WIKI": 8 if include_base_wiki else 4,
+                "GOVERNED_RULE": 8 if include_rules else 4,
             }
         else:
             policy = {
                 "SEMANTIC_METRIC": 12,
                 "SEMANTIC_RELATIONSHIP": 8,
                 "SEMANTIC_TABLE_ASSET": 6,
-                "BASE_WIKI": 6 if include_base_wiki else 3,
+                "GOVERNED_RULE": 6 if include_rules else 3,
             }
     query = str(query_text or "")
     relationship_heavy = any(token in query for token in ["关联", "对应", "join", "同时看", "再看", "并看"])
@@ -994,7 +1104,7 @@ def limit_recall_items_by_source_type(items: list[RecallItem], policy: dict[str,
         return []
     counts: dict[str, int] = {}
     selected: list[RecallItem] = []
-    for item in sorted(items, key=lambda value: value.fusion_score, reverse=True):
+    for item in sorted(items, key=recall_item_sort_key, reverse=True):
         source_type = str(item.source_type or "UNKNOWN").upper()
         cap = int(policy.get(source_type, max(1, limit)))
         if counts.get(source_type, 0) < cap:
@@ -1018,7 +1128,7 @@ def recall_channels_for_items(items: list[RecallItem]) -> list[str]:
 def retrieval_lane_trace(
     retrieval_profile: dict[str, Any],
     vector_enabled: bool,
-    include_base_wiki: bool,
+    include_rules: bool,
     has_metric_candidates: bool,
     broad_enabled: bool,
 ) -> list[dict[str, Any]]:
@@ -1030,8 +1140,8 @@ def retrieval_lane_trace(
     lanes.append({"lane": "broad_bm25_lane", "enabled": broad_flag, "topK": int(retrieval_profile.get("broadTextTopK") or 0) if broad_flag else 0})
     lanes.append({"lane": "broad_vector_lane", "enabled": broad_flag and vector_enabled, "topK": int(retrieval_profile.get("broadVectorTopK") or 0) if broad_flag and vector_enabled else 0})
     lanes.append({"lane": "exact_metric_fallback_lane", "enabled": has_metric_candidates, "topK": 3 if has_metric_candidates else 0})
-    if include_base_wiki:
-        lanes.append({"lane": "rule_wiki_lane", "enabled": True, "topK": int((retrieval_profile.get("sourceTypeCaps") or {}).get("BASE_WIKI") or 0)})
+    if include_rules:
+        lanes.append({"lane": "governed_rule_lane", "enabled": True, "topK": int((retrieval_profile.get("sourceTypeCaps") or {}).get("GOVERNED_RULE") or 0)})
     return lanes
 
 
@@ -1044,8 +1154,8 @@ def rrf_fuse_recall_items(
     """Fuse ranked recall lists with reciprocal rank fusion.
 
     BM25 scores and vector similarities are not comparable. RRF only uses the
-    rank position inside each channel, so a document that appears near the top
-    in both channels naturally wins without score normalization.
+    rank position inside each channel, then normalizes the result to 0..1 so
+    downstream ranking keeps the same score semantics when a channel degrades.
     """
     k = max(1, int(rrf_k or 60))
     scale = float(score_scale or 1.0)
@@ -1068,17 +1178,32 @@ def rrf_fuse_recall_items(
                 by_id[key] = item
             else:
                 by_id[key] = merge_recall_item_metadata(by_id[key], item)
+    active_lane_count = max(1, sum(1 for _, items in ranked_groups if items))
+    theoretical_max = active_lane_count / float(k + 1)
     fused: list[RecallItem] = []
     for key, item in by_id.items():
         metadata = dict(item.metadata or {})
+        raw_score = scores.get(key, 0.0)
+        normalized_score = max(0.0, min(1.0, raw_score / theoretical_max)) if theoretical_max else 0.0
+        if metadata.get("rrfRanks"):
+            metadata["upstreamRrfRanks"] = metadata.get("rrfRanks")
+        if metadata.get("channelScores"):
+            metadata["upstreamChannelScores"] = metadata.get("channelScores")
+        if metadata.get("rrfNormalizedScore") is not None:
+            metadata["upstreamRrfNormalizedScore"] = metadata.get("rrfNormalizedScore")
         metadata["recallFusion"] = "rrf"
-        metadata["rrfScore"] = scores.get(key, 0.0)
+        metadata["scoreVersion"] = "recall_v2"
+        metadata["rrfScore"] = raw_score
+        metadata["rrfNormalizedScore"] = normalized_score
+        metadata["rrfDisplayScore"] = raw_score * scale
+        metadata["retrievalScore"] = normalized_score
         metadata["rrfK"] = k
+        metadata["rrfActiveLaneCount"] = active_lane_count
         metadata["rrfRanks"] = ranks.get(key, {})
         metadata["channelScores"] = channel_scores.get(key, {})
         metadata["recallChannels"] = sorted((ranks.get(key) or {}).keys())
-        fused.append(item.model_copy(update={"fusion_score": round(scores.get(key, 0.0) * scale, 6), "metadata": metadata}))
-    fused = sorted(fused, key=lambda item: item.fusion_score, reverse=True)
+        fused.append(item.model_copy(update={"fusion_score": round(normalized_score, 6), "metadata": metadata}))
+    fused = sorted(fused, key=recall_item_sort_key, reverse=True)
     return fused[: max(1, int(limit or len(fused)))] if limit else fused
 
 
@@ -1118,8 +1243,263 @@ def unique_source_refs(items: list[RecallItem]) -> list[str]:
     return refs
 
 
-def retrieval_query_text(request: KnowledgeRetrievalRequest) -> str:
-    parts = [request.query]
+FOLLOW_UP_QUERY_RE = re.compile(r"^(那|那么|再|然后|还有|这个|这些|它|它们|同样|按|改成|换成|呢|继续)")
+
+
+def rewrite_retrieval_query(request: KnowledgeRetrievalRequest) -> str:
+    """Turn a context-dependent follow-up into a standalone retrieval query.
+
+    This is intentionally deterministic: it only inherits the previous user
+    question when the current turn contains an explicit follow-up signal.
+    """
+    current = re.sub(r"\s+", " ", str(request.query or "")).strip()
+    previous = re.sub(r"\s+", " ", str(request.previous_user_question or "")).strip()
+    if not current or not previous or current == previous:
+        return current
+    follow_up = bool(FOLLOW_UP_QUERY_RE.search(current)) or any(
+        token in current for token in ["按商品看", "按天看", "按周看", "细分一下", "继续下钻", "换个维度"]
+    )
+    if not follow_up:
+        return current
+    return "%s；追问补充：%s" % (previous[:600], current[:300])
+
+
+def filter_recall_items_by_governance(
+    items: list[RecallItem],
+    request: KnowledgeRetrievalRequest,
+) -> tuple[list[RecallItem], dict[str, int]]:
+    kept: list[RecallItem] = []
+    filtered: dict[str, int] = {}
+    for item in items or []:
+        reason = recall_governance_block_reason(item, request)
+        if reason:
+            filtered[reason] = filtered.get(reason, 0) + 1
+            continue
+        kept.append(item)
+    return kept, filtered
+
+
+def recall_governance_metadata(payload: object) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    mappings = {
+        "status": payload.get("status") or payload.get("lifecycleStatus"),
+        "version": payload.get("version") or payload.get("semanticVersion"),
+        "activeVersion": payload.get("activeVersion") or payload.get("currentVersion"),
+        "merchantId": payload.get("merchantId"),
+        "merchantIds": payload.get("merchantIds") or payload.get("allowedMerchantIds"),
+        "allowedRoles": payload.get("allowedRoles"),
+        "requiredPermissions": payload.get("requiredPermissions"),
+        "visibilityPolicy": payload.get("visibilityPolicy"),
+        "expiresAt": payload.get("expiresAt") or payload.get("expiryAt"),
+        "confidence": payload.get("confidence") or payload.get("knowledgeConfidence"),
+    }
+    return {
+        key: value
+        for key, value in mappings.items()
+        if value is not None and value != "" and value != () and value != [] and value != {}
+    }
+
+
+def recall_governance_block_reason(item: RecallItem, request: KnowledgeRetrievalRequest) -> str:
+    metadata = dict(item.metadata or {})
+    status = str(
+        metadata.get("lifecycleStatus")
+        or metadata.get("publishStatus")
+        or metadata.get("status")
+        or ""
+    ).strip().lower()
+    blocked_statuses = {
+        "pending",
+        "pending_review",
+        "draft",
+        "rejected",
+        "disabled",
+        "inactive",
+        "expired",
+        "rolled_back",
+        "deleted",
+        "archived",
+        "blocked",
+    }
+    if status in blocked_statuses:
+        return "status"
+    if str(metadata.get("assetStatus") or "").strip().lower() in blocked_statuses:
+        return "status"
+
+    expires_at = metadata.get("expiresAt") or metadata.get("expiryAt")
+    if expires_at and timestamp_is_past(expires_at):
+        return "expired"
+    if metadata.get("assetExpiresAt") and timestamp_is_past(metadata.get("assetExpiresAt")):
+        return "expired"
+
+    active_version = str(metadata.get("activeVersion") or metadata.get("currentVersion") or "").strip()
+    item_version = str(metadata.get("semanticVersion") or metadata.get("version") or "").strip()
+    if active_version and item_version and active_version != item_version:
+        return "version"
+
+    merchant_id = str(request.merchant_id or "").strip()
+    scoped_merchants = metadata.get("merchantIds") or metadata.get("allowedMerchantIds") or []
+    if isinstance(scoped_merchants, str):
+        scoped_merchants = [scoped_merchants]
+    item_merchant = str(metadata.get("merchantId") or "").strip()
+    if item_merchant and item_merchant not in {"*", "global", merchant_id}:
+        return "merchant"
+    asset_merchant = str(metadata.get("assetMerchantId") or "").strip()
+    if asset_merchant and asset_merchant not in {"*", "global", merchant_id}:
+        return "merchant"
+    if scoped_merchants and merchant_id not in {str(value) for value in scoped_merchants} and "*" not in scoped_merchants:
+        return "merchant"
+
+    visibility = metadata.get("visibilityPolicy") if isinstance(metadata.get("visibilityPolicy"), dict) else {}
+    allowed_roles = metadata.get("allowedRoles") or visibility.get("allowedRoles") or []
+    if isinstance(allowed_roles, str):
+        allowed_roles = [allowed_roles]
+    role = str(request.access_role or "merchant_operator").strip().lower()
+    normalized_roles = {str(value).strip().lower() for value in allowed_roles if str(value).strip()}
+    if normalized_roles and role not in normalized_roles and role not in {"merchant_admin", "admin"}:
+        return "role"
+    asset_roles = metadata.get("assetAllowedRoles") or []
+    if isinstance(asset_roles, str):
+        asset_roles = [asset_roles]
+    normalized_asset_roles = {str(value).strip().lower() for value in asset_roles if str(value).strip()}
+    if normalized_asset_roles and role not in normalized_asset_roles and role not in {"merchant_admin", "admin"}:
+        return "role"
+    visibility_level = str(visibility.get("level") or metadata.get("visibility") or "").strip().lower()
+    if visibility_level == "restricted" and not normalized_roles and role not in {"merchant_admin", "admin"}:
+        return "role"
+    asset_visibility = metadata.get("assetVisibilityPolicy") if isinstance(metadata.get("assetVisibilityPolicy"), dict) else {}
+    if str(asset_visibility.get("level") or "").strip().lower() == "restricted" and not normalized_asset_roles and role not in {"merchant_admin", "admin"}:
+        return "role"
+
+    required_permissions = metadata.get("requiredPermissions") or []
+    if isinstance(required_permissions, str):
+        required_permissions = [required_permissions]
+    granted = {str(value).strip() for value in request.permissions if str(value).strip()}
+    if required_permissions and not set(map(str, required_permissions)).issubset(granted):
+        return "permission"
+    asset_permissions = metadata.get("assetRequiredPermissions") or []
+    if isinstance(asset_permissions, str):
+        asset_permissions = [asset_permissions]
+    if asset_permissions and not set(map(str, asset_permissions)).issubset(granted):
+        return "permission"
+    return ""
+
+
+def timestamp_is_past(value: object) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= datetime.now(timezone.utc)
+
+
+def business_rerank_recall_items(
+    items: list[RecallItem],
+    query_text: str,
+    request: KnowledgeRetrievalRequest,
+) -> list[RecallItem]:
+    query = str(query_text or "").lower()
+    intent = str(request.intent_kind or "").lower()
+    reranked: list[RecallItem] = []
+    fallback_ranks = {
+        id(item): rank
+        for rank, item in enumerate(sorted(items or [], key=lambda value: float(value.fusion_score or 0.0), reverse=True), start=1)
+    }
+    for item in items or []:
+        metadata = dict(item.metadata or {})
+        source_type = str(item.source_type or "").upper()
+        business_score = 0.0
+        reasons: list[str] = []
+        aliases = metadata.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        labels = [
+            metadata.get("businessName"),
+            metadata.get("metricKey"),
+            *aliases,
+        ]
+        if any(str(label).strip().lower() in query for label in labels if len(str(label).strip()) >= 2):
+            business_score += 0.4
+            reasons.append("exact_business_label")
+        if item.topic and str(item.topic).lower() in query:
+            business_score += 0.1
+            reasons.append("topic_match")
+        if source_type == "SEMANTIC_METRIC" and intent in {"metric_query", "multi_metric", "analysis"}:
+            business_score += 0.3
+            reasons.append("metric_intent")
+        if source_type == "SEMANTIC_RELATIONSHIP" and intent in {"multi_hop", "analysis", "rule_data_mix"}:
+            business_score += 0.3
+            reasons.append("relationship_intent")
+        if source_type == "GOVERNED_RULE" and intent in {"rule_only", "rule_data_mix"}:
+            business_score += 0.3
+            reasons.append("rule_intent")
+        confidence = metadata.get("confidence") or metadata.get("knowledgeConfidence")
+        if isinstance(confidence, (int, float)):
+            business_score += max(0.0, min(float(confidence), 1.0)) * 0.2
+            reasons.append("confidence")
+        business_score = max(0.0, min(1.0, business_score))
+        retrieval_score = recall_item_retrieval_score(item, fallback_rank=fallback_ranks.get(id(item), 1))
+        protection_tier, protection_reasons = metric_protection_tier(metadata, source_type, intent)
+        final_score = max(0.0, min(1.0, retrieval_score * 0.75 + business_score * 0.25))
+        metadata["scoreVersion"] = "recall_v2"
+        metadata["retrievalScore"] = round(retrieval_score, 6)
+        metadata["businessScore"] = round(business_score, 6)
+        metadata["retrievalWeightedScore"] = round(retrieval_score * 0.75, 6)
+        metadata["businessWeightedScore"] = round(business_score * 0.25, 6)
+        metadata["finalScore"] = round(final_score, 6)
+        metadata["protectionTier"] = protection_tier
+        metadata["protectionReasons"] = protection_reasons
+        metadata["businessRerankBoost"] = round(business_score * 0.25, 6)
+        metadata["businessRerankReasons"] = reasons
+        reranked.append(item.model_copy(update={"fusion_score": round(final_score, 6), "metadata": metadata}))
+    return sorted(reranked, key=recall_item_sort_key, reverse=True)
+
+
+def recall_item_retrieval_score(item: RecallItem, fallback_rank: int = 1) -> float:
+    metadata = dict(item.metadata or {})
+    for key in ["retrievalScore", "rrfNormalizedScore", "metricResolverScore"]:
+        value = metadata.get(key)
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+    raw_score = float(item.fusion_score or 0.0)
+    if 0.0 <= raw_score <= 1.0:
+        return raw_score
+    rank = max(1, int(fallback_rank or 1))
+    return round(61.0 / float(60 + rank), 6)
+
+
+def metric_protection_tier(metadata: dict[str, Any], source_type: str, intent: str) -> tuple[int, list[str]]:
+    if source_type != "SEMANTIC_METRIC":
+        return 0, []
+    resolution_type = str(metadata.get("metricResolutionType") or "")
+    confidence = max(0.0, min(1.0, float(metadata.get("metricResolutionConfidence") or 0.0)))
+    ambiguous = bool(metadata.get("metricResolutionAmbiguous") or False)
+    metric_intent = intent in {"metric_query", "multi_metric", "analysis"}
+    exact = resolution_type in {"exact_business_name", "exact_alias", "exact_term", "exact_metric_key"}
+    if exact and confidence >= 0.95 and not ambiguous and metric_intent:
+        return 2, ["exact_metric", "high_confidence", "unambiguous", "metric_intent"]
+    if confidence >= 0.8 and not ambiguous:
+        reasons = ["metric_candidate", "high_confidence"]
+        if exact:
+            reasons.append("exact_metric")
+        return 1, reasons
+    return 0, []
+
+
+def recall_item_sort_key(item: RecallItem) -> tuple[int, float, float]:
+    metadata = dict(item.metadata or {})
+    return (
+        int(metadata.get("protectionTier") or 0),
+        float(metadata.get("finalScore") if metadata.get("finalScore") is not None else item.fusion_score or 0.0),
+        float(metadata.get("retrievalScore") or 0.0),
+    )
+
+
+def retrieval_query_text(request: KnowledgeRetrievalRequest, rewritten_query: str = "") -> str:
+    parts = [rewritten_query or request.query]
     parts.extend(request.keywords or [])
     knowledge_request = request.knowledge_request
     if knowledge_request:

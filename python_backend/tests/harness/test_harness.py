@@ -94,7 +94,6 @@ from merchant_ai.services.assets import (
     SkillLoader,
     TopicBuilderWorkflow,
     TopicAssetService,
-    WikiMemoryService,
 )
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
@@ -147,7 +146,10 @@ from merchant_ai.services.context_assembly import ContextAssembler, ThreadContex
 from merchant_ai.services.runs import AgentAsyncRunService, AgentRunManager, AgentRunStreamService, answer_chunks, run_duration_ms
 from merchant_ai.services.memory import (
     EnterpriseMemoryStore,
+    KnowledgeConflictService,
+    KnowledgeCuratorService,
     MemoryEsRepository,
+    MemoryIngestionService,
     MemoryKnowledgeGovernanceService,
     MemoryManagementService,
     StructuredMemoryStore,
@@ -158,6 +160,7 @@ from merchant_ai.services.memory import (
     memory_query_hash,
     truncate_memory_text_by_tokens,
 )
+from merchant_ai.services.llm import TaskModelRouter
 from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.merchant_profile import MerchantProfileStore, MerchantProfileSummaryService
 from merchant_ai.services.evaluation import (
@@ -913,7 +916,7 @@ def test_planner_semantic_tool_loop_loads_ref_then_emits_understanding(tmp_path)
     topic_assets = TopicAssetService(settings)
     catalog = SemanticCatalogService(topic_assets)
     question = "最近 90 天下单最多的前 5 个 SPU，同时看它们的退款量。"
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         KeywordExtractService().extract(question),
         [],
@@ -954,7 +957,7 @@ def test_planner_auto_mode_lets_model_read_semantic_assets_when_needed(tmp_path)
     topic_assets = TopicAssetService(settings)
     catalog = SemanticCatalogService(topic_assets)
     question = "最近 90 天下单最多的前 5 个 SPU，同时看它们的退款量。"
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         KeywordExtractService().extract(question),
         [],
@@ -1049,7 +1052,7 @@ def test_planner_auto_mode_can_emit_directly_when_asset_pack_is_enough(tmp_path)
     topic_assets = TopicAssetService(settings)
     catalog = SemanticCatalogService(topic_assets)
     question = "最近 90 天下单最多的前 5 个 SPU，同时看它们的退款量。"
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         KeywordExtractService().extract(question),
         [],
@@ -1129,7 +1132,7 @@ def test_planner_fast_path_skips_semantic_tool_loop_when_understood(tmp_path):
     topic_assets = TopicAssetService(settings)
     catalog = SemanticCatalogService(topic_assets)
     question = "最近 90 天下单最多的前 5 个 SPU，同时看它们的退款量。"
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         KeywordExtractService().extract(question),
         [],
@@ -1196,7 +1199,7 @@ def test_planner_success_path_does_not_refine_with_semantic_tool_loop(tmp_path):
 def test_recall_uses_single_semantic_asset_document_per_table():
     settings = get_settings()
     topic_assets = TopicAssetService(settings)
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall = HybridRecallService(settings, topic_assets)
     docs = recall._load_documents()
     order_docs = [doc for doc in docs if doc.table == "dwm_trade_order_detail_di" and doc.topic == "电商交易"]
     table_docs = [doc for doc in order_docs if doc.source_type == "SEMANTIC_TABLE_ASSET"]
@@ -2825,6 +2828,47 @@ def test_fast_metric_is_a_main_agent_action_and_preserves_response_sections(monk
     assert response.debug_trace["leadAgentFastDecision"] is True
 
 
+def test_long_term_memory_is_recalled_before_policy_and_builds_constraints():
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    state = workflow._initial_state("最近7天退款率怎么样", "100", ChatContext(), None, "memory_thread", "memory_run")
+    state = workflow.runtime_bootstrap(state)
+
+    class RecallOnlyStore:
+        def __init__(self):
+            self.select_calls = 0
+
+        def select_for_question(self, selected_state, budget_tokens=0, budget_chars=0):
+            self.select_calls += 1
+            assert selected_state["answer"] == ""
+            return {
+                "merchantId": "100",
+                "relevantCorrections": [
+                    {
+                        "id": "mem_refund_definition",
+                        "memoryType": "correction",
+                        "correctionText": "退款率按退款订单数除以支付订单数计算",
+                        "topics": ["REFUND"],
+                        "metrics": ["refund_rate"],
+                        "confidence": 0.95,
+                        "status": "approved",
+                    }
+                ],
+                "memoryInjectionTrace": {"selectedIds": ["mem_refund_definition"]},
+                "source": "test",
+            }
+
+    store = RecallOnlyStore()
+    workflow.memory_store = store
+    state = workflow.recall_memory(state)
+
+    assert store.select_calls == 1
+    assert state["memory_injection_trace"]["selectedIds"] == ["mem_refund_definition"]
+    assert state["memory_constraints"][0]["type"] == "metric_correction"
+    assert state["memory_constraints"][0]["enforcement"] == "required"
+    assert "退款率按退款订单数" in state["memory_constraints"][0]["instruction"]
+    assert any("回答前召回完成" in item for item in state["thinking_steps"])
+
+
 def test_multi_topic_route_does_not_assign_fixed_order_primary_topic():
     question = "最近30天退款金额最高的前5个商品，同时看这些商品的下单量和商品发布时间，帮我判断哪些是高风险新品。"
     keywords = KeywordExtractService().extract(question)
@@ -3160,7 +3204,7 @@ def test_answer_compose_merges_rule_evidence_with_bi_data():
         merged_query_bundle=bundle,
     )
     rule_context = """
-召回规则片段 [BASE_WIKI] yshopping 平台商家规则
+召回规则片段 [GOVERNED_RULE] yshopping 平台商家规则
 - 商家发货时应确保订单状态、发货时效、物流单号和承运信息一致，避免虚假发货、超时发货或单号无轨迹。
 - 若用户咨询“发货规则”“超时发货怎么办”，应重点回答发货时效、物流信息准确性和异常订单排查路径。
 """
@@ -4307,7 +4351,7 @@ def test_knowledge_request_gap_append_is_stable():
 def test_knowledge_retrieval_service_returns_unified_bundle():
     settings = get_settings()
     topic_assets = TopicAssetService(settings)
-    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall_service = HybridRecallService(settings, topic_assets)
     service = HybridKnowledgeRetrievalService(recall_service)
 
     bundle = service.retrieve(
@@ -4943,10 +4987,10 @@ def test_es_knowledge_retrieval_returns_source_refs(monkeypatch):
     topic_assets = TopicAssetService(settings)
     service = EsKnowledgeRetrievalService(settings, topic_assets)
 
-    def fake_search(query_text, topics, include_base_wiki=False):
+    def fake_search(query_text, topics, include_rules=False):
         assert "退款金额" in query_text
         assert topics
-        assert include_base_wiki is False
+        assert include_rules is False
         return [
             RecallItem(
                 doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_related_pay_amt",
@@ -4976,7 +5020,7 @@ def test_es_retrieval_supplements_exact_metric_evidence_when_topk_misses_it(monk
     topic_assets = TopicAssetService(settings)
     service = EsKnowledgeRetrievalService(settings, topic_assets)
 
-    def fake_search(query_text, topics, include_base_wiki=False):
+    def fake_search(query_text, topics, include_rules=False):
         return [
             RecallItem(
                 doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
@@ -5025,7 +5069,7 @@ def test_es_retrieval_resolves_metric_candidates_before_semantic_context(monkeyp
     topic_assets = TopicAssetService(settings)
     service = EsKnowledgeRetrievalService(settings, topic_assets)
 
-    def fake_search(query_text, topics, include_base_wiki=False):
+    def fake_search(query_text, topics, include_rules=False):
         return [
             RecallItem(
                 doc_id="semantic:商品管理:dwm_goods_detail_df:table",
@@ -5061,15 +5105,15 @@ def test_es_retrieval_limits_items_by_source_type_policy():
         RecallItem(doc_id="metric_%d" % index, source_type="SEMANTIC_METRIC", fusion_score=100 - index)
         for index in range(20)
     ] + [
-        RecallItem(doc_id="wiki_%d" % index, source_type="BASE_WIKI", fusion_score=90 - index)
+        RecallItem(doc_id="rule_%d" % index, source_type="GOVERNED_RULE", fusion_score=90 - index)
         for index in range(10)
     ]
-    limited = limit_recall_items_by_source_type(items, source_type_top_k_policy(include_base_wiki=False), limit=18)
+    limited = limit_recall_items_by_source_type(items, source_type_top_k_policy(include_rules=False), limit=18)
 
     metric_count = sum(1 for item in limited if item.source_type == "SEMANTIC_METRIC")
-    wiki_count = sum(1 for item in limited if item.source_type == "BASE_WIKI")
+    rule_count = sum(1 for item in limited if item.source_type == "GOVERNED_RULE")
     assert metric_count <= 12
-    assert wiki_count <= 3
+    assert rule_count <= 3
     assert len(limited) == 15
 
 
@@ -5079,14 +5123,14 @@ def test_retrieval_profile_uses_dynamic_topk_for_focused_and_broad_queries():
     focused = build_retrieval_profile(
         query_text="最近7天退款金额",
         topics=["电商退货"],
-        include_base_wiki=False,
+        include_rules=False,
         metric_candidates=[],
         settings=settings,
     )
     broad = build_retrieval_profile(
         query_text="最近30天退款金额最高的前5个商品，同时看下单量、商品发布时间，并分析是否存在异常波动",
         topics=["电商退货", "交易履约", "商品管理"],
-        include_base_wiki=False,
+        include_rules=False,
         metric_candidates=[{"metricKey": "pay_amt"}, {"metricKey": "order_cnt"}],
         settings=settings,
     )
@@ -5107,7 +5151,7 @@ def test_retrieval_profile_uses_fast_understanding_complexity_override():
     profile = build_retrieval_profile(
         query_text="退款率",
         topics=["电商退货"],
-        include_base_wiki=False,
+        include_rules=False,
         metric_candidates=[],
         settings=settings,
         intent_kind="analysis",
@@ -5129,7 +5173,7 @@ def test_retrieval_profile_can_be_overridden_by_config():
                         "textTopK": 5,
                         "vectorTopK": 4,
                         "hybridTopK": 9,
-                        "sourceTypeCaps": {"SEMANTIC_METRIC": 7, "BASE_WIKI": 1},
+                        "sourceTypeCaps": {"SEMANTIC_METRIC": 7, "GOVERNED_RULE": 1},
                     }
                 },
                 ensure_ascii=False,
@@ -5139,12 +5183,12 @@ def test_retrieval_profile_can_be_overridden_by_config():
     profile = build_retrieval_profile(
         query_text="最近7天退款金额",
         topics=["电商退货"],
-        include_base_wiki=False,
+        include_rules=False,
         metric_candidates=[],
         settings=settings,
     )
     policy = source_type_top_k_policy(
-        include_base_wiki=False,
+        include_rules=False,
         query_text="最近7天退款金额",
         topics=["电商退货"],
         metric_candidates=[],
@@ -5159,7 +5203,7 @@ def test_retrieval_profile_can_be_overridden_by_config():
 
 def test_source_type_topk_policy_expands_relationships_for_multi_hop_queries():
     policy = source_type_top_k_policy(
-        include_base_wiki=False,
+        include_rules=False,
         query_text="最近30天退款金额最高的商品，同时看商品发布时间并关联订单情况",
         topics=["电商退货", "商品管理", "交易履约"],
         metric_candidates=[{"metricKey": "pay_amt"}],
@@ -5178,7 +5222,7 @@ def test_es_retrieval_trace_includes_query_type_and_lanes(monkeypatch):
     monkeypatch.setattr(
         service,
         "_search",
-        lambda query_text, topics, include_base_wiki=False: [
+        lambda query_text, topics, include_rules=False: [
             RecallItem(
                 doc_id="semantic:test",
                 title="退款金额",
@@ -5235,7 +5279,7 @@ def test_es_hybrid_search_uses_vector_and_rrf_when_embedding_configured(monkeypa
     monkeypatch.setattr(
         service,
         "_text_search",
-        lambda query_text, topics, include_base_wiki=False: [
+        lambda query_text, topics, include_rules=False: [
             RecallItem(doc_id="semantic:a", title="A", fusion_score=100),
             RecallItem(doc_id="semantic:b", title="B", fusion_score=80),
         ],
@@ -5243,7 +5287,7 @@ def test_es_hybrid_search_uses_vector_and_rrf_when_embedding_configured(monkeypa
     monkeypatch.setattr(
         service,
         "_vector_search",
-        lambda query_text, vector, topics, include_base_wiki=False: [
+        lambda query_text, vector, topics, include_rules=False: [
             RecallItem(doc_id="semantic:b", title="B", fusion_score=0.91),
             RecallItem(doc_id="semantic:c", title="C", fusion_score=0.89),
         ],
@@ -5260,11 +5304,14 @@ def test_es_hybrid_search_falls_back_to_text_without_embedding_key(monkeypatch):
     settings = get_settings().model_copy(update={"embedding_api_key": "", "llm_api_key": "", "es_vector_enabled": True})
     service = EsKnowledgeRetrievalService(settings, TopicAssetService(settings))
     text_items = [RecallItem(doc_id="semantic:a", title="A", fusion_score=100)]
-    monkeypatch.setattr(service, "_text_search", lambda query_text, topics, include_base_wiki=False: text_items)
+    monkeypatch.setattr(service, "_text_search", lambda query_text, topics, include_rules=False: text_items)
 
     items = service._search("退款金额", ["电商退货"])
 
-    assert items == text_items
+    assert [item.doc_id for item in items] == ["semantic:a"]
+    assert items[0].fusion_score == 1.0
+    assert items[0].metadata["rrfRanks"] == {"bm25": 1}
+    assert items[0].metadata["channelScores"] == {"bm25": 100.0}
 
 
 def test_es_index_adapter_adds_content_vector_when_embedding_configured(monkeypatch):
@@ -5303,7 +5350,7 @@ def test_llm_understanding_compiler_adds_formula_dependency_measure_nodes():
     topic_assets = TopicAssetService(settings)
     builder = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings))
     question = "最近45天优惠券金额投入最高的商品，退款率是否偏高？"
-    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall_service = HybridRecallService(settings, topic_assets)
     recall = recall_service.recall(
         question,
         KeywordExtractService().extract(question),
@@ -7343,6 +7390,366 @@ def test_memory_ingestion_creates_candidate_knowledge_suggestion_and_past_case(t
     assert selected["relevantPastCases"][0]["casePayload"]["semanticRefIds"]
 
 
+class FakeKnowledgeCuratorLlm:
+    configured = True
+    last_error = ""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def tool_json_chat(self, system_prompt, user_prompt, tool, fallback, timeout_seconds=None):
+        self.calls.append(
+            {
+                "systemPrompt": system_prompt,
+                "userPrompt": user_prompt,
+                "tool": tool,
+                "timeoutSeconds": timeout_seconds,
+            }
+        )
+        return self.payload
+
+
+def test_llm_knowledge_curator_extracts_candidate_without_activating_memory(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "memory_curator_enabled": True,
+            "memory_curator_min_confidence": 0.7,
+        }
+    )
+    llm = FakeKnowledgeCuratorLlm(
+        {
+            "shouldExtract": True,
+            "reason": "merchant stated a reusable internal rule",
+            "candidates": [
+                {
+                    "kind": "merchant_rule",
+                    "scope": "merchant",
+                    "title": "赠品销售额规则",
+                    "content": "本店统计销售额时排除赠品。",
+                    "evidenceQuote": "我们店统计销售额时要排除赠品",
+                    "topic": "交易",
+                    "metricName": "销售额",
+                    "aliases": ["GMV"],
+                    "confidence": 0.94,
+                    "reason": "explicit merchant-specific calculation rule",
+                }
+            ],
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    store.ingestion_service = MemoryIngestionService(settings, curator=KnowledgeCuratorService(settings, llm=llm))
+    state = {
+        "question": "不对，我们店统计销售额时要排除赠品。",
+        "requested_merchant_id": "seller_100",
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    category=QuestionCategory.TRADE,
+                    metric_name="销售额",
+                    metric_resolution={"metricKey": "pay_amt"},
+                )
+            ]
+        ),
+        "answer": "好的，我会先生成一条本店知识候选供你确认。",
+    }
+
+    memory = store.update_from_state(state)
+
+    assert llm.calls
+    assert not memory["facts"]
+    assert not memory["preferences"]
+    assert len(memory["knowledgeSuggestions"]) == 1
+    suggestion = memory["knowledgeSuggestions"][0]
+    assert suggestion["source"] == "llm_knowledge_curator"
+    assert suggestion["scopeType"] == "merchant"
+    assert suggestion["payload"]["extractionMode"] == "llm_curator"
+    assert memory["memoryIngestionTrace"]["knowledgeCurator"]["authoritative"] is True
+
+
+def test_llm_knowledge_curator_forces_metric_definition_to_platform_scope(tmp_path):
+    settings = get_settings().model_copy(
+        update={"harness_workspace_path": str(tmp_path), "memory_backend": "file", "memory_curator_enabled": True}
+    )
+    llm = FakeKnowledgeCuratorLlm(
+        {
+            "shouldExtract": True,
+            "reason": "metric definition dispute",
+            "candidates": [
+                {
+                    "kind": "metric_definition",
+                    "scope": "merchant",
+                    "title": "退款率口径纠正",
+                    "content": "退款率应使用退款单数除以下单订单数。",
+                    "evidenceQuote": "退款率应该用退款单数除以下单订单数",
+                    "topic": "退款",
+                    "metricName": "refund_rate",
+                    "aliases": ["退款率"],
+                    "confidence": 0.96,
+                    "reason": "user disputes an official metric definition",
+                }
+            ],
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    store.ingestion_service = MemoryIngestionService(settings, curator=KnowledgeCuratorService(settings, llm=llm))
+    memory = store.update_from_state(
+        {
+            "question": "不对，退款率应该用退款单数除以下单订单数。",
+            "requested_merchant_id": "seller_100",
+            "plan": QueryPlan(
+                intents=[
+                    QuestionIntent(
+                        category=QuestionCategory.REFUND,
+                        metric_name="退款率",
+                        metric_resolution={"metricKey": "refund_rate"},
+                    )
+                ]
+            ),
+            "answer": "已生成平台口径反馈候选。",
+        }
+    )
+
+    assert memory["knowledgeSuggestions"][0]["scopeType"] == "platform"
+    governance = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+    accepted = governance.apply_merchant_action("seller_100", memory["knowledgeSuggestions"][0]["suggestionId"], "accept")
+    assert accepted["success"] is False
+    assert accepted["status"] == "PLATFORM_KNOWLEDGE_REQUIRES_REVIEW"
+
+
+def test_successful_curator_no_candidate_does_not_promote_rule_correction(tmp_path):
+    settings = get_settings().model_copy(
+        update={"harness_workspace_path": str(tmp_path), "memory_backend": "file", "memory_curator_enabled": True}
+    )
+    llm = FakeKnowledgeCuratorLlm({"shouldExtract": False, "reason": "one-off query", "candidates": []})
+    store = StructuredMemoryStore(settings)
+    store.ingestion_service = MemoryIngestionService(settings, curator=KnowledgeCuratorService(settings, llm=llm))
+
+    memory = store.update_from_state(
+        {
+            "question": "不对，这次只看昨天的数据。",
+            "requested_merchant_id": "seller_100",
+            "plan": QueryPlan(intents=[QuestionIntent(category=QuestionCategory.TRADE, days=1)]),
+            "answer": "已改为只分析昨天。",
+        }
+    )
+
+    assert not memory["facts"]
+    assert not memory["knowledgeSuggestions"]
+    assert memory["events"][-1]["status"] == "candidate"
+    assert memory["memoryIngestionTrace"]["knowledgeCurator"]["candidateCount"] == 0
+
+
+class FakeKnowledgeConflictLlm:
+    configured = True
+    last_error = ""
+
+    def __init__(self, relation="conflict", recommended_action="replace", merged_content=""):
+        self.relation = relation
+        self.recommended_action = recommended_action
+        self.merged_content = merged_content
+
+    def tool_json_chat(self, system_prompt, user_prompt, tool, fallback, timeout_seconds=None):
+        payload = json.loads(user_prompt)
+        return {
+            "assessments": [
+                {
+                    "existingKnowledgeId": item["id"],
+                    "relation": self.relation,
+                    "confidence": 0.95,
+                    "reason": "fake conflict judgement",
+                    "recommendedAction": self.recommended_action,
+                    "mergedContent": self.merged_content,
+                }
+                for item in payload.get("existingKnowledge") or []
+            ]
+        }
+
+
+class FakeConflictTopicAssets:
+    def all_topic_names(self):
+        return ["电商退货"]
+
+    def load_manifest(self, topic):
+        return [{"tableName": "refund_table"}]
+
+    def load_table_asset(self, topic, table):
+        return {
+            "metrics": [
+                {
+                    "metricKey": "refund_rate",
+                    "businessName": "退款率",
+                    "description": "退款订单数除以支付订单数",
+                    "formula": "refund_order_cnt / paid_order_cnt",
+                }
+            ],
+            "knowledgeRules": [],
+        }
+
+
+def test_task_model_router_uses_capability_tiers():
+    settings = get_settings().model_copy(
+        update={
+            "llm_model": "default-model",
+            "llm_strong_model": "strong-model",
+            "llm_balanced_model": "balanced-model",
+            "llm_fast_model": "fast-model",
+        }
+    )
+    router = TaskModelRouter(settings)
+
+    assert router.model_for("planner") == "strong-model"
+    assert router.model_for("answer") == "balanced-model"
+    assert router.model_for("knowledge_conflict") == "fast-model"
+
+
+def test_merchant_knowledge_duplicate_requires_confirmation_then_reuses_existing(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "knowledge_conflict_enabled": True,
+            "knowledge_conflict_min_similarity": 0.1,
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    memory = store.empty_memory("seller_100")
+    memory["facts"] = [
+        {
+            "factId": "fact_existing",
+            "memoryType": "business_fact",
+            "content": "本店统计销售额时排除赠品。",
+            "status": "approved",
+        }
+    ]
+    memory["knowledgeSuggestions"] = [
+        {
+            "suggestionId": "ks_duplicate",
+            "suggestionType": "merchant_rule",
+            "scopeType": "merchant",
+            "status": "candidate",
+            "payload": {"correctionText": "本店统计销售额时排除赠品。", "proposedScope": "merchant"},
+        }
+    ]
+    store.save("seller_100", memory)
+    service = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+    service.conflict_service = KnowledgeConflictService(
+        settings,
+        llm=FakeKnowledgeConflictLlm(relation="duplicate", recommended_action="use_existing"),
+        topic_assets=FakeConflictTopicAssets(),
+    )
+
+    pending = service.apply_merchant_action("seller_100", "ks_duplicate", "accept", actor="merchant")
+    assert pending["status"] == "CONFLICT_CONFIRMATION_REQUIRED"
+    assert pending["conflictCheck"]["resolutionOptions"] == ["use_existing", "keep_both", "cancel"]
+
+    resolved = service.apply_merchant_action(
+        "seller_100",
+        "ks_duplicate",
+        "accept",
+        actor="merchant",
+        conflict_resolution="use_existing",
+    )
+    assert resolved["status"] == "EXISTING_KNOWLEDGE_REUSED"
+    assert store.load("seller_100")["knowledgeSuggestions"][0]["status"] == "dismissed"
+
+
+def test_merchant_knowledge_conflict_replace_supersedes_old_fact(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "knowledge_conflict_enabled": True,
+            "knowledge_conflict_min_similarity": 0.1,
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    memory = store.empty_memory("seller_100")
+    memory["facts"] = [
+        {
+            "factId": "fact_old_gift_rule",
+            "memoryType": "business_fact",
+            "content": "本店统计销售额时包含赠品。",
+            "status": "approved",
+        }
+    ]
+    memory["knowledgeSuggestions"] = [
+        {
+            "suggestionId": "ks_new_gift_rule",
+            "suggestionType": "merchant_rule",
+            "scopeType": "merchant",
+            "status": "candidate",
+            "metricName": "销售额",
+            "payload": {"correctionText": "本店统计销售额时排除赠品。", "proposedScope": "merchant"},
+        }
+    ]
+    store.save("seller_100", memory)
+    service = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+    service.conflict_service = KnowledgeConflictService(
+        settings,
+        llm=FakeKnowledgeConflictLlm(relation="conflict", recommended_action="replace"),
+        topic_assets=FakeConflictTopicAssets(),
+    )
+
+    pending = service.apply_merchant_action("seller_100", "ks_new_gift_rule", "accept", actor="merchant")
+    assert pending["status"] == "CONFLICT_CONFIRMATION_REQUIRED"
+    resolved = service.apply_merchant_action(
+        "seller_100",
+        "ks_new_gift_rule",
+        "accept",
+        actor="merchant",
+        conflict_resolution="replace",
+    )
+
+    assert resolved["status"] == "MERCHANT_ACTIVE"
+    saved = store.load("seller_100")
+    assert saved["facts"][0]["status"] == "superseded"
+    assert any(item.get("source") == "knowledge_suggestion_review" for item in saved["facts"])
+
+
+def test_merchant_setting_cannot_override_similar_platform_metric(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "knowledge_conflict_enabled": True,
+            "knowledge_conflict_min_similarity": 0.05,
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    memory = store.empty_memory("seller_100")
+    memory["knowledgeSuggestions"] = [
+        {
+            "suggestionId": "ks_private_refund_rate",
+            "suggestionType": "merchant_rule",
+            "scopeType": "merchant",
+            "status": "candidate",
+            "topic": "电商退货",
+            "metricName": "退款率",
+            "payload": {
+                "correctionText": "本店退款率使用退款订单数除以销售额。",
+                "proposedScope": "merchant",
+            },
+        }
+    ]
+    store.save("seller_100", memory)
+    service = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+    service.conflict_service = KnowledgeConflictService(
+        settings,
+        llm=FakeKnowledgeConflictLlm(relation="conflict", recommended_action="replace"),
+        topic_assets=FakeConflictTopicAssets(),
+    )
+
+    result = service.apply_merchant_action("seller_100", "ks_private_refund_rate", "accept", actor="merchant")
+
+    assert result["status"] == "CONFLICT_CONFIRMATION_REQUIRED"
+    assert result["allowedActions"] == ["suggest", "skip"]
+    assert any(item["relation"] == "blocked_by_platform" for item in result["conflictCheck"]["matches"])
+    assert not store.load("seller_100")["facts"]
+
+
 def test_memory_ingestion_creates_procedure_from_repair_trace(tmp_path):
     settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file", "context_memory_budget_chars": 3200})
     store = StructuredMemoryStore(settings)
@@ -7435,6 +7842,83 @@ def test_memory_knowledge_governance_reviews_publishes_and_indexes_suggestion(tm
     assert indexed["status"] == "INDEXED"
     assert indexed["suggestion"]["status"] == "indexed"
     assert indexed["suggestion"]["indexedAt"]
+
+
+def test_merchant_can_accept_private_knowledge_and_it_becomes_active_memory(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    memory = store.empty_memory("seller_100")
+    memory["knowledgeSuggestions"] = [
+        {
+            "suggestionId": "ks_slow_goods",
+            "suggestionType": "business_rule",
+            "status": "candidate",
+            "scopeType": "merchant",
+            "topic": "商品管理",
+            "metricName": "滞销商品",
+            "payload": {"memoryType": "correction", "correctionText": "连续30天销量低于10件定义为滞销商品"},
+        }
+    ]
+    store.save("seller_100", memory)
+    service = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+
+    result = service.apply_merchant_action("seller_100", "ks_slow_goods", "accept", actor="merchant_user")
+
+    assert result["status"] == "MERCHANT_ACTIVE"
+    assert result["scopeType"] == "merchant"
+    assert result["suggestion"]["status"] == "merchant_active"
+    assert result["promotedMemoryFact"]["status"] == "approved"
+    saved = store.load("seller_100")
+    assert any("销量低于10件" in item["content"] for item in saved["facts"])
+
+
+def test_platform_metric_feedback_cannot_be_accepted_as_private_knowledge(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    memory = store.empty_memory("seller_100")
+    memory["knowledgeSuggestions"] = [
+        {
+            "suggestionId": "ks_refund_dispute",
+            "suggestionType": "metric",
+            "status": "candidate",
+            "scopeType": "platform",
+            "topic": "电商退货",
+            "metricName": "退款率",
+            "payload": {"memoryType": "metric_dispute", "proposedScope": "platform", "correctionText": "退款率官方口径可能有误"},
+        }
+    ]
+    store.save("seller_100", memory)
+    service = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+
+    rejected = service.apply_merchant_action("seller_100", "ks_refund_dispute", "accept", actor="merchant_user")
+    suggested = service.apply_merchant_action("seller_100", "ks_refund_dispute", "suggest", actor="merchant_user")
+    reviewed = service.review_suggestion(
+        "seller_100",
+        "ks_refund_dispute",
+        KnowledgeSuggestionReviewRequest(approved=True, reviewer="platform_ops", action="approve"),
+    )
+
+    assert rejected["success"] is False
+    assert rejected["status"] == "PLATFORM_KNOWLEDGE_REQUIRES_REVIEW"
+    assert suggested["status"] == "PLATFORM_SUGGESTED"
+    assert suggested["suggestion"]["status"] == "platform_suggested"
+    assert reviewed["status"] == "approved"
+    assert "promotedMemoryFact" not in reviewed
+    assert not store.load("seller_100")["facts"]
+
+
+def test_merchant_can_dismiss_knowledge_candidate(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    memory = store.empty_memory("seller_100")
+    memory["knowledgeSuggestions"] = [{"suggestionId": "ks_ignore", "status": "candidate", "scopeType": "merchant"}]
+    store.save("seller_100", memory)
+    service = MemoryKnowledgeGovernanceService(settings, memory_store=store)
+
+    result = service.apply_merchant_action("seller_100", "ks_ignore", "skip", actor="merchant_user")
+
+    assert result["status"] == "DISMISSED"
+    assert result["suggestion"]["status"] == "dismissed"
 
 
 def test_memory_knowledge_governance_request_publish_and_run_jobs(tmp_path):
@@ -10060,7 +10544,7 @@ def test_asset_pack_defers_recalled_profile_table_until_metric_understanding_req
     topic_assets = TopicAssetService(settings)
     question = "最近30天GMV和退款金额走势是否正常？"
     keywords = KeywordExtractService().extract(question)
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         keywords,
         [],
@@ -10102,7 +10586,7 @@ def test_asset_pack_expands_profile_from_recalled_metric_phrase_when_llm_metric_
     topic_assets = TopicAssetService(settings)
     question = "最近7天优惠金额、优惠订单量和 GMV 分别是多少？"
     keywords = KeywordExtractService().extract(question)
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         keywords,
         [],
@@ -10157,7 +10641,7 @@ def test_planner_timeout_can_fallback_to_multi_metric_trend_graph():
     topic_assets = TopicAssetService(settings)
     question = "最近30天GMV和退款金额走势是否正常？"
     keywords = KeywordExtractService().extract(question)
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         keywords,
         [],
@@ -14376,7 +14860,7 @@ def test_hybrid_recall_returns_semantic_metric_evidence():
     settings = get_settings()
     topic_assets = TopicAssetService(settings)
     question = "最近45天优惠券金额投入最高的商品，退款率是否偏高？"
-    recall = HybridRecallService(settings, topic_assets, WikiMemoryService(settings)).recall(
+    recall = HybridRecallService(settings, topic_assets).recall(
         question,
         KeywordExtractService().extract(question),
         [],
@@ -14395,7 +14879,7 @@ def test_semantic_metric_resolver_uses_recalled_metric_evidence_for_bad_llm_ref(
     settings = get_settings()
     topic_assets = TopicAssetService(settings)
     question = "最近45天优惠券金额投入最高的商品，退款率是否偏高？"
-    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall_service = HybridRecallService(settings, topic_assets)
     recall = recall_service.recall(
         question,
         KeywordExtractService().extract(question),
@@ -14586,7 +15070,7 @@ def test_compiler_scope_phrase_does_not_override_explicit_order_anchor_metric():
 
     plan = QuestionUnderstandingCompiler().compile(question, understanding, pack)
     assert plan.knowledge_requests
-    recall_service = HybridRecallService(settings, TopicAssetService(settings), WikiMemoryService(settings))
+    recall_service = HybridRecallService(settings, TopicAssetService(settings))
     scoped_items = []
     for request in plan.knowledge_requests:
         scoped_recall = recall_service.recall(
@@ -15794,7 +16278,7 @@ def test_compiler_corrects_metric_semantic_mismatch_from_source_phrase():
     question = "最近30天GMV最高的前5天，同时看退款金额、赔付金额、工单量，判断是否存在异常波动。"
     topic_assets = TopicAssetService(settings)
     builder = PlanningAssetPackBuilder(topic_assets, SkillLoader(settings))
-    recall_service = HybridRecallService(settings, topic_assets, WikiMemoryService(settings))
+    recall_service = HybridRecallService(settings, topic_assets)
     recall = recall_service.recall(
         question,
         KeywordExtractService().extract(question),
@@ -18970,6 +19454,10 @@ def test_skill_worker_executes_complex_skill_with_isolated_context_package(tmp_p
     assert context["allowedTools"]["write_skill_output"] is True
     assert context["allowedTools"]["semantic_read"] is True
     assert context["allowedTools"]["artifact_grep"] is True
+    assert context["allowedTools"]["retrieve_knowledge"] is True
+    assert context["knowledgeAccess"]["required"] is True
+    assert context["knowledgeAccess"]["merchantIsolation"] is True
+    assert context["modelRoute"]["modelTier"] == "fast"
     assert context["fileContextTools"]["semantic_read"]
     assert context["verifiedRowCount"] == 1
 
@@ -19627,7 +20115,7 @@ def test_hybrid_recall_caches_by_question_and_topics(tmp_path):
             "cache_memory_max_entries": 8,
         }
     )
-    recall = HybridRecallService(settings, TopicAssetService(settings), WikiMemoryService(settings))
+    recall = HybridRecallService(settings, TopicAssetService(settings))
     keywords = type("Keywords", (), {"keywords": ["订单", "退款"]})()
 
     first = recall.recall("最近7天订单退款", keywords, [], "", "100", [QuestionCategory.TRADE, QuestionCategory.REFUND])
@@ -19649,7 +20137,7 @@ def test_es_retrieval_caches_successful_bundle(tmp_path, monkeypatch):
     retriever = EsKnowledgeRetrievalService(settings, TopicAssetService(settings))
     calls = {"count": 0}
 
-    def fake_search(query_text, topics, include_base_wiki=False):
+    def fake_search(query_text, topics, include_rules=False):
         calls["count"] += 1
         return [
             RecallItem(

@@ -137,6 +137,19 @@ export async function recordMetricDefinitionPreference(payload) {
   })
 }
 
+export async function actOnKnowledgeSuggestion(id, action, payload = {}) {
+  return request(`/api/merchant/knowledge-suggestions/${encodeURIComponent(id)}/action`, {
+    method: 'POST',
+    body: JSON.stringify({
+      action,
+      merchantId: DEFAULT_MERCHANT_ID,
+      actor: payload.actor || '',
+      note: payload.note || '',
+      conflictResolution: payload.conflictResolution || ''
+    })
+  })
+}
+
 export async function getDailyReport() {
   return request(`/api/daily-report?merchantId=${DEFAULT_MERCHANT_ID}`)
 }

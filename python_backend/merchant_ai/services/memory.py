@@ -31,6 +31,7 @@ from merchant_ai.models import (
     PendingAnswer,
 )
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.llm import TaskModelRouter
 
 
 MEMORY_SCHEMA_VERSION = "merchant_memory.v2"
@@ -41,7 +42,7 @@ MAX_KNOWLEDGE_SUGGESTIONS = 160
 HABIT_CORE_PROMOTION_HIT_COUNT = 2
 APPROVED_MEMORY_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
 PENDING_MEMORY_STATUSES = {"candidate", "pending", "review_required", "needs_review"}
-INACTIVE_MEMORY_STATUSES = {"deleted", "disabled", "inactive", "rejected", "archived", "expired"}
+INACTIVE_MEMORY_STATUSES = {"deleted", "disabled", "inactive", "rejected", "archived", "expired", "superseded"}
 STRONG_CONSTRAINT_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
 EXPLICIT_HABIT_TERMS = {
     "以后",
@@ -136,12 +137,124 @@ class MemoryWriteGate:
         return event
 
 
+class KnowledgeCuratorService:
+    """Use a bounded LLM call to turn a completed turn into reviewable knowledge."""
+
+    PLATFORM_KINDS = {"metric_definition", "platform_rule", "platform_correction"}
+    ALLOWED_KINDS = PLATFORM_KINDS | {"merchant_preference", "merchant_rule", "merchant_fact"}
+
+    def __init__(self, settings: Settings, llm: Optional[Any] = None):
+        self.settings = settings
+        self.model_router = TaskModelRouter(settings)
+        self.llm = llm or self.model_router.client("knowledge_curator")
+
+    def extract(self, state: AgentState, event: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        trace: Dict[str, Any] = {
+            "enabled": bool(getattr(self.settings, "memory_curator_enabled", True)),
+            "mode": "llm_curator",
+            "authoritative": False,
+            "candidateCount": 0,
+            "rejectedCount": 0,
+            "modelRoute": self.model_router.trace("knowledge_curator"),
+        }
+        if not trace["enabled"]:
+            trace["status"] = "disabled"
+            trace["fallback"] = "rule_extractor"
+            return [], trace
+        if not bool(getattr(self.llm, "configured", False)):
+            trace["status"] = "not_configured"
+            trace["fallback"] = "rule_extractor"
+            return [], trace
+
+        user_messages = curator_user_messages(state)
+        current_question = str(state.get("question") or "").strip()
+        if current_question and (not user_messages or user_messages[-1] != current_question):
+            user_messages.append(current_question)
+        user_messages = user_messages[-8:]
+        evidence_corpus = "\n".join(user_messages)
+        if not evidence_corpus.strip():
+            trace["status"] = "empty_user_context"
+            trace["fallback"] = "rule_extractor"
+            return [], trace
+
+        prompt_payload = {
+            "userMessages": user_messages,
+            "assistantAnswer": str(state.get("answer") or "")[:1600],
+            "structuredContext": {
+                "topics": unique_strings(event.get("topics") or [])[:8],
+                "metrics": unique_strings(event.get("metrics") or [])[:12],
+                "analysisIntent": str(event.get("analysisIntent") or ""),
+                "deterministicSignal": str(event.get("memoryType") or ""),
+                "semanticRefs": unique_strings(event.get("evidenceRefs") or [])[:12],
+            },
+        }
+        system_prompt = (
+            "你是得物商家经营平台的 Knowledge Curator。判断本轮用户对话是否包含值得跨会话复用的明确知识，"
+            "例如本店长期偏好、本店内部经营规则、用户明确补充的业务事实、平台指标口径质疑或平台规则纠正。"
+            "只允许从 userMessages 提取，assistantAnswer 仅用于理解上下文，绝不能作为知识来源。"
+            "闲聊、临时查询条件、一次性分析请求、模型自己的推断、未经用户明确表达的结论都不得提取。"
+            "每条候选必须给出 userMessages 中逐字出现的 evidenceQuote；无法提供原文证据则不要提取。"
+            "本店偏好/内部规则使用 merchant scope；指标定义、官方平台规则及其纠正必须使用 platform scope。"
+            "内容要改写成简短、可独立复用的陈述，不要直接写入知识库，只输出待确认候选。"
+        )
+        try:
+            payload = self.llm.tool_json_chat(
+                system_prompt,
+                json.dumps(prompt_payload, ensure_ascii=False, default=str),
+                knowledge_curator_tool_schema(),
+                {},
+                timeout_seconds=max(1, int(getattr(self.settings, "memory_curator_timeout_seconds", 8) or 8)),
+            )
+        except Exception as exc:
+            trace["status"] = "failed"
+            trace["error"] = str(exc)[:300]
+            trace["fallback"] = "rule_extractor"
+            return [], trace
+        if not isinstance(payload, dict) or "shouldExtract" not in payload:
+            trace["status"] = "failed"
+            trace["error"] = str(getattr(self.llm, "last_error", "") or "invalid curator response")[:300]
+            trace["fallback"] = "rule_extractor"
+            return [], trace
+
+        trace["authoritative"] = True
+        trace["status"] = "completed"
+        trace["reason"] = str(payload.get("reason") or "")[:300]
+        if not bool(payload.get("shouldExtract")):
+            return [], trace
+
+        min_confidence = float(getattr(self.settings, "memory_curator_min_confidence", 0.72) or 0.72)
+        max_candidates = max(1, int(getattr(self.settings, "memory_curator_max_candidates", 3) or 3))
+        suggestions: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw in (payload.get("candidates") or [])[: max_candidates * 2]:
+            suggestion = curator_candidate_to_suggestion(
+                raw,
+                event,
+                evidence_corpus=evidence_corpus,
+                min_confidence=min_confidence,
+            )
+            if not suggestion:
+                trace["rejectedCount"] = int(trace["rejectedCount"]) + 1
+                continue
+            suggestion_id = str(suggestion.get("suggestionId") or "")
+            if suggestion_id in seen_ids:
+                trace["rejectedCount"] = int(trace["rejectedCount"]) + 1
+                continue
+            seen_ids.add(suggestion_id)
+            suggestions.append(suggestion)
+            if len(suggestions) >= max_candidates:
+                break
+        trace["candidateCount"] = len(suggestions)
+        return suggestions, trace
+
+
 class MemoryIngestionService:
     """Owns long-term memory write rules and normalization side effects."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, curator: Optional["KnowledgeCuratorService"] = None):
         self.settings = settings
         self.write_gate = MemoryWriteGate()
+        self.curator = curator or KnowledgeCuratorService(settings)
 
     def update_store(self, store: MemoryStore, state: AgentState) -> Dict[str, Any]:
         merchant_id = merchant_id_from_state(state, self.settings)
@@ -151,12 +264,20 @@ class MemoryIngestionService:
             return memory
         event = self.write_gate.apply(event, merchant_id)
         write_policy = event.get("writePolicy") or {}
+        curated_suggestions, curator_trace = self.curator.extract(state, event)
+        curator_authoritative = bool(curator_trace.get("authoritative"))
+        if curator_authoritative and event.get("memoryType") in {"correction", "metric_dispute"}:
+            # The curator is the semantic judge. Until a merchant/platform action
+            # confirms the candidate, rule markers must not create stable facts.
+            event["status"] = "candidate"
+            event["reviewStatus"] = "model_candidate"
         ingestion_trace = {
             "eventId": event.get("eventId"),
             "memoryType": event.get("memoryType"),
             "written": False,
             "preferenceUpdates": 0,
             "writePolicy": write_policy,
+            "knowledgeCurator": curator_trace,
         }
         if not write_policy.get("allowed", True):
             memory["memoryIngestionTrace"] = ingestion_trace
@@ -176,22 +297,36 @@ class MemoryIngestionService:
             events.append(event)
             ingestion_trace["written"] = True
         memory["events"] = events[-MAX_EVENTS:]
-        preference_updates = 0 if event.get("memoryType") == "metric_dispute" or write_policy.get("action") == "review" else upsert_habit_preferences(memory, event)
+        preference_updates = (
+            0
+            if event.get("memoryType") == "metric_dispute"
+            or write_policy.get("action") == "review"
+            or (curator_authoritative and event.get("memoryType") == "correction")
+            else upsert_habit_preferences(memory, event)
+        )
         ingestion_trace["preferenceUpdates"] = preference_updates
-        if event.get("memoryType") == "correction":
+        if event.get("memoryType") == "correction" and not curator_authoritative:
             fact = correction_fact_from_event(event)
             memory["facts"] = upsert_fact(memory.get("facts") or [], fact)
             conflict = resolve_memory_conflicts(memory, event)
             if conflict:
                 ingestion_trace["conflict"] = conflict.model_dump(by_alias=True)
-        suggestion = knowledge_suggestion_from_event(event)
-        if suggestion:
+        suggestions = curated_suggestions
+        if not curator_authoritative:
+            fallback_suggestion = knowledge_suggestion_from_event(event)
+            suggestions = [fallback_suggestion] if fallback_suggestion else []
+        written_suggestion_ids: List[str] = []
+        for suggestion in suggestions:
             memory["knowledgeSuggestions"], suggestion_written = upsert_knowledge_suggestion(
                 memory.get("knowledgeSuggestions") or [],
                 suggestion,
             )
-            ingestion_trace["knowledgeSuggestionWritten"] = suggestion_written
-            ingestion_trace["knowledgeSuggestionId"] = suggestion.get("suggestionId", "")
+            if suggestion_written:
+                written_suggestion_ids.append(str(suggestion.get("suggestionId") or ""))
+        if suggestions:
+            ingestion_trace["knowledgeSuggestionWritten"] = bool(written_suggestion_ids)
+            ingestion_trace["knowledgeSuggestionId"] = str(suggestions[0].get("suggestionId") or "")
+            ingestion_trace["knowledgeSuggestionIds"] = [str(item.get("suggestionId") or "") for item in suggestions]
             ingestion_trace["knowledgeSuggestionCount"] = len(memory.get("knowledgeSuggestions") or [])
         memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
         memory["memoryIngestionTrace"] = ingestion_trace
@@ -836,6 +971,218 @@ class MemoryEsRepository:
         return "%s/%s" % (self.settings.es_base_url.rstrip("/"), path.lstrip("/"))
 
 
+class KnowledgeConflictService:
+    """Two-stage conflict check: scoped similarity retrieval, then LLM judgement."""
+
+    def __init__(self, settings: Settings, llm: Optional[Any] = None, topic_assets: Optional[Any] = None):
+        self.settings = settings
+        self.model_router = TaskModelRouter(settings)
+        self.llm = llm or self.model_router.client("knowledge_conflict")
+        self._topic_assets = topic_assets
+
+    def check(self, merchant_id: str, suggestion: Dict[str, Any], memory: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(getattr(self.settings, "knowledge_conflict_enabled", True)):
+            return {"status": "clear", "enabled": False, "matches": [], "resolutionOptions": []}
+        text = knowledge_suggestion_text(suggestion)
+        if not text:
+            return {"status": "clear", "enabled": True, "matches": [], "resolutionOptions": []}
+        candidates = self._coarse_candidates(merchant_id, suggestion, memory)
+        minimum = float(getattr(self.settings, "knowledge_conflict_min_similarity", 0.18) or 0.18)
+        top_k = max(1, int(getattr(self.settings, "knowledge_conflict_top_k", 5) or 5))
+        ranked: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            score = knowledge_text_similarity(text, str(candidate.get("text") or ""))
+            if score < minimum:
+                continue
+            ranked.append({**candidate, "similarity": round(score, 4)})
+        ranked.sort(key=lambda item: float(item.get("similarity") or 0.0), reverse=True)
+        ranked = ranked[:top_k]
+        report: Dict[str, Any] = {
+            "enabled": True,
+            "status": "clear",
+            "candidateText": text,
+            "candidateScope": knowledge_suggestion_proposed_scope(suggestion),
+            "matches": [],
+            "resolutionOptions": [],
+            "modelRoute": self.model_router.trace("knowledge_conflict"),
+            "checkedAt": datetime.now().isoformat(),
+        }
+        if not ranked:
+            return report
+        assessments = self._judge(suggestion, ranked)
+        assessment_by_id = {str(item.get("existingKnowledgeId") or ""): item for item in assessments}
+        for item in ranked:
+            existing_id = str(item.get("id") or "")
+            assessment = assessment_by_id.get(existing_id) or deterministic_conflict_assessment(text, item)
+            relation = str(assessment.get("relation") or "possible_conflict")
+            platform_blocker = bool(
+                knowledge_suggestion_proposed_scope(suggestion) == "merchant"
+                and str(item.get("scope") or "") == "platform"
+                and bool(item.get("mandatory") or item.get("kind") == "metric")
+                and relation in {"duplicate", "conflict", "possible_conflict"}
+            )
+            report["matches"].append(
+                {
+                    "existingKnowledgeId": existing_id,
+                    "title": str(item.get("title") or "已有知识"),
+                    "existingText": str(item.get("text") or "")[:500],
+                    "scope": str(item.get("scope") or "merchant"),
+                    "kind": str(item.get("kind") or "knowledge"),
+                    "mandatory": bool(item.get("mandatory")),
+                    "similarity": item.get("similarity"),
+                    "relation": "blocked_by_platform" if platform_blocker else relation,
+                    "confidence": float(assessment.get("confidence") or item.get("similarity") or 0.0),
+                    "reason": str(assessment.get("reason") or "发现语义相近的已有知识")[:500],
+                    "recommendedAction": "suggest" if platform_blocker else str(assessment.get("recommendedAction") or "review"),
+                    "mergedContent": str(assessment.get("mergedContent") or "")[:1000],
+                }
+            )
+        relevant = [item for item in report["matches"] if item.get("relation") != "independent"]
+        if not relevant:
+            return report
+        report["status"] = "confirmation_required"
+        if any(item.get("relation") == "blocked_by_platform" for item in relevant):
+            report["resolutionOptions"] = ["suggest", "cancel"]
+            report["message"] = "候选内容可能覆盖平台强制规则或官方指标，只能提交平台审核或取消。"
+        elif all(item.get("relation") == "duplicate" for item in relevant):
+            report["resolutionOptions"] = ["use_existing", "keep_both", "cancel"]
+            report["message"] = "发现含义相同的已有本店知识，请确认是否继续保存。"
+        else:
+            report["resolutionOptions"] = ["replace", "merge", "keep_both", "cancel"]
+            report["message"] = "发现可能重复、补充或冲突的本店知识，请确认处理方式。"
+        return report
+
+    def _coarse_candidates(
+        self,
+        merchant_id: str,
+        suggestion: Dict[str, Any],
+        memory: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        suggestion_id = str(suggestion.get("suggestionId") or "")
+        for group, id_key, kind in [
+            ("facts", "factId", "fact"),
+            ("preferences", "preferenceId", "preference"),
+            ("knowledgeSuggestions", "suggestionId", "suggestion"),
+        ]:
+            for item in memory.get(group) or []:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get(id_key) or "")
+                if not item_id or item_id == suggestion_id:
+                    continue
+                status = str(item.get("status") or "").lower()
+                if group == "knowledgeSuggestions" and status not in {"merchant_active", "approved", "published", "indexed"}:
+                    continue
+                if group != "knowledgeSuggestions" and status in INACTIVE_MEMORY_STATUSES | PENDING_MEMORY_STATUSES:
+                    continue
+                candidate_text = memory_knowledge_text(item)
+                if candidate_text:
+                    candidates.append(
+                        {
+                            "id": item_id,
+                            "title": memory_knowledge_title(item),
+                            "text": candidate_text,
+                            "scope": "merchant",
+                            "merchantId": merchant_id,
+                            "kind": kind,
+                            "mandatory": False,
+                        }
+                    )
+        candidates.extend(self._platform_candidates(suggestion))
+        return candidates
+
+    def _platform_candidates(self, suggestion: Dict[str, Any]) -> List[Dict[str, Any]]:
+        try:
+            if self._topic_assets is None:
+                from merchant_ai.services.assets import TopicAssetService
+
+                self._topic_assets = TopicAssetService(self.settings)
+            topic = str(suggestion.get("topic") or "").strip()
+            topics = [topic] if topic and topic in set(self._topic_assets.all_topic_names()) else self._topic_assets.all_topic_names()[:4]
+            results: List[Dict[str, Any]] = []
+            for topic_name in topics:
+                for manifest_item in self._topic_assets.load_manifest(topic_name)[:20]:
+                    table = str(manifest_item.get("tableName") or "")
+                    if not table:
+                        continue
+                    asset = self._topic_assets.load_table_asset(topic_name, table)
+                    for metric in asset.get("metrics") or []:
+                        if not isinstance(metric, dict):
+                            continue
+                        metric_key = str(metric.get("metricKey") or metric.get("canonicalMetricKey") or metric.get("businessName") or "")
+                        text = " ".join(
+                            str(value or "")
+                            for value in [metric.get("businessName"), metric_key, metric.get("description"), metric.get("formula")]
+                        ).strip()
+                        if text:
+                            results.append(
+                                {
+                                    "id": "semantic:%s:%s:metric:%s" % (topic_name, table, metric_key),
+                                    "title": str(metric.get("businessName") or metric_key or "平台指标"),
+                                    "text": text,
+                                    "scope": "platform",
+                                    "kind": "metric",
+                                    "mandatory": True,
+                                }
+                            )
+                    for rule in asset.get("knowledgeRules") or []:
+                        if not isinstance(rule, dict):
+                            continue
+                        text = str(rule.get("content") or rule.get("description") or "").strip()
+                        if text:
+                            results.append(
+                                {
+                                    "id": str(rule.get("ruleId") or "semantic:%s:%s:rule:%s" % (topic_name, table, stable_slug(text)[:24])),
+                                    "title": str(rule.get("title") or rule.get("name") or "平台规则"),
+                                    "text": text,
+                                    "scope": "platform",
+                                    "kind": "rule",
+                                    "mandatory": bool(rule.get("alwaysApply", True)),
+                                }
+                            )
+            return results[:240]
+        except Exception:
+            return []
+
+    def _judge(self, suggestion: Dict[str, Any], ranked: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not bool(getattr(self.llm, "configured", False)):
+            return []
+        payload = {
+            "newKnowledge": {
+                "text": knowledge_suggestion_text(suggestion),
+                "scope": knowledge_suggestion_proposed_scope(suggestion),
+                "type": str(suggestion.get("suggestionType") or "knowledge"),
+            },
+            "existingKnowledge": [
+                {
+                    "id": item.get("id"),
+                    "text": item.get("text"),
+                    "scope": item.get("scope"),
+                    "kind": item.get("kind"),
+                    "mandatory": item.get("mandatory"),
+                }
+                for item in ranked
+            ],
+        }
+        system_prompt = (
+            "你是得物商家知识冲突检测 Agent。逐条判断新知识与已有知识的关系："
+            "duplicate 表示含义相同，complement 表示可合并补充，conflict 表示不能同时成立，independent 表示无冲突。"
+            "不得把本店设置判定为可以覆盖平台强制规则或官方指标。输出结构化判断；mergedContent 仅在 complement 时提供。"
+        )
+        try:
+            result = self.llm.tool_json_chat(
+                system_prompt,
+                json.dumps(payload, ensure_ascii=False, default=str),
+                knowledge_conflict_tool_schema(),
+                {},
+                timeout_seconds=max(1, int(getattr(self.settings, "knowledge_conflict_timeout_seconds", 6) or 6)),
+            )
+            return [item for item in (result.get("assessments") or []) if isinstance(item, dict)] if isinstance(result, dict) else []
+        except Exception:
+            return []
+
+
 class MemoryKnowledgeGovernanceService:
     """Govern knowledge suggestions before they can become published semantic assets."""
 
@@ -852,6 +1199,7 @@ class MemoryKnowledgeGovernanceService:
         self._topic_assets = topic_assets
         self._governance_service = governance_service
         self._doris_repository = doris_repository
+        self.conflict_service = KnowledgeConflictService(settings, topic_assets=topic_assets)
 
     def review_suggestion(self, merchant_id: str, suggestion_id: str, request: KnowledgeSuggestionReviewRequest) -> Dict[str, Any]:
         memory = self.memory_store.load(merchant_id)
@@ -876,7 +1224,7 @@ class MemoryKnowledgeGovernanceService:
         suggestion["updatedAt"] = now
         memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
         promoted_fact = {}
-        if knowledge_suggestion_status(suggestion) == "approved":
+        if knowledge_suggestion_status(suggestion) == "approved" and knowledge_suggestion_proposed_scope(suggestion) != "platform":
             promoted_fact = confirmed_fact_from_knowledge_suggestion(suggestion, merchant_id, reviewer=str(getattr(request, "reviewer", "") or ""))
             if promoted_fact:
                 memory["facts"] = upsert_fact(memory.get("facts") or [], promoted_fact)
@@ -887,6 +1235,169 @@ class MemoryKnowledgeGovernanceService:
             "status": suggestion.get("status"),
             "merchantId": merchant_id,
             "suggestionId": suggestion_id,
+            "suggestion": find_knowledge_suggestion(saved, suggestion_id),
+        }
+        if promoted_fact:
+            result["promotedMemoryFact"] = promoted_fact
+        return result
+
+    def apply_merchant_action(
+        self,
+        merchant_id: str,
+        suggestion_id: str,
+        action: str,
+        actor: str = "",
+        note: str = "",
+        conflict_resolution: str = "",
+    ) -> Dict[str, Any]:
+        """Apply the simplified merchant-facing knowledge workflow.
+
+        Merchant acceptance creates a merchant-scoped memory fact immediately.
+        Platform suggestions remain pending until the existing ops review and
+        semantic publish workflow approves them.
+        """
+        selected_action = str(action or "").strip().lower()
+        if selected_action not in {"accept", "suggest", "skip"}:
+            return {
+                "success": False,
+                "status": "INVALID_ACTION",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "allowedActions": ["accept", "suggest", "skip"],
+            }
+        memory = self.memory_store.load(merchant_id)
+        suggestion = find_knowledge_suggestion(memory, suggestion_id)
+        if not suggestion:
+            return {"success": False, "status": "NOT_FOUND", "merchantId": merchant_id, "suggestionId": suggestion_id}
+        current_status = knowledge_suggestion_status(suggestion)
+        terminal_by_action = {
+            "accept": "merchant_active",
+            "suggest": "platform_suggested",
+            "skip": "dismissed",
+        }
+        target_status = terminal_by_action[selected_action]
+        if current_status == target_status:
+            return {
+                "success": True,
+                "status": target_status.upper(),
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "action": selected_action,
+                "idempotent": True,
+                "suggestion": suggestion,
+            }
+        payload = dict(suggestion.get("payload") or {})
+        proposed_scope = knowledge_suggestion_proposed_scope(suggestion)
+        if selected_action == "accept" and proposed_scope == "platform":
+            return {
+                "success": False,
+                "status": "PLATFORM_KNOWLEDGE_REQUIRES_REVIEW",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "allowedActions": ["suggest", "skip"],
+            }
+        resolution = str(conflict_resolution or "").strip().lower()
+        if selected_action in {"accept", "suggest"}:
+            conflict_report = self.conflict_service.check(merchant_id, suggestion, memory)
+            payload["conflictCheck"] = conflict_report
+            suggestion["payload"] = payload
+            memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
+            if selected_action == "accept" and conflict_report.get("status") == "confirmation_required":
+                allowed_resolutions = [str(item) for item in conflict_report.get("resolutionOptions") or []]
+                platform_blocked = any(
+                    str(item.get("relation") or "") == "blocked_by_platform"
+                    for item in conflict_report.get("matches") or []
+                    if isinstance(item, dict)
+                )
+                if platform_blocked:
+                    self.memory_store.save(merchant_id, memory)
+                    return {
+                        "success": True,
+                        "status": "CONFLICT_CONFIRMATION_REQUIRED",
+                        "merchantId": merchant_id,
+                        "suggestionId": suggestion_id,
+                        "allowedActions": ["suggest", "skip"],
+                        "conflictCheck": conflict_report,
+                        "suggestion": suggestion,
+                    }
+                if not resolution:
+                    self.memory_store.save(merchant_id, memory)
+                    return {
+                        "success": True,
+                        "status": "CONFLICT_CONFIRMATION_REQUIRED",
+                        "merchantId": merchant_id,
+                        "suggestionId": suggestion_id,
+                        "allowedResolutions": allowed_resolutions,
+                        "conflictCheck": conflict_report,
+                        "suggestion": suggestion,
+                    }
+                if resolution not in allowed_resolutions:
+                    return {
+                        "success": False,
+                        "status": "INVALID_CONFLICT_RESOLUTION",
+                        "merchantId": merchant_id,
+                        "suggestionId": suggestion_id,
+                        "allowedResolutions": allowed_resolutions,
+                    }
+                if resolution in {"cancel", "use_existing"}:
+                    suggestion["status"] = "dismissed"
+                    suggestion["merchantAction"] = resolution
+                    suggestion["actionedBy"] = str(actor or "merchant_user")
+                    suggestion["actionedAt"] = datetime.now().isoformat()
+                    payload["conflictResolution"] = resolution
+                    suggestion["payload"] = payload
+                    memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
+                    saved = self.memory_store.save(merchant_id, memory)
+                    return {
+                        "success": True,
+                        "status": "EXISTING_KNOWLEDGE_REUSED" if resolution == "use_existing" else "DISMISSED",
+                        "merchantId": merchant_id,
+                        "suggestionId": suggestion_id,
+                        "action": resolution,
+                        "suggestion": find_knowledge_suggestion(saved, suggestion_id),
+                    }
+                apply_conflict_resolution(memory, suggestion, conflict_report, resolution)
+                payload = dict(suggestion.get("payload") or payload)
+                payload["conflictResolution"] = resolution
+                suggestion["payload"] = payload
+        now = datetime.now().isoformat()
+        scope_type = "platform" if selected_action == "suggest" else "merchant"
+        suggestion["status"] = target_status
+        suggestion["scopeType"] = scope_type
+        suggestion["merchantAction"] = selected_action
+        suggestion["actionedBy"] = str(actor or "merchant_user")
+        suggestion["actionedAt"] = now
+        suggestion["updatedAt"] = now
+        if note:
+            suggestion["reviewNote"] = str(note)
+        payload["scopeType"] = scope_type
+        payload["merchantAction"] = selected_action
+        payload["merchantActionAt"] = now
+        payload["merchantActionBy"] = suggestion["actionedBy"]
+        if resolution:
+            payload["conflictResolution"] = resolution
+        if selected_action == "suggest":
+            payload["governance"] = "merchant submitted platform feedback; platform review required before publish"
+        elif selected_action == "accept":
+            payload["governance"] = "merchant-private knowledge; active only for the current merchant"
+        else:
+            payload["governance"] = "merchant dismissed this candidate"
+        suggestion["payload"] = payload
+        promoted_fact: Dict[str, Any] = {}
+        if selected_action == "accept":
+            promoted_fact = confirmed_fact_from_knowledge_suggestion(suggestion, merchant_id, reviewer=suggestion["actionedBy"])
+            if promoted_fact:
+                memory["facts"] = upsert_fact(memory.get("facts") or [], promoted_fact)
+                memory["coreMemoryProfile"] = build_core_memory_profile(memory)
+        memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
+        saved = self.memory_store.save(merchant_id, memory)
+        result = {
+            "success": True,
+            "status": target_status.upper(),
+            "merchantId": merchant_id,
+            "suggestionId": suggestion_id,
+            "action": selected_action,
+            "scopeType": scope_type,
             "suggestion": find_knowledge_suggestion(saved, suggestion_id),
         }
         if promoted_fact:
@@ -2807,6 +3318,12 @@ def knowledge_suggestion_status(item: Dict[str, Any]) -> str:
     return value.lower() if value else "candidate"
 
 
+def knowledge_suggestion_proposed_scope(item: Dict[str, Any]) -> str:
+    payload = (item or {}).get("payload") if isinstance((item or {}).get("payload"), dict) else {}
+    value = str((item or {}).get("scopeType") or payload.get("proposedScope") or payload.get("scopeType") or "merchant").strip().lower()
+    return "platform" if value == "platform" else "merchant"
+
+
 def knowledge_suggestion_publishable(item: Dict[str, Any]) -> bool:
     return knowledge_suggestion_status(item) in {"approved", "publish_requested", "published", "indexed"}
 
@@ -3002,6 +3519,10 @@ def normalize_knowledge_suggestions(items: Any) -> List[Dict[str, Any]]:
             publish_requested_by=str(item.get("publishRequestedBy") or item.get("publish_requested_by") or ""),
             published_ref_id=str(item.get("publishedRefId") or item.get("published_ref_id") or ""),
             indexed_at=str(item.get("indexedAt") or item.get("indexed_at") or ""),
+            scope_type=str(item.get("scopeType") or item.get("scope_type") or "merchant"),
+            merchant_action=str(item.get("merchantAction") or item.get("merchant_action") or ""),
+            actioned_by=str(item.get("actionedBy") or item.get("actioned_by") or ""),
+            actioned_at=str(item.get("actionedAt") or item.get("actioned_at") or ""),
             payload=item.get("payload") if isinstance(item.get("payload"), dict) else {},
             created_at=str(item.get("createdAt") or item.get("created_at") or datetime.now().isoformat()),
             updated_at=str(item.get("updatedAt") or item.get("updated_at") or ""),
@@ -3214,6 +3735,7 @@ def knowledge_suggestion_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     metric_name = metrics[0]
     source_memory_id = str(event.get("eventId") or "")
+    proposed_scope = "platform" if memory_type == "metric_dispute" else "merchant"
     suggestion = KnowledgeSuggestion(
         suggestion_id="ks_%s_%s" % (stable_slug(metric_name), stable_slug(source_memory_id or str(event.get("question") or ""))[:20]),
         suggestion_type="metric",
@@ -3225,11 +3747,322 @@ def knowledge_suggestion_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
         metric_name=metric_name,
         aliases=unique_strings([metric_name, *extract_metric_like_terms(str(event.get("question") or ""))])[:12],
         dependency_fields=unique_strings(event.get("metrics") or [])[:12],
+        scope_type=proposed_scope,
         payload={
             "memoryType": memory_type,
             "question": str(event.get("question") or "")[:1000],
             "correctionText": str(event.get("correctionText") or "")[:1000],
+            "proposedScope": proposed_scope,
             "governance": "candidate only; publish through semantic asset review before rebuilding ES recall index",
+        },
+        created_at=datetime.now().isoformat(),
+        updated_at=datetime.now().isoformat(),
+    )
+    return suggestion.model_dump(by_alias=True)
+
+
+def knowledge_curator_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "extract_merchant_knowledge_candidates",
+            "description": "Extract reviewable merchant or platform knowledge candidates from user-authored conversation text.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "shouldExtract": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                    "candidates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "merchant_preference",
+                                        "merchant_rule",
+                                        "merchant_fact",
+                                        "metric_definition",
+                                        "platform_rule",
+                                        "platform_correction",
+                                    ],
+                                },
+                                "scope": {"type": "string", "enum": ["merchant", "platform"]},
+                                "title": {"type": "string"},
+                                "content": {"type": "string"},
+                                "evidenceQuote": {"type": "string"},
+                                "topic": {"type": "string"},
+                                "metricName": {"type": "string"},
+                                "aliases": {"type": "array", "items": {"type": "string"}},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "reason": {"type": "string"},
+                            },
+                            "required": [
+                                "kind",
+                                "scope",
+                                "title",
+                                "content",
+                                "evidenceQuote",
+                                "topic",
+                                "metricName",
+                                "aliases",
+                                "confidence",
+                                "reason",
+                            ],
+                        },
+                    },
+                },
+                "required": ["shouldExtract", "reason", "candidates"],
+            },
+        },
+    }
+
+
+def knowledge_conflict_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "assess_knowledge_conflicts",
+            "description": "Classify relations between a new merchant knowledge candidate and similar existing knowledge.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "assessments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "existingKnowledgeId": {"type": "string"},
+                                "relation": {
+                                    "type": "string",
+                                    "enum": ["duplicate", "complement", "conflict", "independent"],
+                                },
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "reason": {"type": "string"},
+                                "recommendedAction": {
+                                    "type": "string",
+                                    "enum": ["use_existing", "replace", "merge", "keep_both", "suggest", "review"],
+                                },
+                                "mergedContent": {"type": "string"},
+                            },
+                            "required": [
+                                "existingKnowledgeId",
+                                "relation",
+                                "confidence",
+                                "reason",
+                                "recommendedAction",
+                                "mergedContent",
+                            ],
+                        },
+                    }
+                },
+                "required": ["assessments"],
+            },
+        },
+    }
+
+
+def knowledge_suggestion_text(suggestion: Dict[str, Any]) -> str:
+    payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+    return str(payload.get("correctionText") or payload.get("content") or payload.get("question") or "").strip()[:1200]
+
+
+def memory_knowledge_text(item: Dict[str, Any]) -> str:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    return str(
+        item.get("content")
+        or item.get("value")
+        or payload.get("correctionText")
+        or payload.get("content")
+        or payload.get("question")
+        or item.get("caseSummary")
+        or ""
+    ).strip()[:1200]
+
+
+def memory_knowledge_title(item: Dict[str, Any]) -> str:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    return str(payload.get("title") or item.get("metricName") or item.get("key") or item.get("memoryType") or "本店知识")[:160]
+
+
+def knowledge_text_features(text: str) -> set[str]:
+    normalized = re.sub(r"\s+", "", str(text or "").lower())
+    features = set(re.findall(r"[a-z][a-z0-9_]{1,}|[\u4e00-\u9fff]{2,6}", normalized))
+    features.update(normalized[index : index + 2] for index in range(max(0, len(normalized) - 1)))
+    return {item for item in features if item}
+
+
+def knowledge_text_similarity(left: str, right: str) -> float:
+    left_features = knowledge_text_features(left)
+    right_features = knowledge_text_features(right)
+    if not left_features or not right_features:
+        return 0.0
+    overlap = len(left_features & right_features)
+    union = len(left_features | right_features)
+    containment = overlap / max(1, min(len(left_features), len(right_features)))
+    jaccard = overlap / max(1, union)
+    return min(1.0, jaccard * 0.55 + containment * 0.45)
+
+
+def deterministic_conflict_assessment(new_text: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    existing_text = str(candidate.get("text") or "")
+    normalized_new = re.sub(r"\s+|[，。；、,.!?！？]", "", new_text).lower()
+    normalized_existing = re.sub(r"\s+|[，。；、,.!?！？]", "", existing_text).lower()
+    similarity = float(candidate.get("similarity") or knowledge_text_similarity(new_text, existing_text))
+    if normalized_new == normalized_existing or normalized_new in normalized_existing or normalized_existing in normalized_new:
+        relation = "duplicate"
+        action = "use_existing"
+    elif similarity >= 0.56:
+        relation = "possible_conflict"
+        action = "review"
+    else:
+        relation = "independent"
+        action = "review"
+    return {
+        "existingKnowledgeId": str(candidate.get("id") or ""),
+        "relation": relation,
+        "confidence": similarity,
+        "reason": "规则降级判断：根据文本相似度识别潜在重复或冲突",
+        "recommendedAction": action,
+        "mergedContent": "",
+    }
+
+
+def apply_conflict_resolution(
+    memory: Dict[str, Any],
+    suggestion: Dict[str, Any],
+    conflict_report: Dict[str, Any],
+    resolution: str,
+) -> None:
+    matches = [item for item in conflict_report.get("matches") or [] if isinstance(item, dict)]
+    target_ids = {str(item.get("existingKnowledgeId") or "") for item in matches if item.get("relation") != "independent"}
+    now = datetime.now().isoformat()
+    if resolution == "replace":
+        for group, id_keys in [
+            ("facts", ["factId", "fact_id"]),
+            ("preferences", ["preferenceId", "preference_id"]),
+            ("knowledgeSuggestions", ["suggestionId", "suggestion_id"]),
+        ]:
+            for item in memory.get(group) or []:
+                if not isinstance(item, dict):
+                    continue
+                item_id = next((str(item.get(key) or "") for key in id_keys if item.get(key)), "")
+                if item_id in target_ids:
+                    item["status"] = "superseded"
+                    item["validUntil"] = now
+                    item["supersededBy"] = str(suggestion.get("suggestionId") or "")
+    elif resolution == "merge":
+        merged = next((str(item.get("mergedContent") or "").strip() for item in matches if item.get("mergedContent")), "")
+        payload = dict(suggestion.get("payload") or {})
+        if not merged:
+            existing = next((str(item.get("existingText") or "").strip() for item in matches if item.get("existingText")), "")
+            current = knowledge_suggestion_text(suggestion)
+            merged = "；".join(dict.fromkeys([value for value in [existing, current] if value]))[:1000]
+        payload["correctionText"] = merged
+        payload["mergedFromKnowledgeIds"] = sorted(target_ids)
+        suggestion["payload"] = payload
+    elif resolution == "keep_both":
+        payload = dict(suggestion.get("payload") or {})
+        payload["conditionalCoexistence"] = True
+        payload["coexistsWithKnowledgeIds"] = sorted(target_ids)
+        payload["governance"] = "merchant confirmed coexistence; Planner must apply only when the stated condition matches"
+        suggestion["payload"] = payload
+
+
+def curator_user_messages(state: AgentState) -> List[str]:
+    messages: List[str] = []
+    for item in state.get("message_history") or []:
+        if hasattr(item, "model_dump"):
+            payload = item.model_dump(by_alias=True)
+        elif isinstance(item, dict):
+            payload = item
+        else:
+            continue
+        if str(payload.get("role") or "").strip().lower() not in {"user", "human", "merchant"}:
+            continue
+        text = str(payload.get("text") or payload.get("content") or "").strip()
+        if text and (not messages or messages[-1] != text):
+            messages.append(text[:1200])
+    return messages[-8:]
+
+
+def curator_candidate_to_suggestion(
+    raw: Any,
+    event: Dict[str, Any],
+    *,
+    evidence_corpus: str,
+    min_confidence: float,
+) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    kind = str(raw.get("kind") or "").strip().lower()
+    allowed_kinds = KnowledgeCuratorService.ALLOWED_KINDS
+    if kind not in allowed_kinds:
+        return {}
+    content = str(raw.get("content") or "").strip()[:1000]
+    evidence_quote = str(raw.get("evidenceQuote") or "").strip()[:500]
+    if len(content) < 4 or len(evidence_quote) < 2 or evidence_quote not in evidence_corpus:
+        return {}
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence") or 0.0)))
+    except (TypeError, ValueError):
+        return {}
+    if confidence < min_confidence:
+        return {}
+
+    requested_scope = str(raw.get("scope") or "merchant").strip().lower()
+    platform_required = kind in KnowledgeCuratorService.PLATFORM_KINDS or str(event.get("memoryType") or "") == "metric_dispute"
+    scope_type = "platform" if platform_required or requested_scope == "platform" else "merchant"
+    event_metrics = unique_strings(event.get("metrics") or [])
+    metric_name = str(raw.get("metricName") or "").strip()
+    if not metric_name and kind == "metric_definition" and event_metrics:
+        metric_name = event_metrics[0]
+    topic = str(raw.get("topic") or "").strip() or ((unique_strings(event.get("topics") or []) or [""])[0])
+    title = str(raw.get("title") or "").strip()[:160] or metric_name or "业务知识"
+    fingerprint = hashlib.sha256(
+        ("%s|%s|%s|%s" % (scope_type, kind, topic, content)).encode("utf-8")
+    ).hexdigest()[:20]
+    suggestion_type = {
+        "metric_definition": "metric_definition_dispute",
+        "platform_rule": "knowledge_rule",
+        "platform_correction": "knowledge_rule_correction",
+        "merchant_preference": "merchant_preference",
+        "merchant_rule": "merchant_rule",
+        "merchant_fact": "merchant_fact",
+    }[kind]
+    suggestion = KnowledgeSuggestion(
+        suggestion_id="ks_curated_%s" % fingerprint,
+        suggestion_type=suggestion_type,
+        status="candidate",
+        source="llm_knowledge_curator",
+        source_memory_id=str(event.get("eventId") or ""),
+        source_refs=unique_strings(event.get("evidenceRefs") or []),
+        topic=topic,
+        metric_name=metric_name,
+        aliases=unique_strings(raw.get("aliases") or [])[:12],
+        dependency_fields=event_metrics[:12],
+        scope_type=scope_type,
+        payload={
+            "memoryType": str(event.get("memoryType") or ""),
+            "knowledgeKind": kind,
+            "title": title,
+            "question": str(event.get("question") or "")[:1000],
+            "correctionText": content,
+            "evidenceQuote": evidence_quote,
+            "confidence": confidence,
+            "extractionReason": str(raw.get("reason") or "")[:500],
+            "extractionMode": "llm_curator",
+            "proposedScope": scope_type,
+            "governance": (
+                "platform review required before public publish"
+                if scope_type == "platform"
+                else "candidate only; merchant confirmation required before long-term memory activation"
+            ),
         },
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),
@@ -3378,11 +4211,14 @@ def upsert_knowledge_suggestion(items: List[Dict[str, Any]], suggestion: Dict[st
         return normalized, False
     for item in normalized:
         if item.get("suggestionId") == suggestion.get("suggestionId") or (
-            item.get("sourceMemoryId") and item.get("sourceMemoryId") == suggestion.get("sourceMemoryId")
+            not item.get("suggestionId")
+            and not suggestion.get("suggestionId")
+            and item.get("sourceMemoryId")
+            and item.get("sourceMemoryId") == suggestion.get("sourceMemoryId")
         ):
             existing_status = knowledge_suggestion_status(item)
             item.update({k: v for k, v in suggestion.items() if v not in ("", [], {})})
-            if existing_status in {"reviewed", "approved", "published", "indexed", "rejected"}:
+            if existing_status in {"reviewed", "approved", "published", "indexed", "rejected", "merchant_active", "platform_suggested", "dismissed"}:
                 item["status"] = existing_status
             item["updatedAt"] = datetime.now().isoformat()
             return normalized[-MAX_KNOWLEDGE_SUGGESTIONS:], False
@@ -4123,6 +4959,7 @@ def confirmed_fact_from_knowledge_suggestion(suggestion: Dict[str, Any], merchan
     correction_text = str(payload.get("correctionText") or "").strip()
     question = str(payload.get("question") or "").strip()
     topic = str(suggestion.get("topic") or "").strip()
+    conditional_coexistence = bool(payload.get("conditionalCoexistence"))
     content_parts = []
     if metric_name:
         content_parts.append("已确认商家口径/指标：%s" % metric_name)
@@ -4136,12 +4973,12 @@ def confirmed_fact_from_knowledge_suggestion(suggestion: Dict[str, Any], merchan
     fact = MemoryFact(
         fact_id="fact_knowledge_%s" % stable_slug(str(suggestion.get("suggestionId") or source_memory_id or "|".join(content_parts))[:120]),
         memory_type="business_fact",
-        memory_tier="core",
+        memory_tier="retrieval" if conditional_coexistence else "core",
         memory_class=default_memory_class("business_fact"),
         content="；".join(unique_strings(content_parts))[:1000],
         topics=unique_strings([topic] if topic else []),
         metrics=unique_strings([metric_name, *[str(item) for item in suggestion.get("aliases") or [] if item]])[:12],
-        confidence=0.98,
+        confidence=0.78 if conditional_coexistence else 0.98,
         source="knowledge_suggestion_review",
         source_event_id=source_memory_id,
         scope=memory_scope_from_terms(merchant_id, unique_strings([topic] if topic else []), unique_strings([metric_name] if metric_name else [])),
@@ -4151,7 +4988,12 @@ def confirmed_fact_from_knowledge_suggestion(suggestion: Dict[str, Any], merchan
         allowed_roles=default_memory_allowed_roles("business_fact"),
         approved_by=reviewer or str(suggestion.get("approvedBy") or suggestion.get("reviewer") or ""),
         review_status="approved",
-        write_policy={"action": "write", "reviewStatus": "approved", "source": "knowledge_suggestion_review"},
+        write_policy={
+            "action": "conditional_write" if conditional_coexistence else "write",
+            "reviewStatus": "approved",
+            "source": "knowledge_suggestion_review",
+            "conditionalCoexistence": conditional_coexistence,
+        },
         evidence_refs=unique_strings(suggestion.get("sourceRefs") or []),
         created_at=datetime.now().isoformat(),
     )

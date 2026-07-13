@@ -10,6 +10,7 @@ dependencies = [
   "pydantic-settings>=2.4.0",
   "langchain>=0.3.0",
   "langchain-core>=0.3.0",
+  "langchain-text-splitters>=0.3.0",
   "langchain-openai>=0.2.0",
   "langgraph>=0.2.50",
   "langgraph-checkpoint-sqlite>=2.0.11",

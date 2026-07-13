@@ -16,8 +16,9 @@ from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 class LlmClient:
     """Small LangChain wrapper with local fallback behavior."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, model_name: str = ""):
         self.settings = settings
+        self.model_name = str(model_name or settings.openai_model)
         self._model = None
         self._models_by_timeout: Dict[int, Any] = {}
         self.last_error = ""
@@ -45,7 +46,7 @@ class LlmClient:
             from langchain_openai import ChatOpenAI
 
             model = ChatOpenAI(
-                model=self.settings.openai_model,
+                model=self.model_name,
                 api_key=self.settings.openai_api_key,
                 base_url=self.settings.openai_base_url.rstrip("/"),
                 temperature=0,
@@ -329,7 +330,7 @@ class LlmClient:
             "llm",
             {
                 "kind": kind,
-                "model": self.settings.openai_model,
+                "model": self.model_name,
                 "baseUrl": self.settings.openai_base_url,
                 "promptId": prompt_meta.get("promptId", ""),
                 "promptVersion": prompt_meta.get("promptVersion", ""),
@@ -357,6 +358,32 @@ class LlmClient:
                 "cooldownSeconds": max(1, int(getattr(self.settings, "llm_circuit_cooldown_seconds", 30) or 30)),
             }
         return trace
+
+
+class TaskModelRouter:
+    """Map business task classes to model capability tiers on one provider interface."""
+
+    STRONG_TASKS = {"planner", "complex_analysis", "sql_repair", "evidence_reasoning"}
+    FAST_TASKS = {"knowledge_curator", "knowledge_conflict", "conversation_summary", "simple_skill"}
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def model_for(self, task_type: str) -> str:
+        task = str(task_type or "balanced").strip().lower()
+        if task in self.STRONG_TASKS:
+            return str(getattr(self.settings, "llm_strong_model", "") or self.settings.openai_model)
+        if task in self.FAST_TASKS:
+            return str(getattr(self.settings, "llm_fast_model", "") or self.settings.openai_model)
+        return str(getattr(self.settings, "llm_balanced_model", "") or self.settings.openai_model)
+
+    def client(self, task_type: str) -> LlmClient:
+        return LlmClient(self.settings, model_name=self.model_for(task_type))
+
+    def trace(self, task_type: str) -> Dict[str, Any]:
+        task = str(task_type or "balanced").strip().lower()
+        tier = "strong" if task in self.STRONG_TASKS else "fast" if task in self.FAST_TASKS else "balanced"
+        return {"taskType": task, "modelTier": tier, "model": self.model_for(task)}
 
 
 def tool_call_fingerprint(item: Dict[str, Any]) -> str:

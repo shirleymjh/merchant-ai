@@ -7,7 +7,7 @@ flowchart TB
   A["用户层: Chat / SSE 多轮入口"] --> B["Supervisor Agent<br/>背景知识加载 / 意图识别 / 任务编排"]
   B --> C["ReAct Runtime<br/>推理 -> 行动 -> 观察，最多 16 轮"]
   C --> D["Data Scope Clarification Agent<br/>业务域预定位 / 复杂度判断 / 拆分"]
-  C --> E["FileSystem-as-Context<br/>基础 wiki / runtime wiki / 历史记忆按需加载"]
+  C --> E["FileSystem-as-Context<br/>受治理规则 / Topic 语义资产 / 历史记忆按需加载"]
   C --> F["Data Discovery Agent<br/>ES + 本地 BM25/语义召回，定位候选知识和数据资产"]
   C --> G["SQL Generation Agent<br/>基于候选资产和白名单模板生成可审计查询"]
   C --> H["Chat BI Agent<br/>数据取回后的总结、回答、建议和前端数据组织"]
@@ -44,7 +44,7 @@ flowchart TB
 - 打招呼类输入只自然回复，不写入 `merchant_ai_answer`。
 - 无效或范围不清晰的问题不继续猜测，优先进入 Human-in-the-loop 澄清，不写入 `merchant_ai_answer`。
 - Supervisor Agent 只做背景加载、一级路由和任务编排；后续由 ReAct Runtime 动态选择专业子 Agent。
-- 业务问题先由 Data Scope Clarification Agent 收敛业务域，再由 FileSystem-as-Context 按需加载基础 wiki、runtime wiki 和少量历史记忆。
+- 业务问题先由 Data Scope Clarification Agent 收敛业务域，再由 FileSystem-as-Context 按需加载受治理规则、Topic 语义资产和少量历史记忆。
 - Data Discovery Agent 执行 `BM25/关键词 + 向量语义 + ES metadata` 混合召回，并把候选知识/数据资产写回状态。
 - SQL Generation Agent 只接受白名单内的业务分类、字段和查询模板，避免模型直接拼接不可审计 SQL。
 - Chat BI Agent 负责基于数据结果做自然语言解读、经营建议、猜你想问和前端可视化数据组织。

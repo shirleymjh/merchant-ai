@@ -17,6 +17,7 @@ from merchant_ai.models import (
     FeedbackRequest,
     GoldenEvaluationRequest,
     ChatContext,
+    KnowledgeSuggestionActionRequest,
     KnowledgeSuggestionPublishRequest,
     KnowledgeSuggestionReviewRequest,
     MemoryCleanupRequest,
@@ -28,7 +29,6 @@ from merchant_ai.models import (
     SkillEvaluationRequest,
     TopicBuildRequest,
     TopicReviewRequest,
-    WikiCompressRequest,
 )
 from merchant_ai.services.answer import DailyReportService, FeedbackService
 from merchant_ai.services.attachments import AttachmentStore
@@ -468,6 +468,23 @@ def record_metric_definition_preference(request: MetricDefinitionPreferenceReque
     return memory_management_service.record_metric_definition_preference(target, request)
 
 
+@router.post("/api/merchant/knowledge-suggestions/{item_id}/action")
+def merchant_knowledge_suggestion_action(item_id: str, request: KnowledgeSuggestionActionRequest) -> Dict[str, Any]:
+    target = require_merchant_access(request.merchant_id or settings.merchant_id)
+    result = memory_governance_service.apply_merchant_action(
+        target,
+        item_id,
+        request.action,
+        actor=request.actor,
+        note=request.note,
+        conflict_resolution=request.conflict_resolution,
+    )
+    if not result.get("success"):
+        status_code = 404 if result.get("status") == "NOT_FOUND" else 422
+        raise HTTPException(status_code=status_code, detail=result)
+    return result
+
+
 @router.get("/api/memory/{merchant_id}")
 def get_memory(merchant_id: str, include_inactive: bool = Query(default=True), _auth: None = OpsAuth) -> Dict[str, Any]:
     require_merchant_access(merchant_id)
@@ -688,20 +705,6 @@ def update_access_control_policy(policy: Dict[str, Any], _auth: None = OpsAuth) 
 def get_access_control_audit(limit: int = Query(default=50, ge=1, le=500), _auth: None = OpsAuth) -> Dict[str, Any]:
     service = workflow.node_worker.access_control
     return {"success": True, **service.audit_summary(limit=limit)}
-
-
-@router.post("/api/wiki/compress")
-def compress_wiki(request: WikiCompressRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
-    if not request.category_name:
-        paths: Dict[str, str] = {}
-        for name in ["平台商家规则", "电商交易", "电商退货", "电商客服工单", "电商理赔/赔付", "商品管理"]:
-            rows = workflow.answer_repository.recent_answers_by_category(settings.merchant_id, name, 200)
-            path = workflow.wiki_memory.compress_to_wiki(name, rows, request.manual_markdown)
-            paths[name] = str(path)
-        return {"success": True, "paths": paths}
-    rows = workflow.answer_repository.recent_answers_by_category(settings.merchant_id, request.category_name, 200)
-    path = workflow.wiki_memory.compress_to_wiki(request.category_name, rows, request.manual_markdown)
-    return {"success": True, "path": str(path)}
 
 
 @router.post("/api/es/rebuild-recall-index")

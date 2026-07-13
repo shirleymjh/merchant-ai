@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     llm_circuit_threshold: int = Field(3, validation_alias="YSHOPPING_LLM_CIRCUIT_THRESHOLD")
     llm_circuit_cooldown_seconds: int = Field(30, validation_alias="YSHOPPING_LLM_CIRCUIT_COOLDOWN_SECONDS")
     llm_max_tokens: int = Field(2048, validation_alias="YSHOPPING_LLM_MAX_TOKENS")
+    llm_strong_model: str = Field("", validation_alias="YSHOPPING_LLM_STRONG_MODEL")
+    llm_balanced_model: str = Field("", validation_alias="YSHOPPING_LLM_BALANCED_MODEL")
+    llm_fast_model: str = Field("", validation_alias="YSHOPPING_LLM_FAST_MODEL")
     answer_skill_match_mode: str = Field("always", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
     always_apply_rule_budget: int = Field(20, validation_alias="YSHOPPING_ALWAYS_APPLY_RULE_BUDGET")
     skill_confirmation_required: bool = Field(False, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
@@ -151,6 +154,9 @@ class Settings(BaseSettings):
     es_rrf_score_scale: float = Field(1000.0, validation_alias="YSHOPPING_ES_RRF_SCORE_SCALE")
     es_hybrid_top_k: int = Field(24, validation_alias="YSHOPPING_ES_HYBRID_TOP_K")
     es_retrieval_profiles_json: str = Field("", validation_alias="YSHOPPING_ES_RETRIEVAL_PROFILES_JSON")
+    rule_chunk_target_chars: int = Field(1600, validation_alias="YSHOPPING_RULE_CHUNK_TARGET_CHARS")
+    rule_chunk_max_chars: int = Field(2400, validation_alias="YSHOPPING_RULE_CHUNK_MAX_CHARS")
+    rule_chunk_overlap_chars: int = Field(160, validation_alias="YSHOPPING_RULE_CHUNK_OVERLAP_CHARS")
 
     doris_jdbc_url: str = Field(
         "jdbc:mysql://127.0.0.1:9030/yshopping?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai",
@@ -177,6 +183,14 @@ class Settings(BaseSettings):
     memory_index_async: bool = Field(True, validation_alias="YSHOPPING_MEMORY_INDEX_ASYNC")
     memory_es_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_ES_INDEX")
     memory_vector_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_VECTOR_INDEX")
+    memory_curator_enabled: bool = Field(True, validation_alias="YSHOPPING_MEMORY_CURATOR_ENABLED")
+    memory_curator_timeout_seconds: int = Field(8, validation_alias="YSHOPPING_MEMORY_CURATOR_TIMEOUT_SECONDS")
+    memory_curator_min_confidence: float = Field(0.72, validation_alias="YSHOPPING_MEMORY_CURATOR_MIN_CONFIDENCE")
+    memory_curator_max_candidates: int = Field(3, validation_alias="YSHOPPING_MEMORY_CURATOR_MAX_CANDIDATES")
+    knowledge_conflict_enabled: bool = Field(True, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_ENABLED")
+    knowledge_conflict_timeout_seconds: int = Field(6, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_TIMEOUT_SECONDS")
+    knowledge_conflict_top_k: int = Field(5, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_TOP_K")
+    knowledge_conflict_min_similarity: float = Field(0.18, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_MIN_SIMILARITY")
 
     harness_workspace_path: str = Field("", validation_alias="YSHOPPING_HARNESS_WORKSPACE")
     context_window_tokens: int = Field(16000, validation_alias="YSHOPPING_HARNESS_CONTEXT_WINDOW_TOKENS")
@@ -304,7 +318,7 @@ class Settings(BaseSettings):
     distributed_artifact_s3_endpoint: str = Field("", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_ENDPOINT")
     python_executable: str = Field(default_factory=lambda: sys.executable, validation_alias="YSHOPPING_PYTHON_EXECUTABLE")
 
-    wiki_path: str = Field("", validation_alias="YSHOPPING_WIKI_PATH")
+    rule_knowledge_path: str = Field("", validation_alias="YSHOPPING_RULE_KNOWLEDGE_PATH")
     topic_path: str = Field("", validation_alias="YSHOPPING_TOPIC_PATH")
 
     langsmith_tracing: bool = Field(False, validation_alias="LANGSMITH_TRACING")
@@ -319,10 +333,10 @@ class Settings(BaseSettings):
         return self.repo_root / "python_backend" / "resources"
 
     @property
-    def resolved_wiki_path(self) -> Path:
-        if self.wiki_path:
-            return Path(self.wiki_path)
-        return self.resources_root / "wiki"
+    def resolved_rule_knowledge_path(self) -> Path:
+        if self.rule_knowledge_path:
+            return Path(self.rule_knowledge_path)
+        return self.resources_root / "runtime" / "rules"
 
     @property
     def resolved_topic_path(self) -> Path:

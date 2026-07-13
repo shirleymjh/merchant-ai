@@ -23,7 +23,7 @@ class RecallDocumentProvider(Protocol):
         ...
 
 
-def semantic_docs(root: Path) -> list[dict[str, str]]:
+def semantic_docs(root: Path, ref_prefix: str = "") -> list[dict[str, str]]:
     docs: list[dict[str, str]] = []
     if not root.exists():
         return docs
@@ -33,6 +33,8 @@ def semantic_docs(root: Path) -> list[dict[str, str]]:
         if path.suffix.lower() not in {".json", ".md"}:
             continue
         relative = path.relative_to(root).as_posix()
+        if ref_prefix:
+            relative = "%s/%s" % (ref_prefix.strip("/"), relative)
         docs.append({"ref": relative, "path": str(path), "hash": hash_file(path)})
     return docs
 
@@ -75,8 +77,16 @@ def changed_refs(docs: list[dict[str, str]], previous: dict[str, Any], changed_o
     return changed + ["deleted:%s" % ref for ref in removed]
 
 
-def build_index_manifest(root: Path, previous: dict[str, Any], changed_only: bool) -> dict[str, Any]:
+def build_index_manifest(
+    root: Path,
+    previous: dict[str, Any],
+    changed_only: bool,
+    additional_roots: Iterable[tuple[str, Path]] | None = None,
+) -> dict[str, Any]:
     docs = semantic_docs(root)
+    for prefix, additional_root in additional_roots or []:
+        docs.extend(semantic_docs(additional_root, ref_prefix=prefix))
+    docs.sort(key=lambda item: item["ref"])
     semantic_source_hash = source_hash(docs)
     updated_refs = changed_refs(docs, previous, changed_only)
     return {
@@ -264,7 +274,8 @@ class EsRecallIndexAdapter:
         count = 0
         errors: list[str] = []
         for ref in deleted_refs:
-            semantic_path = "topics/%s" % ref.removeprefix("deleted:")
+            deleted_ref = ref.removeprefix("deleted:")
+            semantic_path = deleted_ref if deleted_ref.startswith("rules/") else "topics/%s" % deleted_ref
             query = {"query": {"term": {"semantic_path": semantic_path}}}
             response = requests.post(
                 self._url("%s/_delete_by_query" % self.settings.es_index),
@@ -315,7 +326,12 @@ class RecallIndexManager:
 
     def rebuild(self, changed_only: bool = True, topic: str = "", table_name: str = "") -> dict[str, Any]:
         previous = load_index_manifest(self.manifest_path)
-        manifest = build_index_manifest(self.settings.resolved_topic_path, previous, changed_only=changed_only)
+        manifest = build_index_manifest(
+            self.settings.resolved_topic_path,
+            previous,
+            changed_only=changed_only,
+            additional_roots=[("rules", self.settings.resolved_rule_knowledge_path)],
+        )
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         updated_refs = filter_changed_refs_for_scope(manifest.get("updatedRefs") or [], topic, table_name)
@@ -353,7 +369,11 @@ class RecallIndexManager:
         docs = self.scoped_documents(topic, table_name)
         if topic or table_name:
             return docs
-        changed_paths = {"topics/%s" % str(ref) for ref in updated_refs if not str(ref).startswith("deleted:")}
+        changed_paths = {
+            str(ref) if str(ref).startswith("rules/") else "topics/%s" % str(ref)
+            for ref in updated_refs
+            if not str(ref).startswith("deleted:")
+        }
         if not changed_paths:
             return []
         changed_scopes = recall_scopes_for_changed_refs(updated_refs)

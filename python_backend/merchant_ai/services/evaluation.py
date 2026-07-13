@@ -49,7 +49,7 @@ GOLDEN_QUESTIONS: List[Dict[str, Any]] = [
         "question": "商家入驻资质规则是什么？",
         "expectedIntent": "rule_only",
         "expectedTopics": ["PLATFORM_RULE"],
-        "expectedSourceTypes": ["BASE_WIKI"],
+        "expectedSourceTypes": ["GOVERNED_RULE"],
     },
 ]
 

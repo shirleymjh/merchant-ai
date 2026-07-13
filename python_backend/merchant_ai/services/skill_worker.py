@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from merchant_ai.models import AgentRunResult, MerchantInfo, QueryPlan
-from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.llm import LlmClient, TaskModelRouter
 from merchant_ai.services.sandbox import MerchantAnalysisSandbox
 
 
@@ -26,6 +26,7 @@ class SkillWorkerExecutor:
     def __init__(self, llm: LlmClient):
         self.llm = llm
         self.settings = llm.settings
+        self.model_router = TaskModelRouter(self.settings)
         self.sandbox = MerchantAnalysisSandbox(self.settings)
 
     def execute_answer_skills(
@@ -421,6 +422,16 @@ class SkillWorkerExecutor:
             "verifiedRowCount": len(rows or []),
             "evidenceGapCount": len(run_result.evidence_gaps or []) if run_result else 0,
             "hasRuleContext": has_rule_context,
+            "knowledgeAccess": {
+                "required": True,
+                "capability": "retrieve_knowledge",
+                "availableScopes": ["current_merchant", "current_topic_platform", "skill_private"],
+                "merchantIsolation": True,
+                "merchantId": getattr(merchant, "merchant_id", "") if merchant else "",
+                "preloadedContext": has_rule_context,
+                "fallbackTools": ["semantic_grep", "semantic_read"],
+            },
+            "modelRoute": self.model_router.trace("simple_skill"),
             "skillMetadata": skill_meta,
             "workspacePath": str(context_path.parent),
             "checkpointPath": str(context_path.parent / "skill_checkpoint.json"),
@@ -440,6 +451,8 @@ class SkillWorkerExecutor:
             "executionContract": [
                 "只读取 skill_input.json 中的已验证数据和证据缺口",
                 "需要语义资产或中间产物细节时，先通过 semantic/artifact 工具按需读取",
+                "Skill 不得内置或覆盖平台公共口径；通用定义必须从 knowledge context 或 semantic 工具读取",
+                "知识读取只能覆盖当前 merchantId、本 Topic 平台知识和当前 Skill 私有知识",
                 "只能写入本次 SkillWorker 工作目录",
                 "不能新增查询、改写查询图或扩大商家/时间范围",
                 "输出必须写入 skill_output.json 并同步 checkpoint",
@@ -461,6 +474,8 @@ class SkillWorkerExecutor:
             "outputArtifact",
             "allowedTools",
             "fileContextTools",
+            "knowledgeAccess",
+            "modelRoute",
         ]
         return {key: package.get(key) for key in keys if key in package}
 
@@ -476,6 +491,7 @@ class SkillWorkerExecutor:
             "artifact_ls": True,
             "artifact_read": True,
             "artifact_grep": True,
+            "retrieve_knowledge": True,
             "execute_script": bool(can_execute_script),
         }
         return tools

@@ -2118,6 +2118,16 @@ body {
 
 .knowledge-proposals article p { margin: 0; color: #78350f; font-size: 13px; }
 .knowledge-proposals article span { color: #92400e; font-size: 12px; }
+.knowledge-proposal-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 4px; }
+.knowledge-proposal-actions button { padding: 7px 10px; border-radius: 8px; background: #d97706; color: #fff; font-size: 12px; font-weight: 700; }
+.knowledge-proposal-actions button.secondary { background: #fff7ed; color: #c2410c; border: 1px solid #fdba74; }
+.knowledge-proposal-actions button.ghost { background: transparent; color: #92400e; border: 1px solid #fcd34d; }
+.knowledge-proposal-actions button:disabled { cursor: wait; opacity: .55; }
+.knowledge-proposal-error { color: #b91c1c; font-size: 12px; }
+.knowledge-conflict-card { margin-top: 8px; padding: 10px; border: 1px solid #f59e0b; border-radius: 10px; background: #fffbeb; }
+.knowledge-conflict-card > strong { color: #92400e; font-size: 13px; }
+.knowledge-conflict-card ul { margin: 6px 0 0; padding-left: 18px; color: #78350f; font-size: 12px; }
+.knowledge-conflict-card li + li { margin-top: 4px; }
 
 .metric-definition-panel {
   max-width: 980px;

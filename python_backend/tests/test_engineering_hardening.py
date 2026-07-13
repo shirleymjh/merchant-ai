@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+import app.main as app_main
 from app.main import create_app
 from merchant_ai.config import Settings
 from merchant_ai.graph.state import emit, register_event_listener, unregister_event_listener
@@ -99,6 +100,40 @@ def test_merchant_allowlist_blocks_cross_tenant_requests():
 
     memory_blocked = client.get("/api/memory/101", headers={"X-Ops-Token": "secret"})
     assert memory_blocked.status_code == 403
+
+
+def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
+    client = TestClient(
+        create_app(
+            Settings(
+                merchant_id="100",
+                allowed_merchant_ids="100",
+                memory_backend="file",
+                harness_workspace_path=str(tmp_path),
+            )
+        )
+    )
+    memory = app_main.workflow.memory_store.load("100")
+    memory["knowledgeSuggestions"] = [
+        {
+            "suggestionId": "ks_store_rule",
+            "status": "candidate",
+            "scopeType": "merchant",
+            "metricName": "退款预警",
+            "payload": {"memoryType": "correction", "correctionText": "本店退款率超过8%时提醒"},
+        }
+    ]
+    app_main.workflow.memory_store.save("100", memory)
+
+    response = client.post(
+        "/api/merchant/knowledge-suggestions/ks_store_rule/action",
+        json={"action": "accept", "merchantId": "100", "actor": "merchant_user"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "MERCHANT_ACTIVE"
+    assert payload["suggestion"]["scopeType"] == "merchant"
 
 
 def test_event_listener_registry_is_safe_for_parallel_runs():

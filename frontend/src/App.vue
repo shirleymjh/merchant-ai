@@ -78,6 +78,7 @@
           @ask="sendSuggestion"
           @confirm-clarification="handleClarificationConfirm"
           @metric-definition-action="handleMetricDefinitionAction"
+          @knowledge-proposal-action="handleKnowledgeProposalAction"
         />
         <div v-if="loading" class="loading-card">
           <LoaderCircle :size="18" />
@@ -141,7 +142,7 @@ import DailyReportCard from './components/DailyReportCard.vue'
 import MetricInsightPanel from './components/MetricInsightPanel.vue'
 import GovernanceConsole from './components/GovernanceConsole.vue'
 import SuggestionList from './components/SuggestionList.vue'
-import { cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, recordMetricDefinitionPreference, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
+import { actOnKnowledgeSuggestion, cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, recordMetricDefinitionPreference, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
 
 const input = ref('')
 const defaultRunStatusText = '正在分析问题并读取经营数据'
@@ -670,6 +671,46 @@ async function handleMetricDefinitionAction(payload) {
     })
   } catch {
     // 前端演示模式下忽略偏好写入失败。
+  }
+}
+
+async function handleKnowledgeProposalAction(payload) {
+  const message = messages.value.find(item => item.id === payload.answerId)
+  if (!message || !payload.suggestionId) return
+  const updateProposal = (patch) => {
+    const experience = { ...(message.merchantExperience || {}) }
+    experience.knowledgeSuggestions = (experience.knowledgeSuggestions || []).map(item =>
+      item.suggestionId === payload.suggestionId ? { ...item, ...patch } : item
+    )
+    message.merchantExperience = experience
+    saveActiveSessionSnapshot()
+  }
+  updateProposal({ actionPending: true, actionError: '' })
+  try {
+    const result = await actOnKnowledgeSuggestion(payload.suggestionId, payload.action, {
+      actor: userIdentity.value.displayName || userIdentity.value.userId || 'merchant_user',
+      conflictResolution: payload.conflictResolution || ''
+    })
+    const suggestion = result.suggestion || {}
+    if (String(result.status || '').toUpperCase() === 'CONFLICT_CONFIRMATION_REQUIRED') {
+      updateProposal({
+        conflictCheck: result.conflictCheck || suggestion.payload?.conflictCheck || {},
+        allowedActions: result.allowedActions || undefined,
+        actionPending: false,
+        actionError: ''
+      })
+      return
+    }
+    updateProposal({
+      status: suggestion.status || String(result.status || '').toLowerCase(),
+      scopeType: suggestion.scopeType || result.scopeType || payload.scopeType,
+      merchantAction: suggestion.merchantAction || payload.action,
+      conflictCheck: suggestion.payload?.conflictCheck || null,
+      actionPending: false,
+      actionError: ''
+    })
+  } catch (error) {
+    updateProposal({ actionPending: false, actionError: `操作失败：${error?.message || error}` })
   }
 }
 

@@ -105,7 +105,7 @@ const historyItems = computed(() => Array.isArray(assetGovernance.value?.publish
 onMounted(loadKnowledge)
 watch(tab, value => { if (value === 'assets') loadTopics(); if (value === 'plans') loadCatalog() })
 
-async function loadKnowledge() { await run(async () => { suggestions.value = (await getKnowledgeSuggestions()).items || [] }) }
+async function loadKnowledge() { await run(async () => { suggestions.value = ((await getKnowledgeSuggestions()).items || []).filter(item => !['merchant_active', 'dismissed'].includes(String(item.status || '').toLowerCase())) }) }
 async function loadTopics() { await run(async () => { topics.value = (await getTopics()).items || []; builder.value.topic ||= topics.value[0] || ''; assetTopic.value ||= topics.value[0] || ''; await loadAssetTables(false) }) }
 async function loadCatalog() { await run(async () => { catalog.value = (await getAnalysisCatalog()).items || [] }) }
 async function review(item, approved) {
@@ -147,7 +147,7 @@ async function rollbackAsset(version) { await run(async () => { const result = a
 async function install(item) { await run(async () => { await installAnalysisPlan(item.skillName, { scope: 'merchant', merchantIds: ['100'], trafficPercent: 100 }); await loadCatalog() }) }
 async function run(fn) { loading.value = true; error.value = ''; try { await fn() } catch (e) { error.value = `操作失败：${e.message || e}` } finally { loading.value = false } }
 function publishable(item) { return ['approved', 'publish_requested', 'published', 'indexed'].includes(String(item.status || '').toLowerCase()) && item.topic && item.sourceTable }
-function statusLabel(value) { return ({ candidate: '待审核', approved: '已通过', rejected: '已舍弃', published: '已发布', indexed: '已生效' })[String(value || '').toLowerCase()] || value || '待处理' }
+function statusLabel(value) { return ({ candidate: '等待商家确认', platform_suggested: '待平台审核', reviewed: '已复核', approved: '已通过', rejected: '已舍弃', published: '已发布', indexed: '已生效' })[String(value || '').toLowerCase()] || value || '待处理' }
 function planLabel(name) { return ({ bi_trend_attribution: '指标波动原因深挖', gmv_drop_diagnosis: 'GMV下降原因诊断', merchant_daily_briefing: '店铺经营体检', new_product_risk: '新品经营风险排查', ratio_analysis: '占比口径核验', refund_rate_diagnosis: '退款压力专项诊断', risk_analysis: '经营风险优先级分析', rule_compliance: '平台规则影响核对' })[name] || '经营专项分析' }
 </script>
 

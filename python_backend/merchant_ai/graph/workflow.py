@@ -97,7 +97,7 @@ from merchant_ai.services.answer import (
     select_answer_skill,
     visible_successful_tasks,
 )
-from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService, WikiMemoryService
+from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.clarification import ClarificationResolutionService
 from merchant_ai.services.context import ContextManager
@@ -117,7 +117,7 @@ from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, merge_task_result_bundles
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
-from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService
+from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService, recall_item_sort_key
 from merchant_ai.services.routing import KeywordExtractService, QuestionRoutingService, RouteSlotExtractor, TopicRouterService, route_primary_topic
 from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.distributed_workers import (
@@ -145,7 +145,6 @@ class MerchantQaWorkflow:
         keyword_service: KeywordExtractService,
         routing_service: QuestionRoutingService,
         topic_router: TopicRouterService,
-        wiki_memory: WikiMemoryService,
         recall_service: HybridRecallService,
         knowledge_retriever: KnowledgeRetrievalService,
         asset_builder: PlanningAssetPackBuilder,
@@ -163,7 +162,6 @@ class MerchantQaWorkflow:
         self.routing_service = routing_service
         self.topic_router = topic_router
         self.route_slot_extractor = RouteSlotExtractor()
-        self.wiki_memory = wiki_memory
         self.recall_service = recall_service
         self.knowledge_retriever = knowledge_retriever
         self.asset_builder = asset_builder
@@ -433,6 +431,7 @@ class MerchantQaWorkflow:
         builder = StateGraph(AgentState)
         builder.add_node("inherit_context", self.inherit_context)
         builder.add_node("runtime_bootstrap", self.runtime_bootstrap)
+        builder.add_node("recall_memory", self.recall_memory)
         builder.add_node("policy", self.policy_node)
         builder.add_node("route_topic", self.route_topic)
         builder.add_node("fast_understand", self.fast_understand)
@@ -458,7 +457,8 @@ class MerchantQaWorkflow:
 
         builder.add_edge(START, "inherit_context")
         builder.add_edge("inherit_context", "runtime_bootstrap")
-        builder.add_edge("runtime_bootstrap", "policy")
+        builder.add_edge("runtime_bootstrap", "recall_memory")
+        builder.add_edge("recall_memory", "policy")
         builder.add_conditional_edges(
             "policy",
             lambda state: state.get("_next_action", "cache_answer"),
@@ -613,6 +613,81 @@ class MerchantQaWorkflow:
         self.record_span(state, "action", "runtime_bootstrap", started)
         self.finish_run_step(state, step, "success", output_summary="route=%s" % enum_value(route))
         emit(state, "node.completed", "LANGGRAPH_RUNTIME", {"route": enum_value(route)})
+        return state
+
+    def recall_memory(self, state: AgentState) -> AgentState:
+        """Recall governed long-term memory before planning and execution."""
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "recall_memory",
+            "LeadAgent",
+            "MEMORY_RECALL",
+            input_summary=state.get("question", ""),
+        )
+        emit(state, "node.started", "MEMORY_RECALL", {})
+        try:
+            injection = self.memory_store.select_for_question(
+                state,
+                budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
+            )
+            state["memory_injection"] = injection
+            state["memory_injection_trace"] = injection.get("memoryInjectionTrace", {})
+            state["memory_constraints"] = build_memory_constraints(injection)
+            state["memory_constraint_trace"] = {
+                "constraintCount": len(state["memory_constraints"]),
+                "requiredCount": sum(
+                    1 for item in state["memory_constraints"] if str(item.get("enforcement") or "") == "required"
+                ),
+                "clarifyCount": sum(
+                    1
+                    for item in state["memory_constraints"]
+                    if str(item.get("enforcement") or "") == "clarify_or_disclose"
+                ),
+                "source": injection.get("source", ""),
+            }
+            state["merchant_profile_summary"] = self.merchant_profile_summary_service.summarize(
+                merchant=state["merchant"],
+                memory_injection=injection,
+                memory_constraints=state["memory_constraints"],
+                route_slots=state.get("route_slots", RouteSlots()),
+                fast_understanding=state.get("fast_understanding", FastUnderstandingResult()),
+            )
+            add_step(
+                state,
+                "Long-term Memory：回答前召回完成 selected=%d constraints=%d"
+                % (
+                    len(state["memory_injection_trace"].get("selectedIds") or []),
+                    len(state["memory_constraints"]),
+                ),
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "success",
+                output_summary="selected=%d constraints=%d"
+                % (
+                    len(state["memory_injection_trace"].get("selectedIds") or []),
+                    len(state["memory_constraints"]),
+                ),
+            )
+        except Exception as exc:
+            state["memory_injection"] = {}
+            state["memory_injection_trace"] = {"error": str(exc)[:500]}
+            state["memory_constraints"] = []
+            state["memory_constraint_trace"] = {"constraintCount": 0, "error": str(exc)[:500]}
+            add_step(state, "Long-term Memory：回答前召回失败，已降级为空记忆")
+            self.finish_run_step(state, step, "failed", output_summary=str(exc)[:500])
+        self.record_span(state, "action", "recall_memory", started)
+        emit(
+            state,
+            "node.completed",
+            "MEMORY_RECALL",
+            {
+                "selectedCount": len(state.get("memory_injection_trace", {}).get("selectedIds") or []),
+                "constraintCount": len(state.get("memory_constraints") or []),
+            },
+        )
         return state
 
     def policy_node(self, state: AgentState) -> AgentState:
@@ -1199,7 +1274,6 @@ class MerchantQaWorkflow:
             self.record_span(state, "action", "route_topic", started)
             self.finish_run_step(state, step, "skipped", output_summary="non_business")
             return state
-        state["base_knowledge_context"] = self.wiki_memory.load_base_wiki()
         context_topic = state["request_context"].topic if state.get("request_context") else ""
         route_slots = self.route_slot_extractor.extract(state["question"], state.get("extracted_keywords", ExtractedKeywords()))
         state["route_decision_trace"] = [
@@ -1323,7 +1397,7 @@ class MerchantQaWorkflow:
                 return state
             topics = self._merge_topic_categories(decision.recall_topics(), diagnostic_topics)
             topic_names = self._topic_names_for_categories(topics)
-            state["topic_asset_context"] = self.wiki_memory.load_relevant_wiki(topic_names)
+            state["topic_asset_context"] = self.recall_service.topic_assets.load_topic_context(topic_names)
             if diagnostic_topics:
                 add_step(
                     state,
@@ -1850,6 +1924,13 @@ class MerchantQaWorkflow:
                 history_rows=state.get("history_rows", []),
                 knowledge_context=knowledge_context(state),
                 merchant_id=state["merchant"].merchant_id,
+                access_role=state.get("access_role", "merchant_analyst"),
+                permissions=list((state.get("user_identity") or {}).get("permissions") or []),
+                previous_user_question=previous_user_question(
+                    state.get("message_history") or [],
+                    current_question=state.get("question", ""),
+                ),
+                session_context=str(state.get("session_context") or "")[-4000:],
                 topic_categories=query_topics,
                 knowledge_request=request,
                 route_slots=(state.get("route_slots") or RouteSlots()).model_dump(by_alias=True),
@@ -1874,10 +1955,10 @@ class MerchantQaWorkflow:
                 current = all_items.get(item.doc_id)
                 if current is not None:
                     item = merge_recall_item_queries(current, item)
-                if current is None or item.fusion_score >= current.fusion_score or set((item.metadata or {}).get("recallQueries") or []) != set((current.metadata or {}).get("recallQueries") or []):
+                if current is None or recall_item_sort_key(item) >= recall_item_sort_key(current) or set((item.metadata or {}).get("recallQueries") or []) != set((current.metadata or {}).get("recallQueries") or []):
                     all_items[item.doc_id] = item
         lineage_items = list(all_items.values())
-        items = sorted(lineage_items, key=lambda item: item.fusion_score, reverse=True)[:24]
+        items = sorted(lineage_items, key=recall_item_sort_key, reverse=True)[:24]
         state["recall_bundle"] = RecallBundle(
             items=items,
             top_score=items[0].fusion_score if items else 0.0,
@@ -4538,35 +4619,26 @@ class MerchantQaWorkflow:
         try:
             memory_payload = self.memory_store.update_from_state(state)
             state["memory_ingestion_trace"] = memory_payload.get("memoryIngestionTrace", {})
+            curator_trace = state["memory_ingestion_trace"].get("knowledgeCurator") or {}
             governance_suggestions = self.merchant_knowledge_suggestions_for_response(memory_payload)
             if governance_suggestions:
                 state["merchant_experience"] = dict(state.get("merchant_experience") or {})
                 state["merchant_experience"]["knowledgeSuggestions"] = governance_suggestions
                 state["merchant_experience"]["knowledgeGovernance"] = {
-                    "mode": "merchant_memory_review",
+                    "mode": "llm_curator_review" if curator_trace.get("authoritative") else "merchant_memory_review",
                     "status": "pending_review",
-                    "description": "从商家纠正中抽取候选经营规则，审核后才会作为稳定知识生效",
+                    "description": "从本轮对话中提取候选业务知识，商家确认或平台审核后才会生效",
                 }
-            state["memory_injection"] = self.memory_store.select_for_question(
-                state,
-                budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
-            )
-            state["memory_injection_trace"] = state["memory_injection"].get("memoryInjectionTrace", {})
-            state["memory_constraints"] = build_memory_constraints(state["memory_injection"])
-            state["memory_constraint_trace"] = {
-                "constraintCount": len(state["memory_constraints"]),
-                "requiredCount": sum(1 for item in state["memory_constraints"] if str(item.get("enforcement") or "") == "required"),
-                "clarifyCount": sum(
-                    1
-                    for item in state["memory_constraints"]
-                    if str(item.get("enforcement") or "") == "clarify_or_disclose"
-                ),
-                "source": state["memory_injection"].get("source", ""),
-            }
+                if curator_trace.get("authoritative"):
+                    add_step(
+                        state,
+                        "Knowledge Curator：模型已从用户原话提取 %d 条待确认知识"
+                        % int(curator_trace.get("candidateCount") or len(governance_suggestions)),
+                    )
             runtime_profile_summary = self.merchant_profile_summary_service.summarize(
                 merchant=state["merchant"],
-                memory_injection=state["memory_injection"],
-                memory_constraints=state["memory_constraints"],
+                memory_injection=state.get("memory_injection") or {},
+                memory_constraints=state.get("memory_constraints") or [],
                 route_slots=state.get("route_slots", RouteSlots()),
                 fast_understanding=state.get("fast_understanding", FastUnderstandingResult()),
             )
@@ -4975,9 +5047,15 @@ class MerchantQaWorkflow:
         result: List[Dict[str, Any]] = []
         for item in suggestions:
             status = str(item.get("status") or "candidate")
+            if status in {"merchant_active", "platform_suggested", "dismissed", "rejected", "published", "indexed"}:
+                continue
             if status not in {"candidate", "review_required", "pending", "reviewed"} and str(item.get("suggestionId") or "") != target_id:
                 continue
             payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            proposed_scope = str(item.get("scopeType") or payload.get("proposedScope") or "merchant").lower()
+            if str(payload.get("memoryType") or "") == "metric_dispute":
+                proposed_scope = "platform"
+            allowed_actions = ["suggest", "skip"] if proposed_scope == "platform" else ["accept", "suggest", "skip"]
             result.append(
                 {
                     "suggestionId": str(item.get("suggestionId") or ""),
@@ -4985,12 +5063,18 @@ class MerchantQaWorkflow:
                     "status": status,
                     "topic": str(item.get("topic") or ""),
                     "metricName": str(item.get("metricName") or ""),
+                    "title": str(payload.get("title") or item.get("metricName") or "业务知识"),
                     "aliases": [str(value) for value in (item.get("aliases") or [])[:6]],
-                    "correctionText": str(payload.get("correctionText") or "")[:240],
+                    "correctionText": str(payload.get("correctionText") or payload.get("question") or "")[:240],
+                    "evidenceQuote": str(payload.get("evidenceQuote") or "")[:240],
+                    "confidence": float(payload.get("confidence") or 0.0),
+                    "extractionMode": str(payload.get("extractionMode") or "rule"),
                     "proposalKind": "knowledge",
                     "classificationRequired": False,
-                    "scope": "topic",
-                    "reviewAction": "approve_or_reject_before_publish",
+                    "scope": proposed_scope,
+                    "scopeType": proposed_scope,
+                    "allowedActions": allowed_actions,
+                    "reviewAction": "merchant_confirm_or_platform_suggest",
                 }
             )
             if len(result) >= limit:
@@ -5540,6 +5624,7 @@ class MerchantQaWorkflow:
             "constraints": list(getattr(package, "constraints", []) or [])[:6],
             "allowedTables": list(getattr(package, "allowed_tables", []) or [])[:12],
             "allowedMetrics": list(getattr(package, "allowed_metrics", []) or [])[:24],
+            "agentContextPolicy": dict(getattr(package, "agent_context_policy", {}) or {}),
             "evidenceGaps": list(getattr(package, "evidence_gaps", []) or [])[:8],
             "artifactRefs": refs,
         }
@@ -6305,7 +6390,7 @@ def rule_recall_item(item: Any) -> bool:
     answer_modes = {part.strip() for part in re.split(r"[,|/]", answer_mode) if part.strip()}
     if answer_modes & {"RULE", "RULE_ANSWER", "PLATFORM_RULE"}:
         return True
-    return source_type == "BASE_WIKI" and ("rule" in doc_id.lower() or "规则" in title)
+    return source_type == "GOVERNED_RULE" and ("rule" in doc_id.lower() or "规则" in title)
 
 
 def merge_recall_item_queries(current: RecallItem, incoming: RecallItem) -> RecallItem:
@@ -6320,11 +6405,12 @@ def merge_recall_item_queries(current: RecallItem, incoming: RecallItem) -> Reca
         query_text = str(metadata.get("recallQuery") or "")
         if query_text and query_text not in queries:
             queries.append(query_text)
-    merged_metadata = {**current_metadata, **incoming_metadata, "recallQueries": queries}
+    base = incoming if recall_item_sort_key(incoming) >= recall_item_sort_key(current) else current
+    other = current if base is incoming else incoming
+    merged_metadata = {**dict(other.metadata or {}), **dict(base.metadata or {}), "recallQueries": queries}
     if queries:
         merged_metadata["recallQuery"] = queries[-1]
-    base = incoming if incoming.fusion_score >= current.fusion_score else current
-    return base.model_copy(update={"fusion_score": max(current.fusion_score, incoming.fusion_score), "metadata": merged_metadata})
+    return base.model_copy(update={"metadata": merged_metadata})
 
 
 def normalize_knowledge_request_text(value: str) -> str:
@@ -6535,6 +6621,16 @@ def unique_workflow_strings(values: List[Any]) -> List[str]:
     return result
 
 
+def previous_user_question(messages: List[Any], current_question: str = "") -> str:
+    current = str(current_question or "").strip()
+    for message in reversed(list(messages or [])):
+        role = str(getattr(message, "role", "") or (message.get("role") if isinstance(message, dict) else "")).strip().lower()
+        text = str(getattr(message, "text", "") or (message.get("text") if isinstance(message, dict) else "")).strip()
+        if role == "user" and text and text != current:
+            return text[:1200]
+    return ""
+
+
 def remaining_run_budget_seconds(state: AgentState, settings: Settings) -> float:
     now = now_ms()
     started = int(state.get("run_started_at_ms") or now)
@@ -6731,8 +6827,7 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
     llm = LlmClient(settings)
     topic_assets = TopicAssetService(settings)
     semantic_catalog = SemanticCatalogService(topic_assets)
-    wiki_memory = WikiMemoryService(settings)
-    recall_service = HybridRecallService(settings, topic_assets, wiki_memory)
+    recall_service = HybridRecallService(settings, topic_assets)
     knowledge_retriever: KnowledgeRetrievalService
     if settings.es_enabled:
         knowledge_retriever = EsKnowledgeRetrievalService(settings, topic_assets)
@@ -6748,7 +6843,6 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
         keyword_service=KeywordExtractService(topic_assets),
         routing_service=QuestionRoutingService(),
         topic_router=TopicRouterService(),
-        wiki_memory=wiki_memory,
         recall_service=recall_service,
         knowledge_retriever=knowledge_retriever,
         asset_builder=asset_builder,

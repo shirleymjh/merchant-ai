@@ -357,16 +357,19 @@ class DailyReportResponse(APIModel):
     suggestions: List[str] = Field(default_factory=list)
 
 
-class WikiCompressRequest(APIModel):
-    category_name: str = ""
-    manual_markdown: str = ""
-
-
 class KnowledgeSuggestionReviewRequest(APIModel):
     approved: bool = False
     reviewer: str = ""
     review_note: str = ""
     action: str = "review"
+
+
+class KnowledgeSuggestionActionRequest(APIModel):
+    action: str = ""
+    merchant_id: str = ""
+    actor: str = ""
+    note: str = ""
+    conflict_resolution: str = ""
 
 
 class KnowledgeSuggestionPublishRequest(APIModel):
@@ -421,6 +424,10 @@ class KnowledgeSuggestion(APIModel):
     publish_requested_by: str = ""
     published_ref_id: str = ""
     indexed_at: str = ""
+    scope_type: str = "merchant"
+    merchant_action: str = ""
+    actioned_by: str = ""
+    actioned_at: str = ""
     payload: Dict[str, Any] = Field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
@@ -596,6 +603,19 @@ class RecallBundle(APIModel):
     merged_context: str = ""
 
     def has_strong_match(self) -> bool:
+        versioned_items = [item for item in self.items if str((item.metadata or {}).get("scoreVersion") or "") == "recall_v2"]
+        if versioned_items:
+            versioned_strong = any(
+                int((item.metadata or {}).get("protectionTier") or 0) >= 1
+                or float((item.metadata or {}).get("finalScore") if (item.metadata or {}).get("finalScore") is not None else item.fusion_score or 0.0) >= 0.5
+                for item in versioned_items
+            )
+            legacy_strong = any(
+                item.fusion_score >= 4.0
+                for item in self.items
+                if str((item.metadata or {}).get("scoreVersion") or "") != "recall_v2"
+            )
+            return versioned_strong or legacy_strong
         return self.top_score >= 4.0 or any(item.fusion_score >= 4.0 for item in self.items)
 
 
@@ -645,6 +665,10 @@ class KnowledgeRetrievalRequest(APIModel):
     history_rows: List[Dict[str, Any]] = Field(default_factory=list)
     knowledge_context: str = ""
     merchant_id: str = ""
+    access_role: str = "merchant_operator"
+    permissions: List[str] = Field(default_factory=list)
+    previous_user_question: str = ""
+    session_context: str = ""
     topic_categories: List[QuestionCategory] = Field(default_factory=list)
     knowledge_request: Optional[KnowledgeRequest] = None
     route_slots: Dict[str, Any] = Field(default_factory=dict)
@@ -673,6 +697,9 @@ class RecallRoundTrace(APIModel):
     intent_kind: str = ""
     complexity: str = ""
     retrieval_lanes: List[Dict[str, Any]] = Field(default_factory=list)
+    rewritten_query: str = ""
+    governance_filtered: Dict[str, int] = Field(default_factory=dict)
+    rerank_applied: bool = False
 
 
 class KnowledgeBundle(APIModel):
@@ -827,6 +854,7 @@ class ContextPackage(APIModel):
     artifact_refs: List[ArtifactRef] = Field(default_factory=list)
     allowed_tables: List[str] = Field(default_factory=list)
     allowed_metrics: List[str] = Field(default_factory=list)
+    agent_context_policy: Dict[str, Any] = Field(default_factory=dict)
     evidence_gaps: List[Dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
     inline_budget_chars: int = 0

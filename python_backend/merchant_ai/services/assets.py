@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
 from merchant_ai.config import Settings
 from merchant_ai.models import (
     PlanningAssetEntry,
@@ -142,6 +144,17 @@ class TopicAssetService:
             return []
         self._topic_names_cache = [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
         return self._topic_names_cache
+
+    def load_topic_context(self, topic_names: Iterable[str]) -> str:
+        parts: List[str] = []
+        for topic in topic_names:
+            topic_dir = self.root / topic
+            for path in sorted(topic_dir.rglob("*.md")):
+                try:
+                    parts.append("## %s/%s\n%s" % (topic, path.name, path.read_text(encoding="utf-8")[:5000]))
+                except Exception:
+                    continue
+        return "\n\n".join(parts)
 
     def table_asset_dir(self, topic: str, table: str) -> Path:
         return self.root / topic / "tables" / table
@@ -748,50 +761,94 @@ class SkillLoader:
         }
 
 
-class WikiMemoryService:
-    def __init__(self, settings: Settings):
-        self.settings = settings
+MARKDOWN_HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4"), ("#####", "h5"), ("######", "h6")]
+CHINESE_RECURSIVE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", ". ", "! ", "? ", "; ", ", ", " ", ""]
 
-    def load_base_wiki(self) -> str:
-        parts = []
-        for path in sorted(self.settings.resolved_wiki_path.glob("*.md")):
-            try:
-                parts.append("# %s\n%s" % (path.stem, path.read_text(encoding="utf-8")))
-            except Exception:
+
+def split_markdown_for_recall(
+    text: str,
+    document_title: str,
+    target_chars: int = 1600,
+    max_chars: int = 2400,
+    overlap_chars: int = 160,
+) -> List[Dict[str, Any]]:
+    """Split governed Markdown with LangChain's header and recursive splitters."""
+    target = max(80, int(target_chars or 1600))
+    maximum = max(target, 120, int(max_chars or 2400))
+    overlap = max(0, min(int(overlap_chars or 0), maximum // 4))
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=MARKDOWN_HEADERS,
+        strip_headers=True,
+    )
+    sections = header_splitter.split_text(str(text or ""))
+    chunks: List[Dict[str, Any]] = []
+    section_counts: Dict[Tuple[str, ...], int] = {}
+    previous_bodies: Dict[Tuple[str, ...], str] = {}
+    for section in sections:
+        effective_path = [
+            str(section.metadata.get("h%d" % level) or "").strip()
+            for level in range(1, 7)
+            if str(section.metadata.get("h%d" % level) or "").strip()
+        ] or [document_title]
+        heading_text = " > ".join(effective_path)
+        heading_prefix = "标题路径：%s" % heading_text
+        body_limit = max(60, min(target, maximum - len(heading_prefix) - 2))
+        section_overlap = max(0, min(overlap, body_limit // 4))
+        recursive_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=body_limit,
+            chunk_overlap=section_overlap,
+            separators=CHINESE_RECURSIVE_SEPARATORS,
+            length_function=len,
+            keep_separator=True,
+            strip_whitespace=True,
+        )
+        section_chunks = recursive_splitter.split_documents([section])
+        heading_key = tuple(effective_path)
+        for split_doc in section_chunks:
+            body = str(split_doc.page_content or "").strip()
+            if not body:
                 continue
-        return "\n\n".join(parts)
+            section_index = section_counts.get(heading_key, 0)
+            previous_body = previous_bodies.get(heading_key, "")
+            actual_overlap = common_chunk_overlap(previous_body, body, section_overlap) if section_index > 0 else 0
+            content = "%s\n\n%s" % (heading_prefix, body)
+            chunks.append(
+                {
+                    "headingPath": effective_path,
+                    "headingText": heading_text,
+                    "content": content,
+                    "sectionChunkIndex": section_index,
+                    "overlapChars": actual_overlap,
+                }
+            )
+            section_counts[heading_key] = section_index + 1
+            previous_bodies[heading_key] = body
+    return chunks or [
+        {
+            "headingPath": [document_title],
+            "headingText": document_title,
+            "content": ("标题路径：%s\n\n%s" % (document_title, str(text or "").strip()))[:maximum],
+            "sectionChunkIndex": 0,
+            "overlapChars": 0,
+        }
+    ]
 
-    def load_relevant_wiki(self, topic_names: Iterable[str]) -> str:
-        parts = []
-        for topic in topic_names:
-            topic_dir = self.settings.resolved_topic_path / topic
-            for path in sorted(topic_dir.rglob("*.md")):
-                try:
-                    parts.append("## %s/%s\n%s" % (topic, path.name, path.read_text(encoding="utf-8")[:5000]))
-                except Exception:
-                    continue
-        return "\n\n".join(parts)
 
-    def compress_to_wiki(self, category_name: str, rows: List[Dict[str, Any]], manual_markdown: str = "") -> Path:
-        target = self.settings.resolved_workspace_path / "wiki" / ("%s.md" % (category_name or "all"))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        lines = ["# %s 问答沉淀" % (category_name or "全部")]
-        if manual_markdown:
-            lines.append(manual_markdown.strip())
-        for row in rows[:200]:
-            lines.append("\n## %s\n%s" % (row.get("question", ""), row.get("answer", "")))
-        target.write_text("\n".join(lines), encoding="utf-8")
-        return target
+def common_chunk_overlap(previous: str, current: str, limit: int) -> int:
+    maximum = min(max(0, int(limit or 0)), len(previous or ""), len(current or ""))
+    for size in range(maximum, 0, -1):
+        if previous[-size:] == current[:size]:
+            return size
+    return 0
 
 
 class HybridRecallService:
-    """Local BM25-ish recall over existing wiki/runtime topic assets, with ES-compatible hook points."""
+    """Local BM25-ish recall over governed rules and runtime topic assets."""
 
-    def __init__(self, settings: Settings, topic_assets: TopicAssetService, wiki_memory: WikiMemoryService):
+    def __init__(self, settings: Settings, topic_assets: TopicAssetService):
         self.settings = settings
         self.topic_assets = topic_assets
         self.semantic_catalog = SemanticCatalogService(topic_assets)
-        self.wiki_memory = wiki_memory
         self._documents: Optional[List[RecallItem]] = None
         self._recall_cache = build_ttl_cache("hybrid_recall", settings, settings.cache_recall_ttl_seconds)
 
@@ -820,7 +877,7 @@ class HybridRecallService:
             return RecallBundle.model_validate(cached)
         scored: List[RecallItem] = []
         for doc in self._load_documents():
-            if not allowed_topics and doc.source_type != "BASE_WIKI":
+            if not allowed_topics and doc.source_type != "GOVERNED_RULE":
                 continue
             if allowed_topics and doc.topic and doc.topic not in allowed_topics:
                 continue
@@ -856,16 +913,37 @@ class HybridRecallService:
         if self._documents is not None:
             return self._documents
         docs: List[RecallItem] = []
-        for path in sorted(self.settings.resolved_wiki_path.glob("*.md")):
+        for path in sorted(self.settings.resolved_rule_knowledge_path.glob("*.md")):
             try:
-                docs.append(
-                    RecallItem(
-                        doc_id=str(path),
-                        title=path.stem,
-                        content=path.read_text(encoding="utf-8")[:8000],
-                        source_type="BASE_WIKI",
-                    )
+                chunks = split_markdown_for_recall(
+                    path.read_text(encoding="utf-8"),
+                    path.stem,
+                    target_chars=self.settings.rule_chunk_target_chars,
+                    max_chars=self.settings.rule_chunk_max_chars,
+                    overlap_chars=self.settings.rule_chunk_overlap_chars,
                 )
+                for chunk_index, chunk in enumerate(chunks):
+                    docs.append(
+                        RecallItem(
+                            doc_id="%s#chunk-%04d" % (path, chunk_index),
+                            title="%s / %s" % (path.stem, chunk["headingText"]),
+                            content=chunk["content"],
+                            source_type="GOVERNED_RULE",
+                            metadata={
+                                "sourcePath": str(path),
+                                "semanticPath": "rules/%s" % path.name,
+                                "headingPath": chunk["headingPath"],
+                                "headingText": chunk["headingText"],
+                                "chunkIndex": chunk_index,
+                                "sectionChunkIndex": chunk["sectionChunkIndex"],
+                                "chunkChars": len(chunk["content"]),
+                                "overlapChars": chunk["overlapChars"],
+                                "chunkStrategy": "langchain_markdown_header_recursive",
+                                "status": "PUBLISHED",
+                                "visibilityPolicy": {"level": "public", "allowedRoles": []},
+                            },
+                        )
+                    )
             except Exception:
                 pass
         for topic in self.topic_assets.all_topic_names():
@@ -894,6 +972,13 @@ class HybridRecallService:
                             "layers": ref["layers"],
                             "estimatedChars": ref["estimatedChars"],
                             "offloadRecommended": ref["offloadRecommended"],
+                            "status": asset.get("status") or manifest_item.get("status") or "PUBLISHED",
+                            "version": asset.get("version") or "",
+                            "merchantId": asset.get("merchantId") or "",
+                            "allowedRoles": asset.get("allowedRoles") or [],
+                            "requiredPermissions": asset.get("requiredPermissions") or [],
+                            "visibilityPolicy": asset.get("visibilityPolicy") or {},
+                            "expiresAt": asset.get("expiresAt") or "",
                         },
                     )
                 )
@@ -928,6 +1013,13 @@ class HybridRecallService:
                                 "aliases": metric.get("aliases") or [],
                                 "merchantUri": merchant_uri_for_semantic_ref(semantic_ref_id, topic=topic, table=table, kind="METRIC", key=metric_key),
                                 "contextLayer": "L1",
+                                "status": metric.get("status") or asset.get("status") or "PUBLISHED",
+                                "version": metric.get("version") or asset.get("version") or "",
+                                "merchantId": metric.get("merchantId") or asset.get("merchantId") or "",
+                                "allowedRoles": metric.get("allowedRoles") or asset.get("allowedRoles") or [],
+                                "requiredPermissions": metric.get("requiredPermissions") or asset.get("requiredPermissions") or [],
+                                "visibilityPolicy": metric.get("visibilityPolicy") or asset.get("visibilityPolicy") or {},
+                                "expiresAt": metric.get("expiresAt") or asset.get("expiresAt") or "",
                             },
                         )
                     )
@@ -952,6 +1044,8 @@ class HybridRecallService:
                             "layers": ref["layers"],
                             "estimatedChars": ref["estimatedChars"],
                             "offloadRecommended": ref["offloadRecommended"],
+                            "status": "PUBLISHED",
+                            "visibilityPolicy": {"level": "public", "allowedRoles": []},
                         },
                     )
                 )
@@ -983,6 +1077,13 @@ class HybridRecallService:
                                 "rightTable": right,
                                 "topic": topic,
                                 "joinKeys": rel.get("keys") or [],
+                                "status": rel.get("status") or "PUBLISHED",
+                                "version": rel.get("version") or "",
+                                "merchantId": rel.get("merchantId") or "",
+                                "allowedRoles": rel.get("allowedRoles") or [],
+                                "requiredPermissions": rel.get("requiredPermissions") or [],
+                                "visibilityPolicy": rel.get("visibilityPolicy") or {},
+                                "expiresAt": rel.get("expiresAt") or "",
                             },
                         )
                     )
