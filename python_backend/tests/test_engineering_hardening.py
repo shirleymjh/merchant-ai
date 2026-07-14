@@ -1,5 +1,9 @@
+import base64
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import hmac
 from io import BytesIO
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -22,6 +26,26 @@ from merchant_ai.services.runtime_state import FileRuntimeStateStore, NodeTaskSt
 from merchant_ai.services.security import Permission, authorize_merchant_access, merchant_principal, ops_principal
 from merchant_ai.services.tool_runtime import ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import node_runtime_tool_schemas, tool_registry_from_descriptions, validate_tool_result_contract
+
+
+def merchant_identity_token(secret: str, merchant_id: str = "100", user_id: str = "u1") -> str:
+    def encode(payload):
+        return base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+
+    header = encode({"alg": "HS256", "typ": "JWT"})
+    claims = encode(
+        {
+            "sub": user_id,
+            "merchantId": merchant_id,
+            "role": "merchant_owner",
+            "permissions": ["memory.read", "memory.write"],
+        }
+    )
+    signing_input = "%s.%s" % (header, claims)
+    signature = base64.urlsafe_b64encode(
+        hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
+    ).decode("ascii").rstrip("=")
+    return "%s.%s" % (signing_input, signature)
 
 
 def test_settings_exposes_grouped_config_views(tmp_path):
@@ -172,12 +196,14 @@ def test_thread_ids_are_validated_and_bound_to_merchant(tmp_path):
 
 
 def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
+    jwt_secret = "test-memory-write-secret"
     client = TestClient(
         create_app(
             Settings(
                 merchant_id="100",
                 allowed_merchant_ids="100",
                 memory_backend="file",
+                identity_jwt_secret=jwt_secret,
                 harness_workspace_path=str(tmp_path),
             )
         )
@@ -194,11 +220,17 @@ def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
     ]
     app_main.workflow.memory_store.save("100", memory)
 
-    response = client.post(
+    unauthorized = client.post(
         "/api/merchant/knowledge-suggestions/ks_store_rule/action",
         json={"action": "confirm_use", "merchantId": "100", "actor": "merchant_user"},
     )
+    response = client.post(
+        "/api/merchant/knowledge-suggestions/ks_store_rule/action",
+        json={"action": "confirm_use", "merchantId": "100", "actor": "merchant_user"},
+        headers={"Authorization": "Bearer %s" % merchant_identity_token(jwt_secret)},
+    )
 
+    assert unauthorized.status_code == 401
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "MERCHANT_ACTIVE"

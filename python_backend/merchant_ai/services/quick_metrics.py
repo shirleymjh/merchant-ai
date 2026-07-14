@@ -127,6 +127,7 @@ def quick_metric_response(
     first, last = values[0], values[-1]
     direction = "上升" if last > first else "下降" if last < first else "持平"
     delta = abs(last - first)
+    direction_text = "整体持平" if delta == 0 else "整体%s %s" % (direction, format_value(delta, metric))
     peak_index = max(range(len(values)), key=values.__getitem__)
     peak = normalized_rows[peak_index]
     total_text = format_value(total, metric)
@@ -138,7 +139,7 @@ def quick_metric_response(
     answer = (
         f"{time_label}，店铺{metric['label']}合计为 {total_text}。\n\n"
         f"{freshness_sentence}"
-        f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，整体{direction} {format_value(delta, metric)}；"
+        f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，{direction_text}；"
         f"峰值日期为 {peak['pt']}，峰值为 {format_value(peak['value'], metric)}。\n\n"
         "建议：\n"
         f"- {advice[0]}\n"
@@ -207,6 +208,9 @@ def verify_quick_metric_answer(
     latest_date = str(trend_rows[-1].get("pt") or "") if trend_rows else ""
     peak_row = max(trend_rows, key=lambda row: float(row.get("value") or 0)) if trend_rows else {}
     peak_date = str(peak_row.get("pt") or "")
+    first_value = float(trend_rows[0].get("value") or 0) if trend_rows else 0.0
+    last_value = float(trend_rows[-1].get("value") or 0) if trend_rows else 0.0
+    delta_value = abs(last_value - first_value)
     plan = QueryPlan(
         intents=[
             QuestionIntent(
@@ -239,7 +243,7 @@ def verify_quick_metric_answer(
     trend_bundle = QueryBundle(tables=[metric["table"]], rows=trend_rows, original_row_count=len(trend_rows))
     date_context_bundle = QueryBundle(
         tables=[metric["table"]],
-        rows=[{"数据日期": latest_date, "峰值日期": peak_date}],
+        rows=[{"数据日期": latest_date, "峰值日期": peak_date, "变化值": delta_value}],
         original_row_count=1,
     )
     run_result = AgentRunResult(

@@ -68,6 +68,8 @@ class UnderstandingExtractor:
         )
 
     def failure_fallback_plan(self, question: str, asset_pack: PlanningAssetPack, trace_reason: str) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
+        if has_knowledge_request_gaps(asset_pack):
+            return QueryPlan(agent_trace=[trace_reason, "planner.failure_fallback=blocked_by_knowledge_request_gaps"]), [], trace_reason
         rejected_trace: List[str] = []
         entity_plan = self.planner._entity_detail_fallback(question, asset_pack)
         if entity_plan.intents:
@@ -93,6 +95,24 @@ class UnderstandingExtractor:
                 return trend_plan, [], "SEMANTIC_FAST_PATH"
             rejected_trace.extend(fallback_coverage_rejection_trace("multi_metric_trend", coverage_gaps))
         return QueryPlan(agent_trace=[trace_reason, *rejected_trace, "planner.failure_fallback=fail_closed_coverage"]), [], trace_reason
+
+
+def has_knowledge_request_gaps(asset_pack: PlanningAssetPack) -> bool:
+    return bool((asset_pack.metric_compaction or {}).get("knowledgeRequestGaps"))
+
+
+def repair_payload_knowledge_requests(payload: Dict[str, Any]) -> List[KnowledgeRequest]:
+    raw_items = payload.get("knowledgeRequests") or payload.get("knowledge_requests") or []
+    requests: List[KnowledgeRequest] = []
+    for item in raw_items or []:
+        if isinstance(item, KnowledgeRequest):
+            requests.append(item)
+        elif isinstance(item, dict):
+            try:
+                requests.append(KnowledgeRequest.model_validate(item))
+            except Exception:
+                continue
+    return requests
 
 
 @dataclass
@@ -188,6 +208,12 @@ class PlanRepairer:
                     repaired = self.enrich_plan(question, repaired, asset_pack, payload)
                     repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=llm_reunderstanding"])
                     return repaired
+            repair_requests = repair_payload_knowledge_requests(payload)
+            if repair_requests:
+                return QueryPlan(
+                    knowledge_requests=repair_requests,
+                    agent_trace=plan.agent_trace + ["planner.repair=llm_requested_knowledge"],
+                )
         plan.agent_trace.append("planner.repair.unavailable")
         return plan
 

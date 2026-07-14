@@ -171,6 +171,19 @@ def require_ops_merchant_access(merchant_id: str, permission: Permission = Permi
     return authorize_merchant_access(settings, ops_principal(), merchant_id or settings.merchant_id, permission)
 
 
+def require_memory_write_identity(merchant_id: str, authorization: Optional[str]) -> Any:
+    identity = resolve_authenticated_identity(settings, authorization or "", None)
+    if identity is None:
+        raise HTTPException(status_code=401, detail="authenticated identity is required for memory writes")
+    target = str(merchant_id or settings.merchant_id).strip()
+    if identity.merchant_id and identity.merchant_id != target:
+        raise HTTPException(status_code=403, detail="authenticated identity cannot write requested merchant memory")
+    permissions = {str(item) for item in identity.permissions}
+    if Permission.MEMORY_WRITE.value not in permissions and identity.role not in {"merchant_owner", "platform_operator"}:
+        raise HTTPException(status_code=403, detail="permission denied: memory.write")
+    return identity
+
+
 def require_thread_access(
     thread_id: str,
     merchant_id: str = "",
@@ -519,14 +532,29 @@ def cancel_run(thread_id: str, run_id: str, authorization: Optional[str] = Heade
 
 
 @router.post("/api/answers/{answer_id}/feedback")
-def feedback(answer_id: str, request: FeedbackRequest) -> Dict[str, Any]:
-    persisted = feedback_service.apply_feedback(answer_id, request.adopted, request.liked, request.disliked)
+def feedback(
+    answer_id: str,
+    request: FeedbackRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    identity = resolve_authenticated_identity(settings, authorization or "", None)
+    persisted = feedback_service.apply_feedback(
+        answer_id,
+        request.adopted,
+        request.liked,
+        request.disliked,
+        identity=identity,
+    )
     return {"success": True, "persisted": persisted}
 
 
 @router.post("/api/merchant-preferences/metric-definition")
-def record_metric_definition_preference(request: MetricDefinitionPreferenceRequest) -> Dict[str, Any]:
+def record_metric_definition_preference(
+    request: MetricDefinitionPreferenceRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     target = require_merchant_access(request.merchant_id or settings.merchant_id)
+    require_memory_write_identity(target, authorization)
     return memory_management_service.record_metric_definition_preference(target, request)
 
 
@@ -581,8 +609,13 @@ def merchant_public_knowledge_action_result(result: Dict[str, Any], requested_ac
 
 
 @router.post("/api/merchant/knowledge-suggestions/{item_id}/action")
-def merchant_knowledge_suggestion_action(item_id: str, request: KnowledgeSuggestionActionRequest) -> Dict[str, Any]:
+def merchant_knowledge_suggestion_action(
+    item_id: str,
+    request: KnowledgeSuggestionActionRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     target = require_merchant_access(request.merchant_id or settings.merchant_id)
+    require_memory_write_identity(target, authorization)
     result = memory_governance_service.apply_merchant_action(
         target,
         item_id,

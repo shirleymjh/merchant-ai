@@ -196,6 +196,7 @@ class AgentState(TypedDict, total=False):
     memory_ingestion_trace: Dict[str, Any]
     memory_constraints: List[Dict[str, Any]]
     memory_constraint_trace: Dict[str, Any]
+    memory_recalled: bool
     merchant_profile_summary: Dict[str, Any]
     open_diagnostic_scope: str
     open_diagnostic_intent: str
@@ -216,6 +217,9 @@ class AgentState(TypedDict, total=False):
 
     answer: str
     analysis_summary: str
+    analysis_worker_trace: Dict[str, Any]
+    analysis_worker_completed: bool
+    analysis_worker_status: Dict[str, Any]
     analysis_skill_trace: Dict[str, Any]
     subagent_delegation_plan: Dict[str, Any]
     subagent_delegation_results: List[Dict[str, Any]]
@@ -225,6 +229,7 @@ class AgentState(TypedDict, total=False):
     confirmation_token: str
     confirmation_source_run_id: str
     analysis_skill_bypassed: bool
+    skill_worker_completed: bool
     analysis_skill_status: Dict[str, Any]
     skill_match: SkillMatchState
     skill_draft: SkillDraft
@@ -237,8 +242,13 @@ class AgentState(TypedDict, total=False):
 
     react_round: int
     query_graph_retrieve_count: int
+    query_graph_supplemental_retrieve_count: int
     query_graph_plan_attempts: int
     query_graph_repair_attempts: int
+    execution_generation: int
+    result_generation: int
+    evidence_generation: int
+    analysis_generation: int
     planning_assets_compacted: bool
     fast_understood: bool
     skills_loaded: bool

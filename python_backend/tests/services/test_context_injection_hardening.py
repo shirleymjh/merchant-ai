@@ -23,9 +23,13 @@ from merchant_ai.services.context_assembly import ThreadContextService
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory import (
     MemoryQueryUnderstandingService,
+    StructuredMemoryStore,
+    memory_event_from_state,
     memory_query_hash,
+    memory_visible_to_context,
     rank_memory_candidates,
     retrieval_context_from_state,
+    upsert_habit_preferences,
 )
 from merchant_ai.services.middleware import MemoryMiddleware, SummarizeMiddleware, estimate_context_tokens
 from merchant_ai.services.planning import QueryGraphPlanner
@@ -49,6 +53,163 @@ def test_kimi_code_client_uses_supported_temperature():
 
     assert kimi._temperature() == 1.0
     assert default._temperature() == 0.0
+
+
+def test_runtime_memory_event_is_principal_scoped():
+    event = memory_event_from_state(
+        {
+            "question": "最近7天退款率",
+            "requested_merchant_id": "100",
+            "user_identity": {
+                "userId": "u1",
+                "storeIds": ["S1"],
+                "permissions": ["memory.read"],
+            },
+            "plan": None,
+            "answer": "退款率为 1%",
+        }
+    )
+
+    assert event["scope"]["merchantId"] == "100"
+    assert event["scope"]["userId"] == "u1"
+    assert event["scope"]["storeIds"] == ["S1"]
+    assert event["scope"]["permissions"] == ["memory.read"]
+
+
+def test_record_usage_merges_into_latest_file_memory(tmp_path):
+    settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "memory_backend": "file"})
+    store = StructuredMemoryStore(settings)
+    initial = store.empty_memory("100")
+    initial["events"] = [
+        {
+            "eventId": "m1",
+            "memoryType": "query_event",
+            "question": "退款率",
+            "confidence": 0.9,
+            "scope": {"merchantId": "100"},
+        }
+    ]
+    store.save("100", initial)
+    latest = store.load("100")
+    latest["events"].append(
+        {
+            "eventId": "m2",
+            "memoryType": "query_event",
+            "question": "订单量",
+            "confidence": 0.9,
+            "scope": {"merchantId": "100"},
+        }
+    )
+    store.save("100", latest)
+
+    store.record_usage("100", ["m1"])
+
+    saved = store.load("100")
+    assert [item["eventId"] for item in saved["events"]] == ["m1", "m2"]
+    assert saved["events"][0]["hitCount"] == 1
+    assert not list((tmp_path / "memory").glob("*.tmp"))
+
+
+def test_memory_aggregates_and_candidate_trace_are_principal_scoped():
+    context = {
+        "merchantId": "100",
+        "accessRole": "merchant_analyst",
+        "userId": "u2",
+        "storeIds": ["S2"],
+        "permissions": ["memory.read"],
+        "question": "退款率",
+        "terms": {"退款率"},
+        "topics": {"售后"},
+        "metrics": {"退款率"},
+        "timeWindows": set(),
+        "analysisIntent": "",
+    }
+    memory = {
+        "merchantId": "100",
+        "events": [
+            {
+                "eventId": "secret_pending_u1",
+                "memoryType": "query_event",
+                "question": "退款率机密异常",
+                "topics": ["机密门店"],
+                "metrics": ["退款率"],
+                "confidence": 0.9,
+                "status": "pending_review",
+                "scope": {"merchantId": "100", "userId": "u1", "storeIds": ["S1"]},
+                "allowedRoles": ["merchant_analyst"],
+            },
+            {
+                "eventId": "visible_u2",
+                "memoryType": "query_event",
+                "question": "退款率趋势",
+                "topics": ["售后"],
+                "metrics": ["退款率"],
+                "confidence": 0.9,
+                "status": "active",
+                "scope": {"merchantId": "100", "userId": "u2", "storeIds": ["S2"]},
+                "allowedRoles": ["merchant_analyst"],
+            },
+        ],
+        "preferences": [
+            {
+                "preferenceId": "secret_core_u1",
+                "memoryType": "business_focus",
+                "memoryTier": "core",
+                "key": "topic:机密门店",
+                "value": "机密门店",
+                "topics": ["机密门店"],
+                "confidence": 0.9,
+                "status": "active",
+                "scope": {"merchantId": "100", "userId": "u1", "storeIds": ["S1"]},
+                "allowedRoles": ["merchant_analyst"],
+            },
+            {
+                "preferenceId": "visible_core_u2",
+                "memoryType": "business_focus",
+                "memoryTier": "core",
+                "key": "topic:售后",
+                "value": "售后",
+                "topics": ["售后"],
+                "confidence": 0.9,
+                "status": "active",
+                "scope": {"merchantId": "100", "userId": "u2", "storeIds": ["S2"]},
+                "allowedRoles": ["merchant_analyst"],
+            },
+        ],
+        "facts": [],
+    }
+
+    candidates, filtered = rank_memory_candidates(memory, context)
+    visible = memory_visible_to_context(memory, context)
+    serialized = json.dumps(visible, ensure_ascii=False)
+
+    assert filtered["principal_scope_filtered"] == 2
+    assert "secret_pending_u1" not in {candidate.memory_id for candidate in candidates}
+    assert "secret_core_u1" not in {candidate.memory_id for candidate in candidates}
+    assert "机密门店" not in serialized
+    assert "售后" in visible["recentFocus"]["summary"]
+    assert visible["coreMemoryProfile"]["corePreferences"][0]["id"] == "visible_core_u2"
+
+
+def test_habit_preferences_do_not_merge_across_principals():
+    memory = {"preferences": []}
+    base_event = {
+        "eventId": "e1",
+        "memoryType": "query_event",
+        "topics": ["售后"],
+        "metrics": ["退款率"],
+        "timeWindows": [7],
+        "confidence": 0.8,
+        "status": "active",
+        "scope": {"merchantId": "100", "storeIds": ["S1"], "permissions": ["memory.read"]},
+    }
+
+    upsert_habit_preferences(memory, {**base_event, "scope": {**base_event["scope"], "userId": "u1"}})
+    upsert_habit_preferences(memory, {**base_event, "eventId": "e2", "scope": {**base_event["scope"], "userId": "u2"}})
+
+    assert len(memory["preferences"]) == 6
+    assert len({item["preferenceId"] for item in memory["preferences"]}) == 6
+    assert {item["scope"]["userId"] for item in memory["preferences"]} == {"u1", "u2"}
 
 
 def test_public_history_rejects_runtime_owned_roles_and_removes_current_question():
@@ -246,6 +407,8 @@ def test_memory_middleware_renders_success_and_retries_failed_snapshot():
         "requested_merchant_id": "100",
         "access_role": "merchant_analyst",
         "question": "最近7天订单量",
+        "topic_routed": True,
+        "memory_recalled": True,
         "memory_injection": {},
         "memory_injection_trace": {"status": "failed", "error": "temporary"},
         "memory_constraints": [],
@@ -281,6 +444,7 @@ def test_memory_snapshot_refreshes_once_after_topic_routing():
         "access_role": "merchant_analyst",
         "question": "最近7天订单量",
         "topic_routed": True,
+        "memory_recalled": True,
         "memory_injection": {"memoryInjectionTrace": {"selectedIds": ["bootstrap"]}},
         "memory_injection_trace": {
             "status": "success",
@@ -298,6 +462,37 @@ def test_memory_snapshot_refreshes_once_after_topic_routing():
     assert store.calls == 1
     assert state["_memory_snapshot_locked"] is True
     assert state["memory_injection_trace"]["selectedIds"] == ["m1"]
+
+
+def test_memory_middleware_reuses_locked_snapshot_without_query_understanding():
+    middleware = MemoryMiddleware(get_settings())
+
+    def fail_profile(_state):
+        raise AssertionError("locked memory snapshot should not recompute query understanding")
+
+    middleware.query_understanding.ensure_state_profile = fail_profile
+    state = {
+        "requested_merchant_id": "100",
+        "access_role": "merchant_analyst",
+        "question": "最近7天订单量",
+        "topic_routed": True,
+        "memory_recalled": True,
+        "_memory_snapshot_locked": True,
+        "memory_injection": {},
+        "memory_injection_trace": {
+            "status": "success",
+            "selectedIds": ["mem_locked"],
+            "contextFingerprint": "locked_fingerprint",
+        },
+        "memory_constraints": [],
+        "memory_context": "locked context",
+        "middleware_events": [],
+    }
+
+    result = middleware.before_policy(state)
+
+    assert result["memory_context"] == "locked context"
+    assert result["middleware_events"][-1].code == "MEMORY_REQUEST_SNAPSHOT_LOCKED"
 
 
 def test_memory_cache_key_matches_every_rank_input():
@@ -437,6 +632,26 @@ def test_memory_query_understanding_falls_back_to_rules_when_small_model_unavail
 
     assert profile["status"] == "unavailable"
     assert {"商品", "退款", "退货", "排行", "风险"} <= set(profile["expandedTerms"])
+
+
+def test_memory_query_understanding_preserves_provider_failure_reason():
+    class FailedLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 2 seconds"
+
+        def json_chat(self, *_args, **_kwargs):
+            return {}
+
+    service = MemoryQueryUnderstandingService(
+        get_settings().model_copy(update={"memory_query_understanding_enabled": True}),
+        llm=FailedLlm(),
+    )
+
+    profile = service.ensure_state_profile({"question": "这阵子哪个品退得最凶"})
+
+    assert profile["status"] == "failed"
+    assert profile["fallbackReason"] == "provider_error"
+    assert "timeout" in profile["error"]
 
 
 def test_structured_memory_context_still_uses_text_terms_for_ranking():

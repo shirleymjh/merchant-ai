@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
 import os
 import re
-import hashlib
 import threading
 import time
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -82,6 +84,11 @@ class MemoryStore:
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def record_usage(self, merchant_id: str, memory_ids: Iterable[str]) -> None:
+        """Record recall usage without rewriting a stale full-memory snapshot."""
+
+        return None
 
 
 class MemoryWriteGate:
@@ -443,13 +450,13 @@ class MemoryRetrievalService:
             return self._select_enterprise(store, merchant_id, context, budget)
         memory = store.load(merchant_id)
         candidates, filtered_reasons = rank_memory_candidates(memory, context)
-        selected, trace = allocate_injection(memory, candidates, filtered_reasons, merchant_id, budget, str(store.memory_path(merchant_id)))
+        visible_memory = memory_visible_to_context(memory, context)
+        selected, trace = allocate_injection(visible_memory, candidates, filtered_reasons, merchant_id, budget, str(store.memory_path(merchant_id)))
         selected["source"] = str(store.memory_path(merchant_id))
         selected["updatedAt"] = memory.get("updatedAt", "")
         selected["memoryInjectionTrace"] = trace.model_dump(by_alias=True)
         if trace.selected_ids:
-            record_memory_usage(memory, trace.selected_ids)
-            store.save(merchant_id, memory)
+            store.record_usage(merchant_id, trace.selected_ids)
         return selected
 
     def _select_enterprise(self, store: "EnterpriseMemoryStore", merchant_id: str, context: Dict[str, Any], budget: int) -> Dict[str, Any]:
@@ -458,8 +465,9 @@ class MemoryRetrievalService:
         cached = store.hot_cache.get_json(injection_key)
         if isinstance(cached, dict):
             cached = dict(cached)
-            for memory_id in memory_ids_from_selected(cached):
-                store.hot_cache.increment_hit_delta(memory_id, merchant_id)
+            selected_ids = memory_ids_from_selected(cached)
+            if selected_ids:
+                store.record_usage(merchant_id, selected_ids)
             trace = dict(cached.get("memoryInjectionTrace") or {})
             trace["cacheHit"] = True
             trace["cacheKey"] = injection_key
@@ -476,6 +484,7 @@ class MemoryRetrievalService:
             if vector_loaded_count:
                 memory = merge_memory_payload(memory, vector_memory)
         candidates, filtered_reasons = rank_memory_candidates(memory, context)
+        visible_memory = memory_visible_to_context(memory, context)
         if vector_ids:
             candidates = boost_vector_candidates(candidates, vector_ids)
             filtered_reasons["vector_candidates"] = len(vector_ids)
@@ -490,7 +499,7 @@ class MemoryRetrievalService:
                 },
             )
         source = memory_source_label(memory, self.settings)
-        selected, trace = allocate_injection(memory, candidates, filtered_reasons, merchant_id, budget, source)
+        selected, trace = allocate_injection(visible_memory, candidates, filtered_reasons, merchant_id, budget, source)
         selected["source"] = source
         selected["updatedAt"] = memory.get("updatedAt", "")
         trace_payload = trace.model_dump(by_alias=True)
@@ -501,10 +510,7 @@ class MemoryRetrievalService:
         trace_payload["vectorLoadedCount"] = vector_loaded_count
         selected["memoryInjectionTrace"] = trace_payload
         if trace.selected_ids:
-            for memory_id in trace.selected_ids:
-                store.hot_cache.increment_hit_delta(memory_id, merchant_id)
-            record_memory_usage(memory, trace.selected_ids)
-            store.save(merchant_id, memory)
+            store.record_usage(merchant_id, trace.selected_ids)
         store.hot_cache.set_json(injection_key, selected)
         return selected
 
@@ -517,30 +523,89 @@ class StructuredMemoryStore(MemoryStore):
         self.ingestion_service = MemoryIngestionService(settings)
         self.retrieval_service = MemoryRetrievalService(settings)
         self._update_lock = threading.RLock()
+        self._file_lock_state = threading.local()
+        self._local_file_transactions = True
 
     def memory_path(self, merchant_id: str) -> Path:
         safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", merchant_id or self.settings.merchant_id or "default")
         return self.settings.resolved_workspace_path / "memory" / ("%s.memory.json" % safe_id)
 
     def load(self, merchant_id: str) -> Dict[str, Any]:
-        path = self.memory_path(merchant_id)
+        with self._update_lock, self._merchant_file_lock(merchant_id, exclusive=False):
+            return self._load_unlocked(merchant_id)
+
+    def save(self, merchant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._update_lock, self._merchant_file_lock(merchant_id, exclusive=True):
+            return self._save_unlocked(merchant_id, payload)
+
+    def record_usage(self, merchant_id: str, memory_ids: Iterable[str]) -> None:
+        selected_ids = unique_strings(memory_ids)
+        if not selected_ids:
+            return
+        with self._update_lock, self._merchant_file_lock(merchant_id, exclusive=True):
+            latest = self._load_unlocked(merchant_id)
+            record_memory_usage(latest, selected_ids)
+            self._save_unlocked(merchant_id, latest)
+
+    @contextmanager
+    def _merchant_file_lock(self, merchant_id: str, exclusive: bool):
+        if not self._local_file_transactions:
+            yield
+            return
+        target = merchant_id or self.settings.merchant_id
+        lock_path = self.memory_path(target).with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        held = getattr(self._file_lock_state, "held", set())
+        lock_key = str(lock_path)
+        if lock_key in held:
+            yield
+            return
+        handle = lock_path.open("a+", encoding="utf-8")
+        held.add(lock_key)
+        self._file_lock_state.held = held
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+            held.discard(lock_key)
+
+    def _load_unlocked(self, merchant_id: str) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        path = self.memory_path(target)
         try:
             if path.exists():
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(payload, dict):
-                    return normalize_memory(payload, merchant_id or self.settings.merchant_id)
-        except Exception:
-            return self.empty_memory(merchant_id)
-        return self.empty_memory(merchant_id)
+                    normalized = normalize_memory(payload, target)
+                    if str(normalized.get("merchantId") or "") != str(target):
+                        raise ValueError("memory file merchant scope mismatch")
+                    return normalized
+        except FileNotFoundError:
+            pass
+        return self.empty_memory(target)
 
-    def save(self, merchant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        payload = normalize_memory(payload, merchant_id or self.settings.merchant_id)
-        payload["updatedAt"] = datetime.now().isoformat()
-        payload["merchantId"] = merchant_id or self.settings.merchant_id
-        path = self.memory_path(merchant_id)
+    def _save_unlocked(self, merchant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        target = merchant_id or self.settings.merchant_id
+        existing_scope = str((payload or {}).get("merchantId") or target)
+        if existing_scope != str(target):
+            raise ValueError("memory payload merchant scope mismatch")
+        normalized = normalize_memory(payload, target)
+        normalized["updatedAt"] = datetime.now().isoformat()
+        normalized["merchantId"] = target
+        path = self.memory_path(target)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
-        return payload
+        temp_path = path.with_name(".%s.%s.%s.tmp" % (path.name, os.getpid(), threading.get_ident()))
+        try:
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(normalized, handle, ensure_ascii=False, default=str, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return normalized
 
     def select_for_question(self, state: AgentState, budget_tokens: int = 0, budget_chars: int = 0) -> Dict[str, Any]:
         return self.retrieval_service.select_from_store(self, state, budget_tokens=budget_tokens, budget_chars=budget_chars)
@@ -581,11 +646,14 @@ class StructuredMemoryStore(MemoryStore):
         state: AgentState,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        with self._update_lock:
+        merchant_id = merchant_id_from_state(state, self.settings)
+        with self._update_lock, self._merchant_file_lock(merchant_id, exclusive=True):
             return self.ingestion_service.update_store(self, state, cancel_check=cancel_check)
 
     def update_from_feedback(self, pending: Optional[PendingAnswer], adopted: Any = None, liked: Any = None, disliked: Any = None) -> Dict[str, Any]:
-        return self.ingestion_service.update_feedback(self, pending, adopted=adopted, liked=liked, disliked=disliked)
+        merchant_id = str(getattr(pending, "merchant_id", "") or self.settings.merchant_id)
+        with self._update_lock, self._merchant_file_lock(merchant_id, exclusive=True):
+            return self.ingestion_service.update_feedback(self, pending, adopted=adopted, liked=liked, disliked=disliked)
 
     def empty_memory(self, merchant_id: str) -> Dict[str, Any]:
         return {
@@ -651,15 +719,22 @@ class EnterpriseMemoryStore(StructuredMemoryStore):
         fallback_store: Optional[StructuredMemoryStore] = None,
     ):
         super().__init__(settings)
+        self._local_file_transactions = False
         self.repository = repository or MemoryEsRepository(settings)
         self.hot_cache = hot_cache or MemoryHotCache(settings)
         self.vector_index = vector_index or MemoryVectorIndex(settings)
         self.fallback_store = fallback_store or StructuredMemoryStore(settings)
 
     def load(self, merchant_id: str) -> Dict[str, Any]:
+        with self._update_lock:
+            return self._load_enterprise(merchant_id)
+
+    def _load_enterprise(self, merchant_id: str) -> Dict[str, Any]:
         target = merchant_id or self.settings.merchant_id
         try:
             payload = self.repository.load_memory(target)
+            if str((payload or {}).get("merchantId") or target) != str(target):
+                raise ValueError("enterprise memory merchant scope mismatch")
             payload = normalize_memory(payload, target)
             payload["storageBackend"] = "es"
             return payload
@@ -675,7 +750,13 @@ class EnterpriseMemoryStore(StructuredMemoryStore):
             return payload
 
     def save(self, merchant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._update_lock:
+            return self._save_enterprise(merchant_id, payload)
+
+    def _save_enterprise(self, merchant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         target = merchant_id or self.settings.merchant_id
+        if str((payload or {}).get("merchantId") or target) != str(target):
+            raise ValueError("enterprise memory payload merchant scope mismatch")
         payload = normalize_memory(payload, target)
         payload["updatedAt"] = datetime.now().isoformat()
         try:
@@ -698,6 +779,29 @@ class EnterpriseMemoryStore(StructuredMemoryStore):
     def select_for_question(self, state: AgentState, budget_tokens: int = 0, budget_chars: int = 0) -> Dict[str, Any]:
         return self.retrieval_service.select_from_store(self, state, budget_tokens=budget_tokens, budget_chars=budget_chars)
 
+    def record_usage(self, merchant_id: str, memory_ids: Iterable[str]) -> None:
+        target = merchant_id or self.settings.merchant_id
+        selected_ids = unique_strings(memory_ids)
+        if not selected_ids:
+            return
+        deltas = {
+            memory_id: {
+                "merchantId": target,
+                "memoryId": memory_id,
+                "hitCount": 1,
+                "lastUsedAt": datetime.now().isoformat(),
+                "decayScore": 1.0,
+            }
+            for memory_id in selected_ids
+        }
+        try:
+            self.repository.apply_hit_deltas(deltas)
+        except Exception:
+            if self._fallback_enabled():
+                self.fallback_store.record_usage(target, selected_ids)
+                return
+            raise
+
     def flush_hit_deltas(self) -> Dict[str, Any]:
         deltas = self.hot_cache.drain_hit_deltas()
         if not deltas:
@@ -706,6 +810,9 @@ class EnterpriseMemoryStore(StructuredMemoryStore):
             flushed = self.repository.apply_hit_deltas(deltas)
             return {"flushed": flushed}
         except Exception as exc:
+            restore = getattr(self.hot_cache, "restore_hit_deltas", None)
+            if callable(restore):
+                restore(deltas)
             return {"flushed": 0, "error": str(exc)[:240]}
 
     def _vector_candidate_ids(self, merchant_id: str, context: Dict[str, Any]) -> List[str]:
@@ -900,8 +1007,8 @@ class MemoryEsRepository:
         self._ensure_ready()
         lines: List[str] = []
         updated = 0
-        for memory_id, delta in (deltas or {}).items():
-            memory_id = str(memory_id or "")
+        for delta_key, delta in (deltas or {}).items():
+            memory_id = str((delta or {}).get("memoryId") or delta_key or "")
             if not memory_id:
                 continue
             hits = max(1, int((delta or {}).get("hitCount") or 1))
@@ -918,16 +1025,25 @@ class MemoryEsRepository:
                 doc_id = str(hit.get("_id") or source.get("doc_id") or "")
                 if not doc_id:
                     continue
-                current_hit_count = int(source.get("hit_count") or 0)
+                updated_at = datetime.now().isoformat()
                 lines.append(json.dumps({"update": {"_index": self.index_name(), "_id": doc_id}}, ensure_ascii=False))
                 lines.append(
                     json.dumps(
                         {
-                            "doc": {
-                                "hit_count": current_hit_count + hits,
-                                "last_used_at": str((delta or {}).get("lastUsedAt") or datetime.now().isoformat()),
-                                "decay_score": float((delta or {}).get("decayScore") or 1.0),
-                                "updated_at": datetime.now().isoformat(),
+                            "script": {
+                                "lang": "painless",
+                                "source": (
+                                    "ctx._source.hit_count = (ctx._source.hit_count == null ? 0 : ctx._source.hit_count) + params.hits; "
+                                    "ctx._source.last_used_at = params.last_used_at; "
+                                    "ctx._source.decay_score = params.decay_score; "
+                                    "ctx._source.updated_at = params.updated_at"
+                                ),
+                                "params": {
+                                    "hits": hits,
+                                    "last_used_at": str((delta or {}).get("lastUsedAt") or updated_at),
+                                    "decay_score": float((delta or {}).get("decayScore") or 1.0),
+                                    "updated_at": updated_at,
+                                },
                             }
                         },
                         ensure_ascii=False,
@@ -1973,7 +2089,7 @@ class MemoryHotCache:
     def increment_hit_delta(self, memory_id: str, merchant_id: str = "") -> None:
         if not self.enabled or not memory_id:
             return
-        key = "memory_hit_delta:%s" % memory_id
+        key = "memory_hit_delta:%s:%s" % (str(merchant_id or "unknown"), memory_id)
         current = self.cache.get(key) or {}
         current["memoryId"] = memory_id
         if merchant_id:
@@ -1990,9 +2106,20 @@ class MemoryHotCache:
         for key, value in memory_cache_items(self.cache).items():
             if not key.startswith("memory_hit_delta:") or not isinstance(value, dict):
                 continue
-            memory_id = str(value.get("memoryId") or key.removeprefix("memory_hit_delta:"))
-            deltas[memory_id] = value
+            memory_id = str(value.get("memoryId") or key.rsplit(":", 1)[-1])
+            merchant_id = str(value.get("merchantId") or "unknown")
+            deltas["%s:%s" % (merchant_id, memory_id)] = value
+        if deltas:
+            self.cache.clear()
         return deltas
+
+    def restore_hit_deltas(self, deltas: Dict[str, Dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
+        for delta_key, value in (deltas or {}).items():
+            memory_id = str((value or {}).get("memoryId") or delta_key.rsplit(":", 1)[-1])
+            merchant_id = str((value or {}).get("merchantId") or "unknown")
+            self.cache.set("memory_hit_delta:%s:%s" % (merchant_id, memory_id), dict(value or {}))
 
     def backend_name(self) -> str:
         try:
@@ -3117,6 +3244,33 @@ def memory_scope_from_terms(merchant_id: str, topics: Iterable[Any], metrics: It
     return scope
 
 
+def memory_scope_from_state(
+    state: AgentState,
+    merchant_id: str,
+    topics: Iterable[Any],
+    metrics: Iterable[Any],
+    principal_scoped: bool = False,
+) -> Dict[str, Any]:
+    scope = memory_scope_from_terms(merchant_id, topics, metrics)
+    if not principal_scoped:
+        return scope
+    identity = state.get("user_identity") or {}
+    if hasattr(identity, "model_dump"):
+        identity = identity.model_dump(by_alias=True)
+    if not isinstance(identity, dict):
+        identity = {}
+    user_id = str(identity.get("userId") or identity.get("user_id") or "").strip()
+    if user_id:
+        scope["userId"] = user_id
+    store_ids = unique_strings(identity.get("storeIds") or identity.get("store_ids") or [])
+    if store_ids:
+        scope["storeIds"] = store_ids
+    permissions = unique_strings(identity.get("permissions") or [])
+    if permissions:
+        scope["permissions"] = permissions
+    return scope
+
+
 def default_memory_status(memory_type: str, source: str = "") -> str:
     normalized = str(memory_type or "")
     if normalized == "metric_dispute":
@@ -3237,7 +3391,15 @@ def default_memory_allowed_roles(memory_type: str) -> List[str]:
     normalized = str(memory_type or "")
     if normalized in {"past_case", "procedure"}:
         return ["merchant_admin", "merchant_analyst", "system"]
-    return ["merchant_admin", "merchant_analyst"]
+    return [
+        "merchant_admin",
+        "merchant_analyst",
+        "merchant_finance",
+        "merchant_service",
+        "merchant_goods",
+        "merchant_fulfillment",
+        "system",
+    ]
 
 
 def build_core_memory_profile(memory: Dict[str, Any]) -> Dict[str, Any]:
@@ -3639,6 +3801,16 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
         memory_type = "correction"
     else:
         memory_type = "business_focus" if analysis_intent_from_plan(plan) not in {"", "none"} else "query_event"
+    principal_scoped = memory_type in {
+        "query_event",
+        "business_focus",
+        "negative_feedback",
+        "feedback",
+        "user_preference",
+        "preference",
+        "metric_habit",
+        "time_window_habit",
+    }
     feedback_signal = "persisted" if state.get("persisted") else ""
     event = MemoryEvent(
         event_id="mem_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
@@ -3656,7 +3828,13 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
         correction_text=correction_text,
         confidence=default_confidence(memory_type, feedback_signal),
         source="answer_run",
-        scope=memory_scope_from_terms(str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""), topics, metrics),
+        scope=memory_scope_from_state(
+            state,
+            str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""),
+            topics,
+            metrics,
+            principal_scoped=principal_scoped,
+        ),
         status=default_memory_status(memory_type, source="answer_run"),
         retention_days=default_retention_days(memory_type),
         visibility=default_memory_visibility(memory_type),
@@ -3690,7 +3868,16 @@ def memory_event_from_feedback(pending: PendingAnswer, adopted: Any = None, like
         feedback_signal=signal,
         confidence=default_confidence(memory_type, signal),
         source="feedback",
-        scope=memory_scope_from_terms(pending.merchant_id, unique_strings([pending.category_name]), extract_metric_like_terms(pending.question)),
+        scope={
+            **memory_scope_from_terms(
+                pending.merchant_id,
+                unique_strings([pending.category_name]),
+                extract_metric_like_terms(pending.question),
+            ),
+            **({"userId": pending.user_id} if pending.user_id else {}),
+            **({"storeIds": unique_strings(pending.store_ids)} if pending.store_ids else {}),
+            **({"permissions": unique_strings(pending.permissions)} if pending.permissions else {}),
+        },
         status=default_memory_status(memory_type, source="feedback"),
         retention_days=default_retention_days(memory_type),
         visibility=default_memory_visibility(memory_type),
@@ -4652,7 +4839,14 @@ class MemoryQueryUnderstandingService:
             return fallback
         profile = normalize_memory_query_profile(result)
         if not has_memory_query_profile_signal(profile):
-            fallback["status"] = "empty_model_profile"
+            provider_error = str(getattr(self.llm, "last_error", "") or "")
+            if provider_error:
+                fallback["status"] = "failed"
+                fallback["fallbackReason"] = "provider_error"
+                fallback["error"] = provider_error[:240]
+            else:
+                fallback["status"] = "empty_model_profile"
+                fallback["fallbackReason"] = "empty_model_profile"
             return fallback
         merged = merge_memory_recall_profiles(fallback, profile)
         merged.update({"source": "small_model", "status": "success", "question": question, "cacheHit": False})
@@ -4780,6 +4974,7 @@ def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
     query_variants = unique_strings(merged_profile.get("queryVariants") or [])
     analysis_intents = unique_strings([*memory_analysis_intent_hints(question, analysis_intent), *(merged_profile.get("analysisIntents") or [])])
     return {
+        "merchantId": str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""),
         "question": question,
         "terms": set(terms),
         "expandedTerms": set(expanded_terms),
@@ -4821,13 +5016,19 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
             if not isinstance(item, dict):
                 continue
             memory_id = str(item.get(memory_id_key) or "")
+            permitted = memory_visible_to_role(item, str(context.get("accessRole") or "merchant_analyst"))
+            principal_permitted = memory_visible_to_principal(item, context)
+            # Authorization is a hard boundary, not a ranking/filtering hint. Do
+            # not retain unauthorized IDs or payloads in candidates because the
+            # candidate list is also emitted in the retrieval trace.
+            if not permitted or not principal_permitted:
+                filtered_reasons["role_filtered" if not permitted else "principal_scope_filtered"] += 1
+                continue
             expired = is_memory_expired(item)
             invalid = float(item.get("confidence") or 0) <= 0.05
             pending = memory_is_pending(item)
             inactive = memory_is_inactive(item)
-            permitted = memory_visible_to_role(item, str(context.get("accessRole") or "merchant_analyst"))
-            principal_permitted = memory_visible_to_principal(item, context)
-            if expired or invalid or pending or inactive or not permitted or not principal_permitted:
+            if expired or invalid or pending or inactive:
                 reason = (
                     "expired"
                     if expired
@@ -4837,15 +5038,7 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
                         else (
                             "pending_governance"
                             if pending
-                            else (
-                                "deleted"
-                                if memory_status(item) == "deleted"
-                                else (
-                                    "inactive"
-                                    if inactive
-                                    else ("role_filtered" if not permitted else "principal_scope_filtered")
-                                )
-                            )
+                            else ("deleted" if memory_status(item) == "deleted" else "inactive")
                         )
                     )
                 )
@@ -5232,9 +5425,10 @@ def record_memory_usage(memory: Dict[str, Any], selected_ids: List[str]) -> None
 def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> int:
     preferences = [item for item in memory.get("preferences", []) if isinstance(item, dict)]
     updates = 0
+    scope_suffix = memory_principal_scope_suffix(event)
     for topic in unique_strings(event.get("topics") or []):
         pref = MemoryPreference(
-            preference_id="pref_topic_%s" % stable_slug(topic),
+            preference_id=scoped_memory_id("pref_topic_%s" % stable_slug(topic), scope_suffix),
             memory_type="business_focus",
             memory_tier=habit_memory_tier_for_event(event, 1),
             memory_class=default_memory_class("business_focus"),
@@ -5258,7 +5452,7 @@ def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> i
         updates += int(did_update)
     for metric in unique_strings(event.get("metrics") or []):
         pref = MemoryPreference(
-            preference_id="pref_metric_%s" % stable_slug(metric),
+            preference_id=scoped_memory_id("pref_metric_%s" % stable_slug(metric), scope_suffix),
             memory_type="metric_habit",
             memory_tier=habit_memory_tier_for_event(event, 1),
             memory_class=default_memory_class("metric_habit"),
@@ -5282,7 +5476,7 @@ def upsert_habit_preferences(memory: Dict[str, Any], event: Dict[str, Any]) -> i
         updates += int(did_update)
     for days in unique_ints(event.get("timeWindows") or []):
         pref = MemoryPreference(
-            preference_id="pref_window_%s" % days,
+            preference_id=scoped_memory_id("pref_window_%s" % days, scope_suffix),
             memory_type="time_window_habit",
             memory_tier=habit_memory_tier_for_event(event, 1),
             memory_class=default_memory_class("time_window_habit"),
@@ -5328,7 +5522,9 @@ def event_promotes_habit_to_core(event: Dict[str, Any]) -> bool:
 def upsert_preference(items: List[Dict[str, Any]], preference: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
     now = datetime.now().isoformat()
     for item in items:
-        if item.get("preferenceId") == preference.get("preferenceId") or item.get("key") == preference.get("key"):
+        same_identity_scope = memory_principal_scope_key(item) == memory_principal_scope_key(preference)
+        same_preference = item.get("preferenceId") == preference.get("preferenceId") or item.get("key") == preference.get("key")
+        if same_identity_scope and same_preference:
             item["confidence"] = round(max(float(item.get("confidence") or 0), float(preference.get("confidence") or 0)), 4)
             item["topics"] = unique_strings(list(item.get("topics") or []) + list(preference.get("topics") or []))
             item["metrics"] = unique_strings(list(item.get("metrics") or []) + list(preference.get("metrics") or []))
@@ -5342,6 +5538,35 @@ def upsert_preference(items: List[Dict[str, Any]], preference: Dict[str, Any]) -
             return items, True
     items.append(preference)
     return items, True
+
+
+def memory_principal_scope_key(item: Dict[str, Any]) -> str:
+    scope = memory_scope_payload(item)
+    principal_scope = {
+        "merchantId": str(scope.get("merchantId") or scope.get("merchant_id") or "").strip(),
+        "orgId": str(scope.get("orgId") or scope.get("org_id") or "").strip(),
+        "userId": str(scope.get("userId") or scope.get("user_id") or "").strip(),
+        "storeIds": sorted(unique_strings(scope.get("storeIds") or scope.get("store_ids") or [])),
+        "permissions": sorted(unique_strings(scope.get("permissions") or [])),
+    }
+    return json.dumps(principal_scope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def memory_principal_scope_suffix(item: Dict[str, Any]) -> str:
+    scope = memory_scope_payload(item)
+    has_principal_scope = bool(
+        str(scope.get("userId") or scope.get("user_id") or "").strip()
+        or unique_strings(scope.get("storeIds") or scope.get("store_ids") or [])
+        or unique_strings(scope.get("permissions") or [])
+        or str(scope.get("orgId") or scope.get("org_id") or "").strip()
+    )
+    if not has_principal_scope:
+        return ""
+    return hashlib.sha256(memory_principal_scope_key(item).encode("utf-8")).hexdigest()[:12]
+
+
+def scoped_memory_id(base_id: str, scope_suffix: str) -> str:
+    return "%s_%s" % (base_id, scope_suffix) if scope_suffix else base_id
 
 
 def correction_fact_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -5615,16 +5840,23 @@ def is_memory_expired(item: Dict[str, Any]) -> bool:
 
 def memory_visible_to_role(item: Dict[str, Any], access_role: str) -> bool:
     visibility = str(item.get("visibility") or "merchant").strip().lower()
-    if visibility in {"public", "merchant"}:
+    if visibility == "public":
         return True
     roles = unique_strings(item.get("allowedRoles") or item.get("allowed_roles") or [])
-    if not roles:
-        return visibility != "planner_only" or str(access_role or "").strip() in {"merchant_admin", "merchant_analyst", "system"}
-    return str(access_role or "merchant_analyst") in roles
+    role = str(access_role or "merchant_analyst").strip()
+    if roles and role not in roles:
+        return False
+    if visibility == "planner_only":
+        return role in (set(roles) if roles else {"merchant_admin", "merchant_analyst", "system"})
+    return visibility in {"merchant", "role", "principal", "restricted"}
 
 
 def memory_visible_to_principal(item: Dict[str, Any], context: Dict[str, Any]) -> bool:
     scope = memory_scope_payload(item)
+    scoped_merchant = str(scope.get("merchantId") or scope.get("merchant_id") or "").strip()
+    principal_merchant = str(context.get("merchantId") or context.get("merchant_id") or "").strip()
+    if scoped_merchant and scoped_merchant != principal_merchant:
+        return False
     scoped_user = str(scope.get("userId") or scope.get("user_id") or "").strip()
     if scoped_user and scoped_user != str(context.get("userId") or "").strip():
         return False
@@ -5637,6 +5869,33 @@ def memory_visible_to_principal(item: Dict[str, Any], context: Dict[str, Any]) -
     if required_permissions and not required_permissions.issubset(principal_permissions):
         return False
     return True
+
+
+def memory_visible_to_context(memory: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the memory aggregate that the current principal may receive.
+
+    Ranking already filters individual candidates. This second boundary is
+    required because recentFocus and coreMemoryProfile are aggregate fields and
+    must never be built from another user's or store's memory.
+    """
+
+    visible = dict(memory or {})
+    access_role = str(context.get("accessRole") or "merchant_analyst")
+    for group in ["events", "preferences", "facts"]:
+        visible[group] = [
+            item
+            for item in (memory.get(group) or [])
+            if isinstance(item, dict)
+            and memory_visible_to_role(item, access_role)
+            and memory_visible_to_principal(item, context)
+            and not memory_is_pending(item)
+            and not memory_is_inactive(item)
+            and not is_memory_expired(item)
+            and float(item.get("confidence") or 0.0) > 0.05
+        ]
+    visible["recentFocus"] = aggregate_recent_focus(visible["events"], visible["preferences"])
+    visible["coreMemoryProfile"] = build_core_memory_profile(visible)
+    return visible
 
 
 def parse_datetime(value: str) -> Optional[datetime]:

@@ -28,6 +28,7 @@ from merchant_ai.services.memory import MemoryStore
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, PendingAnswerStore
 from merchant_ai.services.sandbox import MerchantAnalysisSandbox
+from merchant_ai.services.security import identity_scope_hash
 from merchant_ai.services.answer_formatting import (
     answer_numeric_value,
     extract_question_time_phrase,
@@ -225,6 +226,14 @@ class AnswerComposeService:
                 plan,
                 run_result,
             )
+        partial_blocking_answer = blocking_evidence_partial_answer(question, plan, run_result)
+        if partial_blocking_answer:
+            return self._finalize_answer(
+                self._append_rule_evidence(partial_blocking_answer, question, effective_rule_context),
+                question,
+                plan,
+                run_result,
+            )
         if question_asks_metric_reconciliation(question):
             reconciliation_answer = self._metric_reconciliation_answer(question, plan, run_result)
             if reconciliation_answer:
@@ -376,13 +385,18 @@ class AnswerComposeService:
         rule_context: str = "",
         merchant: MerchantInfo | None = None,
         personalization_context: Optional[Dict[str, Any]] = None,
+        allow_skill: bool = True,
     ) -> str:
-        self.last_analysis_skill_trace = {}
+        self.last_analysis_skill_trace = {"skillName": "", "fallbackSkill": ""}
         if not run_result or not run_result.merged_query_bundle.rows:
             return ""
-        if not analysis_summary_required(plan) and not answer_skill_required(plan, run_result, bool(rule_context)):
+        if not analysis_summary_required(plan) and not (allow_skill and answer_skill_required(plan, run_result, bool(rule_context))):
             return ""
-        skill_name = self.propose_answer_skill(question, plan, run_result, bool(rule_context))
+        skill_name = (
+            self.propose_answer_skill(question, plan, run_result, bool(rule_context))
+            if allow_skill and answer_skill_required(plan, run_result, bool(rule_context))
+            else ""
+        )
         if not skill_name and not analysis_summary_required(plan):
             return ""
         skill_answer = ""
@@ -492,13 +506,19 @@ class AnswerComposeService:
         candidates = answer_skill_headers(self.llm.settings.resources_root / "runtime" / "agent_skills")
         fallback = select_answer_skill(plan, run_result, has_rule_context)
         match_mode = str(self.llm.settings.answer_skill_match_mode or "").lower()
-        if not fallback and (match_mode == "always" or bool(getattr(self.llm.settings, "skill_confirmation_required", False))):
+        workflow_requested = reusable_analysis_workflow_requested(plan.question_understanding or {})
+        if (
+            not fallback
+            and workflow_requested
+            and (match_mode == "always" or bool(getattr(self.llm.settings, "skill_confirmation_required", False)))
+        ):
             fallback = deterministic_analysis_skill_fallback(plan, run_result, has_rule_context)
         trace: Dict[str, Any] = {
             "lifecycle": ["match", "confirm", "isolated_execute", "progress", "output"],
             "matchMode": self.llm.settings.answer_skill_match_mode,
             "candidateSkills": [item.get("name") for item in candidates],
             "fallbackSkill": fallback,
+            "skillName": fallback or "",
         }
         self.last_analysis_skill_trace = trace
         if skill_route_explicit_no_match(plan.question_understanding or {}):
@@ -511,18 +531,22 @@ class AnswerComposeService:
                     "fallbackSuppressedReason": "AUTHORITATIVE_SEMANTIC_NO_MATCH",
                 }
             )
+            self.last_analysis_skill_trace = trace
             return ""
         if not candidates or self.llm.settings.answer_skill_match_mode == "off":
             trace["matchedBy"] = "deterministic_fallback"
             trace["skillName"] = fallback
+            self.last_analysis_skill_trace = trace
             return fallback
         if fallback and (match_mode in {"deterministic_first", "header"} or (match_mode == "always" and fallback == "bi_trend_attribution")):
             trace["matchedBy"] = "deterministic_fallback_before_llm"
             trace["skillName"] = fallback
+            self.last_analysis_skill_trace = trace
             return fallback
         if not self.llm.configured:
             trace["matchedBy"] = "deterministic_fallback_no_llm"
             trace["skillName"] = fallback
+            self.last_analysis_skill_trace = trace
             return fallback
         prompt_payload = {
             "question": question,
@@ -567,6 +591,7 @@ class AnswerComposeService:
                     "fallbackSuppressedReason": "AUTHORITATIVE_LLM_NO_MATCH",
                 }
             )
+            self.last_analysis_skill_trace = trace
             return ""
         if selected and selected not in allowed:
             selected = ""
@@ -580,6 +605,7 @@ class AnswerComposeService:
         else:
             trace["matchStatus"] = "matched"
         trace["skillName"] = selected
+        self.last_analysis_skill_trace = trace
         return selected
 
     def run_analysis_skill(
@@ -1321,7 +1347,11 @@ class AnswerComposeService:
             return "这次没有拿到可靠的数据结果，暂时不能给出具体数值。可以稍后重试，或缩小时间范围后再查。"
         if not bundle.rows:
             return "当前查询范围内没有查到符合条件的数据。"
-        gap_answer = answer_coverage_partial_answer(question, plan, run_result) or gap_aware_partial_answer(question, plan, run_result)
+        gap_answer = (
+            blocking_evidence_partial_answer(question, plan, run_result)
+            or answer_coverage_partial_answer(question, plan, run_result)
+            or gap_aware_partial_answer(question, plan, run_result)
+        )
         if gap_answer:
             return gap_answer
         friendly = merchant_friendly_data_answer(question, plan, bundle, run_result)
@@ -1456,9 +1486,45 @@ def gap_aware_partial_answer(question: str, plan: QueryPlan, run_result: AgentRu
     if evidence_lines:
         lines.append("")
         lines.append("已拿到的证据：")
-        lines.extend(evidence_lines[:5])
+        lines.extend(re.sub(r"：返回\s*\d+\s*条。?$", "：已有返回结果。", item) for item in evidence_lines[:5])
     lines.append("")
     lines.append("建议先补齐缺失的退款/赔付关联证据后，再计算“发生退款或赔付的订单占比”。")
+    return "\n".join(lines)
+
+
+def blocking_evidence_partial_answer(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+    if not run_result:
+        return ""
+    verified = getattr(run_result, "verified_evidence", None)
+    blocking = list(getattr(verified, "blocking_gaps", []) or [])
+    if not blocking:
+        blocking = [
+            gap for gap in (getattr(run_result, "evidence_gaps", []) or [])
+            if str(getattr(gap, "severity", "") or "") == "blocking"
+        ]
+    if not blocking:
+        return ""
+    lines = ["这题目前不能给出完整结论。"]
+    reason = str(getattr(verified, "partial_answer_reason", "") or getattr(run_result, "partial_answer_reason", "") or "").strip()
+    if reason:
+        lines.append("主要原因：%s。" % reason.rstrip("。"))
+    else:
+        reasons = dedupe_strings(
+            [
+                str(getattr(gap, "answer_instruction", "") or getattr(gap, "reason", "") or getattr(gap, "code", "") or "").strip()
+                for gap in blocking
+                if str(getattr(gap, "answer_instruction", "") or getattr(gap, "reason", "") or getattr(gap, "code", "") or "").strip()
+            ]
+        )
+        if reasons:
+            lines.append("主要缺口：%s。" % "；".join(reasons[:3]).rstrip("。"))
+    evidence_lines = partial_evidence_summary_lines(plan, run_result)
+    if evidence_lines:
+        lines.append("")
+        lines.append("已拿到的证据：")
+        lines.extend(re.sub(r"：返回\s*\d+\s*条。?$", "：已有返回结果。", item) for item in evidence_lines[:5])
+    lines.append("")
+    lines.append("上面缺口补齐前，只能把本轮结果作为部分证据，不能当作完整业务判断。")
     return "\n".join(lines)
 
 
@@ -3923,6 +3989,8 @@ def contextual_business_suggestions(
     merchant: MerchantInfo | None = None,
     personalization_context: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
+    if run_result is not None and not answer_evidence_passed(run_result):
+        return []
     plan = QueryPlan(intents=intents or [])
     business_context = answer_business_context(question, plan, run_result, merchant, personalization_context)
     intent_signal_text = contextual_question_intent_signal_text(question, intents)
@@ -4070,22 +4138,48 @@ def build_merchant_experience_package(
     suggestions: Optional[List[str]] = None,
     personalization_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    suggestion_items = dedupe_strings([str(item) for item in (suggestions or []) if str(item).strip()])[:8]
-    anomaly_alerts = merchant_anomaly_alerts(question, plan, run_result)
+    evidence_passed = run_result is None or answer_evidence_passed(run_result)
+    suggestion_items = (
+        dedupe_strings([str(item) for item in (suggestions or []) if str(item).strip()])[:8]
+        if evidence_passed
+        else []
+    )
+    anomaly_alerts = merchant_anomaly_alerts(question, plan, run_result) if evidence_passed else []
     traceability = merchant_traceability(question, plan, run_result, merchant, sections or [])
     drill_actions = merchant_drill_down_actions(question, plan, run_result, suggestion_items)
     metric_notes = lightweight_metric_disclosures(question, plan, run_result)
     return {
         "version": "v1",
-        "businessAdvice": merchant_business_advice(question, plan, run_result, anomaly_alerts, personalization_context)[:2],
+        "businessAdvice": (
+            merchant_business_advice(question, plan, run_result, anomaly_alerts, personalization_context)[:2]
+            if evidence_passed
+            else []
+        ),
         "suggestedQuestions": suggestion_items[:6],
         "anomalyAlerts": anomaly_alerts[:4],
         "metricDisclosures": metric_notes,
+        "evidenceGaps": compact_evidence_gaps(getattr(run_result, "evidence_gaps", []) or []) if run_result else [],
         "traceability": traceability,
-        "drillDownActions": drill_actions[:5],
-        "reportSubscriptionHint": merchant_report_subscription_hint(plan, run_result),
+        "drillDownActions": drill_actions[:5] if evidence_passed else [],
+        "reportSubscriptionHint": merchant_report_subscription_hint(plan, run_result) if evidence_passed else {},
         "clarificationHints": merchant_clarification_hints(plan),
     }
+
+
+def answer_evidence_passed(run_result: AgentRunResult | None) -> bool:
+    verified = getattr(run_result, "verified_evidence", None) if run_result is not None else None
+    has_rows = bool(getattr(getattr(run_result, "merged_query_bundle", None), "rows", None)) or any(
+        getattr(getattr(result, "query_bundle", None), "rows", None) for result in getattr(run_result, "task_results", []) or []
+    )
+    if verified is not None:
+        if getattr(verified, "passed", False):
+            return True
+        if getattr(verified, "gaps", None) or getattr(verified, "blocking_gaps", None) or getattr(verified, "answer_guard_required", False):
+            return False
+        return has_rows
+    if run_result is None or getattr(run_result, "evidence_gaps", None):
+        return False
+    return has_rows
 
 
 def merchant_business_advice(
@@ -4935,7 +5029,14 @@ class FeedbackService:
         self.pending_store = pending_store
         self.memory_store = memory_store
 
-    def apply_feedback(self, answer_id: str, adopted: Any, liked: Any, disliked: Any) -> bool:
+    def apply_feedback(
+        self,
+        answer_id: str,
+        adopted: Any,
+        liked: Any,
+        disliked: Any,
+        identity: Any = None,
+    ) -> bool:
         pending = self.pending_store.get(answer_id)
         persisted = False
         if pending:
@@ -4946,12 +5047,25 @@ class FeedbackService:
                 disliked=bool(disliked) if disliked is not None else False,
             )
         self.answer_repository.update_feedback(answer_id, adopted, liked, disliked)
-        if self.memory_store is not None and pending:
-            try:
-                self.memory_store.update_from_feedback(pending, adopted=adopted, liked=liked, disliked=disliked)
-            except Exception:
-                pass
+        if self.memory_store is not None and pending and self._memory_feedback_authorized(pending, identity):
+            self.memory_store.update_from_feedback(pending, adopted=adopted, liked=liked, disliked=disliked)
         return persisted
+
+    def _memory_feedback_authorized(self, pending: Any, identity: Any) -> bool:
+        if identity is None:
+            return False
+        payload = identity.model_dump(by_alias=True) if hasattr(identity, "model_dump") else identity
+        if not isinstance(payload, dict):
+            return False
+        merchant_id = str(payload.get("merchantId") or payload.get("merchant_id") or "").strip()
+        if not merchant_id or merchant_id != str(getattr(pending, "merchant_id", "") or "").strip():
+            return False
+        expected_hash = str(getattr(pending, "identity_scope_hash", "") or "")
+        if not expected_hash or identity_scope_hash(identity, merchant_id) != expected_hash:
+            return False
+        pending_user = str(getattr(pending, "user_id", "") or "")
+        current_user = str(payload.get("userId") or payload.get("user_id") or "")
+        return bool(pending_user and current_user and current_user == pending_user)
 
 
 def joined_categories(plan: QueryPlan) -> str:

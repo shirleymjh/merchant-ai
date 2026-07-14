@@ -1286,10 +1286,15 @@ def normalize_table_usage_profile(profile: Any, table: str = "") -> Dict[str, An
     queryable = raw.get("queryableByAgent")
     if not isinstance(queryable, bool):
         queryable = default_table_queryable(table, layer)
+    topic_role = str(raw.get("topicRole") or "").upper()
+    if topic_role not in {"ANCHOR", "DETAIL", "DIMENSION", "BRIDGE", "PROFILE", "AUXILIARY", "UNKNOWN"}:
+        topic_role = "PROFILE" if "profile" in str(table or "").lower() else "UNKNOWN"
     return {
         "businessLayer": layer,
         "queryableByAgent": queryable,
         "authorityLevel": authority,
+        "topicRole": topic_role,
+        "defaultForIntents": dedupe_strings([str(item).upper() for item in raw.get("defaultForIntents") or []]),
         "supportedIntents": dedupe_strings([str(item).upper() for item in raw.get("supportedIntents") or []]),
         "supportedMetrics": dedupe_strings([str(item) for item in raw.get("supportedMetrics") or []]),
         "supportedDimensions": dedupe_strings([str(item) for item in raw.get("supportedDimensions") or []]),
@@ -1360,6 +1365,12 @@ class PlanningAssetPackBuilder:
             allow_profile=allow_profile,
             explicit_tables=set(),
         )
+        if allow_profile:
+            profile_tables = self._diagnostic_profile_seed_tables(table_topic, limit=1)
+            for table in profile_tables:
+                if table not in seed_tables:
+                    seed_tables.add(table)
+                    targeted_traces.append("open_diagnostic_profile_seed:%s" % table)
         bridge_tables, bridge_traces = self._relationship_bridge_tables(
             seed_tables,
             all_relationships,
@@ -1421,6 +1432,16 @@ class PlanningAssetPackBuilder:
         recalled_metric_evidence = recalled_metric_evidence_from_bundle(recall_bundle)
         if recalled_metric_evidence:
             pack.metric_compaction["recalledMetricEvidence"] = recalled_metric_evidence
+        if not pack.metrics and not recalled_metric_evidence and self._deferred_structured_understanding(targeted_traces):
+            metric_candidates, metric_candidate_traces = self._topic_metric_candidates_for_deferred_understanding(question, topics)
+            if metric_candidates:
+                pack.metrics.extend(metric_candidates)
+                pack.metric_compaction["deferredMetricCandidates"] = {
+                    "strategy": "topic_metric_candidates_only",
+                    "count": len(metric_candidates),
+                    "tables": sorted({item.table for item in metric_candidates if item.table}),
+                }
+                targeted_traces.extend(metric_candidate_traces)
         self._trim_metrics_for_question(pack, question)
         self._trim_terms_for_question(pack, question)
         metric_dependency_closure = self._expand_tables_for_metric_dependencies(pack, pack_tables, table_topic, question, allow_profile=allow_profile)
@@ -1482,6 +1503,67 @@ class PlanningAssetPackBuilder:
             hasher.update(table.encode("utf-8"))
             hasher.update(json.dumps(schema, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8"))
         return hasher.hexdigest()[:16] if any_schema else ""
+
+    def _deferred_structured_understanding(self, traces: List[str]) -> bool:
+        return any("targeted_seed_source=deferred_structured_understanding" in str(item) for item in traces)
+
+    def _topic_metric_candidates_for_deferred_understanding(
+        self,
+        question: str,
+        topics: List[str],
+    ) -> Tuple[List[PlanningAssetEntry], List[str]]:
+        limit = max(4, min(int(self.topic_assets.settings.agent_planner_seed_metric_limit or 8), 10))
+        per_topic_limit = max(1, min(3, limit))
+        selected: List[PlanningAssetEntry] = []
+        traces: List[str] = []
+        seen: Set[Tuple[str, str]] = set()
+        for topic in topics:
+            candidates: List[Tuple[int, PlanningAssetEntry]] = []
+            for manifest_item in self.topic_assets.load_manifest(topic):
+                table = str(manifest_item.get("tableName") or "")
+                if not table:
+                    continue
+                for metric in self.topic_assets.load_table_metrics(topic, table):
+                    key = str(metric.get("metricKey") or "")
+                    if not key:
+                        continue
+                    entry = PlanningAssetEntry(
+                        key=key,
+                        table=table,
+                        topic=topic,
+                        title=str(metric.get("businessName") or key),
+                        columns=[str(column) for column in metric.get("sourceColumns") or []],
+                        aliases=[str(alias) for alias in metric.get("aliases") or []],
+                        description=json.dumps(metric, ensure_ascii=False),
+                        source_ref_id="semantic:%s:%s:metric:%s" % (topic, table, key),
+                        metadata=metric,
+                    )
+                    score = self._metric_relevance_score(entry, question)
+                    if score <= 0:
+                        level = str(metric.get("metricLevel") or metric.get("metric_level") or "").lower()
+                        score = int(metric.get("defaultCandidateScore") or (5 if "business" in level else 1))
+                    canonical_key = str(metric.get("canonicalMetricKey") or metric.get("canonical_metric_key") or "")
+                    alias_of = str(metric.get("aliasOf") or metric.get("alias_of") or "")
+                    if canonical_key and canonical_key == key and not alias_of:
+                        score += 2
+                    if alias_of:
+                        score -= 2
+                    candidates.append((score, entry))
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            topic_added = 0
+            for score, entry in candidates:
+                identity = (entry.table, entry.key)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                selected.append(entry)
+                topic_added += 1
+                traces.append("deferred_metric_candidate:%s:%s:%s" % (entry.table, entry.key, score))
+                if topic_added >= per_topic_limit or len(selected) >= limit:
+                    break
+            if len(selected) >= limit:
+                break
+        return selected, traces
 
     def expand_for_question_understanding(self, pack: PlanningAssetPack, understanding: Dict[str, Any]) -> List[str]:
         """Load extra semantic assets only when LLM understanding cites them.
@@ -1719,6 +1801,7 @@ class PlanningAssetPackBuilder:
         explicit_tables: Set[str] | None = None,
     ) -> Tuple[Set[str], List[str]]:
         explicit_tables = explicit_tables or set()
+        precise_recalled_tables: Set[str] = set()
         recalled_tables = {
             item.table
             for item in recall_bundle.items
@@ -1736,13 +1819,60 @@ class PlanningAssetPackBuilder:
             )
         )
         for item in recall_bundle.items:
+            if not self._recall_item_has_precise_table_evidence(item):
+                continue
+            item_tables = [item.table, str((item.metadata or {}).get("tableName") or "")]
+            for table in item_tables:
+                if table and self._table_allowed_for_recalled_item(question, item, table, allow_profile=allow_profile):
+                    precise_recalled_tables.add(table)
+        for item in recall_bundle.items:
             if str(item.source_type or "").upper() != "SEMANTIC_RELATIONSHIP":
                 continue
             for table in recalled_relationship_tables(item):
                 if self._table_allowed_for_recalled_item(question, item, table, allow_profile=allow_profile):
                     recalled_tables.add(table)
+                    if self._recall_item_has_precise_table_evidence(item):
+                        precise_recalled_tables.add(table)
         candidate_tables: List[Tuple[str, str, Dict[str, Any]]] = []
-        has_precise_recall_evidence = bool(explicit_tables or recalled_tables)
+        has_precise_recall_evidence = bool(explicit_tables or precise_recalled_tables)
+        if precise_recalled_tables and not explicit_tables and not allow_profile and self._broad_topic_question(question):
+            traces = [
+                "targeted_seed_tables:",
+                "table_selection_explanations:%s"
+                % json.dumps(
+                    [
+                        {
+                            "strategy": "metric_candidates_only",
+                            "reason": "broad_topic_with_precise_metric_recall",
+                            "metricOwnerTables": sorted(precise_recalled_tables),
+                        }
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "targeted_seed_source=metric_candidates_only",
+            ]
+            return set(), traces
+        defer_topic_seed_selection = self._should_defer_topic_seed_selection(question, has_precise_recall_evidence)
+        if defer_topic_seed_selection and not allow_profile:
+            traces = [
+                "targeted_seed_tables:",
+                "table_selection_explanations:%s"
+                % json.dumps(
+                    [
+                        {
+                            "strategy": "defer_table_selection",
+                            "reason": "broad_topic_without_precise_recall",
+                            "topics": topics,
+                        }
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "targeted_seed_source=deferred_structured_understanding",
+            ]
+            return set(), traces
+        seed_source_tables = (explicit_tables | precise_recalled_tables) if has_precise_recall_evidence else (explicit_tables | recalled_tables)
         if not has_precise_recall_evidence:
             for topic in topics:
                 for manifest_item in self.topic_assets.load_manifest(topic):
@@ -1751,7 +1881,7 @@ class PlanningAssetPackBuilder:
                         continue
                     candidate_tables.append((topic, table, manifest_item))
         existing_candidates = {table for _, table, _ in candidate_tables}
-        for table in sorted(explicit_tables | recalled_tables):
+        for table in sorted(seed_source_tables):
             if not table or table in existing_candidates:
                 continue
             topic = table_topic.get(table, "")
@@ -1761,7 +1891,7 @@ class PlanningAssetPackBuilder:
             candidate_tables.append((topic, table, manifest_item))
             existing_candidates.add(table)
         if not candidate_tables:
-            for table in sorted(explicit_tables | recalled_tables):
+            for table in sorted(seed_source_tables):
                 topic = table_topic.get(table, "")
                 if topic:
                     candidate_tables.append((topic, table, {}))
@@ -1773,7 +1903,7 @@ class PlanningAssetPackBuilder:
         table_scores = self._filter_weak_seed_scores_by_topic(table_scores)
         table_scores.sort(key=lambda item: (item[1], item[2].get("recallScore", 0), item[2].get("metricScore", 0)), reverse=True)
         limit = max(1, int(self.topic_assets.settings.agent_planner_seed_table_limit or 4))
-        evidenced_table_count = len({table for table in explicit_tables | recalled_tables if table})
+        evidenced_table_count = len({table for table in explicit_tables | precise_recalled_tables if table})
         limit = min(max(limit, evidenced_table_count), 6)
         selected: List[str] = []
         for table, _, _ in table_scores:
@@ -1790,7 +1920,7 @@ class PlanningAssetPackBuilder:
             selected = [table for table, _, _ in fallback_scores[:limit] if table]
         coverage_topics = {
             table_topic.get(table, "")
-            for table in explicit_tables | recalled_tables
+            for table in seed_source_tables
             if table_topic.get(table, "")
         }
         selected = self._ensure_seed_topic_coverage(selected, table_scores, sorted(coverage_topics), limit)
@@ -1812,6 +1942,31 @@ class PlanningAssetPackBuilder:
         else:
             traces.append("targeted_seed_source=topic_boundary")
         return set(selected), traces
+
+    def _recall_item_has_precise_table_evidence(self, item: RecallItem) -> bool:
+        source_type = str(item.source_type or "").upper()
+        metadata = item.metadata or {}
+        semantic_kind = str(metadata.get("semanticKind") or "").upper()
+        table = item.table or str(metadata.get("tableName") or "")
+        metric_key = str(metadata.get("metricKey") or "")
+        if not table or not metric_key:
+            return False
+        return source_type == "SEMANTIC_METRIC" or semantic_kind == "METRIC" or bool(metadata.get("metricKey"))
+
+    def _should_defer_topic_seed_selection(self, question: str, has_precise_recall_evidence: bool) -> bool:
+        if has_precise_recall_evidence:
+            return False
+        return self._broad_topic_question(question)
+
+    def _broad_topic_question(self, question: str) -> bool:
+        requested_intents = infer_table_selection_intents(question)
+        if requested_intents & {"DETAIL", "METRIC", "TOPN", "GROUP_AGG", "ROOT_CAUSE"}:
+            return False
+        text = str(question or "").lower()
+        broad_markers = ["情况", "怎么样", "如何", "概况", "整体", "表现", "状态", "有没有异常", "异常"]
+        if any(marker in text for marker in broad_markers):
+            return True
+        return len(table_seed_terms(question)) <= 2 and requested_intents <= {"TREND", "PROFILE"}
 
     def _ensure_seed_topic_coverage(
         self,
@@ -2458,6 +2613,24 @@ class PlanningAssetPackBuilder:
             for table in [str(item.get("tableName") or "") for item in manifest]
             if table and self._table_allowed_for_topic_question(topic, question, table, allow_profile=allow_profile)
         }
+
+    def _diagnostic_profile_seed_tables(self, table_topic: Dict[str, str], limit: int = 1) -> List[str]:
+        candidates: List[Tuple[int, str]] = []
+        for table, topic in table_topic.items():
+            if not table or "profile" not in table.lower():
+                continue
+            try:
+                asset = self.topic_assets.load_table_asset(topic, table)
+            except Exception:
+                asset = {}
+            usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
+            if not usage.get("queryableByAgent"):
+                continue
+            role = str(usage.get("topicRole") or "").upper()
+            score = 10 if role == "PROFILE" else 1
+            candidates.append((score, table))
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return [table for _, table in candidates[: max(1, limit)]]
 
     def _table_allowed_for_question(self, question: str, table: str, allow_profile: bool = False) -> bool:
         if not table:
@@ -3703,10 +3876,16 @@ class TopicBuilderWorkflow:
             not_recommended.append("面向商家的正式业务分析")
         if "profile" in table.lower():
             not_recommended.append("历史趋势与明细归因")
+        topic_role = "PROFILE" if "profile" in table.lower() or "画像" in data_grain else "ANCHOR"
+        default_for = ["OVERVIEW", "TREND"]
+        if supported_metrics:
+            default_for.append("METRIC")
         return normalize_table_usage_profile(
             {
                 "businessLayer": layer,
                 "queryableByAgent": default_table_queryable(table, layer),
+                "topicRole": topic_role,
+                "defaultForIntents": default_for,
                 "supportedIntents": intents,
                 "supportedMetrics": supported_metrics,
                 "supportedDimensions": dimensions,
@@ -4110,6 +4289,8 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "businessLayer": {"type": "string", "enum": ["ODS", "DWD", "DWM", "ADS", "DIM", "TMP", "STG", "UNKNOWN"]},
             "queryableByAgent": {"type": "boolean"},
             "authorityLevel": {"type": "integer"},
+            "topicRole": {"type": "string", "enum": ["ANCHOR", "DETAIL", "DIMENSION", "BRIDGE", "PROFILE", "AUXILIARY", "UNKNOWN"]},
+            "defaultForIntents": {"type": "array", "items": {"type": "string"}},
             "supportedIntents": {"type": "array", "items": {"type": "string"}},
             "supportedMetrics": {"type": "array", "items": {"type": "string"}},
             "supportedDimensions": {"type": "array", "items": {"type": "string"}},

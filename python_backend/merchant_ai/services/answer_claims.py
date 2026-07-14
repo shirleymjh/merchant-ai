@@ -358,9 +358,6 @@ def supported_numbers(facts: List[VerifiedFact]) -> List[Tuple[Decimal, List[str
     for fact_group in grouped.values():
         labels = fact_label_candidates(fact_group[0])
         source_fact_ids = [fact.fact_id for fact in fact_group]
-        if len(fact_group) == 1:
-            derived.append((Decimal("0"), labels, source_fact_ids))
-            continue
         if len(fact_group) < 2:
             continue
         numbers = [decimal_value(fact.value) for fact in fact_group]
@@ -561,11 +558,20 @@ def supported_derived_numeric_token(
     target = decimal_token(raw)
     if target is None:
         return []
+    if claim_asserts_direct_metric_value(claim_text):
+        return []
     normalized_claim = normalize_label_text(claim_text)
     for candidate, labels, fact_ids in allowed:
         if decimal_close(target, candidate) and any(label and label in normalized_claim for label in labels):
             return fact_ids
     return []
+
+
+def claim_asserts_direct_metric_value(claim_text: str) -> bool:
+    text = str(claim_text or "")
+    if re.search(r"(变化|变动|差值|差额|增量|减少|增加|上升|下降|提升|降低|波动|环比|同比|涨幅|跌幅|少了|多了|change|delta|diff|increase|decrease)", text, flags=re.I):
+        return False
+    return bool(re.search(r"(?:为|是|达到|等于|合计|总计|当前|本次|查询范围内).{0,12}[-+]?\d", text))
 
 
 def decimal_close(left: Decimal, right: Decimal) -> bool:

@@ -3,6 +3,8 @@ from merchant_ai.graph.policy import V2AgentPolicy
 from merchant_ai.models import (
     AnswerMode,
     FastUnderstandingResult,
+    IntentType,
+    PlanningAssetEntry,
     PlanningAssetPack,
     QuestionCategory,
     QuestionIntent,
@@ -54,35 +56,62 @@ def test_metric_fast_entry_accepts_only_typed_single_metric_features():
 def test_semantic_plan_fast_rejects_multi_node_or_explanation_plan():
     simple = QueryPlan(
         intents=[
-            QuestionIntent(
-                answer_mode=AnswerMode.METRIC,
-                category=QuestionCategory.TRADE,
-                plan_task_id="order_metric",
-                metric_name="order_detail_cnt",
-                metric_resolution={"metricKey": "order_detail_cnt", "semanticRefId": "semantic:trade:order_count"},
-            )
-        ],
+                QuestionIntent(
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.METRIC,
+                    category=QuestionCategory.TRADE,
+                    plan_task_id="order_metric",
+                    preferred_table="dwm_trade_order_detail_di",
+                    metric_name="order_detail_cnt",
+                    metric_column="order_detail_cnt",
+                    metric_resolution={"metricKey": "order_detail_cnt", "semanticRefId": "semantic:trade:order_count"},
+                )
+            ],
         question_understanding={"analysisIntent": "lookup", "requiresExplanation": False},
     )
     complex_plan = simple.model_copy(
         update={
             "intents": [
                 *simple.intents,
-                QuestionIntent(
-                    answer_mode=AnswerMode.METRIC,
-                    category=QuestionCategory.REFUND,
-                    plan_task_id="refund_metric",
-                    metric_name="refund_amt",
-                    metric_resolution={"metricKey": "refund_amt", "semanticRefId": "semantic:refund:refund_amt"},
-                ),
+                    QuestionIntent(
+                        intent_type=IntentType.VALID,
+                        answer_mode=AnswerMode.METRIC,
+                        category=QuestionCategory.REFUND,
+                        plan_task_id="refund_metric",
+                        preferred_table="dwm_trade_refund_detail_di",
+                        metric_name="refund_amt",
+                        metric_column="refund_amt",
+                        metric_resolution={"metricKey": "refund_amt", "semanticRefId": "semantic:refund:refund_amt"},
+                    ),
             ],
             "question_understanding": {"analysisIntent": "attribution", "requiresExplanation": True},
         }
     )
 
-    assert semantic_fast_path_can_bypass_configured_llm("最近7天订单量", simple, PlanningAssetPack()) is True
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "pt", "order_detail_cnt"]),
+            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "pt", "refund_amt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["order_detail_cnt"],
+                source_ref_id="semantic:trade:order_count",
+            ),
+            PlanningAssetEntry(
+                key="refund_amt",
+                table="dwm_trade_refund_detail_di",
+                columns=["refund_amt"],
+                source_ref_id="semantic:refund:refund_amt",
+            ),
+        ],
+    )
+
+    assert semantic_fast_path_can_bypass_configured_llm("最近7天订单量", simple, pack) is True
     assert features_from_query_plan(complex_plan).requires_explanation is True
-    assert semantic_fast_path_can_bypass_configured_llm("分析订单和退款原因", complex_plan, PlanningAssetPack()) is False
+    assert semantic_fast_path_can_bypass_configured_llm("分析订单和退款原因", complex_plan, pack) is False
 
 
 def test_policy_does_not_try_fast_metric_without_structured_fast_understanding():

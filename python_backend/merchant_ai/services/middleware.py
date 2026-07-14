@@ -107,6 +107,7 @@ class MiddlewareChain:
             )
             if policy == "closed":
                 mark_terminal_status(state, "blocked", "MIDDLEWARE_FAIL_CLOSED", middleware.name, str(exc))
+                state["middleware_blocked"] = True
                 state["middleware_loop_blocked"] = True
                 state["chat_bi_completed"] = True
                 state.setdefault("safety_finish_reasons", []).append(
@@ -879,8 +880,46 @@ class MemoryMiddleware(HarnessMiddleware):
         self.query_understanding = MemoryQueryUnderstandingService(settings)
 
     def before_policy(self, state: AgentState) -> AgentState:
-        fingerprint = self._context_fingerprint(state)
+        if state.get("topic_routed") is False:
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="skipped",
+                code="MEMORY_WAITING_FOR_TOPIC",
+                message="memory recall waits for topic workspace",
+            )
+            return state
+        if state.get("memory_recalled") is False:
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="skipped",
+                code="MEMORY_WAITING_FOR_RECALL_NODE",
+                message="governed memory recall is owned by the recall_memory node after topic routing",
+            )
+            return state
         trace = dict(state.get("memory_injection_trace") or {})
+        if state.get("_memory_snapshot_locked") and trace:
+            self._render_existing_snapshot(state)
+            state["_memory_middleware_snapshot_ready"] = True
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="reused",
+                code="MEMORY_REQUEST_SNAPSHOT_LOCKED",
+                message="recall_memory node already produced the governed request snapshot",
+                metadata={
+                    "constraintCount": len(state.get("memory_constraints") or []),
+                    "contextFingerprint": trace.get("contextFingerprint") or "",
+                    "locked": True,
+                    "status": trace.get("status", ""),
+                },
+            )
+            return state
+        fingerprint = self._context_fingerprint(state)
         snapshot_succeeded = bool(trace) and not trace.get("error") and str(trace.get("status") or "success") == "success"
         semantic_refresh = bool(
             state.get("topic_routed")

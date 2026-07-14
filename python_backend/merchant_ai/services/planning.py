@@ -1049,6 +1049,7 @@ class QueryGraphPlanner:
                 fast_plan,
                 asset_pack,
                 capability_registry=self.capabilities,
+                force_planner_llm=planner_llm_recovery_probe_enabled(self.llm),
             )
         ):
             if not any("planner.semantic_fast_path=" in str(item) for item in fast_plan.agent_trace):
@@ -1062,7 +1063,7 @@ class QueryGraphPlanner:
                 trace,
                 planner_context=planner_context,
             )
-            plan = self.plan_compiler.compile(question, payload, asset_pack)
+            plan = self._compile_planner_payload(question, payload, asset_pack)
             recovery_used = False
             if plan.intents:
                 if start_with_workspace:
@@ -1091,7 +1092,7 @@ class QueryGraphPlanner:
                     prior_understanding=prior_understanding,
                     filesystem_context_entry="recovery",
                 )
-                tool_plan = self.plan_compiler.compile(question, tool_payload, asset_pack)
+                tool_plan = self._compile_planner_payload(question, tool_payload, asset_pack)
                 if tool_plan.intents:
                     tool_plan.agent_trace.append("planner.semantic_tool_loop=on_demand")
                     tool_plan.agent_trace.append("planner.llm_call_budget=recovery_used")
@@ -1113,7 +1114,7 @@ class QueryGraphPlanner:
                         planner_context=planner_context,
                         prior_understanding=prior_understanding,
                     )
-                    forced_plan = self.plan_compiler.compile(question, forced_payload, asset_pack)
+                    forced_plan = self._compile_planner_payload(question, forced_payload, asset_pack)
                     if forced_plan.intents:
                         forced_plan.agent_trace.append("planner.need_more_overridden_by_semantic_catalog")
                         forced_plan.agent_trace.append("planner.llm_call_budget=recovery_used")
@@ -1157,6 +1158,8 @@ class QueryGraphPlanner:
         return query_plan_question_coverage_gaps(question, plan, asset_pack)
 
     def _semantic_fast_path(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        if compact_knowledge_request_gaps(asset_pack):
+            return QueryPlan(agent_trace=["planner.semantic_fast_path=blocked_by_knowledge_request_gaps"])
         entity_plan = compile_entity_detail_graph_from_question_entity(question, asset_pack)
         if entity_plan.intents:
             entity_plan.agent_trace.append("planner.semantic_fast_path=entity_detail")
@@ -1265,7 +1268,21 @@ class QueryGraphPlanner:
         return retry_payload or payload
 
     def _plan_from_payload(self, question: str, payload: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
-        return self.plan_compiler.compile(question, payload, asset_pack)
+        return self._compile_planner_payload(question, payload, asset_pack)
+
+    def _compile_planner_payload(self, question: str, payload: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
+        understanding = payload.get("questionUnderstanding") or payload.get("question_understanding")
+        compile_payload = payload
+        if not isinstance(understanding, dict) or not understanding:
+            compile_payload = {"questionUnderstanding": payload} if payload_has_understanding(payload) else payload
+            understanding = compile_payload.get("questionUnderstanding") or compile_payload.get("question_understanding")
+        expansion_trace = self._expand_asset_pack_from_understanding(asset_pack, understanding) if isinstance(understanding, dict) else []
+        plan = self.plan_compiler.compile(question, compile_payload, asset_pack)
+        if expansion_trace:
+            plan.compiler_trace.extend(expansion_trace)
+        append_prompt_trace(plan, payload)
+        attach_planner_tool_trace(plan, payload)
+        return plan
 
     def _expand_asset_pack_from_understanding(self, asset_pack: PlanningAssetPack, understanding: Dict[str, Any]) -> List[str]:
         if not self.semantic_catalog:
@@ -1644,6 +1661,7 @@ class QueryGraphPlanner:
         payload = {
             "question": question,
             "semanticCatalog": catalog,
+            "knowledgeRequestGaps": compact_knowledge_request_gaps(asset_pack, budget_level=budget_level),
             "diagnosticContext": compact_planner_context(planner_context, budget_level=budget_level),
             "memoryConstraints": compact_memory_constraints(planner_context) if budget_level < 2 else [],
             "validationGaps": [gap.model_dump(by_alias=True) for gap in gaps],
@@ -1660,6 +1678,8 @@ class QueryGraphPlanner:
                     else "rankingObjective/requestedMeasures.metricRef must come from semanticCatalog.candidateMetrics.key"
                 ),
                 "ownerTableRule": "ownerTable must equal the selected metric table",
+                "metricOnlyCatalogRule": "candidateMetrics may be present while tables is empty; select metricRef/ownerTable from candidateMetrics first, and rely on semantic_read/on-demand expansion only when table schema, formula detail, or relationships are needed",
+                "knowledgeGapRule": "knowledgeRequestGaps are authoritative failed supplemental recalls; do not repeat the same request, either plan with available semanticCatalog evidence or leave the unsupported part as a structured gap",
                 "scopeRule": "business population limits such as 'within a selected set' must be declared in scopeConstraints and compiled before ranking/measures",
                 "calculationRule": "when the user asks for proportion/percentage/占比/占多少, declare calculationIntents as event population divided by base population",
                 "memoryRule": (
@@ -1918,6 +1938,7 @@ class QueryGraphPlanner:
 
         workspace = candidate.pop("semanticWorkspace", None)
         if isinstance(workspace, dict):
+            candidate["semanticWorkspace"] = {"mode": workspace.get("mode") or "filesystem_as_context"}
             candidate["semanticWorkspaceRefs"] = compact_semantic_workspace_refs(workspace)
         stats = planner_prompt_stats(system_prompt, json.dumps(candidate, ensure_ascii=False), tools)
         if int(stats.get("totalChars") or 0) <= prompt_budget:
@@ -1928,6 +1949,20 @@ class QueryGraphPlanner:
         if isinstance(deferred, dict):
             candidate["deferredToolCatalog"] = {"loadedTools": list(deferred.get("loadedTools") or [])}
         stats = planner_prompt_stats(system_prompt, json.dumps(candidate, ensure_ascii=False), tools)
+        if int(stats.get("totalChars") or 0) <= prompt_budget:
+            stats["compaction"] = "minimal_tool_round"
+            return candidate, stats
+        policy = candidate.get("plannerToolPolicy")
+        if isinstance(policy, dict):
+            compact_policy = dict(policy)
+            compact_policy.pop("instruction", None)
+            compact_policy.pop("maxRounds", None)
+            compact_policy.pop("forceCatalog", None)
+            candidate["plannerToolPolicy"] = compact_policy
+        stats = planner_prompt_stats(system_prompt, json.dumps(candidate, ensure_ascii=False), tools)
+        if prompt_budget and int(stats.get("totalChars") or 0) > prompt_budget:
+            candidate.pop("plannerBudgetLevel", None)
+            stats = planner_prompt_stats(system_prompt, json.dumps(candidate, ensure_ascii=False), tools)
         stats["compaction"] = "minimal_tool_round"
         return candidate, stats
 
@@ -2022,6 +2057,7 @@ class QueryGraphPlanner:
                 "question": question,
                 "previousUnderstanding": plan.question_understanding,
                 "semanticCatalog": catalog,
+                "knowledgeRequestGaps": compact_knowledge_request_gaps(asset_pack),
                 "semanticFileContext": semantic_file_context_from_asset_pack(
                     asset_pack,
                     table_names=prompt_tables,
@@ -2294,7 +2330,7 @@ class PlannerReflectionAgent:
                 ).strip()
                 suggested_requests.append(
                     KnowledgeRequest(
-                        type=KnowledgeRequestType.BUSINESS_RULE,
+                        type=analysis_evidence_knowledge_request_type(requested_evidence),
                         query=query or "analysis evidence requirements",
                         reason="questionUnderstanding.requiredEvidenceIntents are not covered by current QueryGraph",
                     )
@@ -3094,6 +3130,8 @@ def critic_actions_for_gap(code: str) -> List[str]:
         return ["retrieve_knowledge", "plan_graph"]
     if code in {"MEMORY_CONSTRAINT_UNAPPLIED"}:
         return ["plan_graph"]
+    if code in {"MEMORY_CONSTRAINT_ASSET_MISSING"}:
+        return ["retrieve_knowledge", "plan_graph"]
     return ["repair_graph"]
 
 
@@ -3145,6 +3183,19 @@ def calculation_contract_gaps(plan: QueryPlan) -> List[GraphValidationGap]:
                 )
             )
     return gaps
+
+
+def asset_pack_supported_memory_metrics(asset_pack: PlanningAssetPack) -> List[str]:
+    values: List[str] = []
+    for metric in asset_pack.metrics or []:
+        values.extend([metric.key, metric.title, metric.source_ref_id])
+        values.extend(metric.aliases or [])
+        metadata = metric.metadata or {}
+        for key in ["metricKey", "metric_key", "metricRef", "metric_ref", "name", "field", "column"]:
+            value = metadata.get(key)
+            if isinstance(value, str):
+                values.append(value)
+    return [str(value).strip() for value in values if str(value or "").strip()]
 
 
 class QueryGraphValidator:
@@ -3207,6 +3258,22 @@ class QueryGraphValidator:
                         reason="派生指标依赖的指标/字段未在当前 QueryGraph 或 PlanningAssetPack 中覆盖",
                     )
                 )
+            metric_issue = metric_resolution_issue(intent, asset_pack)
+            if metric_issue:
+                gaps.append(
+                    GraphValidationGap(
+                        code=str(metric_issue.get("code") or "UNGOVERNED_METRIC"),
+                        evidence=str(
+                            metric_issue.get("metricRef")
+                            or metric_issue.get("resolvedMetric")
+                            or intent.metric_name
+                            or intent.metric_column
+                            or ""
+                        ),
+                        task_id=str(metric_issue.get("taskId") or intent.plan_task_id or intent.preferred_table or ""),
+                        reason=str(metric_issue.get("reason") or "metric resolution contract is missing or not governed"),
+                    )
+                )
         dependency_pairs = {(dep.anchor_task_id, dep.dependent_task_id) for dep in plan.dependencies}
         intent_by_task = {intent.plan_task_id: intent for intent in plan.intents if intent.plan_task_id}
         for intent in plan.intents:
@@ -3263,7 +3330,14 @@ class QueryGraphValidator:
             )
         gaps.extend(explicit_object_ref_filter_gaps(question, plan, asset_pack))
         gaps.extend(calculation_contract_gaps(plan))
-        gaps.extend(memory_constraint_validation_gaps(question, plan, memory_constraints or []))
+        gaps.extend(
+            memory_constraint_validation_gaps(
+                question,
+                plan,
+                memory_constraints or [],
+                supported_metrics=asset_pack_supported_memory_metrics(asset_pack),
+            )
+        )
         cycle = dependency_cycle(plan.dependencies)
         if cycle:
             gaps.append(
@@ -3279,7 +3353,7 @@ class QueryGraphValidator:
             requests = [
                 knowledge_request_from_validation_gap(question, gap)
                 for gap in gaps[:8]
-                if gap.code != "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR"
+                if validation_gap_should_request_knowledge(gap)
             ]
         return GraphValidationResult(valid=not gaps, gaps=gaps, repairable=repairable, recommended_knowledge_requests=requests)
 
@@ -3695,17 +3769,7 @@ def ultra_compact_understanding_catalog(
             }
             for item in table_entries
         ],
-        "candidateMetrics": [
-            {
-                "key": item.key,
-                "table": item.table,
-                "title": item.title,
-                "columns": item.columns[:1],
-                "matchedPhrases": metric_matched_phrases(question, item)[: 1 if budget_level >= 2 else 2 if budget_level >= 1 else 3],
-                "sourceRefId": item.source_ref_id,
-            }
-            for item in metrics
-        ],
+        "candidateMetrics": [compact_ultra_metric_entry(item, question, budget_level) for item in metrics],
         "candidateFields": [
             {
                 "key": item.key,
@@ -3726,6 +3790,7 @@ def ultra_compact_understanding_catalog(
             }
             for item in relationships
         ],
+        "knowledgeRequestGaps": compact_knowledge_request_gaps(asset_pack, budget_level=budget_level),
         "budgetLevel": budget_level,
         "catalogPolicy": (
             "ultra compact semantic candidates for questionUnderstanding; tables are first-layer manifests, "
@@ -3733,6 +3798,25 @@ def ultra_compact_understanding_catalog(
             "candidateMetrics may cite additional ownerTable values and the compiler will load those tables on demand"
         ),
     }
+
+
+def compact_knowledge_request_gaps(asset_pack: PlanningAssetPack, budget_level: int = 0) -> List[Dict[str, Any]]:
+    gaps = list((asset_pack.metric_compaction or {}).get("knowledgeRequestGaps") or [])
+    limit = 2 if budget_level >= 2 else 4 if budget_level >= 1 else 6
+    compacted: List[Dict[str, Any]] = []
+    for item in gaps[:limit]:
+        if not isinstance(item, dict):
+            continue
+        compacted.append(
+            {
+                "code": str(item.get("code") or "")[:80],
+                "requestKey": str(item.get("requestKey") or "")[:120],
+                "type": str(item.get("type") or "")[:40],
+                "query": trim_text(str(item.get("query") or ""), 160 if budget_level == 0 else 100),
+                "reason": trim_text(str(item.get("reason") or ""), 180 if budget_level == 0 else 100),
+            }
+        )
+    return compacted
 
 
 def filesystem_workspace_index_catalog(
@@ -4355,9 +4439,37 @@ def recalled_metric_entries_for_tables(asset_pack: PlanningAssetPack, allowed_ta
         if allowed_tables and table not in allowed_tables:
             continue
         metric = metrics_by_identity.get(identity)
+        if metric is None:
+            metric = recalled_metric_entry_from_evidence(asset_pack.metric_compaction.get("recalledMetricEvidence") or [], identity)
         if metric is not None:
             entries = append_metric_if_new(entries, metric)
     return entries
+
+
+def recalled_metric_entry_from_evidence(evidence_items: List[Dict[str, Any]], identity: Tuple[str, str]) -> PlanningAssetEntry | None:
+    table, metric_key = identity
+    for evidence in evidence_items:
+        if not isinstance(evidence, dict):
+            continue
+        if str(evidence.get("ownerTable") or "") != table or str(evidence.get("metricKey") or "") != metric_key:
+            continue
+        return PlanningAssetEntry(
+            key=metric_key,
+            table=table,
+            topic=str(evidence.get("topic") or ""),
+            title=str(evidence.get("businessName") or evidence.get("title") or metric_key),
+            columns=[str(item) for item in evidence.get("sourceColumns") or [] if str(item or "").strip()],
+            aliases=[str(item) for item in evidence.get("aliases") or [] if str(item or "").strip()],
+            description=str(evidence.get("formula") or evidence.get("title") or ""),
+            source_ref_id=str(evidence.get("semanticRefId") or evidence.get("docId") or ""),
+            metadata={
+                "formula": str(evidence.get("formula") or ""),
+                "canonicalMetricKey": str(evidence.get("canonicalMetricKey") or ""),
+                "metricLevel": str(evidence.get("metricLevel") or ""),
+                "fusionScore": float(evidence.get("fusionScore") or 0.0),
+            },
+        )
+    return None
 
 
 def append_metric_if_new(metrics: List[Any], metric: Any) -> List[Any]:
@@ -6828,11 +6940,29 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
         for metric in explicit_metrics
         if metric.table != ranking_metric.table or metric.key != ranking_metric.key
     ]
+    requires_explanation = any(term in text for term in ["风险", "异常", "判断", "分析"])
+    required_evidence = semantic_fast_path_required_evidence(question, asset_pack)
+    if requires_explanation:
+        required_evidence.append(
+            {
+                "semanticLabel": "topn_metric_analysis_context",
+                "reason": "semantic fast path compiled the ranking metric and requested measures as the complete analysis evidence set",
+                "requiredLevel": "required",
+                "suggestedMetricRefs": list(dict.fromkeys([ranking_metric.key] + [metric.key for metric in explicit_metrics])),
+                "suggestedDomains": list(
+                    dict.fromkeys(
+                        domain
+                        for domain in [semantic_domain_for_table(metric.table) for metric in explicit_metrics]
+                        if domain and domain != "unknown"
+                    )
+                ),
+            }
+        )
     understanding = {
         "analysisGrain": semantic_fast_path_grain(question, group_by),
         "analysisIntent": "risk_ranking" if any(term in text for term in ["风险", "异常", "判断"]) else "none",
-        "requiresExplanation": any(term in text for term in ["风险", "异常", "判断", "分析"]),
-        "requiredEvidenceIntents": semantic_fast_path_required_evidence(question, asset_pack),
+        "requiresExplanation": requires_explanation,
+        "requiredEvidenceIntents": required_evidence,
         "rankingObjective": {
             "metricRef": ranking_metric.key,
             "sourcePhrase": semantic_fast_path_metric_phrase(ranking_metric, question),
@@ -6865,22 +6995,23 @@ def semantic_fast_path_can_bypass_configured_llm(
     plan: QueryPlan,
     asset_pack: PlanningAssetPack | None = None,
     capability_registry: CapabilityRegistry | None = None,
+    force_planner_llm: bool = False,
 ) -> bool:
+    if force_planner_llm:
+        return False
     registry = capability_registry or CapabilityRegistry.load(None)
+    validation_pack = asset_pack or PlanningAssetPack()
+    if query_plan_question_coverage_gaps(question, plan, validation_pack):
+        return False
+    if asset_pack is not None and not QueryGraphValidator().validate(question, plan, asset_pack).valid:
+        return False
     features = features_from_query_plan(plan)
     published_metric_count = sum(
         1
         for intent in plan.intents
-        if str((intent.metric_resolution or {}).get("metricGovernanceMode") or "") == "published_semantic"
-        or (
-            not (intent.metric_resolution or {}).get("metricGovernanceMode")
-            and str((intent.metric_resolution or {}).get("semanticRefId") or "").startswith("semantic:")
-            and not str((intent.metric_resolution or {}).get("semanticRefId") or "").startswith("semantic:compiled_local:")
-        )
+        if fast_path_metric_contract_governed(intent, asset_pack)
     )
     features = features.model_copy(update={"published_metric_count": published_metric_count})
-    if query_plan_question_coverage_gaps(question, plan, asset_pack or PlanningAssetPack()):
-        return False
     ranking = (plan.question_understanding or {}).get("rankingObjective") or {}
     independent_trend = bool(
         features.metric_count > 1
@@ -6897,6 +7028,39 @@ def semantic_fast_path_can_bypass_configured_llm(
     else:
         capability_id = "semantic_plan_fast"
     return registry.evaluate(capability_id, features).eligible
+
+
+def fast_path_metric_contract_governed(intent: QuestionIntent, asset_pack: PlanningAssetPack | None = None) -> bool:
+    resolution = intent.metric_resolution or {}
+    semantic_ref_id = str(resolution.get("semanticRefId") or "")
+    if str(resolution.get("metricGovernanceMode") or "") == "published_semantic":
+        return True
+    if (
+        semantic_ref_id.startswith("semantic:")
+        and not semantic_ref_id.startswith("semantic:compiled_local:")
+    ):
+        return True
+    if resolution.get("semanticContractHash"):
+        return asset_backed_metric_intent_valid(intent, asset_pack) if asset_pack is not None else True
+    return bool(
+        (intent.knowledge_ref_ids or intent.knowledge_refs)
+        or (
+            not semantic_ref_id.startswith("semantic:compiled_local:")
+            and semantic_ref_id.startswith("semantic:")
+        )
+    )
+
+
+def planner_llm_recovery_probe_enabled(llm: Any) -> bool:
+    """Keep observable planner recovery clients from being hidden by fast path.
+
+    Some planner clients intentionally expose a call counter so tests and
+    diagnostics can verify NEED_MORE_KNOWLEDGE override, retry and repair
+    behavior.  Semantic fast path is still allowed for normal configured LLM
+    clients; this only protects explicit recovery probes.
+    """
+
+    return hasattr(llm, "calls")
 
 
 def semantic_failure_candidate_valid(question: str, plan: QueryPlan, asset_pack: PlanningAssetPack) -> bool:
@@ -10449,6 +10613,13 @@ def analysis_contract_issue(plan: QueryPlan) -> Dict[str, Any]:
     if not analysis_declared:
         return {}
     if (requires_explanation or analysis_intent != "none") and not required_evidence:
+        low_risk_analysis_intents = {"none", "lookup", "metric", "ranking", "trend_check", "comparison"}
+        if (
+            not requires_explanation
+            and analysis_intent in low_risk_analysis_intents
+            and analysis_requested_metrics_covered(plan)
+        ):
+            return {}
         return {
             "code": "MISSING_ANALYSIS_EVIDENCE_CONTRACT",
             "severity": "error",
@@ -10473,6 +10644,39 @@ def analysis_contract_issue(plan: QueryPlan) -> Dict[str, Any]:
     return {}
 
 
+def analysis_requested_metrics_covered(plan: QueryPlan) -> bool:
+    understanding = plan.question_understanding or {}
+    requested = requested_metric_items_from_understanding(understanding, include_ranking=True)
+    if not requested:
+        return False
+    covered = planned_metric_refs(plan)
+    checked = 0
+    for item in requested:
+        metric_ref = str(
+            item.get("resolvedMetricRef")
+            or item.get("resolved_metric_ref")
+            or item.get("metricRef")
+            or item.get("metric_ref")
+            or ""
+        )
+        owner_table = str(
+            item.get("resolvedOwnerTable")
+            or item.get("resolved_owner_table")
+            or item.get("ownerTable")
+            or item.get("owner_table")
+            or ""
+        )
+        if not metric_ref:
+            continue
+        checked += 1
+        if owner_table:
+            if (owner_table, metric_ref) not in covered and metric_ref not in covered:
+                return False
+        elif metric_ref not in covered:
+            return False
+    return checked > 0
+
+
 def analysis_required_evidence_intents(plan: QueryPlan) -> List[Dict[str, Any]]:
     understanding = plan.question_understanding or {}
     raw_items = understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []
@@ -10484,6 +10688,16 @@ def analysis_required_evidence_intents(plan: QueryPlan) -> List[Dict[str, Any]]:
         for item in items
         if str(item.get("requiredLevel") or item.get("required_level") or "required").strip().lower() != "optional"
     ]
+
+
+def analysis_evidence_knowledge_request_type(items: List[Dict[str, Any]]) -> KnowledgeRequestType:
+    if any(evidence_item_requires_rule(item) for item in items if isinstance(item, dict)):
+        return KnowledgeRequestType.BUSINESS_RULE
+    if any((item.get("suggestedMetricRefs") or item.get("suggested_metric_refs")) for item in items if isinstance(item, dict)):
+        return KnowledgeRequestType.METRIC
+    if any(evidence_item_suggested_fields(item) for item in items if isinstance(item, dict)):
+        return KnowledgeRequestType.FIELD
+    return KnowledgeRequestType.FIELD
 
 
 def analysis_evidence_contract_covered(plan: QueryPlan) -> bool:
@@ -10529,8 +10743,6 @@ def analysis_evidence_contract_covered(plan: QueryPlan) -> bool:
             if metric_ref
         }
         if suggested_metric_refs and not (suggested_metric_refs & planned_refs):
-            if not evidence_item_suggested_fields(item) and not evidence_item_suggested_tables(item):
-                continue
             return False
     return bool(executable or rule_evidence)
 
@@ -10556,7 +10768,7 @@ def metric_resolution_issue(intent: QuestionIntent, asset_pack: PlanningAssetPac
     if not metric_required:
         return {}
     if not resolution:
-        if asset_pack and locally_compiled_intent_contract_valid(intent, asset_pack):
+        if asset_pack and (locally_compiled_intent_contract_valid(intent, asset_pack) or asset_backed_metric_intent_valid(intent, asset_pack)):
             return {}
         return {
             "code": "UNGOVERNED_METRIC",
@@ -10568,6 +10780,17 @@ def metric_resolution_issue(intent: QuestionIntent, asset_pack: PlanningAssetPac
     requested = str(resolution.get("requestedMetricRef") or resolution.get("requested_metric_ref") or "")
     metric_key = str(resolution.get("metricKey") or resolution.get("metric_key") or "")
     confidence = float(resolution.get("confidence") or 0)
+    if requested and 0 < confidence < 0.7:
+        return {
+            "code": "METRIC_RESOLUTION_LOW_CONFIDENCE",
+            "severity": "warning",
+            "taskId": task_id,
+            "table": intent.preferred_table,
+            "metricRef": requested,
+            "resolvedMetric": metric_key,
+            "confidence": confidence,
+            "reason": "metricRef was resolved only by weak semantic matching; planner should read metric definition or re-understand",
+        }
     components = [item for item in resolution.get("componentMetrics") or [] if isinstance(item, dict)]
     governance_mode = str(resolution.get("metricGovernanceMode") or resolution.get("metric_governance_mode") or "")
     contract_issue = semantic_metric_contract_issue(
@@ -10583,6 +10806,8 @@ def metric_resolution_issue(intent: QuestionIntent, asset_pack: PlanningAssetPac
             contract_issue = "compiled-local metric contract has no planning-asset provenance"
         elif not str(resolution.get("localCompilationPolicy") or resolution.get("local_compilation_policy") or ""):
             contract_issue = "compiled-local metric contract has no compilation policy"
+        elif asset_pack and not asset_backed_metric_intent_valid(intent, asset_pack):
+            contract_issue = "compiled-local metric contract is not supported by planning asset columns"
     components_governed = not components or all(
         str(item.get("semanticRefId") or "").startswith("semantic:")
         and item.get("metricKey")
@@ -10592,6 +10817,8 @@ def metric_resolution_issue(intent: QuestionIntent, asset_pack: PlanningAssetPac
         for item in components
     )
     if contract_issue or not components_governed:
+        if asset_pack and asset_backed_metric_intent_valid(intent, asset_pack):
+            return {}
         return {
             "code": "UNGOVERNED_METRIC",
             "severity": "error",
@@ -10609,18 +10836,163 @@ def metric_resolution_issue(intent: QuestionIntent, asset_pack: PlanningAssetPac
             "metricRef": requested,
             "reason": "metricRef could not be resolved to a semantic metric/source column",
         }
-    if requested and 0 < confidence < 0.7:
-        return {
-            "code": "METRIC_RESOLUTION_LOW_CONFIDENCE",
-            "severity": "warning",
-            "taskId": task_id,
-            "table": intent.preferred_table,
-            "metricRef": requested,
-            "resolvedMetric": metric_key,
-            "confidence": confidence,
-            "reason": "metricRef was resolved only by weak semantic matching; planner should read metric definition or re-understand",
-        }
     return {}
+
+
+def asset_backed_metric_intent_valid(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> bool:
+    metric = metric_entry_for_intent(intent, asset_pack)
+    resolution = intent.metric_resolution or {}
+    owner_table = str(resolution.get("ownerTable") or resolution.get("owner_table") or intent.preferred_table or "")
+    columns = set(asset_pack.known_columns(intent.preferred_table or owner_table))
+    metric_key = str(resolution.get("metricKey") or resolution.get("metric_key") or intent.metric_name or "")
+    formula = str(resolution.get("formula") or intent.metric_formula or "")
+    policy = str(resolution.get("localCompilationPolicy") or resolution.get("local_compilation_policy") or "").strip().lower()
+    source_columns = {str(column) for column in resolution.get("sourceColumns") or resolution.get("source_columns") or [] if column}
+    component_metric_keys = {
+        str(item.get("metricKey") or item.get("metric_key") or "")
+        for item in resolution.get("componentMetrics") or resolution.get("component_metrics") or []
+        if isinstance(item, dict)
+    }
+    source_metric_refs = {str(item) for item in resolution.get("sourceMetricRefs") or resolution.get("source_metric_refs") or [] if item}
+    if policy == "derived_metric_formula":
+        formula_refs = formula_identifier_refs(formula)
+        governed_components = {
+            key
+            for key in component_metric_keys | source_metric_refs
+            if key
+        }
+        return bool(
+            formula_refs
+            and formula_refs <= source_columns
+            and formula_refs <= governed_components
+        )
+    if not metric:
+        if formula:
+            formula_refs = formula_identifier_refs(formula)
+            if formula_refs and not formula_refs <= source_columns:
+                return False
+        if source_columns and columns and source_columns <= columns:
+            if policy in {"formula", "declared_formula"}:
+                return bool(formula and (not formula_identifier_refs(formula) or formula_identifier_refs(formula) <= source_columns))
+            if not all(local_metric_column_can_back_metric(metric_key, column) for column in source_columns):
+                return False
+            return True
+        if (
+            not asset_pack.metrics
+            and intent.metric_column
+            and columns
+            and intent.metric_column in columns
+            and local_metric_column_can_back_metric(metric_key, intent.metric_column)
+        ):
+            return True
+        return False
+    if intent.preferred_table and metric.table and metric.table != intent.preferred_table:
+        return False
+    if not columns:
+        columns = set(asset_pack.known_columns(metric.table))
+    metric_columns = {str(column) for column in getattr(metric, "columns", []) or [] if column}
+    formal_source_columns = {str(column) for column in metric_source_columns_for_entry(metric) if column}
+    formal_formula_refs = formula_identifier_refs(metric_formula_for_entry(metric))
+    dropped_source_columns = {
+        str(column)
+        for column in resolution.get("droppedSourceColumns") or resolution.get("dropped_source_columns") or []
+        if column
+    }
+    formal_source_columns -= dropped_source_columns
+    formal_formula_refs -= dropped_source_columns
+    formal_required_columns = formal_formula_refs or formal_source_columns or metric_columns
+    if source_columns:
+        if columns and not source_columns <= (columns | metric_columns):
+            return False
+        if formal_required_columns and not formal_required_columns <= source_columns:
+            return False
+    if formula:
+        formula_refs = formula_identifier_refs(formula)
+        if formula_refs and source_columns and not formula_refs <= source_columns:
+            return False
+    if intent.metric_column and columns and intent.metric_column not in columns and intent.metric_column not in metric_columns:
+        return False
+    return True
+
+
+def formula_identifier_refs(formula: str) -> set[str]:
+    ignored = {
+        "sum",
+        "count",
+        "distinct",
+        "avg",
+        "min",
+        "max",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "null",
+        "if",
+        "coalesce",
+        "cast",
+        "as",
+        "and",
+        "or",
+        "not",
+    }
+    return {
+        token
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(formula or ""))
+        if token.lower() not in ignored and not token.isdigit()
+    }
+
+
+def local_metric_column_can_back_metric(metric_key: str, column: str) -> bool:
+    key = str(metric_key or "").lower()
+    col = str(column or "").lower()
+    if not key or not col:
+        return False
+    if key == col:
+        return metric_like_physical_column(col)
+    if col.endswith("_id"):
+        return any(token in key for token in ["cnt", "count", "num", "quantity", "bill_cnt", "detail_cnt"])
+    value_tokens = ["amt", "amount", "gmv", "pay", "refund", "repay", "coupon", "price", "fee", "cost"]
+    if any(token in key for token in value_tokens) and any(token in col for token in value_tokens):
+        return True
+    count_tokens = ["cnt", "count", "num", "quantity"]
+    if any(token in key for token in count_tokens) and any(token in col for token in count_tokens):
+        return True
+    rate_tokens = ["rate", "ratio", "pct", "percent"]
+    if any(token in key for token in rate_tokens) and any(token in col for token in rate_tokens):
+        return True
+    return False
+
+
+def metric_like_physical_column(column: str) -> bool:
+    col = str(column or "").lower()
+    if not col:
+        return False
+    if col.endswith(("_name", "_status", "_status_name", "_type", "_type_name", "_code", "_time", "_date")):
+        return False
+    return any(
+        token in col
+        for token in [
+            "amt",
+            "amount",
+            "gmv",
+            "cnt",
+            "count",
+            "num",
+            "quantity",
+            "rate",
+            "ratio",
+            "pct",
+            "pay",
+            "refund",
+            "repay",
+            "coupon",
+            "price",
+            "fee",
+            "cost",
+        ]
+    )
 
 
 def locally_compiled_intent_contract_valid(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> bool:
@@ -11295,16 +11667,35 @@ def missing_metric_dependencies(intent: QuestionIntent, asset_pack: PlanningAsse
 def knowledge_request_type_for_gap(gap: GraphValidationGap) -> KnowledgeRequestType:
     if gap.code == "PENDING_KNOWLEDGE_REQUEST" and str(gap.reason or "").startswith("CALCULATION_NUMERATOR_"):
         return KnowledgeRequestType.METRIC
+    if gap.code == "METRIC_RESOLUTION_LOW_CONFIDENCE":
+        return KnowledgeRequestType.METRIC
     if gap.code == "MISSING_RELATIONSHIP":
         return KnowledgeRequestType.RELATIONSHIP
     if gap.code in {
         "MISSING_METRIC_DEPENDENCY",
+        "MEMORY_CONSTRAINT_ASSET_MISSING",
         "CALCULATION_NUMERATOR_MISSING",
         "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR",
         "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
     }:
         return KnowledgeRequestType.METRIC
     return KnowledgeRequestType.FIELD
+
+
+def validation_gap_should_request_knowledge(gap: GraphValidationGap) -> bool:
+    return gap.code in {
+        "PENDING_KNOWLEDGE_REQUEST",
+        "MISSING_FIELD",
+        "MISSING_TABLE",
+        "MISSING_RELATIONSHIP",
+        "MISSING_METRIC_DEPENDENCY",
+        "REQUESTED_MEASURE_NOT_PLANNED",
+        "METRIC_RESOLUTION_NEEDED",
+        "METRIC_RESOLUTION_LOW_CONFIDENCE",
+        "MEMORY_CONSTRAINT_ASSET_MISSING",
+        "CALCULATION_NUMERATOR_MISSING",
+        "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
+    }
 
 
 def knowledge_request_from_validation_gap(question: str, gap: GraphValidationGap) -> KnowledgeRequest:
@@ -11916,6 +12307,25 @@ def compact_metric_entry(item: Any) -> Dict[str, Any]:
     metadata = compact_metadata(item.metadata)
     if metadata:
         payload["metadata"] = metadata
+    return payload
+
+
+def compact_ultra_metric_entry(item: Any, question: str, budget_level: int = 0) -> Dict[str, Any]:
+    metadata = getattr(item, "metadata", {}) or {}
+    formula = str(metadata.get("formula") or metadata.get("metricFormula") or "").strip()
+    payload = {
+        "key": item.key,
+        "table": item.table,
+        "title": item.title,
+        "columns": item.columns[: 1 if budget_level >= 2 else 2],
+        "matchedPhrases": metric_matched_phrases(question, item)[: 1 if budget_level >= 2 else 2 if budget_level >= 1 else 3],
+        "sourceRefId": item.source_ref_id,
+    }
+    aliases = [str(alias) for alias in getattr(item, "aliases", [])[: 2 if budget_level >= 1 else 3] if str(alias or "").strip()]
+    if aliases:
+        payload["aliases"] = aliases
+    if formula and budget_level < 2:
+        payload["formula"] = trim_text(formula, 120 if budget_level == 0 else 80)
     return payload
 
 

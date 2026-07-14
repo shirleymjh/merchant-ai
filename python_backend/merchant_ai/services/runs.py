@@ -302,6 +302,9 @@ class AgentRunManager:
             if isinstance(harness.get("checkpoint"), dict) and harness.get("checkpoint"):
                 run.checkpoint_ref = harness["checkpoint"]
                 run.resumable = bool(harness["checkpoint"].get("resumable"))
+            elif run.checkpoint_ref and str(run.checkpoint_ref.get("backend") or "").lower() != "memory":
+                run.checkpoint_ref["resumable"] = True
+                run.resumable = True
             run.trace_path = str((harness.get("traceReplay") or {}).get("path") or harness.get("traceReplayPath") or "")
             run.updated_at = datetime.now()
             self.store.save_run(run)

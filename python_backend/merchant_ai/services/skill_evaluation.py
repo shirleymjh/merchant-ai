@@ -112,7 +112,14 @@ class SkillEvaluationService:
                     metric_name=str((case.question_understanding or {}).get("metric") or ""),
                 )
             )
-        return QueryPlan(question_understanding=dict(case.question_understanding or {}), intents=intents)
+        understanding = dict(case.question_understanding or {})
+        if case.expect_trigger:
+            understanding.setdefault("reusableAnalysis", True)
+        if case.expect_trigger and case.expected_skill:
+            skill_workflow = dict(understanding.get("skillWorkflow") or understanding.get("skill_workflow") or {})
+            skill_workflow.setdefault("skillName", str(case.expected_skill or ""))
+            understanding["skillWorkflow"] = skill_workflow
+        return QueryPlan(question_understanding=understanding, intents=intents)
 
     def _category(self, value: str) -> QuestionCategory:
         try:

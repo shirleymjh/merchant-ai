@@ -193,11 +193,15 @@ def features_from_query_plan(plan: QueryPlan) -> CapabilityFeatures:
         or (intent.metric_resolution or {}).get("semanticContractHash")
         or intent.knowledge_ref_ids
     )
-    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "lookup")
+    raw_analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "").strip()
+    if raw_analysis_intent in {"", "none"}:
+        analysis_intent = "ranking" if isinstance(ranking, dict) and ranking else "lookup"
+    else:
+        analysis_intent = raw_analysis_intent
     requires_explanation = bool(
         understanding.get("requiresExplanation")
         or understanding.get("requires_explanation")
-        or analysis_intent not in {"", "lookup", "metric", "ranking"}
+        or analysis_intent not in {"", "none", "lookup", "metric", "ranking"}
     )
     answer_modes = sorted({str(getattr(intent.answer_mode, "value", intent.answer_mode)) for intent in plan.intents})
     if requires_explanation:

@@ -5,7 +5,19 @@ from pathlib import Path
 from merchant_ai.config import get_settings
 from merchant_ai.graph.policy import V2AgentPolicy
 from merchant_ai.graph.workflow import create_workflow
-from merchant_ai.models import ChatContext, RouteSlots
+from merchant_ai.models import (
+    AgentRunResult,
+    AgentTaskResult,
+    AnswerMode,
+    ChatContext,
+    IntentType,
+    QueryBundle,
+    QueryPlan,
+    QuestionCategory,
+    QuestionIntent,
+    RouteSlots,
+    VerifiedEvidence,
+)
 from merchant_ai.services.distributed_workers import normalize_subagent_result
 from merchant_ai.services.tools import delegate_subagent_tool
 
@@ -86,6 +98,7 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
     )
     workflow = create_workflow(settings)
     assert workflow.lead_llm_action_catalog(["run_analysis_skill", "delegate_subagent", "answer_data"]) == [
+        "run_analysis_skill",
         "delegate_subagent",
         "answer_data",
     ]
@@ -102,8 +115,9 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
     assert result_state["subagent_delegation_completed"] is True
     assert result_state["subagent_delegation_plan"]["tasks"][0]["taskKind"] == "document_analysis"
     result = result_state["subagent_delegation_results"][0]
-    assert result["status"] == "failed"
-    assert result["recommendedNextAction"] in {"retry_or_switch_strategy", "fallback_to_lead_agent"}
+    assert result["status"] == "completed"
+    assert result["recommendedNextAction"] == "return_to_lead_agent"
+    assert result["summary"]
     assert set(
         [
             "status",
@@ -116,3 +130,55 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
         ]
     ).issubset(result)
     assert result_state["main_agent_observations"][-1]["stage"] == "delegate_subagent"
+
+
+def test_workflow_delegates_generic_analysis_worker(tmp_path: Path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "distributed_subagents_enabled": False,
+            "openai_api_key": "",
+        }
+    )
+    workflow = create_workflow(settings)
+    state = workflow._initial_state("最近30天GMV是否异常？", "100", ChatContext(), None, "thread_analysis_delegate", "run_analysis_delegate")
+    state["plan"] = QueryPlan(
+        question_understanding={"analysisIntent": "anomaly_check", "requiresExplanation": True, "analysisGrain": "day"},
+        intents=[
+            QuestionIntent(
+                question="最近30天GMV是否异常？",
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                category=QuestionCategory.TRADE,
+                plan_task_id="gmv_trend",
+                metric_name="order_gmv_amt_1d",
+                group_by_column="pt",
+                preferred_table="ads_merchant_profile",
+            )
+        ],
+    )
+    bundle = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[
+            {"pt": "2026-07-01", "order_gmv_amt_1d": 100},
+            {"pt": "2026-07-02", "order_gmv_amt_1d": 220},
+        ],
+        original_row_count=2,
+    )
+    state["agent_run_result"] = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="gmv_trend", success=True, query_bundle=bundle)],
+        query_bundles=[bundle],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    state["sql_generated"] = True
+    state["evidence_graph_verified"] = True
+    state["evidence_accepted"] = True
+
+    result_state = workflow.delegate_subagent(state)
+
+    assert result_state["subagent_delegation_plan"]["tasks"][0]["taskKind"] == "analysis_worker"
+    result = result_state["subagent_delegation_results"][0]
+    assert result["status"] == "completed"
+    assert "ANALYSIS_WORKER" in str(result)
+    assert result_state["analysis_summary"]

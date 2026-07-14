@@ -387,6 +387,40 @@ def sql_has_bound_column_filter(sql: str, column: str) -> bool:
     return any("%s" in str(match.group("rhs") or "") or "?" in str(match.group("rhs") or "") for match in pattern.finditer(sql or ""))
 
 
+def has_pt_filter_predicate(sql: str) -> bool:
+    parsed = parse_sql_for_binding(sql)
+    if parsed is not None:
+        predicate_types = (
+            exp.Between,
+            exp.EQ,
+            exp.GT,
+            exp.GTE,
+            exp.In,
+            exp.LT,
+            exp.LTE,
+        )
+        for predicate in parsed.find_all(*predicate_types):
+            if predicate_references_column(predicate, "pt"):
+                return True
+    return bool(
+        re.search(
+            r"(?:`pt`|\bpt\b)\s*(?:=|>=|>|<=|<|BETWEEN\b|IN\s*\()",
+            sql or "",
+            flags=re.I,
+        )
+    )
+
+
+def predicate_references_column(expression: Any, column: str) -> bool:
+    normalized = normalize_identifier(column)
+    if not normalized:
+        return False
+    for item in expression.find_all(exp.Column):
+        if normalize_identifier(item.name) == normalized:
+            return True
+    return False
+
+
 def bind_node_sql_parameters_ast(
     sql: str,
     values_by_column: Dict[str, List[Any]],

@@ -57,8 +57,8 @@ def normalize_subagent_result(
         message = str(body.get("stderr") or "python batch exited with return code %s" % body.get("returncode")).strip()
     elif task_kind == "query_node" and body.get("success") is False:
         message = str(body.get("errorMessage") or body.get("error") or "query node reported failure").strip()
-    elif task_kind == "analysis_skill" and isinstance(body.get("trace"), dict) and body["trace"].get("error"):
-        message = str(body["trace"].get("error") or "analysis skill reported failure").strip()
+    elif task_kind in {"analysis_skill", "analysis_worker"} and isinstance(body.get("trace"), dict) and body["trace"].get("error"):
+        message = str(body["trace"].get("error") or "%s reported failure" % task_kind).strip()
     retryable = normalized_status in {"timeout", "canceled"} or any(
         token in message.lower() for token in ("timeout", "temporar", "connection", "provider")
     )
@@ -413,6 +413,7 @@ class DistributedSubAgentWorker:
 def builtin_worker_handlers(settings: Settings) -> Dict[str, TaskHandler]:
     return {
         "query_node": lambda request, canceled: execute_query_node_task(settings, request, canceled),
+        "analysis_worker": lambda request, canceled: execute_analysis_worker_task(settings, request, canceled),
         "analysis_skill": lambda request, canceled: execute_analysis_skill_task(settings, request, canceled),
         "hypothesis_review": lambda request, canceled: execute_hypothesis_review_task(request, canceled),
         "document_analysis": lambda request, canceled: execute_document_analysis_task(settings, request, canceled),
@@ -469,6 +470,27 @@ def execute_analysis_skill_task(settings: Settings, request: Dict[str, Any], can
     return {"answer": result.answer, "trace": result.trace}
 
 
+def execute_analysis_worker_task(settings: Settings, request: Dict[str, Any], canceled: Callable[[], bool]) -> Dict[str, Any]:
+    from merchant_ai.models import AgentRunResult, MerchantInfo, QueryPlan
+    from merchant_ai.services.analysis_worker import AnalysisWorkerExecutor
+    from merchant_ai.services.llm import LlmClient
+
+    if canceled():
+        raise DistributedTaskError("analysis worker canceled before start")
+    local_settings = settings.model_copy(update={"distributed_subagents_enabled": False})
+    result = AnalysisWorkerExecutor(LlmClient(local_settings)).execute(
+        str(request.get("question") or ""),
+        QueryPlan.model_validate(request.get("plan") or {}),
+        AgentRunResult.model_validate(request.get("runResult") or {}),
+        str(request.get("outputsPath") or ""),
+        str(request.get("ruleContext") or ""),
+        merchant=MerchantInfo.model_validate(request.get("merchant") or {}),
+        personalization_context=dict(request.get("personalizationContext") or {}),
+        initial_trace=dict(request.get("initialTrace") or {}),
+    )
+    return {"summary": result.answer, "answer": result.answer, "trace": result.trace}
+
+
 def execute_hypothesis_review_task(request: Dict[str, Any], canceled: Callable[[], bool]) -> Dict[str, Any]:
     from merchant_ai.models import AgentRunResult
     from merchant_ai.services.controlled_react import ControlledReactExplorer
@@ -500,7 +522,15 @@ def execute_document_analysis_task(settings: Settings, request: Dict[str, Any], 
     )
     result = {"answer": answer, "sourceChars": len(content), "truncated": len(content) > 100_000}
     if not str(answer or "").strip():
-        result["error"] = str(llm.last_error or "document analysis returned an empty response")
+        excerpt = " ".join(line.strip() for line in content.splitlines() if line.strip())[:1200]
+        result["answer"] = "文档要点：%s" % (excerpt or "未提取到可读文本")
+        result["fallbackUsed"] = True
+        result["gaps"] = [
+            {
+                "code": "DOCUMENT_LLM_UNAVAILABLE",
+                "message": str(llm.last_error or "document analysis used extractive fallback")[:1000],
+            }
+        ]
     return result
 
 

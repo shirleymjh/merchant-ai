@@ -1906,6 +1906,11 @@ class PendingAnswer(APIModel):
     category_name: str
     doris_tables: str
     suggested_questions: str
+    thread_id: str = ""
+    user_id: str = ""
+    identity_scope_hash: str = ""
+    store_ids: List[str] = Field(default_factory=list)
+    permissions: List[str] = Field(default_factory=list)
     langfuse_trace_id: str = ""
     langfuse_session_id: str = ""
     create_time: datetime = Field(default_factory=datetime.now)

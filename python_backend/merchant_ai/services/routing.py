@@ -4,6 +4,7 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Dict, List, Optional, Set
 
 from merchant_ai.models import (
@@ -96,6 +97,21 @@ class KeywordExtractService:
         self._semantic_topic_matcher = PhraseMatcher(list(self._semantic_topics))
         self._semantic_dimensions = self._build_semantic_dimension_lexicon(self.topic_assets)
         self._semantic_dimension_matcher = PhraseMatcher(list(self._semantic_dimensions))
+
+    def business_surface_signal(self, question: str) -> Dict[str, Any]:
+        """Detect whether the text touches governed business assets without resolving them."""
+
+        normalized = normalize_keyword_text(question or "")
+        hits = set()
+        for matcher in [self._semantic_topic_matcher, self._semantic_matcher, self._semantic_dimension_matcher]:
+            try:
+                hits.update(str(item) for item in matcher.match(normalized))
+            except Exception:
+                continue
+        return {
+            "hasBusinessDomainPhrase": bool(hits),
+            "businessSurfaceSignalCount": len(hits),
+        }
 
     def extract(self, question: str) -> ExtractedKeywords:
         text = question or ""
@@ -258,7 +274,9 @@ class KeywordExtractService:
                 for metric in topic_assets.load_table_metrics(topic_name, table):
                     metric_key = str(metric.get("canonicalMetricKey") or metric.get("metricKey") or "")
                     business_name = str(metric.get("businessName") or metric_key)
-                    aliases = [business_name, metric_key, str(metric.get("metricKey") or ""), *(metric.get("aliases") or [])]
+                    aliases = semantic_metric_alias_phrases(
+                        [business_name, metric_key, str(metric.get("metricKey") or ""), *(metric.get("aliases") or [])]
+                    )
                     for alias in aliases:
                         phrase = normalize_keyword_text(str(alias or ""))
                         if not valid_metric_alias(phrase):
@@ -442,6 +460,26 @@ def semantic_alias_phrases(labels: List[str]) -> List[str]:
             continue
         phrases.append(text)
     return dedupe_ordered(phrases)
+
+
+def semantic_metric_alias_phrases(labels: List[str]) -> List[str]:
+    phrases = semantic_alias_phrases(labels)
+    generated: List[str] = []
+    for phrase in phrases:
+        compact = phrase.replace(" ", "")
+        if len(compact) <= 2:
+            continue
+        generated.append(compact)
+        if compact.endswith("元") and len(compact) > 3:
+            generated.append(compact[:-1])
+        for prefix in ["订单", "交易", "支付成功", "退款订单", "退款关联", "售后关联", "每日"]:
+            if compact.startswith(prefix) and len(compact) > len(prefix) + 1:
+                generated.append(compact[len(prefix):])
+        if "退款" in compact and "支付金额" in compact:
+            generated.append("退款金额")
+        if "支付" in compact and "金额" in compact:
+            generated.append("支付金额")
+    return dedupe_ordered([*phrases, *generated])
 
 
 def phrase_spans(text: str, phrase: str) -> List[tuple[int, int]]:
@@ -637,7 +675,7 @@ class QuestionRoutingService:
 
 
 class SemanticPreflightRouteClassifier:
-    ROUTES = {"GREETING", "BUSINESS_CHAT", "BUSINESS_TASK", "INVALID", "CLARIFICATION_REPLY"}
+    ROUTES = {"GREETING", "BUSINESS_CHAT", "BUSINESS_TASK", "INVALID", "CLARIFICATION_REPLY", "UNSUPPORTED_WRITE"}
 
     def __init__(self, settings: Any, llm: Any = None):
         self.settings = settings
@@ -720,6 +758,14 @@ class SemanticPreflightRouteClassifier:
             return {"enabled": True, "status": "failed", "error": str(exc)[:240]}
         if not isinstance(result, dict):
             return {"enabled": True, "status": "invalid_result"}
+        provider_error = str(getattr(self.llm, "last_error", "") or "")
+        if not result and provider_error:
+            return {
+                "enabled": True,
+                "status": "failed",
+                "error": provider_error[:240],
+                "failureType": "provider_error",
+            }
         route = str(result.get("route") or "").strip().upper()
         if route not in self.ROUTES:
             return {"enabled": True, "status": "invalid_route", "raw": result}
@@ -736,6 +782,274 @@ class SemanticPreflightRouteClassifier:
             "signals": result.get("signals") if isinstance(result.get("signals"), dict) else {},
             "missingSlots": result.get("missingSlots") if isinstance(result.get("missingSlots"), list) else [],
         }
+
+    def classify_surface(
+        self,
+        question: str,
+        surface_signals: Dict[str, Any],
+        pending_context: bool = False,
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self.settings, "preflight_semantic_route_enabled", False)):
+            return {"enabled": False, "status": "disabled"}
+        if not self.llm or not getattr(self.llm, "configured", False) or not hasattr(self.llm, "json_chat"):
+            return {"enabled": True, "status": "unavailable"}
+        system_prompt = (
+            "你是商家经营助手的入口闸门，只判断是否进入后续业务链路。"
+            "不要选择 Topic，不要解析指标口径，不要选择表，不要生成 SQL。"
+            "严格输出 JSON。route 只能是 GREETING、BUSINESS_TASK、BUSINESS_CHAT、INVALID、CLARIFICATION_REPLY、UNSUPPORTED_WRITE。"
+            "BUSINESS_TASK 表示值得进入后续 Topic/RAG/Planner 链路；它不要求指标、时间、口径已经完整。"
+            "只要问题包含商家经营相关对象、业务域、指标样式、时间范围、明细查询、趋势/情况/表现等表达，就应优先输出 BUSINESS_TASK。"
+            "不要因为用户表达简短、指标不完整、时间不完整、只说“情况/表现/怎么样”而判 INVALID；后续 Topic 和澄清节点会处理缺口。"
+            "INVALID 只用于明显非商家经营场景，或完全没有业务对象/经营目标的问题。"
+            "BUSINESS_CHAT 只用于助手能力说明、经营概念闲聊、无需查数或分析的问题；包含订单、退款、商品、工单、履约、赔付、优惠券等经营对象时不要输出 BUSINESS_CHAT。"
+            "如果存在 pendingContext 且当前输入像补充条件、确认或选择，优先 CLARIFICATION_REPLY。"
+            "如果用户要求删除、修改、更新、创建、写入、导入、重建等写操作，输出 UNSUPPORTED_WRITE。"
+        )
+        payload = {
+            "question": str(question or "")[:800],
+            "pendingContext": bool(pending_context),
+            "surfaceSignals": surface_signals,
+            "decisionHints": [
+                "最近7天订单和退款情况 -> BUSINESS_TASK",
+                "昨天客服工单怎么样 -> BUSINESS_TASK",
+                "帮我看一下商品审核情况 -> BUSINESS_TASK",
+                "今天天气怎么样 -> INVALID",
+                "你能做什么 -> BUSINESS_CHAT",
+            ],
+            "outputSchema": {
+                "route": "GREETING|BUSINESS_TASK|BUSINESS_CHAT|INVALID|CLARIFICATION_REPLY|UNSUPPORTED_WRITE",
+                "confidence": "0.0-1.0",
+                "intentKind": "chat|business_task|business_chat|clarification_reply|unsupported_write|invalid",
+                "missingInfo": ["business_scope", "metric", "time_window", "object", "analysis_goal"],
+                "clarificationQuestion": "short question when route is INVALID",
+                "reason": "short Chinese reason",
+            },
+        }
+        try:
+            result = self.llm.json_chat(
+                system_prompt,
+                json.dumps(payload, ensure_ascii=False, default=str),
+                fallback={},
+                timeout_seconds=int(getattr(self.settings, "preflight_semantic_route_timeout_seconds", 3) or 3),
+            )
+        except Exception as exc:
+            return {"enabled": True, "status": "failed", "error": str(exc)[:240]}
+        if not isinstance(result, dict):
+            return {"enabled": True, "status": "invalid_result"}
+        provider_error = str(getattr(self.llm, "last_error", "") or "")
+        if not result and provider_error:
+            return {"enabled": True, "status": "failed", "error": provider_error[:240], "failureType": "provider_error"}
+        route = str(result.get("route") or "").strip().upper()
+        if route not in self.ROUTES:
+            return {"enabled": True, "status": "invalid_route", "raw": result}
+        try:
+            confidence = float(result.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return {
+            "enabled": True,
+            "status": "success",
+            "route": route,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "intentKind": str(result.get("intentKind") or result.get("intent_kind") or "").strip(),
+            "missingInfo": result.get("missingInfo") if isinstance(result.get("missingInfo"), list) else [],
+            "clarificationQuestion": str(result.get("clarificationQuestion") or result.get("clarification_question") or "")[:300],
+            "reason": str(result.get("reason") or "")[:300],
+        }
+
+
+@dataclass
+class PreflightUnderstanding:
+    keywords: ExtractedKeywords
+    route_slots: RouteSlots
+    rule_route: RoutingDecision
+    semantic_trace: Dict[str, Any]
+    routing_decision: RoutingDecision
+    trace: List[Dict[str, Any]] = dataclass_field(default_factory=list)
+    surface_signals: Dict[str, Any] = dataclass_field(default_factory=dict)
+    clarification_question: str = ""
+
+
+class PreflightUnderstandingService:
+    """Small-model-first entry gate. It does not resolve Topic, metric, or table."""
+
+    def __init__(
+        self,
+        settings: Any,
+        keyword_service: KeywordExtractService,
+        routing_service: QuestionRoutingService,
+        slot_extractor: "RouteSlotExtractor",
+        semantic_classifier: SemanticPreflightRouteClassifier,
+    ):
+        self.settings = settings
+        self.keyword_service = keyword_service
+        self.routing_service = routing_service
+        self.slot_extractor = slot_extractor
+        self.semantic_classifier = semantic_classifier
+
+    def understand(self, question: str, pending_context: bool = False) -> PreflightUnderstanding:
+        surface_signals = self.surface_signals(question)
+        surface_signals["pendingContext"] = bool(pending_context)
+        rule_route = self.hard_gate_route(question, surface_signals, pending_context)
+        semantic_trace = self.semantic_classifier.classify_surface(
+            question,
+            surface_signals,
+            pending_context=pending_context,
+        )
+        routing_decision = self.merge_gate_routes(rule_route, semantic_trace, surface_signals, pending_context)
+        route_slots = RouteSlots(
+            operation="write_requested" if surface_signals.get("writeOperation") else "read",
+            risk_level="high_risk" if surface_signals.get("writeOperation") else "normal",
+            route_confidence=float(surface_signals.get("confidence") or 0.0),
+            route_warnings=["PREFLIGHT_SURFACE_ONLY"] + (["WRITE_OPERATION_REQUESTED"] if surface_signals.get("writeOperation") else []),
+        )
+        keywords = ExtractedKeywords()
+        trace = [
+            {
+                "stage": "preflight_surface_gate",
+                "surfaceSignals": surface_signals,
+                "ruleRoute": enum_route(rule_route.route),
+            },
+            {
+                "stage": "semantic_preflight_route",
+                "ruleRoute": enum_route(rule_route.route),
+                "finalRoute": enum_route(routing_decision.route),
+                "semantic": semantic_trace,
+            },
+        ]
+        return PreflightUnderstanding(
+            keywords=keywords,
+            route_slots=route_slots,
+            rule_route=rule_route,
+            semantic_trace=semantic_trace,
+            routing_decision=routing_decision,
+            trace=trace,
+            surface_signals=surface_signals,
+            clarification_question=str(semantic_trace.get("clarificationQuestion") or ""),
+        )
+
+    def surface_signals(self, question: str) -> Dict[str, Any]:
+        text = str(question or "").strip()
+        lowered = text.lower()
+        business_surface = self.keyword_service.business_surface_signal(text)
+        has_time = bool(any(pattern.search(text) for pattern in TIME_PATTERNS)) or any(
+            word in text for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]
+        )
+        has_object_ref = bool(any(pattern.search(text) for _ref_type, pattern in RouteSlotExtractor.OBJECT_PATTERNS))
+        raw_analysis_intent = bool(any(term in text for term in ACTION_KEYWORDS))
+        write_operation = bool(any(term.lower() in lowered for term in RouteSlotExtractor.WRITE_TERMS))
+        greeting = bool(re.match(r"^(你好|您好|hi|hello|hey|在吗|嗨|哈喽|早上好|下午好|晚上好)[!！。,.，\s]*$", lowered, re.I))
+        assistant_chat_phrase = bool(
+            any(term in text for term in ["你是谁", "你能做什么", "你可以做什么", "你会什么", "怎么用", "如何使用"])
+        )
+        business_metric_like = bool(
+            re.search(
+                r"(gmv|销售额|成交额|支付金额|客单价|订单量|单量|下单量|退款率|退款金额|退货率|售后率|"
+                r"赔付率|赔付金额|工单率|优惠券|转化率|履约率|发货率|审核通过率|商品数|库存)",
+                lowered,
+                re.I,
+            )
+        )
+        generic_metric_like = bool(re.search(r"(金额|数量|率|趋势|排行|top|最高|最低|最多|最少|多少)", lowered, re.I))
+        metric_like = bool(business_metric_like or (generic_metric_like and business_surface.get("hasBusinessDomainPhrase")))
+        assistant_chat = bool(
+            assistant_chat_phrase
+            and not (
+                business_surface.get("hasBusinessDomainPhrase")
+                or has_time
+                or has_object_ref
+                or metric_like
+            )
+        )
+        confidence = 0.2
+        has_analysis_intent = bool(
+            raw_analysis_intent
+            and (
+                business_surface.get("hasBusinessDomainPhrase")
+                or business_metric_like
+                or has_object_ref
+            )
+        )
+        if greeting or assistant_chat or write_operation:
+            confidence = 0.98
+        elif has_time or has_object_ref or has_analysis_intent or metric_like or business_surface.get("hasBusinessDomainPhrase"):
+            confidence = 0.72
+        return {
+            "empty": not bool(text),
+            "greeting": greeting,
+            "assistantChat": assistant_chat,
+            "writeOperation": write_operation,
+            "hasTimeExpression": has_time,
+            "hasObjectRef": has_object_ref,
+            "hasMetricLikePhrase": metric_like,
+            "hasBusinessMetricLikePhrase": business_metric_like,
+            "hasGenericMetricLikePhrase": generic_metric_like,
+            "hasAnalysisIntent": has_analysis_intent,
+            **business_surface,
+            "confidence": confidence,
+        }
+
+    def hard_gate_route(self, question: str, signals: Dict[str, Any], pending_context: bool) -> RoutingDecision:
+        if signals.get("empty"):
+            return RoutingDecision(route=QuestionRoute.INVALID, reason="空问题")
+        if signals.get("writeOperation"):
+            return RoutingDecision(route=QuestionRoute.INVALID, reason="检测到写操作请求，当前只支持只读查询和分析")
+        if signals.get("greeting") or signals.get("assistantChat"):
+            return RoutingDecision(route=QuestionRoute.GREETING, reason="寒暄问题")
+        if pending_context:
+            return RoutingDecision(route=QuestionRoute.BUSINESS, complex=False, reason="上一轮存在澄清/确认上下文，进入完整上下文承接")
+        return RoutingDecision(route=QuestionRoute.INVALID, reason="等待小模型入口判断")
+
+    def merge_gate_routes(
+        self,
+        rule_route: RoutingDecision,
+        semantic_trace: Dict[str, Any],
+        signals: Dict[str, Any],
+        pending_context: bool,
+    ) -> RoutingDecision:
+        if rule_route.reason in {"空问题", "检测到写操作请求，当前只支持只读查询和分析", "寒暄问题"}:
+            return rule_route
+        has_business_surface = bool(signals.get("hasObjectRef") or signals.get("hasMetricLikePhrase") or signals.get("hasAnalysisIntent"))
+        has_business_task_surface = bool(
+            has_business_surface
+            or (
+                signals.get("hasBusinessDomainPhrase")
+                and (signals.get("hasTimeExpression") or signals.get("hasObjectRef") or signals.get("hasMetricLikePhrase") or signals.get("hasAnalysisIntent"))
+            )
+        )
+        if pending_context and semantic_trace.get("status") != "success":
+            return rule_route
+        if not semantic_trace or semantic_trace.get("status") != "success":
+            if has_business_task_surface:
+                return RoutingDecision(route=QuestionRoute.BUSINESS, complex=bool(signals.get("hasAnalysisIntent")), reason="入口 surface signal 足够，进入后续 Topic/RAG 链路")
+            return RoutingDecision(route=QuestionRoute.INVALID, reason="入口信息不足，需要补充业务范围或查询目标")
+        semantic_route = str(semantic_trace.get("route") or "")
+        confidence = float(semantic_trace.get("confidence") or 0)
+        min_conf = float(getattr(self.settings, "preflight_semantic_route_min_confidence", 0.62) or 0.62)
+        if pending_context and semantic_route == "CLARIFICATION_REPLY" and confidence >= min_conf:
+            return RoutingDecision(route=QuestionRoute.BUSINESS, complex=False, reason="语义路由：上一轮澄清/确认承接回复")
+        if confidence < min_conf:
+            if has_business_task_surface:
+                return RoutingDecision(route=QuestionRoute.BUSINESS, complex=bool(signals.get("hasAnalysisIntent")), reason="入口 surface signal 覆盖低置信小模型，进入后续 Topic/RAG 链路")
+            return RoutingDecision(route=QuestionRoute.INVALID, reason="小模型入口置信度不足，需要补充业务范围或查询目标")
+        if semantic_route == "GREETING":
+            return RoutingDecision(route=QuestionRoute.GREETING, complex=False, reason="入口判断：轻量对话，不触发查数")
+        if semantic_route == "BUSINESS_CHAT":
+            if has_business_task_surface:
+                return RoutingDecision(route=QuestionRoute.BUSINESS, complex=bool(signals.get("hasAnalysisIntent")), reason="入口 surface signal 覆盖小模型闲聊判断，进入后续 Topic/RAG 链路")
+            if not has_business_surface and not signals.get("greeting") and not signals.get("assistantChat"):
+                return RoutingDecision(route=QuestionRoute.INVALID, complex=False, reason=str(semantic_trace.get("reason") or "入口判断：需要补充业务范围或查询目标"))
+            return RoutingDecision(route=QuestionRoute.GREETING, complex=False, reason="入口判断：轻量业务对话，不触发查数")
+        if semantic_route == "UNSUPPORTED_WRITE":
+            return RoutingDecision(route=QuestionRoute.INVALID, complex=False, reason="入口判断：当前只支持只读查询和分析")
+        if semantic_route in {"BUSINESS_TASK", "CLARIFICATION_REPLY"}:
+            return RoutingDecision(route=QuestionRoute.BUSINESS, complex=bool(signals.get("hasAnalysisIntent")), reason="入口判断：业务任务，进入后续 Topic/RAG 链路")
+        if semantic_route == "INVALID" and has_business_task_surface:
+            return RoutingDecision(route=QuestionRoute.BUSINESS, complex=bool(signals.get("hasAnalysisIntent")), reason="入口 surface signal 覆盖小模型 INVALID，进入后续 Topic/RAG 链路")
+        return RoutingDecision(route=QuestionRoute.INVALID, complex=False, reason=str(semantic_trace.get("reason") or "入口判断：需要补充业务范围或查询目标"))
+
+def enum_route(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
 
 
 class RouteSlotExtractor:
@@ -990,8 +1304,8 @@ class TopicRouterService:
         if not candidates:
             return TopicRoutingDecision(
                 primary_topic=QuestionCategory.UNKNOWN,
-                clarification_required=False,
-                reason="未识别出显式业务 topic；保持开放 scope，交由后续 LLM/知识检索发现缺口",
+                clarification_required=True,
+                reason="未识别出显式业务 topic；默认先确认分析范围，开放诊断问题由 OpenDiagnosticPolicy 接管",
             )
         top_score = max(scores.get(category, 0) for category in candidates)
         confidence = min(0.95, 0.45 + 0.08 * len(candidates) + 0.08 * top_score)

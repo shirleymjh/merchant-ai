@@ -79,6 +79,7 @@ from merchant_ai.services.query_sql_binding import (
     bind_node_sql_parameters,
     blank_entity_value,
     has_merchant_filter_predicate,
+    has_pt_filter_predicate,
     inclusive_day_interval,
     is_dependent_context_column,
     normalize_inclusive_relative_window_sql,
@@ -2641,23 +2642,40 @@ class NodeWorkerExecutor:
         safe_sql = self._draft_structured_sql(intent, asset_pack, context, contract=contract, resource_safe=True)
         if not safe_sql:
             return None
-        safe_bound_sql, safe_params, binding_error = bind_node_sql_parameters(safe_sql, intent, asset_pack, context)
-        if binding_error:
+        base_validation = self.validator.validate(safe_sql, asset_pack)
+        base_validation = self._node_scope_validation(base_validation, intent, safe_sql, asset_pack)
+        base_validation = self._contract_scope_validation(base_validation, intent, safe_sql, contract)
+        if not base_validation.valid:
             return None
         chunk_days = max(1, int(getattr(self.settings, "agent_doris_split_chunk_days", 7) or 7))
         max_chunks = max(1, int(getattr(self.settings, "agent_doris_split_max_chunks", 6) or 6))
         max_concurrency = max(1, int(getattr(self.settings, "agent_doris_split_max_concurrency", 3) or 3))
         limit = structured_limit(intent.limit, detail=True, resource_safe=True)
-        split_sqls = split_detail_sql_by_pt_windows(safe_bound_sql, int(intent.days or 0), chunk_days, max_chunks, limit)
+        split_sqls = split_detail_sql_by_pt_windows(safe_sql, int(intent.days or 0), chunk_days, max_chunks, limit)
         if not split_sqls:
             return None
         anchor_date = ""
-        anchored_split_sqls: List[str] = []
+        chunk_queries: List[Tuple[str, List[Any]]] = []
         for split_sql in split_sqls:
-            anchored_sql, split_anchor_date = self._apply_partition_date_anchor(split_sql, intent, freshness)
-            anchored_split_sqls.append(anchored_sql)
+            split_validation = self.validator.validate(split_sql, asset_pack)
+            split_validation = self._node_scope_validation(split_validation, intent, split_sql, asset_pack)
+            split_validation = self._contract_scope_validation(split_validation, intent, split_sql, contract)
+            if not split_validation.valid:
+                return None
+            safe_bound_sql, safe_params, binding_error = bind_node_sql_parameters(split_sql, intent, asset_pack, context)
+            tenant_binding_error = tenant_scope_binding_error(safe_bound_sql, safe_params, contract, context)
+            if tenant_binding_error:
+                binding_error = binding_error or tenant_binding_error
+            if binding_error:
+                return None
+            anchored_sql, split_anchor_date = self._apply_partition_date_anchor(safe_bound_sql, intent, freshness)
+            access_decision = self.access_control.authorize_contract(contract, anchored_sql, run_id=context.sub_agent_run_id)
+            if not access_decision.allowed:
+                return None
+            chunk_queries.append((anchored_sql, safe_params))
             anchor_date = anchor_date or split_anchor_date
-        split_sqls = anchored_split_sqls
+        if not chunk_queries:
+            return None
         events: List[Dict[str, Any]] = [
             {
                 "event": "split_query_fallback_started",
@@ -2666,8 +2684,8 @@ class NodeWorkerExecutor:
                 "originalDurationMs": previous_duration_ms,
                 "chunkDays": chunk_days,
                 "maxChunks": max_chunks,
-                "chunkCount": len(split_sqls),
-                "maxConcurrency": min(max_concurrency, len(split_sqls)),
+                "chunkCount": len(chunk_queries),
+                "maxConcurrency": min(max_concurrency, len(chunk_queries)),
                 "executionMode": "parallel_chunks",
                 "limit": limit,
                 "anchorPartitionDate": anchor_date,
@@ -2679,12 +2697,12 @@ class NodeWorkerExecutor:
         chunk_results: Dict[int, List[Dict[str, Any]]] = {}
         split_cancel_event = Event()
 
-        def query_chunk(index: int, chunk_sql: str) -> Dict[str, Any]:
+        def query_chunk(index: int, chunk_sql: str, chunk_params: List[Any]) -> Dict[str, Any]:
             chunk_started = time.perf_counter()
             chunk_rows = doris_query_with_cancellation(
                 self.doris_repository,
                 chunk_sql,
-                safe_params,
+                chunk_params,
                 cancel_events=[context.cancel_event, split_cancel_event],
                 timeout_seconds=self.settings.doris_read_timeout_seconds,
             )
@@ -2697,11 +2715,11 @@ class NodeWorkerExecutor:
                 "sql": trim_sql(chunk_sql, 600),
             }
 
-        executor = ThreadPoolExecutor(max_workers=min(max_concurrency, len(split_sqls)))
+        executor = ThreadPoolExecutor(max_workers=min(max_concurrency, len(chunk_queries)))
         try:
             futures = {
-                submit_with_current_context(executor, query_chunk, index, chunk_sql): (index, chunk_sql)
-                for index, chunk_sql in enumerate(split_sqls, start=1)
+                submit_with_current_context(executor, query_chunk, index, chunk_sql, chunk_params): (index, chunk_sql)
+                for index, (chunk_sql, chunk_params) in enumerate(chunk_queries, start=1)
             }
             try:
                 for future in as_completed(
@@ -3074,6 +3092,14 @@ class NodeWorkerExecutor:
                     "valid": False,
                     "error_code": "MISSING_PARTITION_FILTER",
                     "message": "Node SQL 必须包含 pt 分区过滤或 pt 分组",
+                }
+            )
+        if "pt" in columns and (int(intent.days or 0) > 0 or intent.time_range.start_date or intent.time_range.end_date) and not has_pt_filter_predicate(sql):
+            return validation.model_copy(
+                update={
+                    "valid": False,
+                    "error_code": "MISSING_PARTITION_FILTER",
+                    "message": "带时间范围的 Node SQL 必须在 WHERE/HAVING 中包含 pt 分区过滤，不能只 SELECT/GROUP BY pt",
                 }
             )
         if "pt" in columns and invalid_pt_date_filter(sql):

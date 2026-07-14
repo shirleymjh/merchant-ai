@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect
 import re
 import time
 from contextlib import contextmanager
@@ -147,12 +148,14 @@ class DorisRepository:
                 self.last_cache_key = cache_key
                 return cached
         try:
-            rows = self.db.query(
-                sql,
-                params_list or None,
-                cancel_events=cancel_events,
-                timeout_seconds=timeout_seconds,
-            )
+            query_signature = inspect.signature(self.db.query)
+            supported = set(query_signature.parameters)
+            kwargs: Dict[str, Any] = {}
+            if "cancel_events" in supported:
+                kwargs["cancel_events"] = cancel_events
+            if "timeout_seconds" in supported:
+                kwargs["timeout_seconds"] = timeout_seconds
+            rows = self.db.query(sql, params_list or None, **kwargs)
         except Exception as exc:
             self.last_degraded_reason = log_degraded("doris_repository", "query", exc)
             raise

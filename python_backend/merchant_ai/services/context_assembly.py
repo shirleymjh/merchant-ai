@@ -264,7 +264,14 @@ class ContextAssembler:
             self._record_report(state, stage, agent, len(text or ""), len(text or ""), budget, False, [], [], "inline", content_hash)
             return text
         artifact = self._write_artifact(state, "context", "%s_%s_full.md" % (stage, agent), text)
-        preview = (text or "")[: max(500, budget - 700)]
+        preview_chars = max(500, budget - 700)
+        head_chars = max(250, int(preview_chars * 0.6))
+        tail_chars = max(250, preview_chars - head_chars)
+        source = text or ""
+        preview = source[:head_chars]
+        tail = source[-tail_chars:] if len(source) > head_chars + tail_chars else ""
+        if tail:
+            preview = "%s\n\n[context_tail_preview]\n%s" % (preview, tail)
         compact = (
             "%s\n\n[context_offloaded]\nfullContextArtifact=%s\nmerchantUri=%s\noriginalChars=%d"
             % (preview, artifact.relative_path or artifact.path, artifact.merchant_uri, len(text or ""))

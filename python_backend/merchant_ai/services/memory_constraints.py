@@ -162,13 +162,34 @@ def memory_instruction_text(payload: Dict[str, Any]) -> str:
     return "；".join(unique_strings(parts))
 
 
-def memory_constraint_validation_gaps(question: str, plan: QueryPlan, constraints: Iterable[Dict[str, Any]]) -> List[GraphValidationGap]:
+def memory_constraint_validation_gaps(
+    question: str,
+    plan: QueryPlan,
+    constraints: Iterable[Dict[str, Any]],
+    supported_metrics: Iterable[str] | None = None,
+) -> List[GraphValidationGap]:
     gaps: List[GraphValidationGap] = []
     plan_metrics = plan_metric_tokens(plan)
+    supported_metric_set = {normalize_token(metric) for metric in supported_metrics or [] if normalize_token(metric)}
     for constraint in constraints or []:
         if not memory_constraint_is_required(constraint):
             continue
         if not memory_constraint_applies(question, plan, constraint, plan_metrics):
+            continue
+        unsupported = [
+            metric
+            for metric in target_metrics(constraint)
+            if supported_metric_set and normalize_token(metric) not in supported_metric_set
+        ]
+        if unsupported:
+            gaps.append(
+                GraphValidationGap(
+                    code="MEMORY_CONSTRAINT_ASSET_MISSING",
+                    evidence=",".join(unsupported),
+                    reason="长期记忆要求的指标不在当前 PlanningAssetPack 中；必须先召回正式 semanticCatalog 资产，不能用 memory 改写语义层。sourceMemoryId=%s"
+                    % (constraint.get("id", "")),
+                )
+            )
             continue
         missing = [metric for metric in target_metrics(constraint) if metric not in plan_metrics]
         if not missing:
