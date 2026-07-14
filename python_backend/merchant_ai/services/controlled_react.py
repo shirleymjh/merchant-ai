@@ -181,9 +181,24 @@ class ControlledReactExplorer:
         survivor_limit = max(1, int(max_survivors or 1))
         survivor_ids: List[str] = []
         for index, item in enumerate(ranked):
-            survives = len(survivor_ids) < survivor_limit and (int(item.get("evidenceScore") or 0) >= int(min_score or 0) or not survivor_ids)
+            eligible = bool(
+                getattr(item.get("validation"), "valid", False)
+                and item.get("verifiedPassed")
+                and int(item.get("successfulTasks") or 0) > 0
+                and int(item.get("rowCount") or 0) > 0
+            )
+            survives = bool(
+                eligible
+                and len(survivor_ids) < survivor_limit
+                and int(item.get("evidenceScore") or 0) >= int(min_score or 0)
+            )
             item["decision"] = "survive" if survives else "pruned"
             item["rank"] = index + 1
+            if not survives:
+                if not eligible:
+                    item["eliminationReason"] = "hypothesis evidence did not pass validation and verification gates"
+                elif int(item.get("evidenceScore") or 0) < int(min_score or 0):
+                    item["eliminationReason"] = "hypothesis evidence score is below the survivor threshold"
             if survives:
                 survivor_ids.append(str(item.get("hypothesisId") or ""))
         return {
@@ -191,7 +206,7 @@ class ControlledReactExplorer:
             "survivorIds": survivor_ids,
             "prunedIds": [str(item.get("hypothesisId") or "") for item in ranked if item.get("decision") == "pruned"],
             "winnerId": survivor_ids[0] if survivor_ids else "",
-            "comparisonPolicy": "validated independent QueryGraph + verified evidence + rows + gap penalty",
+            "comparisonPolicy": "validation.valid && verified.passed && non-empty rows && score>=threshold",
         }
 
     def followup_decision(

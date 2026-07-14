@@ -29,6 +29,8 @@ from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.repositories import DorisRepository, write_json
+from merchant_ai.services.semantic_request import semantic_request_cache_key
+from merchant_ai.services.time_semantics import resolve_time_range
 from merchant_ai.services.tools import AgentToolDefinition
 
 
@@ -55,6 +57,7 @@ class TopicAssetService:
         self._manifest_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._relationship_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._topic_names_cache: Optional[List[str]] = None
+        self._semantic_source_hash_cache: Dict[Tuple[str, ...], str] = {}
 
     @property
     def root(self) -> Path:
@@ -100,6 +103,7 @@ class TopicAssetService:
             self._manifest_cache.pop(topic, None)
             self._relationship_cache.pop(topic, None)
             self._topic_names_cache = None
+            self._semantic_source_hash_cache.clear()
             return {
                 "success": True,
                 "status": "PUBLISHED",
@@ -145,6 +149,27 @@ class TopicAssetService:
         self._topic_names_cache = [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
         return self._topic_names_cache
 
+    def semantic_source_hash(self, topics: Iterable[str]) -> str:
+        cache_key = tuple(sorted({str(item or "") for item in topics if item}))
+        if cache_key in self._semantic_source_hash_cache:
+            return self._semantic_source_hash_cache[cache_key]
+        hasher = hashlib.sha256()
+        for topic in cache_key:
+            topic_dir = self.root / topic
+            if not topic_dir.exists():
+                continue
+            for path in sorted(topic_dir.rglob("*")):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                try:
+                    hasher.update(str(path.relative_to(self.root)).encode("utf-8"))
+                    hasher.update(path.read_bytes())
+                except Exception:
+                    continue
+        digest = hasher.hexdigest()[:16]
+        self._semantic_source_hash_cache[cache_key] = digest
+        return digest
+
     def load_topic_context(self, topic_names: Iterable[str]) -> str:
         parts: List[str] = []
         for topic in topic_names:
@@ -186,7 +211,7 @@ class TopicAssetService:
         for field, file_name in sidecar_fields.items():
             sidecar = read_json(table_dir / file_name)
             if sidecar:
-                asset[field] = merge_semantic_layer_list(asset.get(field), sidecar, field)
+                asset[field] = sidecar
             else:
                 asset.setdefault(field, [])
         self._table_asset_cache[cache_key] = asset
@@ -863,14 +888,29 @@ class HybridRecallService:
     ) -> RecallBundle:
         query_terms = recall_terms(question, getattr(keywords, "keywords", []))
         allowed_topics = set(self.topic_assets.topic_names_for_categories(topic_categories))
-        cache_key = stable_cache_key(
-            "recall",
-            {
-                "question": question,
-                "keywords": query_terms,
-                "merchantId": merchant_id,
-                "topics": sorted(allowed_topics),
-            },
+        metric_refs = [
+            str(getattr(item, "canonical_key", "") or getattr(item, "phrase", ""))
+            for item in getattr(keywords, "mentions", []) or []
+            if str(getattr(item, "kind", "") or "") == "metric"
+        ] or list(getattr(keywords, "metric_keywords", []) or [])
+        dimensions = [
+            str(getattr(item, "canonical_key", "") or getattr(item, "phrase", ""))
+            for item in getattr(keywords, "mentions", []) or []
+            if str(getattr(item, "kind", "") or "") == "dimension"
+        ] or list(getattr(keywords, "dimension_keywords", []) or [])
+        cache_key = (
+            semantic_request_cache_key(
+                "recall",
+                topics=sorted(allowed_topics),
+                metrics=metric_refs,
+                dimensions=dimensions,
+                filters=[],
+                time_range=resolve_time_range(question, self.settings.business_timezone),
+                asset_version={"semanticSourceHash": self.topic_assets.semantic_source_hash(allowed_topics)},
+                scope={"merchantId": merchant_id},
+            )
+            if metric_refs or dimensions
+            else ""
         )
         cached = self._recall_cache.get(cache_key)
         if cached is not None:
@@ -1259,6 +1299,31 @@ def normalize_table_usage_profile(profile: Any, table: str = "") -> Dict[str, An
     }
 
 
+def infer_aggregate_source_columns(
+    schema: List[Dict[str, Any]],
+    semantic_columns: List[Dict[str, Any]],
+) -> List[str]:
+    """Return schema-backed numeric measures that are safe to propose for review."""
+    roles = {
+        str(item.get("columnName") or ""): str(item.get("role") or "").upper()
+        for item in semantic_columns
+        if isinstance(item, dict) and item.get("columnName")
+    }
+    supported: List[str] = []
+    for column in schema:
+        if not isinstance(column, dict):
+            continue
+        name = str(column.get("columnName") or column.get("Field") or "").strip()
+        family = normalize_column_type_family(str(column.get("dataType") or column.get("Type") or ""))
+        role = roles.get(name, "")
+        if not name or family not in {"int", "bigint", "float", "double", "decimal"}:
+            continue
+        if role in {"KEY", "TIME", "DIMENSION"}:
+            continue
+        supported.append(name)
+    return dedupe_strings(supported)
+
+
 class PlanningAssetPackBuilder:
     def __init__(self, topic_assets: TopicAssetService, skill_loader: Optional[SkillLoader] = None, doris_repository: Optional[DorisRepository] = None):
         self.topic_assets = topic_assets
@@ -1305,23 +1370,27 @@ class PlanningAssetPackBuilder:
         seed_tables.update(bridge_tables)
         pack_tables = {table for table in seed_tables if table}
         live_schema_hash = self._live_schema_hash_for_tables(pack_tables)
-        cache_key = stable_cache_key(
-            "asset_pack",
+        recalled_metrics = [
             {
-                "question": question,
-                "recall": [
-                    (
-                        item.doc_id,
-                        round(float(item.fusion_score or 0), 4),
-                        tuple(str(query) for query in (item.metadata or {}).get("recallQueries") or []),
-                    )
-                    for item in recall_bundle.items
-                ],
-                "topics": [category.value if isinstance(category, QuestionCategory) else str(category) for category in topic_categories],
-                "diagnostic": diagnostic_context or {},
+                "metricKey": str((item.metadata or {}).get("metricKey") or ""),
+                "ownerTable": str(item.table or (item.metadata or {}).get("tableName") or ""),
+            }
+            for item in recall_bundle.items
+            if str((item.metadata or {}).get("metricKey") or "")
+        ]
+        cache_key = semantic_request_cache_key(
+            "asset_pack",
+            topics=[category.value if isinstance(category, QuestionCategory) else str(category) for category in topic_categories],
+            metrics=recalled_metrics,
+            dimensions=[],
+            filters=[diagnostic_context or {}] if diagnostic_context else [],
+            time_range=resolve_time_range(question, self.topic_assets.settings.business_timezone),
+            asset_version={
                 "semanticSourceHash": semantic_source_hash,
                 "liveSchemaHash": live_schema_hash,
+                "sourceRefs": sorted(item.doc_id for item in recall_bundle.items if item.doc_id),
             },
+            scope={},
         )
         cached = self._compact_cache.get(cache_key)
         if cached is not None:
@@ -1398,22 +1467,7 @@ class PlanningAssetPackBuilder:
         }
 
     def _topics_source_hash(self, topics: List[str]) -> str:
-        hasher = hashlib.sha256()
-        for topic in sorted({str(item or "") for item in topics if item}):
-            topic_dir = self.topic_assets.root / topic
-            if not topic_dir.exists():
-                continue
-            for path in sorted(topic_dir.rglob("*")):
-                if not path.is_file():
-                    continue
-                if path.name.startswith("."):
-                    continue
-                try:
-                    hasher.update(str(path.relative_to(self.topic_assets.root)).encode("utf-8"))
-                    hasher.update(path.read_bytes())
-                except Exception:
-                    continue
-        return hasher.hexdigest()[:16]
+        return self.topic_assets.semantic_source_hash(topics)
 
     def _live_schema_hash_for_tables(self, tables: Set[str]) -> str:
         if not self.doris_repository:
@@ -3321,7 +3375,7 @@ class TopicBuilderWorkflow:
         }.items():
             sidecar = read_json(directory / file_name)
             if sidecar:
-                payload[field] = merge_semantic_layer_list(payload.get(field), sidecar, field)
+                payload[field] = sidecar
             else:
                 payload.setdefault(field, [])
         return payload
@@ -3623,22 +3677,24 @@ class TopicBuilderWorkflow:
     ) -> Dict[str, Any]:
         layer = infer_business_layer(table)
         metric_keys = [str(item.get("metricKey") or "") for item in metrics if isinstance(item, dict) and item.get("metricKey")]
+        aggregate_source_columns = infer_aggregate_source_columns(schema, semantic_columns)
+        supported_metrics = dedupe_strings(metric_keys + aggregate_source_columns)
         dimensions = [
             str(item.get("columnName") or "")
             for item in semantic_columns
             if isinstance(item, dict) and str(item.get("role") or "").upper() == "DIMENSION" and item.get("columnName")
         ]
         intents = ["DETAIL", "GROUP_AGG", "TREND"]
-        if metrics:
+        if supported_metrics:
             intents.extend(["METRIC", "TOPN"])
-        if metrics and dimensions:
+        if supported_metrics and dimensions:
             intents.append("ROOT_CAUSE")
         if "profile" in table.lower() or "画像" in data_grain:
             intents.append("PROFILE")
         recommended: List[str] = []
-        if metrics:
+        if supported_metrics:
             recommended.append("指标查询与趋势分析")
-        if metrics and dimensions:
+        if supported_metrics and dimensions:
             recommended.append("按业务维度分组、TopN与原因下钻")
         if "明细" in data_grain:
             recommended.append("明细查询")
@@ -3652,7 +3708,7 @@ class TopicBuilderWorkflow:
                 "businessLayer": layer,
                 "queryableByAgent": default_table_queryable(table, layer),
                 "supportedIntents": intents,
-                "supportedMetrics": metric_keys,
+                "supportedMetrics": supported_metrics,
                 "supportedDimensions": dimensions,
                 "recommendedFor": recommended,
                 "notRecommendedFor": not_recommended,
@@ -4250,7 +4306,10 @@ class SemanticAssetGovernanceService:
         release_gate = combine_release_gates(validation_gate, drift_gate)
         impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
         rollback_snapshot = self._create_rollback_snapshot(topic, table)
-        conflict_detection = semantic_conflict_detection(asset)
+        conflict_detection = combine_semantic_conflict_detection(
+            semantic_conflict_detection(asset),
+            semantic_catalog_conflict_detection(self.topic_assets, topic, table, asset),
+        )
         evaluation_gate = semantic_release_evaluation_gate(asset, validation, drift, conflict_detection)
         release_gate = combine_release_gates(release_gate, evaluation_gate)
         owner = semantic_asset_owner(asset)
@@ -4326,7 +4385,10 @@ class SemanticAssetGovernanceService:
         validation_gate = semantic_validation_gate(validation)
         release_gate = combine_release_gates(validation_gate, drift_gate)
         impact_plan = semantic_asset_impact_test_plan(topic, table, asset, drift)
-        conflict_detection = semantic_conflict_detection(asset)
+        conflict_detection = combine_semantic_conflict_detection(
+            semantic_conflict_detection(asset),
+            semantic_catalog_conflict_detection(self.topic_assets, topic, table, asset),
+        )
         evaluation_gate = semantic_release_evaluation_gate(asset, validation, drift, conflict_detection)
         release_gate = combine_release_gates(release_gate, evaluation_gate)
         payload = {
@@ -4428,6 +4490,7 @@ class SemanticAssetGovernanceService:
                 restored.append(name)
         self.topic_assets._table_asset_cache.pop((topic, table), None)
         self.topic_assets._manifest_cache.pop(topic, None)
+        self.topic_assets._semantic_source_hash_cache.clear()
         payload = {
             "success": True,
             "status": "ROLLED_BACK",
@@ -4457,7 +4520,7 @@ class SemanticAssetGovernanceService:
         }.items():
             sidecar = read_json(directory / file_name)
             if sidecar:
-                payload[field] = merge_semantic_layer_list(payload.get(field), sidecar, field)
+                payload[field] = sidecar
             else:
                 payload.setdefault(field, [])
         return payload
@@ -4992,6 +5055,128 @@ def semantic_conflict_detection(asset: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def semantic_catalog_conflict_detection(
+    topic_assets: TopicAssetService,
+    candidate_topic: str = "",
+    candidate_table: str = "",
+    candidate_asset: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Detect conflicts across the published catalog, not only inside one asset."""
+
+    entries: List[Tuple[str, str, Dict[str, Any]]] = []
+    candidate_seen = False
+    for topic in topic_assets.all_topic_names():
+        tables_dir = topic_assets.root / topic / "tables"
+        if not tables_dir.exists():
+            continue
+        for table_dir in sorted(path for path in tables_dir.iterdir() if path.is_dir()):
+            table = table_dir.name
+            if topic == candidate_topic and table == candidate_table and candidate_asset is not None:
+                asset = dict(candidate_asset)
+                candidate_seen = True
+            else:
+                asset = topic_assets.load_table_asset(topic, table)
+            status = str(asset.get("status") or "PUBLISHED").upper()
+            if status in {"RETIRED", "DEPRECATED", "REJECTED"}:
+                continue
+            entries.append((topic, table, asset))
+    if candidate_asset is not None and candidate_topic and candidate_table and not candidate_seen:
+        entries.append((candidate_topic, candidate_table, dict(candidate_asset)))
+
+    conflicts: List[Dict[str, Any]] = []
+    table_owners: Dict[str, List[str]] = {}
+    metric_formulas: Dict[str, List[Dict[str, str]]] = {}
+    scoped_aliases: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    enum_labels: Dict[Tuple[str, str, str], List[Dict[str, str]]] = {}
+
+    for topic, table, asset in entries:
+        table_owners.setdefault(table, []).append(topic)
+        for metric in asset.get("metrics") or []:
+            if not isinstance(metric, dict):
+                continue
+            metric_key = str(metric.get("canonicalMetricKey") or metric.get("metricKey") or "").strip()
+            formula = normalize_semantic_formula(metric.get("formula") or metric.get("metricFormula"))
+            if metric_key:
+                metric_formulas.setdefault(metric_key, []).append(
+                    {"topic": topic, "table": table, "metricKey": str(metric.get("metricKey") or metric_key), "formula": formula}
+                )
+            for alias in metric.get("aliases") or []:
+                alias_text = str(alias or "").strip().lower()
+                if alias_text:
+                    scoped_aliases.setdefault((topic, alias_text), []).append(
+                        {"table": table, "metricKey": metric_key, "formula": formula}
+                    )
+        for column in asset.get("semanticColumns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("columnName") or column.get("name") or "").strip()
+            for value, label in semantic_enum_labels(column):
+                enum_labels.setdefault((table, column_name, value), []).append({"topic": topic, "label": label})
+
+    for table, topics in table_owners.items():
+        owners = sorted(set(topics))
+        if len(owners) > 1:
+            conflicts.append({"type": "duplicate_table_owner", "tableName": table, "topics": owners})
+    for metric_key, definitions in metric_formulas.items():
+        formulas = sorted({item["formula"] for item in definitions if item["formula"]})
+        if len(formulas) > 1:
+            conflicts.append(
+                {"type": "catalog_metric_formula_conflict", "metricKey": metric_key, "formulas": formulas, "definitions": definitions}
+            )
+    for (topic, alias), definitions in scoped_aliases.items():
+        targets = {(item["metricKey"], item["formula"]) for item in definitions}
+        if len(targets) > 1:
+            conflicts.append({"type": "topic_metric_alias_conflict", "topic": topic, "alias": alias, "definitions": definitions})
+    for (table, column, value), definitions in enum_labels.items():
+        labels = sorted({item["label"] for item in definitions if item["label"]})
+        if len(labels) > 1:
+            conflicts.append(
+                {"type": "enum_interpretation_conflict", "tableName": table, "columnName": column, "value": value, "labels": labels}
+            )
+    return {
+        "status": "passed" if not conflicts else "conflict_detected",
+        "conflictCount": len(conflicts),
+        "conflicts": conflicts[:50],
+    }
+
+
+def combine_semantic_conflict_detection(*reports: Dict[str, Any]) -> Dict[str, Any]:
+    conflicts: List[Dict[str, Any]] = []
+    seen = set()
+    for report in reports:
+        for conflict in (report or {}).get("conflicts") or []:
+            key = json.dumps(conflict, ensure_ascii=False, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            conflicts.append(conflict)
+    return {
+        "status": "passed" if not conflicts else "conflict_detected",
+        "conflictCount": len(conflicts),
+        "conflicts": conflicts[:50],
+    }
+
+
+def normalize_semantic_formula(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def semantic_enum_labels(column: Dict[str, Any]) -> List[Tuple[str, str]]:
+    labels: List[Tuple[str, str]] = []
+    for key in ("enumMappings", "enumMeanings", "valueLabels"):
+        mapping = column.get(key)
+        if isinstance(mapping, dict):
+            labels.extend((str(value), str(label)) for value, label in mapping.items() if str(value) and str(label))
+    for item in column.get("enumValues") or []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or item.get("code") or "")
+        label = str(item.get("label") or item.get("name") or item.get("meaning") or "")
+        if value and label:
+            labels.append((value, label))
+    return labels
+
+
 def semantic_conflict_repair_plan(conflict_detection: Dict[str, Any]) -> Dict[str, Any]:
     conflicts = conflict_detection.get("conflicts") if isinstance(conflict_detection.get("conflicts"), list) else []
     actions = []
@@ -5012,6 +5197,36 @@ def semantic_conflict_repair_plan(conflict_detection: Dict[str, Any]) -> Dict[st
                     "action": "split_or_reassign_alias",
                     "alias": conflict.get("alias", ""),
                     "targets": conflict.get("targets", []),
+                    "requiresOwnerReview": True,
+                }
+            )
+        elif kind == "duplicate_table_owner":
+            actions.append(
+                {
+                    "action": "choose_canonical_table_owner",
+                    "tableName": conflict.get("tableName", ""),
+                    "topics": conflict.get("topics", []),
+                    "requiresOwnerReview": True,
+                }
+            )
+        elif kind in {"catalog_metric_formula_conflict", "topic_metric_alias_conflict"}:
+            actions.append(
+                {
+                    "action": "choose_canonical_metric_contract",
+                    "metricKey": conflict.get("metricKey", ""),
+                    "alias": conflict.get("alias", ""),
+                    "definitions": conflict.get("definitions", []),
+                    "requiresOwnerReview": True,
+                }
+            )
+        elif kind == "enum_interpretation_conflict":
+            actions.append(
+                {
+                    "action": "choose_canonical_enum_interpretation",
+                    "tableName": conflict.get("tableName", ""),
+                    "columnName": conflict.get("columnName", ""),
+                    "value": conflict.get("value", ""),
+                    "labels": conflict.get("labels", []),
                     "requiresOwnerReview": True,
                 }
             )

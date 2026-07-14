@@ -88,6 +88,8 @@ class Settings(BaseSettings):
 
     server_port: int = Field(8088, validation_alias="SERVER_PORT")
     company_name: str = Field("yshopping", validation_alias="YSHOPPING_COMPANY_NAME")
+    business_timezone: str = Field("Asia/Shanghai", validation_alias="YSHOPPING_BUSINESS_TIMEZONE")
+    calendar_time_semantics_enabled: bool = Field(True, validation_alias="YSHOPPING_CALENDAR_TIME_SEMANTICS_ENABLED")
     merchant_id: str = Field("100", validation_alias="YSHOPPING_MERCHANT_ID")
     allowed_merchant_ids: str = Field("", validation_alias="YSHOPPING_ALLOWED_MERCHANT_IDS")
     ops_token: str = Field("", validation_alias="YSHOPPING_OPS_TOKEN")
@@ -114,6 +116,13 @@ class Settings(BaseSettings):
     llm_strong_model: str = Field("", validation_alias="YSHOPPING_LLM_STRONG_MODEL")
     llm_balanced_model: str = Field("", validation_alias="YSHOPPING_LLM_BALANCED_MODEL")
     llm_fast_model: str = Field("", validation_alias="YSHOPPING_LLM_FAST_MODEL")
+    preflight_semantic_route_enabled: bool = Field(True, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_ENABLED")
+    preflight_llm_base_url: str = Field("", validation_alias="YSHOPPING_PREFLIGHT_LLM_BASE_URL")
+    preflight_llm_api_key: str = Field("", validation_alias="YSHOPPING_PREFLIGHT_LLM_API_KEY")
+    preflight_semantic_route_model: str = Field("", validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MODEL")
+    preflight_semantic_route_timeout_seconds: int = Field(3, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_TIMEOUT_SECONDS")
+    preflight_semantic_route_min_confidence: float = Field(0.62, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MIN_CONFIDENCE")
+    preflight_semantic_route_high_confidence: float = Field(0.86, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_HIGH_CONFIDENCE")
     answer_skill_match_mode: str = Field("always", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
     always_apply_rule_budget: int = Field(20, validation_alias="YSHOPPING_ALWAYS_APPLY_RULE_BUDGET")
     skill_confirmation_required: bool = Field(False, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
@@ -183,6 +192,8 @@ class Settings(BaseSettings):
     memory_index_async: bool = Field(True, validation_alias="YSHOPPING_MEMORY_INDEX_ASYNC")
     memory_es_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_ES_INDEX")
     memory_vector_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_VECTOR_INDEX")
+    memory_query_understanding_enabled: bool = Field(True, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_ENABLED")
+    memory_query_understanding_timeout_seconds: int = Field(2, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_TIMEOUT_SECONDS")
     memory_curator_enabled: bool = Field(True, validation_alias="YSHOPPING_MEMORY_CURATOR_ENABLED")
     memory_curator_timeout_seconds: int = Field(8, validation_alias="YSHOPPING_MEMORY_CURATOR_TIMEOUT_SECONDS")
     memory_curator_min_confidence: float = Field(0.72, validation_alias="YSHOPPING_MEMORY_CURATOR_MIN_CONFIDENCE")
@@ -193,6 +204,10 @@ class Settings(BaseSettings):
     knowledge_conflict_min_similarity: float = Field(0.18, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_MIN_SIMILARITY")
 
     harness_workspace_path: str = Field("", validation_alias="YSHOPPING_HARNESS_WORKSPACE")
+    thread_context_summary_ttl_seconds: int = Field(
+        2592000,
+        validation_alias="YSHOPPING_THREAD_CONTEXT_SUMMARY_TTL_SECONDS",
+    )
     context_window_tokens: int = Field(16000, validation_alias="YSHOPPING_HARNESS_CONTEXT_WINDOW_TOKENS")
     tool_result_preview_rows: int = Field(20, validation_alias="YSHOPPING_HARNESS_TOOL_RESULT_PREVIEW_ROWS")
     max_sub_agent_tasks: int = Field(3, validation_alias="YSHOPPING_HARNESS_MAX_SUB_AGENT_TASKS")

@@ -2162,8 +2162,6 @@
       "description": "spu名称",
       "aliases": [
         "spu名称",
-        "商品名称",
-        "产品名称",
         "spu_name"
       ],
       "enumValues": [],
@@ -2304,9 +2302,6 @@
       "description": "入库数量",
       "aliases": [
         "入库数量",
-        "入库量",
-        "供应链入库量",
-        "供应链入库数量",
         "inbound_cnt"
       ],
       "enumValues": [],
@@ -4144,10 +4139,9 @@
   ],
   "metrics": [
     {
-      "metricKey": "inbound_cnt",
+      "metricKey": "scm_inbound_total_cnt",
       "canonicalMetricKey": "scm_inbound_total_cnt",
-      "aliasOf": "scm_inbound_total_cnt",
-      "metricLevel": "physical",
+      "metricLevel": "business",
       "businessName": "入库数量",
       "formula": "SUM(inbound_cnt)",
       "unit": "单",
@@ -4157,7 +4151,11 @@
       ],
       "aliases": [
         "入库数量",
-        "inbound_cnt"
+        "入库量",
+        "供应链入库量",
+        "供应链入库数量",
+        "inbound_cnt",
+        "scm_inbound_total_cnt"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=入库数量"
@@ -4210,26 +4208,6 @@
       ],
       "confidence": 0.78,
       "evidence": "schema comment=首次质检结果,不通过=0,通过=1"
-    },
-    {
-      "metricKey": "scm_inbound_total_cnt",
-      "canonicalMetricKey": "scm_inbound_total_cnt",
-      "metricLevel": "business",
-      "businessName": "入库数量",
-      "formula": "SUM(inbound_cnt)",
-      "unit": "件",
-      "description": "供应链入库数量汇总",
-      "sourceColumns": [
-        "inbound_cnt"
-      ],
-      "aliases": [
-        "入库数量",
-        "入库量",
-        "供应链入库量",
-        "供应链入库数量"
-      ],
-      "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
     },
     {
       "metricKey": "ship_timeout_detail_cnt",

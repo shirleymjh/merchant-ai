@@ -1760,13 +1760,7 @@
       "description": "买家id",
       "aliases": [
         "买家id",
-        "buyer_id",
-        "refund_user_id",
-        "return_user_id",
-        "退货用户ID",
-        "退款用户ID",
-        "退货买家ID",
-        "退款买家ID"
+        "buyer_id"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -1780,17 +1774,7 @@
       "description": "买家昵称",
       "aliases": [
         "买家昵称",
-        "buyer_name",
-        "refund_user",
-        "return_user",
-        "refund_user_id",
-        "return_user_id",
-        "退货用户",
-        "退款用户",
-        "退货买家",
-        "退款买家",
-        "退货用户昵称",
-        "退款用户昵称"
+        "buyer_name"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -1874,14 +1858,6 @@
       "description": "退款状态name",
       "aliases": [
         "退款状态name",
-        "退款状态",
-        "退款处理状态",
-        "处理状态",
-        "退款处理中",
-        "退款异常",
-        "异常退款",
-        "处理中",
-        "异常",
         "refund_status_name"
       ],
       "enumValues": [
@@ -2189,18 +2165,12 @@
     },
     {
       "columnName": "refund_create_time",
-      "businessName": "退款创建时间",
+      "businessName": "创建时间",
       "role": "TIME",
-      "description": "退款创建时间",
+      "description": "创建时间",
       "aliases": [
         "创建时间",
-        "refund_create_time",
-        "退款创建时间",
-        "退款时间",
-        "退货时间",
-        "售后时间",
-        "退货创建时间",
-        "refund_time"
+        "refund_create_time"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -2321,18 +2291,12 @@
     },
     {
       "columnName": "pay_amt",
-      "businessName": "退款金额",
+      "businessName": "支付金额",
       "role": "METRIC",
-      "description": "退款金额",
+      "description": "支付金额",
       "aliases": [
         "支付金额",
-        "pay_amt",
-        "refund_amt",
-        "退款金额",
-        "退货金额",
-        "退款额",
-        "售后金额",
-        "refund_amount"
+        "pay_amt"
       ],
       "enumValues": [],
       "metricFormula": "SUM(pay_amt)",
@@ -3239,15 +3203,16 @@
   "metrics": [
     {
       "metricKey": "sku_count",
-      "businessName": "商品数量",
+      "businessName": "退款商品数量",
       "formula": "SUM(sku_count)",
       "unit": "单",
-      "description": "商品数量",
+      "description": "退款/售后明细中的商品数量",
       "sourceColumns": [
         "sku_count"
       ],
       "aliases": [
-        "商品数量",
+        "退款商品数量",
+        "售后商品数量",
         "sku_count"
       ],
       "confidence": 0.78,
@@ -3257,38 +3222,34 @@
       "metricKey": "pay_amt",
       "canonicalMetricKey": "pay_amt",
       "metricLevel": "business",
-      "businessName": "退款金额",
+      "businessName": "退款订单关联支付金额",
       "formula": "SUM(pay_amt)",
       "unit": "元",
-      "description": "退款金额",
+      "description": "退款明细所关联订单的原支付金额，不代表实际退款金额",
       "sourceColumns": [
         "pay_amt"
       ],
       "aliases": [
-        "支付金额",
-        "pay_amt",
-        "refund_amt",
-        "refund_amount",
-        "return_amount",
-        "退款金额",
-        "退货金额",
-        "退款额",
-        "售后金额"
+        "退款关联支付金额",
+        "退款订单支付金额",
+        "售后关联支付金额",
+        "pay_amt"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
     },
     {
       "metricKey": "refund_discount_amt",
-      "businessName": "优惠金额",
+      "businessName": "退款优惠金额",
       "formula": "SUM(refund_discount_amt)",
       "unit": "元",
-      "description": "优惠金额",
+      "description": "退款/售后明细中的优惠金额",
       "sourceColumns": [
         "refund_discount_amt"
       ],
       "aliases": [
-        "优惠金额",
+        "退款优惠金额",
+        "售后优惠金额",
         "refund_discount_amt"
       ],
       "confidence": 0.78,
@@ -3470,13 +3431,7 @@
       "description": "买家id",
       "aliases": [
         "买家id",
-        "buyer_id",
-        "refund_user_id",
-        "return_user_id",
-        "退货用户ID",
-        "退款用户ID",
-        "退货买家ID",
-        "退款买家ID"
+        "buyer_id"
       ],
       "relatedColumns": [
         "buyer_id"
@@ -3488,17 +3443,7 @@
       "description": "买家昵称",
       "aliases": [
         "买家昵称",
-        "buyer_name",
-        "refund_user",
-        "return_user",
-        "refund_user_id",
-        "return_user_id",
-        "退货用户",
-        "退款用户",
-        "退货买家",
-        "退款买家",
-        "退货用户昵称",
-        "退款用户昵称"
+        "buyer_name"
       ],
       "relatedColumns": [
         "buyer_name"
@@ -3798,17 +3743,11 @@
       "evidence": "来自字段 `exchange_status_name` 的语义注释"
     },
     {
-      "term": "退款创建时间",
-      "description": "退款创建时间",
+      "term": "创建时间",
+      "description": "创建时间",
       "aliases": [
         "创建时间",
-        "refund_create_time",
-        "退款创建时间",
-        "退款时间",
-        "退货时间",
-        "售后时间",
-        "退货创建时间",
-        "refund_time"
+        "refund_create_time"
       ],
       "relatedColumns": [
         "refund_create_time"
@@ -3912,17 +3851,11 @@
       "evidence": "来自字段 `out_pay_id` 的语义注释"
     },
     {
-      "term": "退款金额",
-      "description": "退款金额",
+      "term": "支付金额",
+      "description": "支付金额",
       "aliases": [
         "支付金额",
-        "pay_amt",
-        "refund_amt",
-        "退款金额",
-        "退货金额",
-        "退款额",
-        "售后金额",
-        "refund_amount"
+        "pay_amt"
       ],
       "relatedColumns": [
         "pay_amt"

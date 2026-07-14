@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -76,7 +76,11 @@ class MemoryStore:
     def select_for_question(self, state: AgentState, budget_tokens: int = 0, budget_chars: int = 0) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def update_from_state(self, state: AgentState) -> Dict[str, Any]:
+    def update_from_state(
+        self,
+        state: AgentState,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
         raise NotImplementedError
 
 
@@ -135,6 +139,16 @@ class MemoryWriteGate:
         if policy["action"] == "review":
             event["status"] = "review_required"
         return event
+
+
+def canceled_memory_update(memory: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(memory or {})
+    payload["memoryIngestionTrace"] = {
+        "written": False,
+        "canceled": True,
+        "reason": "run_canceled_before_memory_commit",
+    }
+    return payload
 
 
 class KnowledgeCuratorService:
@@ -284,15 +298,24 @@ class MemoryIngestionService:
         self.write_gate = MemoryWriteGate()
         self.curator = curator or KnowledgeCuratorService(settings)
 
-    def update_store(self, store: MemoryStore, state: AgentState) -> Dict[str, Any]:
+    def update_store(
+        self,
+        store: MemoryStore,
+        state: AgentState,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
         merchant_id = merchant_id_from_state(state, self.settings)
         memory = store.load(merchant_id)
+        if cancel_check and cancel_check():
+            return canceled_memory_update(memory)
         event = memory_event_from_state(state)
         if not event.get("question"):
             return memory
         event = self.write_gate.apply(event, merchant_id)
         write_policy = event.get("writePolicy") or {}
         curated_suggestions, curator_trace = self.curator.extract(state, event)
+        if cancel_check and cancel_check():
+            return canceled_memory_update(memory)
         curator_authoritative = bool(curator_trace.get("authoritative"))
         if curator_authoritative and event.get("memoryType") in {"correction", "metric_dispute"}:
             # The curator is the semantic judge. Until a merchant/platform action
@@ -309,6 +332,8 @@ class MemoryIngestionService:
         }
         if not write_policy.get("allowed", True):
             memory["memoryIngestionTrace"] = ingestion_trace
+            if cancel_check and cancel_check():
+                return canceled_memory_update(memory)
             saved = store.save(merchant_id, memory)
             saved["memoryIngestionTrace"] = ingestion_trace
             return saved
@@ -358,6 +383,8 @@ class MemoryIngestionService:
             ingestion_trace["knowledgeSuggestionCount"] = len(memory.get("knowledgeSuggestions") or [])
         memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
         memory["memoryIngestionTrace"] = ingestion_trace
+        if cancel_check and cancel_check():
+            return canceled_memory_update(memory)
         saved = store.save(merchant_id, memory)
         saved["memoryIngestionTrace"] = ingestion_trace
         return saved
@@ -405,10 +432,12 @@ class MemoryRetrievalService:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.query_understanding = MemoryQueryUnderstandingService(settings)
 
     def select_from_store(self, store: MemoryStore, state: AgentState, budget_tokens: int = 0, budget_chars: int = 0) -> Dict[str, Any]:
         merchant_id = merchant_id_from_state(state, self.settings)
         budget = memory_budget_tokens(self.settings, budget_tokens=budget_tokens, budget_chars=budget_chars)
+        self.query_understanding.ensure_state_profile(state)
         context = retrieval_context_from_state(state)
         if isinstance(store, EnterpriseMemoryStore):
             return self._select_enterprise(store, merchant_id, context, budget)
@@ -487,6 +516,7 @@ class StructuredMemoryStore(MemoryStore):
         self.settings = settings
         self.ingestion_service = MemoryIngestionService(settings)
         self.retrieval_service = MemoryRetrievalService(settings)
+        self._update_lock = threading.RLock()
 
     def memory_path(self, merchant_id: str) -> Path:
         safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", merchant_id or self.settings.merchant_id or "default")
@@ -546,8 +576,13 @@ class StructuredMemoryStore(MemoryStore):
             return ""
         return json.dumps(renderable, ensure_ascii=False, default=str, indent=2)
 
-    def update_from_state(self, state: AgentState) -> Dict[str, Any]:
-        return self.ingestion_service.update_store(self, state)
+    def update_from_state(
+        self,
+        state: AgentState,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        with self._update_lock:
+            return self.ingestion_service.update_store(self, state, cancel_check=cancel_check)
 
     def update_from_feedback(self, pending: Optional[PendingAnswer], adopted: Any = None, liked: Any = None, disliked: Any = None) -> Dict[str, Any]:
         return self.ingestion_service.update_feedback(self, pending, adopted=adopted, liked=liked, disliked=disliked)
@@ -2304,12 +2339,20 @@ def memory_source_label(memory: Dict[str, Any], settings: Settings) -> str:
 def memory_query_hash(merchant_id: str, context: Dict[str, Any]) -> str:
     payload = {
         "merchantId": merchant_id,
+        "question": str(context.get("question") or ""),
+        "terms": sorted(str(item) for item in context.get("terms") or []),
+        "expandedTerms": sorted(str(item) for item in context.get("expandedTerms") or []),
+        "queryVariants": sorted(str(item) for item in context.get("queryVariants") or []),
         "topics": sorted(str(item) for item in context.get("topics") or []),
         "metrics": sorted(str(item) for item in context.get("metrics") or []),
         "timeWindows": sorted(int(item) for item in context.get("timeWindows") or []),
         "analysisIntent": context.get("analysisIntent") or "",
+        "analysisIntents": sorted(str(item) for item in context.get("analysisIntents") or []),
         "objectRefs": stable_object_refs(context.get("objectRefs") or {}),
         "accessRole": str(context.get("accessRole") or ""),
+        "userId": str(context.get("userId") or ""),
+        "storeIds": sorted(str(item) for item in context.get("storeIds") or []),
+        "permissions": sorted(str(item) for item in context.get("permissions") or []),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -2404,9 +2447,12 @@ def truncate_memory_text_by_tokens(text: str, budget_tokens: int) -> str:
 def memory_vector_query_text(context: Dict[str, Any]) -> str:
     parts = [
         str(context.get("question") or ""),
+        " ".join(str(item) for item in context.get("queryVariants") or []),
+        " ".join(sorted(str(item) for item in context.get("expandedTerms") or [])),
         " ".join(sorted(str(item) for item in context.get("topics") or [])),
         " ".join(sorted(str(item) for item in context.get("metrics") or [])),
         str(context.get("analysisIntent") or ""),
+        " ".join(sorted(str(item) for item in context.get("analysisIntents") or [])),
     ]
     return " ".join(part for part in parts if part).strip()[:1200]
 
@@ -4415,6 +4461,273 @@ def analysis_intent_from_plan(plan: Any) -> str:
         return ""
 
 
+def memory_question_terms(question: str) -> List[str]:
+    text = str(question or "")
+    terms = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", text))
+    phrase_hints = [
+        "哪个品",
+        "哪款",
+        "哪几个",
+        "退得最凶",
+        "最凶",
+        "不对劲",
+        "咋回事",
+        "为啥",
+        "这阵子",
+        "这段时间",
+    ]
+    for phrase in phrase_hints:
+        if phrase in text:
+            terms.add(phrase)
+    if re.search(r"(哪个|哪款|哪些|哪几个).{0,4}(品|货|sku|SKU|商品)", text):
+        terms.update(["商品", "单品"])
+    return unique_strings(sorted(terms, key=lambda item: (-len(item), item)))
+
+
+def memory_expanded_terms(
+    question: str,
+    topics: Iterable[Any] = (),
+    metrics: Iterable[Any] = (),
+    analysis_intent: str = "",
+) -> List[str]:
+    text = str(question or "")
+    lowered = text.lower()
+    expanded: List[str] = []
+
+    def add(*items: str) -> None:
+        for item in items:
+            if item and item not in expanded:
+                expanded.append(item)
+
+    if any(marker in text for marker in ["退款", "退货", "售后", "退得", "退单", "退了"]) or re.search(r"退.{0,4}(最|多|高|凶)", text):
+        add("退款", "退货", "售后")
+    if any(marker in text for marker in ["哪个品", "哪款", "哪几个品", "单品", "货品", "商品", "宝贝"]) or re.search(r"(哪个|哪款|哪些|哪几个).{0,4}(品|货|sku|SKU)", text):
+        add("商品", "单品", "SKU")
+    if any(marker in text for marker in ["这阵子", "这段时间", "最近", "近来", "近期", "这几天", "这两天"]):
+        add("近期", "默认时间窗")
+    if any(marker in lowered for marker in ["top", "topn"]) or any(marker in text for marker in ["哪个", "哪些", "哪款", "最高", "最多", "最差", "最凶", "最厉害", "排行", "排名", "前几"]):
+        add("排行", "TopN", "异常突出", "风险")
+    if any(marker in text for marker in ["咋", "怎么", "为啥", "为什么", "原因", "排查", "诊断", "归因", "不对劲"]):
+        add("原因", "排查", "诊断", "异常")
+    if any(marker in str(analysis_intent or "") for marker in ["ranking", "risk"]):
+        add("排行", "风险")
+    for topic in unique_strings(topics):
+        if topic:
+            add(topic)
+    for metric in unique_strings(metrics):
+        if metric:
+            add(metric)
+    return unique_strings(expanded)
+
+
+def memory_analysis_intent_hints(question: str, analysis_intent: str = "") -> List[str]:
+    text = str(question or "")
+    lowered = text.lower()
+    intents: List[str] = []
+    if analysis_intent and analysis_intent != "none":
+        intents.append(analysis_intent)
+    if any(marker in lowered for marker in ["top", "topn"]) or any(marker in text for marker in ["哪个", "哪些", "哪款", "最高", "最多", "最差", "最凶", "排行", "排名", "前几"]):
+        intents.extend(["ranking", "risk_ranking"])
+    if any(marker in text for marker in ["咋", "怎么", "为啥", "为什么", "原因", "排查", "诊断", "归因", "不对劲"]):
+        intents.extend(["diagnosis", "anomaly_check"])
+    return unique_strings(intents)
+
+
+def memory_query_variants(question: str, expanded_terms: Iterable[Any]) -> List[str]:
+    text = str(question or "").strip()
+    expanded = set(unique_strings(expanded_terms))
+    variants: List[str] = []
+    if {"商品", "退款"}.issubset(expanded) or {"商品", "退货"}.issubset(expanded):
+        variants.extend(["近期商品退款退货表现排行", "高退款商品排行", "商品售后异常风险"])
+    elif {"退款", "退货"} & expanded:
+        variants.append("退款退货售后表现")
+    if "诊断" in expanded or "排查" in expanded:
+        variants.append("原因诊断排查")
+    compact = " ".join(item for item in unique_strings(expanded_terms)[:10] if item)
+    if compact:
+        variants.append(compact)
+    if text:
+        variants.append(text)
+    return unique_strings(variants)[:8]
+
+
+def memory_context_text_terms(context: Dict[str, Any]) -> List[str]:
+    terms: List[str] = []
+    terms.extend(unique_strings(context.get("terms") or []))
+    terms.extend(unique_strings(context.get("expandedTerms") or []))
+    for variant in unique_strings(context.get("queryVariants") or []):
+        terms.extend(memory_question_terms(variant))
+    return unique_strings(sorted(terms, key=lambda item: (-len(item), item)))[:80]
+
+
+class MemoryQueryUnderstandingService:
+    """Use the preflight small model to build a soft recall profile for memory search."""
+
+    def __init__(self, settings: Settings, llm: Optional[Any] = None):
+        self.settings = settings
+        self.model_name = (
+            str(getattr(settings, "preflight_semantic_route_model", "") or "")
+            or str(getattr(settings, "llm_fast_model", "") or "")
+            or str(getattr(settings, "openai_model", "") or "")
+        )
+        self.base_url = str(getattr(settings, "preflight_llm_base_url", "") or getattr(settings, "openai_base_url", "") or "")
+        self.cache = build_ttl_cache("memory_query_understanding", settings, int(getattr(settings, "cache_recall_ttl_seconds", 300) or 300))
+        if llm is not None:
+            self.llm = llm
+        else:
+            self.llm = None
+            try:
+                from merchant_ai.services.llm import LlmClient
+
+                self.llm = LlmClient(
+                    settings,
+                    model_name=self.model_name,
+                    api_key=str(getattr(settings, "preflight_llm_api_key", "") or ""),
+                    base_url=str(getattr(settings, "preflight_llm_base_url", "") or ""),
+                )
+            except Exception:
+                self.llm = None
+
+    def ensure_state_profile(self, state: AgentState) -> Dict[str, Any]:
+        existing = state.get("memory_query_understanding")
+        if isinstance(existing, dict) and existing.get("question") == str(state.get("question") or ""):
+            return existing
+        profile = self.understand(state)
+        state["memory_query_understanding"] = profile
+        return profile
+
+    def understand(self, state: AgentState) -> Dict[str, Any]:
+        question = str(state.get("question") or "")
+        fallback = rule_memory_recall_profile(
+            question,
+            topics=[],
+            metrics=extract_metric_like_terms(question),
+            analysis_intent="",
+        )
+        fallback.update({"source": "rule_fallback", "status": "fallback", "question": question})
+        if not bool(getattr(self.settings, "memory_query_understanding_enabled", True)):
+            fallback["status"] = "disabled"
+            return fallback
+        if not self.llm or not getattr(self.llm, "configured", False) or not hasattr(self.llm, "json_chat"):
+            fallback["status"] = "unavailable"
+            return fallback
+        cache_key = self.cache_key(state)
+        cached = self.cache.get(cache_key)
+        if isinstance(cached, dict) and cached:
+            profile = dict(cached)
+            profile["cacheHit"] = True
+            profile["status"] = str(profile.get("status") or "success")
+            return profile
+        payload = {
+            "question": question[:800],
+            "routeSlots": model_dump_or_dict(state.get("route_slots")),
+            "topicRouting": model_dump_or_dict(state.get("topic_routing_decision")),
+            "outputSchema": {
+                "terms": ["原文关键词，短词组"],
+                "expandedTerms": ["适合长期记忆检索的业务近义词，不要编造事实"],
+                "queryVariants": ["2-5 条检索改写"],
+                "topics": ["候选业务主题，仅做软提示"],
+                "metrics": ["候选指标，仅做软提示"],
+                "timeWindows": ["明确天数，无法明确则留空"],
+                "analysisIntents": ["lookup|ranking|risk_ranking|diagnosis|comparison|trend_check|anomaly_check|overview"],
+                "uncertainty": ["不确定点"],
+            },
+        }
+        system_prompt = (
+            "你是商家 BI 长期记忆检索前的轻量 Query Understanding。"
+            "只把用户口语问题改写成适合检索历史记忆的 soft recall profile。"
+            "不要回答问题，不要生成 SQL，不要把不明确时间硬写成 7 天或 30 天。"
+            "所有 topic、metric、intent 都只是候选提示；不确定就放 uncertainty。严格输出 JSON。"
+        )
+        try:
+            result = self.llm.json_chat(
+                system_prompt,
+                json.dumps(payload, ensure_ascii=False, default=str),
+                fallback={},
+                timeout_seconds=int(getattr(self.settings, "memory_query_understanding_timeout_seconds", 2) or 2),
+            )
+        except Exception as exc:
+            fallback["status"] = "failed"
+            fallback["error"] = str(exc)[:240]
+            return fallback
+        profile = normalize_memory_query_profile(result)
+        if not has_memory_query_profile_signal(profile):
+            fallback["status"] = "empty_model_profile"
+            return fallback
+        merged = merge_memory_recall_profiles(fallback, profile)
+        merged.update({"source": "small_model", "status": "success", "question": question, "cacheHit": False})
+        self.cache.set(cache_key, merged)
+        return merged
+
+    def cache_key(self, state: AgentState) -> str:
+        return stable_cache_key(
+            "memory_query_understanding",
+            {
+                "question": str(state.get("question") or ""),
+                "routeSlots": model_dump_or_dict(state.get("route_slots")),
+                "topicRouting": model_dump_or_dict(state.get("topic_routing_decision")),
+                "model": self.model_name,
+                "baseUrl": self.base_url,
+                "promptVersion": "memory_recall_profile.v1",
+            },
+        )
+
+
+def model_dump_or_dict(value: Any) -> Dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True)
+    return value if isinstance(value, dict) else {}
+
+
+def rule_memory_recall_profile(
+    question: str,
+    topics: Iterable[Any] = (),
+    metrics: Iterable[Any] = (),
+    analysis_intent: str = "",
+) -> Dict[str, Any]:
+    terms = memory_question_terms(question)
+    expanded_terms = memory_expanded_terms(question, topics, metrics, analysis_intent)
+    query_variants = memory_query_variants(question, expanded_terms)
+    analysis_intents = memory_analysis_intent_hints(question, analysis_intent)
+    return {
+        "terms": terms,
+        "expandedTerms": expanded_terms,
+        "queryVariants": query_variants,
+        "topics": unique_strings(topics),
+        "metrics": unique_strings(metrics),
+        "timeWindows": [],
+        "analysisIntents": analysis_intents,
+        "uncertainty": [],
+    }
+
+
+def normalize_memory_query_profile(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "terms": unique_strings(payload.get("terms") or [])[:20],
+        "expandedTerms": unique_strings(payload.get("expandedTerms") or payload.get("expanded_terms") or [])[:30],
+        "queryVariants": unique_strings(payload.get("queryVariants") or payload.get("query_variants") or [])[:8],
+        "topics": unique_strings(payload.get("topics") or [])[:8],
+        "metrics": unique_strings(payload.get("metrics") or payload.get("possibleMetrics") or payload.get("possible_metrics") or [])[:12],
+        "timeWindows": unique_ints(payload.get("timeWindows") or payload.get("time_windows") or [])[:6],
+        "analysisIntents": unique_strings(payload.get("analysisIntents") or payload.get("analysis_intents") or payload.get("possibleIntent") or payload.get("possible_intent") or [])[:8],
+        "uncertainty": unique_strings(payload.get("uncertainty") or [])[:8],
+    }
+
+
+def has_memory_query_profile_signal(profile: Dict[str, Any]) -> bool:
+    return any(profile.get(key) for key in ["terms", "expandedTerms", "queryVariants", "topics", "metrics", "timeWindows", "analysisIntents"])
+
+
+def merge_memory_recall_profiles(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    for key in ["terms", "expandedTerms", "queryVariants", "topics", "metrics", "analysisIntents", "uncertainty"]:
+        merged[key] = unique_strings([*(merged.get(key) or []), *(extra.get(key) or [])])
+    merged["timeWindows"] = unique_ints([*(merged.get("timeWindows") or []), *(extra.get("timeWindows") or [])])
+    return merged
+
+
 def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
     question = str(state.get("question") or "")
     plan = state.get("plan")
@@ -4429,6 +4742,12 @@ def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
         days = int(((route_payload.get("timeWindow") or {}).get("days") or 0) if route_payload.get("timeWindow") else 0)
         if days and days not in time_windows:
             time_windows.append(days)
+    topic_decision = state.get("topic_routing_decision")
+    recall_topics = topic_decision.recall_topics() if hasattr(topic_decision, "recall_topics") else []
+    for raw_topic in recall_topics:
+        topic = str(raw_topic or "")
+        if topic and topic not in topics:
+            topics.append(topic)
     eval_context = state.get("memory_eval_context") if isinstance(state.get("memory_eval_context"), dict) else {}
     for topic in unique_strings((eval_context or {}).get("topics") or []):
         if topic not in topics:
@@ -4439,15 +4758,54 @@ def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
     for days in unique_ints((eval_context or {}).get("timeWindows") or (eval_context or {}).get("time_windows") or []):
         if days not in time_windows:
             time_windows.append(days)
+    identity = state.get("user_identity") or {}
+    if hasattr(identity, "model_dump"):
+        identity = identity.model_dump(by_alias=True)
+    if not isinstance(identity, dict):
+        identity = {}
+    analysis_intent = analysis_intent_from_plan(plan)
+    model_profile = state.get("memory_query_understanding") if isinstance(state.get("memory_query_understanding"), dict) else {}
+    rule_profile = rule_memory_recall_profile(
+        question,
+        topics=topics,
+        metrics=[*metrics, *extract_metric_like_terms(question)],
+        analysis_intent=analysis_intent,
+    )
+    merged_profile = merge_memory_recall_profiles(rule_profile, normalize_memory_query_profile(model_profile))
+    topics = unique_strings([*topics, *(merged_profile.get("topics") or [])])
+    metrics = unique_strings([*metrics, *extract_metric_like_terms(question), *(merged_profile.get("metrics") or [])])
+    time_windows = unique_ints([*time_windows, *(merged_profile.get("timeWindows") or [])])
+    terms = unique_strings(merged_profile.get("terms") or [])
+    expanded_terms = unique_strings(merged_profile.get("expandedTerms") or [])
+    query_variants = unique_strings(merged_profile.get("queryVariants") or [])
+    analysis_intents = unique_strings([*memory_analysis_intent_hints(question, analysis_intent), *(merged_profile.get("analysisIntents") or [])])
     return {
         "question": question,
-        "terms": set(re.findall(r"[\w\u4e00-\u9fff]{2,}", question)),
+        "terms": set(terms),
+        "expandedTerms": set(expanded_terms),
+        "queryVariants": query_variants,
         "topics": set(topics),
-        "metrics": set(metrics).union(extract_metric_like_terms(question)),
+        "metrics": set(metrics),
         "timeWindows": set(time_windows or extract_time_windows(question)),
-        "analysisIntent": analysis_intent_from_plan(plan),
+        "analysisIntent": analysis_intent,
+        "analysisIntents": set(analysis_intents),
         "objectRefs": route_payload.get("objectRefs", {}) if isinstance(route_payload, dict) else {},
+        "semanticHints": {
+            "terms": terms,
+            "expandedTerms": expanded_terms,
+            "queryVariants": query_variants,
+            "topics": unique_strings(topics),
+            "metrics": unique_strings(metrics),
+            "timeWindows": unique_ints(time_windows or extract_time_windows(question)),
+            "analysisIntents": analysis_intents,
+            "uncertainty": unique_strings(model_profile.get("uncertainty") or []),
+            "source": str(model_profile.get("source") or "rule_fallback"),
+            "status": str(model_profile.get("status") or ""),
+        },
         "accessRole": str(state.get("access_role") or "merchant_analyst"),
+        "userId": str(identity.get("userId") or identity.get("user_id") or ""),
+        "storeIds": unique_strings(identity.get("storeIds") or identity.get("store_ids") or []),
+        "permissions": unique_strings(identity.get("permissions") or []),
     }
 
 
@@ -4468,14 +4826,27 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
             pending = memory_is_pending(item)
             inactive = memory_is_inactive(item)
             permitted = memory_visible_to_role(item, str(context.get("accessRole") or "merchant_analyst"))
-            if expired or invalid or pending or inactive or not permitted:
+            principal_permitted = memory_visible_to_principal(item, context)
+            if expired or invalid or pending or inactive or not permitted or not principal_permitted:
                 reason = (
                     "expired"
                     if expired
                     else (
                         "low_confidence"
                         if invalid
-                        else ("pending_governance" if pending else ("deleted" if memory_status(item) == "deleted" else ("inactive" if inactive else "role_filtered")))
+                        else (
+                            "pending_governance"
+                            if pending
+                            else (
+                                "deleted"
+                                if memory_status(item) == "deleted"
+                                else (
+                                    "inactive"
+                                    if inactive
+                                    else ("role_filtered" if not permitted else "principal_scope_filtered")
+                                )
+                            )
+                        )
                     )
                 )
                 filtered_reasons[reason] += 1
@@ -4534,11 +4905,15 @@ def memory_relevance_score(item: Dict[str, Any], context: Dict[str, Any], group_
     if time_overlap:
         score += 1.5
         reasons.append("time_window_match")
-    term_hits = [term for term in context.get("terms", set()) if term and term in text]
+    term_hits = [term for term in memory_context_text_terms(context) if term and term in text]
     if term_hits:
-        score += min(3.0, len(term_hits) * 0.35)
+        score += min(4.0, len(term_hits) * 0.35)
         reasons.append("text_match:%d" % len(term_hits))
-    if str(item.get("analysisIntent") or "") and item.get("analysisIntent") == context.get("analysisIntent"):
+    raw_intents = context.get("analysisIntents") or []
+    if isinstance(raw_intents, str):
+        raw_intents = [raw_intents]
+    intent_hints = set(unique_strings([context.get("analysisIntent"), *raw_intents]))
+    if str(item.get("analysisIntent") or "") and item.get("analysisIntent") in intent_hints:
         score += 0.8
         reasons.append("analysis_intent_match")
     decay = memory_decay_score(item)
@@ -5246,6 +5621,22 @@ def memory_visible_to_role(item: Dict[str, Any], access_role: str) -> bool:
     if not roles:
         return visibility != "planner_only" or str(access_role or "").strip() in {"merchant_admin", "merchant_analyst", "system"}
     return str(access_role or "merchant_analyst") in roles
+
+
+def memory_visible_to_principal(item: Dict[str, Any], context: Dict[str, Any]) -> bool:
+    scope = memory_scope_payload(item)
+    scoped_user = str(scope.get("userId") or scope.get("user_id") or "").strip()
+    if scoped_user and scoped_user != str(context.get("userId") or "").strip():
+        return False
+    scoped_stores = set(unique_strings(scope.get("storeIds") or scope.get("store_ids") or []))
+    principal_stores = set(unique_strings(context.get("storeIds") or []))
+    if scoped_stores and not scoped_stores.issubset(principal_stores):
+        return False
+    required_permissions = set(unique_strings(scope.get("permissions") or []))
+    principal_permissions = set(unique_strings(context.get("permissions") or []))
+    if required_permissions and not required_permissions.issubset(principal_permissions):
+        return False
+    return True
 
 
 def parse_datetime(value: str) -> Optional[datetime]:

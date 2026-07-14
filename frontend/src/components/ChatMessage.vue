@@ -485,7 +485,13 @@ const analysisScopeText = computed(() => {
   const scope = analysisScope.value || {}
   const topics = (scope.topics || []).filter(Boolean)
   const label = topics.length ? topics.join(' + ') : '待确认'
-  const mode = scope.mode === 'topic_workspace' ? '跨 Topic Workspace' : '单 Topic'
+  const modeLabels = {
+    topic_workspace: '联合分析 Workspace',
+    adaptive_workspace: '自动语义范围',
+    open_discovery: '开放诊断范围',
+    explicit_topic_scope: '用户限定范围'
+  }
+  const mode = modeLabels[scope.mode] || '自动语义范围'
   return `${mode}：${label}（置信度 ${Math.round(Number(scope.confidence || 0) * 100)}%）`
 })
 const knowledgeProposals = computed(() => (props.merchantExperience?.knowledgeSuggestions || [])

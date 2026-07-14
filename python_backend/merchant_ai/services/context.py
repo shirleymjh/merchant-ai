@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from merchant_ai.config import Settings
 from merchant_ai.models import ArtifactRef, ContextDelta, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
+from merchant_ai.services.security import identity_scope_payload
 
 
 class ImportantFactExtractor:
@@ -332,11 +333,45 @@ class ContextManager:
             "agent": agent,
             "taskId": task_id,
             "question": question,
+            "merchantId": str(state.get("requested_merchant_id") or ""),
+            "identityScope": identity_scope_payload(
+                state.get("user_identity") or {},
+                str(state.get("requested_merchant_id") or ""),
+            ),
+            "accessRole": str(state.get("access_role") or ""),
             "tables": allowed_tables or [],
             "metrics": allowed_metrics or [],
-            "sourceRefs": [ref.locator or ref.path or ref.title for ref in snapshot.source_refs[:12]],
-            "artifactRefs": [ref.relative_path or ref.path for ref in artifact_refs],
+            "protectedFacts": [fact.model_dump(by_alias=True) for fact in snapshot.protected_facts[:18]],
+            "memoryConstraints": list(state.get("memory_constraints") or [])[:12],
+            "memoryIds": list((state.get("memory_injection_trace") or {}).get("selectedIds") or [])[:24],
+            "memoryInjectionSha256": hashlib.sha256(
+                json.dumps(state.get("memory_injection") or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+            "runtimeInjectionSha256": hashlib.sha256(
+                json.dumps(state.get("runtime_injection") or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+            "sessionContextSha256": hashlib.sha256(str(state.get("session_context") or "").encode("utf-8")).hexdigest(),
+            "threadContext": {
+                "previousRunId": (state.get("thread_context") or {}).get("previousRunId", ""),
+                "previousQuestion": (state.get("thread_context") or {}).get("previousQuestion", ""),
+                "recentMessages": list((state.get("thread_context") or {}).get("messageHistory") or [])[-6:],
+            },
+            "sourceRefs": [
+                {
+                    "locator": ref.locator or ref.path or ref.title,
+                    "merchantUri": ref.merchant_uri,
+                }
+                for ref in snapshot.source_refs[:12]
+            ],
+            "artifactRefs": [
+                {
+                    "path": ref.relative_path or ref.path,
+                    "sha256": ref.sha256,
+                }
+                for ref in artifact_refs
+            ],
             "agentContextPolicy": agent_context_policy,
+            "evidenceGaps": gaps,
         }
         context_hash = hashlib.sha256(json.dumps(hash_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
         return ContextPackage(

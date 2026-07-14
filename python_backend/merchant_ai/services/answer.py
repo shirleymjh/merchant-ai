@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -34,12 +35,15 @@ from merchant_ai.services.answer_formatting import (
     format_metric_value_for_answer,
     humanize_column_name,
     identifier_like_column,
+    source_aware_metric_label,
 )
+from merchant_ai.services.answer_claims import AnswerClaimVerifier, build_verified_facts
 
 
 def answer_context_policy() -> str:
     return (
-        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft；不要读取或推断 QueryGraph。"
+        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft；不要读取或推断 QueryGraph。"
+        "verifiedFacts 是数字、日期、实体和排序结论的唯一事实来源；任何事实陈述都必须能直接绑定其中的 factId，不能补充未出现的数值或业务实体。"
         "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
         "不要使用“分析结论”“关键证据”“限制”“证据门禁”“当前证据显示”“已看到的点位显示”这类报告或内部调试话术。"
         "不要说“查到几行”“使用表”“SQL”“字段名”“Doris”；不要输出 markdown 表格，表格和图表由前端结构化区域渲染。"
@@ -56,14 +60,83 @@ def answer_context_policy() -> str:
     )
 
 
+def claim_failure_reason(verification: Any) -> str:
+    reasons: List[str] = []
+    for claim in getattr(verification, "unsupported_claims", [])[:5]:
+        reasons.extend(str(item) for item in getattr(claim, "reasons", []) if str(item))
+    return ";".join(dedupe_strings(reasons)[:8]) or "unsupported_answer_claim"
+
+
 class AnswerComposeService:
     def __init__(self, llm: LlmClient):
         self.llm = llm
         self.prompt_assembler = PromptAssembler()
-        self.last_prompt_chars = 0
-        self.last_analysis_skill_trace: Dict[str, Any] = {}
-        self.last_compose_llm_attempted = False
-        self.last_compose_used_llm = False
+        self._last_prompt_chars: ContextVar[int] = ContextVar("answer_prompt_chars_%x" % id(self), default=0)
+        self._last_analysis_skill_trace: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+            "answer_skill_trace_%x" % id(self),
+            default=None,
+        )
+        self._last_compose_llm_attempted: ContextVar[bool] = ContextVar(
+            "answer_compose_attempted_%x" % id(self),
+            default=False,
+        )
+        self._last_compose_used_llm: ContextVar[bool] = ContextVar(
+            "answer_compose_used_llm_%x" % id(self),
+            default=False,
+        )
+        self.claim_verifier = AnswerClaimVerifier()
+        self._last_answer_claim_trace: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+            "answer_claim_trace_%x" % id(self),
+            default=None,
+        )
+
+    @property
+    def last_prompt_chars(self) -> int:
+        return int(self._last_prompt_chars.get())
+
+    @last_prompt_chars.setter
+    def last_prompt_chars(self, value: int) -> None:
+        self._last_prompt_chars.set(int(value or 0))
+
+    @property
+    def last_analysis_skill_trace(self) -> Dict[str, Any]:
+        trace = self._last_analysis_skill_trace.get()
+        if trace is None:
+            trace = {}
+            self._last_analysis_skill_trace.set(trace)
+        return trace
+
+    @last_analysis_skill_trace.setter
+    def last_analysis_skill_trace(self, value: Dict[str, Any]) -> None:
+        self._last_analysis_skill_trace.set(dict(value or {}))
+
+    @property
+    def last_compose_llm_attempted(self) -> bool:
+        return bool(self._last_compose_llm_attempted.get())
+
+    @last_compose_llm_attempted.setter
+    def last_compose_llm_attempted(self, value: bool) -> None:
+        self._last_compose_llm_attempted.set(bool(value))
+
+    @property
+    def last_compose_used_llm(self) -> bool:
+        return bool(self._last_compose_used_llm.get())
+
+    @last_compose_used_llm.setter
+    def last_compose_used_llm(self, value: bool) -> None:
+        self._last_compose_used_llm.set(bool(value))
+
+    @property
+    def last_answer_claim_trace(self) -> Dict[str, Any]:
+        trace = self._last_answer_claim_trace.get()
+        if trace is None:
+            trace = {}
+            self._last_answer_claim_trace.set(trace)
+        return trace
+
+    @last_answer_claim_trace.setter
+    def last_answer_claim_trace(self, value: Dict[str, Any]) -> None:
+        self._last_answer_claim_trace.set(dict(value or {}))
 
     def compose(
         self,
@@ -80,6 +153,7 @@ class AnswerComposeService:
         self.last_compose_llm_attempted = False
         self.last_compose_used_llm = False
         self.last_prompt_chars = 0
+        self.last_answer_claim_trace = {}
         if not plan.intents:
             return self._no_execution_answer(plan)
         primary = plan.intents[0] if plan.intents else QuestionIntent()
@@ -95,13 +169,15 @@ class AnswerComposeService:
             if deterministic_single_semantic_metric_answer(plan) or not question_requests_diagnosis(question):
                 grounded = deterministic_structured_answer(question, plan, run_result)
                 if grounded:
-                    return self._apply_answer_guard(
+                    return self._finalize_answer(
                         self._append_lightweight_metric_disclosure(grounded, question, plan, run_result),
+                        question,
+                        plan,
                         run_result,
                     )
             cleaned_summary = sanitize_business_answer_text(analysis_summary, question, plan, run_result)
             answer = ensure_required_field_answer_coverage(cleaned_summary, plan, run_result)
-            return self._apply_answer_guard(
+            return self._finalize_answer(
                 self._append_lightweight_metric_disclosure(
                     self._append_rule_evidence(
                         self.append_business_advice(
@@ -122,12 +198,14 @@ class AnswerComposeService:
                     plan,
                     run_result,
                 ),
+                question,
+                plan,
                 run_result,
             )
         if primary.intent_type == "VALID" and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT} and (not run_result or not run_result.task_results):
             return self._no_execution_answer(plan)
         if run_result and run_result.task_results and all(result.query_bundle.failed for result in run_result.task_results):
-            return self._apply_answer_guard(
+            return self._finalize_answer(
                 self._append_rule_evidence(
                     self.append_business_advice(
                         self._execution_failure_answer(run_result),
@@ -138,17 +216,19 @@ class AnswerComposeService:
                         run_result=run_result,
                         merchant=merchant,
                         personalization_context=personalization_context,
-                        allow_llm=allow_llm,
+                        allow_llm=False,
                     ),
                     question,
                     effective_rule_context,
                 ),
+                question,
+                plan,
                 run_result,
             )
         if question_asks_metric_reconciliation(question):
             reconciliation_answer = self._metric_reconciliation_answer(question, plan, run_result)
             if reconciliation_answer:
-                return self._apply_answer_guard(
+                return self._finalize_answer(
                     self._append_rule_evidence(
                         self.append_business_advice(
                             reconciliation_answer,
@@ -159,11 +239,13 @@ class AnswerComposeService:
                             run_result=run_result,
                             merchant=merchant,
                             personalization_context=personalization_context,
-                            allow_llm=allow_llm,
+                            allow_llm=False,
                         ),
                         question,
                         effective_rule_context,
                     ),
+                    question,
+                    plan,
                     run_result,
                 )
         structured_answer = ""
@@ -187,7 +269,7 @@ class AnswerComposeService:
             structured_answer = deterministic_structured_answer(question, plan, run_result)
         if structured_answer:
             structured_answer = ensure_required_field_answer_coverage(structured_answer, plan, run_result)
-            return self._apply_answer_guard(
+            return self._finalize_answer(
                 self._append_lightweight_metric_disclosure(
                     self._append_rule_evidence(
                         self.append_business_advice(
@@ -208,6 +290,8 @@ class AnswerComposeService:
                     plan,
                     run_result,
                 ),
+                question,
+                plan,
                 run_result,
             )
         if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
@@ -227,7 +311,7 @@ class AnswerComposeService:
                 if coverage_answer and not answer_acknowledges_incomplete_evidence(answer):
                     answer = coverage_answer
                 answer = ensure_required_field_answer_coverage(answer, plan, run_result)
-                return self._apply_answer_guard(
+                return self._finalize_answer(
                     self._append_lightweight_metric_disclosure(
                         self._append_rule_evidence(
                             self.append_business_advice(
@@ -239,7 +323,7 @@ class AnswerComposeService:
                                 run_result=run_result,
                                 merchant=merchant,
                                 personalization_context=personalization_context,
-                                allow_llm=allow_llm and not hybrid_ranking_analysis,
+                                allow_llm=False,
                             ),
                             question,
                             effective_rule_context,
@@ -248,6 +332,8 @@ class AnswerComposeService:
                         plan,
                         run_result,
                     ),
+                    question,
+                    plan,
                     run_result,
                 )
         fallback_answer = ensure_required_field_answer_coverage(
@@ -255,7 +341,7 @@ class AnswerComposeService:
             plan,
             run_result,
         )
-        return self._apply_answer_guard(
+        return self._finalize_answer(
             self._append_lightweight_metric_disclosure(
                 self._append_rule_evidence(
                     self.append_business_advice(
@@ -267,7 +353,7 @@ class AnswerComposeService:
                         run_result=run_result,
                         merchant=merchant,
                         personalization_context=personalization_context,
-                        allow_llm=allow_llm,
+                        allow_llm=False,
                     ),
                     question,
                     effective_rule_context,
@@ -276,6 +362,8 @@ class AnswerComposeService:
                 plan,
                 run_result,
             ),
+            question,
+            plan,
             run_result,
         )
 
@@ -297,16 +385,20 @@ class AnswerComposeService:
         skill_name = self.propose_answer_skill(question, plan, run_result, bool(rule_context))
         if not skill_name and not analysis_summary_required(plan):
             return ""
-        skill_answer = self.run_analysis_skill(
-            question,
-            plan,
-            run_result,
-            outputs_path,
-            rule_context,
-            skill_name=skill_name,
-            merchant=merchant,
-            personalization_context=personalization_context,
-        )
+        skill_answer = ""
+        if skill_name:
+            skill_answer = self.run_analysis_skill(
+                question,
+                plan,
+                run_result,
+                outputs_path,
+                rule_context,
+                skill_name=skill_name,
+                merchant=merchant,
+                personalization_context=personalization_context,
+            )
+        else:
+            self.last_analysis_skill_trace["skillExecutionSkipped"] = True
         if skill_answer:
             return skill_answer
         deterministic = deterministic_analysis_summary(question, plan, run_result)
@@ -409,6 +501,17 @@ class AnswerComposeService:
             "fallbackSkill": fallback,
         }
         self.last_analysis_skill_trace = trace
+        if skill_route_explicit_no_match(plan.question_understanding or {}):
+            trace.update(
+                {
+                    "matchedBy": "semantic_explicit_no_match",
+                    "matchStatus": "explicit_no_match",
+                    "skillName": "",
+                    "fallbackSuppressed": True,
+                    "fallbackSuppressedReason": "AUTHORITATIVE_SEMANTIC_NO_MATCH",
+                }
+            )
+            return ""
         if not candidates or self.llm.settings.answer_skill_match_mode == "off":
             trace["matchedBy"] = "deterministic_fallback"
             trace["skillName"] = fallback
@@ -443,23 +546,40 @@ class AnswerComposeService:
         system = (
             "You are an Answer Skill matcher. Choose at most one skill from the provided skill headers. "
             "Do not invent skill names. Return JSON only: {\"skillName\":\"...\", \"confidence\":0-1, \"reason\":\"...\"}. "
-            "Return empty skillName when no skill should run."
+            "Return empty skillName when no skill should run. An empty skillName is an authoritative no-match decision."
         )
         raw = self.llm.chat(system, json.dumps(prompt_payload, ensure_ascii=False, default=str), "", timeout_seconds=8)
         trace["matchedBy"] = "llm_skill_header_match"
         trace["llmRaw"] = raw[:800] if raw else ""
         payload = parse_skill_match_payload(raw)
         allowed = {str(item.get("name") or "") for item in candidates}
-        selected = str(payload.get("skillName") or "")
+        selected = skill_match_payload_name(payload)
+        trace["llmMatchStatus"] = skill_match_response_status(raw, payload, selected)
+        trace["confidence"] = payload.get("confidence")
+        trace["reason"] = payload.get("reason")
+        if skill_match_payload_explicit_no_match(payload):
+            trace.update(
+                {
+                    "matchedBy": "llm_explicit_no_match",
+                    "matchStatus": "explicit_no_match",
+                    "skillName": "",
+                    "fallbackSuppressed": bool(fallback),
+                    "fallbackSuppressedReason": "AUTHORITATIVE_LLM_NO_MATCH",
+                }
+            )
+            return ""
         if selected and selected not in allowed:
             selected = ""
             trace["matchWarning"] = "LLM_SELECTED_UNKNOWN_SKILL"
+            trace["llmMatchStatus"] = "unknown_skill"
         if not selected:
             selected = fallback
             trace["matchedBy"] = "deterministic_fallback_after_llm"
+            trace["matchStatus"] = "fallback" if selected else "no_match"
+            trace["fallbackApplied"] = bool(selected)
+        else:
+            trace["matchStatus"] = "matched"
         trace["skillName"] = selected
-        trace["confidence"] = payload.get("confidence")
-        trace["reason"] = payload.get("reason")
         return selected
 
     def run_analysis_skill(
@@ -473,6 +593,16 @@ class AnswerComposeService:
         merchant: MerchantInfo | None = None,
         personalization_context: Optional[Dict[str, Any]] = None,
     ) -> str:
+        if not skill_name and analysis_skill_match_is_explicit_no_match(self.last_analysis_skill_trace):
+            self.last_analysis_skill_trace.update(
+                {
+                    "activated": False,
+                    "skillExecutionSkipped": True,
+                    "lifecycleStage": "skipped",
+                    "progress": ["matched", "no_match", "skipped"],
+                }
+            )
+            return ""
         selected_skill = skill_name or select_answer_skill(plan, run_result, bool(rule_context)) or "bi_trend_attribution"
         if self._should_use_local_fast_structured_skill(selected_skill, plan, run_result):
             requires_confirmation = bool(
@@ -987,11 +1117,19 @@ class AnswerComposeService:
         lines.append("如果该数值和其他看板不一致，请按当前已发布语义契约逐项核对：")
         for disclosure in metric_disclosures(plan, run_result.verified_evidence)[:3]:
             name = str(disclosure.get("displayName") or disclosure.get("metricKey") or disclosure.get("metric") or "指标")
-            formula = str(disclosure.get("formula") or "")
             description = str(disclosure.get("description") or disclosure.get("fieldWarning") or "")
-            detail = "；".join(item for item in [description, ("公式 %s" % formula if formula else "")] if item)
+            detail = description or lightweight_metric_description(disclosure)
             lines.append("- %s：%s" % (name, detail or "以已发布语义层定义为准"))
-        lines.append("- 查询范围：核对时间窗口、分组维度、过滤条件、租户范围和数据更新时间是否一致。")
+        lines.extend(
+            [
+                "- 时间口径：核对起止时间、自然日边界和时区是否一致。",
+                "- 状态口径：核对订单支付、关闭、退款等状态过滤是否一致。",
+                "- GMV 是否扣退款：核对展示的是支付成功金额，还是扣除后续退款后的净额。",
+                "- 商品粒度：核对按商品、SKU、订单还是店铺汇总。",
+                "- 数据更新：核对数据分区、刷新时间和实时/离线来源是否一致。",
+                "- 查询范围：核对过滤条件和租户范围是否一致。",
+            ]
+        )
         lines.append("建议提供对方看板的语义指标 ID 与查询范围，再按同一契约复算。")
         return "\n".join(lines)
 
@@ -1023,6 +1161,55 @@ class AnswerComposeService:
         if not merchant_notes:
             return answer
         return answer.rstrip() + "\n\n说明：\n" + "\n".join("- %s" % item for item in merchant_notes[:3])
+
+    def _finalize_answer(
+        self,
+        answer: str,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+    ) -> str:
+        guarded = self._apply_answer_guard(answer, run_result)
+        verification = self.claim_verifier.verify(question, plan, run_result, guarded)
+        if verification.passed:
+            self._record_claim_verification(run_result, verification)
+            return guarded
+
+        fallback = deterministic_structured_answer(question, plan, run_result)
+        if not fallback and run_result:
+            fallback = self._fallback_data_answer(question, plan, run_result.merged_query_bundle, run_result)
+        if fallback:
+            fallback = ensure_required_field_answer_coverage(fallback, plan, run_result)
+            fallback = self._append_lightweight_metric_disclosure(fallback, question, plan, run_result)
+            fallback = self._apply_answer_guard(fallback, run_result)
+            fallback_verification = self.claim_verifier.verify(question, plan, run_result, fallback)
+            if fallback_verification.passed:
+                fallback_verification = fallback_verification.model_copy(
+                    update={
+                        "rejected_claims": verification.unsupported_claims,
+                        "fallback_used": True,
+                        "fallback_reason": claim_failure_reason(verification),
+                    }
+                )
+                self._record_claim_verification(run_result, fallback_verification)
+                return fallback
+
+        safe_answer = "当前查询结果已返回，但生成答案中的部分事实无法与已验证数据逐项对应，因此未展示相关数值。请以结构化数据区域为准。"
+        safe_verification = self.claim_verifier.verify(question, plan, run_result, safe_answer)
+        final_verification = safe_verification.model_copy(
+            update={
+                "rejected_claims": verification.unsupported_claims,
+                "fallback_used": True,
+                "fallback_reason": claim_failure_reason(verification),
+            }
+        )
+        self._record_claim_verification(run_result, final_verification)
+        return self._apply_answer_guard(safe_answer, run_result)
+
+    def _record_claim_verification(self, run_result: AgentRunResult | None, verification: Any) -> None:
+        if run_result is not None:
+            run_result.answer_claim_verification = verification
+        self.last_answer_claim_trace = verification.model_dump(by_alias=True) if hasattr(verification, "model_dump") else {}
 
     def contextual_suggestions(
         self,
@@ -1140,7 +1327,6 @@ class AnswerComposeService:
         friendly = merchant_friendly_data_answer(question, plan, bundle, run_result)
         if friendly:
             return friendly
-        successful_task_count = len([item for item in run_result.task_results if not item.query_bundle.failed]) if run_result else 0
         overview = generic_result_overview_sentence(question, plan, bundle.rows, run_result)
         lines = [overview or "当前查询范围内，已返回可核对的数据结果。"]
         gaps = run_result.evidence_gaps if run_result else []
@@ -1460,7 +1646,7 @@ def partial_evidence_summary_lines(plan: QueryPlan, run_result: AgentRunResult) 
         if not rows:
             continue
         intent = intent_map.get(item.task_id)
-        title = task_evidence_title(intent, item)
+        title = task_evidence_title(intent, item, plan)
         lines.append("- %s：返回 %d 条。" % (title, item.query_bundle.effective_row_count()))
     return dedupe_strings(lines)
 
@@ -1708,6 +1894,27 @@ def friendly_column_label(plan: QueryPlan, column: str) -> str:
         if column == str(resolution.get("metricKey") or "") and resolution.get("displayName"):
             return str(resolution.get("displayName"))
     return humanize_column_name(column)
+
+
+def default_answer_column_label(column: str) -> str:
+    """Return stable merchant-facing labels when no semantic display name exists."""
+    return {
+        "spu_id": "SPU ID",
+        "spu_name": "商品",
+        "sku_id": "SKU ID",
+        "order_id": "订单号",
+        "sub_order_id": "子订单号",
+        "refund_id": "退款单号",
+        "ticket_id": "工单号",
+        "bill_id": "赔付单号",
+        "pt": "日期",
+        "spu_apply_create_time": "商品发布时间",
+    }.get(str(column or "").strip(), "")
+
+
+def fallback_metric_label(intent: QuestionIntent, metric: str) -> str:
+    """Disambiguate shared physical fields from their typed owner contract."""
+    return source_aware_metric_label(metric, intent.preferred_table, str(intent.category or ""))
 
 
 def is_ranking_plan(plan: QueryPlan) -> bool:
@@ -2334,17 +2541,16 @@ def merge_visible_task_rows(base_item: Any, other_items: List[Any]) -> List[Dict
                 if not match:
                     continue
                 for key, value in match.items():
-                    alias = merge_conflict_column_name(item, key)
-                    if alias:
-                        if alias not in target:
-                            target[alias] = value
-                            changed = True
-                        continue
                     if key not in target or target.get(key) in (None, ""):
                         target[key] = value
                         changed = True
                         continue
                     if target.get(key) != value:
+                        base_alias = merge_conflict_column_name(base_item, key)
+                        alias = merge_conflict_column_name(item, key)
+                        if base_alias and key in target and base_alias not in target:
+                            target[base_alias] = target.pop(key)
+                            changed = True
                         if alias and alias not in target:
                             target[alias] = value
                             changed = True
@@ -2469,12 +2675,28 @@ def answer_column_labels(plan: QueryPlan) -> Dict[str, str]:
     labels: Dict[str, str] = {}
     for intent in plan.intents:
         resolution = intent.metric_resolution or {}
-        metric = str(resolution.get("metricKey") or intent.metric_name or "").strip()
-        display = str(resolution.get("displayName") or "").strip()
+        metric = str(resolution.get("metricKey") or intent.metric_name or intent.metric_column or "").strip()
+        display = str(resolution.get("displayName") or "").strip() or fallback_metric_label(intent, metric)
         if metric and display:
             labels[metric] = display
+            table = re.sub(r"[^A-Za-z0-9_]+", "_", str(intent.preferred_table or "")).strip("_")
+            if table:
+                labels["%s__%s" % (table, metric)] = display
         if intent.group_by_column and intent.group_by_name:
             labels[intent.group_by_column] = intent.group_by_name
+        for column in [intent.group_by_column, intent.filter_column, *intent.output_keys, *intent.required_evidence]:
+            text = str(column or "").strip()
+            default = default_answer_column_label(text)
+            if text and default:
+                labels.setdefault(text, default)
+    for evidence in (plan.question_understanding or {}).get("requiredEvidenceIntents") or (plan.question_understanding or {}).get("required_evidence_intents") or []:
+        if not isinstance(evidence, dict):
+            continue
+        for field in evidence.get("suggestedFields") or evidence.get("suggested_fields") or []:
+            text = str(field or "").strip()
+            default = default_answer_column_label(text)
+            if text and default:
+                labels.setdefault(text, default)
     return labels
 
 
@@ -2495,7 +2717,7 @@ def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
             lines.append("- %s：执行成功但返回 0 行。" % item.task_id)
             continue
         intent = intent_by_task.get(item.task_id)
-        title = task_evidence_title(intent, item)
+        title = task_evidence_title(intent, item, plan)
         tables = "、".join(bundle.tables) if bundle.tables else (intent.preferred_table if intent else "")
         location = tables or ("派生计算" if intent and intent.answer_mode == AnswerMode.DERIVED else "unknown_table")
         lines.append("- %s（%s）：%s 行。" % (title, location, bundle.effective_row_count()))
@@ -2509,7 +2731,7 @@ def task_evidence_sections(plan: QueryPlan, run_result: AgentRunResult) -> str:
     return "\n".join(lines)
 
 
-def task_evidence_title(intent: QuestionIntent | None, item: Any) -> str:
+def task_evidence_title(intent: QuestionIntent | None, item: Any, plan: QueryPlan | None = None) -> str:
     if not intent:
         return str(getattr(item, "task_id", "") or "查询结果")
     resolution = intent.metric_resolution or {}
@@ -2522,6 +2744,11 @@ def task_evidence_title(intent: QuestionIntent | None, item: Any) -> str:
         return display
     if metric:
         return metric
+    if plan:
+        required = required_evidence_refs(plan.question_understanding or {})
+        matched_fields = [field for field in intent.output_keys if field in required["fields"]]
+        if matched_fields:
+            return friendly_column_label(plan, matched_fields[0])
     if intent.preferred_table:
         return intent.preferred_table
     return str(getattr(item, "task_id", "") or "查询结果")
@@ -2567,12 +2794,37 @@ def should_hide_alternate_metric(plan: QueryPlan, intent: QuestionIntent | None)
     if not intent:
         return False
     resolution = intent.metric_resolution or {}
-    return bool(
+    if bool(
         resolution.get("internalOnly")
         or resolution.get("supportOnly")
         or str(resolution.get("displayRole") or "") == "support"
         or str(resolution.get("sourcePhrase") or "").startswith("semantic formula dependency")
-    )
+    ):
+        return True
+    requested = question_understanding_metric_refs(plan.question_understanding or {})
+    metric_key = intent_metric_key(intent)
+    if not requested or not metric_key or metric_key in requested:
+        return False
+    requested_phrases: set[str] = set()
+    for candidate in plan.intents:
+        if intent_metric_key(candidate) not in requested:
+            continue
+        candidate_resolution = candidate.metric_resolution or {}
+        requested_phrases.update(
+            normalized_metric_phrase(value)
+            for value in [candidate_resolution.get("displayName"), candidate_resolution.get("sourcePhrase")]
+            if normalized_metric_phrase(value)
+        )
+    current_phrases = {
+        normalized_metric_phrase(value)
+        for value in [resolution.get("displayName"), resolution.get("sourcePhrase")]
+        if normalized_metric_phrase(value)
+    }
+    return bool(requested_phrases & current_phrases)
+
+
+def normalized_metric_phrase(value: Any) -> str:
+    return re.sub(r"[\s_\-]+", "", str(value or "")).strip().lower()
 
 
 def intent_metric_key(intent: QuestionIntent | None) -> str:
@@ -2713,6 +2965,8 @@ def answer_skill_required(plan: QueryPlan, run_result: AgentRunResult | None = N
 
 
 def deterministic_analysis_skill_fallback(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> str:
+    if skill_route_explicit_no_match(plan.question_understanding or {}):
+        return ""
     selected = select_answer_skill(plan, run_result, has_rule_context)
     if selected:
         return selected
@@ -2726,6 +2980,8 @@ def deterministic_analysis_skill_fallback(plan: QueryPlan, run_result: AgentRunR
 
 def select_answer_skill(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> str:
     understanding = plan.question_understanding or {}
+    if skill_route_explicit_no_match(understanding):
+        return ""
     analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").strip().lower()
     requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
     categories = {intent.category for intent in plan.intents}
@@ -2792,12 +3048,51 @@ def declared_skill_workflow_name(understanding: Dict[str, Any]) -> str:
     for key in ["skillWorkflow", "skill_workflow", "recommendedSkill", "recommended_skill", "analysisSkill", "analysis_skill"]:
         value = understanding.get(key)
         if isinstance(value, dict):
+            if skill_route_payload_explicit_no_match(value):
+                continue
             name = str(value.get("skillName") or value.get("skill_name") or value.get("name") or "").strip()
         else:
             name = str(value or "").strip()
         if name in allowed:
             return name
     return ""
+
+
+def skill_route_explicit_no_match(understanding: Dict[str, Any]) -> bool:
+    route_keys = [
+        "skillWorkflow",
+        "skill_workflow",
+        "recommendedSkill",
+        "recommended_skill",
+        "analysisSkill",
+        "analysis_skill",
+        "skillMatch",
+        "skill_match",
+        "skillRoute",
+        "skill_route",
+    ]
+    return any(
+        skill_route_payload_explicit_no_match(understanding.get(key))
+        for key in route_keys
+        if isinstance(understanding.get(key), dict)
+    )
+
+
+def skill_route_payload_explicit_no_match(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    name_keys = ["skillName", "skill_name", "name"]
+    if any(key in payload for key in name_keys):
+        name = str(next((payload.get(key) for key in name_keys if key in payload), "") or "").strip()
+        if not name or normalize_skill_match_status(name) in SKILL_NO_MATCH_STATUSES:
+            return True
+    for key in ["status", "decision", "outcome", "matchStatus", "match_status"]:
+        if normalize_skill_match_status(payload.get(key)) in SKILL_NO_MATCH_STATUSES:
+            return True
+    for key in ["applicable", "matched", "enabled"]:
+        if key in payload and not boolish(payload.get(key)):
+            return True
+    return False
 
 
 def looks_like_gmv_or_order_drop(text: str) -> bool:
@@ -2831,14 +3126,6 @@ def reusable_analysis_workflow_requested(understanding: Dict[str, Any]) -> bool:
         label = str(item.get("semanticLabel") or item.get("semantic_label") or "").strip().lower()
         if label in {"reusable_analysis_workflow", "skill_workflow", "fixed_analysis_workflow"}:
             return True
-    # A structured diagnosis/attribution declaration is itself a request for
-    # the governed analysis SOP.  This keeps Skill activation driven by the
-    # Planner contract even when an optional explicit skillWorkflow field was
-    # omitted; raw question keywords alone are still insufficient.
-    analysis_intent = str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "").strip().lower()
-    requires_explanation = boolish(understanding.get("requiresExplanation", understanding.get("requires_explanation")))
-    if requires_explanation and analysis_intent in {"anomaly_check", "diagnosis", "risk_ranking", "store_health", "health_check"}:
-        return True
     return False
 
 
@@ -2993,6 +3280,8 @@ def verified_answer_context(
             rule_evidence=compact_rule_evidence(question, rule_context),
         )
     verified = run_result.verified_evidence
+    facts = build_verified_facts(plan, run_result)
+    run_result.verified_facts = facts
     return VerifiedAnswerContext(
         question=question,
         business_context=answer_business_context(question, plan, run_result, merchant, personalization_context),
@@ -3007,6 +3296,7 @@ def verified_answer_context(
         rule_evidence=compact_rule_evidence(question, rule_context),
         verified_passed=bool(verified.passed),
         partial_answer_reason=run_result.partial_answer_reason or verified.partial_answer_reason,
+        verified_facts=facts,
     )
 
 
@@ -3185,8 +3475,7 @@ def metric_disclosures(plan: QueryPlan, verified: Any) -> List[Dict[str, Any]]:
             continue
         resolution = intent.metric_resolution or {}
         if resolution:
-            disclosures.append(
-                {
+            disclosure = {
                     key: resolution.get(key)
                     for key in [
                         "requestedMetricRef",
@@ -3202,7 +3491,8 @@ def metric_disclosures(plan: QueryPlan, verified: Any) -> List[Dict[str, Any]]:
                     ]
                     if resolution.get(key) not in (None, "", [])
                 }
-            )
+            disclosure.setdefault("ownerTable", intent.preferred_table)
+            disclosures.append(disclosure)
         elif intent.metric_formula or intent.metric_name:
             disclosures.append(
                 {
@@ -3259,6 +3549,11 @@ def lightweight_metric_description(item: Dict[str, Any]) -> str:
     description = str(item.get("description") or item.get("fieldWarning") or "").strip()
     if description:
         return "%s：%s" % (display_name, description)
+    business_fallback = {
+        "order_gmv_amt_1d": "GMV按支付成功订单金额统计，未主动扣除后续退款",
+    }.get(str(item.get("metricKey") or item.get("metric") or "").strip())
+    if business_fallback:
+        return business_fallback
     formula = str(item.get("formula") or "").strip()
     if formula:
         return "%s按已发布语义公式 %s 计算" % (display_name, formula)
@@ -4410,6 +4705,55 @@ def parse_skill_match_payload(raw: str) -> Dict[str, Any]:
             return {}
 
 
+SKILL_NO_MATCH_STATUSES = {
+    "no_match",
+    "no-match",
+    "not_applicable",
+    "not-applicable",
+    "inapplicable",
+    "none",
+    "no_skill",
+    "no-skill",
+    "rejected",
+    "skip",
+    "skipped",
+}
+
+
+def normalize_skill_match_status(value: Any) -> str:
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+def skill_match_payload_name(payload: Dict[str, Any]) -> str:
+    return str(payload.get("skillName") or payload.get("skill_name") or "").strip()
+
+
+def skill_match_payload_explicit_no_match(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict) or not payload:
+        return False
+    return skill_route_payload_explicit_no_match(payload)
+
+
+def skill_match_response_status(raw: str, payload: Dict[str, Any], selected: str) -> str:
+    if not str(raw or "").strip():
+        return "empty_response"
+    if not payload:
+        return "invalid_payload"
+    if skill_match_payload_explicit_no_match(payload):
+        return "explicit_no_match"
+    return "matched" if selected else "invalid_payload"
+
+
+def analysis_skill_match_is_explicit_no_match(trace: Dict[str, Any]) -> bool:
+    return bool(
+        isinstance(trace, dict)
+        and (
+            trace.get("matchStatus") == "explicit_no_match"
+            or trace.get("matchedBy") in {"llm_explicit_no_match", "semantic_explicit_no_match"}
+        )
+    )
+
+
 def answer_skill_reuse_candidate(skill_name: str, result: Dict[str, Any]) -> bool:
     if not skill_name or not isinstance(result, dict):
         return False
@@ -4493,6 +4837,12 @@ class DailyReportService:
         except Exception:
             pass
         alerts = daily_report_alerts(profile, configured_metrics, role_values)
+        alert_suggestions = [
+            str(item.get("drillDownQuestion") or "")
+            for item in alerts
+            if str(item.get("drillDownQuestion") or "").strip()
+        ]
+        configured_suggestions = [str(item) for item in profile.get("suggestions") or [] if str(item)]
         return DailyReportResponse(
             merchant_id=target,
             merchant_name=merchant_name,
@@ -4510,7 +4860,7 @@ class DailyReportService:
                 "semanticProfile": str(profile.get("profileKey") or ""),
                 "semanticMetricRefs": [str(item.get("metricRef") or "") for item in configured_metrics],
             },
-            suggestions=[str(item) for item in profile.get("suggestions") or [] if str(item)][:3],
+            suggestions=dedupe_strings(alert_suggestions + configured_suggestions)[:3],
         )
 
     def _semantic_profile(self) -> tuple[Dict[str, Any], str, str, Dict[str, Any]]:
@@ -4619,6 +4969,7 @@ def build_response_context(
     pending_stage: str = "",
     pending_type: str = "",
     pending_options: List[str] = None,
+    pending_question: str = "",
 ) -> ChatContext:
     primary = plan.intents[0] if plan.intents else QuestionIntent()
     topics = plan.categories()
@@ -4645,6 +4996,6 @@ def build_response_context(
         context_summary="QueryGraph nodes=%s, sections=%s" % (len(plan.intents), len(sections)),
         pending_clarification_stage=pending_stage,
         pending_clarification_type=pending_type,
-        pending_question=question if pending_stage else "",
+        pending_question=(pending_question or question) if pending_stage else "",
         pending_clarification_options=pending_options or [],
     )

@@ -2,7 +2,16 @@ from merchant_ai.services.semantic_metrics import (
     seal_semantic_metric_resolution,
     semantic_metric_contract_issue,
 )
-from merchant_ai.models import AgentRunResult, AgentTaskResult, AnswerMode, PlanningAssetPack, QueryBundle, QueryPlan, QuestionIntent
+from merchant_ai.models import (
+    AgentRunResult,
+    AgentTaskResult,
+    AnswerMode,
+    PlanningAssetEntry,
+    PlanningAssetPack,
+    QueryBundle,
+    QueryPlan,
+    QuestionIntent,
+)
 from merchant_ai.services.answer import (
     deterministic_cross_task_detail_answer,
     ensure_required_field_answer_coverage,
@@ -10,6 +19,11 @@ from merchant_ai.services.answer import (
     metric_value_column_for_rows,
 )
 from merchant_ai.services.memory import reusable_knowledge_assertion_present
+from merchant_ai.services.planning import (
+    PlannerReflectionAgent,
+    QuestionUnderstandingCompiler,
+    semantic_fast_path_can_bypass_configured_llm,
+)
 from merchant_ai.services.query import governed_realtime_metric_resolution, merge_task_result_bundles
 
 
@@ -60,6 +74,119 @@ def test_semantic_metric_contract_rejects_late_table_override():
     resolution["ownerTable"] = "refunds"
 
     assert semantic_metric_contract_issue(resolution, "refunds") == "semantic metric contract drifted after resolution"
+
+
+def test_planner_seals_explicit_asset_as_compiled_local_metric_contract():
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="orders", columns=["seller_id", "order_id", "pt"])],
+        metrics=[PlanningAssetEntry(key="order_cnt", table="orders", columns=["order_id"], title="订单量")],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "order_cnt",
+            "ownerTable": "orders",
+            "sourcePhrase": "订单量",
+            "objectiveType": "metric_total",
+            "groupByColumn": "seller_id",
+            "limit": 1,
+        },
+        "requestedMeasures": [],
+        "scopeConstraints": [],
+        "filters": [],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("最近7天订单量是多少", understanding, pack)
+
+    assert plan.intents
+    assert all(intent.metric_formula == "COUNT(DISTINCT `order_id`)" for intent in plan.intents)
+    assert all(intent.metric_resolution["metricGovernanceMode"] == "compiled_local" for intent in plan.intents)
+    assert all(intent.metric_resolution["localCompilationPolicy"] == "count_metric_convention" for intent in plan.intents)
+    assert all(semantic_metric_contract_issue(intent.metric_resolution, "orders") == "" for intent in plan.intents)
+    assert PlannerReflectionAgent().reflect("最近7天订单量是多少", plan, pack).passed
+    assert not semantic_fast_path_can_bypass_configured_llm("最近7天订单量是多少", plan, pack)
+
+
+def test_planner_does_not_infer_missing_formula_for_published_semantic_metric():
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="orders", columns=["seller_id", "order_id", "pt"])],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_cnt",
+                table="orders",
+                columns=["order_id"],
+                title="订单量",
+                source_ref_id="semantic:trade:orders:metric:order_cnt",
+            )
+        ],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "rankingObjective": {
+            "metricRef": "order_cnt",
+            "ownerTable": "orders",
+            "sourcePhrase": "订单量",
+            "objectiveType": "metric_total",
+            "groupByColumn": "seller_id",
+            "limit": 1,
+        },
+        "requestedMeasures": [],
+        "timeWindowDays": 7,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("最近7天订单量是多少", understanding, pack)
+
+    assert not plan.intents
+    assert "ANCHOR_UNAVAILABLE:order_cnt" in plan.compiler_trace
+
+
+def test_compiled_local_derived_metric_governs_each_component_contract():
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(table="refunds", columns=["seller_id", "refund_id", "pt"]),
+            PlanningAssetEntry(table="orders", columns=["seller_id", "order_id", "pt"]),
+        ],
+        metrics=[
+            PlanningAssetEntry(
+                key="refund_rate",
+                table="refunds",
+                columns=["refund_cnt", "order_cnt"],
+                title="退款率",
+                metadata={"formula": "refund_cnt / order_cnt", "sourceColumns": ["refund_cnt", "order_cnt"]},
+            ),
+            PlanningAssetEntry(key="refund_cnt", table="refunds", columns=["refund_id"], title="退款量"),
+            PlanningAssetEntry(key="order_cnt", table="orders", columns=["order_id"], title="订单量"),
+        ],
+    )
+    understanding = {
+        "analysisGrain": "merchant",
+        "analysisIntent": "none",
+        "requiresExplanation": False,
+        "rankingObjective": {
+            "metricRef": "refund_rate",
+            "ownerTable": "refunds",
+            "sourcePhrase": "退款率",
+            "objectiveType": "ranking",
+            "groupByColumn": "seller_id",
+            "limit": 10,
+        },
+        "requestedMeasures": [],
+        "scopeConstraints": [],
+        "filters": [],
+        "timeWindowDays": 30,
+    }
+
+    plan = QuestionUnderstandingCompiler().compile("退款率最高的商家", understanding, pack)
+    derived = next(intent for intent in plan.intents if intent.metric_name == "refund_rate")
+    components = derived.metric_resolution["componentMetrics"]
+
+    assert derived.metric_resolution["metricGovernanceMode"] == "compiled_local"
+    assert {component["metricGovernanceMode"] for component in components} == {"compiled_local"}
+    assert all(component["semanticContractHash"] for component in components)
+    assert PlannerReflectionAgent().reflect("退款率最高的商家", plan, pack).passed
 
 
 def test_answer_does_not_substitute_an_unrelated_numeric_column_for_a_metric():

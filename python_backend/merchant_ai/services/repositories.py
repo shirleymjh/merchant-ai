@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from threading import Event, RLock, Thread
 from typing import Any, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings, jdbc_to_pymysql_kwargs
@@ -67,15 +69,44 @@ class DatabaseClient:
         finally:
             conn.close()
 
-    def query(self, sql: str, params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
+    def query(
+        self,
+        sql: str,
+        params: Optional[Iterable[Any]] = None,
+        cancel_events: Optional[Iterable[Any]] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         with self.connection() as conn:
-            with conn.cursor() as cursor:
-                if params:
-                    cursor.execute(sql, tuple(params))
-                else:
-                    cursor.execute(sql)
-                rows = cursor.fetchall()
-                return [dict(row) for row in rows]
+            stop_monitor = Event()
+            cancellation_events = [event for event in (cancel_events or []) if event is not None]
+            timeout = max(1, int(timeout_seconds or self.read_timeout_seconds or 1))
+            deadline = time.monotonic() + timeout
+
+            def monitor_query() -> None:
+                while not stop_monitor.wait(0.05):
+                    canceled = any(bool(getattr(event, "is_set", lambda: False)()) for event in cancellation_events)
+                    if not canceled and time.monotonic() < deadline:
+                        continue
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+
+            monitor = Thread(target=monitor_query, name="doris-query-cancel", daemon=True)
+            monitor.start()
+            try:
+                if any(bool(getattr(event, "is_set", lambda: False)()) for event in cancellation_events):
+                    raise RuntimeError("database query canceled")
+                with conn.cursor() as cursor:
+                    if params:
+                        cursor.execute(sql, tuple(params))
+                    else:
+                        cursor.execute(sql)
+                    rows = cursor.fetchall()
+                    return [dict(row) for row in rows]
+            finally:
+                stop_monitor.set()
 
     def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> int:
         with self.connection() as conn:
@@ -97,7 +128,13 @@ class DorisRepository:
         self.last_cache_key = ""
         self.last_degraded_reason: Dict[str, Any] = {}
 
-    def query(self, sql: str, params: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
+    def query(
+        self,
+        sql: str,
+        params: Optional[Iterable[Any]] = None,
+        cancel_events: Optional[Iterable[Any]] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         self.last_cache_hit = False
         self.last_cache_key = ""
         params_list = list(params or [])
@@ -110,7 +147,12 @@ class DorisRepository:
                 self.last_cache_key = cache_key
                 return cached
         try:
-            rows = self.db.query(sql, params_list or None)
+            rows = self.db.query(
+                sql,
+                params_list or None,
+                cancel_events=cancel_events,
+                timeout_seconds=timeout_seconds,
+            )
         except Exception as exc:
             self.last_degraded_reason = log_degraded("doris_repository", "query", exc)
             raise
@@ -364,15 +406,19 @@ class AnswerRepository:
 class PendingAnswerStore:
     def __init__(self):
         self._answers: Dict[str, PendingAnswer] = {}
+        self._lock = RLock()
 
     def put(self, answer: PendingAnswer) -> None:
-        self._answers[answer.id] = answer
+        with self._lock:
+            self._answers[answer.id] = answer
 
     def get(self, answer_id: str) -> Optional[PendingAnswer]:
-        return self._answers.get(answer_id)
+        with self._lock:
+            return self._answers.get(answer_id)
 
     def remove(self, answer_id: str) -> None:
-        self._answers.pop(answer_id, None)
+        with self._lock:
+            self._answers.pop(answer_id, None)
 
 
 class MerchantService:

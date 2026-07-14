@@ -4,9 +4,22 @@ import re
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
-from merchant_ai.models import ChatDataSection, ChatResponse
-from merchant_ai.services.cache import TTLCache, stable_cache_key
+from merchant_ai.models import (
+    AgentRunResult,
+    AgentTaskResult,
+    AnswerMode,
+    ChatDataSection,
+    ChatResponse,
+    QueryBundle,
+    QueryPlan,
+    QuestionIntent,
+    VerifiedEvidence,
+)
+from merchant_ai.services.answer_claims import AnswerClaimVerifier
+from merchant_ai.services.cache import TTLCache
 from merchant_ai.services.formulas import compile_metric_formula
+from merchant_ai.services.semantic_request import semantic_request_cache_key
+from merchant_ai.services.time_semantics import partition_date_matches, resolve_time_range
 
 
 COMPLEX_TERMS = ["明细", "详情", "列表", "记录", "对应", "关联", "拆解", "归因"]
@@ -22,6 +35,7 @@ def quick_metric_response(
     repository: Any,
     extracted_keywords: Any = None,
     semantic_metrics: Optional[list[Dict[str, Any]]] = None,
+    timezone_name: str = "Asia/Shanghai",
 ) -> Optional[ChatResponse]:
     # Fast answers are deliberately a one-metric capability.  The caller must
     # provide contracts compiled from the published semantic layer; an empty,
@@ -43,15 +57,17 @@ def quick_metric_response(
         return None
     if not any(term in question.lower() for term in ["多少", "总", "趋势", "走势", "变化", "最近", "近", "为什么", "原因"]):
         return None
-    days = extract_days(question)
-    cache_key = stable_cache_key(
+    time_range = resolve_time_range(question, timezone_name)
+    days = time_range.days
+    cache_key = semantic_request_cache_key(
         "quick_metric",
-        {
-            "merchantId": merchant_id,
-            "question": normalize_question(question),
-            "days": days,
-            "semanticContract": semantic_metric_identity(metric),
-        },
+        topics=[metric.get("topic")],
+        metrics=[{"metricKey": metric.get("key"), "ownerTable": metric.get("table")}],
+        dimensions=[metric.get("time_column")],
+        filters=[],
+        time_range=time_range,
+        asset_version={"semanticContract": semantic_metric_identity(metric)},
+        scope={"merchantId": merchant_id},
     )
     cached = QUICK_RESPONSE_CACHE.get(cache_key)
     if isinstance(cached, dict):
@@ -80,6 +96,9 @@ def quick_metric_response(
         [merchant_id, merchant_id],
     )
     if not rows:
+        return None
+    latest_partition = str(rows[-1].get("pt") or "")
+    if time_range.kind == "exact_date" and not partition_date_matches(latest_partition, time_range.end_date):
         return None
     total_rows = repository.query(
         "SELECT %s AS value FROM `%s` "
@@ -112,11 +131,15 @@ def quick_metric_response(
     peak = normalized_rows[peak_index]
     total_text = format_value(total, metric)
     advice = metric_advice(metric["label"])
-    time_label = time_range_label(question, days)
+    time_label = time_range.label or time_range_label(question, days)
+    freshness_sentence = ""
+    if time_range.kind == "rolling" and not partition_date_matches(latest_partition, time_range.end_date):
+        freshness_sentence = "数据日期截至 %s。\n\n" % latest_partition
     answer = (
         f"{time_label}，店铺{metric['label']}合计为 {total_text}。\n\n"
+        f"{freshness_sentence}"
         f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，整体{direction} {format_value(delta, metric)}；"
-        f"峰值出现在 {peak['pt']}，为 {format_value(peak['value'], metric)}。\n\n"
+        f"峰值日期为 {peak['pt']}，峰值为 {format_value(peak['value'], metric)}。\n\n"
         "建议：\n"
         f"- {advice[0]}\n"
         f"- {advice[1]}"
@@ -156,13 +179,79 @@ def quick_metric_response(
         debug_trace={
             "quickMetricPath": True,
             "days": days,
+            "timeRange": time_range.model_dump(by_alias=True),
+            "actualLatestPartition": latest_partition,
             "metric": metric["label"],
             "metricTerms": metric.get("terms") or [],
             "semanticMetric": semantic_metric_identity(metric),
         },
     )
+    verification = verify_quick_metric_answer(question, metric, normalized_rows, total, answer)
+    if not verification.passed:
+        return None
+    response.debug_trace["answerClaimVerification"] = verification.model_dump(by_alias=True)
     QUICK_RESPONSE_CACHE.set(cache_key, response.model_dump(by_alias=True))
     return response
+
+
+def verify_quick_metric_answer(
+    question: str,
+    metric: Dict[str, Any],
+    trend_rows: list[Dict[str, Any]],
+    total: float,
+    answer: str,
+):
+    summary_task_id = "quick_metric_summary"
+    trend_task_id = "quick_metric_trend"
+    date_context_task_id = "quick_metric_date_context"
+    latest_date = str(trend_rows[-1].get("pt") or "") if trend_rows else ""
+    peak_row = max(trend_rows, key=lambda row: float(row.get("value") or 0)) if trend_rows else {}
+    peak_date = str(peak_row.get("pt") or "")
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id=summary_task_id,
+                preferred_table=metric["table"],
+                metric_name="value",
+                metric_resolution={"metricKey": "value", "displayName": metric["label"]},
+            ),
+            QuestionIntent(
+                question=question,
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id=trend_task_id,
+                preferred_table=metric["table"],
+                metric_name="value",
+                group_by_column="pt",
+                metric_resolution={"metricKey": "value", "displayName": metric["label"], "displayRole": "trend_context"},
+            ),
+            QuestionIntent(
+                question=question,
+                answer_mode=AnswerMode.DETAIL,
+                plan_task_id=date_context_task_id,
+                preferred_table=metric["table"],
+                output_keys=["数据日期", "峰值日期"],
+            ),
+        ]
+    )
+    summary_bundle = QueryBundle(tables=[metric["table"]], rows=[{"value": total}], original_row_count=1)
+    trend_bundle = QueryBundle(tables=[metric["table"]], rows=trend_rows, original_row_count=len(trend_rows))
+    date_context_bundle = QueryBundle(
+        tables=[metric["table"]],
+        rows=[{"数据日期": latest_date, "峰值日期": peak_date}],
+        original_row_count=1,
+    )
+    run_result = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id=summary_task_id, success=True, query_bundle=summary_bundle),
+            AgentTaskResult(task_id=trend_task_id, success=True, query_bundle=trend_bundle),
+            AgentTaskResult(task_id=date_context_task_id, success=True, query_bundle=date_context_bundle),
+        ],
+        merged_query_bundle=summary_bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    return AnswerClaimVerifier().verify(question, plan, run_result, answer)
 
 
 def quick_metric_definition_response(question: str, merchant_id: str, metrics: list[Dict[str, Any]]) -> Optional[ChatResponse]:

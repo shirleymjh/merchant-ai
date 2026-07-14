@@ -100,6 +100,7 @@ class AgentState(TypedDict, total=False):
     route_slots: RouteSlots
     route_decision_trace: List[Dict[str, Any]]
     clarification_resolution: Dict[str, Any]
+    clarification_root_question: str
     bounded_route_llm_trace: Dict[str, Any]
     bounded_lead_llm_trace: Dict[str, Any]
     fast_gate_decision_trace: Dict[str, Any]
@@ -175,6 +176,7 @@ class AgentState(TypedDict, total=False):
     agent_decision_reason: str
     planner_repair_reason: str
     planner_provider_error: str
+    planner_degraded: Dict[str, Any]
 
     base_knowledge_context: str
     topic_asset_context: str
@@ -202,6 +204,7 @@ class AgentState(TypedDict, total=False):
     hypothesis_exploration: Dict[str, Any]
     hypothesis_results: List[Dict[str, Any]]
     hypothesis_exploration_completed: bool
+    hypothesis_exploration_status: Dict[str, Any]
     hypothesis_exploration_rounds: int
     hypothesis_selected_ids: List[str]
     hypothesis_evidence_ledger: HypothesisEvidenceLedger
@@ -219,7 +222,10 @@ class AgentState(TypedDict, total=False):
     subagent_delegation_attempted: bool
     subagent_delegation_completed: bool
     confirmation_evidence_reused: bool
+    confirmation_token: str
+    confirmation_source_run_id: str
     analysis_skill_bypassed: bool
+    analysis_skill_status: Dict[str, Any]
     skill_match: SkillMatchState
     skill_draft: SkillDraft
     skill_lifecycle_records: List[SkillLifecycleRecord]
@@ -244,6 +250,8 @@ class AgentState(TypedDict, total=False):
     query_graph_reflected: bool
     sql_repair_reviewed: bool
     evidence_graph_verified: bool
+    verification_status: str
+    evidence_accepted: bool
 
     supervised: bool
     scope_clarified: bool
@@ -254,8 +262,10 @@ class AgentState(TypedDict, total=False):
     chat_bi_completed: bool
     run_canceled: bool
     middleware_loop_blocked: bool
+    terminal_status: Dict[str, Any]
     should_persist: bool
     persisted: bool
+    post_answer_tail_pending: bool
 
     human_clarification_required: bool
     human_clarification_question: str
@@ -363,7 +373,15 @@ def merge_agent_state_update(existing: AgentState, update: Dict[str, Any]) -> Ag
     """Merge partial state updates with explicit reducers for shared runtime lists."""
 
     merged: AgentState = dict(existing)
-    for key, value in (update or {}).items():
+    payload = dict(update or {})
+    replacements = payload.pop("__replace__", {})
+    deletions = payload.pop("__delete__", [])
+    if isinstance(replacements, dict):
+        for key, value in replacements.items():
+            merged[str(key)] = value
+    for key in deletions if isinstance(deletions, list) else []:
+        merged.pop(str(key), None)
+    for key, value in payload.items():
         if key in STATE_LIST_MERGE_KEYS:
             merged[key] = merge_state_list(
                 existing.get(key) or [],
@@ -376,6 +394,29 @@ def merge_agent_state_update(existing: AgentState, update: Dict[str, Any]) -> Ag
         else:
             merged[key] = value
     return merged
+
+
+def mark_terminal_status(
+    state: AgentState,
+    status: str,
+    code: str,
+    source: str,
+    message: str = "",
+) -> Dict[str, Any]:
+    """Set a run terminal state once; later middleware cannot silently downgrade it."""
+
+    existing = state.get("terminal_status") or {}
+    if existing.get("active"):
+        return existing
+    terminal = {
+        "active": True,
+        "status": str(status or "blocked"),
+        "code": str(code or "TERMINAL_STOP"),
+        "source": str(source or "runtime"),
+        "message": str(message or "")[:500],
+    }
+    state["terminal_status"] = terminal
+    return terminal
 
 
 def merge_state_list(existing: Any, incoming: Any, id_key: str, limit: int = 200) -> List[Any]:

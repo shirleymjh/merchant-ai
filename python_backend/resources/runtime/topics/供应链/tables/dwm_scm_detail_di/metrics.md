@@ -1,6 +1,6 @@
 # 指标公式
 
-- 入库数量：SUM(inbound_cnt)，单位=单，来源字段=inbound_cnt，同义词=入库数量、inbound_cnt
+- 入库数量：SUM(inbound_cnt)，单位=件，来源字段=inbound_cnt，同义词=入库数量、入库量、供应链入库量、供应链入库数量、inbound_cnt、scm_inbound_total_cnt
 - 质检图片数量：SUM(photo_cnt)，单位=单，来源字段=photo_cnt，同义词=质检图片数量、photo_cnt
 - 审核次数：SUM(check_cnt)，单位=单，来源字段=check_cnt，同义词=审核次数、check_cnt
 - 首次质检结果：AVG(first_check_is_operate_pass)，单位=%，来源字段=first_check_is_operate_pass，同义词=首次质检结果、first_check_is_operate_pass、首次质检结果,不通过=0,通过=1

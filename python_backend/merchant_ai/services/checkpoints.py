@@ -6,9 +6,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Optional
 
-from langgraph.checkpoint.memory import MemorySaver
-
 from merchant_ai.config import Settings
+from merchant_ai.services.langgraph_compat import MemorySaver, postgres_saver_class, sqlite_saver_class
 
 
 class CheckpointManager:
@@ -36,8 +35,7 @@ class CheckpointManager:
         raise ValueError("Unsupported checkpointer backend: %s" % self.backend)
 
     def _sqlite_saver(self) -> Any:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-
+        SqliteSaver = sqlite_saver_class()
         path = self.settings.resolved_checkpointer_sqlite_path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path = str(path)
@@ -48,8 +46,7 @@ class CheckpointManager:
         return saver
 
     def _postgres_saver(self) -> Any:
-        from langgraph.checkpoint.postgres import PostgresSaver
-
+        PostgresSaver = postgres_saver_class()
         if not self.settings.agent_checkpointer_postgres_uri:
             raise ValueError("YSHOPPING_AGENT_CHECKPOINTER_POSTGRES_URI is required for postgres checkpointer")
         self._path = self.settings.agent_checkpointer_postgres_uri
@@ -85,7 +82,8 @@ class CheckpointManager:
             "checkpointThreadId": checkpoint_thread_id,
             "checkpointNamespace": "",
             "storage": self.storage_ref(),
-            "resumable": (self.backend or "sqlite") != "memory",
+            "resumable": False,
+            "purpose": "diagnostic_checkpoint_only",
         }
 
     def storage_ref(self) -> str:
@@ -127,7 +125,8 @@ def checkpoint_ref_for_run(settings: Settings, thread_id: str, run_id: str) -> D
         "checkpointThreadId": checkpoint_thread_id,
         "checkpointNamespace": "",
         "storage": storage,
-        "resumable": backend != "memory",
+        "resumable": False,
+        "purpose": "diagnostic_checkpoint_only",
     }
 
 

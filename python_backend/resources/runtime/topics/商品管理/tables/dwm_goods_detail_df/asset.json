@@ -1003,7 +1003,9 @@
       "description": "spu ID",
       "aliases": [
         "spu ID",
-        "spu_id"
+        "spu_id",
+        "SPU",
+        "商品"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -1017,7 +1019,8 @@
       "description": "商品名称",
       "aliases": [
         "商品名称",
-        "spu_name"
+        "spu_name",
+        "商品"
       ],
       "enumValues": [
         "spu_name_1",
@@ -1344,27 +1347,12 @@
     },
     {
       "columnName": "spu_apply_create_time",
-      "businessName": "SPU 发布时间",
+      "businessName": "创建时间",
       "role": "TIME",
-      "description": "SPU 发布时间",
+      "description": "创建时间",
       "aliases": [
         "创建时间",
-        "spu_apply_create_time",
-        "SPU 发布时间",
-        "商品发布时间",
-        "商品发布信息",
-        "发布时间",
-        "发布日期",
-        "上架时间",
-        "新发布商品",
-        "最近新发布商品",
-        "新发布",
-        "新上架商品",
-        "spu_publish_time",
-        "什么时候发布",
-        "何时发布",
-        "什么时候上架",
-        "何时上架"
+        "spu_apply_create_time"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -2334,22 +2322,11 @@
       "evidence": "来自字段 `spu_desc` 的语义注释"
     },
     {
-      "term": "SPU 发布时间",
-      "description": "SPU 发布时间",
+      "term": "创建时间",
+      "description": "创建时间",
       "aliases": [
         "创建时间",
-        "spu_apply_create_time",
-        "SPU 发布时间",
-        "商品发布时间",
-        "商品发布信息",
-        "发布时间",
-        "发布日期",
-        "上架时间",
-        "spu_publish_time",
-        "什么时候发布",
-        "何时发布",
-        "什么时候上架",
-        "何时上架"
+        "spu_apply_create_time"
       ],
       "relatedColumns": [
         "spu_apply_create_time"

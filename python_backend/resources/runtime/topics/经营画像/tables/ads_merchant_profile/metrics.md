@@ -44,7 +44,7 @@
 - 退货成功金额元：SUM(return_success_amt_1d)，单位=元，来源字段=return_success_amt_1d，同义词=退货成功金额元、return_success_amt_1d、退货成功金额元-最近1天
 - 卖家责任退货量：SUM(seller_responsible_refund_cnt_1d)，单位=单，来源字段=seller_responsible_refund_cnt_1d，同义词=卖家责任退货量、seller_responsible_refund_cnt_1d、卖家责任退货量-最近1天
 - 直接退款量：SUM(direct_refund_cnt_1d)，单位=单，来源字段=direct_refund_cnt_1d，同义词=直接退款量、direct_refund_cnt_1d、直接退款量-最近1天
-- 退货量占支付订单量比例：AVG(refund_rate_1d)，单位=%，来源字段=refund_rate_1d，同义词=退货量占支付订单量比例、退款率、退货率、售后率、整体退款率、店铺退款率、refund_rate、refund_rate_1d、退货量占支付订单量比例-最近1天
+- 每日退货率原始值：AVG(refund_rate_1d)，单位=%，来源字段=refund_rate_1d，同义词=每日退货率原始值、refund_rate_1d、每日退货率。跨天汇总不得直接 AVG，应使用分子分母重算。
 - 工单二次开启量：SUM(ticket_reopen_cnt_1d)，单位=单，来源字段=ticket_reopen_cnt_1d，同义词=工单二次开启量、ticket_reopen_cnt_1d、工单二次开启量-最近1天
 - 催单工单量：SUM(ticket_reminder_cnt_1d)，单位=单，来源字段=ticket_reminder_cnt_1d，同义词=催单工单量、ticket_reminder_cnt_1d、催单工单量-最近1天
 - 关闭工单量：SUM(ticket_close_cnt_1d)，单位=单，来源字段=ticket_close_cnt_1d，同义词=关闭工单量、ticket_close_cnt_1d、关闭工单量-最近1天

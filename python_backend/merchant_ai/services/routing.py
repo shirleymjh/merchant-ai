@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from collections import defaultdict
@@ -633,6 +634,108 @@ class QuestionRoutingService:
         if keywords and keywords.topic_scores:
             return len([score for score in keywords.topic_scores.values() if score > 0])
         return 0
+
+
+class SemanticPreflightRouteClassifier:
+    ROUTES = {"GREETING", "BUSINESS_CHAT", "BUSINESS_TASK", "INVALID", "CLARIFICATION_REPLY"}
+
+    def __init__(self, settings: Any, llm: Any = None):
+        self.settings = settings
+        if llm is not None:
+            self.llm = llm
+        else:
+            model = (
+                str(getattr(settings, "preflight_semantic_route_model", "") or "")
+                or str(getattr(settings, "llm_fast_model", "") or "")
+                or str(getattr(settings, "openai_model", "") or "")
+            )
+            try:
+                from merchant_ai.services.llm import LlmClient
+
+                self.llm = LlmClient(
+                    settings,
+                    model_name=model,
+                    api_key=str(getattr(settings, "preflight_llm_api_key", "") or ""),
+                    base_url=str(getattr(settings, "preflight_llm_base_url", "") or ""),
+                )
+            except Exception:
+                self.llm = None
+
+    def classify(
+        self,
+        question: str,
+        keywords: ExtractedKeywords,
+        route_slots: "RouteSlots",
+        pending_context: bool = False,
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self.settings, "preflight_semantic_route_enabled", False)):
+            return {"enabled": False, "status": "disabled"}
+        if not self.llm or not getattr(self.llm, "configured", False) or not hasattr(self.llm, "json_chat"):
+            return {"enabled": True, "status": "unavailable"}
+        system_prompt = (
+            "你是商家经营助手的第一步轻量语义路由器。"
+            "只判断用户当前输入的意图，不做业务分析、不查询数据、不输出建议。"
+            "严格输出 JSON。route 只能是 GREETING、BUSINESS_CHAT、BUSINESS_TASK、INVALID、CLARIFICATION_REPLY。"
+            "BUSINESS_CHAT 表示包含经营/商家表达但只是闲聊、情绪、泛泛讨论，没有明确查数或分析任务。"
+            "BUSINESS_TASK 表示用户要求查询、排行、诊断、对比、明细、原因分析或经营建议。"
+            "如果存在 pendingContext 且当前输入像补充条件、确认或选择，优先 CLARIFICATION_REPLY。"
+        )
+        payload = {
+            "question": str(question or "")[:800],
+            "pendingContext": bool(pending_context),
+            "ruleSignals": {
+                "businessKeywords": list(getattr(keywords, "business_keywords", []) or [])[:12],
+                "metricKeywords": list(getattr(keywords, "metric_keywords", []) or [])[:12],
+                "topicKeywords": list(getattr(keywords, "topic_keywords", []) or [])[:12],
+                "dimensionKeywords": list(getattr(keywords, "dimension_keywords", []) or [])[:8],
+                "timeKeywords": list(getattr(keywords, "time_keywords", []) or [])[:8],
+                "actionKeywords": list(getattr(keywords, "action_keywords", []) or [])[:8],
+                "rankingKeywords": list(getattr(keywords, "ranking_keywords", []) or [])[:8],
+                "analysisIntent": getattr(keywords, "analysis_intent", ""),
+            },
+            "routeSlots": route_slots.model_dump(by_alias=True) if hasattr(route_slots, "model_dump") else {},
+            "outputSchema": {
+                "route": "GREETING|BUSINESS_CHAT|BUSINESS_TASK|INVALID|CLARIFICATION_REPLY",
+                "confidence": "0.0-1.0",
+                "reason": "short Chinese reason",
+                "signals": {
+                    "hasBusinessDomain": "boolean",
+                    "hasMetric": "boolean",
+                    "hasTimeWindow": "boolean",
+                    "hasObject": "boolean",
+                    "hasActionIntent": "boolean",
+                    "isCasualOrEmotional": "boolean",
+                },
+                "missingSlots": ["metric", "timeWindow", "object", "analysisGoal"],
+            },
+        }
+        try:
+            result = self.llm.json_chat(
+                system_prompt,
+                json.dumps(payload, ensure_ascii=False, default=str),
+                fallback={},
+                timeout_seconds=int(getattr(self.settings, "preflight_semantic_route_timeout_seconds", 3) or 3),
+            )
+        except Exception as exc:
+            return {"enabled": True, "status": "failed", "error": str(exc)[:240]}
+        if not isinstance(result, dict):
+            return {"enabled": True, "status": "invalid_result"}
+        route = str(result.get("route") or "").strip().upper()
+        if route not in self.ROUTES:
+            return {"enabled": True, "status": "invalid_route", "raw": result}
+        try:
+            confidence = float(result.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return {
+            "enabled": True,
+            "status": "success",
+            "route": route,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": str(result.get("reason") or "")[:300],
+            "signals": result.get("signals") if isinstance(result.get("signals"), dict) else {},
+            "missingSlots": result.get("missingSlots") if isinstance(result.get("missingSlots"), list) else [],
+        }
 
 
 class RouteSlotExtractor:

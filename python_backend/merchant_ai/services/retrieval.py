@@ -21,6 +21,8 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.assets import HybridRecallService, TopicAssetService, compact_metric_for_recall
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.semantic_request import semantic_request_cache_key
+from merchant_ai.services.time_semantics import resolve_time_range
 
 
 class KnowledgeRetrievalService(Protocol):
@@ -154,23 +156,47 @@ class EsKnowledgeRetrievalService:
             metric_candidates=metric_candidates,
             retrieval_profile=retrieval_profile,
         )
-        cache_key = stable_cache_key(
-            "es_recall",
+        route_slots = request.route_slots if isinstance(request.route_slots, dict) else {}
+        object_filters = list(route_slots.get("objectRefs") or route_slots.get("object_refs") or [])
+        knowledge_filter = (
+            request.knowledge_request.model_dump(by_alias=True)
+            if request.knowledge_request is not None
+            else {}
+        )
+        metric_contracts = [
             {
-                "query": query_text,
-                "merchantId": request.merchant_id,
-                "accessRole": request.access_role,
-                "permissions": sorted(request.permissions),
-                "topics": topics,
-                "includeRules": include_rules,
-                "requestKey": str(request_key or ""),
-                "indexVersion": self._index_version(),
-                "vectorEnabled": self._vector_enabled(),
-                "embeddingModel": self.settings.embedding_model if self._vector_enabled() else "",
-                "rrfK": self.settings.es_rrf_k,
-                "retrievalProfile": retrieval_profile,
-                "sourceTypeTopK": source_type_top_k,
-            },
+                "metricKey": str(item.get("canonicalMetricKey") or item.get("metricKey") or ""),
+                "ownerTable": str(item.get("ownerTable") or item.get("tableName") or ""),
+            }
+            for item in metric_candidates
+            if str(item.get("canonicalMetricKey") or item.get("metricKey") or "")
+        ]
+        cache_key = (
+            semantic_request_cache_key(
+                "es_recall",
+                topics=topics,
+                metrics=metric_contracts,
+                dimensions=list(route_slots.get("dimensions") or []),
+                filters=[
+                    *object_filters,
+                    {"includeRules": include_rules, "intentKind": request.intent_kind, "complexity": request.complexity},
+                    *([knowledge_filter] if knowledge_filter else []),
+                ],
+                time_range=resolve_time_range(query_text, self.settings.business_timezone),
+                asset_version={
+                    "indexVersion": self._index_version(),
+                    "vectorEnabled": self._vector_enabled(),
+                    "embeddingModel": self.settings.embedding_model if self._vector_enabled() else "",
+                    "retrievalPolicy": {"rrfK": self.settings.es_rrf_k, "sourceTypeTopK": source_type_top_k},
+                },
+                scope={
+                    "merchantId": request.merchant_id,
+                    "accessRole": request.access_role,
+                    "permissions": sorted(request.permissions),
+                },
+            )
+            if metric_contracts or object_filters or knowledge_filter
+            else ""
         )
         cached = self._recall_cache.get(cache_key)
         if cached is not None:

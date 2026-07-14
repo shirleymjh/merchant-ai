@@ -39,6 +39,26 @@ export YSHOPPING_ANSWER_PASSWORD=""
 
 也兼容 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OPENAI_API_KEY`。
 
+轻量前置路由可单独使用小模型 API，不配置时会回退到 `YSHOPPING_LLM_FAST_MODEL`，再回退到主模型：
+
+```bash
+export YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_ENABLED=true
+export YSHOPPING_PREFLIGHT_LLM_BASE_URL="https://api.openai.com/v1"
+export YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MODEL="gpt-4o-mini"
+export YSHOPPING_PREFLIGHT_LLM_API_KEY="..."
+export YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_TIMEOUT_SECONDS=3
+export YSHOPPING_MEMORY_QUERY_UNDERSTANDING_ENABLED=true
+export YSHOPPING_MEMORY_QUERY_UNDERSTANDING_TIMEOUT_SECONDS=2
+```
+
+如果只是同一个 API 下切小模型，也可以只配：
+
+```bash
+export YSHOPPING_LLM_FAST_MODEL="gpt-4o-mini"
+```
+
+长期记忆召回的 query understanding 复用这组轻量路由小模型配置，只生成 `queryVariants`、`expandedTerms`、候选指标和候选意图；结果会进入 TTL/Redis 缓存，并在单次请求内写入 state，避免重复调用。
+
 可选 Redis 配置：
 
 ```bash

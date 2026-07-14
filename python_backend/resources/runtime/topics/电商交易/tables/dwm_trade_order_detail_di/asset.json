@@ -1937,8 +1937,7 @@
       "description": "主订单号",
       "aliases": [
         "主订单号",
-        "order_id",
-        "订单号"
+        "order_id"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -1952,9 +1951,7 @@
       "description": "订单号",
       "aliases": [
         "订单号",
-        "sub_order_id",
-        "子订单",
-        "子订单号"
+        "sub_order_id"
       ],
       "enumValues": [],
       "metricFormula": "",
@@ -3839,6 +3836,7 @@
         "order_count",
         "sales_count",
         "下单量",
+        "下单",
         "关联下单量",
         "下单多",
         "下单量高",
@@ -3851,15 +3849,16 @@
     },
     {
       "metricKey": "discount_amt",
-      "businessName": "优惠金额",
+      "businessName": "订单优惠金额",
       "formula": "SUM(discount_amt)",
       "unit": "元",
-      "description": "优惠金额",
+      "description": "订单明细中的优惠金额",
       "sourceColumns": [
         "discount_amt"
       ],
       "aliases": [
-        "优惠金额",
+        "订单优惠金额",
+        "交易优惠金额",
         "discount_amt"
       ],
       "confidence": 0.78,
@@ -3867,15 +3866,16 @@
     },
     {
       "metricKey": "sku_cnt",
-      "businessName": "商品数量",
+      "businessName": "下单商品数量",
       "formula": "SUM(sku_cnt)",
       "unit": "单",
-      "description": "商品数量",
+      "description": "订单明细中的商品数量",
       "sourceColumns": [
         "sku_cnt"
       ],
       "aliases": [
-        "商品数量",
+        "下单商品数量",
+        "订单商品数量",
         "sku_cnt"
       ],
       "confidence": 0.78,
@@ -3949,19 +3949,22 @@
       "metricKey": "pay_amt",
       "canonicalMetricKey": "pay_amt",
       "metricLevel": "physical",
-      "businessName": "支付金额",
+      "businessName": "订单支付金额",
       "formula": "SUM(pay_amt)",
       "unit": "元",
-      "description": "支付金额，分",
+      "description": "订单明细中的支付金额",
       "sourceColumns": [
         "pay_amt"
       ],
       "aliases": [
-        "支付金额",
+        "订单支付金额",
+        "订单金额",
+        "交易支付金额",
         "pay_amt",
-        "支付金额，分",
-        "sales_amount",
-        "order_amount"
+        "销售额",
+        "成交额",
+        "交易成交金额",
+        "销售金额"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=支付金额，分; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"

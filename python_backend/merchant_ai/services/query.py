@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from contextvars import copy_context
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -96,7 +99,13 @@ from merchant_ai.services.query_security import (
     table_asset_metadata,
     table_field_semantics,
 )
-from merchant_ai.services.tool_runtime import ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService, classify_timeout_type
+from merchant_ai.services.tool_runtime import (
+    ToolFailureRegistry,
+    ToolRuntimePolicyRegistry,
+    ToolRuntimeService,
+    classify_timeout_type,
+    current_tool_cancel_event,
+)
 from merchant_ai.services.tools import artifact_file_tool_definitions, canonical_tool_registry, node_runtime_tool_schemas, semantic_file_tool_definitions, sql_draft_tool, sql_repair_tool
 
 
@@ -289,12 +298,6 @@ class NodePlanCritic:
         if not allowed:
             issues.append(issue("PLAN_CONTRACT_MISMATCH", "node contract has no allowed columns"))
         if self._metric_required(contract):
-            semantic_issue = governed_metric_contract_issue(contract.metric_resolution, contract.preferred_table)
-            if semantic_issue:
-                issues.append(issue("UNGOVERNED_METRIC", semantic_issue, contract.metric_name or contract.metric_column))
-            binding_issue = semantic_metric_binding_issue(contract)
-            if binding_issue:
-                issues.append(issue("SEMANTIC_METRIC_BINDING_DRIFT", binding_issue, contract.metric_name or contract.metric_column))
             metric_columns = formula_columns(contract.metric_formula, allowed)
             if contract.metric_column and contract.metric_column not in allowed:
                 issues.append(issue("MISSING_METRIC_COLUMN", "metricColumn is not available in node schema", contract.metric_column))
@@ -302,6 +305,12 @@ class NodePlanCritic:
                 issues.append(issue("MISSING_METRIC_COLUMN", "metricFormula has no resolvable source columns", contract.metric_formula))
             elif not contract.metric_column and not contract.metric_formula:
                 issues.append(issue("MISSING_METRIC_COLUMN", "metric node has no metricColumn or metricFormula"))
+            governance_issue = metric_execution_contract_issue(contract)
+            if governance_issue:
+                issues.append(issue("UNGOVERNED_METRIC", governance_issue, contract.metric_name or contract.metric_column))
+            binding_issue = semantic_metric_binding_issue(contract)
+            if binding_issue:
+                issues.append(issue("SEMANTIC_METRIC_BINDING_DRIFT", binding_issue, contract.metric_name or contract.metric_column))
         if self._group_required(contract) and not contract.group_by_column and not contract.output_keys:
             issues.append(issue("MISSING_GROUP_BY_COLUMN", "aggregate node has no groupByColumn or outputKeys"))
         if contract.group_by_column and contract.group_by_column not in allowed:
@@ -395,7 +404,6 @@ class NodeWorkerExecutor:
         self.semantic_catalog = semantic_catalog
         self.node_agent = NodeAgent(self)
         self.prompt_assembler = PromptAssembler()
-        self._prompt_traces_by_task: Dict[str, Dict[str, Any]] = {}
         self.tool_runtime_policies = ToolRuntimePolicyRegistry(settings)
         self.tool_failure_registry = ToolFailureRegistry(
             repeat_threshold=settings.tool_failure_repeat_threshold,
@@ -417,11 +425,9 @@ class NodeWorkerExecutor:
         )
         self.node_plan_critic = NodePlanCritic()
         self.access_control = AccessControlService(settings)
-        self._last_sql_draft_decisions: Dict[str, SqlDraftDecision] = {}
-        self._last_node_file_tool_results: Dict[str, List[Dict[str, Any]]] = {}
 
     def with_artifact_root(self, root: str) -> None:
-        self.artifact_store = self.artifact_store.with_root(root)
+        self.artifact_store.set_context_root(root)
 
     def execute_plan(
         self,
@@ -441,10 +447,22 @@ class NodeWorkerExecutor:
         execution_run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
         executable = [intent for intent in plan.intents if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE]
         tasks_by_id = {intent.plan_task_id or "node_%s" % (index + 1): intent for index, intent in enumerate(executable)}
+        contract_hashes = {
+            task_id: node_execution_contract_hash(intent, plan, merchant_id, access_role, user_scope or {}, asset_pack)
+            for task_id, intent in tasks_by_id.items()
+        }
         completed: Dict[str, AgentTaskResult] = {}
         for prior in resume_task_results or []:
-            if prior.task_id in tasks_by_id and prior.success and not prior.query_bundle.failed:
+            expected_hash = contract_hashes.get(prior.task_id, "")
+            if (
+                expected_hash
+                and prior.execution_contract_hash == expected_hash
+                and prior.success
+                and not prior.query_bundle.failed
+            ):
                 completed[prior.task_id] = prior
+            elif prior.task_id in tasks_by_id:
+                result.resume_rejected_task_ids.append(prior.task_id)
         result.resumed_task_ids = list(completed.keys())
         pending = {task_id: intent for task_id, intent in tasks_by_id.items() if task_id not in completed}
         if completed:
@@ -483,6 +501,7 @@ class NodeWorkerExecutor:
             )
             result.node_execution_batches.append(batch_trace)
             for task_id, task_result in batch_results.items():
+                task_result.execution_contract_hash = contract_hashes.get(task_id, "")
                 completed[task_id] = task_result
                 pending.pop(task_id, None)
 
@@ -593,7 +612,8 @@ class NodeWorkerExecutor:
                     if distributed:
                         context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
                         context.context_package.update({"parentRunId": run_id, "runtimeMode": "distributed_subagent", "subagentEnabled": True})
-                        future = executor.submit(
+                        future = submit_with_current_context(
+                            executor,
                             self._execute_distributed_node,
                             run_id,
                             pending[task_id],
@@ -632,10 +652,24 @@ class NodeWorkerExecutor:
                         if task_mode == "subagent":
                             context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
                             context.context_package["parentRunId"] = run_id
-                            future = executor.submit(self._run_isolated_subagent, pending[task_id], asset_pack, knowledge_context, context)
+                            future = submit_with_current_context(
+                                executor,
+                                self._run_isolated_subagent,
+                                pending[task_id],
+                                asset_pack,
+                                knowledge_context,
+                                context,
+                            )
                         else:
                             context.context_package.update({"parentRunId": run_id, "runtimeMode": "direct_node_worker", "subagentEnabled": False})
-                            future = executor.submit(self.execute_node, pending[task_id], asset_pack, knowledge_context, context)
+                            future = submit_with_current_context(
+                                executor,
+                                self.execute_node,
+                                pending[task_id],
+                                asset_pack,
+                                knowledge_context,
+                                context,
+                            )
                     chunk_futures[future] = task_id
                     future_modes[future] = task_mode
                     future_cancel_events[future] = context.cancel_event
@@ -649,7 +683,19 @@ class NodeWorkerExecutor:
                 poll_interval = max(0.1, float(getattr(self.settings, "agent_node_poll_interval_seconds", 5.0) or 5.0))
                 deadline = time.perf_counter() + timeout_seconds
                 next_heartbeat_at = time.perf_counter() + poll_interval
+                run_was_canceled = False
                 while not_done and time.perf_counter() < deadline:
+                    if self.runtime_state_store.run_canceled(run_id):
+                        run_was_canceled = True
+                        for running_future in not_done:
+                            future_cancel_events[running_future].set()
+                        batch.runtime_events.append(
+                            {
+                                "event": "node.run_canceled",
+                                "runningTaskIds": [chunk_futures[future] for future in not_done],
+                            }
+                        )
+                        break
                     remaining = max(0.0, deadline - time.perf_counter())
                     wait_for = min(remaining, max(0.05, next_heartbeat_at - time.perf_counter()))
                     just_done, still_running = wait(not_done, timeout=wait_for, return_when=FIRST_COMPLETED)
@@ -699,6 +745,12 @@ class NodeWorkerExecutor:
                 for future in not_done:
                     task_id = chunk_futures[future]
                     future_cancel_events[future].set()
+                    if run_was_canceled:
+                        batch.failed_task_ids.append(task_id)
+                        results[task_id] = cancelled_result(pending[task_id])
+                        self.runtime_state_store.complete_node_task(run_id, task_id, "canceled", {"reason": "run canceled"})
+                        future.cancel()
+                        continue
                     grace_seconds = max(0, int(getattr(self.settings, "agent_node_timeout_grace_seconds", 60) or 60))
                     batch.runtime_events.append(
                         {
@@ -976,13 +1028,20 @@ class NodeWorkerExecutor:
     ) -> AgentTaskResult:
         if context_is_cancelled(context):
             return cancelled_result(intent)
-        if intent.answer_mode == AnswerMode.DERIVED:
-            result = self._execute_derived_node(intent, asset_pack, context)
-        else:
-            result = self.node_agent.execute(intent, asset_pack, knowledge_context, context)
-        if context_is_cancelled(context):
-            return cancelled_result(intent)
-        return self._finalize_subagent_result(result, intent, context)
+        context.runtime_scratch = {}
+        try:
+            if intent.answer_mode == AnswerMode.DERIVED:
+                result = self._execute_derived_node(intent, asset_pack, context)
+            else:
+                result = self.node_agent.execute(intent, asset_pack, knowledge_context, context)
+            file_tool_results = list(context.runtime_scratch.get("file_tool_results") or [])
+            if file_tool_results and not result.file_tool_results:
+                result.file_tool_results = file_tool_results
+            if context_is_cancelled(context):
+                return cancelled_result(intent)
+            return self._finalize_subagent_result(result, intent, context)
+        finally:
+            context.runtime_scratch = {}
 
     def _execute_derived_node(
         self,
@@ -1194,7 +1253,7 @@ class NodeWorkerExecutor:
         result.sub_agent_checkpoint_path = context.checkpoint_path
         result.sub_agent_workspace = context.workspace_path
         result.sub_agent_context = dict(context.context_package or {})
-        result.file_tool_results = list(self._last_node_file_tool_results.pop(intent.plan_task_id, []) or [])
+        result.file_tool_results = list(result.file_tool_results or [])
         if result.file_tool_results:
             result.react_trace.insert(
                 0,
@@ -1395,8 +1454,12 @@ class NodeWorkerExecutor:
         draft_started = time.perf_counter()
         sql = self._draft_sql(intent, asset_pack, knowledge_context, context, contract)
         draft_duration_ms = int((time.perf_counter() - draft_started) * 1000)
-        draft_decision = self._last_sql_draft_decisions.pop(intent.plan_task_id, SqlDraftDecision(task_id=intent.plan_task_id))
-        file_tool_results = self._last_node_file_tool_results.get(intent.plan_task_id, [])
+        draft_decision = pop_node_runtime_value(
+            context,
+            "sql_draft_decision",
+            SqlDraftDecision(task_id=intent.plan_task_id),
+        )
+        file_tool_results = list(context.runtime_scratch.get("file_tool_results") or [])
         if file_tool_results:
             record_tool(
                 tool_traces,
@@ -1410,10 +1473,10 @@ class NodeWorkerExecutor:
         if draft_decision.source == "structured_fast_path":
             draft_tool = "draft_structured_sql_fast_path"
         draft_summary = trim_sql(sql)
-        draft_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "draft"), None)
+        draft_prompt = pop_node_prompt_trace(context, prompt_trace_key(intent, "draft"))
         if draft_prompt:
             draft_summary = append_prompt_marker(draft_summary, draft_prompt)
-        draft_tool_schema = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "draft_tool"), None)
+        draft_tool_schema = pop_node_prompt_trace(context, prompt_trace_key(intent, "draft_tool"))
         if draft_tool_schema:
             draft_summary = append_tool_schema_marker(draft_summary, draft_tool_schema)
         record_tool(
@@ -1525,10 +1588,10 @@ class NodeWorkerExecutor:
                 repair_duration_ms = int((time.perf_counter() - repair_started) * 1000)
                 repair_attempts.append(repaired)
                 repair_summary = trim_sql(repaired.repaired_sql)
-                repair_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair"), None)
+                repair_prompt = pop_node_prompt_trace(context, prompt_trace_key(intent, "repair"))
                 if repair_prompt:
                     repair_summary = append_prompt_marker(repair_summary, repair_prompt)
-                repair_tool_schema = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair_tool"), None)
+                repair_tool_schema = pop_node_prompt_trace(context, prompt_trace_key(intent, "repair_tool"))
                 if repair_tool_schema:
                     repair_summary = append_tool_schema_marker(repair_summary, repair_tool_schema)
                 record_tool(
@@ -1670,16 +1733,24 @@ class NodeWorkerExecutor:
             if context_is_cancelled(context):
                 return cancelled_result(intent)
             query_started = time.perf_counter()
+            query_cancel_event = Event()
             runtime_result = self.tool_runtime_service.execute(
                 "execute_sql",
                 execute_args,
                 lambda _args: {
-                    "rows": self.doris_repository.query(bound_sql, sql_params),
+                    "rows": doris_query_with_cancellation(
+                        self.doris_repository,
+                        bound_sql,
+                        sql_params,
+                        cancel_events=[context.cancel_event, query_cancel_event],
+                        timeout_seconds=self.settings.doris_read_timeout_seconds,
+                    ),
                     "cacheHit": bool(getattr(self.doris_repository, "last_cache_hit", False)),
                     "cacheKey": str(getattr(self.doris_repository, "last_cache_key", "") or ""),
                 },
                 call_id=intent.plan_task_id or "execute_sql",
                 target_kind="doris",
+                cancel_event=query_cancel_event,
             )
             query_duration_ms = runtime_result.duration_ms or int((time.perf_counter() - query_started) * 1000)
             if context_is_cancelled(context):
@@ -2005,10 +2076,10 @@ class NodeWorkerExecutor:
                 repair_duration_ms = int((time.perf_counter() - repair_started) * 1000)
                 repair_attempts.append(repaired)
                 repair_summary = trim_sql(repaired.repaired_sql)
-                repair_prompt = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair"), None)
+                repair_prompt = pop_node_prompt_trace(context, prompt_trace_key(intent, "repair"))
                 if repair_prompt:
                     repair_summary = append_prompt_marker(repair_summary, repair_prompt)
-                repair_tool_schema = self._prompt_traces_by_task.pop(prompt_trace_key(intent, "repair_tool"), None)
+                repair_tool_schema = pop_node_prompt_trace(context, prompt_trace_key(intent, "repair_tool"))
                 if repair_tool_schema:
                     repair_summary = append_tool_schema_marker(repair_summary, repair_tool_schema)
                 record_tool(
@@ -2060,13 +2131,13 @@ class NodeWorkerExecutor:
         if intent.sql:
             decision.source = "provided_sql"
             decision.reason = "intent already contains SQL"
-            self._last_sql_draft_decisions[intent.plan_task_id] = decision
+            context.runtime_scratch["sql_draft_decision"] = decision
             return intent.sql.strip()
         if intent.sql_strategy == "structured_first":
             structured_sql = self._draft_structured_sql(intent, asset_pack, context, contract=contract)
             decision.source = "structured_first"
             decision.reason = "intent.sql_strategy=structured_first"
-            self._last_sql_draft_decisions[intent.plan_task_id] = decision
+            context.runtime_scratch["sql_draft_decision"] = decision
             if structured_sql:
                 return structured_sql
         if self._use_structured_fast_path(intent, contract, context):
@@ -2074,7 +2145,7 @@ class NodeWorkerExecutor:
             if structured_sql:
                 decision.source = "structured_fast_path"
                 decision.reason = "low-risk node contract can be compiled deterministically"
-                self._last_sql_draft_decisions[intent.plan_task_id] = decision
+                context.runtime_scratch["sql_draft_decision"] = decision
                 return structured_sql
         sql = ""
         if self.llm.configured:
@@ -2092,7 +2163,7 @@ class NodeWorkerExecutor:
                 decision.source = "structured_fallback"
                 decision.fallback_reason = "draft_llm_sql blocked by circuit breaker: %s" % blocked.reason
                 structured_sql = self._draft_structured_sql(intent, asset_pack, context, contract=contract)
-                self._last_sql_draft_decisions[intent.plan_task_id] = decision
+                context.runtime_scratch["sql_draft_decision"] = decision
                 return structured_sql
             tool = sql_draft_tool()
             prompt = self.prompt_assembler.render(
@@ -2106,7 +2177,7 @@ class NodeWorkerExecutor:
         )
             file_context, file_results = self._node_file_tool_loop(intent, context, contract, knowledge_context)
             if file_results:
-                self._last_node_file_tool_results[intent.plan_task_id] = file_results
+                context.runtime_scratch["file_tool_results"] = file_results
             user_payload = self._node_llm_payload(intent, context, contract, file_context)
             try:
                 if hasattr(self.llm, "tool_json_chat"):
@@ -2116,8 +2187,8 @@ class NodeWorkerExecutor:
             except Exception as exc:
                 self.tool_failure_registry.record_failure("draft_llm_sql", draft_args, "PROVIDER_ERROR", str(exc))
                 payload = {}
-            self._prompt_traces_by_task[prompt_trace_key(intent, "draft")] = prompt.trace()
-            self._prompt_traces_by_task[prompt_trace_key(intent, "draft_tool")] = tool.trace_schema()
+            set_node_prompt_trace(context, prompt_trace_key(intent, "draft"), prompt.trace())
+            set_node_prompt_trace(context, prompt_trace_key(intent, "draft_tool"), tool.trace_schema())
             sql = str(payload.get("sql") or "").strip()
             if sql:
                 self.tool_failure_registry.record_success("draft_llm_sql", draft_args)
@@ -2127,13 +2198,13 @@ class NodeWorkerExecutor:
                 error_type = "PROVIDER_ERROR" if self.llm.last_error else "SQL_EMPTY"
                 self.tool_failure_registry.record_failure("draft_llm_sql", draft_args, error_type, self.llm.last_error or "LLM returned empty SQL")
         if sql:
-            self._last_sql_draft_decisions[intent.plan_task_id] = decision
+            context.runtime_scratch["sql_draft_decision"] = decision
             return sql
         decision.structured_fallback_used = True
         decision.source = "structured_fallback"
         decision.fallback_reason = self.llm.last_error or "LLM unavailable or returned empty SQL"
         decision.reason = "fallback to deterministic single-table SQL builder"
-        self._last_sql_draft_decisions[intent.plan_task_id] = decision
+        context.runtime_scratch["sql_draft_decision"] = decision
         return self._draft_structured_sql(intent, asset_pack, context, contract=contract)
 
     def _use_structured_fast_path(
@@ -2395,7 +2466,13 @@ class NodeWorkerExecutor:
             params.append(context.merchant_id)
         sql = "SELECT MIN(`pt`) AS `min_pt`, MAX(`pt`) AS `max_pt` FROM `%s`%s" % (table, where)
         try:
-            rows = self.doris_repository.query(sql, params)
+            rows = doris_query_with_cancellation(
+                self.doris_repository,
+                sql,
+                params,
+                cancel_events=[context.cancel_event],
+                timeout_seconds=min(5, int(self.settings.doris_read_timeout_seconds or 5)),
+            )
         except Exception as exc:
             return FreshnessCheckResult(
                 task_id=intent.plan_task_id,
@@ -2423,6 +2500,8 @@ class NodeWorkerExecutor:
 
     def _apply_partition_date_anchor(self, sql: str, intent: QuestionIntent, freshness: FreshnessCheckResult) -> tuple[str, str]:
         if not bool(getattr(self.settings, "agent_partition_date_anchor_enabled", False)):
+            return sql, ""
+        if intent.time_range.start_date and intent.time_range.end_date and intent.time_range.anchor_policy == "calendar":
             return sql, ""
         if not freshness.checked or not freshness.max_pt or "CURDATE()" not in str(sql or "").upper():
             return sql, ""
@@ -2598,10 +2677,17 @@ class NodeWorkerExecutor:
         cache_keys: List[str] = []
         started = time.perf_counter()
         chunk_results: Dict[int, List[Dict[str, Any]]] = {}
+        split_cancel_event = Event()
 
         def query_chunk(index: int, chunk_sql: str) -> Dict[str, Any]:
             chunk_started = time.perf_counter()
-            chunk_rows = self.doris_repository.query(chunk_sql, safe_params)
+            chunk_rows = doris_query_with_cancellation(
+                self.doris_repository,
+                chunk_sql,
+                safe_params,
+                cancel_events=[context.cancel_event, split_cancel_event],
+                timeout_seconds=self.settings.doris_read_timeout_seconds,
+            )
             return {
                 "chunkIndex": index,
                 "rows": list(chunk_rows or []),
@@ -2611,41 +2697,61 @@ class NodeWorkerExecutor:
                 "sql": trim_sql(chunk_sql, 600),
             }
 
-        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(split_sqls))) as executor:
+        executor = ThreadPoolExecutor(max_workers=min(max_concurrency, len(split_sqls)))
+        try:
             futures = {
-                executor.submit(query_chunk, index, chunk_sql): (index, chunk_sql)
+                submit_with_current_context(executor, query_chunk, index, chunk_sql): (index, chunk_sql)
                 for index, chunk_sql in enumerate(split_sqls, start=1)
             }
-            for future in as_completed(futures):
-                index, chunk_sql = futures[future]
-                try:
-                    payload = future.result()
-                except Exception as exc:
+            try:
+                for future in as_completed(
+                    futures,
+                    timeout=max(1, int(self.settings.doris_read_timeout_seconds or 1)),
+                ):
+                    index, chunk_sql = futures[future]
+                    try:
+                        payload = future.result()
+                    except Exception as exc:
+                        events.append(
+                            {
+                                "event": "split_query_chunk_failed",
+                                "chunkIndex": index,
+                                "errorCode": classify_doris_error(str(exc)),
+                                "error": str(exc)[:240],
+                                "sql": trim_sql(chunk_sql, 600),
+                            }
+                        )
+                        continue
+                    chunk_rows = payload["rows"]
+                    chunk_results[index] = chunk_rows
+                    cache_hit = cache_hit or bool(payload["cacheHit"])
+                    if payload["cacheKey"]:
+                        cache_keys.append(payload["cacheKey"])
                     events.append(
                         {
-                            "event": "split_query_chunk_failed",
+                            "event": "split_query_chunk_succeeded",
                             "chunkIndex": index,
-                            "errorCode": classify_doris_error(str(exc)),
-                            "error": str(exc)[:240],
-                            "sql": trim_sql(chunk_sql, 600),
+                            "rows": len(chunk_rows),
+                            "cacheHit": bool(payload["cacheHit"]),
+                            "durationMs": payload["durationMs"],
+                            "sql": payload["sql"],
                         }
                     )
-                    continue
-                chunk_rows = payload["rows"]
-                chunk_results[index] = chunk_rows
-                cache_hit = cache_hit or bool(payload["cacheHit"])
-                if payload["cacheKey"]:
-                    cache_keys.append(payload["cacheKey"])
+            except TimeoutError:
+                split_cancel_event.set()
                 events.append(
                     {
-                        "event": "split_query_chunk_succeeded",
-                        "chunkIndex": index,
-                        "rows": len(chunk_rows),
-                        "cacheHit": bool(payload["cacheHit"]),
-                        "durationMs": payload["durationMs"],
-                        "sql": payload["sql"],
+                        "event": "split_query_timeout",
+                        "timeoutSeconds": self.settings.doris_read_timeout_seconds,
                     }
                 )
+            finally:
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+        finally:
+            split_cancel_event.set()
+            executor.shutdown(wait=False, cancel_futures=True)
         rows: List[Dict[str, Any]] = []
         for index in sorted(chunk_results):
             if len(rows) >= limit:
@@ -2709,7 +2815,7 @@ class NodeWorkerExecutor:
     ) -> str:
         group_columns = self._structured_group_columns(intent, columns, contract)
         select_parts = [quote_identifier(column) for column in group_columns]
-        metric_parts = structured_metric_select_parts(intent, table, columns)
+        metric_parts = structured_metric_select_parts(intent, table, columns, contract.metric_specs)
         if metric_parts is None:
             return ""
         if not metric_parts:
@@ -2855,7 +2961,13 @@ class NodeWorkerExecutor:
             if entity.values and entity.join_key in columns and entity.join_key not in applied_entity_columns:
                 where.append("`%s` IN (%s)" % (entity.join_key, ", ".join(sql_literal(value) for value in entity.values[:entity_value_limit])))
                 applied_entity_columns.add(entity.join_key)
-        if "pt" in columns and int(intent.days or 0) > 0:
+        if "pt" in columns and intent.time_range.start_date and intent.time_range.end_date:
+            if not any("`pt`" in predicate for predicate in where):
+                where.append(
+                    "`pt` BETWEEN %s AND %s"
+                    % (sql_literal(intent.time_range.start_date), sql_literal(intent.time_range.end_date))
+                )
+        elif "pt" in columns and int(intent.days or 0) > 0:
             if not any("`pt`" in predicate for predicate in where):
                 where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(intent.days))
         return where
@@ -2916,8 +3028,8 @@ class NodeWorkerExecutor:
         except Exception as exc:
             self.tool_failure_registry.record_failure("repair_sql", repair_args, "PROVIDER_ERROR", str(exc))
             payload = {}
-        self._prompt_traces_by_task[prompt_trace_key(intent, "repair")] = prompt.trace()
-        self._prompt_traces_by_task[prompt_trace_key(intent, "repair_tool")] = tool.trace_schema()
+        set_node_prompt_trace(context, prompt_trace_key(intent, "repair"), prompt.trace())
+        set_node_prompt_trace(context, prompt_trace_key(intent, "repair_tool"), tool.trace_schema())
         attempt.repaired_sql = str(payload.get("sql") or "").strip()
         attempt.success = bool(attempt.repaired_sql)
         if attempt.success:
@@ -3054,13 +3166,15 @@ class NodeWorkerExecutor:
     ) -> NodePlanContract:
         table = intent.preferred_table
         table_columns = asset_pack.known_columns(table)
+        metric_contract = compile_node_metric_contract(intent, asset_pack, set(table_columns))
         required_columns = self._node_required_columns(intent, asset_pack).get(table, [])
         allowed_columns = list(required_columns)
         contract_output_keys = self._node_contract_output_keys(intent, set(table_columns))
-        for column in formula_columns(intent.metric_formula, set(table_columns)):
+        for column in formula_columns(str(metric_contract.get("formula") or intent.metric_formula), set(table_columns)):
             if column not in allowed_columns:
                 allowed_columns.append(column)
-        for spec in metric_specs_for_intent(intent, table):
+        effective_metric_specs = metric_specs_for_contract(intent, table, metric_contract, asset_pack, set(table_columns))
+        for spec in effective_metric_specs:
             for column in metric_spec_source_columns(spec, set(table_columns)):
                 if column not in allowed_columns:
                     allowed_columns.append(column)
@@ -3086,6 +3200,12 @@ class NodeWorkerExecutor:
         store_filter_column = str(table_metadata.get("storeFilterColumn") or "")
         if not store_filter_column:
             store_filter_column = next((column for column in ["store_id", "outlet_id", "branch_id"] if column in table_columns), "")
+        execution_scope_columns = [merchant_filter_column, region_filter_column, store_filter_column]
+        if "pt" in table_columns and (intent.days or intent.time_range.start_date or intent.time_range.end_date):
+            execution_scope_columns.append("pt")
+        for column in execution_scope_columns:
+            if column and column in table_columns and column not in allowed_columns:
+                allowed_columns.append(column)
         access_role = str(context.access_role or DEFAULT_ACCESS_ROLE)
         field_semantics = table_field_semantics(asset_pack, table)
         visible_columns: List[str] = []
@@ -3121,9 +3241,9 @@ class NodeWorkerExecutor:
             internal_only_columns=internal_only_columns,
             required_columns=required_columns,
             metric_column=intent.metric_column,
-            metric_name=intent.metric_name,
-            metric_formula=intent.metric_formula,
-            metric_specs=metric_specs_for_intent(intent, table),
+            metric_name=str(metric_contract.get("metricKey") or intent.metric_name),
+            metric_formula=str(metric_contract.get("formula") or intent.metric_formula),
+            metric_specs=effective_metric_specs,
             group_by_column=intent.group_by_column,
             output_keys=contract_output_keys,
             required_evidence=intent.required_evidence,
@@ -3145,7 +3265,8 @@ class NodeWorkerExecutor:
             task_role=enum_text(intent.task_role),
             sql_strategy=intent.sql_strategy or "llm_plan_bound_first",
             upstream_entity_sets=[item.model_dump(by_alias=True) for item in context.upstream_entity_sets],
-            metric_resolution=intent.metric_resolution,
+            metric_resolution=dict(metric_contract.get("resolution") or intent.metric_resolution),
+            metric_governance_mode=str(metric_contract.get("mode") or "legacy_unsealed"),
         )
 
     def _enforce_identity_scope_sql(
@@ -3503,6 +3624,59 @@ def optimize_query_plan_for_execution(plan: QueryPlan, asset_pack: PlanningAsset
     plan.compiler_trace = optimizer_notes
 
 
+def node_execution_contract_hash(
+    intent: QuestionIntent,
+    plan: QueryPlan,
+    merchant_id: str,
+    access_role: str,
+    user_scope: Dict[str, Any],
+    asset_pack: Optional[PlanningAssetPack] = None,
+) -> str:
+    """Bind resumable node results to the exact execution contract, not only task id."""
+
+    dependencies = [
+        item.model_dump(by_alias=True)
+        for item in plan.dependencies
+        if item.anchor_task_id == intent.plan_task_id or item.dependent_task_id == intent.plan_task_id
+    ]
+    dependencies.sort(key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
+    node_contract = {
+        "intent": intent.model_dump(by_alias=True),
+        "dependencies": dependencies,
+    }
+    scope = {
+        "merchantId": str(merchant_id or ""),
+        "accessRole": str(access_role or ""),
+        "userScope": user_scope or {},
+    }
+    asset_versions = {}
+    if asset_pack is not None:
+        relevant_tables = {intent.preferred_table, *[str(item) for item in getattr(intent, "candidate_tables", []) or []]}
+        asset_versions = {
+            table: version.model_dump(by_alias=True)
+            for table, version in asset_pack.semantic_catalog_version.items()
+            if table in relevant_tables
+        }
+    payload = {
+        "planFingerprint": hashlib.sha256(
+            json.dumps(plan.model_dump(by_alias=True), ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "nodeContractHash": hashlib.sha256(
+            json.dumps(node_contract, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "scope": scope,
+        "timeRange": {
+            "days": int(intent.days or 0),
+            "filterColumn": intent.filter_column,
+            "filterValue": intent.filter_value,
+        },
+        "assetVersion": asset_versions,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def primary_metric_intent(group: List[QuestionIntent]) -> QuestionIntent:
     for intent in group:
         if intent.answer_mode == AnswerMode.TOPN and not intent.depends_on_task_ids:
@@ -3585,6 +3759,300 @@ def rewrite_evidence_contracts(plan: QueryPlan, task_id_map: Dict[str, str]) -> 
             contract["task_id"] = task_id_map[task_id]
 
 
+def compile_node_metric_contract(
+    intent: QuestionIntent,
+    asset_pack: PlanningAssetPack,
+    table_columns: Set[str],
+) -> Dict[str, Any]:
+    resolution = dict(intent.metric_resolution or {})
+    declared_mode = str(
+        resolution.get("metricGovernanceMode")
+        or resolution.get("metric_governance_mode")
+        or ""
+    )
+    if resolution:
+        semantic_ref_id = str(resolution.get("semanticRefId") or "")
+        claims_local_compilation = bool(
+            declared_mode == "compiled_local"
+            or semantic_ref_id.startswith("semantic:compiled_local:")
+        )
+        if claims_local_compilation:
+            normalized = seal_local_execution_resolution(resolution, intent, table_columns)
+            if not normalized:
+                return {"mode": "legacy_unsealed", "resolution": resolution}
+            return {
+                "mode": "compiled_local",
+                "metricKey": str(normalized.get("metricKey") or intent.metric_name),
+                "formula": str(normalized.get("formula") or intent.metric_formula),
+                "sourceColumns": list(normalized.get("sourceColumns") or []),
+                "resolution": normalized,
+            }
+        claims_published_semantics = bool(
+            semantic_ref_id.startswith("semantic:")
+            or resolution.get("semanticContract")
+            or resolution.get("semanticContractHash")
+            or str(resolution.get("governanceStatus") or "").lower() == "published"
+            or declared_mode == "published_semantic"
+        )
+        if claims_published_semantics:
+            return {
+                "mode": "published_semantic",
+                "metricKey": str(resolution.get("metricKey") or intent.metric_name),
+                "formula": str(resolution.get("formula") or intent.metric_formula),
+                "sourceColumns": list(resolution.get("sourceColumns") or []),
+                "resolution": resolution,
+            }
+        if local_resolution_complete(resolution, intent.preferred_table, table_columns):
+            normalized = seal_local_execution_resolution(resolution, intent, table_columns)
+            return {
+                "mode": "compiled_local",
+                "metricKey": str(normalized.get("metricKey") or intent.metric_name),
+                "formula": str(normalized.get("formula") or intent.metric_formula),
+                "sourceColumns": list(normalized.get("sourceColumns") or []),
+                "resolution": normalized,
+            }
+        return {"mode": "legacy_unsealed", "resolution": resolution}
+
+    implicit_metric = implicit_local_metric(intent, table_columns)
+    metric = local_metric_entry(intent, asset_pack)
+    metadata = dict(getattr(metric, "metadata", {}) or {}) if metric else {}
+    metric_key = str(
+        intent.metric_name
+        or getattr(metric, "key", "")
+        or intent.metric_column
+        or implicit_metric.get("metricKey")
+        or ""
+    )
+    formula = str(
+        intent.metric_formula
+        or metadata.get("formula")
+        or metadata.get("metricFormula")
+        or implicit_metric.get("formula")
+        or ""
+    ).strip()
+    aggregation_source = "explicit_formula" if intent.metric_formula else ("asset_formula" if formula else "")
+    source_columns = dedupe_strings(
+        [
+            str(item)
+            for item in metadata.get("sourceColumns")
+            or metadata.get("source_columns")
+            or getattr(metric, "columns", [])
+            or []
+            if str(item) in table_columns
+        ]
+    )
+    if formula:
+        source_columns = dedupe_strings(source_columns + formula_columns(formula, table_columns))
+    if not source_columns and implicit_metric:
+        source_columns = list(implicit_metric.get("sourceColumns") or [])
+        aggregation_source = "implicit_count_contract"
+    if not formula and intent.metric_column in table_columns:
+        aggregation = normalized_local_aggregation(metadata.get("aggregation") or metadata.get("agg"))
+        if aggregation:
+            formula = local_aggregation_formula(aggregation, intent.metric_column)
+            aggregation_source = "asset_aggregation"
+        else:
+            formula = typed_local_metric_formula(intent.metric_name, intent.metric_column)
+            aggregation_source = "typed_column_contract" if formula else ""
+        source_columns = [intent.metric_column] if formula else []
+    if not metric_key or not formula or not source_columns or not compile_metric_formula(formula, table_columns):
+        return {"mode": "legacy_unsealed", "resolution": {}}
+    compiled = {
+        "semanticRefId": "semantic:compiled_local:%s:metric:%s" % (intent.preferred_table, metric_key),
+        "metricKey": metric_key,
+        "ownerTable": intent.preferred_table,
+        "formula": formula,
+        "sourceColumns": source_columns,
+        "metricGovernanceMode": "compiled_local",
+        "contractProvenance": {
+            "kind": "execution_contract",
+            "ownerTable": intent.preferred_table,
+            "metricKey": metric_key,
+            "taskId": intent.plan_task_id,
+        },
+        "resolutionSource": "compiled_local",
+        "localCompilationPolicy": aggregation_source,
+    }
+    compiled = seal_semantic_metric_resolution(compiled, force=True)
+    return {
+        "mode": "compiled_local",
+        "metricKey": metric_key,
+        "formula": formula,
+        "sourceColumns": source_columns,
+        "resolution": compiled,
+    }
+
+
+def seal_local_execution_resolution(
+    resolution: Dict[str, Any],
+    intent: QuestionIntent,
+    table_columns: Set[str],
+) -> Dict[str, Any]:
+    updated = dict(resolution or {})
+    metric_key = str(updated.get("metricKey") or intent.metric_name or intent.metric_column or "")
+    owner_table = str(updated.get("ownerTable") or intent.preferred_table or "")
+    formula = str(updated.get("formula") or intent.metric_formula or "")
+    source_columns = [str(item) for item in updated.get("sourceColumns") or [] if str(item)]
+    if not source_columns and formula:
+        source_columns = formula_columns(formula, table_columns)
+    if not metric_key or owner_table != intent.preferred_table or not formula or not source_columns:
+        return {}
+    if any(column not in table_columns for column in source_columns) or not compile_metric_formula(formula, table_columns):
+        return {}
+    provenance = updated.get("contractProvenance")
+    if not isinstance(provenance, dict):
+        provenance = {
+            "kind": "execution_contract",
+            "ownerTable": owner_table,
+            "metricKey": metric_key,
+            "taskId": intent.plan_task_id,
+        }
+    updated.update(
+        {
+            "semanticRefId": str(updated.get("semanticRefId") or "semantic:compiled_local:%s:metric:%s" % (owner_table, metric_key)),
+            "metricKey": metric_key,
+            "ownerTable": owner_table,
+            "formula": formula,
+            "sourceColumns": source_columns,
+            "metricGovernanceMode": "compiled_local",
+            "contractProvenance": provenance,
+            "resolutionSource": "compiled_local",
+            "localCompilationPolicy": str(
+                updated.get("localCompilationPolicy")
+                or updated.get("aggregationSource")
+                or "provided_execution_contract"
+            ),
+        }
+    )
+    return seal_semantic_metric_resolution(updated, force=True)
+
+
+def implicit_local_metric(intent: QuestionIntent, table_columns: Set[str]) -> Dict[str, Any]:
+    if intent.answer_mode not in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
+        return {}
+    if intent.metric_name or intent.metric_column or intent.metric_formula or intent.metric_specs:
+        return {}
+    candidates = [
+        str(column)
+        for column in intent.required_evidence + intent.output_keys
+        if str(column).endswith("_id")
+        and str(column) in table_columns
+        and str(column) not in {intent.group_by_column, "seller_id", "merchant_id", "store_id"}
+    ]
+    count_column = candidates[0] if candidates else (intent.group_by_column if intent.group_by_column in table_columns else "")
+    if not count_column:
+        return {}
+    metric_key = "%s_cnt" % count_column[:-3] if count_column.endswith("_id") else "%s_count" % count_column
+    return {
+        "metricKey": metric_key,
+        "formula": "COUNT(DISTINCT `%s`)" % count_column,
+        "sourceColumns": [count_column],
+    }
+
+
+def local_resolution_complete(resolution: Dict[str, Any], table: str, table_columns: Set[str]) -> bool:
+    formula = str(resolution.get("formula") or "")
+    source_columns = [str(item) for item in resolution.get("sourceColumns") or [] if str(item)]
+    return bool(
+        resolution.get("metricKey")
+        and str(resolution.get("ownerTable") or "") == table
+        and formula
+        and source_columns
+        and all(column in table_columns for column in source_columns)
+        and compile_metric_formula(formula, table_columns)
+    )
+
+
+def local_metric_entry(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> Any:
+    candidates = []
+    requested = {str(item) for item in [intent.metric_name, intent.metric_column] if str(item)}
+    for metric in asset_pack.metrics:
+        if metric.table != intent.preferred_table:
+            continue
+        names = {str(metric.key or ""), str(metric.title or ""), *[str(item) for item in metric.aliases or []]}
+        columns = {str(item) for item in metric.columns or []}
+        if requested & (names | columns):
+            candidates.append(metric)
+    identities = {(str(item.table), str(item.key), str(item.source_ref_id)) for item in candidates}
+    return candidates[0] if len(identities) == 1 else None
+
+
+def normalized_local_aggregation(value: Any) -> str:
+    text = str(value or "").strip().lower().replace(" ", "_")
+    aliases = {
+        "sum": "sum",
+        "avg": "avg",
+        "average": "avg",
+        "count": "count",
+        "count_distinct": "count_distinct",
+        "distinct_count": "count_distinct",
+        "max": "max",
+        "min": "min",
+    }
+    return aliases.get(text, "")
+
+
+def local_aggregation_formula(aggregation: str, column: str) -> str:
+    if aggregation == "count_distinct":
+        return "COUNT(DISTINCT `%s`)" % column
+    if aggregation in {"sum", "avg", "count", "max", "min"}:
+        return "%s(`%s`)" % (aggregation.upper(), column)
+    return ""
+
+
+def typed_local_metric_formula(metric_name: str, metric_column: str) -> str:
+    metric_key = str(metric_name or "").lower()
+    column = str(metric_column or "").lower()
+    if is_count_metric_alias(metric_key):
+        return "COUNT(DISTINCT `%s`)" % metric_column
+    additive_suffixes = ("_amt", "_amount", "_gmv", "_cnt", "_count")
+    if column.endswith(additive_suffixes) or any(token in column for token in ["_amt_", "_amount_", "_gmv_", "_cnt_", "_count_"]):
+        return "SUM(`%s`)" % metric_column
+    return ""
+
+
+def metric_specs_for_contract(
+    intent: QuestionIntent,
+    table: str,
+    metric_contract: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+    table_columns: Set[str],
+) -> List[Dict[str, Any]]:
+    specs = metric_specs_for_intent(intent, table)
+    if not specs and metric_contract.get("formula"):
+        specs = [
+            {
+                "metricName": str(metric_contract.get("metricKey") or ""),
+                "metricColumn": intent.metric_column,
+                "metricFormula": str(metric_contract.get("formula") or ""),
+                "sourceColumns": list(metric_contract.get("sourceColumns") or []),
+                "sourceTaskId": intent.plan_task_id,
+            }
+        ]
+    compiled_specs: List[Dict[str, Any]] = []
+    for spec in specs:
+        compiled = dict(spec)
+        if not compiled.get("metricFormula"):
+            spec_intent = intent.model_copy(
+                update={
+                    "metric_name": str(compiled.get("metricName") or ""),
+                    "metric_column": str(compiled.get("metricColumn") or ""),
+                    "metric_formula": "",
+                    "metric_specs": [],
+                    "metric_resolution": {},
+                }
+            )
+            spec_contract = compile_node_metric_contract(spec_intent, asset_pack, table_columns)
+            if spec_contract.get("mode") == "compiled_local":
+                compiled["metricName"] = str(spec_contract.get("metricKey") or compiled.get("metricName") or "")
+                compiled["metricFormula"] = str(spec_contract.get("formula") or "")
+                compiled["sourceColumns"] = list(spec_contract.get("sourceColumns") or [])
+        elif not compiled.get("sourceColumns"):
+            compiled["sourceColumns"] = formula_columns(str(compiled.get("metricFormula") or ""), table_columns)
+        compiled_specs.append(compiled)
+    return compiled_specs
+
+
 def metric_specs_for_intent(intent: QuestionIntent, table: str) -> List[Dict[str, Any]]:
     if intent.metric_specs:
         return [normalize_metric_spec(spec, intent, table) for spec in intent.metric_specs if isinstance(spec, dict)]
@@ -3634,9 +4102,14 @@ def dedupe_metric_specs(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
-def structured_metric_select_parts(intent: QuestionIntent, table: str, columns: set) -> List[Tuple[str, str]] | None:
+def structured_metric_select_parts(
+    intent: QuestionIntent,
+    table: str,
+    columns: set,
+    contract_specs: Optional[List[Dict[str, Any]]] = None,
+) -> List[Tuple[str, str]] | None:
     parts: List[Tuple[str, str]] = []
-    for spec in metric_specs_for_intent(intent, table):
+    for spec in contract_specs or metric_specs_for_intent(intent, table):
         metric_alias = str(spec.get("metricName") or "")
         metric_formula = str(spec.get("metricFormula") or "")
         metric_column = str(spec.get("metricColumn") or "")
@@ -3647,8 +4120,6 @@ def structured_metric_select_parts(intent: QuestionIntent, table: str, columns: 
             parts.append((metric_expr, metric_alias or "metric_value"))
             continue
         if metric_column:
-            # Aggregation is a governed part of the semantic metric contract.
-            # A bare column must never be upgraded to SUM/COUNT by convention.
             return None
     return parts
 
@@ -3857,6 +4328,49 @@ def governed_metric_contract_issue(resolution: Dict[str, Any], table: str = "") 
         ):
             return "derived metric components are missing governed semantic references"
     return semantic_metric_contract_issue(payload, table)
+
+
+def metric_execution_contract_issue(contract: NodePlanContract) -> str:
+    mode = str(contract.metric_governance_mode or "legacy_unsealed")
+    if mode == "published_semantic":
+        return governed_metric_contract_issue(contract.metric_resolution, contract.preferred_table)
+    if mode == "compiled_local":
+        resolution = contract.metric_resolution or {}
+        if str(resolution.get("ownerTable") or "") != contract.preferred_table:
+            return "locally compiled metric ownerTable does not match the execution table"
+        if not str(resolution.get("metricKey") or ""):
+            return "locally compiled metric has no metricKey"
+        source_columns = [str(item) for item in resolution.get("sourceColumns") or [] if str(item)]
+        if not source_columns:
+            return "locally compiled metric has no sourceColumns"
+        if any(column not in set(contract.allowed_columns) for column in source_columns):
+            return "locally compiled metric sourceColumns are outside the node schema"
+        formula = str(resolution.get("formula") or "")
+        if not formula or not compile_metric_formula(formula, set(contract.allowed_columns)):
+            return "locally compiled metric formula is not executable against the node schema"
+        semantic_ref_id = str(resolution.get("semanticRefId") or "")
+        provenance = resolution.get("contractProvenance") or {}
+        if not semantic_ref_id.startswith("semantic:compiled_local:"):
+            return "locally compiled metric has no local semantic reference"
+        if not isinstance(provenance, dict) or str(provenance.get("kind") or "") not in {
+            "execution_contract",
+            "planning_asset",
+        }:
+            return "locally compiled metric has no verified provenance"
+        sealed_issue = semantic_metric_contract_issue(resolution, contract.preferred_table)
+        if sealed_issue:
+            return sealed_issue
+        for spec in contract.metric_specs or []:
+            spec_formula = str(spec.get("metricFormula") or "")
+            spec_columns = [str(item) for item in spec.get("sourceColumns") or [] if str(item)]
+            if not spec_formula or not spec_columns:
+                return "locally compiled multi-metric contract is incomplete"
+            if any(column not in set(contract.allowed_columns) for column in spec_columns):
+                return "locally compiled multi-metric sourceColumns are outside the node schema"
+            if not compile_metric_formula(spec_formula, set(contract.allowed_columns)):
+                return "locally compiled multi-metric formula is not executable against the node schema"
+        return ""
+    return "metric execution contract is unsealed and has no verified local provenance"
 
 
 def semantic_metric_binding_issue(contract: NodePlanContract) -> str:
@@ -4496,6 +5010,53 @@ def timed_out_result(task_id: str, intent: QuestionIntent, timeout_seconds: int)
         }
     )
     return result
+
+
+def submit_with_current_context(executor: ThreadPoolExecutor, fn: Any, *args: Any):
+    context = copy_context()
+    return executor.submit(context.run, fn, *args)
+
+
+def doris_query_with_cancellation(
+    repository: Any,
+    sql: str,
+    params: Optional[List[Any]] = None,
+    cancel_events: Optional[List[Any]] = None,
+    timeout_seconds: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    query = getattr(repository, "query")
+    effective_cancel_events = [event for event in (cancel_events or []) if event is not None]
+    runtime_cancel_event = current_tool_cancel_event()
+    if runtime_cancel_event is not None and runtime_cancel_event not in effective_cancel_events:
+        effective_cancel_events.append(runtime_cancel_event)
+    try:
+        signature = inspect.signature(query)
+        supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+        supports_cancellation = supports_kwargs or "cancel_events" in signature.parameters
+    except (TypeError, ValueError):
+        supports_cancellation = False
+    if supports_cancellation:
+        return query(
+            sql,
+            params,
+            cancel_events=effective_cancel_events,
+            timeout_seconds=timeout_seconds,
+        )
+    return query(sql, params)
+
+
+def set_node_prompt_trace(context: NodeExecutionContext, key: str, payload: Dict[str, Any]) -> None:
+    traces = context.runtime_scratch.setdefault("prompt_traces", {})
+    traces[str(key)] = payload
+
+
+def pop_node_prompt_trace(context: NodeExecutionContext, key: str) -> Optional[Dict[str, Any]]:
+    traces = context.runtime_scratch.get("prompt_traces") or {}
+    return traces.pop(str(key), None)
+
+
+def pop_node_runtime_value(context: NodeExecutionContext, key: str, default: Any = None) -> Any:
+    return context.runtime_scratch.pop(str(key), default)
 
 
 def context_is_cancelled(context: NodeExecutionContext) -> bool:

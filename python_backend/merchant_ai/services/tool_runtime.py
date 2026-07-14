@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib import request as url_request
@@ -26,6 +29,63 @@ from merchant_ai.models import (
 from merchant_ai.services.tools import ToolRegistry, canonical_tool_registry, validate_tool_result_contract
 
 
+_TOOL_RUNTIME_SCOPE: ContextVar[Optional[Dict[str, str]]] = ContextVar("merchant_ai_tool_runtime_scope", default=None)
+_TOOL_CANCEL_EVENT: ContextVar[Any] = ContextVar("merchant_ai_tool_cancel_event", default=None)
+
+
+@contextmanager
+def tool_runtime_scope(merchant_id: str = "", thread_id: str = "", run_id: str = ""):
+    token = _TOOL_RUNTIME_SCOPE.set(
+        {
+            "merchantId": str(merchant_id or ""),
+            "threadId": str(thread_id or ""),
+            "runId": str(run_id or ""),
+        }
+    )
+    try:
+        yield
+    finally:
+        _TOOL_RUNTIME_SCOPE.reset(token)
+
+
+def current_tool_runtime_scope() -> Dict[str, str]:
+    return dict(_TOOL_RUNTIME_SCOPE.get() or {})
+
+
+def current_tool_cancel_event() -> Any:
+    return _TOOL_CANCEL_EVENT.get()
+
+
+@contextmanager
+def tool_cancel_scope(cancel_event: Any):
+    token = _TOOL_CANCEL_EVENT.set(cancel_event)
+    try:
+        yield
+    finally:
+        _TOOL_CANCEL_EVENT.reset(token)
+
+
+def scoped_rate_limit_key(
+    tool_name: str,
+    service_name: str = "",
+    target: str = "",
+    merchant_id: str = "",
+    thread_id: str = "",
+) -> str:
+    scope = current_tool_runtime_scope()
+    merchant = str(merchant_id or scope.get("merchantId") or "*")
+    thread = str(thread_id or scope.get("threadId") or "*")
+    run = str(scope.get("runId") or "*")
+    return "tool=%s|service=%s|target=%s|merchant=%s|thread=%s|run=%s" % (
+        str(tool_name or "tool"),
+        str(service_name or "tool"),
+        str(target or "default"),
+        merchant,
+        thread,
+        run,
+    )
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -33,6 +93,8 @@ def now_ms() -> int:
 def classify_tool_error(error: Exception | str) -> str:
     text = str(error or "")
     lower = text.lower()
+    if "cancelled" in lower or "canceled" in lower:
+        return "CANCELED"
     if "timeout" in lower or "timed out" in lower:
         return "TIMEOUT"
     if "unknown column" in lower or "unknown field" in lower:
@@ -877,6 +939,7 @@ class ToolFailureRegistry:
         self.cooldown_seconds = max(1, int(cooldown_seconds or 60))
         self.records: Dict[str, ToolFailureRecord] = {}
         self.circuits: Dict[str, CircuitBreakerState] = {}
+        self._lock = threading.RLock()
 
     def fingerprint(
         self,
@@ -899,17 +962,18 @@ class ToolFailureRegistry:
         merchant_id: str = "",
         thread_id: str = "",
     ) -> Dict[str, str]:
+        scope = current_tool_runtime_scope()
         context = normalize_tool_context(tool_name, args, service_name, target)
-        if merchant_id:
-            context["merchantId"] = merchant_id
-        if thread_id:
-            context["threadId"] = thread_id
-        context["circuitKey"] = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s" % (
+        context["merchantId"] = str(merchant_id or context.get("merchantId") or scope.get("merchantId") or "")
+        context["threadId"] = str(thread_id or context.get("threadId") or scope.get("threadId") or "")
+        run_id = str(scope.get("runId") or "")
+        context["circuitKey"] = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s|run=%s" % (
             tool_name,
             context["serviceName"] or "tool",
             context["target"] or "default",
             context["merchantId"] or "*",
             context["threadId"] or "*",
+            run_id or "*",
         )
         context["fingerprint"] = "%s|params=%s" % (context["circuitKey"], context["paramsHash"])
         return context
@@ -924,39 +988,40 @@ class ToolFailureRegistry:
         thread_id: str = "",
     ) -> CircuitBreakerState | None:
         context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
-        circuit = self.circuits.get(context["circuitKey"])
-        if circuit and circuit.state == "open":
-            if circuit.open_until_ms and circuit.open_until_ms <= now_ms():
-                circuit.state = "half_open"
-                circuit.open = False
-                circuit.half_open_probe_in_flight = True
-                circuit.last_probe_at_ms = now_ms()
-                circuit.reason = "half-open probe allowed after cooldown"
-                self.circuits[context["circuitKey"]] = circuit
-            else:
+        with self._lock:
+            circuit = self.circuits.get(context["circuitKey"])
+            if circuit and circuit.state == "open":
+                if circuit.open_until_ms and circuit.open_until_ms <= now_ms():
+                    circuit.state = "half_open"
+                    circuit.open = False
+                    circuit.half_open_probe_in_flight = True
+                    circuit.last_probe_at_ms = now_ms()
+                    circuit.reason = "half-open probe allowed after cooldown"
+                    self.circuits[context["circuitKey"]] = circuit
+                else:
+                    return circuit
+            elif circuit and circuit.state == "half_open" and circuit.half_open_probe_in_flight:
+                circuit.open = True
+                circuit.reason = circuit.reason or "half-open probe already in flight"
                 return circuit
-        elif circuit and circuit.state == "half_open" and circuit.half_open_probe_in_flight:
-            circuit.open = True
-            circuit.reason = circuit.reason or "half-open probe already in flight"
-            return circuit
-        record = self.records.get(context["fingerprint"])
-        if record and record.blocked:
-            return CircuitBreakerState(
-                circuit_key=context["fingerprint"],
-                tool_name=tool_name,
-                service_name=context["serviceName"],
-                target=context["target"],
-                merchant_id=context["merchantId"],
-                thread_id=context["threadId"],
-                params_hash=context["paramsHash"],
-                state="open",
-                open=True,
-                failure_count=record.count,
-                reason="repeated identical failure: %s" % record.error_type,
-                recovery_action=record.recovery_action,
-                recommended_action=record.recovery_action,
-            )
-        return None
+            record = self.records.get(context["fingerprint"])
+            if record and record.blocked:
+                return CircuitBreakerState(
+                    circuit_key=context["fingerprint"],
+                    tool_name=tool_name,
+                    service_name=context["serviceName"],
+                    target=context["target"],
+                    merchant_id=context["merchantId"],
+                    thread_id=context["threadId"],
+                    params_hash=context["paramsHash"],
+                    state="open",
+                    open=True,
+                    failure_count=record.count,
+                    reason="repeated identical failure: %s" % record.error_type,
+                    recovery_action=record.recovery_action,
+                    recommended_action=record.recovery_action,
+                )
+            return None
 
     def record_success(
         self,
@@ -968,18 +1033,19 @@ class ToolFailureRegistry:
         thread_id: str = "",
     ) -> CircuitBreakerState | None:
         context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
-        self.records.pop(context["fingerprint"], None)
-        circuit = self.circuits.get(context["circuitKey"])
-        if circuit:
-            circuit.failure_count = 0
-            circuit.open = False
-            circuit.state = "closed"
-            circuit.reason = ""
-            circuit.open_until_ms = 0
-            circuit.half_open_probe_in_flight = False
-            self.circuits[context["circuitKey"]] = circuit
-            return circuit
-        return None
+        with self._lock:
+            self.records.pop(context["fingerprint"], None)
+            circuit = self.circuits.get(context["circuitKey"])
+            if circuit:
+                circuit.failure_count = 0
+                circuit.open = False
+                circuit.state = "closed"
+                circuit.reason = ""
+                circuit.open_until_ms = 0
+                circuit.half_open_probe_in_flight = False
+                self.circuits[context["circuitKey"]] = circuit
+                return circuit
+            return None
 
     def record_failure(
         self,
@@ -996,56 +1062,58 @@ class ToolFailureRegistry:
         fingerprint = context["fingerprint"]
         recovery = recovery_action_for(tool_name, error_type, context["serviceName"])
         timestamp = now_ms()
-        record = self.records.get(fingerprint) or ToolFailureRecord(
-            fingerprint=fingerprint,
-            tool_name=tool_name,
-            service_name=context["serviceName"],
-            target=context["target"],
-            merchant_id=context["merchantId"],
-            thread_id=context["threadId"],
-            params_hash=context["paramsHash"],
-            circuit_key=context["circuitKey"],
-            first_failed_at_ms=timestamp,
-        )
-        record.error_type = error_type or "ERROR"
-        record.error_message = str(error_message or "")[:500]
-        record.count += 1
-        record.blocked = record.count >= self.repeat_threshold
-        record.last_failed_at_ms = timestamp
-        record.recovery_action = recovery.action
-        self.records[fingerprint] = record
-        circuit = self.circuits.get(context["circuitKey"]) or CircuitBreakerState(
-            circuit_key=context["circuitKey"],
-            tool_name=tool_name,
-            service_name=context["serviceName"],
-            target=context["target"],
-            merchant_id=context["merchantId"],
-            thread_id=context["threadId"],
-            params_hash=context["paramsHash"],
-        )
-        circuit.failure_count += 1
-        circuit.params_hash = context["paramsHash"]
-        circuit.recovery_action = recovery.action
-        circuit.recommended_action = recovery.action
-        circuit.fallback_tools = list(recovery.fallback_tools)
-        if circuit.state == "half_open" or circuit.failure_count >= self.circuit_threshold:
-            circuit.state = "open"
-            circuit.open = True
-            circuit.reason = "tool failure threshold reached: %s" % record.error_type
-            circuit.opened_at_ms = now_ms()
-            circuit.open_until_ms = circuit.opened_at_ms + self.cooldown_seconds * 1000
-            circuit.half_open_probe_in_flight = False
-        else:
-            circuit.state = "closed"
-            circuit.open = False
-        self.circuits[context["circuitKey"]] = circuit
-        return record
+        with self._lock:
+            record = self.records.get(fingerprint) or ToolFailureRecord(
+                fingerprint=fingerprint,
+                tool_name=tool_name,
+                service_name=context["serviceName"],
+                target=context["target"],
+                merchant_id=context["merchantId"],
+                thread_id=context["threadId"],
+                params_hash=context["paramsHash"],
+                circuit_key=context["circuitKey"],
+                first_failed_at_ms=timestamp,
+            )
+            record.error_type = error_type or "ERROR"
+            record.error_message = str(error_message or "")[:500]
+            record.count += 1
+            record.blocked = record.count >= self.repeat_threshold
+            record.last_failed_at_ms = timestamp
+            record.recovery_action = recovery.action
+            self.records[fingerprint] = record
+            circuit = self.circuits.get(context["circuitKey"]) or CircuitBreakerState(
+                circuit_key=context["circuitKey"],
+                tool_name=tool_name,
+                service_name=context["serviceName"],
+                target=context["target"],
+                merchant_id=context["merchantId"],
+                thread_id=context["threadId"],
+                params_hash=context["paramsHash"],
+            )
+            circuit.failure_count += 1
+            circuit.params_hash = context["paramsHash"]
+            circuit.recovery_action = recovery.action
+            circuit.recommended_action = recovery.action
+            circuit.fallback_tools = list(recovery.fallback_tools)
+            if circuit.state == "half_open" or circuit.failure_count >= self.circuit_threshold:
+                circuit.state = "open"
+                circuit.open = True
+                circuit.reason = "tool failure threshold reached: %s" % record.error_type
+                circuit.opened_at_ms = now_ms()
+                circuit.open_until_ms = circuit.opened_at_ms + self.cooldown_seconds * 1000
+                circuit.half_open_probe_in_flight = False
+            else:
+                circuit.state = "closed"
+                circuit.open = False
+            self.circuits[context["circuitKey"]] = circuit
+            return record
 
     def trace(self) -> Dict[str, Any]:
-        return {
-            "failures": [item.model_dump(by_alias=True) for item in self.records.values()],
-            "circuits": [item.model_dump(by_alias=True) for item in self.circuits.values()],
-        }
+        with self._lock:
+            return {
+                "failures": [item.model_dump(by_alias=True) for item in self.records.values()],
+                "circuits": [item.model_dump(by_alias=True) for item in self.circuits.values()],
+            }
 
 
 def default_load_balancer(settings: Settings) -> RoundRobinLoadBalancer:
@@ -1127,6 +1195,7 @@ class ToolRuntimeService:
         call_id: str = "",
         cache_policy: ToolCachePolicy | None = None,
         target_kind: str = "",
+        cancel_event: Any = None,
     ) -> ToolCallExecutionResult:
         call = ToolCallRequest(id=call_id or tool_name, name=tool_name, args=args or {})
         service_name = target_kind or self._tool_kind(tool_name)
@@ -1204,8 +1273,14 @@ class ToolRuntimeService:
                 )
             )
         if self.settings.tool_rate_limit_enabled:
-            rate_key = service_name
-            if not self.rate_limit_store.allow(rate_key, self._tool_qps(tool_name, rate_key)):
+            rate_key = scoped_rate_limit_key(
+                tool_name,
+                service_name,
+                selected_target.name,
+                context.get("merchantId", ""),
+                context.get("threadId", ""),
+            )
+            if not self.rate_limit_store.allow(rate_key, self._tool_qps(tool_name, service_name)):
                 recovery = recovery_action_for(tool_name, "RATE_LIMITED", service_name)
                 details = tool_error_details(tool_name, call.args, "RATE_LIMITED", "tool rate limited: %s" % rate_key, context=context, call_id=call.id)
                 tool_message = structured_tool_message(
@@ -1289,6 +1364,7 @@ class ToolRuntimeService:
                     handler,
                     next_args,
                     policy.timeout_seconds,
+                    cancel_event=cancel_event,
                     heartbeat=lambda elapsed_ms, timeout_seconds: attempt_events.append(
                         self._record_event(
                             "tool.heartbeat",
@@ -1424,20 +1500,34 @@ class ToolRuntimeService:
             {"toolCallCount": len(calls), "maxConcurrency": max_workers, "toolNames": [call.name for call in calls]},
         )
         started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = {}
+        try:
             for call in calls:
                 handler = handlers.get(call.name)
                 if handler is None:
                     results.append(ToolCallExecutionResult(id=call.id, name=call.name, status="failed", error_type="UNKNOWN_TOOL", error_message="No handler registered"))
                     continue
-                futures[executor.submit(self.execute, call.name, call.args, handler, call.id, (cache_policies or {}).get(call.name))] = call
+                futures[submit_with_current_context(
+                    executor,
+                    self.execute,
+                    call.name,
+                    call.args,
+                    handler,
+                    call.id,
+                    (cache_policies or {}).get(call.name),
+                )] = call
             for future in as_completed(futures):
                 try:
                     results.append(future.result())
                 except Exception as exc:
                     call = futures[future]
                     results.append(ToolCallExecutionResult(id=call.id, name=call.name, status="failed", error_type=classify_tool_error(exc), error_message=str(exc)[:500]))
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
         self._record_event(
             "tool.parallel.batch_finished",
             ToolCallExecutionResult(id="tool_batch", name="execute_many", status="finished", service_name="tool"),
@@ -1492,38 +1582,48 @@ class ToolRuntimeService:
         handler: Callable[[Dict[str, Any]], Dict[str, Any]],
         args: Dict[str, Any],
         timeout_seconds: int,
+        cancel_event: Any = None,
         heartbeat: Optional[Callable[[int, int], None]] = None,
     ) -> Dict[str, Any]:
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(handler, args)
+        result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+        execution_cancel_event = cancel_event or threading.Event()
+        context = copy_context()
+
+        def invoke_handler() -> None:
+            try:
+                with tool_cancel_scope(execution_cancel_event):
+                    result_queue.put(("ok", handler(args)))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=context.run, args=(invoke_handler,), name="tool-runtime-call", daemon=True)
+        thread.start()
         timeout = max(1, int(timeout_seconds or 1))
         started = time.monotonic()
         heartbeat_interval = max(0.1, float(getattr(self.settings, "tool_heartbeat_interval_seconds", 5.0) or 5.0))
         next_heartbeat_at = started + heartbeat_interval
         try:
             while True:
+                if bool(getattr(execution_cancel_event, "is_set", lambda: False)()):
+                    raise RuntimeError("tool execution canceled")
                 remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0:
                     raise TimeoutError("tool execution timed out")
                 wait_for = min(remaining, max(0.05, next_heartbeat_at - time.monotonic()))
                 try:
-                    return future.result(timeout=wait_for)
-                except TimeoutError:
-                    if future.done():
-                        return future.result(timeout=0)
+                    status, value = result_queue.get(timeout=wait_for)
+                    if status == "error":
+                        raise value
+                    return value
+                except queue.Empty:
                     now = time.monotonic()
                     if heartbeat and now >= next_heartbeat_at:
                         heartbeat(int((now - started) * 1000), timeout)
                         next_heartbeat_at = now + heartbeat_interval
         except TimeoutError as exc:
-            future.cancel()
-            if future.done():
-                original = future.exception()
-                if isinstance(original, TimeoutError):
-                    raise original
+            if hasattr(execution_cancel_event, "set"):
+                execution_cancel_event.set()
             raise TimeoutError("tool execution timed out") from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def _tool_kind(self, tool_name: str) -> str:
         if tool_name in {"draft_llm_sql", "repair_sql", "emit_question_understanding", "draft_sql", "llm_chat", "llm_tool_chat"}:
@@ -1562,8 +1662,10 @@ class ToolCallExecutor:
             return []
         results: List[ToolCallExecutionResult] = []
         order = {call.id: index for index, call in enumerate(calls)}
-        with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(calls))) as executor:
-            futures = {}
+        executor = ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(calls)))
+        futures = {}
+        cancel_events: Dict[Any, threading.Event] = {}
+        try:
             for call in calls:
                 context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
                 idempotency_key = tool_idempotency_key(call.name, call.id, context)
@@ -1612,9 +1714,12 @@ class ToolCallExecutor:
                         )
                     )
                     continue
-                futures[executor.submit(self._run_one, call, handler)] = call
+                cancel_event = threading.Event()
+                future = submit_with_current_context(executor, self._run_one, call, handler, cancel_event)
+                futures[future] = call
+                cancel_events[future] = cancel_event
             if futures:
-                max_timeout = max(max(1, self.policy_registry.policy_for(call.name).timeout_seconds) for call in futures.values())
+                max_timeout = max(tool_policy_budget_seconds(self.policy_registry.policy_for(call.name)) for call in futures.values())
                 batches = (len(futures) + self.max_concurrency - 1) // self.max_concurrency
                 batch_timeout = max_timeout * max(1, batches)
                 completed = set()
@@ -1651,6 +1756,7 @@ class ToolCallExecutor:
                 for future, call in futures.items():
                     if future in completed:
                         continue
+                    cancel_events[future].set()
                     future.cancel()
                     self.failure_registry.record_failure(call.name, call.args, "TIMEOUT", "tool execution timed out")
                     recovery = recovery_action_for(call.name, "TIMEOUT", infer_tool_kind(call.name))
@@ -1675,9 +1781,20 @@ class ToolCallExecutor:
                             tool_message=structured_tool_message(call.name, "failed", "TIMEOUT", "tool execution timed out", recovery, tool_call_id=call.id, details=details),
                         )
                     )
+        finally:
+            for future, cancel_event in cancel_events.items():
+                if not future.done():
+                    cancel_event.set()
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
         return sorted(results, key=lambda item: order.get(item.id, 999))
 
-    def _run_one(self, call: ToolCallRequest, handler: Callable[[Dict[str, Any]], Dict[str, Any]]) -> ToolCallExecutionResult:
+    def _run_one(
+        self,
+        call: ToolCallRequest,
+        handler: Callable[[Dict[str, Any]], Dict[str, Any]],
+        batch_cancel_event: threading.Event,
+    ) -> ToolCallExecutionResult:
         started = time.monotonic()
         policy = self.policy_registry.policy_for(call.name)
         context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
@@ -1687,8 +1804,18 @@ class ToolCallExecutor:
         last_error_type = "ERROR"
         last_timeout_type = ""
         for attempt in range(attempts):
+            if batch_cancel_event.is_set():
+                last_error = "tool execution canceled after batch timeout"
+                last_error_type = "TIMEOUT"
+                last_timeout_type = "tool_timeout"
+                break
             try:
-                result = handler(call.args)
+                result = self._call_with_timeout(
+                    handler,
+                    call.args,
+                    policy.timeout_seconds,
+                    batch_cancel_event=batch_cancel_event,
+                )
                 self.failure_registry.record_success(call.name, call.args)
                 contract = validate_tool_result_contract(call.name, result or {}, canonical_tool_registry())
                 if not contract.get("valid", True) and tool_contract_enforced(contract):
@@ -1715,8 +1842,13 @@ class ToolCallExecutor:
                 if policy.retryable_errors and last_error_type not in policy.retryable_errors:
                     break
                 if policy.backoff_seconds > 0:
-                    time.sleep(policy.backoff_seconds * (attempt + 1))
-        self.failure_registry.record_failure(call.name, call.args, last_error_type, last_error)
+                    if batch_cancel_event.wait(policy.backoff_seconds * (attempt + 1)):
+                        last_error = "tool execution canceled after batch timeout"
+                        last_error_type = "TIMEOUT"
+                        last_timeout_type = "tool_timeout"
+                        break
+        if not batch_cancel_event.is_set():
+            self.failure_registry.record_failure(call.name, call.args, last_error_type, last_error)
         recovery = recovery_action_for(call.name, last_error_type, infer_tool_kind(call.name))
         details = tool_error_details(call.name, call.args, last_error_type, last_error[:500], timeout_type=last_timeout_type, context=context, call_id=call.id)
         return ToolCallExecutionResult(
@@ -1736,3 +1868,53 @@ class ToolCallExecutor:
             details=details,
             tool_message=structured_tool_message(call.name, "failed", last_error_type, last_error[:500], recovery, tool_call_id=call.id, details=details),
         )
+
+    def _call_with_timeout(
+        self,
+        handler: Callable[[Dict[str, Any]], Dict[str, Any]],
+        args: Dict[str, Any],
+        timeout_seconds: int,
+        batch_cancel_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
+        result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+        execution_cancel_event = threading.Event()
+        context = copy_context()
+
+        def invoke_handler() -> None:
+            try:
+                with tool_cancel_scope(execution_cancel_event):
+                    result_queue.put(("ok", handler(args)))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=context.run, args=(invoke_handler,), name="tool-call", daemon=True)
+        thread.start()
+        timeout = max(1, int(timeout_seconds or 1))
+        deadline = time.monotonic() + timeout
+        while True:
+            if batch_cancel_event is not None and batch_cancel_event.is_set():
+                execution_cancel_event.set()
+                raise TimeoutError("tool execution canceled after batch timeout")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                execution_cancel_event.set()
+                raise TimeoutError("tool execution timed out")
+            try:
+                status, value = result_queue.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if status == "error":
+                raise value
+            return value
+
+
+def tool_policy_budget_seconds(policy: ToolRuntimePolicy) -> int:
+    attempts = max(1, int(policy.max_retries or 0) + 1)
+    timeout = max(1, int(policy.timeout_seconds or 1))
+    backoff = max(0.0, float(policy.backoff_seconds or 0.0))
+    return max(1, int(attempts * timeout + backoff * sum(range(1, attempts)) + 1))
+
+
+def submit_with_current_context(executor: ThreadPoolExecutor, fn: Any, *args: Any):
+    context = copy_context()
+    return executor.submit(context.run, fn, *args)

@@ -2142,7 +2142,7 @@
     },
     {
       "metricKey": "deposit_amt",
-      "businessName": "保证金",
+      "businessName": "保证金余额",
       "formula": "SUM(deposit_amt)",
       "unit": "元",
       "description": "保证金",
@@ -2150,7 +2150,8 @@
         "deposit_amt"
       ],
       "aliases": [
-        "deposit_amt"
+        "deposit_amt",
+        "保证金余额"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=保证金; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
@@ -2166,21 +2167,6 @@
       ],
       "aliases": [
         "商家数"
-      ],
-      "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
-    },
-    {
-      "metricKey": "merchant_deposit_amt",
-      "businessName": "保证金余额",
-      "formula": "SUM(deposit_amt)",
-      "unit": "元",
-      "description": "商家当前保证金余额；单商家查询时代表该商家的保证金",
-      "sourceColumns": [
-        "deposit_amt"
-      ],
-      "aliases": [
-        "保证金余额"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成"

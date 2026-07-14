@@ -47,6 +47,25 @@
     "evidence": "由 Topic Builder 基于字段组合自动生成"
   },
   {
+    "metricKey": "appeal_success_rate",
+    "businessName": "申诉成功率",
+    "formula": "appeal_pass_cnt / NULLIF(appeal_cnt, 0)",
+    "unit": "%",
+    "description": "申诉通过次数占申诉次数的比例",
+    "sourceColumns": [
+      "appeal_pass_cnt",
+      "appeal_cnt"
+    ],
+    "aliases": [
+      "申诉成功率",
+      "申诉通过率",
+      "appeal_success_rate",
+      "appeal_pass_rate"
+    ],
+    "confidence": 0.9,
+    "evidence": "语义层派生指标：申诉通过次数 / 申诉次数"
+  },
+  {
     "metricKey": "punish_appeal_cnt",
     "businessName": "处罚类申诉次数",
     "formula": "SUM(CASE WHEN apply_type_code = 6 OR apply_type_name = '处罚' THEN 1 ELSE 0 END)",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -15,8 +16,18 @@ class WorkspaceArtifactStore:
 
     def __init__(self, settings: Settings, root: Path | str | None = None):
         self.settings = settings
-        self.root = Path(root) if root else settings.resolved_workspace_path / "artifacts"
+        self._default_root = Path(root) if root else settings.resolved_workspace_path / "artifacts"
+        self._context_root: ContextVar[Path | None] = ContextVar("workspace_artifact_root_%x" % id(self), default=None)
         self.root.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def root(self) -> Path:
+        return self._context_root.get() or self._default_root
+
+    def set_context_root(self, root: Path | str) -> None:
+        target = Path(root)
+        target.mkdir(parents=True, exist_ok=True)
+        self._context_root.set(target)
 
     def with_root(self, root: Path | str) -> "WorkspaceArtifactStore":
         return WorkspaceArtifactStore(self.settings, root)

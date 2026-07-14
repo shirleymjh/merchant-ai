@@ -835,12 +835,7 @@
       "aliases": [
         "优惠金额",
         "coupon_amt",
-        "优惠券",
-        "券金额",
-        "券金额投入",
-        "优惠券金额投入",
-        "优惠券投入",
-        "优惠投入"
+        "优惠券"
       ],
       "enumValues": [],
       "metricFormula": "SUM(coupon_amt)",
@@ -1415,33 +1410,45 @@
   ],
   "metrics": [
     {
-      "metricKey": "coupon_amt",
+      "metricKey": "coupon_total_amt",
       "canonicalMetricKey": "coupon_total_amt",
-      "aliasOf": "coupon_total_amt",
-      "metricLevel": "physical",
-      "businessName": "优惠金额",
+      "metricLevel": "business",
+      "businessName": "优惠券金额",
       "formula": "SUM(coupon_amt)",
       "unit": "元",
-      "description": "优惠金额",
+      "description": "优惠券金额投入，按优惠券明细表 coupon_amt 聚合；可用于回答券金额投入、优惠券投入、优惠投入等问题",
       "sourceColumns": [
-        "coupon_amt"
+        "coupon_amt",
+        "coupon_total_amt"
       ],
       "aliases": [
-        "优惠金额",
-        "coupon_amt",
-        "优惠券"
+        "优惠券金额",
+        "优惠券面额",
+        "券面额",
+        "券金额",
+        "券金额投入",
+        "优惠券金额投入",
+        "优惠券投入",
+        "优惠投入",
+        "券投入",
+        "券活动投入",
+        "优惠券活动投入",
+        "coupon_amt"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=优惠金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
     },
     {
-      "metricKey": "allowance_amt",
+      "metricKey": "allowance_total_amt",
+      "canonicalMetricKey": "allowance_total_amt",
+      "metricLevel": "business",
       "businessName": "津贴金额",
       "formula": "SUM(CAST(allowance_amt AS DECIMAL(18,2)))",
       "unit": "元",
       "description": "津贴金额",
       "sourceColumns": [
-        "allowance_amt"
+        "allowance_amt",
+        "allowance_total_amt"
       ],
       "aliases": [
         "津贴金额",
@@ -1460,9 +1467,7 @@
         "coupon_id"
       ],
       "aliases": [
-        "优惠券发放量",
-        "coupon_count",
-        "coupon_issue_count"
+        "优惠券发放量"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成"
@@ -1477,47 +1482,7 @@
         "is_receive"
       ],
       "aliases": [
-        "优惠券领取量",
-        "coupon_receive_count"
-      ],
-      "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
-    },
-    {
-      "metricKey": "coupon_total_amt",
-      "canonicalMetricKey": "coupon_total_amt",
-      "metricLevel": "business",
-      "businessName": "优惠券金额",
-      "formula": "SUM(coupon_amt)",
-      "unit": "元",
-      "description": "优惠券面额金额汇总",
-      "sourceColumns": [
-        "coupon_amt"
-      ],
-      "aliases": [
-        "优惠券金额",
-        "coupon_amount",
-        "coupon_investment_amount",
-        "券金额",
-        "券金额投入",
-        "优惠券金额投入",
-        "优惠券投入",
-        "优惠投入"
-      ],
-      "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
-    },
-    {
-      "metricKey": "allowance_total_amt",
-      "businessName": "津贴金额",
-      "formula": "SUM(CAST(allowance_amt AS DECIMAL(18,2)))",
-      "unit": "元",
-      "description": "津贴金额汇总；字段为字符串时需要先转数值",
-      "sourceColumns": [
-        "allowance_amt"
-      ],
-      "aliases": [
-        "津贴金额"
+        "优惠券领取量"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成"

@@ -159,7 +159,7 @@ class GoldenEvaluationService:
             "sql": self._score_sql(case, trace),
             "execution": self._score_execution(case, trace, query_executor, merchant_id),
             "evidence": self._score_evidence(case, trace),
-            "answer": self._score_answer(case, response.answer or ""),
+            "answer": self._score_answer(case, response.answer or "", trace),
         }
         return self._case_result(case, duration_ms, response.id, trace, layers, "")
 
@@ -378,7 +378,7 @@ class GoldenEvaluationService:
                 reasons.append("missing_disclosure:%s" % item)
         return self._layer(not reasons, reasons)
 
-    def _score_answer(self, case: Dict[str, Any], answer: str) -> Dict[str, Any]:
+    def _score_answer(self, case: Dict[str, Any], answer: str, trace: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         text = self._normalize(answer)
         reasons = []
         if not text:
@@ -389,7 +389,29 @@ class GoldenEvaluationService:
         for term in case.get("answerMustNotMention") or []:
             if self._normalize(term) in text:
                 reasons.append("answer_forbidden:%s" % term)
-        return self._layer(not reasons, reasons)
+        claim_verification = self._answer_claim_verification(trace or {})
+        if claim_verification and claim_verification.get("passed") is False:
+            reasons.append("answer_claim_verification_failed")
+        return self._layer(
+            not reasons,
+            reasons,
+            details={
+                "claimVerificationConfigured": bool(claim_verification),
+                "claimVerificationPassed": claim_verification.get("passed") if claim_verification else None,
+                "claimFallbackUsed": bool(claim_verification.get("fallbackUsed")) if claim_verification else False,
+                "rejectedClaimCount": len(claim_verification.get("rejectedClaims") or []) if claim_verification else 0,
+            },
+        )
+
+    def _answer_claim_verification(self, trace: Dict[str, Any]) -> Dict[str, Any]:
+        direct = trace.get("answerClaimVerification") or trace.get("answer_claim_verification") or {}
+        if isinstance(direct, dict) and direct:
+            return direct
+        guard = trace.get("answerGuard") or trace.get("answer_guard") or {}
+        if not isinstance(guard, dict):
+            return {}
+        verification = guard.get("claimVerification") or guard.get("claim_verification") or {}
+        return verification if isinstance(verification, dict) else {}
 
     def _case_result(
         self,
@@ -443,6 +465,11 @@ class GoldenEvaluationService:
             ),
             "evidenceCoverageRate": layer_scores["evidence"],
             "answerAccuracy": layer_scores["answer"],
+            "answerClaimFallbackCount": sum(
+                1
+                for item in results
+                if bool((((item.get("layers") or {}).get("answer") or {}).get("details") or {}).get("claimFallbackUsed"))
+            ),
             "firstFailureBreakdown": first_failure_breakdown,
         }
 

@@ -5,7 +5,8 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from threading import RLock
+from typing import Any, Callable, Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.models import AgentRunResult, QueryPlan, SkillDraft, SkillDraftReviewRequest, category_display
@@ -39,28 +40,52 @@ class SkillDraftService:
         self.root = settings.resolved_workspace_path / "ops" / "skill_drafts"
         self.index_path = self.root / "skill_drafts.json"
         self.registry_path = settings.resolved_workspace_path / "ops" / "skill_market" / "skill_registry.json"
+        self._draft_lock = RLock()
 
-    def maybe_create_from_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    def maybe_create_from_state(
+        self,
+        state: Dict[str, Any],
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
         if not self._eligible(state):
             return {}
         draft = self._build_draft(state)
-        existing = self.list_drafts()
-        if any(item.get("sourceRunId") == draft.source_run_id for item in existing):
-            return {}
-        payload = draft.model_dump(by_alias=True)
-        _write_json(self.root / ("%s.json" % draft.draft_id), payload)
-        existing.append(payload)
-        _write_json(self.index_path, {"items": existing})
-        return payload
+        with self._draft_lock:
+            if cancel_check and cancel_check():
+                return {}
+            existing = self.list_drafts()
+            if any(item.get("sourceRunId") == draft.source_run_id for item in existing):
+                return {}
+            payload = draft.model_dump(by_alias=True)
+            draft_path = self.root / ("%s.json" % draft.draft_id)
+            _write_json(draft_path, payload)
+            if cancel_check and cancel_check():
+                try:
+                    draft_path.unlink()
+                except OSError:
+                    pass
+                return {}
+            existing.append(payload)
+            _write_json(self.index_path, {"items": existing})
+            if cancel_check and cancel_check():
+                try:
+                    draft_path.unlink()
+                except OSError:
+                    pass
+                existing = [item for item in existing if item.get("draftId") != draft.draft_id]
+                _write_json(self.index_path, {"items": existing})
+                return {}
+            return payload
 
     def list_drafts(self, status: str = "") -> List[Dict[str, Any]]:
-        payload = _read_json(self.index_path, {"items": []})
-        items = payload.get("items") if isinstance(payload, dict) else payload
-        if not isinstance(items, list):
-            items = []
-        if status:
-            return [item for item in items if str(item.get("status") or "") == status]
-        return items
+        with self._draft_lock:
+            payload = _read_json(self.index_path, {"items": []})
+            items = payload.get("items") if isinstance(payload, dict) else payload
+            if not isinstance(items, list):
+                items = []
+            if status:
+                return [item for item in items if str(item.get("status") or "") == status]
+            return items
 
     def review_draft(self, draft_id: str, request: SkillDraftReviewRequest) -> Dict[str, Any]:
         items = self.list_drafts()

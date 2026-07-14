@@ -6,6 +6,7 @@ from merchant_ai.config import Settings
 from merchant_ai.graph.state import AgentState
 from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute
 from merchant_ai.services.answer import answer_skill_required
+from merchant_ai.services.capabilities import CapabilityRegistry, features_from_fast_understanding
 
 
 MAX_MAIN_AGENT_ACTIONS = 16
@@ -149,7 +150,7 @@ class AgentActionRegistry:
                 agent="SkillWorker",
                 description="dynamically dispatch an isolated analysis skill worker before final answer",
                 required_state_keys=["agent_run_result.task_results"],
-                required_state_flags=["sql_generated", "evidence_graph_verified"],
+                required_state_flags=["sql_generated", "evidence_accepted"],
                 expected_state_keys=["analysis_summary"],
                 fallback_action="verify_evidence",
             ),
@@ -166,6 +167,7 @@ class AgentActionRegistry:
                 node="explore_hypotheses",
                 agent="LeadAgent",
                 description="generate, validate and execute independent QueryGraphs for competing merchant hypotheses, then prune or expand them",
+                required_state_flags=["evidence_accepted"],
                 expected_state_flags=["hypothesis_exploration_completed"],
                 fallback_action="answer_data",
             ),
@@ -186,6 +188,7 @@ class AgentActionRegistry:
             AgentAction(id="answer", node="answer_analysis", agent="AnswerAgent", description="legacy alias for answer_data"),
             AgentAction(id="ask_human", node="human_in_loop", agent="LeadAgent", description="request clarification"),
             AgentAction(id="cache_answer", node="cache_answer", agent="LeadAgent", description="cache final answer"),
+            AgentAction(id="terminal_end", node="terminal_end", agent="Runtime", description="end a terminal run without more tools"),
         ]
         self._by_id: Dict[str, AgentAction] = {action.id: action for action in actions}
         self._by_node: Dict[str, AgentAction] = {action.node: action for action in actions}
@@ -209,6 +212,7 @@ class V2AgentPolicy:
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings
         self.registry = AgentActionRegistry()
+        self.capabilities = CapabilityRegistry.from_settings(settings)
 
     @property
     def max_main_actions(self) -> int:
@@ -247,10 +251,17 @@ class V2AgentPolicy:
 
     def _candidate_action_ids(self, state: AgentState) -> tuple[List[str], str, bool]:
         if state.get("run_canceled"):
-            return ["cache_answer"], "run was canceled by user; stop the ReAct loop", True
+            return ["terminal_end"], "run was canceled by user; end without persistence or post-processing", True
+        terminal = state.get("terminal_status") or {}
+        if terminal.get("active"):
+            return ["terminal_end"], "terminal runtime guard stops all further orchestration", True
         if state.get("run_budget_exhausted"):
+            if self.has_task_results(state) and not state.get("evidence_graph_verified"):
+                return ["verify_evidence"], "run budget exhausted after SQL execution; evidence verification is still mandatory", True
             return ["answer_data"], "run budget exhausted; answer with collected results", True
         if state.get("middleware_loop_blocked"):
+            if self.has_task_results(state) and not self.evidence_verification_attempted(state):
+                return ["verify_evidence"], "loop guard stopped orchestration after SQL execution; evidence verification is still mandatory", True
             return ["answer_data"], "middleware loop guard blocked repeated action pattern", True
         route = state.get("routing_decision")
         if route and route.route == QuestionRoute.GREETING:
@@ -296,7 +307,7 @@ class V2AgentPolicy:
                 return ["cache_answer"], "Lead Agent accepted a verified single semantic metric result", False
             if self.general_delegation_needed(state):
                 return ["delegate_subagent", "retrieve_knowledge"], "request contains bounded document or Python work suitable for an isolated Sub-Agent", False
-            if not state.get("fast_metric_attempted"):
+            if not state.get("fast_metric_attempted") and self.fast_metric_candidate(state):
                 return ["try_fast_metric", "retrieve_knowledge"], "Lead Agent may try the governed single-metric fast capability or continue to semantic planning", False
             return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge has not been retrieved"), False
         if self.has_rule_recall_ready(state):
@@ -313,7 +324,12 @@ class V2AgentPolicy:
                 return ["retrieve_knowledge", "compact_assets", "plan_graph", "repair_graph", "answer_data"], self.pending_knowledge_reason(state), False
             if not state.get("query_graph_validated"):
                 return ["validate_graph"], "knowledge request budget exhausted; validate current graph as structured gap", True
-        if (not plan or not plan.intents) and state.get("planner_provider_error") and self.hypothesis_recovery_needed(state):
+        if (
+            (not plan or not plan.intents)
+            and state.get("planner_provider_error")
+            and not self.planner_degraded_fail_fast(state)
+            and self.hypothesis_recovery_needed(state)
+        ):
             return ["explore_hypotheses", "validate_graph", "answer_data"], "Planner provider failed; independently seed and execute bounded hypothesis QueryGraphs from semantic assets", False
         if (not plan or not plan.intents) and state.get("planner_provider_error"):
             if not state.get("query_graph_validated"):
@@ -322,9 +338,11 @@ class V2AgentPolicy:
         if (not plan or not plan.intents) and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
             return ["plan_graph", "retrieve_knowledge"], "QueryGraph has not been planned", False
         if plan and plan.intents and not state.get("query_graph_reflected"):
-            if self.fast_path_verified_graph(state):
-                return ["validate_graph"], "fast path single-node QueryGraph skips planner reflection but still validates graph", False
-            return ["reflect_plan", "validate_graph"], "QueryGraph needs planner reflection before validation", False
+            if self.fast_path_bypasses_reflection(state):
+                if not state.get("query_graph_validated"):
+                    return ["validate_graph"], "fast candidate skips Planner Reflection but must pass deterministic validation", False
+            else:
+                return ["reflect_plan", "validate_graph"], "QueryGraph needs planner reflection before validation", False
         reflection = normalize_reflection(state.get("planner_reflection"))
         if reflection and not reflection.passed:
             repair_actions = self.repair_request_actions(reflection)
@@ -381,7 +399,7 @@ class V2AgentPolicy:
             return ["answer_data"], "graph-repairable execution gaps remain but repair budget is exhausted", True
         if not state.get("sql_repair_reviewed") and self.has_sql_failure(state):
             return ["repair_sql", "verify_evidence"], "one or more node SQL executions failed", False
-        if self.has_task_results(state) and not state.get("evidence_graph_verified"):
+        if self.has_task_results(state) and not self.evidence_verification_attempted(state):
             return ["verify_evidence"], "evidence has not been verified", False
         if self.has_graph_repairable_execution_gap(state):
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
@@ -414,7 +432,12 @@ class V2AgentPolicy:
         early_understanding = not state.get("data_discovered") and not has_plan and not has_tasks
         if early_understanding and not state.get("fast_understood"):
             return ["fast_understand"]
-        if early_understanding and state.get("fast_understood") and not state.get("fast_metric_attempted"):
+        if (
+            early_understanding
+            and state.get("fast_understood")
+            and not state.get("fast_metric_attempted")
+            and self.fast_metric_candidate(state)
+        ):
             if self.general_delegation_needed(state):
                 return ["delegate_subagent", "retrieve_knowledge"]
             return ["try_fast_metric", "retrieve_knowledge"]
@@ -430,7 +453,7 @@ class V2AgentPolicy:
             return ["compact_assets"]
         if not has_plan:
             if state.get("planner_provider_error"):
-                if self.hypothesis_recovery_needed(state):
+                if not self.planner_degraded_fail_fast(state) and self.hypothesis_recovery_needed(state):
                     return ["explore_hypotheses", "validate_graph", "answer_data"]
                 return ["validate_graph"]
             if int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
@@ -446,8 +469,12 @@ class V2AgentPolicy:
                 return ["plan_graph", "repair_graph", "answer_data"]
             if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "retrieve_knowledge", "answer_data"]
-        if has_plan and not state.get("query_graph_reflected") and not self.fast_path_verified_graph(state):
-            return ["reflect_plan", "validate_graph"]
+        if has_plan and not state.get("query_graph_reflected"):
+            if self.fast_path_bypasses_reflection(state):
+                if not state.get("query_graph_validated"):
+                    return ["validate_graph"]
+            else:
+                return ["reflect_plan", "validate_graph"]
         if has_plan and not state.get("query_graph_validated"):
             if reflection and not reflection.passed and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "validate_graph", "answer_data"]
@@ -468,19 +495,19 @@ class V2AgentPolicy:
             return ["answer_data"]
         if state.get("sql_generated") and self.has_sql_failure(state) and not state.get("sql_repair_reviewed"):
             return ["repair_sql", "verify_evidence"]
-        if has_tasks and not state.get("evidence_graph_verified"):
+        if has_tasks and not self.evidence_verification_attempted(state):
             return ["verify_evidence"]
         if self.has_graph_repairable_execution_gap(state):
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"]
             return ["answer_data"]
-        if state.get("evidence_graph_verified") and self.hypothesis_exploration_needed(state):
+        if self.evidence_verification_passed(state) and self.hypothesis_exploration_needed(state):
             actions = ["explore_hypotheses", "run_analysis_skill", "answer_data"]
             return actions if state.get("subagent_delegation_attempted") else [actions[0], "delegate_subagent"] + actions[1:]
-        if state.get("evidence_graph_verified") and self.analysis_skill_needed(state):
+        if self.evidence_verification_passed(state) and self.analysis_skill_needed(state):
             actions = ["run_analysis_skill", "answer_data"]
             return actions if state.get("subagent_delegation_attempted") else [actions[0], "delegate_subagent"] + actions[1:]
-        if state.get("evidence_graph_verified") or state.get("planner_provider_error") or (has_plan and validation and not validation.valid):
+        if self.evidence_verification_attempted(state) or state.get("planner_provider_error") or (has_plan and validation and not validation.valid):
             return ["answer_data"]
         if state.get("chat_bi_completed"):
             return ["cache_answer"]
@@ -497,6 +524,33 @@ class V2AgentPolicy:
             token in question for token in ("python", "批量分析", "批处理", "模拟计算", "运行脚本")
         )
         return document_signal or python_signal
+
+    def fast_metric_candidate(self, state: AgentState) -> bool:
+        return self.fast_metric_decision(state.get("fast_understanding")).eligible
+
+    def fast_metric_decision(self, fast: object):
+        features = features_from_fast_understanding(fast)
+        analysis_intent = str(getattr(fast, "analysis_intent", "") or "").strip().lower()
+        object_refs = getattr(fast, "object_refs", {}) or {}
+        if (
+            analysis_intent == "trend"
+            and features.metric_count == 1
+            and features.domain_count == 1
+            and not object_refs
+        ):
+            # Fast understanding treats any trend signal as complex analysis,
+            # while the metric executor supports a bounded single-metric daily
+            # series. Project that typed shape onto the low-risk capability.
+            features = features.model_copy(
+                update={
+                    "intent_kind": "metric_query",
+                    "complexity": "simple",
+                    "analysis_intent": "metric",
+                    "requires_explanation": False,
+                    "needs_planner": False,
+                }
+            )
+        return self.capabilities.evaluate("metric_fast_entry", features)
 
     def has_unresolved_planning_work(self, state: AgentState) -> bool:
         plan = state.get("plan")
@@ -652,6 +706,8 @@ class V2AgentPolicy:
         return any(result.query_bundle.failed for result in run_result.task_results)
 
     def analysis_skill_needed(self, state: AgentState) -> bool:
+        if self.planner_degraded_fail_fast(state):
+            return False
         if state.get("analysis_skill_bypassed"):
             return False
         if self.fast_path_verified_graph(state):
@@ -662,14 +718,20 @@ class V2AgentPolicy:
         run_result = state.get("agent_run_result")
         if not plan or not run_result or not getattr(run_result, "task_results", None):
             return False
-        if not state.get("evidence_graph_verified"):
+        if not self.evidence_verification_passed(state):
             return False
         return bool(answer_skill_required(plan, run_result, bool(state.get("rule_recall_context", ""))))
 
     def hypothesis_exploration_needed(self, state: AgentState) -> bool:
+        if self.planner_degraded_fail_fast(state):
+            return False
+        if self.fast_path_verified_graph(state):
+            return False
         if not bool(getattr(self.settings, "hypothesis_query_exploration_enabled", False)):
             return False
-        if state.get("hypothesis_exploration_completed") or not state.get("evidence_graph_verified"):
+        if state.get("hypothesis_exploration_completed") or not self.evidence_verification_passed(state):
+            return False
+        if not self.evidence_verification_passed(state):
             return False
         hypotheses = list((state.get("hypothesis_exploration") or {}).get("hypotheses") or [])
         if len(hypotheses) < 2:
@@ -692,6 +754,10 @@ class V2AgentPolicy:
         return bool(plan and getattr(plan, "intents", None))
 
     def hypothesis_recovery_needed(self, state: AgentState) -> bool:
+        if self.planner_degraded_fail_fast(state):
+            return False
+        if not self.evidence_verification_passed(state):
+            return False
         if not bool(getattr(self.settings, "hypothesis_query_exploration_enabled", False)):
             return False
         if state.get("hypothesis_exploration_completed") or not state.get("planning_assets_compacted"):
@@ -700,9 +766,35 @@ class V2AgentPolicy:
         pack = state.get("planning_asset_pack")
         return len(hypotheses) >= 2 and bool(pack and getattr(pack, "metrics", None))
 
+    def planner_degraded_fail_fast(self, state: AgentState) -> bool:
+        degraded = state.get("planner_degraded") or {}
+        return bool(degraded.get("active") and degraded.get("stopExpensivePostProcessing", True))
+
+    def evidence_verification_passed(self, state: AgentState) -> bool:
+        run_result = state.get("agent_run_result")
+        verified = getattr(run_result, "verified_evidence", None) if run_result else None
+        accepted = state.get("evidence_accepted")
+        if accepted is None:
+            accepted = state.get("evidence_graph_verified")
+        return bool(accepted and verified and getattr(verified, "passed", False))
+
+    def evidence_verification_attempted(self, state: AgentState) -> bool:
+        status = str(state.get("verification_status") or "")
+        return status in {"passed", "failed"} or bool(state.get("evidence_graph_verified"))
+
     def fast_path_verified_graph(self, state: AgentState) -> bool:
         latency = state.get("latency_optimization") or {}
-        return bool(latency.get("eligible")) and str(latency.get("mode") or "") == "fast_path_verified_graph"
+        return bool(latency.get("eligible")) and (
+            str(latency.get("state") or "") == "fast_verified"
+            or str(latency.get("mode") or "") == "fast_path_verified_graph"
+        )
+
+    def fast_path_bypasses_reflection(self, state: AgentState) -> bool:
+        latency = state.get("latency_optimization") or {}
+        return bool(latency.get("eligible")) and (
+            str(latency.get("state") or "") in {"fast_candidate", "fast_verified"}
+            or str(latency.get("mode") or "") in {"fast_path", "fast_path_candidate_graph", "fast_path_verified_graph"}
+        )
 
     def has_graph_repairable_execution_gap(self, state: AgentState) -> bool:
         run_result = state.get("agent_run_result")

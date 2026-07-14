@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings
-from merchant_ai.graph.state import AgentState, merge_agent_state_update
+from merchant_ai.graph.state import AgentState, mark_terminal_status, merge_agent_state_update
 from merchant_ai.models import (
     AgentDecision,
     ArtifactRef,
@@ -30,7 +30,13 @@ from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.context_assembly import ContextAssembler
 from merchant_ai.services.context import ContextManager
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
-from merchant_ai.services.memory import create_memory_store, truncate_memory_text_by_tokens
+from merchant_ai.services.memory import (
+    MemoryQueryUnderstandingService,
+    create_memory_store,
+    memory_query_hash,
+    retrieval_context_from_state,
+    truncate_memory_text_by_tokens,
+)
 from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.observability import artifact_ref_from_path
 
@@ -100,7 +106,8 @@ class MiddlewareChain:
                 metadata={"failurePolicy": policy},
             )
             if policy == "closed":
-                state["middleware_blocked"] = True
+                mark_terminal_status(state, "blocked", "MIDDLEWARE_FAIL_CLOSED", middleware.name, str(exc))
+                state["middleware_loop_blocked"] = True
                 state["chat_bi_completed"] = True
                 state.setdefault("safety_finish_reasons", []).append(
                     {
@@ -415,16 +422,36 @@ class SummarizeMiddleware(HarnessMiddleware):
             "runtime_checkpoint_%s.json" % stage,
             build_runtime_checkpoint_payload(state, stage),
         )
+        full_context_artifact = write_middleware_json_artifact(
+            state,
+            self.settings,
+            "context",
+            "pre_compaction_context_%s.json" % stage,
+            {
+                key: state.get(key)
+                for key in [
+                    "session_context",
+                    "memory_context",
+                    "runtime_context",
+                    "base_knowledge_context",
+                    "topic_asset_context",
+                    "recall_context",
+                    "tool_context",
+                    "summary_context",
+                ]
+            },
+        )
         if checkpoint and (checkpoint.path or checkpoint.relative_path or checkpoint.merchant_uri):
             state.setdefault("runtime_checkpoints", []).append(checkpoint.model_dump(by_alias=True))
             state["runtime_checkpoints"] = state["runtime_checkpoints"][-8:]
         summary = build_compression_summary(state, target_tokens * 4)
         artifact = write_middleware_text_artifact(state, self.settings, "context", "summary_%s.md" % stage, summary)
         state["summary_context"] = summary
+        compact_runtime_context_fields(state, target_tokens * 4)
         event = ContextCompressionEvent(
             stage=stage,
             before_tokens=before_tokens,
-            after_tokens=estimate_text_tokens(summary),
+            after_tokens=estimate_context_tokens(state),
             target_ratio=float(self.settings.context_compaction_target_ratio or 0.4),
             summary_artifact=artifact,
             protected_keys=protected_fact_keys(state),
@@ -441,7 +468,11 @@ class SummarizeMiddleware(HarnessMiddleware):
             status="compressed",
             code="CONTEXT_SUMMARIZED",
             message="context compressed to summary artifact after runtime checkpoint flush",
-            artifact_refs=[ref for ref in [checkpoint, artifact] if ref and (ref.path or ref.relative_path or ref.merchant_uri)],
+            artifact_refs=[
+                ref
+                for ref in [checkpoint, full_context_artifact, artifact]
+                if ref and (ref.path or ref.relative_path or ref.merchant_uri)
+            ],
             input_chars=before_tokens * 4,
             output_chars=len(summary),
         )
@@ -845,16 +876,23 @@ class MemoryMiddleware(HarnessMiddleware):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.memory_store = create_memory_store(settings)
+        self.query_understanding = MemoryQueryUnderstandingService(settings)
 
     def before_policy(self, state: AgentState) -> AgentState:
-        if state.get("_memory_middleware_snapshot_ready"):
-            return state
-        # Memory is immutable during the request and is written only after the
-        # answer is finalized. Re-reading ES/JSON before every ReAct decision
-        # adds network tail latency and can even change constraints mid-run.
-        # Reuse the governed snapshot loaded by the dedicated recall stage.
-        if state.get("memory_injection_trace"):
+        fingerprint = self._context_fingerprint(state)
+        trace = dict(state.get("memory_injection_trace") or {})
+        snapshot_succeeded = bool(trace) and not trace.get("error") and str(trace.get("status") or "success") == "success"
+        semantic_refresh = bool(
+            state.get("topic_routed")
+            and not state.get("_memory_snapshot_locked")
+            and trace.get("contextFingerprint") != fingerprint
+            and not state.get("_memory_semantic_refresh_attempted")
+        )
+        if snapshot_succeeded and not semantic_refresh:
+            self._render_existing_snapshot(state)
             state["_memory_middleware_snapshot_ready"] = True
+            if state.get("topic_routed"):
+                state["_memory_snapshot_locked"] = True
             append_middleware_event(
                 state,
                 self.name,
@@ -862,15 +900,45 @@ class MemoryMiddleware(HarnessMiddleware):
                 status="reused",
                 code="MEMORY_REQUEST_SNAPSHOT_REUSED",
                 message="request-scoped governed memory snapshot reused",
-                metadata={"constraintCount": len(state.get("memory_constraints") or [])},
+                metadata={
+                    "constraintCount": len(state.get("memory_constraints") or []),
+                    "contextFingerprint": fingerprint,
+                    "locked": bool(state.get("_memory_snapshot_locked")),
+                },
             )
             return state
-        injection = self.memory_store.select_for_question(
-            state,
-            budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
-        )
+        if trace.get("error") and state.get("_memory_middleware_retry_attempted") and not semantic_refresh:
+            return state
+        if semantic_refresh:
+            state["_memory_semantic_refresh_attempted"] = True
+        else:
+            state["_memory_middleware_retry_attempted"] = True
+        try:
+            injection = self.memory_store.select_for_question(
+                state,
+                budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
+            )
+        except Exception as exc:
+            state["memory_injection_trace"] = {
+                "status": "failed",
+                "error": str(exc)[:500],
+                "contextFingerprint": fingerprint,
+            }
+            state["_memory_middleware_snapshot_ready"] = False
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="error",
+                code="MEMORY_RECALL_RETRY_FAILED",
+                message=str(exc)[:500],
+                metadata={"contextFingerprint": fingerprint},
+            )
+            return state
         state["memory_injection"] = injection
-        state["memory_injection_trace"] = injection.get("memoryInjectionTrace", {})
+        next_trace = dict(injection.get("memoryInjectionTrace") or {})
+        next_trace.update({"status": "success", "contextFingerprint": fingerprint})
+        state["memory_injection_trace"] = next_trace
         constraints = build_memory_constraints(injection)
         state["memory_constraints"] = constraints
         state["memory_constraint_trace"] = {
@@ -908,7 +976,27 @@ class MemoryMiddleware(HarnessMiddleware):
             },
         )
         state["_memory_middleware_snapshot_ready"] = True
+        if state.get("topic_routed"):
+            state["_memory_snapshot_locked"] = True
         return state
+
+    def _context_fingerprint(self, state: AgentState) -> str:
+        self.query_understanding.ensure_state_profile(state)
+        merchant_id = str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or "")
+        return memory_query_hash(merchant_id, retrieval_context_from_state(state))
+
+    def _render_existing_snapshot(self, state: AgentState) -> None:
+        if state.get("memory_context"):
+            return
+        renderer = getattr(self.memory_store, "render_injection", None)
+        if not callable(renderer):
+            return
+        rendered = renderer(state.get("memory_injection") or {})
+        if rendered:
+            state["memory_context"] = truncate_memory_text_by_tokens(
+                rendered,
+                int(self.settings.context_memory_budget_tokens or 1200),
+            )
 
 
 class SkillMiddleware(HarnessMiddleware):
@@ -1496,6 +1584,32 @@ def build_compression_summary(state: AgentState, max_chars: int) -> str:
         for gap in gaps[:12]:
             lines.append("- %s %s" % (getattr(gap, "code", ""), str(getattr(gap, "message", ""))[:240]))
     return "\n".join(lines)[: max(1000, max_chars)]
+
+
+def compact_runtime_context_fields(state: AgentState, target_chars: int) -> None:
+    total_budget = max(1800, int(target_chars or 0))
+    summary_budget = max(800, total_budget // 2)
+    state["summary_context"] = str(state.get("summary_context") or "")[:summary_budget]
+    remaining = max(1000, total_budget - len(state["summary_context"]))
+    fields = [
+        "session_context",
+        "memory_context",
+        "base_knowledge_context",
+        "topic_asset_context",
+        "recall_context",
+        "tool_context",
+    ]
+    per_field = max(160, remaining // len(fields))
+    for key in fields:
+        value = str(state.get(key) or "")
+        if len(value) <= per_field:
+            continue
+        head = max(80, per_field // 2)
+        tail = max(80, per_field - head - 20)
+        state[key] = "%s\n...[compacted]...\n%s" % (value[:head], value[-tail:])
+    state["runtime_context"] = ""
+    state["context_snapshots"] = list(state.get("context_snapshots") or [])[-2:]
+    state["context_assembly_reports"] = list(state.get("context_assembly_reports") or [])[-2:]
 
 
 def build_runtime_checkpoint_payload(state: AgentState, stage: str) -> Dict[str, Any]:

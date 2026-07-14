@@ -4,24 +4,28 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from merchant_ai.graph.message_history import append_context_section
-from merchant_ai.models import ChatContext, RouteSlots, RouteTimeWindow
+from merchant_ai.models import ChatContext, QuestionCategory, RouteSlots, RouteTimeWindow
 
 
 class ClarificationResolutionService:
     """Resolve merchant clarification answers into structured runtime slots."""
 
     def resolve_context(self, context: ChatContext, answer_text: str) -> Dict[str, Any]:
-        answer = str(answer_text or "").strip()
+        raw_answer = str(answer_text or "").strip()
         pending_type = str(context.pending_clarification_type or "")
-        if not answer or not pending_type:
+        if not raw_answer or not pending_type:
             return {}
+        answer, selected_index = self.resolve_option(context.pending_clarification_options, raw_answer)
         resolution: Dict[str, Any] = {
             "resolved": True,
             "stage": context.pending_clarification_stage,
             "type": pending_type,
-            "rawAnswer": answer,
+            "rawAnswer": raw_answer,
+            "normalizedAnswer": answer,
             "pendingQuestion": context.pending_question,
         }
+        if selected_index >= 0:
+            resolution.update({"selectedOption": answer, "selectedOptionIndex": selected_index})
         if pending_type == "time_window":
             days, label = self.parse_time_window(answer)
             if days:
@@ -33,7 +37,14 @@ class ClarificationResolutionService:
         elif pending_type == "priority_goal":
             resolution.update({"priorityGoal": answer[:80], "clarificationResolved": True})
         elif pending_type == "topic_required":
-            resolution.update({"topicFocus": answer[:80], "clarificationResolved": True})
+            topics = self.parse_topic_focus(answer)
+            resolution.update(
+                {
+                    "topicFocus": answer[:80],
+                    "topics": [topic.value for topic in topics],
+                    "clarificationResolved": True,
+                }
+            )
         elif pending_type == "business_scope":
             days, label = self.parse_time_window(answer)
             if days:
@@ -67,6 +78,18 @@ class ClarificationResolutionService:
                 "clarified_priority_goal:%s" % context.priority_goal,
                 max_chars=800,
             )
+        if resolution.get("topicFocus"):
+            context.topic = str(resolution.get("topicFocus") or "")
+            topics = []
+            for value in resolution.get("topics") or []:
+                try:
+                    topic = QuestionCategory(str(value))
+                except Exception:
+                    continue
+                if topic not in topics:
+                    topics.append(topic)
+            if topics:
+                context.topics = topics
 
     def apply_to_route_slots(self, route_slots: RouteSlots, resolution: Dict[str, Any]) -> Tuple[RouteSlots, List[Dict[str, Any]]]:
         trace: List[Dict[str, Any]] = []
@@ -127,3 +150,32 @@ class ClarificationResolutionService:
             if re.search(pattern, text):
                 return value
         return ""
+
+    def resolve_option(self, options: List[str], answer: str) -> tuple[str, int]:
+        text = str(answer or "").strip()
+        match = re.fullmatch(r"(?:选|第)?\s*(\d{1,2})\s*(?:个|项)?", text)
+        if not match:
+            return text, -1
+        index = int(match.group(1)) - 1
+        normalized_options = [str(item or "").strip() for item in options or []]
+        if index < 0 or index >= len(normalized_options) or not normalized_options[index]:
+            return text, -1
+        return normalized_options[index], index
+
+    def parse_topic_focus(self, answer: str) -> List[QuestionCategory]:
+        text = str(answer or "").lower()
+        patterns = [
+            (r"平台|规则|处罚|申诉", QuestionCategory.PLATFORM_RULE),
+            (r"交易|gmv|销售额|订单", QuestionCategory.TRADE),
+            (r"退款|退货|售后", QuestionCategory.REFUND),
+            (r"客服|工单|客诉", QuestionCategory.CS_TICKET),
+            (r"赔付|理赔|补偿", QuestionCategory.COMPENSATION),
+            (r"优惠券|优惠", QuestionCategory.COUPON),
+            (r"商品|动销|新品|审核", QuestionCategory.GOODS),
+            (r"履约|发货|供应链", QuestionCategory.SCM),
+        ]
+        topics: List[QuestionCategory] = []
+        for pattern, topic in patterns:
+            if re.search(pattern, text) and topic not in topics:
+                topics.append(topic)
+        return topics

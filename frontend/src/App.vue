@@ -143,7 +143,7 @@ import DailyReportCard from './components/DailyReportCard.vue'
 import MetricInsightPanel from './components/MetricInsightPanel.vue'
 import GovernanceConsole from './components/GovernanceConsole.vue'
 import SuggestionList from './components/SuggestionList.vue'
-import { actOnKnowledgeSuggestion, cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, mockChat, mockDailyReport, recordMetricDefinitionPreference, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
+import { actOnKnowledgeSuggestion, cancelRun, getDailyReport, getMerchantProfile, getRun, getRunEvents, recordMetricDefinitionPreference, resumeChatRun, sendFeedback, streamChatRun, uploadAttachment } from './api/client'
 
 const input = ref('')
 const defaultRunStatusText = '正在分析问题并读取经营数据'
@@ -223,7 +223,7 @@ const runStatusText = computed(() => activeSession.value?.runStatusText || defau
 onMounted(async () => {
   resumeSessionRuns()
   const [reportResult, profileResult] = await Promise.allSettled([getDailyReport(), getMerchantProfile()])
-  dailyReport.value = reportResult.status === 'fulfilled' ? reportResult.value : mockDailyReport()
+  dailyReport.value = reportResult.status === 'fulfilled' ? reportResult.value : null
   merchantProfile.value = profileResult.status === 'fulfilled' ? profileResult.value.profile || null : null
 })
 
@@ -276,24 +276,27 @@ async function askWithOptions(message, options = {}) {
   try {
     const requestContext = cloneValue(options.context || session.conversationContext)
     const requestHistory = buildMessageHistory(messages.value)
+    const requestThreadId = options.resumeThreadId || session.serverThreadId || ''
     const requestOptions = {
       signal: controller.signal,
       messageHistory: requestHistory,
-      threadId: options.resumeThreadId || '',
+      threadId: requestThreadId,
       attachments: options.attachments || [],
       userIdentity: cloneValue(userIdentity.value)
     }
     if (!options.resumeThreadId) {
       const completed = await streamChatRun(message, requestContext, requestOptions, event => handleStreamEvent(sessionId, event))
       if (!completed?.response) throw new Error('STREAM_COMPLETED_WITHOUT_RESPONSE')
+      const completedThreadId = completed.threadId || requestThreadId || findSession(sessionId)?.serverThreadId || ''
       updateSessionRuntime(sessionId, {
         activeRun: null,
+        ...(completedThreadId ? { serverThreadId: completedThreadId } : {}),
         submitting: false,
         submitController: null,
         stopping: false,
         runStatusText: defaultRunStatusText
       })
-      appendAssistantToSession(sessionId, completed.response)
+      appendAssistantToSession(sessionId, completed.response, completed.runId)
       return
     }
     const created = await resumeChatRun(message, requestContext, requestOptions)
@@ -309,6 +312,7 @@ async function askWithOptions(message, options = {}) {
     }
     updateSessionRuntime(sessionId, {
       activeRun: run,
+      serverThreadId: threadId,
       submitting: false,
       submitController: null,
       runStatusText: '任务已提交，正在排队'
@@ -317,6 +321,7 @@ async function askWithOptions(message, options = {}) {
   } catch (error) {
     const aborted = error?.name === 'AbortError'
     const currentSession = findSession(sessionId)
+    const streamingRunId = currentSession?.activeRun?.runId || ''
     updateSessionRuntime(sessionId, {
       activeRun: null,
       submitting: false,
@@ -325,23 +330,28 @@ async function askWithOptions(message, options = {}) {
       runStatusText: defaultRunStatusText
     })
     if (aborted) {
-      if (currentSession?.stopRequested) {
-        appendAssistantToSession(sessionId, systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
-      }
+      return
     } else {
-      appendAssistantToSession(sessionId, mockChat(message))
+      const detail = String(error?.message || '后端执行异常').slice(0, 160)
+      appendAssistantToSession(sessionId, systemMessage(`本次回答失败：${detail}。请稍后重试。`), streamingRunId)
     }
   }
 }
 
 function handleStreamEvent(sessionId, event) {
+  if (event.event === 'answer.delta') {
+    appendStreamingDelta(sessionId, event.payload?.runId || event.runId || '', event.payload?.delta || '')
+    return
+  }
   if (event.event === 'run.started') {
+    const threadId = event.payload?.threadId || event.threadId || ''
     updateSessionRuntime(sessionId, {
       activeRun: {
         runId: event.payload?.runId || event.runId,
-        threadId: event.payload?.threadId || event.threadId,
+        threadId,
         token: `stream_${Date.now()}`
       },
+      ...(threadId ? { serverThreadId: threadId } : {}),
       submitting: false,
       runStatusText: '正在分析问题'
     })
@@ -414,7 +424,7 @@ async function handleClarificationConfirm(payload) {
   const answer = String(payload?.value || '').trim()
   if (!answer || loading.value) return
   const session = activeSession.value
-  const threadId = payload?.threadId || payload?.checkpoint?.threadId || payload?.checkpoint?.checkpointThreadId || session?.activeRun?.threadId || ''
+  const threadId = payload?.threadId || payload?.checkpoint?.threadId || payload?.checkpoint?.checkpointThreadId || session?.activeRun?.threadId || session?.serverThreadId || ''
   await askWithOptions(answer, {
     resumeThreadId: threadId,
     context: cloneValue(session?.conversationContext)
@@ -453,6 +463,7 @@ async function pollSessionRun(sessionId, token) {
       clearRunPoll(sessionId)
       updateSessionRuntime(sessionId, {
         activeRun: null,
+        serverThreadId: current.threadId,
         submitting: false,
         stopping: false,
         runStatusText: defaultRunStatusText
@@ -468,6 +479,7 @@ async function pollSessionRun(sessionId, token) {
       clearRunPoll(sessionId)
       updateSessionRuntime(sessionId, {
         activeRun: null,
+        serverThreadId: current.threadId,
         submitting: false,
         stopping: false,
         runStatusText: defaultRunStatusText
@@ -479,6 +491,7 @@ async function pollSessionRun(sessionId, token) {
       clearRunPoll(sessionId)
       updateSessionRuntime(sessionId, {
         activeRun: null,
+        serverThreadId: current.threadId,
         submitting: false,
         stopping: false,
         runStatusText: defaultRunStatusText
@@ -507,6 +520,13 @@ async function stopCurrentRun() {
   clearRunPoll(session.id)
   if (!current && session.submitController) {
     session.submitController.abort()
+    updateSessionRuntime(session.id, {
+      submitting: false,
+      stopping: false,
+      submitController: null,
+      runStatusText: defaultRunStatusText
+    })
+    appendAssistantToSession(session.id, systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
     return
   }
   if (!current) {
@@ -531,7 +551,11 @@ async function stopCurrentRun() {
       stopping: false,
       runStatusText: defaultRunStatusText
     })
-    appendAssistantToSession(session.id, systemMessage('已停止本次回答。您可以修改问题后重新提问。'))
+    appendAssistantToSession(
+      session.id,
+      systemMessage('已停止本次回答。您可以修改问题后重新提问。'),
+      stoppedRun.runId
+    )
   }
 }
 
@@ -601,10 +625,10 @@ function appendAssistant(response) {
   appendAssistantToSession(activeSessionId.value, response)
 }
 
-function appendAssistantToSession(sessionId, response) {
+function appendAssistantToSession(sessionId, response, streamingRunId = '') {
   const targetMessages = sessionId === activeSessionId.value ? messages.value : cloneValue(findSession(sessionId)?.messages || [])
   const sourceQuestion = [...targetMessages].reverse().find(message => message.role === 'user')?.text || ''
-  targetMessages.push({
+  const nextMessage = {
     localId: `a_${Date.now()}_${Math.random().toString(16).slice(2)}`,
     id: response.id || `local_${Date.now()}`,
     role: 'assistant',
@@ -627,7 +651,16 @@ function appendAssistantToSession(sessionId, response) {
       disliked: false,
       persisted: Boolean(response.persisted)
     }
-  })
+  }
+  const streamingIndex = streamingRunId
+    ? targetMessages.findIndex(message => message.streamingRunId === streamingRunId)
+    : -1
+  if (streamingIndex >= 0) {
+    nextMessage.localId = targetMessages[streamingIndex].localId
+    targetMessages.splice(streamingIndex, 1, nextMessage)
+  } else {
+    targetMessages.push(nextMessage)
+  }
   const sessionUpdates = {
     messages: cloneValue(targetMessages)
   }
@@ -651,6 +684,39 @@ function appendAssistantToSession(sessionId, response) {
     if (response.context) {
       conversationContext.value = cloneValue(response.context)
     }
+    scrollBottom()
+  }
+}
+
+function appendStreamingDelta(sessionId, runId, delta) {
+  const text = String(delta || '')
+  if (!runId || !text) return
+  const targetMessages = sessionId === activeSessionId.value ? messages.value : cloneValue(findSession(sessionId)?.messages || [])
+  let message = targetMessages.find(item => item.streamingRunId === runId)
+  if (!message) {
+    const sourceQuestion = [...targetMessages].reverse().find(item => item.role === 'user')?.text || ''
+    message = {
+      localId: `stream_${runId}`,
+      role: 'assistant',
+      question: sourceQuestion,
+      text: '',
+      steps: [],
+      tables: [],
+      dataRows: [],
+      dataSections: [],
+      merchantExperience: {},
+      suggestions: [],
+      clarification: null,
+      feedbackStatus: {},
+      streamingRunId: runId
+    }
+    targetMessages.push(message)
+  }
+  message.text += text
+  const nextMessages = cloneValue(targetMessages)
+  updateSession(sessionId, { messages: nextMessages })
+  if (sessionId === activeSessionId.value) {
+    messages.value = nextMessages
     scrollBottom()
   }
 }
@@ -825,6 +891,7 @@ function createConversationSession(title, welcomeText) {
     suggestionCursor: 0,
     suggestions: defaultSuggestions.slice(0, 3),
     activeRun: null,
+    serverThreadId: '',
     submitting: false,
     submitController: null,
     stopping: false,
@@ -916,6 +983,7 @@ function normalizeRestoredSession(session) {
     suggestions: Array.isArray(session.suggestions) && session.suggestions.length
       ? cloneValue(session.suggestions)
       : defaultSuggestions.slice(0, 3),
+    serverThreadId: session.serverThreadId || activeRun?.threadId || '',
     activeRun,
     submitting: false,
     submitController: null,

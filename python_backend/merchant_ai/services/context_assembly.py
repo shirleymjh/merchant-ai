@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from merchant_ai.config import Settings
+from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.state import AgentState
 from merchant_ai.models import ArtifactRef, ContextAssemblyReport
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 from merchant_ai.services.observability import artifact_ref_from_path
+from merchant_ai.services.security import identity_scope_hash
 
 
 class ContextAllocator:
@@ -258,8 +259,9 @@ class ContextAssembler:
 
     def compact_text_context(self, state: AgentState, stage: str, agent: str, text: str, budget_chars: int = 0) -> str:
         budget = max(1000, int(budget_chars or self.settings.context_runtime_budget_chars or 6000))
+        content_hash = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
         if len(text or "") <= budget:
-            self._record_report(state, stage, agent, len(text or ""), len(text or ""), budget, False, [], [], "inline")
+            self._record_report(state, stage, agent, len(text or ""), len(text or ""), budget, False, [], [], "inline", content_hash)
             return text
         artifact = self._write_artifact(state, "context", "%s_%s_full.md" % (stage, agent), text)
         preview = (text or "")[: max(500, budget - 700)]
@@ -267,7 +269,19 @@ class ContextAssembler:
             "%s\n\n[context_offloaded]\nfullContextArtifact=%s\nmerchantUri=%s\noriginalChars=%d"
             % (preview, artifact.relative_path or artifact.path, artifact.merchant_uri, len(text or ""))
         )
-        self._record_report(state, stage, agent, len(text or ""), len(compact), budget, True, ["text"], [artifact], "text context exceeded budget")
+        self._record_report(
+            state,
+            stage,
+            agent,
+            len(text or ""),
+            len(compact),
+            budget,
+            True,
+            ["text"],
+            [artifact],
+            "text context exceeded budget",
+            content_hash,
+        )
         return compact
 
     def assemble_payload(
@@ -280,8 +294,9 @@ class ContextAssembler:
     ) -> Dict[str, Any]:
         budget = max(1000, int(budget_chars or self.settings.context_planner_budget_chars or 12000))
         raw = json.dumps(payload or {}, ensure_ascii=False, default=str, sort_keys=True)
+        content_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         if len(raw) <= budget:
-            self._record_report(state, stage, agent, len(raw), len(raw), budget, False, [], [], "inline")
+            self._record_report(state, stage, agent, len(raw), len(raw), budget, False, [], [], "inline", content_hash)
             return payload
         compacted, sections, artifacts = self._compact_payload_sections(state, stage, payload)
         compact_raw = json.dumps(compacted, ensure_ascii=False, default=str, sort_keys=True)
@@ -311,6 +326,7 @@ class ContextAssembler:
             sorted(set(sections)),
             artifacts,
             "payload exceeded stage budget",
+            content_hash,
         )
         return compacted
 
@@ -360,6 +376,7 @@ class ContextAssembler:
         trimmed_sections: List[str],
         artifact_refs: List[ArtifactRef],
         reason: str,
+        content_hash: str,
     ) -> None:
         context_hash = hashlib.sha256(
             json.dumps(
@@ -368,6 +385,7 @@ class ContextAssembler:
                     "agent": agent,
                     "input": input_chars,
                     "output": output_chars,
+                    "contentSha256": content_hash,
                     "artifacts": [ref.relative_path or ref.path for ref in artifact_refs],
                 },
                 ensure_ascii=False,
@@ -467,6 +485,19 @@ def build_llm_context_blocks(state: AgentState, package: Any, budget_report: Dic
             truncated_reason="memoryInjection" if "memoryInjection" in trimmed else "",
         ),
         context_block_manifest(
+            "conversation_context",
+            {
+                "threadContext": state.get("thread_context") or {},
+                "sessionContext": str(state.get("session_context") or "")[:8000],
+            },
+            source="user_conversation",
+            priority=86,
+            cache_policy="volatile",
+            sensitivity="user",
+            trusted_instruction=False,
+            truncated_reason="conversationContext" if "conversationContext" in trimmed else "",
+        ),
+        context_block_manifest(
             "verified_evidence",
                 {
                 "memoryIds": context_memory_ids_from_state(state),
@@ -560,37 +591,94 @@ def context_quarantine_policy(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class ThreadContextService:
-    """Restore thread-level recoverable context without resuming an ended run checkpoint."""
+    """Restore only explicitly published immutable summaries from prior runs."""
+
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or get_settings()
 
     def restore(self, state: AgentState) -> Dict[str, Any]:
         thread_data = state.get("thread_data")
         outputs_path = getattr(thread_data, "outputs_path", "") if thread_data is not None else ""
         if not outputs_path:
             return {"restored": False, "reason": "missing_outputs_path"}
-        root = Path(outputs_path)
-        snapshot = self._read_json(root / "context_snapshot.json")
-        trace = self._read_json(root / "trace_replay.json")
-        run_result = self._read_json(root / "artifacts" / "node" / "agent_run_result.json")
-        if trace.get("runId") == state.get("run_id"):
-            trace = {}
-        entity_sets = extract_reusable_entity_sets(run_result)
-        artifacts = self._artifact_refs(root)
-        restored = bool(snapshot or trace or entity_sets or artifacts)
+        run_outputs = Path(outputs_path)
+        try:
+            thread_root = run_outputs.parents[2]
+        except IndexError:
+            return {"restored": False, "reason": "invalid_run_outputs_path"}
+        published_dir = thread_root / "published"
+        summaries = (
+            sorted(published_dir.glob("*.summary.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+            if published_dir.exists()
+            else []
+        )
+        summary: Dict[str, Any] = {}
+        rejection_reasons: List[str] = []
+        for path in summaries:
+            if str(state.get("run_id") or "") in path.name:
+                continue
+            candidate = self._read_json(path)
+            if not candidate:
+                rejection_reasons.append("invalid_json:%s" % path.name)
+                continue
+            valid, reason = self._summary_matches_state(candidate, state)
+            if not valid:
+                rejection_reasons.append("%s:%s" % (reason, path.name))
+                continue
+            summary = candidate
+            break
+        restored = bool(summary)
+        primary_reason = next(
+            (reason for reason in rejection_reasons if reason.startswith(("identity_scope_mismatch", "merchant_scope_mismatch"))),
+            rejection_reasons[0] if rejection_reasons else "no_published_summary",
+        )
         context = {
             "restored": restored,
+            "reason": "restored" if restored else primary_reason,
+            "rejectionReasons": rejection_reasons[:12],
             "checkpointRef": state.get("checkpoint_thread_id", ""),
-            "previousRunId": trace.get("runId", ""),
-            "previousQuestion": trace.get("question", ""),
-            "previousAnswerPreview": str(trace.get("answer") or "")[:500],
-            "previousSummary": snapshot.get("summary", ""),
-            "previousArtifacts": artifacts[:20],
-            "reusableEntitySets": entity_sets[:10],
+            "previousRunId": summary.get("runId", ""),
+            "previousQuestion": summary.get("question", ""),
+            "previousAnswerPreview": str(summary.get("answerPreview") or "")[:500],
+            "previousSummary": summary.get("summary", ""),
+            "previousArtifacts": list(summary.get("artifacts") or [])[:20],
+            "reusableEntitySets": list(summary.get("reusableEntitySets") or summary.get("reusable_entity_sets") or [])[:12],
             "restoredAt": datetime.now().isoformat(),
         }
         state["thread_context"] = context
         if restored:
             state["session_context"] = append_thread_context_summary(state.get("session_context") or "", context)
         return context
+
+    def _summary_matches_state(self, summary: Dict[str, Any], state: AgentState) -> Tuple[bool, str]:
+        try:
+            version = int(summary.get("version") or 0)
+        except (TypeError, ValueError):
+            return False, "unsupported_summary_version"
+        if version < 2:
+            return False, "unsupported_summary_version"
+        expected_thread = str(state.get("thread_id") or getattr(state.get("thread_data"), "thread_id", "") or "").strip()
+        if expected_thread and str(summary.get("threadId") or "").strip() != expected_thread:
+            return False, "thread_scope_mismatch"
+        expected_merchant = str(state.get("requested_merchant_id") or "").strip()
+        if str(summary.get("merchantId") or "").strip() != expected_merchant:
+            return False, "merchant_scope_mismatch"
+        expected_scope = identity_scope_hash(state.get("user_identity") or {}, expected_merchant)
+        if not summary.get("identityScopeHash") or str(summary.get("identityScopeHash")) != expected_scope:
+            return False, "identity_scope_mismatch"
+        published_at = str(summary.get("publishedAt") or "").strip()
+        if not published_at:
+            return False, "missing_published_at"
+        try:
+            timestamp = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False, "invalid_published_at"
+        ttl_seconds = int(getattr(self.settings, "thread_context_summary_ttl_seconds", 0) or 0)
+        if ttl_seconds > 0 and (datetime.now(timezone.utc) - timestamp).total_seconds() > ttl_seconds:
+            return False, "summary_expired"
+        return True, ""
 
     def _read_json(self, path: Path) -> Dict[str, Any]:
         try:
@@ -708,6 +796,8 @@ def append_thread_context_summary(existing: str, context: Dict[str, Any]) -> str
         lines.append("- previousQuestion=%s" % str(context.get("previousQuestion"))[:300])
     if context.get("previousAnswerPreview"):
         lines.append("- previousAnswerPreview=%s" % str(context.get("previousAnswerPreview"))[:300])
+    if context.get("previousSummary"):
+        lines.append("- previousSummary=%s" % str(context.get("previousSummary"))[:600])
     for entity in context.get("reusableEntitySets", [])[:6]:
         lines.append(
             "- reusableEntitySet task=%s key=%s count=%s preview=%s"

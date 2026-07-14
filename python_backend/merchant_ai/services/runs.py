@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
+import re
 import shutil
 import time
 import uuid
@@ -22,14 +23,27 @@ from merchant_ai.models import (
     ArtifactRef,
     ChatContext,
     ChatResponse,
+    ConversationMessage,
     RunCreateRequest,
 )
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 from merchant_ai.services.checkpoints import checkpoint_ref_for_run, prune_completed_sqlite_checkpoints
 from merchant_ai.services.runtime_state import create_runtime_state_store
+from merchant_ai.services.security import identity_scope_hash, identity_scope_payload
 
 
 ANSWER_DELTA_CHARS = 80
+THREAD_ID_PATTERN = re.compile(r"^thread_[0-9a-f]{32}$")
+RUN_ID_PATTERN = re.compile(r"^run_[0-9a-f]{32}$")
+SERVER_THREAD_HISTORY_RUNS = 8
+
+
+def valid_thread_id(thread_id: str) -> bool:
+    return bool(THREAD_ID_PATTERN.fullmatch(str(thread_id or "")))
+
+
+def valid_run_id(run_id: str) -> bool:
+    return bool(RUN_ID_PATTERN.fullmatch(str(run_id or "")))
 
 
 def call_run_chat(
@@ -175,14 +189,32 @@ class AgentRunManager:
         except (OSError, ValueError):
             pass
 
-    def create_thread(self, merchant_id: str, topic: str = "", context: Optional[ChatContext] = None) -> AgentThreadRecord:
+    def create_thread(
+        self,
+        merchant_id: str,
+        topic: str = "",
+        context: Optional[ChatContext] = None,
+        identity: Any = None,
+    ) -> AgentThreadRecord:
         thread_id = "thread_" + uuid.uuid4().hex
-        record = AgentThreadRecord(thread_id=thread_id, merchant_id=merchant_id, topic=topic or "", context=context)
+        identity = identity or (getattr(context, "user_identity", None) if context is not None else None)
+        scope = identity_scope_payload(identity, merchant_id)
+        record = AgentThreadRecord(
+            thread_id=thread_id,
+            merchant_id=merchant_id,
+            topic=topic or "",
+            context=context,
+            owner_user_id=str(scope.get("userId") or ""),
+            owner_role=str(scope.get("role") or ""),
+            owner_scope_hash=identity_scope_hash(identity, merchant_id),
+        )
         self.threads[thread_id] = record
         self.store.save_thread(record)
         return record
 
     def get_thread(self, thread_id: str) -> Optional[AgentThreadRecord]:
+        if not valid_thread_id(thread_id):
+            return None
         thread = self.threads.get(thread_id) or self.store.load_thread(thread_id)
         if thread:
             self.threads[thread_id] = thread
@@ -194,7 +226,18 @@ class AgentRunManager:
         merchant_id: str,
         question: str,
         initial_status: AgentRunStatus = AgentRunStatus.RUNNING,
+        identity: Any = None,
     ) -> AgentRunRecord:
+        if not valid_thread_id(thread_id):
+            raise ValueError("invalid threadId")
+        thread = self.get_thread(thread_id)
+        if not thread:
+            raise ValueError("thread not found")
+        if thread.merchant_id != merchant_id:
+            raise ValueError("thread merchant does not match run merchant")
+        if thread.owner_scope_hash and identity is not None:
+            if thread.owner_scope_hash != identity_scope_hash(identity, merchant_id):
+                raise ValueError("thread identity scope does not match run identity")
         run_id = "run_" + uuid.uuid4().hex
         run = AgentRunRecord(
             run_id=run_id,
@@ -204,7 +247,7 @@ class AgentRunManager:
             status=initial_status,
             start_time=datetime.now(),
             checkpoint_ref=checkpoint_ref_for_run(self.settings, thread_id, run_id),
-            resumable=(self.settings.agent_checkpointer_backend or "sqlite").strip().lower() != "memory",
+            resumable=False,
         )
         with self._lock:
             self.runs[run_id] = run
@@ -214,6 +257,8 @@ class AgentRunManager:
         return run
 
     def get_run(self, run_id: str) -> Optional[AgentRunRecord]:
+        if not valid_run_id(run_id):
+            return None
         run = self.runs.get(run_id) or self.store.load_run(run_id)
         if run:
             self.runs[run_id] = run
@@ -270,7 +315,7 @@ class AgentRunManager:
             run.answer = ChatResponse.model_validate(public_response_payload(response))
             self.store.save_run(run)
             if bool(self.settings.agent_compact_success_artifacts_enabled):
-                compact_completed_thread_outputs(self.settings.resolved_workspace_path, run.thread_id)
+                compact_completed_thread_outputs(self.settings.resolved_workspace_path, run.thread_id, run.run_id)
             self.append_event(
                 run_id,
                 run.thread_id,
@@ -349,6 +394,58 @@ class AgentRunManager:
         runs = sorted(by_id.values(), key=lambda item: item.start_time, reverse=True)
         return runs[: max(1, limit)]
 
+    def thread_message_history(
+        self,
+        thread_id: str,
+        merchant_id: str = "",
+        exclude_run_id: str = "",
+        max_runs: int = SERVER_THREAD_HISTORY_RUNS,
+    ) -> List[ConversationMessage]:
+        if not valid_thread_id(thread_id):
+            return []
+        runs = [
+            run
+            for run in self.list_runs(limit=200, merchant_id=merchant_id)
+            if run.thread_id == thread_id
+            and run.run_id != exclude_run_id
+            and run_status_value(run.status).upper() == AgentRunStatus.COMPLETED.value
+            and run.answer
+        ]
+        runs = sorted(runs, key=lambda item: item.start_time)[-max(1, int(max_runs or SERVER_THREAD_HISTORY_RUNS)) :]
+        messages: List[ConversationMessage] = []
+        for run in runs:
+            question = str(run.question or "").strip()
+            answer = str(getattr(run.answer, "answer", "") or "").strip()
+            if question:
+                messages.append(
+                    ConversationMessage(
+                        role="user",
+                        text=question,
+                        id="%s:user" % run.run_id,
+                        local_id="server_thread:%s:user" % run.run_id,
+                    )
+                )
+            if answer:
+                messages.append(
+                    ConversationMessage(
+                        role="assistant",
+                        text=answer,
+                        id="%s:assistant" % run.run_id,
+                        local_id="server_thread:%s:assistant" % run.run_id,
+                    )
+                )
+        return messages
+
+    def effective_message_history(
+        self,
+        thread_id: str,
+        merchant_id: str,
+        exclude_run_id: str,
+        client_history: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        server_history = self.thread_message_history(thread_id, merchant_id, exclude_run_id=exclude_run_id)
+        return server_history if server_history else list(client_history or [])
+
     def dashboard(self, limit: int = 50, status: str = "", merchant_id: str = "") -> Dict[str, Any]:
         runs = self.list_runs(limit=limit, status=status, merchant_id=merchant_id)
         status_counts: Dict[str, int] = {}
@@ -400,17 +497,57 @@ class AgentRunStreamService:
         merchant_id = request.merchant_id or self.default_merchant_id
         thread_id = request.thread_id
         if not thread_id:
-            thread = self.run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
+            thread = self.run_manager.create_thread(
+                merchant_id,
+                request.context.topic if request.context else "",
+                request.context,
+                identity=request.user_identity,
+            )
             thread_id = thread.thread_id
-        run = self.run_manager.create_run(thread_id, merchant_id, request.message)
+        identity = request.user_identity or (getattr(request.context, "user_identity", None) if request.context is not None else None)
+        run = self.run_manager.create_run(thread_id, merchant_id, request.message, identity=identity)
+        message_history = self.run_manager.effective_message_history(
+            thread_id,
+            merchant_id,
+            run.run_id,
+            request.message_history,
+        )
         started_payload = {"runId": run.run_id, "threadId": thread_id, "merchantId": merchant_id}
         self.run_manager.append_event(run.run_id, thread_id, "run.started", "RUN_STREAM", started_payload)
         q.put({"event": "run.started", "node": "RUN_STREAM", "payload": started_payload})
+        streamed_answer = ""
+
+        def enqueue_answer(answer: str) -> None:
+            nonlocal streamed_answer
+            text = str(answer or "")
+            if not text or streamed_answer:
+                return
+            streamed_answer = text
+            for index, chunk in enumerate(answer_chunks(text, ANSWER_DELTA_CHARS)):
+                payload = {
+                    "runId": run.run_id,
+                    "threadId": thread_id,
+                    "index": index,
+                    "delta": chunk,
+                }
+                self.run_manager.append_event(run.run_id, thread_id, "answer.delta", "ANSWER_STREAM", payload)
+                q.put({"event": "answer.delta", "node": "ANSWER_STREAM", "payload": payload})
+            completed_payload = {
+                "runId": run.run_id,
+                "threadId": thread_id,
+                "answerLength": len(text),
+            }
+            self.run_manager.append_event(run.run_id, thread_id, "answer.completed", "ANSWER_STREAM", completed_payload)
+            q.put({"event": "answer.completed", "node": "ANSWER_STREAM", "payload": completed_payload})
 
         def listener(event_type: str, node: str, payload: Dict[str, Any]) -> None:
-            safe_payload = compact_event_payload(payload)
+            event_payload = dict(payload or {})
+            answer = str(event_payload.pop("answer", "")) if event_type == "answer.ready" else ""
+            safe_payload = compact_event_payload(event_payload)
             self.run_manager.append_event(run.run_id, thread_id, event_type, node, safe_payload)
             q.put({"event": event_type, "node": node, "payload": safe_payload})
+            if answer:
+                enqueue_answer(answer)
 
         def worker() -> None:
             try:
@@ -422,25 +559,10 @@ class AgentRunStreamService:
                     listener,
                     thread_id,
                     run.run_id,
-                    request.message_history,
+                    message_history,
                 )
                 self.run_manager.complete_run(run.run_id, response)
-                for index, chunk in enumerate(answer_chunks(response.answer, ANSWER_DELTA_CHARS)):
-                    payload = {
-                        "runId": run.run_id,
-                        "threadId": thread_id,
-                        "index": index,
-                        "delta": chunk,
-                    }
-                    self.run_manager.append_event(run.run_id, thread_id, "answer.delta", "ANSWER_STREAM", payload)
-                    q.put({"event": "answer.delta", "node": "ANSWER_STREAM", "payload": payload})
-                completed_payload = {
-                    "runId": run.run_id,
-                    "threadId": thread_id,
-                    "answerLength": len(response.answer or ""),
-                }
-                self.run_manager.append_event(run.run_id, thread_id, "answer.completed", "ANSWER_STREAM", completed_payload)
-                q.put({"event": "answer.completed", "node": "ANSWER_STREAM", "payload": completed_payload})
+                enqueue_answer(response.answer)
                 q.put({"event": "done", "runId": run.run_id, "threadId": thread_id, "response": public_response_payload(response)})
             except Exception as exc:
                 self.run_manager.fail_run(run.run_id, str(exc))
@@ -479,9 +601,21 @@ class AgentAsyncRunService:
         merchant_id = request.merchant_id or self.default_merchant_id
         thread_id = request.thread_id
         if not thread_id:
-            thread = self.run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
+            thread = self.run_manager.create_thread(
+                merchant_id,
+                request.context.topic if request.context else "",
+                request.context,
+                identity=request.user_identity,
+            )
             thread_id = thread.thread_id
-        run = self.run_manager.create_run(thread_id, merchant_id, request.message, initial_status=AgentRunStatus.QUEUED)
+        identity = request.user_identity or (getattr(request.context, "user_identity", None) if request.context is not None else None)
+        run = self.run_manager.create_run(
+            thread_id,
+            merchant_id,
+            request.message,
+            initial_status=AgentRunStatus.QUEUED,
+            identity=identity,
+        )
         self.run_manager.append_event(
             run.run_id,
             thread_id,
@@ -490,7 +624,13 @@ class AgentAsyncRunService:
             {"workerPool": "thread", "merchantId": merchant_id},
         )
         run_snapshot = run.model_copy(deep=True)
-        future = self.executor.submit(self._worker, run.run_id, thread_id, merchant_id, request.message, request.context, request.message_history)
+        message_history = self.run_manager.effective_message_history(
+            thread_id,
+            merchant_id,
+            run.run_id,
+            request.message_history,
+        )
+        future = self.executor.submit(self._worker, run.run_id, thread_id, merchant_id, request.message, request.context, message_history)
         with self._lock:
             self.futures[run.run_id] = future
         return run_snapshot
@@ -540,8 +680,8 @@ class AgentAsyncRunService:
                 self.run_manager.append_event(run_id, thread_id, "run.worker.finished", "ASYNC_RUN_SERVICE", {})
 
 
-def compact_completed_thread_outputs(workspace_root: Path, thread_id: str) -> None:
-    outputs = workspace_root / "threads" / thread_id / "outputs"
+def compact_completed_thread_outputs(workspace_root: Path, thread_id: str, run_id: str = "") -> None:
+    outputs = workspace_root / "threads" / thread_id / "runs" / run_id / "outputs"
     if not outputs.exists():
         return
     removable_directories = [outputs / "artifacts" / "context", outputs / "context_packages"]

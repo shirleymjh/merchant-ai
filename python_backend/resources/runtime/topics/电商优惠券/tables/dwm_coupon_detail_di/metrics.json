@@ -1,15 +1,15 @@
 [
   {
-    "metricKey": "coupon_amt",
+    "metricKey": "coupon_total_amt",
     "canonicalMetricKey": "coupon_total_amt",
-    "aliasOf": "coupon_total_amt",
-    "metricLevel": "physical",
+    "metricLevel": "business",
     "businessName": "优惠券金额",
     "formula": "SUM(coupon_amt)",
     "unit": "元",
     "description": "优惠券金额投入，按优惠券明细表 coupon_amt 聚合；可用于回答券金额投入、优惠券投入、优惠投入等问题",
     "sourceColumns": [
-      "coupon_amt"
+      "coupon_amt",
+      "coupon_total_amt"
     ],
     "aliases": [
       "优惠券金额",
@@ -29,13 +29,16 @@
     "evidence": "schema comment=优惠金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
   },
   {
-    "metricKey": "allowance_amt",
+    "metricKey": "allowance_total_amt",
+    "canonicalMetricKey": "allowance_total_amt",
+    "metricLevel": "business",
     "businessName": "津贴金额",
     "formula": "SUM(CAST(allowance_amt AS DECIMAL(18,2)))",
     "unit": "元",
     "description": "津贴金额",
     "sourceColumns": [
-      "allowance_amt"
+      "allowance_amt",
+      "allowance_total_amt"
     ],
     "aliases": [
       "津贴金额",

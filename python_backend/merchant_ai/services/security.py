@@ -15,6 +15,42 @@ from merchant_ai.config import Settings
 from merchant_ai.models import UserIdentity
 
 
+def identity_scope_payload(identity: Any = None, merchant_id: str = "") -> Dict[str, Any]:
+    """Return the stable authorization scope that owns thread-scoped context."""
+
+    if hasattr(identity, "model_dump"):
+        payload = identity.model_dump(by_alias=True)
+    elif isinstance(identity, dict):
+        payload = dict(identity)
+    else:
+        payload = {}
+    return {
+        "merchantId": str(payload.get("merchantId") or payload.get("merchant_id") or merchant_id or "").strip(),
+        "userId": str(payload.get("userId") or payload.get("user_id") or "").strip(),
+        "role": str(payload.get("role") or "merchant_operator").strip(),
+        "storeIds": sorted(
+            {
+                str(item).strip()
+                for item in (payload.get("storeIds") or payload.get("store_ids") or [])
+                if str(item).strip()
+            }
+        ),
+        "permissions": sorted(
+            {
+                str(item).strip()
+                for item in (payload.get("permissions") or [])
+                if str(item).strip()
+            }
+        ),
+    }
+
+
+def identity_scope_hash(identity: Any = None, merchant_id: str = "") -> str:
+    payload = identity_scope_payload(identity, merchant_id)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 class Permission(str, Enum):
     CHAT_RUN = "chat.run"
     RUN_READ = "run.read"

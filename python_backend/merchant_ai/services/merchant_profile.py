@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
+from threading import RLock
+from typing import Any, Callable, Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.models import FastUnderstandingResult, MerchantInfo, RouteSlots
@@ -155,41 +156,55 @@ class MerchantProfileStore:
         self.settings = settings
         self.root = root or (settings.resolved_workspace_path / "ops" / "merchant_profiles")
         self.index_path = self.root / "merchant_profiles.json"
+        self._lock = RLock()
 
     def get_profile(self, merchant_id: str, include_expired: bool = False) -> Dict[str, Any]:
-        profiles = self._load()
-        profile = dict(profiles.get(str(merchant_id or "").strip()) or {})
-        if not profile:
-            profile = self._default_profile(merchant_id)
-        if not include_expired:
-            profile = self._without_expired(profile)
-        return profile
+        with self._lock:
+            profiles = self._load()
+            profile = dict(profiles.get(str(merchant_id or "").strip()) or {})
+            if not profile:
+                profile = self._default_profile(merchant_id)
+            if not include_expired:
+                profile = self._without_expired(profile)
+            return profile
 
-    def upsert_profile(self, merchant_id: str, patch: Dict[str, Any], reviewer: str = "", review_status: str = "reviewed") -> Dict[str, Any]:
-        merchant_id = str(merchant_id or "").strip() or self.settings.merchant_id
-        profiles = self._load()
-        current = dict(profiles.get(merchant_id) or self._default_profile(merchant_id))
-        next_profile = self._merge_profile(current, patch or {})
-        now = datetime.utcnow().isoformat() + "Z"
-        next_profile["merchantId"] = merchant_id
-        next_profile["updatedAt"] = now
-        next_profile["reviewStatus"] = review_status or next_profile.get("reviewStatus") or "reviewed"
-        if reviewer:
-            next_profile["reviewer"] = reviewer
-            next_profile["reviewedAt"] = now
-        history = list(next_profile.get("history") or [])
-        history.append(
-            {
-                "at": now,
-                "reviewer": reviewer,
-                "reviewStatus": next_profile["reviewStatus"],
-                "changedFields": sorted((patch or {}).keys()),
-            }
-        )
-        next_profile["history"] = history[-30:]
-        profiles[merchant_id] = next_profile
-        self._write(profiles)
-        return next_profile
+    def upsert_profile(
+        self,
+        merchant_id: str,
+        patch: Dict[str, Any],
+        reviewer: str = "",
+        review_status: str = "reviewed",
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            merchant_id = str(merchant_id or "").strip() or self.settings.merchant_id
+            profiles = self._load()
+            current = dict(profiles.get(merchant_id) or self._default_profile(merchant_id))
+            if cancel_check and cancel_check():
+                return current
+            next_profile = self._merge_profile(current, patch or {})
+            now = datetime.utcnow().isoformat() + "Z"
+            next_profile["merchantId"] = merchant_id
+            next_profile["updatedAt"] = now
+            next_profile["reviewStatus"] = review_status or next_profile.get("reviewStatus") or "reviewed"
+            if reviewer:
+                next_profile["reviewer"] = reviewer
+                next_profile["reviewedAt"] = now
+            history = list(next_profile.get("history") or [])
+            history.append(
+                {
+                    "at": now,
+                    "reviewer": reviewer,
+                    "reviewStatus": next_profile["reviewStatus"],
+                    "changedFields": sorted((patch or {}).keys()),
+                }
+            )
+            next_profile["history"] = history[-30:]
+            if cancel_check and cancel_check():
+                return current
+            profiles[merchant_id] = next_profile
+            self._write(profiles)
+            return next_profile
 
     def merge_runtime_summary(self, merchant_id: str, summary: Dict[str, Any]) -> Dict[str, Any]:
         profile = self.get_profile(merchant_id)

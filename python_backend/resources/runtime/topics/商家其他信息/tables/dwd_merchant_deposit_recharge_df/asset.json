@@ -401,7 +401,7 @@
   "metrics": [
     {
       "metricKey": "deposit_recharge_amt",
-      "businessName": "金额",
+      "businessName": "保证金充值金额",
       "formula": "SUM(deposit_recharge_amt)",
       "unit": "元",
       "description": "金额, 通用单位元",
@@ -431,21 +431,6 @@
       ],
       "aliases": [
         "保证金充值流水数"
-      ],
-      "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
-    },
-    {
-      "metricKey": "deposit_recharge_total_amt",
-      "businessName": "保证金充值金额",
-      "formula": "SUM(deposit_recharge_amt)",
-      "unit": "元",
-      "description": "保证金补缴/充值金额汇总",
-      "sourceColumns": [
-        "deposit_recharge_amt"
-      ],
-      "aliases": [
-        "保证金充值金额"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成"

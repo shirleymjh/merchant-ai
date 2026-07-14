@@ -97,9 +97,78 @@ def test_merchant_allowlist_blocks_cross_tenant_requests():
     assert client.post("/api/chat", json={"message": "你好", "merchantId": "100"}).status_code == 200
     blocked = client.post("/api/chat", json={"message": "你好", "merchantId": "101"})
     assert blocked.status_code == 403
-
     memory_blocked = client.get("/api/memory/101", headers={"X-Ops-Token": "secret"})
     assert memory_blocked.status_code == 403
+
+
+def test_thread_access_is_bound_to_user_role_and_store_scope(tmp_path):
+    client = TestClient(
+        create_app(
+            Settings(
+                merchant_id="100",
+                allowed_merchant_ids="100",
+                harness_workspace_path=str(tmp_path),
+            )
+        )
+    )
+    alice = {
+        "userId": "alice",
+        "merchantId": "100",
+        "role": "merchant_operator",
+        "storeIds": ["S1"],
+    }
+    created = client.post(
+        "/api/threads",
+        json={"merchantId": "100", "userIdentity": alice},
+    )
+    assert created.status_code == 200
+    thread_id = created.json()["thread"]["threadId"]
+
+    bob = {
+        "userId": "bob",
+        "merchantId": "100",
+        "role": "merchant_operator",
+        "storeIds": ["S2"],
+    }
+    blocked = client.post(
+        "/api/runs/async",
+        json={
+            "message": "最近7天订单量",
+            "merchantId": "100",
+            "threadId": thread_id,
+            "userIdentity": bob,
+        },
+    )
+
+    assert blocked.status_code == 403
+    assert "identity scope" in blocked.json()["detail"]
+
+def test_thread_ids_are_validated_and_bound_to_merchant(tmp_path):
+    client = TestClient(
+        create_app(
+            Settings(
+                merchant_id="100",
+                allowed_merchant_ids="100,200",
+                harness_workspace_path=str(tmp_path),
+            )
+        )
+    )
+    created = client.post("/api/threads", json={"merchantId": "100"})
+    assert created.status_code == 200
+    thread_id = created.json()["thread"]["threadId"]
+
+    invalid = client.post(
+        "/api/chat/stream",
+        json={"message": "最近7天GMV", "merchantId": "100", "threadId": "../../outside"},
+    )
+    cross_merchant = client.post(
+        "/api/chat/stream",
+        json={"message": "最近7天GMV", "merchantId": "200", "threadId": thread_id},
+    )
+
+    assert invalid.status_code == 400
+    assert cross_merchant.status_code == 403
+    assert client.get(f"/api/threads/{thread_id}").status_code == 200
 
 
 def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
@@ -335,7 +404,10 @@ def test_redis_runtime_state_store_uses_real_backend_protocol(monkeypatch):
 
 
 def test_semantic_governance_creates_snapshot_impact_and_rolls_back(tmp_path):
-    settings = Settings(harness_workspace_path=str(tmp_path))
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "workspace"),
+        topic_path=str(tmp_path / "topics"),
+    )
     topic_assets = TopicAssetService(settings)
     table_dir = topic_assets.table_asset_dir("电商交易", "ads_merchant_profile")
     table_dir.mkdir(parents=True, exist_ok=True)

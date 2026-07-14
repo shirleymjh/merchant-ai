@@ -7,32 +7,76 @@ import queue
 import re
 import threading
 import time
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.semantic_request import explicit_semantic_request_fingerprint
 
 
 class LlmClient:
     """Small LangChain wrapper with local fallback behavior."""
 
-    def __init__(self, settings: Settings, model_name: str = ""):
+    def __init__(self, settings: Settings, model_name: str = "", api_key: str = "", base_url: str = ""):
         self.settings = settings
         self.model_name = str(model_name or settings.openai_model)
+        self.api_key_override = str(api_key or "")
+        self.base_url_override = str(base_url or "")
         self._model = None
         self._models_by_timeout: Dict[int, Any] = {}
-        self.last_error = ""
-        self.error_events: List[str] = []
+        self._last_error: ContextVar[str] = ContextVar("llm_last_error_%x" % id(self), default="")
+        self._error_events: ContextVar[Optional[List[str]]] = ContextVar("llm_error_events_%x" % id(self), default=None)
         self.response_cache = build_ttl_cache("llm_response", settings, settings.cache_llm_ttl_seconds)
-        self.last_cache_hit = False
-        self.last_cache_key = ""
+        self._last_cache_hit: ContextVar[bool] = ContextVar("llm_last_cache_hit_%x" % id(self), default=False)
+        self._last_cache_key: ContextVar[str] = ContextVar("llm_last_cache_key_%x" % id(self), default="")
         self._failure_count = 0
         self._circuit_open_until_ms = 0
         self._circuit_lock = threading.RLock()
 
     @property
+    def last_error(self) -> str:
+        return self._last_error.get()
+
+    @last_error.setter
+    def last_error(self, value: str) -> None:
+        self._last_error.set(str(value or ""))
+
+    @property
+    def error_events(self) -> List[str]:
+        events = self._error_events.get()
+        if events is None:
+            events = []
+            self._error_events.set(events)
+        return events
+
+    @property
+    def last_cache_hit(self) -> bool:
+        return bool(self._last_cache_hit.get())
+
+    @last_cache_hit.setter
+    def last_cache_hit(self, value: bool) -> None:
+        self._last_cache_hit.set(bool(value))
+
+    @property
+    def last_cache_key(self) -> str:
+        return self._last_cache_key.get()
+
+    @last_cache_key.setter
+    def last_cache_key(self, value: str) -> None:
+        self._last_cache_key.set(str(value or ""))
+
+    @property
     def configured(self) -> bool:
-        return bool(self.settings.openai_api_key)
+        return bool(self.api_key_override or self.settings.openai_api_key)
+
+    @property
+    def api_key(self) -> str:
+        return self.api_key_override or self.settings.openai_api_key
+
+    @property
+    def base_url(self) -> str:
+        return self.base_url_override or self.settings.openai_base_url
 
     def _chat_model(self, timeout_seconds: Optional[int] = None):
         effective_timeout = max(1, int(timeout_seconds or self.settings.llm_request_timeout_seconds or 1))
@@ -47,9 +91,9 @@ class LlmClient:
 
             model = ChatOpenAI(
                 model=self.model_name,
-                api_key=self.settings.openai_api_key,
-                base_url=self.settings.openai_base_url.rstrip("/"),
-                temperature=0,
+                api_key=self.api_key,
+                base_url=self.base_url.rstrip("/"),
+                temperature=self._temperature(),
                 timeout=effective_timeout,
                 max_tokens=self.settings.llm_max_tokens,
             )
@@ -63,6 +107,15 @@ class LlmClient:
                 self._model = None
             return None
         return model
+
+    def _temperature(self) -> float:
+        """Use the provider-supported deterministic setting when available."""
+
+        model = self.model_name.strip().lower()
+        base_url = self.base_url.strip().lower()
+        if model.startswith("kimi-for-coding") and "api.kimi.com/coding" in base_url:
+            return 1.0
+        return 0.0
 
     def record_error(self, error: str) -> None:
         self.last_error = error
@@ -326,22 +379,24 @@ class LlmClient:
         tool_choice: Optional[str] = None,
     ) -> str:
         prompt_meta = prompt_cache_metadata(system_prompt)
+        semantic_fingerprint = explicit_semantic_request_fingerprint(user_prompt)
+        if not semantic_fingerprint:
+            return ""
+        tools_fingerprint = stable_cache_key("tools", {"tools": tools or []}) if tools else ""
         return stable_cache_key(
             "llm",
             {
                 "kind": kind,
                 "model": self.model_name,
-                "baseUrl": self.settings.openai_base_url,
+                "baseUrl": self.base_url,
                 "promptId": prompt_meta.get("promptId", ""),
                 "promptVersion": prompt_meta.get("promptVersion", ""),
                 "promptAgent": prompt_meta.get("promptAgent", ""),
                 "templateFingerprint": prompt_meta.get("templateFingerprint", ""),
                 "systemPromptFingerprint": prompt_meta.get("systemPromptFingerprint", ""),
-                "system": system_prompt,
-                "user": user_prompt,
-                "tools": tools or [],
+                "semanticRequestFingerprint": semantic_fingerprint,
+                "toolsFingerprint": tools_fingerprint,
                 "toolChoice": tool_choice or "",
-                "timeoutSeconds": timeout_seconds or self.settings.llm_request_timeout_seconds,
             },
         )
 

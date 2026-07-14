@@ -84,6 +84,18 @@ def humanize_column_name(column: str) -> str:
     return label or text
 
 
+def source_aware_metric_label(column: str, table: str = "", category: str = "") -> str:
+    text = str(column or "").strip()
+    if text != "pay_amt":
+        return ""
+    source = "%s %s" % (str(table or "").lower(), str(category or "").lower())
+    if "refund" in source or "退货" in source or "退款" in source:
+        return "退款金额"
+    if any(token in source for token in ["trade", "order", "交易", "订单"]):
+        return "支付金额"
+    return ""
+
+
 def identifier_like_column(column: str) -> bool:
     text = str(column or "").strip().lower()
     return text in {"seller_id", "merchant_id", "user_id", "pt"} or text.endswith("_id") or text.endswith("_no")

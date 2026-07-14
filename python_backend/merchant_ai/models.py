@@ -211,6 +211,8 @@ class ChatContext(APIModel):
     pending_clarification_type: str = ""
     pending_question: str = ""
     pending_clarification_options: List[str] = Field(default_factory=list)
+    confirmation_token: str = ""
+    confirmation_run_id: str = ""
     user_identity: UserIdentity = Field(default_factory=UserIdentity)
 
 
@@ -634,6 +636,18 @@ class IntentSignals(APIModel):
     observations: List[str] = Field(default_factory=list)
 
 
+class ResolvedTimeRange(APIModel):
+    kind: str = "rolling"
+    start_date: str = ""
+    end_date: str = ""
+    days: int = 0
+    label: str = ""
+    timezone: str = "Asia/Shanghai"
+    anchor_policy: str = "calendar"
+    explicit: bool = False
+    source: str = ""
+
+
 class FastUnderstandingResult(APIModel):
     complexity: str = "unknown"
     intent_kind: str = "unknown"
@@ -647,6 +661,7 @@ class FastUnderstandingResult(APIModel):
     suggested_actions: List[str] = Field(default_factory=list)
     confidence: float = 0.0
     reasons: List[str] = Field(default_factory=list)
+    time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
 
 
 class KnowledgeRequest(APIModel):
@@ -1293,6 +1308,7 @@ class NodePlanContract(APIModel):
     sql_strategy: str = ""
     upstream_entity_sets: List[Dict[str, Any]] = Field(default_factory=list)
     metric_resolution: Dict[str, Any] = Field(default_factory=dict)
+    metric_governance_mode: str = "legacy_unsealed"
 
 
 class NodePlanCritiqueResult(APIModel):
@@ -1483,6 +1499,7 @@ class NodeExecutionContext(APIModel):
     workspace_path: str = ""
     context_package: Dict[str, Any] = Field(default_factory=dict)
     cancel_event: Any = Field(default=None, exclude=True)
+    runtime_scratch: Dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class EvidenceGap(APIModel):
@@ -1536,6 +1553,37 @@ class VerifiedEvidence(APIModel):
     partial_answer_reason: str = ""
 
 
+class VerifiedFact(APIModel):
+    fact_id: str = ""
+    task_id: str = ""
+    table: str = ""
+    row_index: int = 0
+    column: str = ""
+    label: str = ""
+    value: Any = None
+    value_type: str = "text"
+    result_role: str = "result"
+
+
+class AnswerClaim(APIModel):
+    text: str = ""
+    numeric_values: List[str] = Field(default_factory=list)
+    entity_values: List[str] = Field(default_factory=list)
+    fact_ids: List[str] = Field(default_factory=list)
+    supported: bool = False
+    reasons: List[str] = Field(default_factory=list)
+
+
+class AnswerClaimVerification(APIModel):
+    passed: bool = True
+    fact_count: int = 0
+    claims: List[AnswerClaim] = Field(default_factory=list)
+    unsupported_claims: List[AnswerClaim] = Field(default_factory=list)
+    rejected_claims: List[AnswerClaim] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str = ""
+
+
 class VerifiedAnswerContext(APIModel):
     question: str = ""
     business_context: Dict[str, Any] = Field(default_factory=dict)
@@ -1550,6 +1598,7 @@ class VerifiedAnswerContext(APIModel):
     rule_evidence: Any = ""
     verified_passed: bool = False
     partial_answer_reason: str = ""
+    verified_facts: List[VerifiedFact] = Field(default_factory=list)
 
     def prompt_payload(self) -> Dict[str, Any]:
         return {
@@ -1566,6 +1615,7 @@ class VerifiedAnswerContext(APIModel):
             "ruleEvidence": self.rule_evidence,
             "verifiedPassed": self.verified_passed,
             "partialAnswerReason": self.partial_answer_reason,
+            "verifiedFacts": [item.model_dump(by_alias=True) for item in self.verified_facts],
         }
 
 
@@ -1607,6 +1657,7 @@ class QuestionIntent(APIModel):
     sql_strategy: str = "llm_plan_bound_first"
     sql: str = ""
     metric_resolution: Dict[str, Any] = Field(default_factory=dict)
+    time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
 
 
 class QueryPlan(APIModel):
@@ -1679,6 +1730,7 @@ class AgentTask(APIModel):
 
 class AgentTaskResult(APIModel):
     task_id: str = ""
+    execution_contract_hash: str = ""
     sub_agent_type: str = "NODE_WORKER"
     sub_agent_run_id: str = ""
     sub_agent_checkpoint_path: str = ""
@@ -1788,7 +1840,10 @@ class AgentRunResult(APIModel):
     node_execution_batches: List[NodeExecutionBatch] = Field(default_factory=list)
     skill_lifecycle_records: List[SkillLifecycleRecord] = Field(default_factory=list)
     resumed_task_ids: List[str] = Field(default_factory=list)
+    resume_rejected_task_ids: List[str] = Field(default_factory=list)
     degraded_reasons: List[Dict[str, Any]] = Field(default_factory=list)
+    verified_facts: List[VerifiedFact] = Field(default_factory=list)
+    answer_claim_verification: AnswerClaimVerification = Field(default_factory=AnswerClaimVerification)
 
 
 class HypothesisEvidenceRecord(APIModel):
@@ -2005,6 +2060,9 @@ class AgentThreadRecord(APIModel):
     merchant_id: str
     topic: str = ""
     context: Optional[ChatContext] = None
+    owner_user_id: str = ""
+    owner_role: str = ""
+    owner_scope_hash: str = ""
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 

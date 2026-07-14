@@ -68,19 +68,31 @@ class UnderstandingExtractor:
         )
 
     def failure_fallback_plan(self, question: str, asset_pack: PlanningAssetPack, trace_reason: str) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
+        rejected_trace: List[str] = []
         entity_plan = self.planner._entity_detail_fallback(question, asset_pack)
         if entity_plan.intents:
-            entity_plan.agent_trace.extend([trace_reason, "planner.entity_id_semantic_fallback_after_llm_failure"])
-            return entity_plan, [], trace_reason
+            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, entity_plan, asset_pack)
+            if not coverage_gaps:
+                entity_plan.agent_trace.extend(
+                    [trace_reason, "planner.entity_id_semantic_fallback_after_llm_failure", "planner.semantic_fast_path=entity_detail_after_failure"]
+                )
+                return entity_plan, [], "SEMANTIC_FAST_PATH"
+            rejected_trace.extend(fallback_coverage_rejection_trace("entity_detail", coverage_gaps))
         recalled_metric_plan = self.planner._recalled_metric_diagnostic_fallback(question, asset_pack)
         if recalled_metric_plan.intents:
-            recalled_metric_plan.agent_trace.extend([trace_reason, "planner.recalled_metric_diagnostic_fallback_after_llm_failure"])
-            return recalled_metric_plan, [], trace_reason
+            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, recalled_metric_plan, asset_pack)
+            if not coverage_gaps:
+                recalled_metric_plan.agent_trace.extend([trace_reason, "planner.recalled_metric_diagnostic_fallback_after_llm_failure"])
+                return recalled_metric_plan, [], "SEMANTIC_FAST_PATH"
+            rejected_trace.extend(fallback_coverage_rejection_trace("recalled_metric_diagnostic", coverage_gaps))
         trend_plan = self.planner._multi_metric_trend_fallback(question, asset_pack)
         if trend_plan.intents:
-            trend_plan.agent_trace.extend([trace_reason, "planner.multi_metric_trend_fallback_after_llm_failure"])
-            return trend_plan, [], trace_reason
-        return QueryPlan(agent_trace=[trace_reason]), [], trace_reason
+            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, trend_plan, asset_pack)
+            if not coverage_gaps:
+                trend_plan.agent_trace.extend([trace_reason, "planner.multi_metric_trend_fallback_after_llm_failure"])
+                return trend_plan, [], "SEMANTIC_FAST_PATH"
+            rejected_trace.extend(fallback_coverage_rejection_trace("multi_metric_trend", coverage_gaps))
+        return QueryPlan(agent_trace=[trace_reason, *rejected_trace, "planner.failure_fallback=fail_closed_coverage"]), [], trace_reason
 
 
 @dataclass
@@ -188,3 +200,11 @@ class GraphContractValidator:
 
     def validate(self, *args: Any, **kwargs: Any) -> Any:
         return self.validator.validate(*args, **kwargs)
+
+
+def fallback_coverage_rejection_trace(candidate: str, gaps: List[GraphValidationGap]) -> List[str]:
+    return [
+        "planner.failure_fallback.coverage_rejected=%s:%s:%s"
+        % (candidate, gap.code, gap.evidence)
+        for gap in gaps[:8]
+    ]

@@ -43,10 +43,13 @@ from merchant_ai.services.runs import (
     AgentRunStreamService,
     run_duration_ms,
     run_summary_payload,
+    valid_run_id,
+    valid_thread_id,
 )
 from merchant_ai.services.security import (
     Permission,
     authorize_merchant_access,
+    identity_scope_hash,
     merchant_principal,
     ops_principal,
     resolve_authenticated_identity,
@@ -168,6 +171,44 @@ def require_ops_merchant_access(merchant_id: str, permission: Permission = Permi
     return authorize_merchant_access(settings, ops_principal(), merchant_id or settings.merchant_id, permission)
 
 
+def require_thread_access(
+    thread_id: str,
+    merchant_id: str = "",
+    authorization: Optional[str] = None,
+    requested_identity: Any = None,
+) -> Any:
+    if not valid_thread_id(thread_id):
+        raise HTTPException(status_code=400, detail="invalid threadId")
+    thread = run_manager.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="thread not found")
+    requested_merchant = str(merchant_id or thread.merchant_id).strip()
+    if requested_merchant != thread.merchant_id:
+        raise HTTPException(status_code=403, detail="thread does not belong to requested merchantId")
+    identity = resolve_authenticated_identity(settings, authorization or "", requested_identity)
+    if identity and identity.merchant_id and identity.merchant_id != thread.merchant_id:
+        raise HTTPException(status_code=403, detail="authenticated identity cannot access thread")
+    if identity and thread.owner_scope_hash:
+        if identity_scope_hash(identity, thread.merchant_id) != thread.owner_scope_hash:
+            raise HTTPException(status_code=403, detail="authenticated identity scope cannot access thread")
+    require_merchant_access(thread.merchant_id)
+    return thread
+
+
+def require_thread_run_access(
+    thread_id: str,
+    run_id: str,
+    authorization: Optional[str] = None,
+) -> Any:
+    thread = require_thread_access(thread_id, authorization=authorization)
+    if not valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="invalid runId")
+    run = run_manager.get_run(run_id)
+    if not run or run.thread_id != thread.thread_id or run.merchant_id != thread.merchant_id:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
 def create_app(runtime_settings: Optional[Settings] = None) -> FastAPI:
     _init_services(runtime_settings)
     application = FastAPI(title="yshopping Merchant AI Python", version="0.1.0")
@@ -195,8 +236,19 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
     apply_request_identity(request, authorization)
     merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
     request.message = message_with_attachments(request.message, request.attachments, merchant_id)
-    thread = run_manager.create_thread(merchant_id, request.context.topic if request.context else "", request.context)
-    run = run_manager.create_run(thread.thread_id, merchant_id, request.message)
+    thread = run_manager.create_thread(
+        merchant_id,
+        request.context.topic if request.context else "",
+        request.context,
+        identity=request.user_identity,
+    )
+    run = run_manager.create_run(thread.thread_id, merchant_id, request.message, identity=request.user_identity)
+    message_history = run_manager.effective_message_history(
+        thread.thread_id,
+        merchant_id,
+        run.run_id,
+        request.message_history,
+    )
 
     def listener(event_type: str, node: str, payload: Dict[str, Any]) -> None:
         run_manager.append_event(run.run_id, thread.thread_id, event_type, node, payload)
@@ -209,7 +261,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
             listener,
             thread.thread_id,
             run.run_id,
-            message_history=request.message_history,
+            message_history=message_history,
         )
         run_manager.complete_run(run.run_id, response)
         return response.model_dump(by_alias=True)
@@ -222,6 +274,8 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
 def stream_chat(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)):
     apply_request_identity(request, authorization)
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    if request.thread_id:
+        require_thread_access(request.thread_id, request.merchant_id, authorization, request.user_identity)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     return StreamingResponse(stream_service.stream(request), media_type="text/event-stream")
 
@@ -230,6 +284,8 @@ def stream_chat(request: RunCreateRequest, authorization: Optional[str] = Header
 def create_async_run(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     apply_request_identity(request, authorization)
     request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    if request.thread_id:
+        require_thread_access(request.thread_id, request.merchant_id, authorization, request.user_identity)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     run = async_run_service.submit(request)
     return {
@@ -254,6 +310,7 @@ def resume_chat(request: RunCreateRequest, authorization: Optional[str] = Header
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     if not request.thread_id:
         raise HTTPException(status_code=400, detail="threadId is required for resume")
+    require_thread_access(request.thread_id, request.merchant_id, authorization, request.user_identity)
     run = async_run_service.submit(request)
     return {
         "success": True,
@@ -389,34 +446,37 @@ def ops_runs_dashboard(_auth: None = OpsAuth) -> HTMLResponse:
 
 
 @router.post("/api/threads")
-def create_thread(request: Optional[RunCreateRequest] = None) -> Dict[str, Any]:
+def create_thread(
+    request: Optional[RunCreateRequest] = None,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     safe = request or RunCreateRequest()
+    apply_request_identity(safe, authorization)
     merchant_id = require_merchant_access(safe.merchant_id or settings.merchant_id)
-    thread = run_manager.create_thread(merchant_id, safe.context.topic if safe.context else "", safe.context)
+    thread = run_manager.create_thread(
+        merchant_id,
+        safe.context.topic if safe.context else "",
+        safe.context,
+        identity=safe.user_identity,
+    )
     return {"success": True, "thread": jsonable_encoder(thread, by_alias=True)}
 
 
 @router.get("/api/threads/{thread_id}")
-def get_thread(thread_id: str = ApiPath(...)) -> Dict[str, Any]:
-    thread = run_manager.get_thread(thread_id)
-    if not thread:
-        return {"success": False, "message": "thread not found", "threadId": thread_id}
+def get_thread(thread_id: str = ApiPath(...), authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    thread = require_thread_access(thread_id, authorization=authorization)
     return {"success": True, "thread": jsonable_encoder(thread, by_alias=True)}
 
 
 @router.get("/api/threads/{thread_id}/runs/{run_id}")
-def get_run(thread_id: str, run_id: str) -> Dict[str, Any]:
-    run = run_manager.get_run(run_id)
-    if not run or run.thread_id != thread_id:
-        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+def get_run(thread_id: str, run_id: str, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    run = require_thread_run_access(thread_id, run_id, authorization)
     return {"success": True, "run": jsonable_encoder(run, by_alias=True)}
 
 
 @router.get("/api/threads/{thread_id}/runs/{run_id}/events")
-def get_run_events(thread_id: str, run_id: str) -> Dict[str, Any]:
-    run = run_manager.get_run(run_id)
-    if not run or run.thread_id != thread_id:
-        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+def get_run_events(thread_id: str, run_id: str, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    require_thread_run_access(thread_id, run_id, authorization)
     return {
         "success": True,
         "runId": run_id,
@@ -426,10 +486,12 @@ def get_run_events(thread_id: str, run_id: str) -> Dict[str, Any]:
 
 
 @router.get("/api/threads/{thread_id}/runs/{run_id}/trace")
-def get_run_trace(thread_id: str, run_id: str, _auth: None = OpsAuth) -> Dict[str, Any]:
-    run = run_manager.get_run(run_id)
-    if not run or run.thread_id != thread_id:
-        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+def get_run_trace(
+    thread_id: str,
+    run_id: str,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    require_thread_run_access(thread_id, run_id)
     trace = run_manager.trace(run_id)
     if trace is None:
         return {"success": False, "message": "trace not found", "threadId": thread_id, "runId": run_id}
@@ -437,10 +499,12 @@ def get_run_trace(thread_id: str, run_id: str, _auth: None = OpsAuth) -> Dict[st
 
 
 @router.get("/api/threads/{thread_id}/runs/{run_id}/checkpoint")
-def get_run_checkpoint(thread_id: str, run_id: str, _auth: None = OpsAuth) -> Dict[str, Any]:
-    run = run_manager.get_run(run_id)
-    if not run or run.thread_id != thread_id:
-        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+def get_run_checkpoint(
+    thread_id: str,
+    run_id: str,
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    run = require_thread_run_access(thread_id, run_id)
     try:
         checkpoint = workflow.checkpoint_state_summary(thread_id, run_id)
     except Exception as exc:
@@ -449,10 +513,8 @@ def get_run_checkpoint(thread_id: str, run_id: str, _auth: None = OpsAuth) -> Di
 
 
 @router.post("/api/threads/{thread_id}/runs/{run_id}/cancel")
-def cancel_run(thread_id: str, run_id: str) -> Dict[str, Any]:
-    run = run_manager.get_run(run_id)
-    if not run or run.thread_id != thread_id:
-        return {"success": False, "message": "run not found", "threadId": thread_id, "runId": run_id}
+def cancel_run(thread_id: str, run_id: str, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    require_thread_run_access(thread_id, run_id, authorization)
     return {"success": True, "run": jsonable_encoder(async_run_service.cancel(run_id), by_alias=True)}
 
 

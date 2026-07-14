@@ -92,8 +92,7 @@
   },
   {
     "metricKey": "pay_gmv_amt_1d",
-    "canonicalMetricKey": "order_gmv_amt_1d",
-    "aliasOf": "order_gmv_amt_1d",
+    "canonicalMetricKey": "pay_gmv_amt_1d",
     "metricLevel": "business_variant",
     "businessName": "支付gmv金额元",
     "formula": "SUM(pay_gmv_amt_1d)",
@@ -517,8 +516,7 @@
   },
   {
     "metricKey": "trade_success_gmv_amt_1d",
-    "canonicalMetricKey": "order_gmv_amt_1d",
-    "aliasOf": "order_gmv_amt_1d",
+    "canonicalMetricKey": "trade_success_gmv_amt_1d",
     "metricLevel": "business_variant",
     "businessName": "交易成功gmv金额元",
     "formula": "SUM(trade_success_gmv_amt_1d)",
@@ -761,23 +759,17 @@
   },
   {
     "metricKey": "refund_rate_1d",
-    "businessName": "退货量占支付订单量比例",
+    "businessName": "每日退货率原始值",
     "formula": "AVG(refund_rate_1d)",
     "unit": "%",
-    "description": "退货量占支付订单量比例-最近1天",
+    "description": "表内每日退货率原始字段；跨天汇总不得直接 AVG，应使用分子分母重算",
     "sourceColumns": [
       "refund_rate_1d"
     ],
     "aliases": [
-      "退货量占支付订单量比例",
-      "退款率",
-      "退货率",
-      "售后率",
-      "整体退款率",
-      "店铺退款率",
-      "refund_rate",
+      "每日退货率原始值",
       "refund_rate_1d",
-      "退货量占支付订单量比例-最近1天"
+      "每日退货率"
     ],
     "confidence": 0.78,
     "evidence": "schema comment=退货量占支付订单量比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
@@ -869,6 +861,24 @@
     ],
     "confidence": 0.78,
     "evidence": "schema comment=商品审核通过量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+  },
+  {
+    "metricKey": "appeal_success_rate_1d",
+    "businessName": "申诉成功率",
+    "formula": "SUM(appeal_success_cnt_1d) / NULLIF(SUM(appeal_cnt_1d), 0)",
+    "unit": "%",
+    "description": "申诉成功次数占申诉次数的比例",
+    "sourceColumns": [
+      "appeal_success_cnt_1d",
+      "appeal_cnt_1d"
+    ],
+    "aliases": [
+      "店铺申诉成功率",
+      "店铺申诉通过率",
+      "appeal_success_rate_1d"
+    ],
+    "confidence": 0.9,
+    "evidence": "语义层派生指标：申诉成功次数 / 申诉次数"
   },
   {
     "metricKey": "net_gmv_after_refund",

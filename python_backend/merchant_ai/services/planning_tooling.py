@@ -28,14 +28,16 @@ def compact_openai_tool_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     return compact
 
 
-def planner_prompt_stats(system_prompt: str, user_prompt: str, tool_schema: Dict[str, Any]) -> Dict[str, Any]:
+def planner_prompt_stats(system_prompt: str, user_prompt: str, tool_schema: Any) -> Dict[str, Any]:
     tool_chars = len(json.dumps(tool_schema, ensure_ascii=False, sort_keys=True, default=str))
+    schema_count = len(tool_schema) if isinstance(tool_schema, list) else (1 if tool_schema else 0)
     return {
         "systemPromptChars": len(system_prompt or ""),
         "userPromptChars": len(user_prompt or ""),
         "toolSchemaChars": tool_chars,
         "totalChars": len(system_prompt or "") + len(user_prompt or "") + tool_chars,
-        "schemaMode": "compact_tool_schema",
+        "toolSchemaCount": schema_count,
+        "schemaMode": "runtime_tool_bundle" if isinstance(tool_schema, list) else "compact_tool_schema",
     }
 
 
@@ -231,18 +233,42 @@ def artifact_summary(artifact: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def compact_planner_context(planner_context: Dict[str, Any] | None) -> Dict[str, Any]:
+def compact_planner_context(planner_context: Dict[str, Any] | None, budget_level: int = 0) -> Dict[str, Any]:
     if not isinstance(planner_context, dict):
         return {}
+    result: Dict[str, Any] = {}
     diagnostic = planner_context.get("openDiagnostic") or planner_context.get("open_diagnostic") or {}
-    if not isinstance(diagnostic, dict) or not diagnostic.get("scope"):
-        return {}
-    return {
-        "scope": str(diagnostic.get("scope") or ""),
-        "intent": str(diagnostic.get("intent") or ""),
-        "goal": str(diagnostic.get("goal") or ""),
-        "seedTopics": [str(item) for item in diagnostic.get("seedTopics") or diagnostic.get("seed_topics") or [] if item][:8],
-    }
+    if isinstance(diagnostic, dict) and diagnostic.get("scope"):
+        result.update(
+            {
+                "scope": str(diagnostic.get("scope") or ""),
+                "intent": str(diagnostic.get("intent") or ""),
+                "goal": str(diagnostic.get("goal") or ""),
+                "seedTopics": [
+                    str(item)
+                    for item in diagnostic.get("seedTopics") or diagnostic.get("seed_topics") or []
+                    if item
+                ][:8],
+            }
+        )
+    conversation = planner_context.get("conversationContext") or planner_context.get("conversation_context") or {}
+    if isinstance(conversation, dict) and conversation:
+        recent_limit = 2 if budget_level >= 2 else 6
+        result["conversationContext"] = {
+            "trust": "untrusted_conversation_data",
+            "previousQuestion": str(conversation.get("previousQuestion") or "")[: 300 if budget_level >= 2 else 600],
+            "previousAnswerPreview": str(conversation.get("previousAnswerPreview") or "")[: 400 if budget_level >= 2 else 800],
+            "previousSummary": "" if budget_level >= 2 else str(conversation.get("previousSummary") or "")[:1000],
+            "recentMessages": [
+                {
+                    "role": str(item.get("role") or ""),
+                    "text": str(item.get("text") or "")[:800],
+                }
+                for item in conversation.get("recentMessages") or []
+                if isinstance(item, dict) and str(item.get("role") or "") in {"user", "assistant"}
+            ][-recent_limit:],
+        }
+    return result
 
 
 def compact_memory_constraints(planner_context: Dict[str, Any] | None) -> List[Dict[str, Any]]:
