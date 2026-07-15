@@ -1232,10 +1232,10 @@ class QueryGraphPlanner:
         if diagnostic_plan.intents:
             diagnostic_plan.agent_trace.append("planner.semantic_fast_path=canonical_recalled_diagnostic")
             return diagnostic_plan
-        topn_plan = compile_semantic_topn_metric_fast_graph(question, asset_pack)
-        if topn_plan.intents:
-            topn_plan.agent_trace.append("planner.semantic_fast_path=topn_metric")
-            return topn_plan
+        # Ranking questions need the planner to decide the entity grain, scope,
+        # and whether the user is asking for comparison, trend, or true TopN.
+        # Keep the compiler available for explicit tools/skills, but do not let
+        # the default fast path infer ranking from a few surface words.
         trend_plan = compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
         if trend_plan.intents:
             trend_plan.agent_trace.append("planner.semantic_fast_path=multi_metric_trend")

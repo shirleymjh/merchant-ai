@@ -177,7 +177,7 @@ from merchant_ai.services.tools import (
     semantic_file_tool_definitions,
     semantic_file_tool_schemas,
 )
-from merchant_ai.services.time_semantics import apply_time_range_to_plan, resolve_time_range
+from merchant_ai.services.time_semantics import apply_time_window_contract_to_plan, resolve_time_range, resolve_time_window_contract
 from merchant_ai.services.tool_runtime import tool_runtime_scope
 from merchant_ai.services.security import identity_scope_hash, identity_scope_payload
 
@@ -3655,6 +3655,53 @@ class MerchantQaWorkflow:
                 "reason": str(selection_payload.get("reason") or ""),
             } if selection_payload else {},
         }
+        selection_action = str(selection_payload.get("action") or "").strip().lower()
+        selection_status = str(selection_payload.get("status") or "").strip().upper()
+        if not plan.intents and selection_payload and (
+            selection_action in {"ask_human", "clarify", "clarification"}
+            or selection_status in {"AMBIGUOUS", "NEED_CLARIFICATION"}
+        ):
+            clarifications = [item for item in (selection_payload.get("clarifications") or []) if isinstance(item, dict)]
+            first = clarifications[0] if clarifications else {}
+            question = str(first.get("question") or selection_payload.get("reason") or "请确认你想看的指标口径。").strip()
+            options: List[str] = []
+            for option in first.get("options") or []:
+                if isinstance(option, dict):
+                    label = str(option.get("label") or option.get("ref") or "").strip()
+                else:
+                    label = str(option or "").strip()
+                if label and label not in options:
+                    options.append(label)
+            self.request_human_clarification(state, question, "METRIC_SCOPE", "metric_focus", options)
+            state["query_metric_trace"] = {
+                **dict(state.get("query_metric_trace") or {}),
+                "status": "needs_clarification",
+                "clarification": {
+                    "question": question,
+                    "options": options,
+                    "reason": str(selection_payload.get("reason") or ""),
+                    "clarifications": clarifications,
+                },
+            }
+            add_step(state, "Metric Tool query_metric：语义选择需要确认指标口径，调用 ask_human")
+            self.record_span(
+                state,
+                "semantic_tool",
+                "query_metric",
+                started,
+                status="gap",
+                error_code="METRIC_SELECTION_REQUIRES_CLARIFICATION",
+                metadata=state["query_metric_trace"],
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="semantic selection -> ask_human",
+                error_code="METRIC_SELECTION_REQUIRES_CLARIFICATION",
+            )
+            emit(state, "node.completed", "QUERY_METRIC", {"supported": False, "clarificationRequired": True})
+            return state
         if not plan.intents:
             self.escalate_fast_request(state, "query_metric could not resolve one governed semantic metric from the current Topic workspace")
             add_step(state, "Metric Tool query_metric：当前 Topic 资产包未能唯一解析受控单指标，交回 Planner 多轮探索")
@@ -3899,10 +3946,9 @@ class MerchantQaWorkflow:
             planner_context,
         )
         if self.settings.calendar_time_semantics_enabled:
-            plan = apply_time_range_to_plan(
-                plan,
-                resolve_time_range(state["question"], self.settings.business_timezone),
-            )
+            time_window_contract = resolve_time_window_contract(state["question"], self.settings.business_timezone)
+            state["time_window_contract"] = time_window_contract
+            plan = apply_time_window_contract_to_plan(plan, time_window_contract)
         state["plan"] = plan
         state["candidate_query_graphs"] = self.controlled_react_explorer.evaluate_candidates(
             state.get("hypothesis_exploration") or {},
@@ -8177,9 +8223,22 @@ class MerchantQaWorkflow:
         }
 
     def request_human_clarification(self, state: AgentState, question: str, stage: str, type_: str, options: List[str]) -> None:
+        question_text = str(question or "").strip()
+        metric_gap = re.search(r"(?:当前)?候选(?:指标)?中没有明确的[“\"]?(.+?)[”\"]?指标", question_text)
+        if metric_gap:
+            metric_label = metric_gap.group(1).strip(" “”\"")
+            question_text = "我还不能确定你想看的%s口径，请确认一下。" % (metric_label or "指标")
+        else:
+            question_text = (
+                question_text.replace("当前候选中", "当前可用口径里")
+                .replace("当前候选指标中", "当前可用口径里")
+                .replace("候选指标中", "当前可用口径里")
+                .replace("候选中", "当前可用口径里")
+                .replace("QueryGraph", "查询计划")
+            )
         state["human_clarification_required"] = True
         state["scope_clarified"] = False
-        state["human_clarification_question"] = question
+        state["human_clarification_question"] = question_text
         state["human_clarification_stage"] = stage
         state["human_clarification_type"] = type_
         state["human_clarification_options"] = options

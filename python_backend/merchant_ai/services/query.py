@@ -1902,7 +1902,7 @@ class NodeWorkerExecutor:
                 )
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris", action="query_doris", observation="rows=%s" % len(rows)))
                 entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
-                display_rows = apply_column_masks(rows, contract)
+                display_rows = annotate_time_window_result_rows(apply_column_masks(rows, contract), intent)
                 self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success")
                 artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                 preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
@@ -1967,7 +1967,7 @@ class NodeWorkerExecutor:
                     cache_key = str(split_result.get("cacheKey") or "")
                     split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
                     split_events = list(split_result.get("runtimeEvents") or [])
-                    display_rows = apply_column_masks(rows, contract)
+                    display_rows = annotate_time_window_result_rows(apply_column_masks(rows, contract), intent)
                     self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success_split_fallback")
                     artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                     preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
@@ -3021,6 +3021,7 @@ class NodeWorkerExecutor:
                         partition_column="pt",
                         tenant_column=tenant_column,
                         tenant_value_sql=sql_literal(context.merchant_id) if tenant_column else "",
+                        offset_days=int(getattr(intent.time_range, "offset_days", 0) or 0),
                     )
                 )
         return where
@@ -3501,6 +3502,28 @@ def merge_query_bundles(bundles: List[QueryBundle]) -> QueryBundle:
     )
 
 
+def annotate_time_window_result_rows(rows: List[Dict[str, Any]], intent: QuestionIntent) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+    time_range = intent.time_range
+    role = str(getattr(time_range, "window_role", "") or (intent.metric_resolution or {}).get("timeWindowRole") or "").strip()
+    label = str(getattr(time_range, "label", "") or "").strip()
+    if not role and not label:
+        return rows
+    annotated: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if role:
+            item["__timeWindowRole"] = role
+        if label:
+            item["__timeWindowLabel"] = label
+        comparison_type = str(getattr(time_range, "comparison_type", "") or "").strip()
+        if comparison_type:
+            item["__timeWindowComparisonType"] = comparison_type
+        annotated.append(item)
+    return annotated
+
+
 ENTITY_MERGE_KEY_PRIORITY = [
     "spu_id",
     "sku_id",
@@ -3819,6 +3842,10 @@ def same_table_metric_base_key(intent: QuestionIntent, asset_pack: PlanningAsset
         intent.filter_column,
         str(intent.filter_value or ""),
         int(intent.days or 0),
+        str(getattr(intent.time_range, "window_role", "") or ""),
+        int(getattr(intent.time_range, "offset_days", 0) or 0),
+        str(getattr(intent.time_range, "start_date", "") or ""),
+        str(getattr(intent.time_range, "end_date", "") or ""),
     )
 
 

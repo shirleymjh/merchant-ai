@@ -47,6 +47,7 @@ def answer_context_policy() -> str:
     return (
         "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft、mandatoryAnswerSkeleton；不要读取或推断 QueryGraph。"
         "metricFacts 是本轮必须覆盖的指标事实清单，最终回答必须自然覆盖其中每个指标名称、数值和时间范围；不要遗漏，也不要机械照抄模板。"
+        "metricComparisonFacts 是已验证的同指标跨时间窗口对比事实；用户问相比、变化、环比时必须覆盖当前值、对比窗口值和变化方向。"
         "verifiedFacts 是数字、日期、实体和排序结论的唯一事实来源；任何事实陈述都必须能直接绑定其中的 factId，不能补充未出现的数值或业务实体。"
         "mandatoryAnswerSkeleton 是必须覆盖的答案事实骨架；可以改写成自然语言，但不能遗漏其中的指标、数值、时间范围和缺口说明。"
         "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
@@ -1962,6 +1963,7 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
         return []
     values: List[Dict[str, Any]] = []
     seen: set[str] = set()
+    comparison_plan = plan_has_time_window_comparison(plan)
     for intent in plan.intents:
         if not intent:
             continue
@@ -1981,9 +1983,10 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
         if metric_spec_values:
             for item in metric_spec_values:
                 metric_key = str(item.get("metricKey") or "")
-                if not metric_key or metric_key in seen:
+                seen_key = summary_metric_seen_key(metric_key, str(item.get("timeWindowRole") or ""), comparison_plan)
+                if not metric_key or seen_key in seen:
                     continue
-                seen.add(metric_key)
+                seen.add(seen_key)
                 values.append(item)
             continue
         value_column = metric_value_column_for_rows(plan, intent, rows)
@@ -1994,15 +1997,19 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
             continue
         resolution = intent.metric_resolution or {}
         metric_key = str(resolution.get("metricKey") or intent.metric_name or value_column)
-        if metric_key in seen:
+        time_role = answer_time_window_role(intent, rows[0])
+        seen_key = summary_metric_seen_key(metric_key, time_role, comparison_plan)
+        if seen_key in seen:
             continue
-        seen.add(metric_key)
+        seen.add(seen_key)
         values.append(
             {
                 "metricKey": metric_key,
                 "label": str(resolution.get("displayName") or friendly_column_label(plan, value_column)),
                 "value": value,
                 "taskId": intent.plan_task_id,
+                "timeWindowRole": time_role,
+                "timeWindowLabel": answer_time_window_label(intent, rows[0]),
             }
         )
     return values
@@ -2049,9 +2056,49 @@ def summary_metric_spec_values(plan: QueryPlan, intent: QuestionIntent, rows: Li
                 "label": metric_spec_label(plan, intent, spec, key, value_column),
                 "value": value,
                 "taskId": intent.plan_task_id,
+                "timeWindowRole": answer_time_window_role(intent, rows[0]),
+                "timeWindowLabel": answer_time_window_label(intent, rows[0]),
             }
         )
     return values
+
+
+def plan_has_time_window_comparison(plan: QueryPlan) -> bool:
+    contract = (plan.question_understanding or {}).get("timeWindowContract") or {}
+    if isinstance(contract, dict) and contract.get("requiresComparison"):
+        return True
+    for intent in plan.intents:
+        if answer_time_window_role(intent, {}) == "comparison":
+            return True
+    return False
+
+
+def summary_metric_seen_key(metric_key: str, time_role: str, comparison_plan: bool) -> str:
+    if comparison_plan:
+        return "%s|%s" % (metric_key, time_role or "primary")
+    return metric_key
+
+
+def answer_time_window_role(intent: QuestionIntent | None, row: Dict[str, Any]) -> str:
+    row_role = str((row or {}).get("__timeWindowRole") or "").strip()
+    if row_role:
+        return row_role
+    if intent:
+        role = str(getattr(intent.time_range, "window_role", "") or (intent.metric_resolution or {}).get("timeWindowRole") or "").strip()
+        if role:
+            return role
+    return ""
+
+
+def answer_time_window_label(intent: QuestionIntent | None, row: Dict[str, Any]) -> str:
+    row_label = str((row or {}).get("__timeWindowLabel") or "").strip()
+    if row_label:
+        return row_label
+    if intent:
+        label = str(getattr(intent.time_range, "label", "") or "").strip()
+        if label:
+            return label
+    return ""
 
 
 def metric_spec_label(
@@ -2110,21 +2157,87 @@ def answer_metric_facts(question: str, plan: QueryPlan, run_result: AgentRunResu
     if not summaries:
         return []
     time_phrase = extract_question_time_phrase(question) or "本次查询范围"
+    comparison_by_metric = {
+        str(item.get("metricKey") or ""): item
+        for item in summaries
+        if str(item.get("timeWindowRole") or "") == "comparison"
+    }
     facts: List[Dict[str, Any]] = []
     for item in summaries[:8]:
         label = str(item.get("label") or item.get("metricKey") or "指标")
         metric_key = str(item.get("metricKey") or "")
-        facts.append(
-            {
-                "metricKey": metric_key,
-                "displayName": label,
-                "value": item.get("value"),
-                "formattedValue": format_metric_value_for_answer(item.get("value"), metric_key, label),
-                "timeRange": time_phrase,
-                "taskId": item.get("taskId") or "",
-            }
-        )
+        time_label = str(item.get("timeWindowLabel") or "").strip() or time_phrase
+        fact = {
+            "metricKey": metric_key,
+            "displayName": label,
+            "value": item.get("value"),
+            "formattedValue": format_metric_value_for_answer(item.get("value"), metric_key, label),
+            "timeRange": time_label,
+            "timeWindowRole": item.get("timeWindowRole") or "",
+            "taskId": item.get("taskId") or "",
+        }
+        if str(item.get("timeWindowRole") or "") == "primary":
+            comparison = comparison_by_metric.get(metric_key)
+            if comparison:
+                fact.update(metric_comparison_payload(item, comparison))
+        facts.append(fact)
     return facts
+
+
+def answer_metric_comparison_facts(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> List[Dict[str, Any]]:
+    return [fact for fact in answer_metric_facts(question, plan, run_result) if fact.get("comparisonValue") not in (None, "")]
+
+
+def metric_comparison_payload(primary: Dict[str, Any], comparison: Dict[str, Any]) -> Dict[str, Any]:
+    label = str(primary.get("label") or primary.get("metricKey") or "指标")
+    metric_key = str(primary.get("metricKey") or "")
+    primary_value = answer_numeric_value(primary.get("value"))
+    comparison_value = answer_numeric_value(comparison.get("value"))
+    payload: Dict[str, Any] = {
+        "comparisonTimeRange": comparison.get("timeWindowLabel") or "对比窗口",
+        "comparisonValue": comparison.get("value"),
+        "formattedComparisonValue": format_metric_value_for_answer(comparison.get("value"), metric_key, label),
+    }
+    if primary_value is None or comparison_value is None:
+        return payload
+    change_value = primary_value - comparison_value
+    change_rate = (change_value / abs(comparison_value)) if comparison_value else None
+    payload.update(
+        {
+            "changeValue": change_value,
+            "formattedChangeValue": format_metric_change_value_for_answer(change_value, metric_key, label),
+            "changeRate": change_rate,
+            "formattedChangeRate": format_signed_percent(change_rate) if change_rate is not None else "",
+            "direction": metric_change_direction(change_value),
+        }
+    )
+    return payload
+
+
+def metric_change_direction(change_value: float) -> str:
+    if abs(change_value) <= 1e-12:
+        return "持平"
+    return "上升" if change_value > 0 else "下降"
+
+
+def format_metric_change_value_for_answer(value: float, metric_key: str, label: str = "") -> str:
+    metric_text = "%s %s" % (metric_key or "", label or "")
+    if re.search(r"(rate|ratio|比例|占比|率)", metric_text, flags=re.I):
+        points = abs(float(value or 0)) * 100
+        if float(points).is_integer():
+            return "%s个百分点" % int(points)
+        return ("%.2f个百分点" % points).replace(".00个百分点", "个百分点")
+    return format_metric_value_for_answer(abs(value), metric_key, label)
+
+
+def format_signed_percent(value: float | None) -> str:
+    if value is None:
+        return ""
+    percent = float(value) * 100
+    sign = "+" if percent > 0 else ""
+    if float(percent).is_integer():
+        return "%s%d%%" % (sign, int(percent))
+    return ("%s%.2f%%" % (sign, percent)).replace(".00%", "%")
 
 
 def include_mandatory_skeleton_in_answer_prompt(
@@ -2141,6 +2254,8 @@ def include_mandatory_skeleton_in_answer_prompt(
         return True
     coverage = answer_requirement_coverage(question, plan, run_result)
     if coverage.get("shouldBlockDirectAnswer"):
+        return True
+    if answer_metric_comparison_facts(question, plan, run_result):
         return True
     return not bool(answer_metric_facts(question, plan, run_result))
 
@@ -2287,6 +2402,10 @@ def allowed_answer_numbers(
         value = numeric_token_value(fact.get("value"))
         if value is not None:
             values.append(value)
+        for key in ["comparisonValue", "changeValue", "changeRate"]:
+            numeric = numeric_token_value(fact.get(key))
+            if numeric is not None:
+                values.append(numeric)
     if run_result:
         for row in list(getattr(getattr(run_result, "merged_query_bundle", None), "rows", []) or [])[:20]:
             for value in row.values():
@@ -2357,6 +2476,9 @@ def summary_metric_sentence(question: str, plan: QueryPlan, run_result: AgentRun
 def summary_metric_sentence_from_items(question: str, summaries: List[Dict[str, Any]]) -> str:
     if not summaries:
         return ""
+    comparison_sentence = comparison_metric_sentence_from_items(question, summaries)
+    if comparison_sentence:
+        return comparison_sentence
     time_phrase = extract_question_time_phrase(question)
     prefix = "%s，" % time_phrase if time_phrase else "当前查询范围内，"
     parts = []
@@ -2365,6 +2487,44 @@ def summary_metric_sentence_from_items(question: str, summaries: List[Dict[str, 
         value = format_metric_value_for_answer(item.get("value"), item.get("metricKey") or "", str(label))
         parts.append("%s为 %s" % (label, value))
     return prefix + "，".join(parts) + "。"
+
+
+def comparison_metric_sentence_from_items(question: str, summaries: List[Dict[str, Any]]) -> str:
+    if not summaries:
+        return ""
+    primary_items = [item for item in summaries if str(item.get("timeWindowRole") or "") == "primary"]
+    comparison_by_metric = {
+        str(item.get("metricKey") or ""): item
+        for item in summaries
+        if str(item.get("timeWindowRole") or "") == "comparison"
+    }
+    if not primary_items or not comparison_by_metric:
+        return ""
+    time_phrase = primary_items[0].get("timeWindowLabel") or extract_question_time_phrase(question) or "当前查询范围"
+    parts: List[str] = []
+    for item in primary_items[:6]:
+        metric_key = str(item.get("metricKey") or "")
+        comparison = comparison_by_metric.get(metric_key)
+        if not comparison:
+            continue
+        label = str(item.get("label") or metric_key or "指标")
+        current_value = format_metric_value_for_answer(item.get("value"), metric_key, label)
+        comparison_label = str(comparison.get("timeWindowLabel") or "对比窗口")
+        comparison_value = format_metric_value_for_answer(comparison.get("value"), metric_key, label)
+        payload = metric_comparison_payload(item, comparison)
+        direction = str(payload.get("direction") or "")
+        if direction == "持平":
+            change_text = "持平"
+        elif direction:
+            rate_text = str(payload.get("formattedChangeRate") or "").strip()
+            suffix = "，%s" % rate_text if rate_text else ""
+            change_text = "%s %s%s" % (direction, payload.get("formattedChangeValue") or "", suffix)
+        else:
+            change_text = "已完成对比"
+        parts.append("%s为 %s（%s为 %s，%s）" % (label, current_value, comparison_label, comparison_value, change_text))
+    if not parts:
+        return ""
+    return "%s，%s。" % (time_phrase, "；".join(parts))
 
 
 def chart_hint_sentence(plan: QueryPlan, run_result: AgentRunResult | None) -> str:
@@ -3911,6 +4071,9 @@ def answer_data_package(
     metric_facts = answer_metric_facts(question, plan, run_result)
     if metric_facts:
         payload["metricFacts"] = metric_facts
+    comparison_facts = [fact for fact in metric_facts if fact.get("comparisonValue") not in (None, "")]
+    if comparison_facts:
+        payload["metricComparisonFacts"] = comparison_facts
     return payload
 
 

@@ -646,6 +646,9 @@ class ResolvedTimeRange(APIModel):
     anchor_policy: str = "calendar"
     explicit: bool = False
     source: str = ""
+    window_role: str = "primary"
+    offset_days: int = 0
+    comparison_type: str = ""
 
 
 class FastUnderstandingResult(APIModel):
