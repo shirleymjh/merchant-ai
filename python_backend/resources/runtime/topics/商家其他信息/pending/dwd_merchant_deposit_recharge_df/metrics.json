@@ -1,7 +1,7 @@
 [
   {
     "metricKey": "deposit_recharge_amt",
-    "businessName": "保证金充值金额",
+    "businessName": "保证金明细充值金额",
     "formula": "SUM(deposit_recharge_amt)",
     "unit": "元",
     "description": "金额, 通用单位元",
@@ -9,20 +9,30 @@
       "deposit_recharge_amt"
     ],
     "aliases": [
+      "保证金明细充值金额",
       "deposit_recharge_amt",
       "金额, 通用单位元",
-      "保证金充值金额",
       "保证金补缴金额",
-      "保证金缴纳金额",
-      "充值金额",
-      "补缴金额"
+      "保证金缴纳金额"
     ],
     "confidence": 0.78,
-    "evidence": "schema comment=金额, 通用单位元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    "evidence": "schema comment=金额, 通用单位元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+    "displayName": "保证金明细充值金额",
+    "disambiguationName": "保证金明细充值金额",
+    "tableKind": "detail_fact",
+    "metricGrain": "merchant_deposit_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "保证金充值金额",
+    "originalBusinessName": "保证金充值金额",
+    "naturalAlias": "保证金充值金额",
+    "sourceColumnAliases": [
+      "deposit_recharge_amt"
+    ]
   },
   {
     "metricKey": "deposit_recharge_cnt",
-    "businessName": "保证金充值流水数",
+    "businessName": "保证金明细充值流水数",
     "formula": "COUNT(DISTINCT deposit_recharge_id)",
     "unit": "笔",
     "description": "按保证金补缴/充值申请号去重统计流水数",
@@ -30,9 +40,22 @@
       "deposit_recharge_id"
     ],
     "aliases": [
-      "保证金充值流水数"
+      "保证金明细充值流水数",
+      "deposit_recharge_cnt"
     ],
     "confidence": 0.82,
-    "evidence": "由 Topic Builder 基于字段组合自动生成"
+    "evidence": "由 Topic Builder 基于字段组合自动生成",
+    "displayName": "保证金明细充值流水数",
+    "disambiguationName": "保证金明细充值流水数",
+    "tableKind": "detail_fact",
+    "metricGrain": "merchant_deposit_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "保证金充值流水数",
+    "originalBusinessName": "保证金充值流水数",
+    "naturalAlias": "保证金充值流水数",
+    "sourceColumnAliases": [
+      "deposit_recharge_id"
+    ]
   }
 ]

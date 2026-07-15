@@ -594,6 +594,30 @@ def test_memory_query_understanding_uses_small_model_profile_and_state_cache():
     assert context["semanticHints"]["source"] == "small_model"
 
 
+def test_memory_query_understanding_skips_model_when_structured_recall_signals_are_present():
+    class FailingLlm:
+        configured = True
+
+        def json_chat(self, *_args, **_kwargs):
+            raise AssertionError("structured memory recall should not call query understanding LLM")
+
+    service = MemoryQueryUnderstandingService(
+        get_settings().model_copy(update={"memory_query_understanding_enabled": True}),
+        llm=FailingLlm(),
+    )
+    state = {
+        "question": "最近7天退款率是多少？",
+        "route_slots": {"timeWindow": {"days": 7}},
+        "topic_routing_decision": {"topicIds": ["REFUND"]},
+    }
+
+    profile = service.ensure_state_profile(state)
+
+    assert profile["status"] == "rule_sufficient"
+    assert profile["source"] == "rule_fallback"
+    assert profile["skipReason"] == "structured_recall_signals_present"
+
+
 def test_memory_query_understanding_uses_ttl_cache_across_states():
     class FakeLlm:
         configured = True

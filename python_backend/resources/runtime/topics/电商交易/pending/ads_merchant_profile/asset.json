@@ -6,7 +6,8 @@
       "metricKey": "gmv",
       "sourceColumns": [
         "pay_amt_new"
-      ]
+      ],
+      "description": "gmv"
     }
   ]
 }

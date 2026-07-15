@@ -35,15 +35,30 @@ from merchant_ai.services.tools import AgentToolDefinition
 
 
 class TopicAssetService:
-    MANAGED_TABLE_FILENAMES = {
-        "asset.json",
+    SEMANTIC_LIST_FIELDS = {
+        "schemaColumns",
+        "semanticColumns",
+        "metrics",
+        "terms",
+        "knowledgeRules",
+    }
+    SEMANTIC_SIDECAR_FILES = {
         "schema.json",
-        "sample_rows.json",
-        "sample_profile.json",
         "semantic_columns.json",
         "metrics.json",
         "terms.json",
         "knowledge_rules.json",
+        "schema.md",
+        "semantic_columns.md",
+        "metrics.md",
+        "terms.md",
+        "knowledge_rules.md",
+        "review.md",
+    }
+    MANAGED_TABLE_FILENAMES = {
+        "asset.json",
+        "sample_rows.json",
+        "sample_profile.json",
         "asset_production_report.json",
     }
     GOVERNANCE_FILENAMES = {
@@ -82,6 +97,7 @@ class TopicAssetService:
         write_json(pending / "review-result.json", review_payload)
         if approved:
             target.mkdir(parents=True, exist_ok=True)
+            self._canonicalize_pending_asset(pending, topic, table_name)
             changed_files: List[str] = []
             unchanged_files: List[str] = []
             deleted_files: List[str] = []
@@ -97,6 +113,11 @@ class TopicAssetService:
                     changed_files.append(name)
                     continue
                 if target_path.exists() and target_path.is_file() and name not in self.GOVERNANCE_FILENAMES:
+                    target_path.unlink()
+                    deleted_files.append(name)
+            for name in sorted(self.SEMANTIC_SIDECAR_FILES):
+                target_path = target / name
+                if target_path.exists() and target_path.is_file():
                     target_path.unlink()
                     deleted_files.append(name)
             self._table_asset_cache.pop((topic, table_name), None)
@@ -154,31 +175,44 @@ class TopicAssetService:
         if cache_key in self._semantic_source_hash_cache:
             return self._semantic_source_hash_cache[cache_key]
         hasher = hashlib.sha256()
-        for topic in cache_key:
-            topic_dir = self.root / topic
-            if not topic_dir.exists():
+        for path in self.canonical_semantic_files(cache_key):
+            try:
+                hasher.update(str(path.relative_to(self.root)).encode("utf-8"))
+                hasher.update(path.read_bytes())
+            except Exception:
                 continue
-            for path in sorted(topic_dir.rglob("*")):
-                if not path.is_file() or path.name.startswith("."):
-                    continue
-                try:
-                    hasher.update(str(path.relative_to(self.root)).encode("utf-8"))
-                    hasher.update(path.read_bytes())
-                except Exception:
-                    continue
         digest = hasher.hexdigest()[:16]
         self._semantic_source_hash_cache[cache_key] = digest
         return digest
 
+    def canonical_semantic_files(self, topics: Iterable[str]) -> List[Path]:
+        files: List[Path] = []
+        for topic in sorted({str(item or "") for item in topics if item}):
+            topic_dir = self.root / topic
+            if not topic_dir.exists():
+                continue
+            for name in ["manifest.json", "relationships.json"]:
+                path = topic_dir / name
+                if path.exists() and path.is_file():
+                    files.append(path)
+            tables_dir = topic_dir / "tables"
+            for path in sorted(tables_dir.glob("*/asset.json")):
+                if path.exists() and path.is_file():
+                    files.append(path)
+        return files
+
     def load_topic_context(self, topic_names: Iterable[str]) -> str:
         parts: List[str] = []
         for topic in topic_names:
-            topic_dir = self.root / topic
-            for path in sorted(topic_dir.rglob("*.md")):
-                try:
-                    parts.append("## %s/%s\n%s" % (topic, path.name, path.read_text(encoding="utf-8")[:5000]))
-                except Exception:
+            manifest = self.load_manifest(str(topic))
+            if manifest:
+                parts.append("## %s/manifest.json\n%s" % (topic, json.dumps(manifest, ensure_ascii=False)[:5000]))
+            for item in manifest:
+                table = str(item.get("tableName") or "")
+                if not table:
                     continue
+                asset = self.load_table_asset(str(topic), table)
+                parts.append("## %s/%s/asset.json\n%s" % (topic, table, compact_semantic_asset_for_recall(asset)[:5000]))
         return "\n\n".join(parts)
 
     def table_asset_dir(self, topic: str, table: str) -> Path:
@@ -190,13 +224,6 @@ class TopicAssetService:
             return self._table_asset_cache[cache_key]
         table_dir = self.table_asset_dir(topic, table)
         asset = read_json(table_dir / "asset.json")
-        sidecar_fields = {
-            "schemaColumns": "schema.json",
-            "semanticColumns": "semantic_columns.json",
-            "metrics": "metrics.json",
-            "terms": "terms.json",
-            "knowledgeRules": "knowledge_rules.json",
-        }
         if not isinstance(asset, dict) or not asset:
             manifest_item = next((item for item in self.load_manifest(topic) if str(item.get("tableName") or "") == table), {})
             asset = {
@@ -208,14 +235,34 @@ class TopicAssetService:
             asset = {**asset}
             asset.setdefault("topic", topic)
             asset.setdefault("tableName", table)
-        for field, file_name in sidecar_fields.items():
-            sidecar = read_json(table_dir / file_name)
-            if sidecar:
-                asset[field] = sidecar
-            else:
-                asset.setdefault(field, [])
+        for field in self.SEMANTIC_LIST_FIELDS:
+            if not isinstance(asset.get(field), list):
+                asset[field] = []
         self._table_asset_cache[cache_key] = asset
         return asset
+
+    def _canonicalize_pending_asset(self, pending_dir: Path, topic: str, table: str) -> Dict[str, Any]:
+        asset = read_json(pending_dir / "asset.json")
+        payload: Dict[str, Any] = asset if isinstance(asset, dict) else {}
+        payload.setdefault("topic", topic)
+        payload.setdefault("tableName", table)
+        sidecar_fields = {
+            "schemaColumns": "schema.json",
+            "semanticColumns": "semantic_columns.json",
+            "metrics": "metrics.json",
+            "terms": "terms.json",
+            "knowledgeRules": "knowledge_rules.json",
+        }
+        changed = False
+        for field, file_name in sidecar_fields.items():
+            if isinstance(payload.get(field), list):
+                continue
+            sidecar = read_json(pending_dir / file_name)
+            payload[field] = sidecar if isinstance(sidecar, list) else []
+            changed = True
+        if changed or not (pending_dir / "asset.json").exists():
+            write_json(pending_dir / "asset.json", payload)
+        return payload
 
     def load_table_schema(self, topic: str, table: str) -> List[Dict[str, Any]]:
         data = self.load_table_asset(topic, table).get("schemaColumns")
@@ -328,7 +375,6 @@ class TopicAssetService:
                 "reviewStatus": "approved",
             }
             asset["terms"] = upsert_semantic_suggestion_item(asset.get("terms") or [], item, "sourceSuggestionId")
-            write_json(pending / "terms.json", asset["terms"])
         elif suggestion_type == "metric" and (suggestion.get("sourceFields") or suggestion.get("aggregation")):
             patched_kind = "metrics"
             metric_key = stable_cache_key("suggested_metric", {"id": suggestion_id, "name": metric_name})[:24]
@@ -344,7 +390,6 @@ class TopicAssetService:
                 "reviewStatus": "approved",
             }
             asset["metrics"] = upsert_semantic_suggestion_item(asset.get("metrics") or [], item, "sourceSuggestionId")
-            write_json(pending / "metrics.json", asset["metrics"])
         else:
             item = {
                 "ruleId": "suggestion_%s" % re.sub(r"[^a-zA-Z0-9_]+", "_", suggestion_id).strip("_"),
@@ -356,7 +401,6 @@ class TopicAssetService:
                 "reviewStatus": "approved",
             }
             asset["knowledgeRules"] = upsert_semantic_suggestion_item(asset.get("knowledgeRules") or [], item, "sourceSuggestionId")
-            write_json(pending / "knowledge_rules.json", asset["knowledgeRules"])
         asset["status"] = "PENDING_REVIEW"
         asset.setdefault("semanticGovernance", {})["lastKnowledgeSuggestionId"] = suggestion_id
         write_json(asset_path, asset)
@@ -1031,6 +1075,7 @@ class HybridRecallService:
                     if not metric_key:
                         continue
                     semantic_ref_id = "semantic:%s:%s:metric:%s" % (topic, table, metric_key)
+                    semantic_path = "%s#metric:%s" % (semantic_table_path(topic, table), metric_key)
                     docs.append(
                         RecallItem(
                             doc_id=semantic_ref_id,
@@ -1043,6 +1088,7 @@ class HybridRecallService:
                                 "semanticSource": "metrics",
                                 "semanticKind": "METRIC",
                                 "semanticRefId": semantic_ref_id,
+                                "semanticPath": semantic_path,
                                 "metricKey": metric_key,
                                 "tableName": table,
                                 "topic": topic,
@@ -1354,6 +1400,12 @@ class PlanningAssetPackBuilder:
         topics = self.topic_assets.topic_names_for_categories(topic_categories)
         if not topics:
             topics = sorted({item.topic for item in recall_bundle.items if item.topic})
+        recalled_precise_topics = [
+            item.topic
+            for item in recall_bundle.items
+            if item.topic and self._recall_item_has_precise_table_evidence(item)
+        ]
+        topics = list(dict.fromkeys([*topics, *recalled_precise_topics]))
         semantic_source_hash = self._topics_source_hash(topics)
         table_topic = self._table_topic_index()
         all_relationships = self._all_relationships()
@@ -1401,7 +1453,7 @@ class PlanningAssetPackBuilder:
                 "liveSchemaHash": live_schema_hash,
                 "sourceRefs": sorted(item.doc_id for item in recall_bundle.items if item.doc_id),
             },
-            scope={},
+            scope={"questionFingerprint": hashlib.sha256(normalize_for_match(question).encode("utf-8")).hexdigest()[:16]},
         )
         cached = self._compact_cache.get(cache_key)
         if cached is not None:
@@ -1600,6 +1652,81 @@ class PlanningAssetPackBuilder:
         expansion = pack.metric_compaction.setdefault("questionUnderstandingExpansion", [])
         if isinstance(expansion, list):
             expansion.extend(traces)
+        return traces + relationship_traces
+
+    def expand_for_metric_catalog_resolution(self, pack: PlanningAssetPack, question: str, limit: int = 6) -> List[str]:
+        """Read exact metric candidates from the published semantic catalog.
+
+        This does not select a business table by Topic or by hard-coded metric
+        names.  It only loads owner tables for metrics whose published labels or
+        aliases are explicitly named by the question, then lets the normal metric
+        resolver decide whether the candidate set is unique enough to execute.
+        """
+
+        normalized_question = normalize_for_match(question)
+        if not normalized_question:
+            return []
+        current_identities = {(metric.table, metric.key) for metric in pack.metrics if metric.table and metric.key}
+        candidates: List[Tuple[int, str, PlanningAssetEntry]] = []
+        for metric in self._all_metric_entries():
+            if not metric.table or not metric.key:
+                continue
+            matched_label = metric_direct_match_label(metric, question)
+            if not matched_label:
+                continue
+            score = self._metric_relevance_score(metric, question) or len(normalize_for_match(matched_label))
+            candidates.append((score, matched_label, metric))
+        candidates.sort(key=lambda item: (item[0], len(normalize_for_match(item[1]))), reverse=True)
+        selected: List[Tuple[int, str, PlanningAssetEntry]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for score, matched_label, metric in candidates:
+            identity = (metric.table, metric.key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            selected.append((score, matched_label, metric))
+            if len(selected) >= max(1, limit):
+                break
+        if not selected:
+            return []
+        table_topic = self._table_topic_index()
+        pack_tables = set(pack.known_tables())
+        traces: List[str] = []
+        evidence: List[Dict[str, Any]] = list(pack.metric_compaction.get("recalledMetricEvidence") or [])
+        existing_evidence = {
+            (str(item.get("ownerTable") or ""), str(item.get("metricKey") or ""))
+            for item in evidence
+            if isinstance(item, dict)
+        }
+        ambiguous_identities = ambiguous_catalog_metric_identities(selected)
+        for score, matched_label, metric in selected:
+            topic = table_topic.get(metric.table) or metric.topic
+            if metric.table not in pack_tables and topic:
+                self._append_table_assets(pack, topic, metric.table)
+                pack_tables.add(metric.table)
+                traces.append("catalog_metric_table:%s:%s" % (metric.table, metric.key))
+            elif (metric.table, metric.key) not in current_identities and not any(item.table == metric.table and item.key == metric.key for item in pack.metrics):
+                pack.metrics.append(metric)
+                traces.append("catalog_metric_entry:%s:%s" % (metric.table, metric.key))
+            identity = (metric.table, metric.key)
+            if identity not in existing_evidence:
+                evidence.append(catalog_metric_evidence_payload(metric, matched_label, score, identity in ambiguous_identities))
+                existing_evidence.add(identity)
+        if evidence:
+            pack.metric_compaction["recalledMetricEvidence"] = evidence
+        pack.metric_compaction["catalogMetricCandidates"] = [
+            {
+                "ownerTable": metric.table,
+                "metricKey": metric.key,
+                "semanticRefId": metric.source_ref_id,
+                "matchedMetricLabel": matched_label,
+                "score": score,
+                "ambiguous": (metric.table, metric.key) in ambiguous_identities,
+            }
+            for score, matched_label, metric in selected
+        ]
+        relationship_traces = self._append_relationships_for_tables(pack, pack_tables, table_topic)
+        pack.relationship_closure.extend(traces + relationship_traces)
         return traces + relationship_traces
 
     def _expand_tables_for_metric_dependencies(
@@ -1833,28 +1960,40 @@ class PlanningAssetPackBuilder:
                     recalled_tables.add(table)
                     if self._recall_item_has_precise_table_evidence(item):
                         precise_recalled_tables.add(table)
-        candidate_tables: List[Tuple[str, str, Dict[str, Any]]] = []
-        has_precise_recall_evidence = bool(explicit_tables or precise_recalled_tables)
-        if precise_recalled_tables and not explicit_tables and not allow_profile and self._broad_topic_question(question):
+        precise_metric_seed_tables, precise_metric_seed_traces = self._precise_metric_seed_tables(
+            question,
+            topics,
+            table_topic,
+            allow_profile=allow_profile,
+        )
+        precise_seed_tables = explicit_tables | precise_recalled_tables | precise_metric_seed_tables
+        if precise_seed_tables:
+            source_parts: List[str] = []
+            if explicit_tables:
+                source_parts.append("explicit_tables")
+            if precise_recalled_tables:
+                source_parts.append("recall_source_refs")
+            if precise_metric_seed_tables:
+                source_parts.append("semantic_metric_alias")
             traces = [
-                "targeted_seed_tables:",
+                "targeted_seed_tables:%s"
+                % ",".join("%s=evidence_owner_table" % table for table in sorted(precise_seed_tables)),
                 "table_selection_explanations:%s"
                 % json.dumps(
                     [
                         {
-                            "strategy": "metric_candidates_only",
-                            "reason": "broad_topic_with_precise_metric_recall",
-                            "metricOwnerTables": sorted(precise_recalled_tables),
+                            "strategy": "evidence_owner_tables",
+                            "reason": "precise_metric_or_recall_evidence",
+                            "ownerTables": sorted(precise_seed_tables),
                         }
                     ],
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
-                "targeted_seed_source=metric_candidates_only",
+                "targeted_seed_source=%s" % "+".join(source_parts or ["evidence_owner_tables"]),
             ]
-            return set(), traces
-        defer_topic_seed_selection = self._should_defer_topic_seed_selection(question, has_precise_recall_evidence)
-        if defer_topic_seed_selection and not allow_profile:
+            return set(precise_seed_tables), traces + precise_metric_seed_traces
+        if self._broad_topic_question(question) and not allow_profile:
             traces = [
                 "targeted_seed_tables:",
                 "table_selection_explanations:%s"
@@ -1872,76 +2011,75 @@ class PlanningAssetPackBuilder:
                 "targeted_seed_source=deferred_structured_understanding",
             ]
             return set(), traces
-        seed_source_tables = (explicit_tables | precise_recalled_tables) if has_precise_recall_evidence else (explicit_tables | recalled_tables)
-        if not has_precise_recall_evidence:
-            for topic in topics:
-                for manifest_item in self.topic_assets.load_manifest(topic):
-                    table = str(manifest_item.get("tableName") or "")
-                    if not table or not self._table_allowed_for_topic_question(topic, question, table, allow_profile=allow_profile):
-                        continue
-                    candidate_tables.append((topic, table, manifest_item))
-        existing_candidates = {table for _, table, _ in candidate_tables}
-        for table in sorted(seed_source_tables):
-            if not table or table in existing_candidates:
-                continue
-            topic = table_topic.get(table, "")
-            if not topic:
-                continue
-            manifest_item = next((item for item in self.topic_assets.load_manifest(topic) if str(item.get("tableName") or "") == table), {})
-            candidate_tables.append((topic, table, manifest_item))
-            existing_candidates.add(table)
-        if not candidate_tables:
-            for table in sorted(seed_source_tables):
-                topic = table_topic.get(table, "")
-                if topic:
-                    candidate_tables.append((topic, table, {}))
-        table_scores = [
-            self._table_seed_score(question, recall_bundle, topic, table, manifest_item, table in explicit_tables, table in recalled_tables)
-            for topic, table, manifest_item in candidate_tables
-        ]
-        table_scores = [item for item in table_scores if item[1] > 0 or item[0] in explicit_tables or item[0] in recalled_tables]
-        table_scores = self._filter_weak_seed_scores_by_topic(table_scores)
-        table_scores.sort(key=lambda item: (item[1], item[2].get("recallScore", 0), item[2].get("metricScore", 0)), reverse=True)
-        limit = max(1, int(self.topic_assets.settings.agent_planner_seed_table_limit or 4))
-        evidenced_table_count = len({table for table in explicit_tables | precise_recalled_tables if table})
-        limit = min(max(limit, evidenced_table_count), 6)
-        selected: List[str] = []
-        for table, _, _ in table_scores:
-            if table not in selected:
-                selected.append(table)
-            if len(selected) >= limit:
-                break
-        if not selected:
-            fallback_scores = [
-                self._table_seed_score(question, recall_bundle, topic, table, manifest_item, table in explicit_tables, table in recalled_tables)
-                for topic, table, manifest_item in candidate_tables
+        evidence_tables = {table for table in (explicit_tables | recalled_tables) if table}
+        if evidence_tables:
+            evidence_preview = [
+                {
+                    "table": table,
+                    "strategy": "recalled_owner_table",
+                    "topic": table_topic.get(table, ""),
+                }
+                for table in sorted(evidence_tables)
             ]
-            fallback_scores.sort(key=lambda item: item[1], reverse=True)
-            selected = [table for table, _, _ in fallback_scores[:limit] if table]
-        coverage_topics = {
-            table_topic.get(table, "")
-            for table in seed_source_tables
-            if table_topic.get(table, "")
-        }
-        selected = self._ensure_seed_topic_coverage(selected, table_scores, sorted(coverage_topics), limit)
-        score_preview = [
-            {
-                "table": table,
-                "score": score,
-                **{key: value for key, value in detail.items() if value},
-            }
-            for table, score, detail in table_scores[: max(limit, 6)]
-        ]
+            traces = [
+                "targeted_seed_tables:%s" % ",".join("%s=recalled_owner_table" % table for table in sorted(evidence_tables)),
+                "table_selection_explanations:%s"
+                % json.dumps(evidence_preview, ensure_ascii=False, separators=(",", ":")),
+                "targeted_seed_source=recall_source_refs",
+            ]
+            return evidence_tables, traces
         traces = [
-            "targeted_seed_tables:%s"
-            % ",".join("%s=%s" % (item["table"], item["score"]) for item in score_preview[:limit])
+            "targeted_seed_tables:",
+            "table_selection_explanations:%s"
+            % json.dumps(
+                [
+                    {
+                        "strategy": "defer_table_selection",
+                        "reason": "no_explicit_or_recalled_table_evidence",
+                        "topics": topics,
+                    }
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "targeted_seed_source=deferred_structured_understanding",
         ]
-        traces.append("table_selection_explanations:%s" % json.dumps(score_preview[: max(limit, 6)], ensure_ascii=False, separators=(",", ":")))
-        if has_precise_recall_evidence:
-            traces.append("targeted_seed_source=recall_source_refs")
-        else:
-            traces.append("targeted_seed_source=topic_boundary")
-        return set(selected), traces
+        return set(), traces
+
+    def _precise_metric_seed_tables(
+        self,
+        question: str,
+        topics: List[str],
+        table_topic: Dict[str, str],
+        allow_profile: bool = False,
+    ) -> Tuple[Set[str], List[str]]:
+        q = normalize_for_match(question)
+        if not q:
+            return set(), []
+        seed_tables: Set[str] = set()
+        traces: List[str] = []
+        for topic in topics:
+            for manifest_item in self.topic_assets.load_manifest(topic):
+                table = str(manifest_item.get("tableName") or "")
+                if not table or table_topic.get(table) != topic:
+                    continue
+                if not self._table_queryable_for_topic(topic, table):
+                    continue
+                for metric in self.topic_assets.load_table_metrics(topic, table):
+                    metric_key = str(metric.get("metricKey") or "")
+                    labels = [
+                        str(metric.get("displayName") or ""),
+                        str(metric.get("businessName") or ""),
+                        metric_key,
+                        *[str(alias) for alias in metric.get("aliases") or []],
+                    ]
+                    matched = next((label for label in labels if label and normalize_for_match(label) in q), "")
+                    if not matched:
+                        continue
+                    seed_tables.add(table)
+                    traces.append("precise_metric_seed:%s:%s:%s" % (table, metric_key, matched))
+                    break
+        return seed_tables, traces
 
     def _recall_item_has_precise_table_evidence(self, item: RecallItem) -> bool:
         source_type = str(item.source_type or "").upper()
@@ -1968,168 +2106,6 @@ class PlanningAssetPackBuilder:
             return True
         return len(table_seed_terms(question)) <= 2 and requested_intents <= {"TREND", "PROFILE"}
 
-    def _ensure_seed_topic_coverage(
-        self,
-        selected: List[str],
-        table_scores: List[Tuple[str, int, Dict[str, Any]]],
-        topics: List[str],
-        limit: int,
-    ) -> List[str]:
-        if not selected or not table_scores:
-            return selected
-        score_by_table = {table: (score, detail) for table, score, detail in table_scores}
-        candidates_by_topic: Dict[str, List[Tuple[str, int, Dict[str, Any]]]] = {}
-        for table, score, detail in table_scores:
-            topic = str(detail.get("topic") or "")
-            if not topic:
-                continue
-            candidates_by_topic.setdefault(topic, []).append((table, score, detail))
-        selected_set = set(selected)
-        for topic in topics:
-            if topic not in candidates_by_topic:
-                continue
-            if any(str(score_by_table.get(table, (0, {}))[1].get("topic") or "") == topic for table in selected):
-                continue
-            replacement = next((item for item in candidates_by_topic[topic] if item[0] not in selected_set), None)
-            if not replacement:
-                continue
-            replacement_table = replacement[0]
-            if len(selected) < limit:
-                selected.append(replacement_table)
-                selected_set.add(replacement_table)
-                continue
-            topic_counts: Dict[str, int] = {}
-            for table in selected:
-                selected_topic = str(score_by_table.get(table, (0, {}))[1].get("topic") or "")
-                topic_counts[selected_topic] = topic_counts.get(selected_topic, 0) + 1
-            replace_index = -1
-            replace_score = 10**9
-            for index, table in enumerate(selected):
-                selected_score, detail = score_by_table.get(table, (0, {}))
-                selected_topic = str(detail.get("topic") or "")
-                if topic_counts.get(selected_topic, 0) <= 1:
-                    continue
-                if detail.get("explicit"):
-                    continue
-                if selected_score < replace_score:
-                    replace_score = selected_score
-                    replace_index = index
-            if replace_index >= 0:
-                selected_set.discard(selected[replace_index])
-                selected[replace_index] = replacement_table
-                selected_set.add(replacement_table)
-        return selected[:limit]
-
-    def _table_seed_score(
-        self,
-        question: str,
-        recall_bundle: RecallBundle,
-        topic: str,
-        table: str,
-        manifest_item: Dict[str, Any],
-        explicit: bool = False,
-        recalled: bool = False,
-    ) -> Tuple[str, int, Dict[str, Any]]:
-        terms = table_seed_terms(question)
-        manifest_text = json.dumps(manifest_item, ensure_ascii=False)
-        score = int(score_document(terms, manifest_text))
-        detail: Dict[str, Any] = {}
-        if explicit:
-            score += 80
-            detail["explicit"] = True
-        detail["topic"] = topic
-        recall_score = table_recall_score(recall_bundle, table)
-        if recall_score:
-            score += int(recall_score * 4) + 20
-            detail["recallScore"] = round(recall_score, 2)
-        elif recalled:
-            score += 20
-            detail["recalled"] = True
-        try:
-            asset = self.topic_assets.load_table_asset(topic, table)
-        except Exception:
-            asset = {}
-        if asset:
-            score += int(score_document(terms, compact_semantic_asset_for_recall(asset)))
-            table_text = normalize_for_match(
-                " ".join(
-                    [
-                        table,
-                        str(asset.get("tableComment") or ""),
-                        str(asset.get("dataGrain") or ""),
-                        str(asset.get("manualNotes") or ""),
-                    ]
-                )
-            )
-            for term in terms:
-                normalized = normalize_for_match(term)
-                if normalized and normalized in table_text:
-                    score += 8
-            metric_scores = []
-            for metric in self.topic_assets.load_table_metrics(topic, table)[:120]:
-                entry = PlanningAssetEntry(
-                    key=str(metric.get("metricKey") or ""),
-                    table=table,
-                    topic=topic,
-                    title=str(metric.get("businessName") or metric.get("metricKey") or ""),
-                    columns=[str(col) for col in metric.get("sourceColumns") or []],
-                    aliases=[str(alias) for alias in metric.get("aliases") or []],
-                    description=json.dumps(metric, ensure_ascii=False),
-                    metadata=metric,
-                )
-                metric_score = self._metric_relevance_score(entry, question)
-                if metric_score > 0:
-                    metric_scores.append(metric_score)
-            if metric_scores:
-                top_metric_score = max(metric_scores)
-                score += top_metric_score
-                detail["metricScore"] = top_metric_score
-            field_text = json.dumps(asset.get("semanticColumns") or [], ensure_ascii=False)
-            field_score = int(score_document(terms, field_text))
-            if field_score:
-                score += field_score
-                detail["fieldScore"] = field_score
-            usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
-            usage_match = int(score_document(terms, json.dumps(usage, ensure_ascii=False)))
-            if usage_match:
-                score += min(usage_match, 60)
-                detail["usageScore"] = min(usage_match, 60)
-            requested_intents = infer_table_selection_intents(question)
-            supported_intents = {str(item).upper() for item in usage.get("supportedIntents") or []}
-            matched_intents = sorted(requested_intents & supported_intents)
-            missing_intents = sorted(requested_intents - supported_intents) if supported_intents else []
-            if matched_intents:
-                score += 12 * len(matched_intents)
-                detail["matchedIntents"] = matched_intents
-            if missing_intents:
-                score -= 8 * len(missing_intents)
-                detail["missingIntents"] = missing_intents
-            authority_boost = round(int(usage.get("authorityLevel") or 0) / 10)
-            score += authority_boost
-            detail["authorityLevel"] = int(usage.get("authorityLevel") or 0)
-            recommendation_score = int(score_document(terms, " ".join(str(item) for item in usage.get("recommendedFor") or [])))
-            if recommendation_score:
-                score += min(recommendation_score, 30)
-                detail["recommendationScore"] = min(recommendation_score, 30)
-            caution_score = int(score_document(terms, " ".join(str(item) for item in usage.get("notRecommendedFor") or [])))
-            if caution_score:
-                score -= min(caution_score, 30)
-                detail["notRecommendedPenalty"] = min(caution_score, 30)
-            reasons: List[str] = []
-            if recall_score:
-                reasons.append("召回证据命中")
-            if detail.get("metricScore"):
-                reasons.append("指标覆盖匹配")
-            if field_score:
-                reasons.append("字段或维度匹配")
-            if matched_intents:
-                reasons.append("支持分析意图:%s" % ",".join(matched_intents))
-            reasons.append("业务权威度:%s" % usage.get("authorityLevel"))
-            detail["selectionReasons"] = reasons
-        if "profile" in table.lower() and not explicit and not recalled:
-            score -= 40
-        return table, score, detail
-
     def _table_allowed_for_recalled_item(
         self,
         question: str,
@@ -2139,26 +2115,28 @@ class PlanningAssetPackBuilder:
     ) -> bool:
         if not table:
             return False
+        if self._recall_item_has_precise_table_evidence(item) and self._recalled_metric_table_queryable(item, table):
+            return True
         topic = str(item.topic or (item.metadata or {}).get("topic") or "")
         if self._table_allowed_for_topic_question(topic, question, table, allow_profile=allow_profile):
             return True
         return False
 
-    def _filter_weak_seed_scores_by_topic(self, table_scores: List[Tuple[str, int, Dict[str, Any]]]) -> List[Tuple[str, int, Dict[str, Any]]]:
-        by_topic: Dict[str, List[Tuple[str, int, Dict[str, Any]]]] = {}
-        for item in table_scores:
-            by_topic.setdefault(str(item[2].get("topic") or ""), []).append(item)
-        filtered: List[Tuple[str, int, Dict[str, Any]]] = []
-        for topic, items in by_topic.items():
-            if len(items) <= 1:
-                filtered.extend(items)
-                continue
-            top_score = max(score for _, score, _ in items)
-            minimum_score = max(1, int(top_score * 0.25))
-            for table, score, detail in items:
-                if detail.get("explicit") or float(detail.get("recallScore") or 0.0) >= 8.0 or score >= minimum_score:
-                    filtered.append((table, score, detail))
-        return filtered
+    def _recalled_metric_table_queryable(self, item: RecallItem, table: str) -> bool:
+        topic = str(item.topic or (item.metadata or {}).get("topic") or "")
+        return self._table_queryable_for_topic(topic, table) if topic else default_table_queryable(table)
+
+    def _table_queryable_for_topic(self, topic: str, table: str) -> bool:
+        if not table:
+            return False
+        if not topic:
+            return default_table_queryable(table)
+        try:
+            asset = self.topic_assets.load_table_asset(topic, table)
+        except Exception:
+            return default_table_queryable(table)
+        usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
+        return bool(usage.get("queryableByAgent"))
 
     def _relationship_bridge_tables(
         self,
@@ -2464,27 +2442,22 @@ class PlanningAssetPackBuilder:
         )
 
     def _semantic_source_hash(self, topic: str, table: str) -> str:
-        table_dir = self.topic_assets.root / topic / "tables" / table
-        if not table_dir.exists():
+        asset_path = self.topic_assets.root / topic / "tables" / table / "asset.json"
+        if not asset_path.exists():
             return ""
         hasher = hashlib.sha256()
-        for path in sorted(table_dir.glob("*")):
-            if path.is_file():
-                try:
-                    hasher.update(path.name.encode("utf-8"))
-                    hasher.update(path.read_bytes())
-                except Exception:
-                    continue
+        try:
+            hasher.update(asset_path.name.encode("utf-8"))
+            hasher.update(asset_path.read_bytes())
+        except Exception:
+            return ""
         return hasher.hexdigest()
 
     def _semantic_published_at(self, topic: str, table: str) -> str:
-        table_dir = self.topic_assets.root / topic / "tables" / table
-        if not table_dir.exists():
+        asset_path = self.topic_assets.root / topic / "tables" / table / "asset.json"
+        if not asset_path.exists():
             return ""
-        mtimes = [path.stat().st_mtime for path in table_dir.glob("*") if path.is_file()]
-        if not mtimes:
-            return ""
-        return datetime.fromtimestamp(max(mtimes)).isoformat()
+        return datetime.fromtimestamp(asset_path.stat().st_mtime).isoformat()
 
     def _schema_drift_report(
         self,
@@ -2635,8 +2608,6 @@ class PlanningAssetPackBuilder:
     def _table_allowed_for_question(self, question: str, table: str, allow_profile: bool = False) -> bool:
         if not table:
             return False
-        if "profile" in table.lower():
-            return allow_profile
         return default_table_queryable(table)
 
     def _table_allowed_for_topic_question(self, topic: str, question: str, table: str, allow_profile: bool = False) -> bool:
@@ -3074,69 +3045,51 @@ def metric_request_match_score(metric: PlanningAssetEntry, normalized_ref: str, 
     return metric_ref_match_score(metric, normalized_ref) + metric_phrase_match_score(metric, normalized_phrase)
 
 
+def metric_business_label_texts(metric: PlanningAssetEntry) -> List[str]:
+    metadata = metric.metadata or {}
+    return [
+        metric.key,
+        metric.title,
+        metric.source_ref_id,
+        str(metadata.get("businessName") or ""),
+        str(metadata.get("displayName") or ""),
+        str(metadata.get("naturalName") or ""),
+        str(metadata.get("originalBusinessName") or ""),
+        *metric.aliases,
+        *[str(alias) for alias in metadata.get("aliases") or []],
+    ]
+
+
 def metric_ref_match_score(metric: PlanningAssetEntry, normalized_ref: str) -> int:
     if not normalized_ref:
         return 0
     metadata = metric.metadata or {}
-    names = [
-        metric.key,
-        metric.title,
-        metric.source_ref_id,
-        *metric.aliases,
-        *[str(alias) for alias in metadata.get("aliases") or []],
-        str(metadata.get("businessName") or ""),
-    ]
+    names = metric_business_label_texts(metric)
     columns = [str(column) for column in metadata.get("sourceColumns") or metadata.get("source_columns") or metric.columns]
     normalized_names = {normalize_for_match(item) for item in names if item}
     normalized_columns = {normalize_for_match(item) for item in columns if item}
-    text = normalize_for_match(
-        " ".join(
-            [
-                metric.key,
-                metric.title,
-                " ".join(metric.aliases),
-                metric.description,
-                json.dumps(metadata, ensure_ascii=False),
-            ]
-        )
-    )
     score = 0
     if normalized_ref in normalized_names:
         score += 40
     elif normalized_ref in normalized_columns:
         score += 30
-    elif normalized_ref in text:
-        score += 18
     return score
 
 
 def metric_phrase_match_score(metric: PlanningAssetEntry, phrase: str) -> int:
     terms = metric_phrase_terms(phrase)
-    if not terms:
+    normalized_phrase = normalize_for_match(phrase)
+    if not terms or not normalized_phrase:
         return 0
     metadata = metric.metadata or {}
-    names = [
-        metric.key,
-        metric.title,
-        *metric.aliases,
-        *[str(alias) for alias in metadata.get("aliases") or []],
-        str(metadata.get("businessName") or ""),
-    ]
+    names = metric_business_label_texts(metric)
     columns = [str(column) for column in metadata.get("sourceColumns") or metadata.get("source_columns") or metric.columns]
     normalized_names = {normalize_for_match(item) for item in names if item}
     normalized_columns = {normalize_for_match(item) for item in columns if item}
-    text = normalize_for_match(
-        " ".join(
-            [
-                metric.key,
-                metric.title,
-                " ".join(metric.aliases),
-                metric.description,
-                json.dumps(metadata, ensure_ascii=False),
-            ]
-        )
-    )
     score = 0
+    for label in normalized_names:
+        if is_strong_label_text_match(label, normalized_phrase):
+            score = max(score, 40 + min(len(label), 20))
     for term in terms:
         if not term:
             continue
@@ -3144,8 +3097,6 @@ def metric_phrase_match_score(metric: PlanningAssetEntry, phrase: str) -> int:
             score += 18
         elif term in normalized_columns:
             score += 14
-        elif term in text:
-            score += 8
     return min(score, 60)
 
 
@@ -3169,25 +3120,80 @@ def metric_phrase_terms(phrase: str) -> List[str]:
 
 
 def metric_phrase_directly_names_metric(metric: PlanningAssetEntry, phrase: str) -> bool:
+    return bool(metric_direct_match_label(metric, phrase))
+
+
+def metric_direct_match_label(metric: PlanningAssetEntry, phrase: str) -> str:
     normalized_phrase = normalize_for_match(phrase)
     if not normalized_phrase:
-        return False
+        return ""
     metadata = metric.metadata or {}
     labels = [
         metric.key,
         metric.title,
         str(metadata.get("businessName") or ""),
+        str(metadata.get("displayName") or ""),
+        str(metadata.get("naturalName") or ""),
+        str(metadata.get("originalBusinessName") or ""),
         *metric.aliases,
         *[str(alias) for alias in metadata.get("aliases") or []],
     ]
-    for label in labels:
+    ranked = sorted({str(label or "").strip() for label in labels if str(label or "").strip()}, key=lambda item: len(normalize_for_match(item)), reverse=True)
+    for label in ranked:
         normalized_label = normalize_for_match(label)
         if is_strong_label_text_match(normalized_label, normalized_phrase):
-            return True
-        for token in re.findall(r"[A-Za-z0-9_]{3,}", str(phrase or "").lower()):
-            if token and token in normalized_label:
-                return True
-    return False
+            return label
+    return ""
+
+
+def ambiguous_catalog_metric_identities(selected: List[Tuple[int, str, PlanningAssetEntry]]) -> Set[Tuple[str, str]]:
+    by_label: Dict[str, List[PlanningAssetEntry]] = {}
+    for _score, matched_label, metric in selected:
+        label = normalize_for_match(matched_label)
+        if label:
+            by_label.setdefault(label, []).append(metric)
+    ambiguous: Set[Tuple[str, str]] = set()
+    for metrics in by_label.values():
+        families = {
+            (
+                metric.topic,
+                metric.table,
+                str((metric.metadata or {}).get("canonicalMetricKey") or (metric.metadata or {}).get("aliasOf") or metric.key),
+            )
+            for metric in metrics
+            if metric.table and metric.key
+        }
+        if len(families) <= 1:
+            continue
+        ambiguous.update((metric.table, metric.key) for metric in metrics if metric.table and metric.key)
+    return ambiguous
+
+
+def catalog_metric_evidence_payload(metric: PlanningAssetEntry, matched_label: str, score: int, ambiguous: bool = False) -> Dict[str, Any]:
+    metadata = metric.metadata or {}
+    return {
+        "ownerTable": metric.table,
+        "metricKey": metric.key,
+        "semanticRefId": metric.source_ref_id,
+        "docId": metric.source_ref_id,
+        "title": metric.title,
+        "fusionScore": float(score or 0),
+        "sourceType": "SEMANTIC_METRIC",
+        "businessName": str(metadata.get("businessName") or metric.title or ""),
+        "canonicalMetricKey": str(metadata.get("canonicalMetricKey") or ""),
+        "aliasOf": str(metadata.get("aliasOf") or ""),
+        "metricLevel": str(metadata.get("metricLevel") or ""),
+        "formula": str(metadata.get("formula") or metadata.get("metricFormula") or ""),
+        "sourceColumns": metadata.get("sourceColumns") or metadata.get("source_columns") or metric.columns,
+        "aliases": list(dict.fromkeys([*metric.aliases, *[str(alias) for alias in metadata.get("aliases") or []]])),
+        "recallQuery": matched_label,
+        "recallQueries": [matched_label] if matched_label else [],
+        "matchedMetricLabel": matched_label,
+        "metricResolutionType": "semantic_catalog_label",
+        "metricResolutionReason": "matched_published_semantic_label:%s" % matched_label,
+        "metricResolutionConfidence": 0.0 if ambiguous else 0.97,
+        "metricResolutionAmbiguous": bool(ambiguous),
+    }
 
 
 def is_strong_label_text_match(normalized_label: str, normalized_phrase: str) -> bool:
@@ -3400,6 +3406,11 @@ class TopicBuilderWorkflow:
             },
             table,
         )
+        asset_payload["schemaColumns"] = schema if isinstance(schema, list) else []
+        asset_payload["semanticColumns"] = semantic_columns
+        asset_payload["metrics"] = metrics
+        asset_payload["terms"] = terms
+        asset_payload["knowledgeRules"] = rules
         production_report = topic_asset_production_report(
             topic=topic,
             table=table,
@@ -3433,14 +3444,9 @@ class TopicBuilderWorkflow:
             publishable=False,
         )
         asset_payload["semanticLineage"] = semantic_asset_lineage(topic, table, asset_payload, metrics, rules)
-        write_json(pending_dir / "schema.json", schema if isinstance(schema, list) else [])
         write_json(pending_dir / "sample_rows.json", sample_rows)
         write_json(pending_dir / "sample_profile.json", profile)
         write_json(pending_dir / "asset.json", asset_payload)
-        write_json(pending_dir / "semantic_columns.json", semantic_columns)
-        write_json(pending_dir / "metrics.json", metrics)
-        write_json(pending_dir / "terms.json", terms)
-        write_json(pending_dir / "knowledge_rules.json", rules)
         write_json(pending_dir / "asset_production_report.json", production_report)
         return {
             "success": True,
@@ -5734,18 +5740,6 @@ def table_seed_terms(question: str) -> List[str]:
         if normalized not in terms:
             terms.append(normalized)
     return terms or targeted_recall_terms(question)
-
-
-def table_recall_score(recall_bundle: RecallBundle, table: str) -> float:
-    score = 0.0
-    if not recall_bundle or not table:
-        return score
-    for item in recall_bundle.items:
-        item_table = item.table or str((item.metadata or {}).get("tableName") or "")
-        if item_table != table:
-            continue
-        score = max(score, float(item.fusion_score or 0.0))
-    return score
 
 
 def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Dict[str, Any]]:

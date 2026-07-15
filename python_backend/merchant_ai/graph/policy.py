@@ -4,9 +4,10 @@ from typing import Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.graph.state import AgentState
-from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute
+from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute, SkillMatchState
 from merchant_ai.services.answer import analysis_summary_required, answer_skill_required
 from merchant_ai.services.capabilities import CapabilityRegistry, features_from_fast_understanding
+from merchant_ai.services.quick_metrics import is_metric_definition_question
 
 
 MAX_MAIN_AGENT_ACTIONS = 16
@@ -63,7 +64,7 @@ class AgentActionRegistry:
                 id="try_fast_metric",
                 node="try_fast_metric",
                 agent="LeadAgent",
-                description="answer one uniquely matched published semantic metric; unsupported requests fall back to Planner",
+                description="legacy compatibility path for one uniquely matched published semantic metric",
                 required_state_flags=["fast_understood"],
                 expected_state_flags=["fast_metric_attempted"],
                 fallback_action="retrieve_knowledge",
@@ -85,6 +86,15 @@ class AgentActionRegistry:
                 required_state_flags=["data_discovered"],
                 expected_state_flags=["planning_assets_compacted"],
                 fallback_action="retrieve_knowledge",
+            ),
+            AgentAction(
+                id="query_metric",
+                node="query_metric",
+                agent="MetricTool",
+                description="resolve, validate, execute and verify one governed semantic metric inside the current Topic workspace",
+                required_state_flags=["planning_assets_compacted"],
+                expected_state_flags=["query_metric_attempted"],
+                fallback_action="plan_graph",
             ),
             AgentAction(
                 id="plan_graph",
@@ -173,7 +183,7 @@ class AgentActionRegistry:
                 agent="SkillWorker",
                 description="dynamically dispatch an isolated analysis skill worker before final answer",
                 required_state_keys=["agent_run_result.task_results"],
-                required_state_flags=["sql_generated", "evidence_accepted"],
+                required_state_flags=["sql_generated", "evidence_graph_verified"],
                 expected_state_keys=["analysis_summary"],
                 fallback_action="verify_evidence",
             ),
@@ -183,7 +193,7 @@ class AgentActionRegistry:
                 agent="AnalysisWorker",
                 description="optionally dispatch a generic isolated analysis worker for long-tail analysis before final answer",
                 required_state_keys=["agent_run_result.task_results"],
-                required_state_flags=["sql_generated", "evidence_accepted"],
+                required_state_flags=["sql_generated", "evidence_graph_verified"],
                 expected_state_keys=["analysis_summary"],
                 fallback_action="answer_data",
             ),
@@ -347,9 +357,7 @@ class V2AgentPolicy:
                 return ["cache_answer"], "Lead Agent accepted a verified single semantic metric result", False
             if self.general_delegation_needed(state):
                 return ["delegate_subagent", "retrieve_knowledge"], "request contains bounded document or Python work suitable for an isolated Sub-Agent", False
-            if not state.get("fast_metric_attempted") and self.fast_metric_candidate(state):
-                return ["try_fast_metric", "retrieve_knowledge"], "Lead Agent may try the governed single-metric fast capability or continue to semantic planning", False
-            return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge has not been retrieved"), False
+            return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge refresh is required before metric/query tools"), False
         if self.has_rule_recall_ready(state):
             return ["answer_rule"], "platform rule knowledge is ready; answer without BI QueryGraph", False
         if self.has_rule_answer_plan(state):
@@ -364,6 +372,10 @@ class V2AgentPolicy:
                 return ["retrieve_knowledge", "compact_assets", "plan_graph", "repair_graph", "answer_data"], self.pending_knowledge_reason(state), False
             if not state.get("query_graph_validated"):
                 return ["validate_graph"], "knowledge request budget exhausted; validate current graph as structured gap", True
+        if state.get("query_metric_completed") and self.evidence_verification_passed(state):
+            return ["answer_data"], "query_metric executed and verified one governed semantic metric", False
+        if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
+            return ["query_metric", "plan_graph"], "single governed metric can be resolved through query_metric after Topic workspace recall", False
         if (
             (not plan or not plan.intents)
             and state.get("planner_provider_error")
@@ -482,25 +494,22 @@ class V2AgentPolicy:
         early_understanding = not state.get("data_discovered") and not has_plan and not has_tasks
         if early_understanding and not state.get("fast_understood"):
             return ["fast_understand"]
-        if (
-            early_understanding
-            and state.get("fast_understood")
-            and not state.get("fast_metric_attempted")
-            and self.fast_metric_candidate(state)
-        ):
-            if self.general_delegation_needed(state):
-                return ["delegate_subagent", "retrieve_knowledge"]
-            return ["try_fast_metric", "retrieve_knowledge"]
         if self.has_pending_knowledge_requests(state):
             if self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state):
                 return ["retrieve_knowledge"]
             return self.stalled_knowledge_actions(state)
         if not state.get("data_discovered"):
+            if self.general_delegation_needed(state):
+                return ["delegate_subagent", "retrieve_knowledge"]
             return ["retrieve_knowledge"]
         if self.has_rule_recall_ready(state) or self.has_rule_answer_plan(state):
             return ["answer_rule"]
         if state.get("data_discovered") and not state.get("planning_assets_compacted"):
             return ["compact_assets"]
+        if state.get("query_metric_completed") and self.evidence_verification_passed(state):
+            return ["answer_data"]
+        if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
+            return ["query_metric", "plan_graph"]
         if not has_plan:
             if state.get("planner_provider_error"):
                 if not self.planner_degraded_fail_fast(state) and self.hypothesis_recovery_needed(state):
@@ -610,7 +619,33 @@ class V2AgentPolicy:
         return document_signal or python_signal
 
     def fast_metric_candidate(self, state: AgentState) -> bool:
-        return self.fast_metric_decision(state.get("fast_understanding")).eligible
+        if self.fast_metric_decision(state.get("fast_understanding")).eligible:
+            return True
+        fast = state.get("fast_understanding")
+        metric_phrases = {
+            str(item).strip().lower()
+            for item in (getattr(fast, "metric_phrases", None) or [])
+            if str(item or "").strip()
+        }
+        return bool(
+            is_metric_definition_question(str(state.get("question") or ""))
+            and len(metric_phrases) == 1
+        )
+
+    def query_metric_candidate(self, state: AgentState) -> bool:
+        if not state.get("planning_assets_compacted"):
+            return False
+        if self.has_pending_knowledge_requests(state):
+            return False
+        if state.get("plan") and getattr(state["plan"], "intents", None):
+            return False
+        if state.get("query_metric_completed"):
+            return False
+        fast = state.get("fast_understanding")
+        if not fast:
+            return False
+        decision = self.fast_metric_decision(fast)
+        return bool(decision.eligible)
 
     def fast_metric_decision(self, fast: object):
         features = features_from_fast_understanding(fast)
@@ -619,7 +654,6 @@ class V2AgentPolicy:
         if (
             analysis_intent == "trend"
             and features.metric_count == 1
-            and features.domain_count == 1
             and not object_refs
         ):
             # Fast understanding treats any trend signal as complex analysis,
@@ -630,10 +664,25 @@ class V2AgentPolicy:
                     "intent_kind": "metric_query",
                     "complexity": "simple",
                     "analysis_intent": "metric",
+                    "domain_count": 1,
                     "requires_explanation": False,
                     "needs_planner": False,
                 }
             )
+        elif (
+            features.intent_kind == "metric_query"
+            and features.complexity == "simple"
+            and features.metric_count == 1
+            and not features.requires_explanation
+            and not object_refs
+        ):
+            # Topic routing can over-include adjacent domains for a phrase like
+            # GMV/refund-rate because semantic recall keeps related domains in
+            # the workspace.  The governed fast executor still resolves exactly
+            # one published metric contract before querying; let that executor
+            # arbitrate support instead of forcing a full Planner round on topic
+            # noise alone.
+            features = features.model_copy(update={"domain_count": 1, "needs_planner": False})
         return self.capabilities.evaluate("metric_fast_entry", features)
 
     def has_unresolved_planning_work(self, state: AgentState) -> bool:
@@ -793,6 +842,9 @@ class V2AgentPolicy:
         if self.planner_degraded_fail_fast(state):
             return False
         if state.get("analysis_skill_bypassed"):
+            return False
+        match = state.get("skill_match")
+        if isinstance(match, SkillMatchState) and match.status == "no_match":
             return False
         if self.fast_path_verified_graph(state):
             return False

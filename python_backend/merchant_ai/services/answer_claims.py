@@ -240,6 +240,7 @@ def extract_numeric_tokens(text: str) -> List[str]:
     ]
     excluded_spans = [*temporal_spans, *(match.span() for match in date_matches)]
     formula_spans = system_formula_expression_spans(source)
+    system_contextual_spans = system_contextual_number_spans(source)
     values: List[Tuple[int, str]] = [
         *((match.start(), match.group(0)) for match in temporal_matches),
         *((match.start(), match.group(0)) for match in date_matches),
@@ -248,6 +249,8 @@ def extract_numeric_tokens(text: str) -> List[str]:
         if span_overlaps(match.span(), excluded_spans):
             continue
         if ignorable_formula_constant(match.group(0), match.span(), formula_spans):
+            continue
+        if span_overlaps(match.span(), system_contextual_spans):
             continue
         values.append((match.start(), match.group(0)))
     return dedupe_texts(value for _, value in sorted(values, key=lambda item: item[0]))
@@ -264,6 +267,15 @@ def system_formula_expression_spans(text: str) -> List[Tuple[int, int]]:
             spans.append((match.start(), closing + 1))
     for match in re.finditer(r"\bCASE\b.*?\bEND\b", text, flags=re.I):
         spans.append(match.span())
+    return spans
+
+
+def system_contextual_number_spans(text: str) -> List[Tuple[int, int]]:
+    if not SYSTEM_FORMULA_EXPLANATION_PATTERN.match(str(text or "").strip()):
+        return []
+    spans: List[Tuple[int, int]] = []
+    for pattern in contextual_number_patterns():
+        spans.extend(match.span() for match in re.finditer(pattern, str(text or ""), flags=re.I))
     return spans
 
 
@@ -321,6 +333,11 @@ def support_for_claim(
 ) -> Tuple[List[str], List[str]]:
     fact_ids: List[str] = []
     reasons: List[str] = []
+    direction_reason, direction_fact_ids = trend_direction_support(claim.text, facts)
+    if direction_fact_ids:
+        fact_ids.extend(direction_fact_ids)
+    if direction_reason:
+        reasons.append(direction_reason)
     for raw in claim.numeric_values:
         matching = fact_ids_for_value(raw, facts, claim.text)
         if matching:
@@ -345,6 +362,100 @@ def support_for_claim(
             continue
         reasons.append("unsupported_entity:%s" % raw)
     return dedupe_texts(fact_ids), dedupe_texts(reasons)
+
+
+def trend_direction_support(claim_text: str, facts: List[VerifiedFact]) -> Tuple[str, List[str]]:
+    text = str(claim_text or "")
+    if not re.search(r"(上升|增加|提升|上涨|下降|减少|降低|下滑|持平)", text):
+        return "", []
+    for trend in trend_fact_groups(facts):
+        labels = [label for label in trend["labels"] if label]
+        matched_label = next((label for label in labels if label in normalize_label_text(text)), "")
+        if not matched_label:
+            continue
+        segment = claim_segment_for_label(text, matched_label)
+        expected = str(trend["direction"])
+        claimed = direction_word(segment)
+        if not claimed:
+            continue
+        if claimed != expected:
+            return "unsupported_trend_direction:%s" % claimed, list(trend["fact_ids"])
+        return "", list(trend["fact_ids"])
+    return "", []
+
+
+def trend_fact_groups(facts: List[VerifiedFact]) -> List[Dict[str, Any]]:
+    by_task_row: Dict[Tuple[str, int], List[VerifiedFact]] = {}
+    for fact in facts:
+        by_task_row.setdefault((fact.task_id, fact.row_index), []).append(fact)
+    rows_by_task: Dict[str, List[Dict[str, Any]]] = {}
+    for (task_id, row_index), row_facts in by_task_row.items():
+        date_fact = next((fact for fact in row_facts if fact.value_type == "date" or fact.column == "pt"), None)
+        for fact in row_facts:
+            value = decimal_value(fact.value)
+            if value is None or fact.value_type != "number" or fact.column == "pt":
+                continue
+            rows_by_task.setdefault("%s:%s" % (task_id, fact.column), []).append(
+                {
+                    "task_id": task_id,
+                    "column": fact.column,
+                    "label": fact.label,
+                    "row_index": row_index,
+                    "date": normalize_temporal_token(date_fact.value) if date_fact else "",
+                    "value": value,
+                    "fact_id": fact.fact_id,
+                    "date_fact_id": date_fact.fact_id if date_fact else "",
+                }
+            )
+    groups: List[Dict[str, Any]] = []
+    for rows in rows_by_task.values():
+        if len(rows) < 2:
+            continue
+        ordered = sorted(rows, key=lambda item: (str(item["date"] or ""), int(item["row_index"])))
+        first, last = ordered[0], ordered[-1]
+        delta = last["value"] - first["value"]
+        direction = "up" if delta > 0 else "down" if delta < 0 else "flat"
+        fact_ids = [str(first["fact_id"]), str(last["fact_id"])]
+        for item in [first, last]:
+            if item.get("date_fact_id"):
+                fact_ids.append(str(item["date_fact_id"]))
+        groups.append(
+            {
+                "labels": fact_label_candidates(
+                    VerifiedFact(
+                        fact_id=str(first["fact_id"]),
+                        task_id=str(first["task_id"]),
+                        row_index=int(first["row_index"]),
+                        column=str(first["column"]),
+                        label=str(first["label"]),
+                        value=first["value"],
+                    )
+                ),
+                "direction": direction,
+                "fact_ids": dedupe_texts(fact_ids),
+            }
+        )
+    return groups
+
+
+def claim_segment_for_label(text: str, normalized_label: str) -> str:
+    normalized_text = normalize_label_text(text)
+    index = normalized_text.find(normalized_label)
+    if index < 0:
+        return text
+    raw_index = max(0, min(len(text), index))
+    tail = text[raw_index:]
+    return re.split(r"[；;。.!！?？\n]", tail, maxsplit=1)[0]
+
+
+def direction_word(text: str) -> str:
+    if re.search(r"(持平|不变)", text):
+        return "flat"
+    if re.search(r"(上升|增加|提升|上涨)", text):
+        return "up"
+    if re.search(r"(下降|减少|降低|下滑)", text):
+        return "down"
+    return ""
 
 
 def supported_numbers(facts: List[VerifiedFact]) -> List[Tuple[Decimal, List[str], List[str]]]:

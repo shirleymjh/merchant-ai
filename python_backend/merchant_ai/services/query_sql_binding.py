@@ -35,7 +35,14 @@ def normalize_inclusive_relative_window_sql(sql: str, days: Any) -> str:
     return pattern.sub(lambda match: "DATE_SUB(%s, INTERVAL %d DAY)" % (match.group(1), inclusive_interval), text)
 
 
-def split_detail_sql_by_pt_windows(sql: str, days: int, chunk_days: int, max_chunks: int, limit: int) -> List[str]:
+def split_detail_sql_by_pt_windows(
+    sql: str,
+    days: int,
+    chunk_days: int,
+    max_chunks: int,
+    limit: int,
+    anchor_date: str = "",
+) -> List[str]:
     text = str(sql or "").strip()
     if not text or re.search(r"\b(group\s+by|union|join)\b", text, flags=re.I):
         return []
@@ -46,16 +53,19 @@ def split_detail_sql_by_pt_windows(sql: str, days: int, chunk_days: int, max_chu
     chunks = max(1, int(max_chunks or 1))
     capped_limit = max(1, int(limit or 1))
     result: List[str] = []
+    anchor_expr = "CURDATE()"
+    if anchor_date:
+        anchor_expr = "'%s'" % str(anchor_date).replace("'", "''")
     for offset in range(0, total_days, window_days):
         if len(result) >= chunks:
             break
         upper = min(total_days, offset + window_days)
         lower = offset
-        lower_bound = "`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(upper)
+        lower_bound = "`pt` >= DATE_SUB(%s, INTERVAL %d DAY)" % (anchor_expr, inclusive_day_interval(upper))
         if lower <= 0:
-            upper_bound = "`pt` < DATE_ADD(CURDATE(), INTERVAL 1 DAY)"
+            upper_bound = "`pt` < DATE_ADD(%s, INTERVAL 1 DAY)" % anchor_expr
         else:
-            upper_bound = "`pt` < DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(lower)
+            upper_bound = "`pt` < DATE_SUB(%s, INTERVAL %d DAY)" % (anchor_expr, inclusive_day_interval(lower))
         chunk_sql = add_sql_where_condition(text, "(%s AND %s)" % (lower_bound, upper_bound))
         chunk_sql = replace_sql_limit(chunk_sql, capped_limit)
         result.append(chunk_sql)

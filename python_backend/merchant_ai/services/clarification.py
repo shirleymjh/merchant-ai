@@ -31,7 +31,7 @@ class ClarificationResolutionService:
             if days:
                 resolution.update({"timeWindowDays": days, "timeExpression": label, "clarificationResolved": True})
         elif pending_type == "metric_focus":
-            metric_focus = self.parse_metric_focus(answer)
+            metric_focus = answer[:120] if selected_index >= 0 else self.parse_metric_focus(answer)
             if metric_focus:
                 resolution.update({"metricFocus": metric_focus, "clarificationResolved": True})
         elif pending_type == "priority_goal":

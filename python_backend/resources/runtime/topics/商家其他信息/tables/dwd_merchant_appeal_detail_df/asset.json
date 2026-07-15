@@ -660,7 +660,7 @@
   "metrics": [
     {
       "metricKey": "appeal_cnt",
-      "businessName": "申诉次数",
+      "businessName": "申诉明细次数",
       "formula": "COUNT(DISTINCT appeal_id)",
       "unit": "次",
       "description": "按申诉 ID 去重统计商家申诉次数",
@@ -668,14 +668,27 @@
         "appeal_id"
       ],
       "aliases": [
-        "申诉次数"
+        "申诉明细次数",
+        "appeal_cnt"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "申诉明细次数",
+      "disambiguationName": "申诉明细次数",
+      "tableKind": "detail_fact",
+      "metricGrain": "appeal_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "申诉次数",
+      "originalBusinessName": "申诉次数",
+      "naturalAlias": "申诉次数",
+      "sourceColumnAliases": [
+        "appeal_id"
+      ]
     },
     {
       "metricKey": "appeal_pass_cnt",
-      "businessName": "申诉通过次数",
+      "businessName": "申诉明细通过次数",
       "formula": "SUM(CASE WHEN appeal_status_code = 1 OR appeal_status_name = '通过' THEN 1 ELSE 0 END)",
       "unit": "次",
       "description": "按申诉状态统计通过次数",
@@ -684,14 +697,28 @@
         "appeal_status_name"
       ],
       "aliases": [
-        "申诉通过次数"
+        "申诉明细通过次数",
+        "appeal_pass_cnt"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "申诉明细通过次数",
+      "disambiguationName": "申诉明细通过次数",
+      "tableKind": "detail_fact",
+      "metricGrain": "appeal_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "申诉通过次数",
+      "originalBusinessName": "申诉通过次数",
+      "naturalAlias": "申诉通过次数",
+      "sourceColumnAliases": [
+        "appeal_status_code",
+        "appeal_status_name"
+      ]
     },
     {
       "metricKey": "appeal_reject_cnt",
-      "businessName": "申诉驳回次数",
+      "businessName": "申诉明细驳回次数",
       "formula": "SUM(CASE WHEN appeal_status_code = 2 OR appeal_status_name = '驳回' THEN 1 ELSE 0 END)",
       "unit": "次",
       "description": "按申诉状态统计驳回次数",
@@ -700,33 +727,63 @@
         "appeal_status_name"
       ],
       "aliases": [
-        "申诉驳回次数"
+        "申诉明细驳回次数",
+        "appeal_reject_cnt"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "申诉明细驳回次数",
+      "disambiguationName": "申诉明细驳回次数",
+      "tableKind": "detail_fact",
+      "metricGrain": "appeal_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "申诉驳回次数",
+      "originalBusinessName": "申诉驳回次数",
+      "naturalAlias": "申诉驳回次数",
+      "sourceColumnAliases": [
+        "appeal_status_code",
+        "appeal_status_name"
+      ]
     },
     {
       "metricKey": "appeal_success_rate",
-      "businessName": "申诉成功率",
+      "businessName": "申诉明细成功率",
       "formula": "appeal_pass_cnt / NULLIF(appeal_cnt, 0)",
       "unit": "%",
       "description": "申诉通过次数占申诉次数的比例",
-      "sourceColumns": [
-        "appeal_pass_cnt",
-        "appeal_cnt"
-      ],
+      "sourceColumns": [],
       "aliases": [
-        "申诉成功率",
-        "申诉通过率",
+        "申诉明细成功率",
         "appeal_success_rate",
-        "appeal_pass_rate"
+        "申诉成功率",
+        "申诉通过率"
       ],
       "confidence": 0.9,
-      "evidence": "语义层派生指标：申诉通过次数 / 申诉次数"
+      "evidence": "语义层派生指标：申诉通过次数 / 申诉次数",
+      "displayName": "申诉明细成功率",
+      "disambiguationName": "申诉明细成功率",
+      "tableKind": "detail_fact",
+      "metricGrain": "appeal_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "申诉成功率",
+      "originalBusinessName": "申诉成功率",
+      "naturalAlias": "申诉成功率",
+      "sourceColumnAliases": [
+        "appeal_cnt",
+        "appeal_pass_cnt"
+      ],
+      "semanticCleanup": {
+        "droppedNonSchemaSourceColumns": [
+          "appeal_pass_cnt",
+          "appeal_cnt"
+        ]
+      }
     },
     {
       "metricKey": "punish_appeal_cnt",
-      "businessName": "处罚类申诉次数",
+      "businessName": "申诉明细处罚类申诉次数",
       "formula": "SUM(CASE WHEN apply_type_code = 6 OR apply_type_name = '处罚' THEN 1 ELSE 0 END)",
       "unit": "次",
       "description": "按申诉类型统计处罚类申诉次数",
@@ -735,10 +792,25 @@
         "apply_type_name"
       ],
       "aliases": [
-        "处罚类申诉次数"
+        "申诉明细处罚类申诉次数",
+        "punish_appeal_cnt",
+        "申诉处罚类申诉次数"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "申诉明细处罚类申诉次数",
+      "disambiguationName": "申诉明细处罚类申诉次数",
+      "tableKind": "detail_fact",
+      "metricGrain": "appeal_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "处罚类申诉次数",
+      "originalBusinessName": "处罚类申诉次数",
+      "naturalAlias": "处罚类申诉次数",
+      "sourceColumnAliases": [
+        "apply_type_code",
+        "apply_type_name"
+      ]
     }
   ],
   "terms": [

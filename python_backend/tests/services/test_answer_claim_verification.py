@@ -58,6 +58,44 @@ def detail_run(row):
     )
 
 
+def metric_plan():
+    return QueryPlan(
+        question_understanding={"source": "semantic_metric_fallback", "analysisIntent": "none"},
+        intents=[
+            QuestionIntent(
+                question="最近7天GMV是多少？",
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="metric_gmv",
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_column="order_gmv_amt_1d",
+                group_by_column="merchant_id",
+                metric_resolution={
+                    "semanticRefId": "semantic:经营画像:ads_merchant_profile:metric:order_gmv_amt_1d",
+                    "metricKey": "order_gmv_amt_1d",
+                    "ownerTable": "ads_merchant_profile",
+                    "displayName": "总GMV金额",
+                    "sourceColumns": ["order_gmv_amt_1d"],
+                },
+            )
+        ],
+    )
+
+
+def metric_run(value=188.0):
+    bundle = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[{"merchant_id": "100", "order_gmv_amt_1d": value}],
+        original_row_count=1,
+    )
+    return AgentRunResult(
+        task_results=[AgentTaskResult(task_id="metric_gmv", success=True, query_bundle=bundle)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+
 def test_verified_facts_are_task_and_cell_bound():
     plan = detail_plan()
     facts = build_verified_facts(plan, detail_run({"order_id": "order_1", "pay_amt": 121.5}))
@@ -233,6 +271,25 @@ def test_answer_compose_keeps_supported_llm_fact():
     assert service.last_answer_claim_trace["passed"] is True
     assert service.last_answer_claim_trace["fallbackUsed"] is False
     assert len(llm.payloads) == 1
+
+
+def test_answer_compose_keeps_verified_single_metric_fallback_when_llm_fact_is_wrong():
+    llm = ClaimAnswerLlm("最近7天总GMV金额为 999元。")
+    service = AnswerComposeService(llm)
+
+    answer = service.compose(
+        "最近7天GMV是多少？",
+        MerchantInfo(merchant_id="100"),
+        metric_plan(),
+        metric_run(188.0),
+        "",
+    )
+
+    assert "188" in answer
+    assert "999" not in answer
+    assert "以结构化数据区域为准" not in answer
+    assert service.last_answer_claim_trace["passed"] is True
+    assert service.last_answer_claim_trace["fallbackUsed"] is True
 
 
 def test_golden_answer_score_honors_runtime_claim_verification():

@@ -68,10 +68,11 @@
 - 退货成功金额元：退货成功金额元-最近1天，同义词=退货成功金额元、return_success_amt_1d、退货成功金额元-最近1天，关联字段=return_success_amt_1d
 - 卖家责任退货量：卖家责任退货量-最近1天，同义词=卖家责任退货量、seller_responsible_refund_cnt_1d、卖家责任退货量-最近1天、退款、售后，关联字段=seller_responsible_refund_cnt_1d
 - 直接退款量：直接退款量-最近1天，同义词=直接退款量、direct_refund_cnt_1d、直接退款量-最近1天，关联字段=direct_refund_cnt_1d
-- 退货量占支付订单量比例：退货量占支付订单量比例-最近1天，同义词=退货量占支付订单量比例、退款率、退货率、售后率、整体退款率、店铺退款率、refund_rate、refund_rate_1d、退货量占支付订单量比例-最近1天、退款、售后、订单，关联字段=refund_rate_1d
+- 退货量占支付订单量比例：退货率口径：退货量占支付订单量的比例；单日看每日退货率，周期汇总看周期汇总退货率。，同义词=退货量占支付订单量比例、退货率、退货订单率、售后退货率、整体退货率、店铺退货率，关联字段=refund_rate_1d、return_cnt_1d、pay_order_cnt_1d
 - 工单二次开启量：工单二次开启量-最近1天，同义词=工单二次开启量、ticket_reopen_cnt_1d、工单二次开启量-最近1天，关联字段=ticket_reopen_cnt_1d
 - 催单工单量：催单工单量-最近1天，同义词=催单工单量、ticket_reminder_cnt_1d、催单工单量-最近1天，关联字段=ticket_reminder_cnt_1d
 - 关闭工单量：关闭工单量-最近1天，同义词=关闭工单量、ticket_close_cnt_1d、关闭工单量-最近1天，关联字段=ticket_close_cnt_1d
 - 平均工单评价分：平均工单评价分-最近1天，同义词=平均工单评价分、avg_ticket_score_1d、平均工单评价分-最近1天，关联字段=avg_ticket_score_1d
 - 商品审核通过量：商品审核通过量-最近1天，同义词=商品审核通过量、goods_audit_pass_cnt_1d、商品审核通过量-最近1天，关联字段=goods_audit_pass_cnt_1d
 - GMV：交易成交金额，优先使用语义层中的 GMV 指标字段或公式，同义词=成交额、销售额、交易流水
+- 退款率：退款率口径：直接退款量占支付订单量的比例，和退货率不是同一指标。，同义词=退款率、直接退款率、周期退款率、汇总退款率、店铺退款率、整体退款率、退款订单率，关联字段=direct_refund_cnt_1d、pay_order_cnt_1d

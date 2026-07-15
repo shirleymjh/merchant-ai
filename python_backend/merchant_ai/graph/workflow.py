@@ -42,6 +42,7 @@ from merchant_ai.models import (
     AgentDecision,
     AgentActionTrace,
     AgentRunResult,
+    AgentTaskResult,
     AnswerMode,
     ChatContext,
     ChatDataSection,
@@ -87,6 +88,7 @@ from merchant_ai.models import (
     RoutingDecision,
     ThreadData,
     TopicRoutingDecision,
+    VerifiedEvidence,
 )
 from merchant_ai.services.langgraph_compat import END, START, StateGraph
 from merchant_ai.services.answer import (
@@ -102,7 +104,16 @@ from merchant_ai.services.answer import (
     visible_successful_tasks,
 )
 from merchant_ai.services.analysis_worker import AnalysisWorkerExecutor
-from merchant_ai.services.assets import HybridRecallService, PlanningAssetPackBuilder, SemanticCatalogService, SkillLoader, TopicAssetService
+from merchant_ai.services.assets import (
+    HybridRecallService,
+    PlanningAssetPackBuilder,
+    SemanticCatalogService,
+    SkillLoader,
+    TopicAssetService,
+    metric_direct_match_label,
+    normalize_for_match,
+    recalled_metric_evidence_matches_phrase,
+)
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.clarification import ClarificationResolutionService
 from merchant_ai.services.context import ContextManager
@@ -125,6 +136,7 @@ from merchant_ai.services.merchant_profile import MerchantProfileStore, Merchant
 from merchant_ai.services.middleware import MiddlewareChain, default_harness_middlewares
 from merchant_ai.services.observability import append_span, artifact_ref_from_path, now_ms, performance_summary, start_step, finish_step
 from merchant_ai.services.planning import (
+    compile_semantic_metric_fallback_graph,
     PlannerReflectionAgent,
     QueryGraphPlanner,
     QueryGraphValidator,
@@ -135,7 +147,12 @@ from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, merge_task_result_bundles
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
-from merchant_ai.services.retrieval import EsKnowledgeRetrievalService, HybridKnowledgeRetrievalService, KnowledgeRetrievalService, recall_item_sort_key
+from merchant_ai.services.retrieval import (
+    EsKnowledgeRetrievalService,
+    HybridKnowledgeRetrievalService,
+    KnowledgeRetrievalService,
+    recall_item_sort_key,
+)
 from merchant_ai.services.routing import (
     KeywordExtractService,
     PreflightUnderstandingService,
@@ -459,6 +476,8 @@ class MerchantQaWorkflow:
             evidence_generation=-1,
             analysis_generation=-1,
             fast_understood=False,
+            query_metric_attempted=False,
+            query_metric_completed=False,
             planning_assets_compacted=False,
             skills_loaded=False,
             loaded_skills=[],
@@ -503,6 +522,7 @@ class MerchantQaWorkflow:
         builder.add_node("try_fast_metric", self.try_fast_metric)
         builder.add_node("retrieve_knowledge", self.retrieve_knowledge)
         builder.add_node("compact_assets", self.compact_assets)
+        builder.add_node("query_metric", self.query_metric)
         builder.add_node("plan_query_graph", self.plan_query_graph)
         builder.add_node("reflect_query_graph", self.reflect_query_graph)
         builder.add_node("validate_query_graph", self.validate_query_graph)
@@ -544,6 +564,7 @@ class MerchantQaWorkflow:
                 "try_fast_metric": "try_fast_metric",
                 "retrieve_knowledge": "retrieve_knowledge",
                 "compact_assets": "compact_assets",
+                "query_metric": "query_metric",
                 "plan_query_graph": "plan_query_graph",
                 "reflect_query_graph": "reflect_query_graph",
                 "validate_query_graph": "validate_query_graph",
@@ -578,6 +599,7 @@ class MerchantQaWorkflow:
             },
         )
         builder.add_edge("compact_assets", "policy")
+        builder.add_edge("query_metric", "policy")
         builder.add_conditional_edges(
             "plan_query_graph",
             self.route_after_plan_query_graph,
@@ -683,6 +705,56 @@ class MerchantQaWorkflow:
             state["analysis_skill_status"] = {"status": "pending", "source": reason}
         if had_outputs:
             add_step(state, "Runtime Guard：%s，已清空旧 SQL/证据/分析输出" % reason)
+
+    def clear_analysis_outputs(self, state: AgentState, reason: str) -> None:
+        had_analysis = bool(state.get("analysis_summary") or state.get("analysis_worker_completed") or state.get("skill_worker_completed"))
+        state["analysis_summary"] = ""
+        state["analysis_generation"] = -1
+        state["analysis_worker_result"] = {}
+        state["analysis_worker_trace"] = {}
+        state["analysis_worker_completed"] = False
+        state["analysis_worker_status"] = {"status": "pending", "source": reason}
+        state["analysis_skill_trace"] = {}
+        state["skill_worker_completed"] = False
+        skill_status = state.get("analysis_skill_status") or {}
+        user_declined_skill = state.get("analysis_skill_bypassed") and skill_status.get("status") == "declined" and skill_status.get("source") == "user"
+        if not user_declined_skill:
+            state["analysis_skill_status"] = {"status": "pending", "source": reason}
+        if had_analysis:
+            add_step(state, "Runtime Guard：%s，已清空旧分析输出" % reason)
+
+    def guard_unaccepted_evidence_for_answer(self, state: AgentState) -> None:
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        if not getattr(run_result, "task_results", None):
+            return
+        if evidence_accepted_for_state(state):
+            return
+        existing = list(getattr(run_result, "evidence_gaps", []) or [])
+        if not existing:
+            existing = [
+                EvidenceGap(
+                    code="UNVERIFIED_EVIDENCE",
+                    severity="blocking",
+                    reason="查询结果尚未通过证据校验，不能作为完整业务结论。",
+                    answer_instruction="本轮查询结果尚未通过证据校验，只能说明当前证据不完整，不能给出完整业务判断。",
+                )
+            ]
+        blocking = [
+            gap
+            for gap in existing
+            if str(getattr(gap, "severity", "") or "") == "blocking"
+        ] or existing[:1]
+        run_result.evidence_gaps = existing
+        run_result.partial_answer_reason = run_result.partial_answer_reason or "查询结果尚未通过证据校验"
+        run_result.verified_evidence = VerifiedEvidence(
+            passed=False,
+            gaps=existing,
+            blocking_gaps=blocking,
+            answer_guard_required=True,
+            partial_answer_reason=run_result.partial_answer_reason,
+        )
+        state["agent_run_result"] = run_result
+        state["evidence_accepted"] = False
 
     def route_after_retrieve_knowledge(self, state: AgentState) -> str:
         terminal = self.terminal_or_human_node(state)
@@ -1136,7 +1208,7 @@ class MerchantQaWorkflow:
         state["lead_decision_context"] = self.build_lead_decision_context(state, observation)
         decision = self.policy.decide(state)
         decision.observation = observation.get("summary", "")
-        decision = self.apply_bounded_lead_llm_decision(state, decision)
+        decision = self.arbitrate_lead_action_if_needed(state, decision)
         state = self.middleware_chain.before_action(state, decision)
         if (state.get("terminal_status") or {}).get("active"):
             action = self.policy.registry.get("terminal_end")
@@ -1238,11 +1310,11 @@ class MerchantQaWorkflow:
         )
         self.reconcile_fast_request_agent_gates(state)
 
-    def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
+    def arbitrate_lead_action_if_needed(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
         mode = str(getattr(self.settings, "lead_action_llm_mode", "always") or "always").lower()
         policy_allowed = [str(item) for item in decision.available_actions if item]
         allowed = self.lead_llm_action_catalog(policy_allowed, state)
-        is_fast_gate = {"try_fast_metric", "retrieve_knowledge"}.issubset(set(allowed))
+        is_fast_gate = {"query_metric", "plan_graph"}.issubset(set(allowed))
         observation = state.get("main_agent_observations", [{}])[-1] if state.get("main_agent_observations") else {}
         trace: Dict[str, Any] = {
             "mode": mode,
@@ -1259,7 +1331,7 @@ class MerchantQaWorkflow:
             and state.get("fast_understood")
             and decision.selected_action == "retrieve_knowledge"
         )
-        if is_fast_gate or is_preknowledge_retrieval_guard:
+        if is_preknowledge_retrieval_guard:
             state["fast_gate_decision_trace"] = trace
             fast_guard_reason = self.fast_gate_retrieval_guard_reason(state)
             if fast_guard_reason:
@@ -1286,10 +1358,23 @@ class MerchantQaWorkflow:
         if self.latency_optimizer.blocks_expensive_agents(state.get("latency_optimization") or {}):
             trace.update({"status": "skipped", "reason": "simple_request_fast_path_blocks_lead_llm"})
             return decision
+        deterministic_reason = self.lead_action_deterministic_skip_reason(state, decision, allowed)
+        if deterministic_reason:
+            trace.update(
+                {
+                    "status": "skipped",
+                    "reason": deterministic_reason,
+                    "policySource": "deterministic",
+                    "selectedAction": decision.selected_action,
+                }
+            )
+            return decision
         if mode in {"off", "false", "0", "disabled"}:
+            trace["policySource"] = "deterministic"
             return decision
         if len(allowed) <= 1:
             trace["reason"] = "single_available_action"
+            trace["policySource"] = "deterministic"
             return decision
         should_call = mode == "always" or (mode == "fast_gate" and is_fast_gate) or (
             mode == "low_confidence"
@@ -1304,11 +1389,13 @@ class MerchantQaWorkflow:
             should_call = self.adaptive_lead_llm_needed(state, allowed, is_fast_gate)
         if not should_call:
             trace["reason"] = "deterministic_decision_confident"
+            trace["policySource"] = "deterministic"
             return decision
         llm = getattr(self.planner, "llm", None)
         if not llm or not getattr(llm, "configured", False):
             trace.update({"status": "skipped", "reason": "llm_not_configured"})
             return decision
+        trace.update({"status": "calling", "reason": "lead_llm_arbitration_needed", "policySource": "lead_llm_arbitration"})
         payload = {
             "question": state.get("question", ""),
             "observation": observation,
@@ -1414,6 +1501,43 @@ class MerchantQaWorkflow:
             source="lead_llm_tool",
         )
 
+    def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
+        return self.arbitrate_lead_action_if_needed(state, decision)
+
+    def lead_action_deterministic_skip_reason(self, state: AgentState, decision: AgentDecision, allowed: List[str]) -> str:
+        """Return why LeadAction LLM arbitration is unnecessary for settled states.
+
+        This does not prescribe the business workflow.  It only avoids asking a
+        second model to re-decide states that the harness has already proven:
+        terminal answers, clarification stops, verified evidence, and required
+        knowledge refreshes.
+        """
+
+        selected = str(decision.selected_action or "")
+        allowed_set = {str(item) for item in allowed if item}
+        analysis_dispatch_actions = {"delegate_subagent", "explore_hypotheses", "run_analysis_worker", "run_analysis_skill"}
+        if selected in {"terminal_end", "cache_answer", "ask_human"}:
+            return "%s_is_terminal_or_user_blocked" % selected
+        if bool(decision.budget_exhausted):
+            return "budget_or_runtime_guard_decision"
+        if state.get("human_clarification_required"):
+            return "human_clarification_required"
+        if selected == "verify_evidence":
+            return "evidence_verification_is_mandatory"
+        if selected == "retrieve_knowledge" and state.get("pending_knowledge_requests"):
+            return "pending_knowledge_request_requires_retrieve"
+        if selected == "answer_rule":
+            return "rule_answer_ready"
+        if selected == "answer_data":
+            if state.get("query_metric_completed") and evidence_accepted_for_state(state):
+                return "verified_query_metric_answer_ready"
+            if evidence_accepted_for_state(state) and not (analysis_dispatch_actions & allowed_set):
+                return "verified_evidence_answer_ready"
+            route = state.get("routing_decision") or RoutingDecision()
+            if route.route in {QuestionRoute.GREETING, QuestionRoute.INVALID}:
+                return "preflight_terminal_answer"
+        return ""
+
     def fast_gate_retrieval_guard_reason(self, state: AgentState) -> str:
         route = state.get("routing_decision") or RoutingDecision()
         if route.route != QuestionRoute.BUSINESS:
@@ -1503,9 +1627,9 @@ class MerchantQaWorkflow:
         if not is_fast_gate:
             return base
         return base + (
-            "当前同时提供快速指标与知识检索：只有一个已发布语义指标的合计、最近N天按日趋势、变化或单指标口径说明可选择 try_fast_metric；"
-            "多指标、占比、排名、归因、明细、非日期维度、附件上下文、指标歧义或非语义层指标必须选择 retrieve_knowledge。"
-            "fastUnderstanding.needsPlanner/needsKnowledge 是保守提示，不是 Fast 能力判决。"
+            "当前已完成 Topic workspace 召回和资产压缩：只有一个受控语义指标、无需归因/排行/明细/跨域分析时可选择 query_metric；"
+            "如果指标歧义、资产缺口、需要解释原因或多轮探索，选择 plan_graph 或后续 ask_human。"
+            "query_metric 只接收当前 Topic 资产包里的语义引用，并会自行完成校验、执行和证据门禁。"
         )
 
     def main_agent_observation(self, state: AgentState) -> Dict[str, Any]:
@@ -1611,6 +1735,7 @@ class MerchantQaWorkflow:
                 "evidenceGraphVerified": bool(state.get("evidence_graph_verified")),
                 "evidenceAccepted": bool(evidence_accepted_for_state(state)),
                 "analysisWorkerCompleted": bool(state.get("analysis_worker_completed")),
+                "skillWorkerCompleted": bool(state.get("skill_worker_completed")),
                 "hypothesisExplorationCompleted": bool(state.get("hypothesis_exploration_completed")),
                 "chatBiCompleted": bool(state.get("chat_bi_completed")),
             },
@@ -2020,7 +2145,7 @@ class MerchantQaWorkflow:
         decision: TopicRoutingDecision,
         route_slots: RouteSlots,
     ) -> None:
-        """Set discovery seeds without freezing the semantic execution boundary."""
+        """Set the semantic workspace boundary before any knowledge retrieval."""
         topics = decision.recall_topics()
         confidence = max(float(decision.confidence or 0.0), float(route_slots.route_confidence or 0.0))
         context = state.get("request_context")
@@ -2056,15 +2181,28 @@ class MerchantQaWorkflow:
             decision.clarification_required = True
         elif explicit_single_topic_lock:
             mode = "explicit_topic_scope"
-        elif len(topics) > 1:
+        elif len(topics) >= 1:
             mode = "topic_workspace"
         else:
-            mode = "adaptive_workspace"
+            mode = "clarification_required"
+            decision.clarification_required = True
         topic_names = self._topic_names_for_categories(topics)
         high_risk = str(route_slots.risk_level or "") in {"high_risk", "rule_sensitive"}
         decision.routing_mode = mode
         decision.workspace_topics = topics if mode not in {"clarification_required", "open_discovery"} else []
         decision.scope_disclosure_required = bool(high_risk or mode == "topic_workspace")
+        if mode == "explicit_topic_scope":
+            topic_role = "explicit_boundary"
+            expansion_policy = "user_locked"
+        elif mode == "topic_workspace":
+            topic_role = "topic_boundary"
+            expansion_policy = "on_gap_or_tool_request"
+        elif mode == "open_discovery":
+            topic_role = "discovery_seed"
+            expansion_policy = "coverage_and_relationship_driven"
+        else:
+            topic_role = "needs_clarification"
+            expansion_policy = "ask_human"
         workspace = {
             "mode": mode,
             "topics": topic_names,
@@ -2072,9 +2210,9 @@ class MerchantQaWorkflow:
             "confidence": round(confidence, 3),
             "confirmedByUser": user_confirmed,
             "isolated": mode == "explicit_topic_scope",
-            "allowCrossTopic": mode in {"adaptive_workspace", "topic_workspace", "open_discovery"},
-            "topicRole": "discovery_seed" if mode in {"adaptive_workspace", "topic_workspace", "open_discovery"} else "explicit_boundary",
-            "expansionPolicy": "coverage_and_relationship_driven" if mode != "explicit_topic_scope" else "user_locked",
+            "allowCrossTopic": mode == "open_discovery",
+            "topicRole": topic_role,
+            "expansionPolicy": expansion_policy,
             "scopeDisclosureRequired": decision.scope_disclosure_required,
             "knowledgeRefreshPolicy": "refresh_each_business_turn",
         }
@@ -2084,7 +2222,7 @@ class MerchantQaWorkflow:
             "riskLevel": str(route_slots.risk_level or "normal"),
             "timeWindow": route_slots.time_window.model_dump(by_alias=True),
             "objectRefs": [item.model_dump(by_alias=True) for item in route_slots.object_refs],
-            "displayText": "当前发现起点：%s；缺失证据可自动扩展关联 Topic"
+            "displayText": "当前 Topic 边界：%s；仅在证据缺口或工具请求时补充关联 Topic"
             % (" + ".join(topic_names) if topic_names else "待确认"),
         }
         state.setdefault("route_decision_trace", []).append({"stage": "topic_workspace", **workspace})
@@ -2279,7 +2417,12 @@ class MerchantQaWorkflow:
             self.record_span(state, "tool", "try_fast_metric", started, status="gap", error_code="FAST_UNSUPPORTED")
             self.finish_run_step(state, step, "gap", output_summary="unsupported -> Planner", error_code="FAST_UNSUPPORTED")
             return state
-        semantic_identity = dict((response.debug_trace or {}).get("semanticMetric") or {})
+        debug_trace = response.debug_trace or {}
+        semantic_identity = dict(debug_trace.get("semanticMetric") or {})
+        if not semantic_identity:
+            semantic_identities = list(debug_trace.get("semanticMetrics") or [])
+            if len(semantic_identities) == 1:
+                semantic_identity = dict(semantic_identities[0] or {})
         if not semantic_identity.get("semanticRefId") or semantic_identity.get("governanceStatus") != "published":
             state["fast_metric_completed"] = False
             self.escalate_fast_request(state, "fast metric result lacked published semantic lineage")
@@ -2304,12 +2447,20 @@ class MerchantQaWorkflow:
         state["query_bundle"] = QueryBundle(
             tables=list(response.doris_tables or []),
             rows=list(response.data_rows or []),
-            summary="verified published semantic single-metric result",
-            cache_hit=bool((response.debug_trace or {}).get("quickMetricCacheHit")),
+            summary="published semantic metric definition" if debug_trace.get("definitionOnly") else "verified published semantic single-metric result",
+            cache_hit=bool(debug_trace.get("quickMetricCacheHit")),
         )
-        state["should_persist"] = True
+        if debug_trace.get("definitionOnly"):
+            self.attach_fast_metric_definition_state(state, response, semantic_identity)
+            state["should_persist"] = False
+        else:
+            self.attach_fast_metric_evidence_state(state, response, semantic_identity)
+            state["should_persist"] = True
         state["chat_bi_completed"] = True
-        add_step(state, "Lead Agent Fast Tool：唯一已发布语义指标完整覆盖本轮问题，采用已校验快速结果")
+        if debug_trace.get("definitionOnly"):
+            add_step(state, "Lead Agent Fast Tool：唯一已发布语义指标覆盖口径问题，采用语义资产口径说明")
+        else:
+            add_step(state, "Lead Agent Fast Tool：唯一已发布语义指标完整覆盖本轮问题，采用已校验快速结果")
         emit(
             state,
             "node.completed",
@@ -2367,6 +2518,108 @@ class MerchantQaWorkflow:
             response.thinking_steps = ["刷新本轮平台/Topic 强制规则", *steps]
         if rules:
             add_step(state, "Fast Metric Knowledge Refresh：已将 %d 条本轮 Topic 强制规则注入快速指标答案" % len(rules))
+
+    def attach_fast_metric_definition_state(self, state: AgentState, response: ChatResponse, semantic_identity: Dict[str, Any]) -> None:
+        debug_trace = response.debug_trace or {}
+        metric_disclosures = (response.merchant_experience or {}).get("metricDisclosures") or [{}]
+        metric_key = str(semantic_identity.get("metricKey") or "")
+        display_name = str(metric_disclosures[0].get("displayName") or metric_key or debug_trace.get("metric") or "指标口径")
+        table = str(semantic_identity.get("table") or ((response.doris_tables or [""])[0] if response.doris_tables else ""))
+        topic_name = str(semantic_identity.get("category") or semantic_identity.get("topic") or "")
+        category = TOPIC_TO_CATEGORY.get(topic_name, QuestionCategory.UNKNOWN)
+        state["plan"] = QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question=state.get("question", ""),
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.RULE,
+                    category=category,
+                    plan_task_id="quick_metric_definition",
+                    preferred_table=table,
+                    metric_name=display_name,
+                    metric_resolution={
+                        "metricKey": metric_key,
+                        "displayName": display_name,
+                        "semanticRefId": str(semantic_identity.get("semanticRefId") or ""),
+                        "metricGovernanceMode": "published_semantic_definition",
+                    },
+                )
+            ],
+            agent_trace=["fast_metric_published_semantic_definition"],
+        )
+        state["agent_run_result"] = AgentRunResult(
+            query_bundles=[state.get("query_bundle") or QueryBundle()],
+            merged_query_bundle=state.get("query_bundle") or QueryBundle(),
+            verified_evidence=VerifiedEvidence(passed=False, summary="semantic definition only; no Doris evidence required"),
+        )
+        state["sql_generated"] = False
+        state["evidence_graph_verified"] = False
+        state["verification_status"] = "semantic_definition"
+        state["evidence_accepted"] = False
+
+    def attach_fast_metric_evidence_state(self, state: AgentState, response: ChatResponse, semantic_identity: Dict[str, Any]) -> None:
+        debug_trace = response.debug_trace or {}
+        metric_disclosures = (response.merchant_experience or {}).get("metricDisclosures") or [{}]
+        metric_key = str(semantic_identity.get("metricKey") or "")
+        display_name = str(metric_disclosures[0].get("displayName") or metric_key or debug_trace.get("metric") or "value")
+        table = str(semantic_identity.get("table") or ((response.doris_tables or [""])[0] if response.doris_tables else ""))
+        topic_name = str(semantic_identity.get("category") or semantic_identity.get("topic") or "")
+        category = TOPIC_TO_CATEGORY.get(topic_name, QuestionCategory.UNKNOWN)
+        days = int(debug_trace.get("days") or ((debug_trace.get("timeRange") or {}).get("days") or 0))
+        summary_rows: List[Dict[str, Any]] = []
+        for section in response.data_sections or []:
+            if str(getattr(section, "result_role", "") or "") == "summary":
+                summary_rows.extend(list(getattr(section, "data_rows", []) or []))
+        if not summary_rows:
+            summary_rows = list(response.data_rows or [])[:1]
+        summary_bundle = QueryBundle(
+            tables=[table] if table else list(response.doris_tables or []),
+            rows=summary_rows,
+            original_row_count=len(summary_rows),
+            summary="verified published semantic single-metric result",
+        )
+        trend_bundle = QueryBundle(
+            tables=[table] if table else list(response.doris_tables or []),
+            rows=list(response.data_rows or []),
+            original_row_count=len(response.data_rows or []),
+            summary="verified published semantic single-metric trend result",
+        )
+        state["plan"] = QueryPlan(
+            intents=[
+                QuestionIntent(
+                    question=state.get("question", ""),
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.METRIC,
+                    category=category,
+                    plan_task_id="quick_metric_summary",
+                    preferred_table=table,
+                    metric_name=display_name,
+                    metric_column="value",
+                    metric_resolution={
+                        "metricKey": metric_key,
+                        "displayName": display_name,
+                        "semanticRefId": str(semantic_identity.get("semanticRefId") or ""),
+                    },
+                    days=days,
+                )
+            ],
+            agent_trace=["fast_metric_verified_semantic_contract"],
+        )
+        state["agent_run_result"] = AgentRunResult(
+            task_results=[
+                AgentTaskResult(task_id="quick_metric_summary", success=True, query_bundle=summary_bundle),
+                AgentTaskResult(task_id="quick_metric_trend", success=True, query_bundle=trend_bundle),
+            ],
+            query_bundles=[summary_bundle, trend_bundle],
+            merged_query_bundle=summary_bundle,
+            verified_evidence=VerifiedEvidence(passed=True),
+        )
+        state["sql_generated"] = True
+        state["evidence_graph_verified"] = True
+        state["verification_status"] = "passed"
+        state["evidence_accepted"] = True
+        state["result_generation"] = int(state.get("execution_generation") or 0)
+        state["evidence_generation"] = int(state.get("execution_generation") or 0)
 
     def merchant_clarification_need(self, state: AgentState, fast: FastUnderstandingResult) -> Dict[str, Any]:
         if not bool(getattr(self.settings, "merchant_clarification_enabled", True)):
@@ -3168,6 +3421,414 @@ class MerchantQaWorkflow:
         emit(state, "node.completed", "COMPACT_ASSETS", {"tables": pack.known_tables()[:12]})
         return state
 
+    def query_metric_ambiguity(self, pack: PlanningAssetPack, question: str) -> Dict[str, Any]:
+        normalized_question = normalize_for_match(question)
+        if not normalized_question:
+            return {}
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+
+        def add_candidate(raw: Dict[str, Any], source: str, ambiguous: bool) -> None:
+            label = str(
+                raw.get("matchedMetricLabel")
+                or raw.get("recallQuery")
+                or raw.get("businessName")
+                or raw.get("title")
+                or raw.get("metricKey")
+                or ""
+            ).strip()
+            label_norm = normalize_for_match(label)
+            if not label_norm:
+                return
+            if label_norm not in normalized_question and not ambiguous:
+                return
+            table = str(raw.get("ownerTable") or raw.get("tableName") or raw.get("table") or "").strip()
+            metric_key = str(raw.get("metricKey") or raw.get("metricRef") or "").strip()
+            if not table or not metric_key:
+                return
+            display = str(raw.get("businessName") or raw.get("title") or raw.get("displayName") or metric_key).strip()
+            bucket = buckets.setdefault(label_norm, [])
+            if any(item["table"] == table and item["metricKey"] == metric_key for item in bucket):
+                return
+            bucket.append(
+                {
+                    "label": label,
+                    "display": display,
+                    "table": table,
+                    "metricKey": metric_key,
+                    "source": source,
+                    "ambiguous": bool(ambiguous),
+                }
+            )
+
+        for evidence in (pack.metric_compaction or {}).get("recalledMetricEvidence") or []:
+            if not isinstance(evidence, dict):
+                continue
+            if not recalled_metric_evidence_matches_phrase(evidence, question) and not evidence.get("metricResolutionAmbiguous"):
+                continue
+            add_candidate(evidence, "recalled_metric_evidence", bool(evidence.get("metricResolutionAmbiguous")))
+
+        for candidate in (pack.metric_compaction or {}).get("catalogMetricCandidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            add_candidate(candidate, "catalog_metric_candidate", bool(candidate.get("ambiguous")))
+
+        for metric in pack.metrics:
+            matched_label = metric_direct_match_label(metric, question)
+            if not matched_label:
+                continue
+            label_norm = normalize_for_match(matched_label)
+            if not label_norm:
+                continue
+            metric_metadata = metric.metadata or {}
+            sibling_metrics = []
+            for sibling in pack.metrics:
+                if sibling.table == metric.table and sibling.key == metric.key:
+                    continue
+                sibling_metadata = sibling.metadata or {}
+                sibling_level = str(sibling_metadata.get("metricLevel") or sibling_metadata.get("metric_level") or "").lower()
+                if sibling_level != "business_variant":
+                    continue
+                sibling_labels = [
+                    sibling.key,
+                    sibling.title,
+                    str(sibling_metadata.get("businessName") or ""),
+                    str(sibling_metadata.get("displayName") or ""),
+                    *sibling.aliases,
+                    *[str(alias) for alias in sibling_metadata.get("aliases") or []],
+                ]
+                if any(label_norm and label_norm in normalize_for_match(label) for label in sibling_labels if str(label or "").strip()):
+                    sibling_metrics.append(sibling)
+            if not sibling_metrics:
+                continue
+            add_candidate(
+                {
+                    "matchedMetricLabel": matched_label,
+                    "businessName": str(metric_metadata.get("businessName") or metric.title or metric.key),
+                    "ownerTable": metric.table,
+                    "metricKey": metric.key,
+                },
+                "semantic_metric_variant_family",
+                True,
+            )
+            for sibling in sibling_metrics[:5]:
+                sibling_metadata = sibling.metadata or {}
+                add_candidate(
+                    {
+                        "matchedMetricLabel": matched_label,
+                        "businessName": str(sibling_metadata.get("businessName") or sibling.title or sibling.key),
+                        "ownerTable": sibling.table,
+                        "metricKey": sibling.key,
+                    },
+                    "semantic_metric_variant_family",
+                    True,
+                )
+
+        for _label_norm, candidates in buckets.items():
+            if len(candidates) < 2:
+                continue
+            if not any(item.get("ambiguous") for item in candidates):
+                continue
+            label = next((item["label"] for item in candidates if item.get("label")), "这个指标")
+            options = [
+                "%s（%s.%s）" % (item["display"], item["table"], item["metricKey"])
+                for item in candidates[:6]
+            ]
+            return {
+                "label": label,
+                "options": dedupe_texts(options),
+                "candidates": candidates,
+            }
+        return {}
+
+    def request_query_metric_ambiguity_clarification(
+        self,
+        state: AgentState,
+        ambiguity: Dict[str, Any],
+        started: int,
+        step: Any,
+    ) -> AgentState:
+        label = str(ambiguity.get("label") or "这个指标").strip()
+        options = [str(item) for item in ambiguity.get("options") or [] if str(item).strip()]
+        self.request_human_clarification(
+            state,
+            "你想看哪个 %s 口径？" % label,
+            "METRIC_SCOPE",
+            "metric_focus",
+            options,
+        )
+        state["query_metric_trace"] = {
+            **dict(state.get("query_metric_trace") or {}),
+            "status": "needs_clarification",
+            "ambiguity": ambiguity,
+        }
+        add_step(state, "Metric Tool query_metric：指标候选多义，调用 ask_human 确认口径")
+        self.record_span(
+            state,
+            "semantic_tool",
+            "query_metric",
+            started,
+            status="gap",
+            error_code="METRIC_AMBIGUITY_REQUIRES_CLARIFICATION",
+            metadata=state["query_metric_trace"],
+        )
+        self.finish_run_step(
+            state,
+            step,
+            "gap",
+            output_summary="metric ambiguity -> ask_human",
+            error_code="METRIC_AMBIGUITY_REQUIRES_CLARIFICATION",
+        )
+        emit(state, "node.completed", "QUERY_METRIC", {"supported": False, "clarificationRequired": True})
+        return state
+
+    def query_metric(self, state: AgentState) -> AgentState:
+        """Execute a governed single-metric tool after Topic recall and asset compaction."""
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "query_metric",
+            "MetricTool",
+            "QUERY_METRIC",
+            input_summary=state.get("question", ""),
+        )
+        increment_round(state)
+        self.configure_artifact_roots(state)
+        emit(state, "node.started", "QUERY_METRIC", {})
+        state["query_metric_attempted"] = True
+        state["query_metric_completed"] = False
+        self.invalidate_execution_outputs(state, "query_metric 重新生成受控 QueryGraph")
+        pack = state.get("planning_asset_pack") or PlanningAssetPack()
+        ambiguity = self.query_metric_ambiguity(pack, state.get("question", ""))
+        if ambiguity:
+            return self.request_query_metric_ambiguity_clarification(state, ambiguity, started, step)
+        plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
+        catalog_expansion_traces: List[str] = []
+        if not plan.intents:
+            catalog_expansion_traces = self.asset_builder.expand_for_metric_catalog_resolution(
+                pack,
+                state.get("question", ""),
+            )
+            if catalog_expansion_traces:
+                state["planning_asset_pack"] = pack
+                catalog_candidates = [
+                    item
+                    for item in (pack.metric_compaction or {}).get("catalogMetricCandidates") or []
+                    if isinstance(item, dict)
+                ]
+                candidate_identities = {
+                    (str(item.get("ownerTable") or ""), str(item.get("metricKey") or ""))
+                    for item in catalog_candidates
+                    if str(item.get("ownerTable") or "") and str(item.get("metricKey") or "") and not bool(item.get("ambiguous"))
+                }
+                if len(candidate_identities) == 1 and not any(bool(item.get("ambiguous")) for item in catalog_candidates):
+                    plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
+                ambiguity = self.query_metric_ambiguity(pack, state.get("question", ""))
+                if ambiguity:
+                    return self.request_query_metric_ambiguity_clarification(state, ambiguity, started, step)
+        state["query_metric_trace"] = {
+            "status": "compiled" if plan.intents else "unsupported",
+            "agentTrace": list(plan.agent_trace or []),
+            "compilerTrace": list(plan.compiler_trace or []),
+            "catalogExpansion": list(catalog_expansion_traces),
+            "catalogMetricCandidates": list((pack.metric_compaction or {}).get("catalogMetricCandidates") or []),
+        }
+        if not plan.intents:
+            self.escalate_fast_request(state, "query_metric could not resolve one governed semantic metric from the current Topic workspace")
+            add_step(state, "Metric Tool query_metric：当前 Topic 资产包未能唯一解析受控单指标，交回 Planner 多轮探索")
+            self.record_span(
+                state,
+                "semantic_tool",
+                "query_metric",
+                started,
+                status="gap",
+                error_code="QUERY_METRIC_UNSUPPORTED",
+                metadata=state["query_metric_trace"],
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="unsupported -> Planner",
+                error_code="QUERY_METRIC_UNSUPPORTED",
+            )
+            emit(state, "node.completed", "QUERY_METRIC", {"supported": False, "fallback": "plan_query_graph"})
+            return state
+        state["plan"] = plan
+        state["query_graph_reflected"] = True
+        state["planner_reflection"] = PlannerReflectionResult()
+        state["latency_optimization"] = self.latency_optimizer.update_after_plan(
+            state.get("latency_optimization") or {},
+            plan,
+        )
+        validation = self.graph_validator.validate(
+            state["question"],
+            plan,
+            pack,
+            state.get("memory_constraints", []),
+        )
+        validation = validation_with_question_coverage(state["question"], plan, pack, validation)
+        state["query_graph_validation_result"] = validation
+        state["query_graph_validated"] = True
+        state["last_query_graph_validation_gaps"] = [] if validation.valid else list(validation.gaps)
+        state["pending_knowledge_requests"] = filter_blocked_knowledge_requests(
+            state,
+            dedupe_workflow_knowledge_requests(
+                list(state.get("pending_knowledge_requests") or []) + list(validation.recommended_knowledge_requests or [])
+            ),
+        )
+        state["latency_optimization"] = self.latency_optimizer.update_after_validation(
+            state.get("latency_optimization") or {},
+            validation,
+        )
+        self.reconcile_fast_request_agent_gates(state)
+        if not validation.valid:
+            self.escalate_fast_request(state, "query_metric graph validation failed")
+            add_step(
+                state,
+                "Metric Tool query_metric：已解析单指标但校验发现缺口，gaps=%d，交回 Planner/补知识"
+                % len(validation.gaps),
+            )
+            self.record_span(
+                state,
+                "validator",
+                "query_metric.validate",
+                started,
+                status="failed",
+                error_code=",".join(gap.code for gap in validation.gaps[:4]),
+                metadata={"gaps": [gap.model_dump(by_alias=True) for gap in validation.gaps[:12]]},
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="validation failed gaps=%d" % len(validation.gaps),
+                error_code=",".join(gap.code for gap in validation.gaps[:4]),
+            )
+            emit(state, "node.completed", "QUERY_METRIC", {"supported": True, "valid": False, "gaps": len(validation.gaps)})
+            return state
+        state["worker_dispatch_context"] = {
+            **self.worker_dispatch_context(state),
+            "tool": "query_metric",
+            "executionMode": "direct",
+            "reason": "single_metric_tool_executes_governed_query_graph",
+        }
+        try:
+            node_package = self.prepare_scoped_context_package(
+                state,
+                "query_metric",
+                "MetricTool",
+                allowed_tables=pack.known_tables()[:12],
+                allowed_metrics=self.planning_metric_keys_for_context(pack)[:24],
+            )
+            node_knowledge_context = append_context_section(
+                knowledge_context(state),
+                self.render_context_package_for_prompt(node_package),
+                max_chars=int(self.settings.context_runtime_budget_chars or 6000),
+            )
+            run_result = self.node_worker.execute_plan(
+                state["merchant"].merchant_id,
+                plan,
+                pack,
+                node_knowledge_context,
+                state["question"],
+                resume_task_results=[],
+                run_id=state.get("run_id", ""),
+                access_role=state.get("access_role", "merchant_operator"),
+                user_scope=state.get("user_identity", {}),
+                execution_mode="direct",
+            )
+        except Exception as exc:
+            run_result = AgentRunResult(
+                merged_query_bundle=QueryBundle(failed=True, error=str(exc), summary="query_metric NodeWorker 执行失败"),
+                reflection_notes=["query_metric NodeWorker 执行失败: %s" % str(exc)[:200]],
+            )
+        state["agent_run_result"] = run_result
+        state["query_bundle"] = run_result.merged_query_bundle
+        state["query_bundles"] = run_result.query_bundles
+        state["node_tool_traces"] = run_result.node_tool_traces
+        state["freshness_reports"] = run_result.freshness_reports
+        state["sql_generated"] = True
+        state["result_generation"] = int(state.get("execution_generation") or 0)
+        self.sync_tool_runtime_state(state)
+        verified = self.evidence_verifier.verify(
+            state["question"],
+            plan,
+            run_result,
+            state.get("memory_constraints", []),
+            recall_knowledge_ref_ids(state),
+        )
+        run_result.verified_evidence = verified
+        run_result.evidence_gaps = verified.gaps
+        run_result.partial_answer_reason = verified.partial_answer_reason
+        graph_repair_gaps = graph_repair_validation_gaps(verified.gaps)
+        if graph_repair_gaps:
+            state["query_graph_validation_result"] = GraphValidationResult(
+                valid=False,
+                gaps=graph_repair_gaps,
+                repairable=True,
+            )
+        state["evidence_graph_verified"] = True
+        state["verification_status"] = "passed" if verified.passed else "failed"
+        state["evidence_accepted"] = bool(verified.passed)
+        state["evidence_generation"] = int(state.get("execution_generation") or 0) if verified.passed else -1
+        state["agent_run_result"] = run_result
+        self.planner.artifact_store.write_json("node", "query_metric_agent_run_result.json", run_result.model_dump(by_alias=True), preview_chars=0)
+        failed_tasks = sum(1 for item in run_result.task_results if item.query_bundle.failed)
+        if verified.passed and not failed_tasks:
+            state["query_metric_completed"] = True
+            state["should_persist"] = True
+            state["latency_optimization"] = self.latency_optimizer.mark_verified(
+                state.get("latency_optimization") or {},
+                "query_metric resolved, executed and verified one governed semantic metric",
+            )
+            self.reconcile_fast_request_agent_gates(state)
+            add_step(state, "Metric Tool query_metric：受控单指标 QueryGraph 执行并通过证据校验")
+        else:
+            self.escalate_fast_request(state, "query_metric evidence verification failed")
+            add_step(
+                state,
+                "Metric Tool query_metric：执行后证据未通过，failedTasks=%d gaps=%d，交回标准链路"
+                % (failed_tasks, len(verified.gaps)),
+            )
+        self.record_span(
+            state,
+            "semantic_tool",
+            "query_metric",
+            started,
+            status="success" if state.get("query_metric_completed") else "failed",
+            row_count=run_result.merged_query_bundle.effective_row_count(),
+            error_code="" if state.get("query_metric_completed") else (",".join(gap.code for gap in verified.gaps[:4]) or "QUERY_METRIC_EVIDENCE_FAILED"),
+            metadata={
+                "tasks": len(run_result.tasks),
+                "failedTasks": failed_tasks,
+                "validationGaps": len(validation.gaps),
+                "evidenceGaps": len(verified.gaps),
+                "trace": state.get("query_metric_trace") or {},
+            },
+        )
+        self.finish_run_step(
+            state,
+            step,
+            "success" if state.get("query_metric_completed") else "gap",
+            output_summary="tasks=%d rows=%d evidencePassed=%s"
+            % (len(run_result.tasks), run_result.merged_query_bundle.effective_row_count(), verified.passed),
+            error_code="" if state.get("query_metric_completed") else (",".join(gap.code for gap in verified.gaps[:4]) or "QUERY_METRIC_EVIDENCE_FAILED"),
+            artifact_paths=[str(Path(state["thread_data"].outputs_path) / "artifacts" / "node" / "query_metric_agent_run_result.json")],
+        )
+        emit(
+            state,
+            "node.completed",
+            "QUERY_METRIC",
+            {
+                "supported": True,
+                "valid": True,
+                "tasks": len(run_result.tasks),
+                "rows": run_result.merged_query_bundle.effective_row_count(),
+                "evidencePassed": verified.passed,
+            },
+        )
+        return state
+
     def plan_query_graph(self, state: AgentState) -> AgentState:
         started = now_ms()
         step = self.start_run_step(state, "plan_query_graph", "PlannerAgent", "PLAN_QUERY_GRAPH", input_summary=state.get("question", ""))
@@ -3201,13 +3862,9 @@ class MerchantQaWorkflow:
             planner_context,
             budget_chars=int(self.settings.context_planner_budget_chars or 12000),
         )
-        planner_knowledge_context = self.context_assembler.compact_text_context(
-            state,
-            "planner_knowledge_context",
-            "PlannerAgent",
-            knowledge_context(state),
-            budget_chars=int(self.settings.context_planner_budget_chars or 12000),
-        )
+        # Planner follows Diana-style progressive semantic reads: start from
+        # workspace refs/catalog only, then semantic_read details on demand.
+        planner_knowledge_context = ""
         plan, requests, reason = self.planner.plan(
             state["question"],
             state.get("history_rows", []),
@@ -4801,7 +5458,13 @@ class MerchantQaWorkflow:
         state["subagent_delegation_results"] = results
         state["subagent_delegation_completed"] = True
         completed = [item for item in results if item.get("status") == "completed"]
-        summaries = [str(item.get("summary") or "").strip() for item in completed if str(item.get("summary") or "").strip()]
+        analysis_summary_task_kinds = {"document_analysis", "analysis_worker", "analysis_skill", "hypothesis_review"}
+        summaries = [
+            str(item.get("summary") or "").strip()
+            for item in completed
+            if str(item.get("taskKind") or item.get("task_kind") or "") in analysis_summary_task_kinds
+            and str(item.get("summary") or "").strip()
+        ]
         if summaries:
             delegated_summary = "\n".join("- %s" % text for text in summaries)
             prior = str(state.get("analysis_summary") or "").strip()
@@ -5097,14 +5760,14 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "RUN_ANALYSIS_WORKER", {})
         if not evidence_accepted_for_state(state):
+            self.clear_analysis_outputs(state, "证据未通过，阻止 AnalysisWorker 使用旧分析")
             state["analysis_worker_status"] = {"status": "blocked", "source": "evidence_gate"}
-            state["analysis_worker_completed"] = False
             self.finish_run_step(state, step, "gap", output_summary="blocked: evidence verification failed", error_code="EVIDENCE_NOT_ACCEPTED")
             emit(state, "node.completed", "RUN_ANALYSIS_WORKER", {"completed": False, "evidenceAccepted": False})
             return state
         if planner_degraded_stops_expensive_work(state):
+            self.clear_analysis_outputs(state, "planner degraded，跳过 AnalysisWorker")
             state["analysis_worker_status"] = {"status": "skipped", "source": "planner_degraded"}
-            state["analysis_worker_completed"] = False
             self.finish_run_step(state, step, "partial", output_summary="skipped: planner degraded fail-fast", error_code="PLANNER_DEGRADED_FAIL_FAST")
             emit(state, "node.completed", "RUN_ANALYSIS_WORKER", {"completed": False, "degradedSkipped": True})
             return state
@@ -5175,14 +5838,14 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "RUN_ANALYSIS_SKILL", {})
         if not evidence_accepted_for_state(state):
+            self.clear_analysis_outputs(state, "证据未通过，阻止 SkillWorker 使用旧分析")
             state["analysis_skill_status"] = {"status": "blocked", "source": "evidence_gate"}
-            state["skill_worker_completed"] = False
             self.finish_run_step(state, step, "gap", output_summary="blocked: evidence verification failed", error_code="EVIDENCE_NOT_ACCEPTED")
             emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"completed": False, "evidenceAccepted": False})
             return state
         if planner_degraded_stops_expensive_work(state):
+            self.clear_analysis_outputs(state, "planner degraded，跳过 SkillWorker")
             state["analysis_skill_status"] = {"status": "skipped", "source": "planner_degraded"}
-            state["skill_worker_completed"] = False
             self.finish_run_step(
                 state,
                 step,
@@ -5199,16 +5862,25 @@ class MerchantQaWorkflow:
             return state
         match = self.match_analysis_skill(state)
         if state.get("analysis_skill_bypassed"):
-            state["skill_worker_completed"] = False
+            self.clear_analysis_outputs(state, "商家跳过 SkillWorker")
             self.finish_run_step(state, step, "success", output_summary="merchant chose current verified result")
             emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"completed": False, "bypassed": True})
             return state
         if not match.skill_name:
-            state["skill_worker_completed"] = False
+            self.clear_analysis_outputs(state, "未匹配 SkillWorker")
+            state["analysis_skill_trace"] = {
+                "error": "NO_MATCHED_SKILL",
+                "skillName": "",
+                "matchStatus": match.status,
+                "candidateSkills": list(match.candidate_skills or []),
+                "reason": match.reason,
+            }
+            state["analysis_skill_status"] = {"status": "no_match", "source": "skill_match"}
             self.finish_run_step(state, step, "partial", output_summary="no matched skill", error_code="NO_MATCHED_SKILL")
             emit(state, "node.completed", "RUN_ANALYSIS_SKILL", {"completed": False, "reason": "NO_MATCHED_SKILL"})
             return state
         if self.maybe_request_skill_confirmation(state):
+            self.clear_analysis_outputs(state, "等待 SkillWorker 人工确认")
             self.finish_run_step(
                 state,
                 step,
@@ -5456,6 +6128,7 @@ class MerchantQaWorkflow:
             self.request_human_clarification(state, self.build_scope_clarification_prompt(state), "BUSINESS_SCOPE", "business_scope", business_scope_options())
             return self.human_in_loop(state)
         else:
+            self.guard_unaccepted_evidence_for_answer(state)
             answer_package = self.prepare_scoped_context_package(
                 state,
                 "answer_analysis",
@@ -5490,7 +6163,7 @@ class MerchantQaWorkflow:
                 state["plan"],
                 state["agent_run_result"],
                 answer_context,
-                state.get("analysis_summary", ""),
+                current_analysis_summary_for_state(state),
                 allow_llm=allow_answer_llm,
                 rule_context=state.get("rule_recall_context", ""),
                 personalization_context=personalization_context,
@@ -5890,12 +6563,21 @@ class MerchantQaWorkflow:
             state["persisted"] = False
             add_step(state, "当前已关闭问答记录立即写入，已缓存待反馈回答")
         else:
-            add_step(state, "寒暄或无效意图不写入问答记录")
+            if fast_response is not None and (getattr(fast_response, "debug_trace", {}) or {}).get("definitionOnly"):
+                add_step(state, "Fast Metric Definition：口径说明类答案不写入问答记录和长期记忆")
+            else:
+                add_step(state, "寒暄、无效意图或非持久化答案不写入问答记录")
         if self.run_cancellation_requested(state):
             self.pending_store.remove(state["qa_id"])
             return self.finish_canceled_run(state)
         if state.get("should_persist"):
-            self.commit_memory_before_response(state)
+            state["memory_ingestion_trace"] = {
+                **dict(state.get("memory_ingestion_trace") or {}),
+                "status": "pending",
+                "written": False,
+                "commitMode": "post_answer_async",
+            }
+            add_step(state, "Memory Middleware：已安排回答后异步抽象长期记忆")
         self.emit_answer_ready(state)
         state["post_answer_tail_pending"] = bool(state.get("should_persist"))
         state["response_context"] = build_response_context(
@@ -5922,7 +6604,7 @@ class MerchantQaWorkflow:
                 for item in (getattr(fast_response, "merchant_experience", {}) or {}).get("metricDisclosures", [])
                 if item.get("metricKey")
             ]
-            state["response_context"].dimension_keys = ["pt"]
+            state["response_context"].dimension_keys = [] if (getattr(fast_response, "debug_trace", {}) or {}).get("definitionOnly") else ["pt"]
             state["response_context"].data_catalog = ",".join(getattr(fast_response, "doris_tables", []) or [])
         emit(state, "node.completed", "CACHE_ANSWER", {"persisted": state["persisted"]})
         self.refresh_context_snapshot(state, "cache_answer")
@@ -5995,6 +6677,40 @@ class MerchantQaWorkflow:
         try:
             if self.run_cancellation_requested(state):
                 return
+            if state.get("should_persist"):
+                try:
+                    memory_payload = self.update_memory_after_answer(state)
+                    trace = dict(memory_payload.get("memoryIngestionTrace") or {})
+                    trace["status"] = "success"
+                    trace["commitMode"] = "post_answer_async"
+                    state["memory_ingestion_trace"] = trace
+                    curator_trace = trace.get("knowledgeCurator") or {}
+                    governance_suggestions = self.merchant_knowledge_suggestions_for_response(memory_payload)
+                    if governance_suggestions:
+                        state["merchant_experience"] = dict(state.get("merchant_experience") or {})
+                        state["merchant_experience"]["knowledgeSuggestions"] = governance_suggestions
+                        state["merchant_experience"]["knowledgeGovernance"] = {
+                            "mode": "llm_curator_review" if curator_trace.get("authoritative") else "merchant_memory_review",
+                            "status": "pending_review",
+                            "description": "从本轮对话中提取候选业务知识，商家确认或平台审核后才会生效",
+                        }
+                        if curator_trace.get("authoritative"):
+                            add_step(
+                                state,
+                                "Knowledge Curator：模型已从用户原话提取 %d 条待确认知识"
+                                % int(curator_trace.get("candidateCount") or len(governance_suggestions)),
+                            )
+                    add_step(state, "Memory Middleware：回答后已异步提交结构化长期记忆 events=%d" % len(memory_payload.get("events") or []))
+                except Exception as exc:
+                    state["memory_ingestion_trace"] = {
+                        "status": "failed",
+                        "written": False,
+                        "error": str(exc)[:500],
+                        "commitMode": "post_answer_async",
+                    }
+                    add_step(state, "Memory Middleware：回答后异步长期记忆提交失败 %s" % str(exc)[:180])
+                if self.run_cancellation_requested(state):
+                    return
             runtime_profile_summary = self.merchant_profile_summary_service.summarize(
                 merchant=state["merchant"],
                 memory_injection=state.get("memory_injection") or {},
@@ -6101,6 +6817,7 @@ class MerchantQaWorkflow:
                         state.get("loaded_skills", []),
                         self.settings.max_concurrent_sub_agents,
                     ),
+                    "plannerRuntime": self.planner_runtime_debug(state),
                 },
                 "toolCalling": self.tool_calling_debug(state),
                 "threadContext": state.get("thread_context", {}),
@@ -6321,6 +7038,7 @@ class MerchantQaWorkflow:
                             state.get("loaded_skills", []),
                             self.settings.max_concurrent_sub_agents,
                         ),
+                        "plannerRuntime": self.planner_runtime_debug(state),
                     },
                     "toolCalling": self.tool_calling_debug(state),
                     "threadContext": state.get("thread_context", {}),
@@ -7273,6 +7991,37 @@ class MerchantQaWorkflow:
                 "strategy": "confidence * time_decay * feedback_weight * hit_count_boost",
                 "recentFocusWeighted": bool((injection.get("recentFocus") or {}).get("updatedBy")),
             },
+        }
+
+    def planner_runtime_debug(self, state: AgentState) -> Dict[str, Any]:
+        plan = state.get("plan") or QueryPlan()
+        stats = dict(getattr(plan, "planner_prompt_stats", None) or {})
+        tool_calls = list(getattr(plan, "planner_tool_calls", None) or [])
+        tool_results = list(getattr(plan, "planner_tool_results", None) or [])
+        semantic_reads = [
+            call for call in tool_calls if str(call.get("name") or call.get("toolName") or "") == "semantic_read"
+        ]
+        semantic_refs = []
+        for call in semantic_reads:
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            ref_id = str(args.get("refId") or args.get("ref_id") or "")
+            if ref_id and ref_id not in semantic_refs:
+                semantic_refs.append(ref_id)
+        fast_path = any("planner.semantic_fast_path" in str(item) for item in (getattr(plan, "agent_trace", []) or []))
+        return {
+            "promptTotalChars": int(stats.get("totalChars") or 0),
+            "maxRoundTotalChars": int(stats.get("maxRoundTotalChars") or stats.get("totalChars") or 0),
+            "budgetLevel": int(stats.get("budgetLevel") or 0),
+            "toolRounds": len(stats.get("toolRounds") or []),
+            "toolCallCount": len(tool_calls),
+            "semanticReadCalls": len(semantic_reads),
+            "semanticReadRefs": semantic_refs[:12],
+            "plannerToolResultCount": len(tool_results),
+            "loadedRefCount": len(getattr(plan, "planner_loaded_refs", []) or []),
+            "contextFileCount": len(getattr(plan, "planner_context_files", []) or []),
+            "schemaMode": str(stats.get("schemaMode") or ""),
+            "fastPath": fast_path,
+            "degraded": state.get("planner_degraded") or {},
         }
 
     def middleware_debug(self, state: AgentState) -> Dict[str, Any]:
@@ -8378,6 +9127,18 @@ def evidence_accepted_for_state(state: AgentState) -> bool:
     elif accepted is False and state.get("evidence_graph_verified") and str(state.get("verification_status") or "") != "failed":
         accepted = True
     return bool(accepted and run_result.verified_evidence.passed)
+
+
+def current_analysis_summary_for_state(state: AgentState) -> str:
+    summary = str(state.get("analysis_summary") or "")
+    if not summary or "execution_generation" not in state:
+        return summary
+    analysis_generation = int(state.get("analysis_generation") if state.get("analysis_generation") is not None else -1)
+    if analysis_generation < 0:
+        return summary
+    if analysis_generation != int(state.get("execution_generation") or 0):
+        return ""
+    return summary
 
 
 def merge_query_plans(left: QueryPlan, right: QueryPlan) -> QueryPlan:

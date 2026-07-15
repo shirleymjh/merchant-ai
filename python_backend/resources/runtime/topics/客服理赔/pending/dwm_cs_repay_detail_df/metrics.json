@@ -1,7 +1,7 @@
 [
   {
     "metricKey": "repay_amt",
-    "businessName": "赔付金额",
+    "businessName": "赔付明细金额",
     "formula": "SUM(repay_amt)",
     "unit": "元",
     "description": "赔付/理赔单支付金额",
@@ -9,17 +9,27 @@
       "repay_amt"
     ],
     "aliases": [
-      "赔付金额",
-      "理赔金额",
-      "赔付支付金额",
-      "repay_amt"
+      "赔付明细金额",
+      "repay_amt",
+      "赔付支付金额"
     ],
     "confidence": 0.78,
-    "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+    "displayName": "赔付明细金额",
+    "disambiguationName": "赔付明细金额",
+    "tableKind": "detail_fact",
+    "metricGrain": "repay_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "赔付金额",
+    "originalBusinessName": "赔付金额",
+    "sourceColumnAliases": [
+      "repay_amt"
+    ]
   },
   {
     "metricKey": "coupon_rule_a",
-    "businessName": "满多少元",
+    "businessName": "赔付明细满多少元",
     "formula": "SUM(coupon_rule_a)",
     "unit": "元",
     "description": "满多少元",
@@ -27,15 +37,28 @@
       "coupon_rule_a"
     ],
     "aliases": [
-      "满多少元",
-      "coupon_rule_a"
+      "赔付明细满多少元",
+      "coupon_rule_a",
+      "赔付满多少元"
     ],
     "confidence": 0.78,
-    "evidence": "schema comment=满多少元"
+    "evidence": "schema comment=满多少元",
+    "displayName": "赔付明细满多少元",
+    "disambiguationName": "赔付明细满多少元",
+    "tableKind": "detail_fact",
+    "metricGrain": "repay_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "满多少元",
+    "originalBusinessName": "满多少元",
+    "naturalAlias": "满多少元",
+    "sourceColumnAliases": [
+      "coupon_rule_a"
+    ]
   },
   {
     "metricKey": "coupon_rule_b",
-    "businessName": "减多少元",
+    "businessName": "赔付明细减多少元",
     "formula": "SUM(coupon_rule_b)",
     "unit": "元",
     "description": "减多少元",
@@ -43,15 +66,28 @@
       "coupon_rule_b"
     ],
     "aliases": [
-      "减多少元",
-      "coupon_rule_b"
+      "赔付明细减多少元",
+      "coupon_rule_b",
+      "赔付减多少元"
     ],
     "confidence": 0.78,
-    "evidence": "schema comment=减多少元"
+    "evidence": "schema comment=减多少元",
+    "displayName": "赔付明细减多少元",
+    "disambiguationName": "赔付明细减多少元",
+    "tableKind": "detail_fact",
+    "metricGrain": "repay_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "减多少元",
+    "originalBusinessName": "减多少元",
+    "naturalAlias": "减多少元",
+    "sourceColumnAliases": [
+      "coupon_rule_b"
+    ]
   },
   {
     "metricKey": "repay_bill_cnt",
-    "businessName": "赔付单量",
+    "businessName": "赔付明细单量",
     "formula": "COUNT(DISTINCT bill_id)",
     "unit": "单",
     "description": "按赔付单号去重统计赔付单数量",
@@ -59,52 +95,63 @@
       "bill_id"
     ],
     "aliases": [
-      "赔付单量",
+      "赔付明细单量",
+      "repay_bill_cnt",
       "赔付订单量",
       "赔付订单数",
-      "赔付单数",
-      "理赔单量",
       "理赔订单量",
-      "赔付多",
-      "赔付也多",
-      "赔付量高",
-      "赔付较多",
-      "赔付高发",
       "有没有赔付",
-      "是否赔付",
-      "有无赔付",
       "有赔付订单",
-      "产生赔付",
-      "有产生赔付",
-      "或赔付",
-      "及赔付"
+      "有产生赔付"
     ],
     "confidence": 0.82,
-    "evidence": "由 Topic Builder 基于字段组合自动生成"
+    "evidence": "由 Topic Builder 基于字段组合自动生成",
+    "displayName": "赔付明细单量",
+    "disambiguationName": "赔付明细单量",
+    "tableKind": "detail_fact",
+    "metricGrain": "repay_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "赔付单量",
+    "originalBusinessName": "赔付单量",
+    "naturalAlias": "赔付单量",
+    "sourceColumnAliases": [
+      "bill_id"
+    ]
   },
   {
     "metricKey": "compensation_rate",
-    "businessName": "商品赔付率",
+    "businessName": "商品维度赔付率",
     "formula": "赔付单量 / 订单量",
     "unit": "%",
-    "description": "同一商品或订单集合下，赔付单量占订单量的比例；查询时必须同时取赔付单量和订单量作为分子、分母。",
+    "description": "同一商品或订单集合下，赔付单量占订单量的比例；查询时必须同时取赔付单量和订单量作为分子、分母",
     "sourceColumns": [
       "repay_bill_cnt",
       "order_detail_cnt"
     ],
     "aliases": [
-      "商品赔付率",
-      "赔付率",
-      "理赔率",
-      "compensation_rate",
-      "repay_rate"
+      "商品维度赔付率",
+      "compensation_rate"
     ],
     "confidence": 0.86,
-    "evidence": "语义层派生指标：赔付单量 / 订单量"
+    "evidence": "语义层派生指标：赔付单量 / 订单量",
+    "displayName": "商品维度赔付率",
+    "disambiguationName": "商品维度赔付率",
+    "tableKind": "detail_fact",
+    "metricGrain": "repay_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "商品赔付率",
+    "originalBusinessName": "商品赔付率",
+    "naturalAlias": "商品赔付率",
+    "sourceColumnAliases": [
+      "order_detail_cnt",
+      "repay_bill_cnt"
+    ]
   },
   {
     "metricKey": "repay_success_amt",
-    "businessName": "打款成功赔付金额",
+    "businessName": "赔付明细打款成功赔付金额",
     "formula": "SUM(CASE WHEN pay_status_name = '打款成功' THEN repay_amt ELSE 0 END)",
     "unit": "元",
     "description": "只统计到账状态为打款成功的赔付金额",
@@ -113,9 +160,24 @@
       "repay_amt"
     ],
     "aliases": [
-      "打款成功赔付金额"
+      "赔付明细打款成功赔付金额",
+      "repay_success_amt",
+      "赔付打款成功赔付金额"
     ],
     "confidence": 0.82,
-    "evidence": "由 Topic Builder 基于字段组合自动生成"
+    "evidence": "由 Topic Builder 基于字段组合自动生成",
+    "displayName": "赔付明细打款成功赔付金额",
+    "disambiguationName": "赔付明细打款成功赔付金额",
+    "tableKind": "detail_fact",
+    "metricGrain": "repay_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "打款成功赔付金额",
+    "originalBusinessName": "打款成功赔付金额",
+    "naturalAlias": "打款成功赔付金额",
+    "sourceColumnAliases": [
+      "pay_status_name",
+      "repay_amt"
+    ]
   }
 ]

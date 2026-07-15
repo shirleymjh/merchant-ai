@@ -547,7 +547,8 @@ class EsKnowledgeRetrievalService:
                     candidate = resolve_term_metric_candidate(term, metrics_by_key, topic, table, query)
                     if candidate is None:
                         continue
-                    candidate["governance"] = {**table_governance, **recall_governance_metadata(metric)}
+                    resolved_metric = candidate.get("metric") if isinstance(candidate.get("metric"), dict) else {}
+                    candidate["governance"] = {**table_governance, **recall_governance_metadata(resolved_metric)}
                     semantic_ref_id = str(candidate["semanticRefId"])
                     current = by_id.get(semantic_ref_id)
                     if current is None or float(candidate.get("metricResolutionConfidence") or 0.0) > float(current.get("metricResolutionConfidence") or 0.0):
@@ -622,6 +623,7 @@ class EsKnowledgeRetrievalService:
                 "semanticSource": "metrics",
                 "semanticKind": "METRIC",
                 "semanticRefId": semantic_ref_id,
+                "semanticPath": "topics/%s/tables/%s/asset.json#metric:%s" % (topic, table, metric_key),
                 "metricKey": metric_key,
                 "tableName": table,
                 "topic": topic,

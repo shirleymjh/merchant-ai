@@ -257,6 +257,71 @@ def array_property(description: str, item_schema: Dict[str, Any]) -> Dict[str, A
     return {"type": "array", "description": description, "items": item_schema}
 
 
+def semantic_asset_selection_tool() -> AgentToolDefinition:
+    selected_asset_schema = object_schema(
+        {
+            "sourcePhrase": string_property("exact metric/business phrase copied from the user question"),
+            "semanticRefId": string_property("selected semanticCatalog.candidateMetrics.sourceRefId"),
+            "metricRef": string_property("selected semanticCatalog.candidateMetrics.key"),
+            "ownerTable": string_property("selected semanticCatalog.candidateMetrics.table"),
+            "confidence": string_property("0.0-1.0 confidence as a string"),
+            "reason": string_property("brief semantic evidence for the selection"),
+        },
+        required=["sourcePhrase", "semanticRefId", "metricRef", "ownerTable", "confidence", "reason"],
+    )
+    gap_schema = object_schema(
+        {
+            "code": string_property(
+                "why selection cannot be completed from current workspace",
+                [
+                    "AMBIGUOUS_METRIC",
+                    "MISSING_SEMANTIC_ASSET",
+                    "NEED_SEMANTIC_READ",
+                    "UNSUPPORTED_GRAPH_CONTRACT",
+                    "LOW_CONFIDENCE",
+                    "INVALID",
+                ],
+            ),
+            "sourcePhrase": string_property("metric/business phrase that has the gap"),
+            "reason": string_property("brief reason"),
+            "candidateIds": array_property("related candidate semanticRefIds", string_property("semanticRefId")),
+            "clarificationQuestion": string_property("ask_human question when the candidates are ambiguous"),
+        },
+        required=["code", "sourcePhrase", "reason", "candidateIds"],
+    )
+    query_contract_schema = object_schema(
+        {
+            "contractType": string_property(
+                "minimal build contract supported by selected assets",
+                ["independent_metrics", "time_series_metrics", "requires_planner"],
+            ),
+            "timeWindowDays": integer_property("requested time window in days", 1),
+            "reason": string_property("brief reason for this contract"),
+        },
+        required=["contractType", "timeWindowDays", "reason"],
+    )
+    return AgentToolDefinition(
+        name="emit_semantic_asset_selection",
+        description=(
+            "Select semantic metric assets from the current Topic workspace candidates. "
+            "Do not emit SQL, QueryGraph, tables outside the candidates, or questionUnderstanding."
+        ),
+        parameters=object_schema(
+            {
+                "status": string_property(
+                    "selection status",
+                    ["SELECTED", "AMBIGUOUS", "NEED_MORE_KNOWLEDGE", "UNSUPPORTED", "INVALID"],
+                ),
+                "selectedAssets": array_property("one selected semantic asset per explicit user metric phrase", selected_asset_schema),
+                "gaps": array_property("selection gaps that require retrieve_knowledge, semantic_read, planner, or ask_human", gap_schema),
+                "queryContract": query_contract_schema,
+                "reason": string_property("brief summary"),
+            },
+            required=["status", "selectedAssets", "gaps", "queryContract", "reason"],
+        ),
+    )
+
+
 def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinition:
     status_values = ["UNDERSTOOD", "INVALID"] if force_catalog else ["UNDERSTOOD", "NEED_MORE_KNOWLEDGE", "INVALID"]
     ranking_schema = object_schema(
@@ -278,6 +343,23 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "ownerTable": string_property("metric owner table from semanticCatalog"),
         },
         required=["metricRef", "ownerTable"],
+    )
+    metric_candidate_decision_schema = object_schema(
+        {
+            "phrase": string_property("metric phrase from user"),
+            "decision": string_property("candidate arbitration result", ["selected_one", "need_clarification", "need_more_context"]),
+            "selectedCandidateId": string_property("selected semanticRefId or ownerTable.metricRef"),
+            "selectedMetricRef": string_property("selected metric key"),
+            "selectedOwnerTable": string_property("selected owner table"),
+            "rejectedCandidateIds": array_property(
+                "rejected semanticRefIds or ownerTable.metricRefs",
+                string_property("rejected candidate id"),
+            ),
+            "confidence": string_property("0.0-1.0 confidence as a string"),
+            "reason": string_property("brief reason"),
+            "clarificationQuestion": string_property("question to ask the user when decision is need_clarification"),
+        },
+        required=["phrase", "decision", "selectedCandidateId", "rejectedCandidateIds", "reason"],
     )
     scope_schema = object_schema(
         {
@@ -341,6 +423,10 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             ),
             "rankingObjective": ranking_schema,
             "requestedMeasures": array_property("additional requested metrics", measure_schema),
+            "metricCandidateDecisions": array_property(
+                "same/near-name metric candidate arbitration before planning",
+                metric_candidate_decision_schema,
+            ),
             "calculationIntents": array_property(
                 "explicit derived calculations requested by the user, such as percentage/proportion/ratio between a scoped denominator and an event numerator",
                 object_schema(
@@ -378,6 +464,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "requiredEvidenceIntents",
             "rankingObjective",
             "requestedMeasures",
+            "metricCandidateDecisions",
             "calculationIntents",
             "scopeConstraints",
             "filters",

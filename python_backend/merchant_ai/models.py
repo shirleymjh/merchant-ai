@@ -1309,6 +1309,7 @@ class NodePlanContract(APIModel):
     upstream_entity_sets: List[Dict[str, Any]] = Field(default_factory=list)
     metric_resolution: Dict[str, Any] = Field(default_factory=dict)
     metric_governance_mode: str = "legacy_unsealed"
+    time_window_contract: Dict[str, Any] = Field(default_factory=dict)
 
 
 class NodePlanCritiqueResult(APIModel):

@@ -649,17 +649,22 @@
   },
   {
     "columnName": "pay_amt",
-    "businessName": "支付金额",
+    "businessName": "退款金额",
     "role": "METRIC",
-    "description": "支付金额",
+    "description": "退款明细中的退款金额",
     "aliases": [
-      "支付金额",
+      "退款金额",
+      "退货金额",
+      "退款额",
+      "售后金额",
+      "refund_amt",
+      "refund_amount",
       "pay_amt"
     ],
     "enumValues": [],
     "metricFormula": "SUM(pay_amt)",
     "confidence": 0.78,
-    "evidence": "schema comment=支付金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    "evidence": "schema comment=退款金额; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
   },
   {
     "columnName": "pay_extra",

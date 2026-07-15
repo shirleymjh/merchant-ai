@@ -520,10 +520,15 @@
     "evidence": "来自字段 `out_pay_id` 的语义注释"
   },
   {
-    "term": "支付金额",
-    "description": "支付金额",
+    "term": "退款金额",
+    "description": "退款明细中的退款金额",
     "aliases": [
-      "支付金额",
+      "退款金额",
+      "退货金额",
+      "退款额",
+      "售后金额",
+      "refund_amt",
+      "refund_amount",
       "pay_amt"
     ],
     "relatedColumns": [

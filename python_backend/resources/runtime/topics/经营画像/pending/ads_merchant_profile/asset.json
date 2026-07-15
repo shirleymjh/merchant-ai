@@ -2535,24 +2535,24 @@
     },
     {
       "columnName": "refund_rate_1d",
-      "businessName": "退货量占支付订单量比例",
+      "businessName": "每日退货率",
       "role": "METRIC",
-      "description": "退货量占支付订单量比例-最近1天",
+      "description": "每日退货率，按单日退货量占支付订单量统计，适合查看退货率走势。",
       "aliases": [
-        "退货量占支付订单量比例",
-        "退款率",
-        "退货率",
-        "售后率",
-        "整体退款率",
-        "店铺退款率",
-        "refund_rate",
+        "每日退货率",
         "refund_rate_1d",
+        "退货率日值",
+        "退货率单日值",
+        "单日退货率",
+        "按日退货率",
         "退货量占支付订单量比例-最近1天"
       ],
       "enumValues": [],
       "metricFormula": "AVG(refund_rate_1d)",
-      "confidence": 0.78,
-      "evidence": "schema comment=退货量占支付订单量比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+      "confidence": 0.9,
+      "evidence": "schema comment=退货量占支付订单量比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]",
+      "aggregationPolicy": "daily_value_only",
+      "rollupMetricKey": "return_rate_by_pay_order"
     },
     {
       "columnName": "ticket_reopen_cnt_1d",
@@ -2645,14 +2645,26 @@
       ],
       "aliases": [
         "保证金余额元",
-        "deposit_amt"
+        "deposit_amt",
+        "保证金余额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=保证金余额元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=保证金余额元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "保证金余额元",
+      "disambiguationName": "保证金余额元",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "保证金余额元",
+      "originalBusinessName": "保证金余额元",
+      "sourceColumnAliases": [
+        "deposit_amt"
+      ]
     },
     {
       "metricKey": "order_cnt_1d",
-      "businessName": "总订单量",
+      "businessName": "总订单日汇总量",
       "formula": "SUM(order_cnt_1d)",
       "unit": "单",
       "description": "总订单量-最近1天",
@@ -2660,16 +2672,36 @@
         "order_cnt_1d"
       ],
       "aliases": [
-        "总订单量",
+        "总订单日汇总量",
         "order_cnt_1d",
-        "总订单量-最近1天"
+        "总订单量",
+        "总订单量-最近1天",
+        "订单量",
+        "订单数",
+        "下单量",
+        "下单数",
+        "总订单数",
+        "店铺订单量",
+        "整体订单量"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=总订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=总订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "总订单日汇总量",
+      "disambiguationName": "总订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "detailMetricRef": "semantic:电商交易:dwm_trade_order_detail_di:metric:order_detail_cnt",
+      "naturalName": "总订单量",
+      "originalBusinessName": "总订单量",
+      "sourceColumnAliases": [
+        "order_cnt_1d"
+      ]
     },
     {
       "metricKey": "order_user_cnt_1d",
-      "businessName": "下单用户量",
+      "businessName": "下单用户日汇总量",
       "formula": "SUM(order_user_cnt_1d)",
       "unit": "单",
       "description": "下单用户量-最近1天",
@@ -2677,18 +2709,30 @@
         "order_user_cnt_1d"
       ],
       "aliases": [
-        "下单用户量",
+        "下单用户日汇总量",
         "order_user_cnt_1d",
+        "下单用户量",
         "下单用户量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=下单用户量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=下单用户量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "下单用户日汇总量",
+      "disambiguationName": "下单用户日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "下单用户量",
+      "originalBusinessName": "下单用户量",
+      "sourceColumnAliases": [
+        "order_user_cnt_1d"
+      ]
     },
     {
       "metricKey": "order_gmv_amt_1d",
       "canonicalMetricKey": "order_gmv_amt_1d",
       "metricLevel": "business",
-      "businessName": "总gmv金额元",
+      "businessName": "GMV日汇总金额",
       "formula": "SUM(order_gmv_amt_1d)",
       "unit": "元",
       "description": "总gmv金额元-最近1天",
@@ -2696,20 +2740,37 @@
         "order_gmv_amt_1d"
       ],
       "aliases": [
-        "总gmv金额元",
+        "GMV日汇总金额",
         "order_gmv_amt_1d",
+        "总gmv金额元",
+        "总gmv金额",
+        "GMV金额",
         "总gmv金额元-最近1天",
         "GMV",
         "成交额",
         "销售额",
-        "交易流水"
+        "交易流水",
+        "总GMV",
+        "销售金额",
+        "交易额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=总gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=总gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "GMV日汇总金额",
+      "disambiguationName": "GMV日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "总gmv金额元",
+      "originalBusinessName": "总gmv金额元",
+      "sourceColumnAliases": [
+        "order_gmv_amt_1d"
+      ]
     },
     {
       "metricKey": "pay_order_cnt_1d",
-      "businessName": "支付订单量",
+      "businessName": "支付订单日汇总量",
       "formula": "SUM(pay_order_cnt_1d)",
       "unit": "单",
       "description": "支付订单量-最近1天",
@@ -2717,19 +2778,34 @@
         "pay_order_cnt_1d"
       ],
       "aliases": [
-        "支付订单量",
+        "支付订单日汇总量",
         "pay_order_cnt_1d",
-        "支付订单量-最近1天"
+        "支付订单量",
+        "支付订单量-最近1天",
+        "支付订单数",
+        "付款订单量",
+        "付款订单数"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=支付订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=支付订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "支付订单日汇总量",
+      "disambiguationName": "支付订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "支付订单量",
+      "originalBusinessName": "支付订单量",
+      "sourceColumnAliases": [
+        "pay_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "pay_gmv_amt_1d",
       "canonicalMetricKey": "order_gmv_amt_1d",
       "aliasOf": "order_gmv_amt_1d",
       "metricLevel": "business_variant",
-      "businessName": "支付gmv金额元",
+      "businessName": "支付GMV日汇总金额",
       "formula": "SUM(pay_gmv_amt_1d)",
       "unit": "元",
       "description": "支付gmv金额元-最近1天",
@@ -2737,20 +2813,34 @@
         "pay_gmv_amt_1d"
       ],
       "aliases": [
-        "支付gmv金额元",
+        "支付GMV日汇总金额",
         "pay_gmv_amt_1d",
+        "支付gmv金额元",
+        "支付gmv金额",
+        "支付GMV金额",
         "支付gmv金额元-最近1天",
-        "GMV",
-        "成交额",
-        "销售额",
-        "交易流水"
+        "支付GMV",
+        "支付成交额",
+        "支付销售额",
+        "支付gmv"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=支付gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=支付gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "支付GMV日汇总金额",
+      "disambiguationName": "支付GMV日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "支付gmv金额元",
+      "originalBusinessName": "支付gmv金额元",
+      "sourceColumnAliases": [
+        "pay_gmv_amt_1d"
+      ]
     },
     {
       "metricKey": "trade_success_order_cnt_1d",
-      "businessName": "交易成功订单量",
+      "businessName": "交易成功订单日汇总量",
       "formula": "SUM(trade_success_order_cnt_1d)",
       "unit": "单",
       "description": "交易成功订单量-最近1天",
@@ -2758,16 +2848,28 @@
         "trade_success_order_cnt_1d"
       ],
       "aliases": [
-        "交易成功订单量",
+        "交易成功订单日汇总量",
         "trade_success_order_cnt_1d",
+        "交易成功订单量",
         "交易成功订单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=交易成功订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=交易成功订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "交易成功订单日汇总量",
+      "disambiguationName": "交易成功订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "交易成功订单量",
+      "originalBusinessName": "交易成功订单量",
+      "sourceColumnAliases": [
+        "trade_success_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "pay_success_discount_order_cnt_1d",
-      "businessName": "支付成功优惠单量",
+      "businessName": "支付成功优惠订单日汇总量",
       "formula": "SUM(pay_success_discount_order_cnt_1d)",
       "unit": "单",
       "description": "支付成功优惠单量-最近1天",
@@ -2775,16 +2877,32 @@
         "pay_success_discount_order_cnt_1d"
       ],
       "aliases": [
-        "支付成功优惠单量",
+        "支付成功优惠订单日汇总量",
         "pay_success_discount_order_cnt_1d",
-        "支付成功优惠单量-最近1天"
+        "支付成功优惠单量",
+        "支付成功优惠订单量",
+        "支付成功优惠单量-最近1天",
+        "优惠订单量",
+        "优惠订单数",
+        "支付优惠订单量"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=支付成功优惠单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=支付成功优惠单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "支付成功优惠订单日汇总量",
+      "disambiguationName": "支付成功优惠订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "支付成功优惠单量",
+      "originalBusinessName": "支付成功优惠单量",
+      "sourceColumnAliases": [
+        "pay_success_discount_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "pay_success_discount_amt_1d",
-      "businessName": "支付成功优惠金额元",
+      "businessName": "支付成功优惠日汇总金额",
       "formula": "SUM(pay_success_discount_amt_1d)",
       "unit": "元",
       "description": "支付成功优惠金额元-最近1天",
@@ -2792,19 +2910,33 @@
         "pay_success_discount_amt_1d"
       ],
       "aliases": [
-        "支付成功优惠金额元",
+        "支付成功优惠日汇总金额",
         "pay_success_discount_amt_1d",
-        "支付成功优惠金额元-最近1天",
+        "支付成功优惠金额元",
         "支付成功优惠金额",
+        "支付成功优惠金额元-最近1天",
         "支付优惠金额",
-        "支付优惠额"
+        "支付优惠额",
+        "优惠金额",
+        "优惠券使用金额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=支付成功优惠金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=支付成功优惠金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "支付成功优惠日汇总金额",
+      "disambiguationName": "支付成功优惠日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "支付成功优惠金额元",
+      "originalBusinessName": "支付成功优惠金额元",
+      "sourceColumnAliases": [
+        "pay_success_discount_amt_1d"
+      ]
     },
     {
       "metricKey": "trade_success_discount_order_cnt_1d",
-      "businessName": "交易成功优惠单量",
+      "businessName": "交易成功优惠订单日汇总量",
       "formula": "SUM(trade_success_discount_order_cnt_1d)",
       "unit": "单",
       "description": "交易成功优惠单量-最近1天",
@@ -2812,16 +2944,29 @@
         "trade_success_discount_order_cnt_1d"
       ],
       "aliases": [
-        "交易成功优惠单量",
+        "交易成功优惠订单日汇总量",
         "trade_success_discount_order_cnt_1d",
+        "交易成功优惠单量",
+        "交易成功优惠订单量",
         "交易成功优惠单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=交易成功优惠单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=交易成功优惠单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "交易成功优惠订单日汇总量",
+      "disambiguationName": "交易成功优惠订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "交易成功优惠单量",
+      "originalBusinessName": "交易成功优惠单量",
+      "sourceColumnAliases": [
+        "trade_success_discount_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "trade_success_discount_amt_1d",
-      "businessName": "交易成功优惠金额元",
+      "businessName": "交易成功优惠日汇总金额",
       "formula": "SUM(trade_success_discount_amt_1d)",
       "unit": "元",
       "description": "交易成功优惠金额元-最近1天",
@@ -2829,20 +2974,30 @@
         "trade_success_discount_amt_1d"
       ],
       "aliases": [
-        "交易成功优惠金额元",
+        "交易成功优惠日汇总金额",
         "trade_success_discount_amt_1d",
-        "交易成功优惠金额元-最近1天",
+        "交易成功优惠金额元",
         "交易成功优惠金额",
-        "优惠金额",
-        "优惠额",
+        "交易成功优惠金额元-最近1天",
         "成交优惠金额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=交易成功优惠金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=交易成功优惠金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "交易成功优惠日汇总金额",
+      "disambiguationName": "交易成功优惠日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "交易成功优惠金额元",
+      "originalBusinessName": "交易成功优惠金额元",
+      "sourceColumnAliases": [
+        "trade_success_discount_amt_1d"
+      ]
     },
     {
       "metricKey": "cs_ticket_cnt_1d",
-      "businessName": "咨询工单量",
+      "businessName": "咨询工单日汇总量",
       "formula": "SUM(cs_ticket_cnt_1d)",
       "unit": "单",
       "description": "咨询工单量-最近1天",
@@ -2850,16 +3005,33 @@
         "cs_ticket_cnt_1d"
       ],
       "aliases": [
-        "咨询工单量",
+        "咨询工单日汇总量",
         "cs_ticket_cnt_1d",
-        "咨询工单量-最近1天"
+        "咨询工单量",
+        "咨询工单量-最近1天",
+        "客服工单量",
+        "客服工单数",
+        "工单量",
+        "工单数",
+        "咨询工单数"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=咨询工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=咨询工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "咨询工单日汇总量",
+      "disambiguationName": "咨询工单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "咨询工单量",
+      "originalBusinessName": "咨询工单量",
+      "sourceColumnAliases": [
+        "cs_ticket_cnt_1d"
+      ]
     },
     {
       "metricKey": "risk_complaint_order_cnt_1d",
-      "businessName": "风控客诉订单量",
+      "businessName": "风控客诉订单日汇总量",
       "formula": "SUM(risk_complaint_order_cnt_1d)",
       "unit": "单",
       "description": "风控客诉订单量-最近1天",
@@ -2867,16 +3039,28 @@
         "risk_complaint_order_cnt_1d"
       ],
       "aliases": [
-        "风控客诉订单量",
+        "风控客诉订单日汇总量",
         "risk_complaint_order_cnt_1d",
+        "风控客诉订单量",
         "风控客诉订单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=风控客诉订单量-最近1天"
+      "evidence": "schema comment=风控客诉订单量-最近1天",
+      "displayName": "风控客诉订单日汇总量",
+      "disambiguationName": "风控客诉订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "风控客诉订单量",
+      "originalBusinessName": "风控客诉订单量",
+      "sourceColumnAliases": [
+        "risk_complaint_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "seller_repay_order_cnt_1d",
-      "businessName": "卖家赔付订单数",
+      "businessName": "卖家赔付订单日汇总数",
       "formula": "SUM(seller_repay_order_cnt_1d)",
       "unit": "单",
       "description": "卖家赔付订单数-最近1天",
@@ -2884,16 +3068,30 @@
         "seller_repay_order_cnt_1d"
       ],
       "aliases": [
-        "卖家赔付订单数",
+        "卖家赔付订单日汇总数",
         "seller_repay_order_cnt_1d",
-        "卖家赔付订单数-最近1天"
+        "卖家赔付订单数",
+        "卖家赔付订单数-最近1天",
+        "赔付订单量",
+        "赔付订单数"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=卖家赔付订单数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=卖家赔付订单数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "卖家赔付订单日汇总数",
+      "disambiguationName": "卖家赔付订单日汇总数",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "卖家赔付订单数",
+      "originalBusinessName": "卖家赔付订单数",
+      "sourceColumnAliases": [
+        "seller_repay_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "seller_repay_amt_1d",
-      "businessName": "卖家赔付金额元",
+      "businessName": "卖家赔付日汇总金额",
       "formula": "SUM(seller_repay_amt_1d)",
       "unit": "元",
       "description": "卖家赔付金额元-最近1天",
@@ -2901,16 +3099,32 @@
         "seller_repay_amt_1d"
       ],
       "aliases": [
-        "卖家赔付金额元",
+        "卖家赔付日汇总金额",
         "seller_repay_amt_1d",
-        "卖家赔付金额元-最近1天"
+        "卖家赔付金额元",
+        "卖家赔付金额",
+        "卖家赔付金额元-最近1天",
+        "赔付金额",
+        "赔付额",
+        "商家赔付金额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=卖家赔付金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=卖家赔付金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "卖家赔付日汇总金额",
+      "disambiguationName": "卖家赔付日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "卖家赔付金额元",
+      "originalBusinessName": "卖家赔付金额元",
+      "sourceColumnAliases": [
+        "seller_repay_amt_1d"
+      ]
     },
     {
       "metricKey": "entry_audit_duration_hours_1d",
-      "businessName": "入驻审核平均时效小时",
+      "businessName": "入驻审核平均时效小时（日汇总）",
       "formula": "SUM(entry_audit_duration_hours_1d)",
       "unit": "小时",
       "description": "入驻审核平均时效小时-最近1天",
@@ -2918,16 +3132,28 @@
         "entry_audit_duration_hours_1d"
       ],
       "aliases": [
-        "入驻审核平均时效小时",
+        "入驻审核平均时效小时（日汇总）",
         "entry_audit_duration_hours_1d",
+        "入驻审核平均时效小时",
         "入驻审核平均时效小时-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=入驻审核平均时效小时-最近1天"
+      "evidence": "schema comment=入驻审核平均时效小时-最近1天",
+      "displayName": "入驻审核平均时效小时（日汇总）",
+      "disambiguationName": "入驻审核平均时效小时（日汇总）",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "入驻审核平均时效小时",
+      "originalBusinessName": "入驻审核平均时效小时",
+      "sourceColumnAliases": [
+        "entry_audit_duration_hours_1d"
+      ]
     },
     {
       "metricKey": "deposit_pay_cnt_1d",
-      "businessName": "缴纳保证金次数",
+      "businessName": "缴纳保证金次日汇总数",
       "formula": "SUM(deposit_pay_cnt_1d)",
       "unit": "单",
       "description": "缴纳保证金次数-最近1天",
@@ -2935,16 +3161,28 @@
         "deposit_pay_cnt_1d"
       ],
       "aliases": [
-        "缴纳保证金次数",
+        "缴纳保证金次日汇总数",
         "deposit_pay_cnt_1d",
+        "缴纳保证金次数",
         "缴纳保证金次数-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=缴纳保证金次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=缴纳保证金次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "缴纳保证金次日汇总数",
+      "disambiguationName": "缴纳保证金次日汇总数",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "缴纳保证金次数",
+      "originalBusinessName": "缴纳保证金次数",
+      "sourceColumnAliases": [
+        "deposit_pay_cnt_1d"
+      ]
     },
     {
       "metricKey": "entry_success_duration_hours_1d",
-      "businessName": "入驻成功平均总时长小时",
+      "businessName": "入驻成功平均总时长小时（日汇总）",
       "formula": "SUM(entry_success_duration_hours_1d)",
       "unit": "小时",
       "description": "入驻成功平均总时长小时-最近1天",
@@ -2952,16 +3190,28 @@
         "entry_success_duration_hours_1d"
       ],
       "aliases": [
-        "入驻成功平均总时长小时",
+        "入驻成功平均总时长小时（日汇总）",
         "entry_success_duration_hours_1d",
+        "入驻成功平均总时长小时",
         "入驻成功平均总时长小时-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=入驻成功平均总时长小时-最近1天"
+      "evidence": "schema comment=入驻成功平均总时长小时-最近1天",
+      "displayName": "入驻成功平均总时长小时（日汇总）",
+      "disambiguationName": "入驻成功平均总时长小时（日汇总）",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "入驻成功平均总时长小时",
+      "originalBusinessName": "入驻成功平均总时长小时",
+      "sourceColumnAliases": [
+        "entry_success_duration_hours_1d"
+      ]
     },
     {
       "metricKey": "punish_cnt_1d",
-      "businessName": "处罚次数",
+      "businessName": "处罚次日汇总数",
       "formula": "SUM(punish_cnt_1d)",
       "unit": "单",
       "description": "处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正",
@@ -2969,16 +3219,28 @@
         "punish_cnt_1d"
       ],
       "aliases": [
-        "处罚次数",
+        "处罚次日汇总数",
         "punish_cnt_1d",
+        "处罚次数",
         "处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=处罚次数-最近1天；当前按处罚类申诉记录近似，待补处罚单源表校正; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "处罚次日汇总数",
+      "disambiguationName": "处罚次日汇总数",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "处罚次数",
+      "originalBusinessName": "处罚次数",
+      "sourceColumnAliases": [
+        "punish_cnt_1d"
+      ]
     },
     {
       "metricKey": "appeal_cnt_1d",
-      "businessName": "申诉次数",
+      "businessName": "申诉次日汇总数",
       "formula": "SUM(appeal_cnt_1d)",
       "unit": "单",
       "description": "申诉次数-最近1天",
@@ -2986,16 +3248,28 @@
         "appeal_cnt_1d"
       ],
       "aliases": [
-        "申诉次数",
+        "申诉次日汇总数",
         "appeal_cnt_1d",
+        "申诉次数",
         "申诉次数-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=申诉次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=申诉次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "申诉次日汇总数",
+      "disambiguationName": "申诉次日汇总数",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "申诉次数",
+      "originalBusinessName": "申诉次数",
+      "sourceColumnAliases": [
+        "appeal_cnt_1d"
+      ]
     },
     {
       "metricKey": "appeal_success_cnt_1d",
-      "businessName": "申诉成功次数",
+      "businessName": "申诉成功次日汇总数",
       "formula": "SUM(appeal_success_cnt_1d)",
       "unit": "单",
       "description": "申诉成功次数-最近1天",
@@ -3003,35 +3277,28 @@
         "appeal_success_cnt_1d"
       ],
       "aliases": [
-        "申诉成功次数",
+        "申诉成功次日汇总数",
         "appeal_success_cnt_1d",
+        "申诉成功次数",
         "申诉成功次数-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=申诉成功次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
-    },
-    {
-      "metricKey": "appeal_success_rate_1d",
-      "businessName": "申诉成功率",
-      "formula": "SUM(appeal_success_cnt_1d) / NULLIF(SUM(appeal_cnt_1d), 0)",
-      "unit": "%",
-      "description": "申诉成功次数占申诉次数的比例",
-      "sourceColumns": [
-        "appeal_success_cnt_1d",
-        "appeal_cnt_1d"
-      ],
-      "aliases": [
-        "申诉成功率",
-        "申诉通过率",
-        "appeal_success_rate",
-        "appeal_success_rate_1d"
-      ],
-      "confidence": 0.9,
-      "evidence": "语义层派生指标：申诉成功次数 / 申诉次数"
+      "evidence": "schema comment=申诉成功次数-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "申诉成功次日汇总数",
+      "disambiguationName": "申诉成功次日汇总数",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "申诉成功次数",
+      "originalBusinessName": "申诉成功次数",
+      "sourceColumnAliases": [
+        "appeal_success_cnt_1d"
+      ]
     },
     {
       "metricKey": "scm_performance_cnt_1d",
-      "businessName": "供应链履约量",
+      "businessName": "供应链履约日汇总量",
       "formula": "SUM(scm_performance_cnt_1d)",
       "unit": "单",
       "description": "供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计",
@@ -3039,16 +3306,28 @@
         "scm_performance_cnt_1d"
       ],
       "aliases": [
-        "供应链履约量",
+        "供应链履约日汇总量",
         "scm_performance_cnt_1d",
+        "供应链履约量",
         "供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=供应链履约量-最近1天；按outbound_modify_time大于outbound_latest_time统计; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "供应链履约日汇总量",
+      "disambiguationName": "供应链履约日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "供应链履约量",
+      "originalBusinessName": "供应链履约量",
+      "sourceColumnAliases": [
+        "scm_performance_cnt_1d"
+      ]
     },
     {
       "metricKey": "return_success_cnt_1d",
-      "businessName": "退货成功量",
+      "businessName": "退货成功日汇总量",
       "formula": "SUM(return_success_cnt_1d)",
       "unit": "单",
       "description": "退货成功量-最近1天",
@@ -3056,16 +3335,28 @@
         "return_success_cnt_1d"
       ],
       "aliases": [
-        "退货成功量",
+        "退货成功日汇总量",
         "return_success_cnt_1d",
+        "退货成功量",
         "退货成功量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=退货成功量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=退货成功量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "退货成功日汇总量",
+      "disambiguationName": "退货成功日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "退货成功量",
+      "originalBusinessName": "退货成功量",
+      "sourceColumnAliases": [
+        "return_success_cnt_1d"
+      ]
     },
     {
       "metricKey": "return_cnt_1d",
-      "businessName": "退货量",
+      "businessName": "退货日汇总量",
       "formula": "SUM(return_cnt_1d)",
       "unit": "单",
       "description": "退货量-最近1天",
@@ -3073,16 +3364,30 @@
         "return_cnt_1d"
       ],
       "aliases": [
-        "退货量",
+        "退货日汇总量",
         "return_cnt_1d",
-        "退货量-最近1天"
+        "退货量",
+        "退货量-最近1天",
+        "退货数",
+        "退货订单量"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=退货量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=退货量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "退货日汇总量",
+      "disambiguationName": "退货日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "退货量",
+      "originalBusinessName": "退货量",
+      "sourceColumnAliases": [
+        "return_cnt_1d"
+      ]
     },
     {
       "metricKey": "fake_identify_cnt_1d",
-      "businessName": "鉴定为假货量",
+      "businessName": "鉴定为假货日汇总量",
       "formula": "SUM(fake_identify_cnt_1d)",
       "unit": "单",
       "description": "鉴定为假货量-最近1天",
@@ -3090,16 +3395,28 @@
         "fake_identify_cnt_1d"
       ],
       "aliases": [
-        "鉴定为假货量",
+        "鉴定为假货日汇总量",
         "fake_identify_cnt_1d",
+        "鉴定为假货量",
         "鉴定为假货量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=鉴定为假货量-最近1天"
+      "evidence": "schema comment=鉴定为假货量-最近1天",
+      "displayName": "鉴定为假货日汇总量",
+      "disambiguationName": "鉴定为假货日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "鉴定为假货量",
+      "originalBusinessName": "鉴定为假货量",
+      "sourceColumnAliases": [
+        "fake_identify_cnt_1d"
+      ]
     },
     {
       "metricKey": "check_unpass_cnt_1d",
-      "businessName": "质检不通过量",
+      "businessName": "质检不通过日汇总量",
       "formula": "SUM(check_unpass_cnt_1d)",
       "unit": "单",
       "description": "质检不通过量-最近1天",
@@ -3107,16 +3424,28 @@
         "check_unpass_cnt_1d"
       ],
       "aliases": [
-        "质检不通过量",
+        "质检不通过日汇总量",
         "check_unpass_cnt_1d",
+        "质检不通过量",
         "质检不通过量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=质检不通过量-最近1天"
+      "evidence": "schema comment=质检不通过量-最近1天",
+      "displayName": "质检不通过日汇总量",
+      "disambiguationName": "质检不通过日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "质检不通过量",
+      "originalBusinessName": "质检不通过量",
+      "sourceColumnAliases": [
+        "check_unpass_cnt_1d"
+      ]
     },
     {
       "metricKey": "goods_audit_reject_cnt_1d",
-      "businessName": "商品审核拒绝量",
+      "businessName": "商品审核拒绝日汇总量",
       "formula": "SUM(goods_audit_reject_cnt_1d)",
       "unit": "单",
       "description": "商品审核拒绝量-最近1天",
@@ -3124,22 +3453,37 @@
         "goods_audit_reject_cnt_1d"
       ],
       "aliases": [
-        "商品审核拒绝量",
+        "商品审核拒绝日汇总量",
         "goods_audit_reject_cnt_1d",
+        "商品审核拒绝量",
         "商品审核拒绝量-最近1天",
         "审核拒绝量",
         "审核拒绝数",
         "审核驳回量",
         "审核驳回数",
         "拒绝量",
-        "驳回量"
+        "驳回量",
+        "商品审核拒绝数",
+        "商品审核驳回量"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=商品审核拒绝量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=商品审核拒绝量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "商品审核拒绝日汇总量",
+      "disambiguationName": "商品审核拒绝日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "detailMetricRef": "semantic:商品管理:dwm_goods_detail_df:metric:goods_audit_reject_detail_cnt",
+      "naturalName": "商品审核拒绝量",
+      "originalBusinessName": "商品审核拒绝量",
+      "sourceColumnAliases": [
+        "goods_audit_reject_cnt_1d"
+      ]
     },
     {
       "metricKey": "goods_online_cnt_1d",
-      "businessName": "上架商品量",
+      "businessName": "上架商品日汇总量",
       "formula": "SUM(goods_online_cnt_1d)",
       "unit": "单",
       "description": "上架商品量-最近1天",
@@ -3147,16 +3491,28 @@
         "goods_online_cnt_1d"
       ],
       "aliases": [
-        "上架商品量",
+        "上架商品日汇总量",
         "goods_online_cnt_1d",
+        "上架商品量",
         "上架商品量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=上架商品量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=上架商品量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "上架商品日汇总量",
+      "disambiguationName": "上架商品日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "上架商品量",
+      "originalBusinessName": "上架商品量",
+      "sourceColumnAliases": [
+        "goods_online_cnt_1d"
+      ]
     },
     {
       "metricKey": "goods_apply_cnt_1d",
-      "businessName": "商品申请量",
+      "businessName": "商品申请日汇总量",
       "formula": "SUM(goods_apply_cnt_1d)",
       "unit": "单",
       "description": "商品申请量-最近1天",
@@ -3164,19 +3520,31 @@
         "goods_apply_cnt_1d"
       ],
       "aliases": [
-        "商品申请量",
+        "商品申请日汇总量",
         "goods_apply_cnt_1d",
+        "商品申请量",
         "商品申请量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=商品申请量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=商品申请量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "商品申请日汇总量",
+      "disambiguationName": "商品申请日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "商品申请量",
+      "originalBusinessName": "商品申请量",
+      "sourceColumnAliases": [
+        "goods_apply_cnt_1d"
+      ]
     },
     {
       "metricKey": "trade_success_gmv_amt_1d",
       "canonicalMetricKey": "order_gmv_amt_1d",
       "aliasOf": "order_gmv_amt_1d",
       "metricLevel": "business_variant",
-      "businessName": "交易成功gmv金额元",
+      "businessName": "交易成功GMV日汇总金额",
       "formula": "SUM(trade_success_gmv_amt_1d)",
       "unit": "元",
       "description": "交易成功gmv金额元-最近1天",
@@ -3184,20 +3552,33 @@
         "trade_success_gmv_amt_1d"
       ],
       "aliases": [
-        "交易成功gmv金额元",
+        "交易成功GMV日汇总金额",
         "trade_success_gmv_amt_1d",
+        "交易成功gmv金额元",
+        "交易成功gmv金额",
+        "交易成功GMV金额",
         "交易成功gmv金额元-最近1天",
-        "GMV",
-        "成交额",
-        "销售额",
-        "交易流水"
+        "交易成功GMV",
+        "交易成功成交额",
+        "交易成功销售额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=交易成功gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=交易成功gmv金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "交易成功GMV日汇总金额",
+      "disambiguationName": "交易成功GMV日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "交易成功gmv金额元",
+      "originalBusinessName": "交易成功gmv金额元",
+      "sourceColumnAliases": [
+        "trade_success_gmv_amt_1d"
+      ]
     },
     {
       "metricKey": "trade_success_user_cnt_1d",
-      "businessName": "交易成功用户量",
+      "businessName": "交易成功用户日汇总量",
       "formula": "SUM(trade_success_user_cnt_1d)",
       "unit": "单",
       "description": "交易成功用户量-最近1天",
@@ -3205,16 +3586,28 @@
         "trade_success_user_cnt_1d"
       ],
       "aliases": [
-        "交易成功用户量",
+        "交易成功用户日汇总量",
         "trade_success_user_cnt_1d",
+        "交易成功用户量",
         "交易成功用户量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=交易成功用户量-最近1天"
+      "evidence": "schema comment=交易成功用户量-最近1天",
+      "displayName": "交易成功用户日汇总量",
+      "disambiguationName": "交易成功用户日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "交易成功用户量",
+      "originalBusinessName": "交易成功用户量",
+      "sourceColumnAliases": [
+        "trade_success_user_cnt_1d"
+      ]
     },
     {
       "metricKey": "avg_pay_order_amt_1d",
-      "businessName": "支付成功客单价元",
+      "businessName": "支付成功客单价元（日汇总）",
       "formula": "AVG(avg_pay_order_amt_1d)",
       "unit": "元",
       "description": "支付成功客单价元-最近1天",
@@ -3222,16 +3615,29 @@
         "avg_pay_order_amt_1d"
       ],
       "aliases": [
-        "支付成功客单价元",
+        "支付成功客单价元（日汇总）",
         "avg_pay_order_amt_1d",
+        "支付成功客单价元",
+        "支付成功客单价",
         "支付成功客单价元-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=支付成功客单价元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=支付成功客单价元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "支付成功客单价元（日汇总）",
+      "disambiguationName": "支付成功客单价元（日汇总）",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "支付成功客单价元",
+      "originalBusinessName": "支付成功客单价元",
+      "sourceColumnAliases": [
+        "avg_pay_order_amt_1d"
+      ]
     },
     {
       "metricKey": "order_close_cnt_1d",
-      "businessName": "关闭订单量",
+      "businessName": "关闭订单日汇总量",
       "formula": "SUM(order_close_cnt_1d)",
       "unit": "单",
       "description": "关闭订单量-最近1天",
@@ -3239,16 +3645,28 @@
         "order_close_cnt_1d"
       ],
       "aliases": [
-        "关闭订单量",
+        "关闭订单日汇总量",
         "order_close_cnt_1d",
+        "关闭订单量",
         "关闭订单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=关闭订单量-最近1天"
+      "evidence": "schema comment=关闭订单量-最近1天",
+      "displayName": "关闭订单日汇总量",
+      "disambiguationName": "关闭订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "关闭订单量",
+      "originalBusinessName": "关闭订单量",
+      "sourceColumnAliases": [
+        "order_close_cnt_1d"
+      ]
     },
     {
       "metricKey": "seller_subsidy_amt_1d",
-      "businessName": "商家补贴金额元",
+      "businessName": "商家补贴日汇总金额",
       "formula": "SUM(seller_subsidy_amt_1d)",
       "unit": "元",
       "description": "商家补贴金额元-最近1天",
@@ -3256,16 +3674,29 @@
         "seller_subsidy_amt_1d"
       ],
       "aliases": [
-        "商家补贴金额元",
+        "商家补贴日汇总金额",
         "seller_subsidy_amt_1d",
+        "商家补贴金额元",
+        "商家补贴金额",
         "商家补贴金额元-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=商家补贴金额元-最近1天"
+      "evidence": "schema comment=商家补贴金额元-最近1天",
+      "displayName": "商家补贴日汇总金额",
+      "disambiguationName": "商家补贴日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "商家补贴金额元",
+      "originalBusinessName": "商家补贴金额元",
+      "sourceColumnAliases": [
+        "seller_subsidy_amt_1d"
+      ]
     },
     {
       "metricKey": "platform_subsidy_amt_1d",
-      "businessName": "平台补贴金额元",
+      "businessName": "平台补贴日汇总金额",
       "formula": "SUM(platform_subsidy_amt_1d)",
       "unit": "元",
       "description": "平台补贴金额元-最近1天",
@@ -3273,16 +3704,29 @@
         "platform_subsidy_amt_1d"
       ],
       "aliases": [
-        "平台补贴金额元",
+        "平台补贴日汇总金额",
         "platform_subsidy_amt_1d",
+        "平台补贴金额元",
+        "平台补贴金额",
         "平台补贴金额元-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=平台补贴金额元-最近1天"
+      "evidence": "schema comment=平台补贴金额元-最近1天",
+      "displayName": "平台补贴日汇总金额",
+      "disambiguationName": "平台补贴日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "平台补贴金额元",
+      "originalBusinessName": "平台补贴金额元",
+      "sourceColumnAliases": [
+        "platform_subsidy_amt_1d"
+      ]
     },
     {
       "metricKey": "ship_timeout_order_cnt_1d",
-      "businessName": "发货超时订单量",
+      "businessName": "发货超时订单日汇总量",
       "formula": "SUM(ship_timeout_order_cnt_1d)",
       "unit": "单",
       "description": "发货超时订单量-最近1天",
@@ -3290,16 +3734,28 @@
         "ship_timeout_order_cnt_1d"
       ],
       "aliases": [
-        "发货超时订单量",
+        "发货超时订单日汇总量",
         "ship_timeout_order_cnt_1d",
+        "发货超时订单量",
         "发货超时订单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=发货超时订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=发货超时订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "发货超时订单日汇总量",
+      "disambiguationName": "发货超时订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "发货超时订单量",
+      "originalBusinessName": "发货超时订单量",
+      "sourceColumnAliases": [
+        "ship_timeout_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "signed_order_cnt_1d",
-      "businessName": "签收订单量",
+      "businessName": "签收订单日汇总量",
       "formula": "SUM(signed_order_cnt_1d)",
       "unit": "单",
       "description": "签收订单量-最近1天",
@@ -3307,16 +3763,28 @@
         "signed_order_cnt_1d"
       ],
       "aliases": [
-        "签收订单量",
+        "签收订单日汇总量",
         "signed_order_cnt_1d",
+        "签收订单量",
         "签收订单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=签收订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=签收订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "签收订单日汇总量",
+      "disambiguationName": "签收订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "签收订单量",
+      "originalBusinessName": "签收订单量",
+      "sourceColumnAliases": [
+        "signed_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "delivery_timeout_order_cnt_1d",
-      "businessName": "签收超预计送达订单量",
+      "businessName": "签收超预计送达订单日汇总量",
       "formula": "SUM(delivery_timeout_order_cnt_1d)",
       "unit": "单",
       "description": "签收超预计送达订单量-最近1天",
@@ -3324,16 +3792,28 @@
         "delivery_timeout_order_cnt_1d"
       ],
       "aliases": [
-        "签收超预计送达订单量",
+        "签收超预计送达订单日汇总量",
         "delivery_timeout_order_cnt_1d",
+        "签收超预计送达订单量",
         "签收超预计送达订单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=签收超预计送达订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=签收超预计送达订单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "签收超预计送达订单日汇总量",
+      "disambiguationName": "签收超预计送达订单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "签收超预计送达订单量",
+      "originalBusinessName": "签收超预计送达订单量",
+      "sourceColumnAliases": [
+        "delivery_timeout_order_cnt_1d"
+      ]
     },
     {
       "metricKey": "pay_discount_rate_1d",
-      "businessName": "支付成功优惠金额占支付gmv比例",
+      "businessName": "支付成功优惠日汇总金额占支付gmv比例",
       "formula": "AVG(pay_discount_rate_1d)",
       "unit": "%",
       "description": "支付成功优惠金额占支付gmv比例-最近1天",
@@ -3341,16 +3821,31 @@
         "pay_discount_rate_1d"
       ],
       "aliases": [
-        "支付成功优惠金额占支付gmv比例",
+        "支付成功优惠日汇总金额占支付gmv比例",
         "pay_discount_rate_1d",
-        "支付成功优惠金额占支付gmv比例-最近1天"
+        "支付成功优惠金额占支付gmv比例",
+        "支付成功优惠金额占支付gmv比例-最近1天",
+        "优惠占比",
+        "支付优惠占比",
+        "优惠金额占比"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=支付成功优惠金额占支付gmv比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+      "evidence": "schema comment=支付成功优惠金额占支付gmv比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]",
+      "displayName": "支付成功优惠日汇总金额占支付gmv比例",
+      "disambiguationName": "支付成功优惠日汇总金额占支付gmv比例",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "支付成功优惠金额占支付gmv比例",
+      "originalBusinessName": "支付成功优惠金额占支付gmv比例",
+      "sourceColumnAliases": [
+        "pay_discount_rate_1d"
+      ]
     },
     {
       "metricKey": "refund_amt_1d",
-      "businessName": "退款金额元",
+      "businessName": "退款日汇总金额",
       "formula": "SUM(refund_amt_1d)",
       "unit": "元",
       "description": "退款金额元-最近1天",
@@ -3358,16 +3853,30 @@
         "refund_amt_1d"
       ],
       "aliases": [
-        "退款金额元",
+        "退款日汇总金额",
         "refund_amt_1d",
-        "退款金额元-最近1天"
+        "退款金额元",
+        "退款金额",
+        "退款金额元-最近1天",
+        "退款额"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=退款金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=退款金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "退款日汇总金额",
+      "disambiguationName": "退款日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "退款金额元",
+      "originalBusinessName": "退款金额元",
+      "sourceColumnAliases": [
+        "refund_amt_1d"
+      ]
     },
     {
       "metricKey": "return_success_amt_1d",
-      "businessName": "退货成功金额元",
+      "businessName": "退货成功日汇总金额",
       "formula": "SUM(return_success_amt_1d)",
       "unit": "元",
       "description": "退货成功金额元-最近1天",
@@ -3375,16 +3884,29 @@
         "return_success_amt_1d"
       ],
       "aliases": [
-        "退货成功金额元",
+        "退货成功日汇总金额",
         "return_success_amt_1d",
+        "退货成功金额元",
+        "退货成功金额",
         "退货成功金额元-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=退货成功金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=退货成功金额元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "退货成功日汇总金额",
+      "disambiguationName": "退货成功日汇总金额",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "退货成功金额元",
+      "originalBusinessName": "退货成功金额元",
+      "sourceColumnAliases": [
+        "return_success_amt_1d"
+      ]
     },
     {
       "metricKey": "seller_responsible_refund_cnt_1d",
-      "businessName": "卖家责任退货量",
+      "businessName": "卖家责任退货日汇总量",
       "formula": "SUM(seller_responsible_refund_cnt_1d)",
       "unit": "单",
       "description": "卖家责任退货量-最近1天",
@@ -3392,16 +3914,28 @@
         "seller_responsible_refund_cnt_1d"
       ],
       "aliases": [
-        "卖家责任退货量",
+        "卖家责任退货日汇总量",
         "seller_responsible_refund_cnt_1d",
+        "卖家责任退货量",
         "卖家责任退货量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=卖家责任退货量-最近1天"
+      "evidence": "schema comment=卖家责任退货量-最近1天",
+      "displayName": "卖家责任退货日汇总量",
+      "disambiguationName": "卖家责任退货日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "卖家责任退货量",
+      "originalBusinessName": "卖家责任退货量",
+      "sourceColumnAliases": [
+        "seller_responsible_refund_cnt_1d"
+      ]
     },
     {
       "metricKey": "direct_refund_cnt_1d",
-      "businessName": "直接退款量",
+      "businessName": "直接退款日汇总量",
       "formula": "SUM(direct_refund_cnt_1d)",
       "unit": "单",
       "description": "直接退款量-最近1天",
@@ -3409,39 +3943,103 @@
         "direct_refund_cnt_1d"
       ],
       "aliases": [
-        "直接退款量",
+        "直接退款日汇总量",
         "direct_refund_cnt_1d",
-        "直接退款量-最近1天"
+        "直接退款量",
+        "直接退款量-最近1天",
+        "直接退款数"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=直接退款量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=直接退款量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "直接退款日汇总量",
+      "disambiguationName": "直接退款日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "直接退款量",
+      "originalBusinessName": "直接退款量",
+      "sourceColumnAliases": [
+        "direct_refund_cnt_1d"
+      ]
+    },
+    {
+      "metricKey": "direct_refund_rate_by_pay_order",
+      "businessName": "直接退款率",
+      "displayName": "直接退款率",
+      "disambiguationName": "直接退款率（直接退款量/支付订单量）",
+      "naturalName": "退款率",
+      "originalBusinessName": "退款率",
+      "formula": "SUM(direct_refund_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+      "metricFormula": "SUM(direct_refund_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+      "unit": "%",
+      "valueFormat": "percent",
+      "description": "店铺周期退款率，按直接退款量占支付订单量统计。该指标和退货率不同。",
+      "sourceColumns": [
+        "direct_refund_cnt_1d",
+        "pay_order_cnt_1d"
+      ],
+      "aliases": [
+        "直接退款率",
+        "退款率",
+        "周期退款率",
+        "汇总退款率",
+        "店铺退款率",
+        "整体退款率",
+        "退款订单率",
+        "direct_refund_rate_by_pay_order"
+      ],
+      "confidence": 0.86,
+      "evidence": "语义层口径：SUM(direct_refund_cnt_1d) / SUM(pay_order_cnt_1d)",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "metricLevel": "business",
+      "canonicalMetricKey": "direct_refund_rate_by_pay_order",
+      "aggregationPolicy": "period_rollup"
     },
     {
       "metricKey": "refund_rate_1d",
-      "businessName": "退货量占支付订单量比例",
+      "businessName": "每日退货率",
       "formula": "AVG(refund_rate_1d)",
       "unit": "%",
-      "description": "退货量占支付订单量比例-最近1天",
+      "description": "每日退货率，按单日退货量占支付订单量统计，适合查看退货率走势。",
       "sourceColumns": [
         "refund_rate_1d"
       ],
       "aliases": [
-        "退货量占支付订单量比例",
-        "退款率",
-        "退货率",
-        "售后率",
-        "整体退款率",
-        "店铺退款率",
-        "refund_rate",
+        "每日退货率",
         "refund_rate_1d",
+        "退货率日值",
+        "退货率单日值",
+        "单日退货率",
+        "按日退货率",
         "退货量占支付订单量比例-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=退货量占支付订单量比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+      "evidence": "schema comment=退货量占支付订单量比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]",
+      "displayName": "每日退货率",
+      "disambiguationName": "每日退货率（单日字段）",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "每日退货率",
+      "originalBusinessName": "每日退货率",
+      "sourceColumnAliases": [
+        "refund_rate_1d"
+      ],
+      "metricFormula": "AVG(refund_rate_1d)",
+      "metricLevel": "daily_rate",
+      "canonicalMetricKey": "return_rate_by_pay_order",
+      "aliasOf": "return_rate_by_pay_order",
+      "aggregationPolicy": "daily_value_only",
+      "rollupMetricKey": "return_rate_by_pay_order",
+      "rollupFormula": "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)"
     },
     {
       "metricKey": "ticket_reopen_cnt_1d",
-      "businessName": "工单二次开启量",
+      "businessName": "工单二次开启日汇总量",
       "formula": "SUM(ticket_reopen_cnt_1d)",
       "unit": "单",
       "description": "工单二次开启量-最近1天",
@@ -3449,16 +4047,28 @@
         "ticket_reopen_cnt_1d"
       ],
       "aliases": [
-        "工单二次开启量",
+        "工单二次开启日汇总量",
         "ticket_reopen_cnt_1d",
+        "工单二次开启量",
         "工单二次开启量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=工单二次开启量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=工单二次开启量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "工单二次开启日汇总量",
+      "disambiguationName": "工单二次开启日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "工单二次开启量",
+      "originalBusinessName": "工单二次开启量",
+      "sourceColumnAliases": [
+        "ticket_reopen_cnt_1d"
+      ]
     },
     {
       "metricKey": "ticket_reminder_cnt_1d",
-      "businessName": "催单工单量",
+      "businessName": "催单工单日汇总量",
       "formula": "SUM(ticket_reminder_cnt_1d)",
       "unit": "单",
       "description": "催单工单量-最近1天",
@@ -3466,16 +4076,28 @@
         "ticket_reminder_cnt_1d"
       ],
       "aliases": [
-        "催单工单量",
+        "催单工单日汇总量",
         "ticket_reminder_cnt_1d",
+        "催单工单量",
         "催单工单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=催单工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=催单工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "催单工单日汇总量",
+      "disambiguationName": "催单工单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "催单工单量",
+      "originalBusinessName": "催单工单量",
+      "sourceColumnAliases": [
+        "ticket_reminder_cnt_1d"
+      ]
     },
     {
       "metricKey": "ticket_close_cnt_1d",
-      "businessName": "关闭工单量",
+      "businessName": "关闭工单日汇总量",
       "formula": "SUM(ticket_close_cnt_1d)",
       "unit": "单",
       "description": "关闭工单量-最近1天",
@@ -3483,16 +4105,28 @@
         "ticket_close_cnt_1d"
       ],
       "aliases": [
-        "关闭工单量",
+        "关闭工单日汇总量",
         "ticket_close_cnt_1d",
+        "关闭工单量",
         "关闭工单量-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=关闭工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=关闭工单量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "关闭工单日汇总量",
+      "disambiguationName": "关闭工单日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "关闭工单量",
+      "originalBusinessName": "关闭工单量",
+      "sourceColumnAliases": [
+        "ticket_close_cnt_1d"
+      ]
     },
     {
       "metricKey": "avg_ticket_score_1d",
-      "businessName": "平均工单评价分",
+      "businessName": "平均工单评价分（日汇总）",
       "formula": "AVG(avg_ticket_score_1d)",
       "unit": "",
       "description": "平均工单评价分-最近1天",
@@ -3500,16 +4134,28 @@
         "avg_ticket_score_1d"
       ],
       "aliases": [
-        "平均工单评价分",
+        "平均工单评价分（日汇总）",
         "avg_ticket_score_1d",
+        "平均工单评价分",
         "平均工单评价分-最近1天"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=平均工单评价分-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=平均工单评价分-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "平均工单评价分（日汇总）",
+      "disambiguationName": "平均工单评价分（日汇总）",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "平均工单评价分",
+      "originalBusinessName": "平均工单评价分",
+      "sourceColumnAliases": [
+        "avg_ticket_score_1d"
+      ]
     },
     {
       "metricKey": "goods_audit_pass_cnt_1d",
-      "businessName": "商品审核通过量",
+      "businessName": "商品审核通过日汇总量",
       "formula": "SUM(goods_audit_pass_cnt_1d)",
       "unit": "单",
       "description": "商品审核通过量-最近1天",
@@ -3517,15 +4163,30 @@
         "goods_audit_pass_cnt_1d"
       ],
       "aliases": [
-        "商品审核通过量",
+        "商品审核通过日汇总量",
         "goods_audit_pass_cnt_1d",
+        "商品审核通过量",
         "商品审核通过量-最近1天",
         "审核通过量",
         "审核通过数",
-        "通过量"
+        "通过量",
+        "商品审核通过数",
+        "审核通过商品量"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=商品审核通过量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]"
+      "evidence": "schema comment=商品审核通过量-最近1天; samples=[2, 3, 4, 5, 6, 7, 8, 9]",
+      "displayName": "商品审核通过日汇总量",
+      "disambiguationName": "商品审核通过日汇总量",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "detailMetricRef": "semantic:商品管理:dwm_goods_detail_df:metric:goods_audit_pass_detail_cnt",
+      "naturalName": "商品审核通过量",
+      "originalBusinessName": "商品审核通过量",
+      "sourceColumnAliases": [
+        "goods_audit_pass_cnt_1d"
+      ]
     },
     {
       "metricKey": "net_gmv_after_refund",
@@ -3540,26 +4201,63 @@
         "refund_amt_1d"
       ],
       "aliases": [
-        "扣退款后 GMV"
+        "扣退款后 GMV",
+        "net_gmv_after_refund"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "扣退款后 GMV",
+      "disambiguationName": "扣退款后 GMV",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "扣退款后 GMV",
+      "originalBusinessName": "扣退款后 GMV",
+      "sourceColumnAliases": [
+        "order_gmv_amt_1d",
+        "refund_amt_1d"
+      ]
     },
     {
       "metricKey": "return_rate_by_pay_order",
-      "businessName": "退货率",
+      "businessName": "周期汇总退货率",
       "formula": "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
       "unit": "%",
-      "description": "退货量占支付订单量比例；若表内已有 refund_rate_1d，也可直接使用 AVG(refund_rate_1d)",
+      "description": "跨天或指定周期的店铺退货率，按退货量占支付订单量统计。",
       "sourceColumns": [
         "return_cnt_1d",
         "pay_order_cnt_1d"
       ],
       "aliases": [
-        "退货率"
+        "退货率（退货量/支付订单量）",
+        "return_rate_by_pay_order",
+        "退货率",
+        "周期退货率",
+        "汇总退货率",
+        "退货订单率",
+        "售后退货率",
+        "店铺退货率",
+        "整体退货率"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "周期汇总退货率",
+      "disambiguationName": "周期汇总退货率（退货量/支付订单量）",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "ambiguousAliases": [],
+      "naturalName": "退货率",
+      "originalBusinessName": "退货率",
+      "sourceColumnAliases": [
+        "pay_order_cnt_1d",
+        "return_cnt_1d"
+      ],
+      "metricFormula": "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+      "metricLevel": "business",
+      "canonicalMetricKey": "return_rate_by_pay_order",
+      "aggregationPolicy": "period_rollup"
     }
   ],
   "terms": [
@@ -4453,22 +5151,22 @@
     },
     {
       "term": "退货量占支付订单量比例",
-      "description": "退货量占支付订单量比例-最近1天",
+      "description": "退货率口径：退货量占支付订单量的比例；单日看每日退货率，周期汇总看周期汇总退货率。",
       "aliases": [
         "退货量占支付订单量比例",
-        "退款率",
         "退货率",
-        "售后率",
-        "整体退款率",
-        "店铺退款率",
-        "refund_rate",
-        "refund_rate_1d",
-        "退货量占支付订单量比例-最近1天"
+        "退货订单率",
+        "售后退货率",
+        "整体退货率",
+        "店铺退货率"
       ],
       "relatedColumns": [
-        "refund_rate_1d"
+        "refund_rate_1d",
+        "return_cnt_1d",
+        "pay_order_cnt_1d"
       ],
-      "evidence": "来自字段 `refund_rate_1d` 的语义注释"
+      "evidence": "语义层口径：单日字段 refund_rate_1d；周期汇总 SUM(return_cnt_1d) / SUM(pay_order_cnt_1d)",
+      "canonicalMetricKey": "return_rate_by_pay_order"
     },
     {
       "term": "工单二次开启量",
@@ -4548,6 +5246,25 @@
       ],
       "relatedColumns": [],
       "evidence": "由表名/字段语义自动沉淀"
+    },
+    {
+      "term": "退款率",
+      "description": "退款率口径：直接退款量占支付订单量的比例，和退货率不是同一指标。",
+      "aliases": [
+        "退款率",
+        "直接退款率",
+        "周期退款率",
+        "汇总退款率",
+        "店铺退款率",
+        "整体退款率",
+        "退款订单率"
+      ],
+      "relatedColumns": [
+        "direct_refund_cnt_1d",
+        "pay_order_cnt_1d"
+      ],
+      "evidence": "语义层口径：SUM(direct_refund_cnt_1d) / SUM(pay_order_cnt_1d)",
+      "canonicalMetricKey": "direct_refund_rate_by_pay_order"
     }
   ],
   "knowledgeRules": [

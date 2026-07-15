@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from merchant_ai.models import QueryPlan, ResolvedTimeRange
 
 
+CALENDAR_ANCHOR_POLICY = "calendar"
+LATEST_PARTITION_ANCHOR_POLICY = "latest_available_partition"
 EXPLICIT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:日)?(?!\d)")
 ROLLING_DAYS_PATTERN = re.compile(r"(?:最近|近)\s*(\d{1,3})\s*天")
 
@@ -81,6 +83,10 @@ def local_today(timezone_name: str, now: Optional[datetime]) -> date:
     return now.astimezone(zone).date()
 
 
+def time_window_anchor_policy(kind: str) -> str:
+    return LATEST_PARTITION_ANCHOR_POLICY if kind == "rolling" else CALENDAR_ANCHOR_POLICY
+
+
 def resolved_range(kind: str, start: date, end: date, timezone_name: str, label: str, source: str) -> ResolvedTimeRange:
     return ResolvedTimeRange(
         kind=kind,
@@ -89,10 +95,78 @@ def resolved_range(kind: str, start: date, end: date, timezone_name: str, label:
         days=(end - start).days + 1,
         label=label,
         timezone=timezone_name,
-        anchor_policy="calendar",
+        anchor_policy=time_window_anchor_policy(kind),
         explicit=True,
         source=source,
     )
+
+
+def quote_sql_identifier(value: object) -> str:
+    return "`%s`" % str(value or "").strip().replace("`", "")
+
+
+def latest_partition_anchor_sql(
+    table: str,
+    partition_column: str = "pt",
+    tenant_column: str = "",
+    tenant_value_sql: str = "",
+) -> str:
+    table_sql = quote_sql_identifier(table)
+    partition_sql = quote_sql_identifier(partition_column or "pt")
+    where_sql = ""
+    if tenant_column and tenant_value_sql:
+        where_sql = " WHERE %s = %s" % (quote_sql_identifier(tenant_column), tenant_value_sql)
+    return "(SELECT MAX(%s) FROM %s%s)" % (partition_sql, table_sql, where_sql)
+
+
+def latest_partition_window_predicate(
+    table: str,
+    days: Any,
+    partition_column: str = "pt",
+    tenant_column: str = "",
+    tenant_value_sql: str = "",
+) -> str:
+    anchor_sql = latest_partition_anchor_sql(table, partition_column, tenant_column, tenant_value_sql)
+    try:
+        interval_days = max(int(days or 0) - 1, 0)
+    except (TypeError, ValueError):
+        interval_days = 0
+    partition_sql = quote_sql_identifier(partition_column or "pt")
+    return "%s BETWEEN DATE_SUB(%s, INTERVAL %d DAY) AND %s" % (
+        partition_sql,
+        anchor_sql,
+        interval_days,
+        anchor_sql,
+    )
+
+
+def time_window_contract_payload(
+    time_range: ResolvedTimeRange,
+    table: str = "",
+    partition_column: str = "pt",
+    tenant_column: str = "",
+) -> Dict[str, Any]:
+    anchor_policy = time_range.anchor_policy or time_window_anchor_policy(time_range.kind)
+    contract = {
+        "kind": time_range.kind,
+        "label": time_range.label,
+        "days": time_range.days,
+        "startDate": time_range.start_date,
+        "endDate": time_range.end_date,
+        "timezone": time_range.timezone,
+        "anchorPolicy": anchor_policy,
+        "partitionColumn": partition_column or "pt",
+        "source": time_range.source,
+    }
+    if table:
+        contract["table"] = table
+    if tenant_column:
+        contract["tenantColumn"] = tenant_column
+    if anchor_policy == LATEST_PARTITION_ANCHOR_POLICY:
+        contract["executionRule"] = "relative windows must anchor to MAX(%s) after merchant filter" % quote_sql_identifier(partition_column or "pt")
+    else:
+        contract["executionRule"] = "calendar/exact windows use startDate/endDate directly"
+    return contract
 
 
 def safe_date(year: str, month: str, day: str) -> Optional[date]:

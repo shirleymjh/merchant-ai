@@ -44,7 +44,7 @@ CREATE TABLE `dwm_trade_refund_detail_di` (
   `pay_status_code` bigint NULL COMMENT "支付状态code",
   `pay_status_name` text NULL COMMENT "支付状态name",
   `out_pay_id` text NULL COMMENT "支付单流水号",
-  `pay_amt` bigint NULL COMMENT "支付金额",
+  `pay_amt` bigint NULL COMMENT "退款金额",
   `pay_extra` text NULL COMMENT "支付拓展属性",
   `pay_create_time` text NULL COMMENT "支付创建时间",
   `pay_modify_time` text NULL COMMENT "支付更新时间",

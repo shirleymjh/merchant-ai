@@ -19,14 +19,49 @@ from merchant_ai.services.answer_claims import AnswerClaimVerifier
 from merchant_ai.services.cache import TTLCache
 from merchant_ai.services.formulas import compile_metric_formula
 from merchant_ai.services.semantic_request import semantic_request_cache_key
-from merchant_ai.services.time_semantics import partition_date_matches, resolve_time_range
+from merchant_ai.services.time_semantics import (
+    CALENDAR_ANCHOR_POLICY,
+    latest_partition_window_predicate,
+    partition_date_matches,
+    resolve_time_range,
+    time_window_contract_payload,
+)
 
 
 COMPLEX_TERMS = ["明细", "详情", "列表", "记录", "对应", "关联", "拆解", "归因"]
 ANALYSIS_TERMS = ["为什么", "原因", "分析", "归因", "诊断", "异常", "建议"]
 DEFINITION_TERMS = ["口径", "定义", "含义", "什么意思", "是否扣", "怎么算", "计算方式"]
+DETAIL_SCOPE_TERMS = [
+    "明细",
+    "详情",
+    "列表",
+    "记录",
+    "拆解",
+    "排名",
+    "排行",
+    "top",
+    "前",
+    "最高",
+    "最低",
+    "哪些",
+    "哪个",
+    "按商品",
+    "按spu",
+    "按sku",
+    "按类目",
+    "按订单",
+    "分商品",
+    "分spu",
+    "分sku",
+    "分类目",
+]
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 QUICK_RESPONSE_CACHE = TTLCache("quick_metric_response", max_entries=512, ttl_seconds=30)
+
+
+def is_metric_definition_question(question: str) -> bool:
+    text = str(question or "")
+    return any(term in text for term in DEFINITION_TERMS)
 
 
 def quick_metric_response(
@@ -48,7 +83,7 @@ def quick_metric_response(
         return None
     if structured_keywords_require_planner(extracted_keywords, matched_metrics) or "[用户附件上下文]" in question:
         return None
-    if any(term in question for term in DEFINITION_TERMS):
+    if is_metric_definition_question(question):
         return quick_metric_definition_response(question, merchant_id, matched_metrics)
     if any(term in question for term in ANALYSIS_TERMS):
         return None
@@ -76,24 +111,21 @@ def quick_metric_response(
     table = metric["table"]
     time_column = metric["time_column"]
     tenant_column = metric["tenant_column"]
+    time_filter, time_params = quick_metric_time_filter(time_range, table, time_column, tenant_column, merchant_id)
     rows = repository.query(
         "SELECT `%s` AS pt, %s AS value FROM `%s` "
-        "WHERE `%s`=%%s AND `%s` >= DATE_SUB((SELECT MAX(`%s`) FROM `%s` WHERE `%s`=%%s), INTERVAL %d DAY) "
+        "WHERE `%s`=%%s AND %s "
         "GROUP BY `%s` ORDER BY `%s`"
         % (
             time_column,
             formula,
             table,
             tenant_column,
-            time_column,
-            time_column,
-            table,
-            tenant_column,
-            max(0, days - 1),
+            time_filter,
             time_column,
             time_column,
         ),
-        [merchant_id, merchant_id],
+        [merchant_id] + time_params,
     )
     if not rows:
         return None
@@ -102,18 +134,14 @@ def quick_metric_response(
         return None
     total_rows = repository.query(
         "SELECT %s AS value FROM `%s` "
-        "WHERE `%s`=%%s AND `%s` >= DATE_SUB((SELECT MAX(`%s`) FROM `%s` WHERE `%s`=%%s), INTERVAL %d DAY)"
+        "WHERE `%s`=%%s AND %s"
         % (
             formula,
             table,
             tenant_column,
-            time_column,
-            time_column,
-            table,
-            tenant_column,
-            max(0, days - 1),
+            time_filter,
         ),
-        [merchant_id, merchant_id],
+        [merchant_id] + time_params,
     )
     if not total_rows or total_rows[0].get("value") is None:
         return None
@@ -127,20 +155,28 @@ def quick_metric_response(
     first, last = values[0], values[-1]
     direction = "上升" if last > first else "下降" if last < first else "持平"
     delta = abs(last - first)
-    direction_text = "整体持平" if delta == 0 else "整体%s %s" % (direction, format_value(delta, metric))
+    direction_text = "整体持平" if delta == 0 else "整体%s" % direction
     peak_index = max(range(len(values)), key=values.__getitem__)
     peak = normalized_rows[peak_index]
     total_text = format_value(total, metric)
-    advice = metric_advice(metric["label"])
+    all_zero = bool(values) and all(value == 0 for value in values)
+    advice = zero_metric_advice(metric["label"]) if all_zero else metric_advice(metric["label"])
     time_label = time_range.label or time_range_label(question, days)
     freshness_sentence = ""
     if time_range.kind == "rolling" and not partition_date_matches(latest_partition, time_range.end_date):
         freshness_sentence = "数据日期截至 %s。\n\n" % latest_partition
+    trend_sentence = (
+        f"从每日表现看，{metric['label']}各日均为 {format_value(0, metric)}。"
+        if all_zero
+        else (
+            f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，{direction_text}；"
+            f"峰值日期为 {peak['pt']}，峰值为 {format_value(peak['value'], metric)}。"
+        )
+    )
     answer = (
-        f"{time_label}，店铺{metric['label']}合计为 {total_text}。\n\n"
+        f"{time_label}，店铺{metric['label']}{summary_predicate(metric)} {total_text}。\n\n"
         f"{freshness_sentence}"
-        f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，{direction_text}；"
-        f"峰值日期为 {peak['pt']}，峰值为 {format_value(peak['value'], metric)}。\n\n"
+        f"{trend_sentence}\n\n"
         "建议：\n"
         f"- {advice[0]}\n"
         f"- {advice[1]}"
@@ -150,6 +186,7 @@ def quick_metric_response(
         "sourceSummary": "Doris 快速指标查询",
         "merchantId": merchant_id,
         "timeRange": time_label,
+        "timeWindowContract": time_window_contract_payload(time_range, table, time_column, tenant_column),
         "dataUpdatedAt": normalized_rows[-1]["pt"],
         "rowCount": len(normalized_rows),
         "sourceTables": [table],
@@ -181,6 +218,7 @@ def quick_metric_response(
             "quickMetricPath": True,
             "days": days,
             "timeRange": time_range.model_dump(by_alias=True),
+            "timeWindowContract": time_window_contract_payload(time_range, table, time_column, tenant_column),
             "actualLatestPartition": latest_partition,
             "metric": metric["label"],
             "metricTerms": metric.get("terms") or [],
@@ -193,6 +231,31 @@ def quick_metric_response(
     response.debug_trace["answerClaimVerification"] = verification.model_dump(by_alias=True)
     QUICK_RESPONSE_CACHE.set(cache_key, response.model_dump(by_alias=True))
     return response
+
+
+def quick_metric_time_filter(
+    time_range: Any,
+    table: str,
+    time_column: str,
+    tenant_column: str,
+    merchant_id: str,
+) -> tuple[str, list[Any]]:
+    if (
+        getattr(time_range, "anchor_policy", "") == CALENDAR_ANCHOR_POLICY
+        and getattr(time_range, "start_date", "")
+        and getattr(time_range, "end_date", "")
+    ):
+        if time_range.start_date == time_range.end_date:
+            return "`%s` = %%s" % time_column, [time_range.end_date]
+        return "`%s` BETWEEN %%s AND %%s" % time_column, [time_range.start_date, time_range.end_date]
+    predicate = latest_partition_window_predicate(
+        table,
+        getattr(time_range, "days", 0) or 1,
+        partition_column=time_column,
+        tenant_column=tenant_column,
+        tenant_value_sql="%s",
+    )
+    return predicate, [merchant_id, merchant_id]
 
 
 def verify_quick_metric_answer(
@@ -336,9 +399,12 @@ def structured_keywords_require_planner(keywords: Any, matched_metrics: Optional
         return True
     if getattr(keywords, "unresolved_phrases", None):
         return True
-    if str(getattr(keywords, "analysis_intent", "") or "") in {"attribution", "ranking", "detail", "advice", "ratio"}:
-        return True
     structured_metrics = list(getattr(keywords, "metric_keywords", None) or [])
+    analysis_intent = str(getattr(keywords, "analysis_intent", "") or "")
+    if analysis_intent in {"attribution", "ranking", "detail", "advice"}:
+        return True
+    if analysis_intent == "ratio" and not (matched_metrics is not None and len(matched_metrics) == 1 and len(structured_metrics) <= 1):
+        return True
     if matched_metrics is not None and len(structured_metrics) > len(matched_metrics):
         return True
     metric_candidates: Dict[str, set[str]] = {}
@@ -406,7 +472,7 @@ def compile_semantic_quick_metric(
     metric_key = str(metric.get("metricKey") or metric.get("canonicalMetricKey") or "").strip()
     if not metric_key:
         return None
-    label = str(metric.get("businessName") or metric.get("displayName") or metric_key).strip()
+    label = str(metric.get("displayName") or metric.get("businessName") or metric_key).strip()
     aliases = [label, metric_key, *source_columns, *(metric.get("aliases") or [])]
     terms = list(dict.fromkeys(str(item or "").strip() for item in aliases if str(item or "").strip()))
     if not terms:
@@ -425,6 +491,10 @@ def compile_semantic_quick_metric(
         "topic": topic,
         "description": str(metric.get("description") or "").strip(),
         "evidence": str(metric.get("evidence") or "").strip(),
+        "natural_name": str(metric.get("naturalName") or "").strip(),
+        "metric_grain": str(metric.get("metricGrain") or "").strip(),
+        "metric_intent": str(metric.get("metricIntent") or "").strip(),
+        "selection_guidance": str(metric.get("selectionGuidance") or "").strip(),
     }
 
 
@@ -487,6 +557,8 @@ def resolve_metrics(
     result: list[Dict[str, Any]] = []
     for phrase in phrases:
         scored = [(semantic_phrase_score(metric, phrase), metric) for metric in semantic_metrics]
+        if unresolved_cross_table_metric_candidates(scored):
+            return []
         top_score = max([score for score, _metric in scored] or [0])
         winners = [metric for score, metric in scored if score == top_score and score > 0]
         winner_identities = {(metric["table"], metric["key"], metric["formula"]) for metric in winners}
@@ -499,6 +571,20 @@ def resolve_metrics(
         identities.add(identity)
         result.append(metric)
     return result
+
+
+def unresolved_cross_table_metric_candidates(scored: list[tuple[int, Dict[str, Any]]]) -> bool:
+    candidates = [(score, metric) for score, metric in scored if score >= 100]
+    if len({(metric["table"], metric["key"]) for _score, metric in candidates}) < 2:
+        return False
+    top_score = max(score for score, _metric in candidates)
+    top_tables = {metric["table"] for score, metric in candidates if score == top_score}
+    return len(top_tables) > 1
+
+
+def question_requests_detail_scope(question: str) -> bool:
+    text = normalize_question(question)
+    return any(normalize_question(term) in text for term in DETAIL_SCOPE_TERMS)
 
 
 def semantic_phrase_score(metric: Dict[str, Any], phrase: str) -> int:
@@ -558,11 +644,29 @@ def format_value(value: float, metric: Dict[str, Any]) -> str:
         return f"{value * 100:.2f}%"
     if metric["unit"] == "元":
         return f"¥{value:,.2f}"
+    if not metric["unit"] and float(value).is_integer() is False:
+        return f"{value:,.2f}".rstrip("0").rstrip(".")
     return f"{value:,.0f}{metric['unit']}"
+
+
+def summary_predicate(metric: Dict[str, Any]) -> str:
+    label = str(metric.get("label") or "")
+    key = str(metric.get("key") or "").lower()
+    formula = str(metric.get("formula") or "").strip().upper()
+    unit = str(metric.get("unit") or "")
+    if unit == "%" or "rate" in key or "率" in label or "比例" in label:
+        return "为"
+    if formula.startswith("AVG(") or key.startswith("avg_") or "平均" in label or "score" in key or "duration" in key:
+        return "平均为"
+    return "合计为"
 
 
 def metric_advice(label: str) -> list[str]:
     return [f"复盘{label}峰值日期对应的主要维度。", f"将{label}与语义层中相关指标联动观察，确认变化来源。"]
+
+
+def zero_metric_advice(label: str) -> list[str]:
+    return [f"当前{label}为 0，先确认是否符合预期。", f"后续可继续观察该指标是否出现新增波动。"]
 
 
 def metric_suggestions(label: str, days: int) -> list[str]:

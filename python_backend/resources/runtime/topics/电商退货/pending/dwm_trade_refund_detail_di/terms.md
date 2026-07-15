@@ -43,7 +43,7 @@
 - 支付状态code：支付状态code，同义词=支付状态code、pay_status_code，关联字段=pay_status_code
 - 支付状态name：支付状态name，同义词=支付状态name、pay_status_name，关联字段=pay_status_name
 - 支付单流水号：支付单流水号，同义词=支付单流水号、out_pay_id，关联字段=out_pay_id
-- 支付金额：支付金额，同义词=支付金额、pay_amt，关联字段=pay_amt
+- 退款金额：退款明细中的退款金额，同义词=退款金额、退货金额、退款额、售后金额、refund_amt、refund_amount、pay_amt，关联字段=pay_amt
 - 支付拓展属性：支付拓展属性，同义词=支付拓展属性、pay_extra，关联字段=pay_extra
 - 支付创建时间：支付创建时间，同义词=支付创建时间、pay_create_time，关联字段=pay_create_time
 - 支付更新时间：支付更新时间，同义词=支付更新时间、pay_modify_time，关联字段=pay_modify_time

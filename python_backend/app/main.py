@@ -1023,14 +1023,10 @@ def stage_topic_table_draft(
     pending = topic_assets.root / topic / "pending" / table_name
     pending.mkdir(parents=True, exist_ok=True)
     write_json(pending / "asset.json", draft)
-    for field, file_name in {
-        "schemaColumns": "schema.json",
-        "semanticColumns": "semantic_columns.json",
-        "metrics": "metrics.json",
-        "terms": "terms.json",
-        "knowledgeRules": "knowledge_rules.json",
-    }.items():
-        write_json(pending / file_name, draft.get(field) or [])
+    for file_name in topic_assets.SEMANTIC_SIDECAR_FILES:
+        sidecar = pending / file_name
+        if sidecar.exists() and sidecar.is_file():
+            sidecar.unlink()
     write_json(
         pending / "editor_metadata.json",
         {"editor": str(payload.get("editor") or "merchant_ops"), "updatedAt": datetime_now_iso(), "fields": sorted(set(payload) & allowed)},

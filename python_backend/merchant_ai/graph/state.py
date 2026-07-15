@@ -117,6 +117,9 @@ class AgentState(TypedDict, total=False):
     knowledge_request_lineage: Dict[str, Any]
     intent_signals: IntentSignals
     fast_understanding: FastUnderstandingResult
+    query_metric_attempted: bool
+    query_metric_completed: bool
+    query_metric_trace: Dict[str, Any]
     fast_metric_attempted: bool
     fast_metric_completed: bool
     fast_metric_response: Any

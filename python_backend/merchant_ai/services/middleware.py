@@ -901,9 +901,10 @@ class MemoryMiddleware(HarnessMiddleware):
             )
             return state
         trace = dict(state.get("memory_injection_trace") or {})
-        if state.get("_memory_snapshot_locked") and trace:
+        if (state.get("_memory_snapshot_locked") or state.get("memory_recalled")) and trace:
             self._render_existing_snapshot(state)
             state["_memory_middleware_snapshot_ready"] = True
+            state["_memory_snapshot_locked"] = True
             append_middleware_event(
                 state,
                 self.name,

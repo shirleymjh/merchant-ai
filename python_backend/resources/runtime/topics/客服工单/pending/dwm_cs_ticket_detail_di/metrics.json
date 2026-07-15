@@ -1,7 +1,7 @@
 [
   {
     "metricKey": "reminder_cnt",
-    "businessName": "催单次数",
+    "businessName": "客服工单明细催单次数",
     "formula": "SUM(reminder_cnt)",
     "unit": "单",
     "description": "催单次数",
@@ -9,15 +9,28 @@
       "reminder_cnt"
     ],
     "aliases": [
-      "催单次数",
-      "reminder_cnt"
+      "客服工单明细催单次数",
+      "reminder_cnt",
+      "客服工单催单次数"
     ],
     "confidence": 0.78,
-    "evidence": "schema comment=催单次数"
+    "evidence": "schema comment=催单次数",
+    "displayName": "客服工单明细催单次数",
+    "disambiguationName": "客服工单明细催单次数",
+    "tableKind": "detail_fact",
+    "metricGrain": "ticket_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "催单次数",
+    "originalBusinessName": "催单次数",
+    "naturalAlias": "催单次数",
+    "sourceColumnAliases": [
+      "reminder_cnt"
+    ]
   },
   {
     "metricKey": "ticket_score",
-    "businessName": "工单评价分数",
+    "businessName": "客服工单明细评价分数",
     "formula": "AVG(ticket_score)",
     "unit": "",
     "description": "工单评价分数",
@@ -25,15 +38,28 @@
       "ticket_score"
     ],
     "aliases": [
-      "工单评价分数",
-      "ticket_score"
+      "客服工单明细评价分数",
+      "ticket_score",
+      "客服工单评价分数"
     ],
     "confidence": 0.78,
-    "evidence": "schema comment=工单评价分数; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+    "evidence": "schema comment=工单评价分数; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+    "displayName": "客服工单明细评价分数",
+    "disambiguationName": "客服工单明细评价分数",
+    "tableKind": "detail_fact",
+    "metricGrain": "ticket_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "工单评价分数",
+    "originalBusinessName": "工单评价分数",
+    "naturalAlias": "工单评价分数",
+    "sourceColumnAliases": [
+      "ticket_score"
+    ]
   },
   {
     "metricKey": "ticket_cnt",
-    "businessName": "工单量",
+    "businessName": "客服工单明细量",
     "formula": "COUNT(DISTINCT ticket_id)",
     "unit": "单",
     "description": "按工单号去重统计工单数量",
@@ -41,19 +67,29 @@
       "ticket_id"
     ],
     "aliases": [
-      "工单量",
-      "客服工单量",
-      "工单多",
-      "工单量高",
+      "客服工单明细量",
+      "ticket_cnt",
       "客服工单量高",
-      "ticket_count"
+      "客服工单明细数",
+      "按商品客服工单量"
     ],
     "confidence": 0.82,
-    "evidence": "由 Topic Builder 基于字段组合自动生成"
+    "evidence": "由 Topic Builder 基于字段组合自动生成",
+    "displayName": "客服工单明细量",
+    "disambiguationName": "客服工单明细量",
+    "tableKind": "detail_fact",
+    "metricGrain": "ticket_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "工单量",
+    "originalBusinessName": "工单量",
+    "sourceColumnAliases": [
+      "ticket_id"
+    ]
   },
   {
     "metricKey": "ticket_rate",
-    "businessName": "商品工单率",
+    "businessName": "商品维度工单率",
     "formula": "工单量 / 订单量",
     "unit": "%",
     "description": "工单量与订单量的比值",
@@ -62,12 +98,24 @@
       "order_detail_cnt"
     ],
     "aliases": [
-      "工单率",
-      "客服工单率",
-      "商品工单率",
-      "ticket_rate"
+      "商品维度工单率",
+      "ticket_rate",
+      "客服工单率"
     ],
     "confidence": 0.8,
-    "evidence": "由 Topic Builder 基于语义指标公式自动生成"
+    "evidence": "由 Topic Builder 基于语义指标公式自动生成",
+    "displayName": "商品维度工单率",
+    "disambiguationName": "商品维度工单率",
+    "tableKind": "detail_fact",
+    "metricGrain": "ticket_detail",
+    "metricIntent": "detail_drilldown",
+    "ambiguousAliases": [],
+    "naturalName": "商品工单率",
+    "originalBusinessName": "商品工单率",
+    "naturalAlias": "商品工单率",
+    "sourceColumnAliases": [
+      "order_detail_cnt",
+      "ticket_cnt"
+    ]
   }
 ]

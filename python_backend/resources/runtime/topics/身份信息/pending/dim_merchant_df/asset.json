@@ -2138,11 +2138,22 @@
         "init_deposit_amt"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=商户入驻初始保证金元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=商户入驻初始保证金元; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "商户入驻初始保证金元",
+      "disambiguationName": "商户入驻初始保证金元",
+      "tableKind": "dimension",
+      "metricGrain": "merchant_dimension",
+      "metricIntent": "dimension_summary",
+      "ambiguousAliases": [],
+      "naturalName": "商户入驻初始保证金元",
+      "originalBusinessName": "商户入驻初始保证金元",
+      "sourceColumnAliases": [
+        "init_deposit_amt"
+      ]
     },
     {
       "metricKey": "deposit_amt",
-      "businessName": "保证金",
+      "businessName": "保证金余额",
       "formula": "SUM(deposit_amt)",
       "unit": "元",
       "description": "保证金",
@@ -2150,10 +2161,22 @@
         "deposit_amt"
       ],
       "aliases": [
+        "保证金余额",
         "deposit_amt"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=保证金; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=保证金; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "displayName": "保证金余额",
+      "disambiguationName": "保证金余额",
+      "tableKind": "dimension",
+      "metricGrain": "merchant_dimension",
+      "metricIntent": "dimension_summary",
+      "ambiguousAliases": [],
+      "naturalName": "保证金余额",
+      "originalBusinessName": "保证金余额",
+      "sourceColumnAliases": [
+        "deposit_amt"
+      ]
     },
     {
       "metricKey": "merchant_cnt",
@@ -2165,25 +2188,22 @@
         "merchant_id"
       ],
       "aliases": [
-        "商家数"
+        "商家数",
+        "merchant_cnt"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
-    },
-    {
-      "metricKey": "merchant_deposit_amt",
-      "businessName": "保证金余额",
-      "formula": "SUM(deposit_amt)",
-      "unit": "元",
-      "description": "商家当前保证金余额；单商家查询时代表该商家的保证金",
-      "sourceColumns": [
-        "deposit_amt"
-      ],
-      "aliases": [
-        "保证金余额"
-      ],
-      "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "商家数",
+      "disambiguationName": "商家数",
+      "tableKind": "dimension",
+      "metricGrain": "merchant_dimension",
+      "metricIntent": "dimension_summary",
+      "ambiguousAliases": [],
+      "naturalName": "商家数",
+      "originalBusinessName": "商家数",
+      "sourceColumnAliases": [
+        "merchant_id"
+      ]
     },
     {
       "metricKey": "merchant_deposit_freeze_amt",
@@ -2195,10 +2215,22 @@
         "deposit_freeze"
       ],
       "aliases": [
-        "冻结保证金"
+        "冻结保证金",
+        "merchant_deposit_freeze_amt"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "冻结保证金",
+      "disambiguationName": "冻结保证金",
+      "tableKind": "dimension",
+      "metricGrain": "merchant_dimension",
+      "metricIntent": "dimension_summary",
+      "ambiguousAliases": [],
+      "naturalName": "冻结保证金",
+      "originalBusinessName": "冻结保证金",
+      "sourceColumnAliases": [
+        "deposit_freeze"
+      ]
     }
   ],
   "terms": [

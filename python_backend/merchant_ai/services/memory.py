@@ -118,6 +118,13 @@ class MemoryWriteGate:
         if memory_type == "query_event" and confidence < 0.45:
             action = "reject"
             reasons.append("low_confidence_query_event")
+        evidence_checked = bool(event.get("answerEvidenceChecked"))
+        if evidence_checked and memory_type in {"query_event", "business_focus"} and (
+            bool(event.get("answerWithGap")) or event.get("answerVerified") is False
+        ):
+            action = "review" if action != "reject" else action
+            review_status = "evidence_gap"
+            reasons.append("answer_not_fully_verified")
         if memory_type in {"business_fact", "correction"} and confidence < 0.7:
             action = "review"
             review_status = "review_required"
@@ -3787,6 +3794,30 @@ def normalize_knowledge_suggestions(items: Any) -> List[Dict[str, Any]]:
 def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
     plan = state.get("plan")
     topics, metrics, time_windows = plan_memory_terms(plan)
+    run_result = state.get("agent_run_result")
+    has_task_results = bool(getattr(run_result, "task_results", None))
+    evidence_gaps = list(getattr(run_result, "evidence_gaps", []) or []) if run_result is not None else []
+    verified_evidence = getattr(run_result, "verified_evidence", None) if run_result is not None else None
+    verification_failed = str(state.get("verification_status") or "") == "failed"
+    evidence_graph_verified = bool(state.get("evidence_graph_verified"))
+    evidence_checked = bool(
+        has_task_results
+        or evidence_graph_verified
+        or evidence_gaps
+        or state.get("planner_provider_error")
+    )
+    accepted = state.get("evidence_accepted")
+    if accepted is None:
+        accepted = evidence_graph_verified
+    elif accepted is False and evidence_graph_verified and not verification_failed:
+        accepted = True
+    answer_verified = bool(
+        evidence_checked
+        and bool(getattr(verified_evidence, "passed", False))
+        and accepted
+        and not evidence_gaps
+        and not state.get("planner_provider_error")
+    )
     route_slots = state.get("route_slots")
     route_payload = route_slots.model_dump(by_alias=True) if hasattr(route_slots, "model_dump") else (route_slots or {})
     if not time_windows:
@@ -3842,7 +3873,15 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
         evidence_refs=state_semantic_refs(state)[:16],
         created_at=datetime.now().isoformat(),
     )
-    return event.model_dump(by_alias=True)
+    payload = event.model_dump(by_alias=True)
+    if evidence_checked:
+        payload["answerEvidenceChecked"] = True
+        payload["answerVerified"] = answer_verified
+        payload["answerWithGap"] = bool(evidence_gaps or state.get("planner_provider_error"))
+        payload["evidenceGapCodes"] = [gap_code(item) for item in evidence_gaps[:12]]
+    if evidence_checked and not answer_verified and memory_type in {"query_event", "business_focus"}:
+        payload["confidence"] = round(min(float(payload.get("confidence") or 0.0), 0.38), 4)
+    return payload
 
 
 def memory_event_from_feedback(pending: PendingAnswer, adopted: Any = None, liked: Any = None, disliked: Any = None) -> Dict[str, Any]:
@@ -3895,13 +3934,28 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
     validation = state.get("query_graph_validation_result")
     validation_gaps = getattr(validation, "gaps", []) if validation is not None else []
     evidence_gaps = getattr(run_result, "evidence_gaps", []) if run_result is not None else []
-    completed = bool(state.get("chat_bi_completed")) or bool(getattr(run_result, "task_results", None))
-    has_failure = bool(validation_gaps or evidence_gaps or state.get("planner_provider_error"))
+    has_task_results = bool(getattr(run_result, "task_results", None))
+    completed = bool(state.get("chat_bi_completed")) or has_task_results
+    verification_failed = str(state.get("verification_status") or "") == "failed"
+    evidence_graph_verified = bool(state.get("evidence_graph_verified"))
+    accepted = state.get("evidence_accepted")
+    if accepted is None:
+        accepted = evidence_graph_verified
+    elif accepted is False and evidence_graph_verified and not verification_failed:
+        accepted = True
+    verified = bool(
+        accepted
+        and run_result is not None
+        and bool(getattr(getattr(run_result, "verified_evidence", None), "passed", False))
+    )
+    has_unverified_execution = bool(has_task_results and not verified)
+    has_failure = bool(validation_gaps or evidence_gaps or state.get("planner_provider_error") or has_unverified_execution)
+    case_success = bool(completed and not has_failure)
     if not completed and not has_failure:
         return {}
     topics, metrics, time_windows = plan_memory_terms(plan)
     case_payload = {
-        "caseStatus": "failure" if has_failure and not bool(state.get("chat_bi_completed")) else "success",
+        "caseStatus": "success" if case_success else "failure",
         "route": str(getattr(state.get("routing_decision"), "route", "") or ""),
         "intentCount": len(getattr(plan, "intents", []) or []),
         "dependencyCount": len(getattr(plan, "dependencies", []) or []),
@@ -3909,8 +3963,10 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
         "recallRefs": state_recall_refs(state)[:24],
         "validationGaps": [gap_code(item) for item in validation_gaps[:12]],
         "evidenceGaps": [gap_code(item) for item in evidence_gaps[:12]],
+        "answerVerified": verified,
+        "unverifiedExecution": has_unverified_execution,
         "repairActions": state_repair_actions(state)[:12],
-        "answerWithGap": bool(evidence_gaps or validation_gaps or state.get("planner_provider_error")),
+        "answerWithGap": bool(evidence_gaps or validation_gaps or state.get("planner_provider_error") or has_unverified_execution),
         "sqlSummaries": state_sql_summaries(state)[:12],
     }
     summary = "QueryGraph案例: topics=%s metrics=%s status=%s gaps=%d" % (
@@ -3922,7 +3978,7 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="case_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type="past_case",
-        memory_tier=default_memory_tier("past_case", "approved", 0.72 if case_payload["caseStatus"] == "success" else 0.62),
+        memory_tier=default_memory_tier("past_case", "approved" if case_success else "review_required", 0.72 if case_success else 0.62),
         memory_class=default_memory_class("past_case"),
         question=str(state.get("question") or "")[:1000],
         answer_preview=str(state.get("answer") or "")[:500],
@@ -3933,7 +3989,7 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
         confidence=0.72 if case_payload["caseStatus"] == "success" else 0.62,
         source="query_graph_run",
         scope=memory_scope_from_terms(str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""), topics, metrics),
-        status="approved",
+        status="approved" if case_success else "review_required",
         retention_days=default_retention_days("past_case"),
         visibility=default_memory_visibility("past_case"),
         allowed_roles=default_memory_allowed_roles("past_case"),
@@ -3979,7 +4035,7 @@ def procedure_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="proc_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type="procedure",
-        memory_tier=default_memory_tier("procedure", "approved" if payload["reviewed"] else "reviewed", 0.68 if payload["reviewed"] else 0.6),
+        memory_tier=default_memory_tier("procedure", "approved" if payload["reviewed"] else "review_required", 0.68 if payload["reviewed"] else 0.6),
         memory_class=default_memory_class("procedure"),
         question=str(state.get("question") or "")[:1000],
         answer_preview=summary[:500],
@@ -3990,7 +4046,7 @@ def procedure_event_from_state(state: AgentState) -> Dict[str, Any]:
         confidence=0.68 if payload["reviewed"] else 0.6,
         source="planner_repair",
         scope=memory_scope_from_terms(str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""), topics, metrics),
-        status="approved" if payload["reviewed"] else "reviewed",
+        status="approved" if payload["reviewed"] else "review_required",
         retention_days=default_retention_days("procedure"),
         visibility=default_memory_visibility("procedure"),
         allowed_roles=default_memory_allowed_roles("procedure"),
@@ -4795,6 +4851,11 @@ class MemoryQueryUnderstandingService:
         if not bool(getattr(self.settings, "memory_query_understanding_enabled", True)):
             fallback["status"] = "disabled"
             return fallback
+        if not self.should_call_llm(state, fallback):
+            fallback["status"] = "rule_sufficient"
+            fallback["skipReason"] = "structured_recall_signals_present"
+            fallback["cacheHit"] = False
+            return fallback
         if not self.llm or not getattr(self.llm, "configured", False) or not hasattr(self.llm, "json_chat"):
             fallback["status"] = "unavailable"
             return fallback
@@ -4831,7 +4892,7 @@ class MemoryQueryUnderstandingService:
                 system_prompt,
                 json.dumps(payload, ensure_ascii=False, default=str),
                 fallback={},
-                timeout_seconds=int(getattr(self.settings, "memory_query_understanding_timeout_seconds", 2) or 2),
+                timeout_seconds=self.timeout_seconds(),
             )
         except Exception as exc:
             fallback["status"] = "failed"
@@ -4852,6 +4913,36 @@ class MemoryQueryUnderstandingService:
         merged.update({"source": "small_model", "status": "success", "question": question, "cacheHit": False})
         self.cache.set(cache_key, merged)
         return merged
+
+    def timeout_seconds(self) -> int:
+        configured = int(getattr(self.settings, "memory_query_understanding_timeout_seconds", 4) or 4)
+        max_timeout = int(getattr(self.settings, "memory_query_understanding_max_timeout_seconds", 5) or 5)
+        return max(3, min(configured, max_timeout))
+
+    def should_call_llm(self, state: AgentState, fallback: Dict[str, Any]) -> bool:
+        question = str(state.get("question") or "")
+        route_slots = model_dump_or_dict(state.get("route_slots"))
+        topic_decision = state.get("topic_routing_decision")
+        topics = topic_decision.recall_topics() if hasattr(topic_decision, "recall_topics") else []
+        object_refs = route_slots.get("objectRefs") if isinstance(route_slots.get("objectRefs"), dict) else {}
+        time_window = route_slots.get("timeWindow") if isinstance(route_slots.get("timeWindow"), dict) else {}
+        time_windows = unique_ints([time_window.get("days"), *extract_time_windows(question)])
+        metric_terms = unique_strings([*(fallback.get("metrics") or []), *extract_metric_like_terms(question)])
+        analysis_intents = set(unique_strings(fallback.get("analysisIntents") or []))
+        expanded_terms = set(unique_strings(fallback.get("expandedTerms") or []))
+        has_structured_scope = bool(topics or object_refs or time_windows)
+        has_metric_or_object = bool(metric_terms or object_refs)
+        if has_structured_scope and has_metric_or_object:
+            return False
+        if topics and metric_terms:
+            return False
+        if analysis_intents & {"ranking", "risk_ranking", "diagnosis", "anomaly_check"}:
+            return True
+        if {"商品", "单品", "SKU"} & expanded_terms and {"退款", "退货", "售后"} & expanded_terms:
+            return True
+        if not has_structured_scope and not has_metric_or_object and len(expanded_terms) >= 2:
+            return True
+        return False
 
     def cache_key(self, state: AgentState) -> str:
         return stable_cache_key(
@@ -5721,6 +5812,11 @@ def aggregate_recent_focus(events: Iterable[Dict[str, Any]], preferences: Iterab
     metric_counter: Counter[str] = Counter()
     days_counter: Counter[int] = Counter()
     for event in list(events)[-120:]:
+        status = memory_status(event)
+        if status in INACTIVE_MEMORY_STATUSES | PENDING_MEMORY_STATUSES:
+            continue
+        if event.get("answerEvidenceChecked") and event.get("answerVerified") is False:
+            continue
         weight = weighted_memory_value(event)
         for topic in unique_strings(event.get("topics") or []):
             topic_counter[topic] += weight
@@ -5729,6 +5825,9 @@ def aggregate_recent_focus(events: Iterable[Dict[str, Any]], preferences: Iterab
         for days in unique_ints(event.get("timeWindows") or []):
             days_counter[days] += weight
     for pref in preferences:
+        status = memory_status(pref)
+        if status in INACTIVE_MEMORY_STATUSES | PENDING_MEMORY_STATUSES:
+            continue
         weight = weighted_memory_value(pref) * 0.7
         for topic in unique_strings(pref.get("topics") or []):
             topic_counter[topic] += weight

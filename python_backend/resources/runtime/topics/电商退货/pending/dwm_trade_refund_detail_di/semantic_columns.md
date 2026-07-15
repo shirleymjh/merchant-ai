@@ -53,7 +53,7 @@
 - `pay_status_code`：支付状态code，角色=DIMENSION，说明=支付状态code，同义词=支付状态code、pay_status_code
 - `pay_status_name`：支付状态name，角色=DIMENSION，说明=支付状态name，同义词=支付状态name、pay_status_name
 - `out_pay_id`：支付单流水号，角色=KEY，说明=支付单流水号，同义词=支付单流水号、out_pay_id
-- `pay_amt`：支付金额，角色=METRIC，说明=支付金额，公式=SUM(pay_amt)，同义词=支付金额、pay_amt
+- `pay_amt`：退款金额，角色=METRIC，说明=退款明细中的退款金额，公式=SUM(pay_amt)，同义词=退款金额、退货金额、退款额、售后金额、refund_amt、refund_amount、pay_amt
 - `pay_extra`：支付拓展属性，角色=OTHER，说明=支付拓展属性，同义词=支付拓展属性、pay_extra
 - `pay_create_time`：支付创建时间，角色=TIME，说明=支付创建时间，同义词=支付创建时间、pay_create_time
 - `pay_modify_time`：支付更新时间，角色=TIME，说明=支付更新时间，同义词=支付更新时间、pay_modify_time

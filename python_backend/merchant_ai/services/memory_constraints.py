@@ -146,8 +146,6 @@ def memory_constraint_type(memory_type: str, fallback_type: str) -> str:
 def memory_constraint_enforcement(constraint_type: str, confidence: float, metrics: Sequence[str]) -> str:
     if constraint_type == "metric_dispute":
         return "clarify_or_disclose"
-    if constraint_type == "business_fact" and confidence >= 0.9 and metrics:
-        return "required"
     if constraint_type in REQUIRED_MEMORY_CONSTRAINT_TYPES and confidence >= 0.7 and metrics:
         return "required"
     return "advisory"
@@ -176,10 +174,17 @@ def memory_constraint_validation_gaps(
             continue
         if not memory_constraint_applies(question, plan, constraint, plan_metrics):
             continue
+        planned_targets = [
+            metric
+            for metric in target_metrics(constraint)
+            if metric in plan_metrics or normalize_token(metric) in plan_metrics
+        ]
         unsupported = [
             metric
             for metric in target_metrics(constraint)
             if supported_metric_set and normalize_token(metric) not in supported_metric_set
+            and metric not in planned_targets
+            and normalize_token(metric) not in planned_targets
         ]
         if unsupported:
             gaps.append(
@@ -191,7 +196,7 @@ def memory_constraint_validation_gaps(
                 )
             )
             continue
-        missing = [metric for metric in target_metrics(constraint) if metric not in plan_metrics]
+        missing = [metric for metric in target_metrics(constraint) if metric not in plan_metrics and normalize_token(metric) not in plan_metrics]
         if not missing:
             continue
         gaps.append(

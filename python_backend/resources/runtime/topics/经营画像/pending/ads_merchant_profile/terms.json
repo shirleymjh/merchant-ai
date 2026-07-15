@@ -889,22 +889,22 @@
   },
   {
     "term": "退货量占支付订单量比例",
-    "description": "退货量占支付订单量比例-最近1天",
+    "description": "退货率口径：退货量占支付订单量的比例；单日看每日退货率，周期汇总看周期汇总退货率。",
     "aliases": [
       "退货量占支付订单量比例",
-      "退款率",
       "退货率",
-      "售后率",
-      "整体退款率",
-      "店铺退款率",
-      "refund_rate",
-      "refund_rate_1d",
-      "退货量占支付订单量比例-最近1天"
+      "退货订单率",
+      "售后退货率",
+      "整体退货率",
+      "店铺退货率"
     ],
     "relatedColumns": [
-      "refund_rate_1d"
+      "refund_rate_1d",
+      "return_cnt_1d",
+      "pay_order_cnt_1d"
     ],
-    "evidence": "来自字段 `refund_rate_1d` 的语义注释"
+    "evidence": "语义层口径：单日字段 refund_rate_1d；周期汇总 SUM(return_cnt_1d) / SUM(pay_order_cnt_1d)",
+    "canonicalMetricKey": "return_rate_by_pay_order"
   },
   {
     "term": "工单二次开启量",
@@ -984,5 +984,24 @@
     ],
     "relatedColumns": [],
     "evidence": "由表名/字段语义自动沉淀"
+  },
+  {
+    "term": "退款率",
+    "description": "退款率口径：直接退款量占支付订单量的比例，和退货率不是同一指标。",
+    "aliases": [
+      "退款率",
+      "直接退款率",
+      "周期退款率",
+      "汇总退款率",
+      "店铺退款率",
+      "整体退款率",
+      "退款订单率"
+    ],
+    "relatedColumns": [
+      "direct_refund_cnt_1d",
+      "pay_order_cnt_1d"
+    ],
+    "evidence": "语义层口径：SUM(direct_refund_cnt_1d) / SUM(pay_order_cnt_1d)",
+    "canonicalMetricKey": "direct_refund_rate_by_pay_order"
   }
 ]

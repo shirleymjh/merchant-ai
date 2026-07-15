@@ -271,7 +271,7 @@
 }, {
   "columnName" : "pay_amt",
   "dataType" : "decimal",
-  "comment" : "支付金额",
+  "comment" : "退款金额",
   "nullable" : true,
   "keyType" : ""
 }, {

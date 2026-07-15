@@ -100,6 +100,12 @@ from merchant_ai.services.query_security import (
     table_asset_metadata,
     table_field_semantics,
 )
+from merchant_ai.services.time_semantics import (
+    CALENDAR_ANCHOR_POLICY,
+    LATEST_PARTITION_ANCHOR_POLICY,
+    latest_partition_window_predicate,
+    time_window_contract_payload,
+)
 from merchant_ai.services.tool_runtime import (
     ToolFailureRegistry,
     ToolRuntimePolicyRegistry,
@@ -2370,8 +2376,10 @@ class NodeWorkerExecutor:
                     "selectMustInclude 是强制 SELECT 输出列，必须逐个原样出现在 SELECT 中；"
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
                     "GROUP_AGG/TOPN 必须按 outputKeys 和 groupByColumn 分组并输出，不能丢失 coupon_id/spu_id/spu_name/sub_order_id/order_id/ticket_id/bill_id 等实体键；"
-                    "如果表有 pt 且不是快照维表豁免，必须使用 nodePlanContract.days 生成时间窗过滤。"
-                    "pt 是 Doris DATE 分区列，最近N天包含今天/最新分区在内，时间窗下界必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N-1 DAY)，例如最近7天写 INTERVAL 6 DAY，最近30天写 INTERVAL 29 DAY；不要使用 DATE_FORMAT('%Y%m%d')。"
+                    "如果表有 pt 且不是快照维表豁免，必须使用 nodePlanContract.timeWindowContract/nodePlanContract.days 生成时间窗过滤。"
+                    "TimeWindowContract 必须落地：相对时间窗锚定 preferredTable 在当前商家过滤后的 MAX(pt)，不要用 CURDATE()/CURRENT_DATE；"
+                    "写法为 `pt` BETWEEN DATE_SUB((SELECT MAX(`pt`) FROM preferredTable WHERE merchantFilterColumn=<same merchant>), INTERVAL N-1 DAY) AND (SELECT MAX(`pt`) FROM preferredTable WHERE merchantFilterColumn=<same merchant>)。"
+                    "显式日期且 anchorPolicy=calendar 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
                     "没有倒排索引时不要假设索引存在；只选择 requiredColumns 中需要字段和过滤字段；明细 LIMIT <= 20。"
                     "不能修改 contract 里的指标、粒度、依赖或证据要求。"
                 ),
@@ -2504,14 +2512,16 @@ class NodeWorkerExecutor:
             return sql, ""
         if intent.time_range.start_date and intent.time_range.end_date and intent.time_range.anchor_policy == "calendar":
             return sql, ""
-        if not freshness.checked or not freshness.max_pt or "CURDATE()" not in str(sql or "").upper():
+        if not freshness.checked or not freshness.max_pt:
             return sql, ""
         anchor = parse_partition_date(freshness.max_pt)
         if not anchor:
             return sql, ""
         anchor_text = anchor.isoformat()
+        if not re.search(r"\b(CURDATE\(\)|CURRENT_DATE(?:\(\))?)", str(sql or ""), flags=re.I):
+            return sql, ""
         normalized_sql = normalize_inclusive_relative_window_sql(str(sql or ""), intent.days)
-        anchored_sql = re.sub(r"\bCURDATE\(\)", "'%s'" % anchor_text, normalized_sql, flags=re.I)
+        anchored_sql = re.sub(r"\b(CURDATE\(\)|CURRENT_DATE(?:\(\))?)", "'%s'" % anchor_text, normalized_sql, flags=re.I)
         if anchored_sql == sql:
             return sql, ""
         freshness.reason = append_note(freshness.reason, "relative time anchored to max_pt=%s" % anchor_text)
@@ -2651,7 +2661,17 @@ class NodeWorkerExecutor:
         max_chunks = max(1, int(getattr(self.settings, "agent_doris_split_max_chunks", 6) or 6))
         max_concurrency = max(1, int(getattr(self.settings, "agent_doris_split_max_concurrency", 3) or 3))
         limit = structured_limit(intent.limit, detail=True, resource_safe=True)
-        split_sqls = split_detail_sql_by_pt_windows(safe_sql, int(intent.days or 0), chunk_days, max_chunks, limit)
+        anchor = parse_partition_date(freshness.max_pt) if freshness.max_pt else None
+        if not anchor:
+            return None
+        split_sqls = split_detail_sql_by_pt_windows(
+            safe_sql,
+            int(intent.days or 0),
+            chunk_days,
+            max_chunks,
+            limit,
+            anchor_date=anchor.isoformat() if anchor else "",
+        )
         if not split_sqls:
             return None
         anchor_date = ""
@@ -2979,15 +2999,30 @@ class NodeWorkerExecutor:
             if entity.values and entity.join_key in columns and entity.join_key not in applied_entity_columns:
                 where.append("`%s` IN (%s)" % (entity.join_key, ", ".join(sql_literal(value) for value in entity.values[:entity_value_limit])))
                 applied_entity_columns.add(entity.join_key)
-        if "pt" in columns and intent.time_range.start_date and intent.time_range.end_date:
+        days = int(intent.days or getattr(intent.time_range, "days", 0) or 0)
+        if (
+            "pt" in columns
+            and intent.time_range.start_date
+            and intent.time_range.end_date
+            and intent.time_range.anchor_policy == CALENDAR_ANCHOR_POLICY
+        ):
             if not any("`pt`" in predicate for predicate in where):
                 where.append(
                     "`pt` BETWEEN %s AND %s"
                     % (sql_literal(intent.time_range.start_date), sql_literal(intent.time_range.end_date))
                 )
-        elif "pt" in columns and int(intent.days or 0) > 0:
+        elif "pt" in columns and days > 0:
             if not any("`pt`" in predicate for predicate in where):
-                where.append("`pt` >= DATE_SUB(CURDATE(), INTERVAL %d DAY)" % inclusive_day_interval(intent.days))
+                tenant_column = next((column for column in ["seller_id", "merchant_id", "shop_id"] if column in columns), "")
+                where.append(
+                    latest_partition_window_predicate(
+                        table,
+                        days,
+                        partition_column="pt",
+                        tenant_column=tenant_column,
+                        tenant_value_sql=sql_literal(context.merchant_id) if tenant_column else "",
+                    )
+                )
         return where
 
     def _repair_sql(
@@ -3293,7 +3328,37 @@ class NodeWorkerExecutor:
             upstream_entity_sets=[item.model_dump(by_alias=True) for item in context.upstream_entity_sets],
             metric_resolution=dict(metric_contract.get("resolution") or intent.metric_resolution),
             metric_governance_mode=str(metric_contract.get("mode") or "legacy_unsealed"),
+            time_window_contract=self._intent_time_window_contract(intent, table, table_columns, merchant_filter_column),
         )
+
+    def _intent_time_window_contract(
+        self,
+        intent: QuestionIntent,
+        table: str,
+        table_columns: List[str],
+        merchant_filter_column: str,
+    ) -> Dict[str, Any]:
+        if "pt" not in set(table_columns) or not (intent.days or intent.time_range.start_date or intent.time_range.end_date):
+            return {}
+        if intent.time_range.start_date or intent.time_range.end_date:
+            contract = time_window_contract_payload(intent.time_range, table, "pt", merchant_filter_column)
+            if contract.get("anchorPolicy") != CALENDAR_ANCHOR_POLICY:
+                contract["anchorPolicy"] = LATEST_PARTITION_ANCHOR_POLICY
+                contract["executionRule"] = "relative windows must anchor to MAX(`pt`) after merchant filter"
+            if intent.days and not contract.get("days"):
+                contract["days"] = int(intent.days or 0)
+            return contract
+        days = int(intent.days or 0)
+        return {
+            "kind": "rolling",
+            "label": "最近%d天" % days,
+            "days": days,
+            "anchorPolicy": LATEST_PARTITION_ANCHOR_POLICY,
+            "partitionColumn": "pt",
+            "table": table,
+            "tenantColumn": merchant_filter_column,
+            "executionRule": "relative windows must anchor to MAX(`pt`) after merchant filter",
+        }
 
     def _enforce_identity_scope_sql(
         self,

@@ -752,7 +752,7 @@ class SemanticPreflightRouteClassifier:
                 system_prompt,
                 json.dumps(payload, ensure_ascii=False, default=str),
                 fallback={},
-                timeout_seconds=int(getattr(self.settings, "preflight_semantic_route_timeout_seconds", 3) or 3),
+                timeout_seconds=self._timeout_seconds(),
             )
         except Exception as exc:
             return {"enabled": True, "status": "failed", "error": str(exc)[:240]}
@@ -830,7 +830,7 @@ class SemanticPreflightRouteClassifier:
                 system_prompt,
                 json.dumps(payload, ensure_ascii=False, default=str),
                 fallback={},
-                timeout_seconds=int(getattr(self.settings, "preflight_semantic_route_timeout_seconds", 3) or 3),
+                timeout_seconds=self._timeout_seconds(),
             )
         except Exception as exc:
             return {"enabled": True, "status": "failed", "error": str(exc)[:240]}
@@ -856,6 +856,11 @@ class SemanticPreflightRouteClassifier:
             "clarificationQuestion": str(result.get("clarificationQuestion") or result.get("clarification_question") or "")[:300],
             "reason": str(result.get("reason") or "")[:300],
         }
+
+    def _timeout_seconds(self) -> int:
+        configured = int(getattr(self.settings, "preflight_semantic_route_timeout_seconds", 3) or 3)
+        max_timeout = int(getattr(self.settings, "preflight_semantic_route_max_timeout_seconds", 5) or 5)
+        return max(3, min(configured, max_timeout))
 
 
 @dataclass
@@ -891,11 +896,7 @@ class PreflightUnderstandingService:
         surface_signals = self.surface_signals(question)
         surface_signals["pendingContext"] = bool(pending_context)
         rule_route = self.hard_gate_route(question, surface_signals, pending_context)
-        semantic_trace = self.semantic_classifier.classify_surface(
-            question,
-            surface_signals,
-            pending_context=pending_context,
-        )
+        semantic_trace = self.semantic_preflight_trace(question, rule_route, surface_signals, pending_context)
         routing_decision = self.merge_gate_routes(rule_route, semantic_trace, surface_signals, pending_context)
         route_slots = RouteSlots(
             operation="write_requested" if surface_signals.get("writeOperation") else "read",
@@ -927,6 +928,50 @@ class PreflightUnderstandingService:
             surface_signals=surface_signals,
             clarification_question=str(semantic_trace.get("clarificationQuestion") or ""),
         )
+
+    def semantic_preflight_trace(
+        self,
+        question: str,
+        rule_route: RoutingDecision,
+        surface_signals: Dict[str, Any],
+        pending_context: bool = False,
+    ) -> Dict[str, Any]:
+        if rule_route.reason in {"空问题", "检测到写操作请求，当前只支持只读查询和分析", "寒暄问题"}:
+            return {
+                "enabled": bool(getattr(self.settings, "preflight_semantic_route_enabled", False)),
+                "status": "skipped_rule_terminal",
+                "reason": rule_route.reason,
+            }
+        if self.surface_business_task_sufficient(surface_signals, pending_context):
+            return {
+                "enabled": bool(getattr(self.settings, "preflight_semantic_route_enabled", False)),
+                "status": "skipped_surface_business",
+                "route": "BUSINESS_TASK",
+                "confidence": float(surface_signals.get("confidence") or 0.0),
+                "reason": "surface signals are sufficient for the Topic/RAG chain",
+            }
+        return self.semantic_classifier.classify_surface(
+            question,
+            surface_signals,
+            pending_context=pending_context,
+        )
+
+    def surface_business_task_sufficient(self, signals: Dict[str, Any], pending_context: bool = False) -> bool:
+        if pending_context:
+            return True
+        if signals.get("empty") or signals.get("greeting") or signals.get("assistantChat") or signals.get("writeOperation"):
+            return False
+        if signals.get("hasObjectRef") or signals.get("hasBusinessMetricLikePhrase"):
+            return True
+        if signals.get("hasMetricLikePhrase") and (
+            signals.get("hasBusinessDomainPhrase")
+            or signals.get("hasTimeExpression")
+            or signals.get("hasAnalysisIntent")
+        ):
+            return True
+        if signals.get("hasBusinessDomainPhrase") and signals.get("hasAnalysisIntent"):
+            return True
+        return int(signals.get("businessSurfaceSignalCount") or 0) >= 2
 
     def surface_signals(self, question: str) -> Dict[str, Any]:
         text = str(question or "").strip()

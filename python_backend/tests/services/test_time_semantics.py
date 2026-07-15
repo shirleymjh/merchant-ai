@@ -28,6 +28,7 @@ def test_resolve_rolling_window_to_absolute_bounds():
     assert resolved.start_date == "2026-07-07"
     assert resolved.end_date == "2026-07-13"
     assert resolved.days == 7
+    assert resolved.anchor_policy == "latest_available_partition"
 
 
 def test_apply_time_range_seals_every_query_intent():

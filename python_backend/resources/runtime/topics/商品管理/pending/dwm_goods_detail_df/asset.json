@@ -1963,7 +1963,7 @@
   "metrics": [
     {
       "metricKey": "spu_auth_price",
-      "businessName": "发售价分",
+      "businessName": "商品明细发售价分",
       "formula": "AVG(spu_auth_price)",
       "unit": "分",
       "description": "发售价分",
@@ -1971,15 +1971,30 @@
         "spu_auth_price"
       ],
       "aliases": [
-        "发售价分",
-        "spu_auth_price"
+        "商品明细发售价分",
+        "spu_auth_price",
+        "商品发售价分",
+        "按商品发售价分",
+        "按SPU发售价分"
       ],
       "confidence": 0.78,
-      "evidence": "schema comment=发售价分"
+      "evidence": "schema comment=发售价分",
+      "displayName": "商品明细发售价分",
+      "disambiguationName": "商品明细发售价分",
+      "tableKind": "detail_fact",
+      "metricGrain": "goods_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "发售价分",
+      "originalBusinessName": "发售价分",
+      "naturalAlias": "发售价分",
+      "sourceColumnAliases": [
+        "spu_auth_price"
+      ]
     },
     {
       "metricKey": "goods_cnt",
-      "businessName": "商品数",
+      "businessName": "商品明细去重商品数",
       "formula": "COUNT(DISTINCT spu_id)",
       "unit": "个",
       "description": "按 SPU 去重统计商品数量",
@@ -1987,14 +2002,30 @@
         "spu_id"
       ],
       "aliases": [
-        "商品数"
+        "商品明细去重商品数",
+        "goods_cnt",
+        "商品去重商品数",
+        "按商品数",
+        "按SPU数"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "商品明细去重商品数",
+      "disambiguationName": "商品明细去重商品数",
+      "tableKind": "detail_fact",
+      "metricGrain": "goods_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "商品数",
+      "originalBusinessName": "商品数",
+      "naturalAlias": "商品数",
+      "sourceColumnAliases": [
+        "spu_id"
+      ]
     },
     {
       "metricKey": "goods_audit_pass_detail_cnt",
-      "businessName": "商品审核通过量",
+      "businessName": "商品审核通过明细量",
       "formula": "SUM(CASE WHEN is_audit_pass = 1 THEN 1 ELSE 0 END)",
       "unit": "个",
       "description": "按商品审核是否通过统计通过量",
@@ -2002,17 +2033,31 @@
         "is_audit_pass"
       ],
       "aliases": [
-        "商品审核通过量",
-        "审核通过量",
+        "商品审核通过明细量",
+        "goods_audit_pass_detail_cnt",
+        "按商品审核通过量",
+        "按SPU审核通过量",
         "审核通过商品量",
         "审核通过商品"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "商品审核通过明细量",
+      "disambiguationName": "商品审核通过明细量",
+      "tableKind": "detail_fact",
+      "metricGrain": "goods_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "summaryMetricRef": "semantic:经营画像:ads_merchant_profile:metric:goods_audit_pass_cnt_1d",
+      "naturalName": "商品审核通过量",
+      "originalBusinessName": "商品审核通过量",
+      "sourceColumnAliases": [
+        "is_audit_pass"
+      ]
     },
     {
       "metricKey": "goods_audit_reject_detail_cnt",
-      "businessName": "商品审核拒绝量",
+      "businessName": "商品审核拒绝明细量",
       "formula": "SUM(CASE WHEN is_audit_pass = 0 THEN 1 ELSE 0 END)",
       "unit": "个",
       "description": "按商品审核是否通过统计拒绝量",
@@ -2020,19 +2065,33 @@
         "is_audit_pass"
       ],
       "aliases": [
-        "商品审核拒绝量",
-        "审核被拒",
-        "审核拒绝",
+        "商品审核拒绝明细量",
+        "goods_audit_reject_detail_cnt",
+        "按商品审核拒绝量",
+        "按SPU审核拒绝量",
         "被拒商品量",
         "被拒SPU量",
-        "驳回商品量"
+        "驳回商品量",
+        "审核拒绝商品量"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "商品审核拒绝明细量",
+      "disambiguationName": "商品审核拒绝明细量",
+      "tableKind": "detail_fact",
+      "metricGrain": "goods_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "summaryMetricRef": "semantic:经营画像:ads_merchant_profile:metric:goods_audit_reject_cnt_1d",
+      "naturalName": "商品审核拒绝量",
+      "originalBusinessName": "商品审核拒绝量",
+      "sourceColumnAliases": [
+        "is_audit_pass"
+      ]
     },
     {
       "metricKey": "goods_online_detail_cnt",
-      "businessName": "上架商品量",
+      "businessName": "商品上架明细量",
       "formula": "SUM(CASE WHEN spu_status_code = 1 OR spu_status_name = '上架' THEN 1 ELSE 0 END)",
       "unit": "个",
       "description": "按商品状态统计上架商品量",
@@ -2041,19 +2100,34 @@
         "spu_status_name"
       ],
       "aliases": [
-        "上架商品量",
+        "商品上架明细量",
+        "goods_online_detail_cnt",
+        "商品上架量",
+        "按商品上架商品量",
+        "按SPU上架商品量",
         "发布成功商品量",
         "发布成功商品",
-        "发布成功",
         "重新发布成功商品量",
         "重新发布成功商品",
         "重新发布成功",
         "重新上架商品量",
-        "上架成功商品量",
-        "上架成功"
+        "上架成功商品量"
       ],
       "confidence": 0.82,
-      "evidence": "由 Topic Builder 基于字段组合自动生成"
+      "evidence": "由 Topic Builder 基于字段组合自动生成",
+      "displayName": "商品上架明细量",
+      "disambiguationName": "商品上架明细量",
+      "tableKind": "detail_fact",
+      "metricGrain": "goods_detail",
+      "metricIntent": "detail_drilldown",
+      "ambiguousAliases": [],
+      "naturalName": "上架商品量",
+      "originalBusinessName": "上架商品量",
+      "naturalAlias": "上架商品量",
+      "sourceColumnAliases": [
+        "spu_status_code",
+        "spu_status_name"
+      ]
     }
   ],
   "terms": [

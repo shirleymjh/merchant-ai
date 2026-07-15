@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from merchant_ai.models import (
     AgentRunResult,
     AnswerMode,
+    AnswerClaimVerification,
     ChatContext,
     ChatDataSection,
     DailyReportResponse,
@@ -43,8 +44,9 @@ from merchant_ai.services.answer_claims import AnswerClaimVerifier, build_verifi
 
 def answer_context_policy() -> str:
     return (
-        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft；不要读取或推断 QueryGraph。"
+        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft、mandatoryAnswerSkeleton；不要读取或推断 QueryGraph。"
         "verifiedFacts 是数字、日期、实体和排序结论的唯一事实来源；任何事实陈述都必须能直接绑定其中的 factId，不能补充未出现的数值或业务实体。"
+        "mandatoryAnswerSkeleton 是必须覆盖的答案事实骨架；可以改写成自然语言，但不能遗漏其中的指标、数值、时间范围和缺口说明。"
         "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
         "不要使用“分析结论”“关键证据”“限制”“证据门禁”“当前证据显示”“已看到的点位显示”这类报告或内部调试话术。"
         "不要说“查到几行”“使用表”“SQL”“字段名”“Doris”；不要输出 markdown 表格，表格和图表由前端结构化区域渲染。"
@@ -166,42 +168,60 @@ class AnswerComposeService:
             return self._compose_rule_answer(question, knowledge_context)
         effective_rule_context = rule_context if plan_requires_rule_evidence(plan) else ""
         bundle = run_result.merged_query_bundle if run_result else QueryBundle()
+        mandatory_skeleton = self._mandatory_answer_skeleton(question, plan, run_result)
         if analysis_summary:
-            if deterministic_single_semantic_metric_answer(plan) or not question_requests_diagnosis(question):
-                grounded = deterministic_structured_answer(question, plan, run_result)
-                if grounded:
-                    return self._finalize_answer(
-                        self._append_lightweight_metric_disclosure(grounded, question, plan, run_result),
-                        question,
-                        plan,
-                        run_result,
-                    )
-            cleaned_summary = sanitize_business_answer_text(analysis_summary, question, plan, run_result)
-            answer = ensure_required_field_answer_coverage(cleaned_summary, plan, run_result)
-            return self._finalize_answer(
-                self._append_lightweight_metric_disclosure(
-                    self._append_rule_evidence(
-                        self.append_business_advice(
-                            answer,
-                            plan.intents,
-                            bundle,
-                            question=question,
-                            plan=plan,
-                            run_result=run_result,
-                            merchant=merchant,
-                            personalization_context=personalization_context,
-                            allow_llm=False,
-                        ),
-                        question,
-                        effective_rule_context,
-                    ),
+            if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
+                answer = self._compose_llm_business_answer(
                     question,
                     plan,
                     run_result,
-                ),
+                    rule_context,
+                    merchant,
+                    personalization_context,
+                    analysis_summary=analysis_summary,
+                    mandatory_skeleton=mandatory_skeleton,
+                )
+                if answer:
+                    answer = ensure_required_field_answer_coverage(answer, plan, run_result)
+                    return self._compose_final_answer(
+                        answer,
+                        mandatory_skeleton,
+                        question,
+                        plan,
+                        run_result,
+                        bundle,
+                        effective_rule_context,
+                        merchant,
+                        personalization_context,
+                    )
+            if deterministic_single_semantic_metric_answer(plan) or not question_requests_diagnosis(question):
+                grounded = deterministic_structured_answer(question, plan, run_result)
+                if grounded:
+                    return self._compose_final_answer(
+                        grounded,
+                        mandatory_skeleton,
+                        question,
+                        plan,
+                        run_result,
+                        bundle,
+                        effective_rule_context,
+                        merchant,
+                        personalization_context,
+                    )
+            cleaned_summary = sanitize_business_answer_text(analysis_summary, question, plan, run_result)
+            cleaned_summary = self._ensure_multi_trend_answer_coverage(cleaned_summary, question, plan, run_result)
+            cleaned_summary = self._ensure_multi_metric_summary_coverage(cleaned_summary, question, plan, run_result)
+            answer = ensure_required_field_answer_coverage(cleaned_summary, plan, run_result)
+            return self._compose_final_answer(
+                answer,
+                mandatory_skeleton,
                 question,
                 plan,
                 run_result,
+                bundle,
+                effective_rule_context,
+                merchant,
+                personalization_context,
             )
         if primary.intent_type == "VALID" and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT} and (not run_result or not run_result.task_results):
             return self._no_execution_answer(plan)
@@ -228,37 +248,66 @@ class AnswerComposeService:
             )
         partial_blocking_answer = blocking_evidence_partial_answer(question, plan, run_result)
         if partial_blocking_answer:
-            return self._finalize_answer(
-                self._append_rule_evidence(partial_blocking_answer, question, effective_rule_context),
+            return self._compose_final_answer(
+                partial_blocking_answer,
+                mandatory_skeleton,
                 question,
                 plan,
                 run_result,
+                bundle,
+                effective_rule_context,
+                merchant,
+                personalization_context,
+                append_advice=False,
             )
         if question_asks_metric_reconciliation(question):
             reconciliation_answer = self._metric_reconciliation_answer(question, plan, run_result)
             if reconciliation_answer:
-                return self._finalize_answer(
-                    self._append_rule_evidence(
-                        self.append_business_advice(
-                            reconciliation_answer,
-                            plan.intents,
-                            bundle,
-                            question=question,
-                            plan=plan,
-                            run_result=run_result,
-                            merchant=merchant,
-                            personalization_context=personalization_context,
-                            allow_llm=False,
-                        ),
-                        question,
-                        effective_rule_context,
-                    ),
+                return self._compose_final_answer(
+                    reconciliation_answer,
+                    mandatory_skeleton,
                     question,
                     plan,
                     run_result,
+                    bundle,
+                    effective_rule_context,
+                    merchant,
+                    personalization_context,
+                )
+        ranking_answer = deterministic_ranking_answer(question, plan, run_result)
+        llm_first_attempted = False
+        if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
+            llm_first_attempted = True
+            answer = self._compose_llm_business_answer(
+                question,
+                plan,
+                run_result,
+                rule_context,
+                merchant,
+                personalization_context,
+                mandatory_skeleton=mandatory_skeleton,
+            )
+            if answer:
+                hybrid_ranking_analysis = bool(ranking_answer and question_requests_diagnosis(question))
+                if hybrid_ranking_analysis:
+                    answer = merge_deterministic_ranking_with_llm_answer(ranking_answer, answer)
+                coverage_answer = answer_coverage_partial_answer(question, plan, run_result)
+                if coverage_answer and not answer_acknowledges_incomplete_evidence(answer):
+                    answer = coverage_answer
+                answer = ensure_required_field_answer_coverage(answer, plan, run_result)
+                return self._compose_final_answer(
+                    answer,
+                    mandatory_skeleton,
+                    question,
+                    plan,
+                    run_result,
+                    bundle,
+                    effective_rule_context,
+                    merchant,
+                    personalization_context,
                 )
         structured_answer = ""
-        ranking_answer = deterministic_ranking_answer(question, plan, run_result)
+        trusted_structured = False
         if ranking_answer and (
             deterministic_ranking_preferred_before_llm(question)
             and (not question_requests_diagnosis(question) or not (allow_llm and self.llm.configured))
@@ -268,6 +317,7 @@ class AnswerComposeService:
             # Keep the factual metric value/trend deterministic.  LLM prose is
             # never allowed to replace the one metric contract or its values.
             structured_answer = deterministic_structured_answer(question, plan, run_result)
+            trusted_structured = trusted_single_metric_verified_answer(plan, run_result)
         elif not question_requests_diagnosis(question):
             # Verified data lookups, multi-metric trends and detail queries do
             # not need generative prose in the response hot path.  Rendering
@@ -278,32 +328,19 @@ class AnswerComposeService:
             structured_answer = deterministic_structured_answer(question, plan, run_result)
         if structured_answer:
             structured_answer = ensure_required_field_answer_coverage(structured_answer, plan, run_result)
-            return self._finalize_answer(
-                self._append_lightweight_metric_disclosure(
-                    self._append_rule_evidence(
-                        self.append_business_advice(
-                            structured_answer,
-                            plan.intents,
-                            bundle,
-                            question=question,
-                            plan=plan,
-                            run_result=run_result,
-                            merchant=merchant,
-                            personalization_context=personalization_context,
-                            allow_llm=False,
-                        ),
-                        question,
-                        effective_rule_context,
-                    ),
-                    question,
-                    plan,
-                    run_result,
-                ),
+            return self._compose_final_answer(
+                structured_answer,
+                mandatory_skeleton,
                 question,
                 plan,
                 run_result,
+                bundle,
+                effective_rule_context,
+                merchant,
+                personalization_context,
+                trusted_structured=trusted_structured,
             )
-        if allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
+        if not llm_first_attempted and allow_llm and self.llm.configured and (bundle.rows or run_result.evidence_gaps):
             answer = self._compose_llm_business_answer(
                 question,
                 plan,
@@ -311,6 +348,7 @@ class AnswerComposeService:
                 rule_context,
                 merchant,
                 personalization_context,
+                mandatory_skeleton=mandatory_skeleton,
             )
             if answer:
                 hybrid_ranking_analysis = bool(ranking_answer and question_requests_diagnosis(question))
@@ -320,60 +358,32 @@ class AnswerComposeService:
                 if coverage_answer and not answer_acknowledges_incomplete_evidence(answer):
                     answer = coverage_answer
                 answer = ensure_required_field_answer_coverage(answer, plan, run_result)
-                return self._finalize_answer(
-                    self._append_lightweight_metric_disclosure(
-                        self._append_rule_evidence(
-                            self.append_business_advice(
-                                answer,
-                                plan.intents,
-                                bundle,
-                                question=question,
-                                plan=plan,
-                                run_result=run_result,
-                                merchant=merchant,
-                                personalization_context=personalization_context,
-                                allow_llm=False,
-                            ),
-                            question,
-                            effective_rule_context,
-                        ),
-                        question,
-                        plan,
-                        run_result,
-                    ),
+                return self._compose_final_answer(
+                    answer,
+                    mandatory_skeleton,
                     question,
                     plan,
                     run_result,
+                    bundle,
+                    effective_rule_context,
+                    merchant,
+                    personalization_context,
                 )
         fallback_answer = ensure_required_field_answer_coverage(
-            self._fallback_data_answer(question, plan, bundle, run_result),
+            mandatory_skeleton or self._fallback_data_answer(question, plan, bundle, run_result),
             plan,
             run_result,
         )
-        return self._finalize_answer(
-            self._append_lightweight_metric_disclosure(
-                self._append_rule_evidence(
-                    self.append_business_advice(
-                        fallback_answer,
-                        plan.intents,
-                        bundle,
-                        question=question,
-                        plan=plan,
-                        run_result=run_result,
-                        merchant=merchant,
-                        personalization_context=personalization_context,
-                        allow_llm=False,
-                    ),
-                    question,
-                    effective_rule_context,
-                ),
-                question,
-                plan,
-                run_result,
-            ),
+        return self._compose_final_answer(
+            fallback_answer,
+            mandatory_skeleton,
             question,
             plan,
             run_result,
+            bundle,
+            effective_rule_context,
+            merchant,
+            personalization_context,
         )
 
     def summarize_analysis(
@@ -463,6 +473,7 @@ class AnswerComposeService:
         merchant: MerchantInfo | None,
         personalization_context: Optional[Dict[str, Any]],
         analysis_summary: str = "",
+        mandatory_skeleton: str = "",
     ) -> str:
         self.last_compose_llm_attempted = True
         package = answer_data_package(
@@ -475,6 +486,8 @@ class AnswerComposeService:
         )
         if analysis_summary:
             package["analysisDraft"] = analysis_summary[:1800]
+        if mandatory_skeleton:
+            package["mandatoryAnswerSkeleton"] = mandatory_skeleton[:2400]
         prompt = json.dumps(package, ensure_ascii=False, default=str)
         answer_prompt = self.prompt_assembler.render(
             "answer.bi",
@@ -491,10 +504,164 @@ class AnswerComposeService:
             return ""
         self.last_compose_used_llm = True
         answer = sanitize_business_answer_text(answer, question, plan, run_result)
+        answer = self._ensure_multi_trend_answer_coverage(answer, question, plan, run_result)
         answer = self._ensure_multi_metric_summary_coverage(answer, question, plan, run_result)
         answer = self._correct_metric_total_misread(answer, question, plan, run_result)
         answer = self._clean_summary_trend_misphrasing(answer, plan, run_result)
         return sanitize_business_answer_text(answer, question, plan, run_result)
+
+    def _mandatory_answer_skeleton(self, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not run_result:
+            return ""
+        partial = (
+            blocking_evidence_partial_answer(question, plan, run_result)
+            or answer_coverage_partial_answer(question, plan, run_result)
+            or gap_aware_partial_answer(question, plan, run_result)
+        )
+        if partial:
+            return partial
+        structured = deterministic_structured_answer(question, plan, run_result)
+        if structured:
+            return structured
+        trend = multi_trend_metric_sentence(question, plan, run_result)
+        if trend:
+            return trend + chart_hint_sentence(plan, run_result)
+        summary = summary_metric_sentence(question, plan, run_result)
+        if summary:
+            return summary + chart_hint_sentence(plan, run_result)
+        if run_result and len(visible_successful_tasks(plan, run_result)) > 1:
+            lines = ["当前已拿到多组可核对数据。"]
+            table = business_summary_table(plan, run_result)
+            if table:
+                lines.append("")
+                lines.append("结果摘要：")
+                lines.append(table)
+            evidence = task_evidence_sections(plan, run_result)
+            if evidence:
+                lines.append("")
+                lines.append(evidence)
+            return "\n".join(lines)
+        return ""
+
+    def _compose_final_answer(
+        self,
+        draft: str,
+        mandatory_skeleton: str,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+        bundle: QueryBundle,
+        effective_rule_context: str,
+        merchant: MerchantInfo | None,
+        personalization_context: Optional[Dict[str, Any]],
+        append_advice: bool = True,
+        trusted_structured: bool = False,
+    ) -> str:
+        answer = sanitize_business_answer_text(draft or mandatory_skeleton, question, plan, run_result)
+        if mandatory_skeleton:
+            answer = self._ensure_mandatory_answer_skeleton(answer, mandatory_skeleton, question, plan, run_result)
+        answer = ensure_required_field_answer_coverage(answer, plan, run_result)
+        if append_advice:
+            answer = self.append_business_advice(
+                answer,
+                plan.intents,
+                bundle,
+                question=question,
+                plan=plan,
+                run_result=run_result,
+                merchant=merchant,
+                personalization_context=personalization_context,
+                allow_llm=False,
+            )
+        answer = self._append_rule_evidence(answer, question, effective_rule_context)
+        answer = self._append_lightweight_metric_disclosure(answer, question, plan, run_result)
+        skeleton_fallback = self._append_lightweight_metric_disclosure(
+            self._append_rule_evidence(mandatory_skeleton, question, effective_rule_context),
+            question,
+            plan,
+            run_result,
+        )
+        if trusted_structured and trusted_single_metric_verified_answer(plan, run_result):
+            facts = build_verified_facts(plan, run_result)
+            if run_result is not None:
+                run_result.verified_facts = facts
+            self._record_claim_verification(
+                run_result,
+                AnswerClaimVerification(
+                    passed=True,
+                    fact_count=len(facts),
+                    fallback_used=False,
+                    fallback_reason="trusted_single_metric_tool_result",
+                ),
+            )
+            return self._apply_answer_guard(answer, run_result)
+        return self._finalize_answer(answer, question, plan, run_result, fallback_answer=skeleton_fallback)
+
+    def _ensure_mandatory_answer_skeleton(
+        self,
+        answer: str,
+        skeleton: str,
+        question: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+    ) -> str:
+        if not skeleton:
+            return answer
+        if not answer:
+            return skeleton
+        answer = self._ensure_multi_trend_answer_coverage(answer, question, plan, run_result)
+        answer = self._ensure_multi_metric_summary_coverage(answer, question, plan, run_result)
+        coverage = answer_requirement_coverage(question, plan, run_result)
+        if coverage.get("shouldBlockDirectAnswer") and not answer_acknowledges_incomplete_evidence(answer):
+            return skeleton
+        if self._mandatory_skeleton_is_covered(answer, skeleton, plan, run_result):
+            return answer
+        return skeleton.rstrip() + "\n\n" + answer.strip()
+
+    def _mandatory_skeleton_is_covered(
+        self,
+        answer: str,
+        skeleton: str,
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+    ) -> bool:
+        if not answer or not skeleton:
+            return False
+        compact_answer = re.sub(r"\s+", "", answer)
+        compact_skeleton = re.sub(r"\s+", "", skeleton)
+        if compact_skeleton and compact_skeleton in compact_answer:
+            return True
+        if run_result:
+            for item in summary_metric_values(plan, run_result):
+                label = str(item.get("label") or "")
+                value = format_metric_value_for_answer(item.get("value"), item.get("metricKey") or "", label)
+                if label and value and (label not in answer or value not in answer):
+                    return False
+            intent_map = intent_by_task_id(plan)
+            trend_tasks = []
+            for task in visible_successful_tasks(plan, run_result):
+                intent = intent_map.get(task.task_id)
+                if answer_result_role(intent) != "trend_context" or not task.query_bundle.rows:
+                    continue
+                points = metric_series_rows_for_intent(plan, intent, task.query_bundle.rows) if intent else []
+                if len(points) >= 2:
+                    trend_tasks.append((intent, points))
+            for intent, points in trend_tasks:
+                resolution = intent.metric_resolution or {}
+                metric_key = str(resolution.get("metricKey") or intent.metric_name or "")
+                label = str(resolution.get("displayName") or friendly_column_label(plan, metric_key) or metric_key)
+                first_value = format_metric_value_for_answer(points[0].get("value"), metric_key, label)
+                last_value = format_metric_value_for_answer(points[-1].get("value"), metric_key, label)
+                if label not in skeleton or (first_value not in skeleton and last_value not in skeleton):
+                    continue
+                if label and label not in answer:
+                    return False
+                if first_value not in answer and last_value not in answer:
+                    return False
+            if trend_tasks:
+                return True
+        skeleton_numbers = [item for item in re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?%?", skeleton) if item not in {"0", "1"}]
+        return all(item in answer for item in skeleton_numbers[:8])
 
     def propose_answer_skill(
         self,
@@ -1089,6 +1256,39 @@ class AnswerComposeService:
             return sentence + "\n\n" + stripped
         return sentence + "\n\n" + stripped
 
+    def _ensure_multi_trend_answer_coverage(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+        if not answer or not run_result or run_result.evidence_gaps:
+            return answer
+        trend_tasks = []
+        intent_map = intent_by_task_id(plan)
+        for task in visible_successful_tasks(plan, run_result):
+            intent = intent_map.get(task.task_id)
+            if answer_result_role(intent) != "trend_context" or not task.query_bundle.rows:
+                continue
+            points = metric_series_rows_for_intent(plan, intent, task.query_bundle.rows) if intent else []
+            if len(points) >= 2:
+                trend_tasks.append((intent, points))
+        if len(trend_tasks) <= 1:
+            return answer
+        missing = []
+        for intent, points in trend_tasks:
+            resolution = intent.metric_resolution or {}
+            metric_key = str(resolution.get("metricKey") or intent.metric_name or "")
+            label = str(resolution.get("displayName") or friendly_column_label(plan, metric_key) or metric_key)
+            first_value = format_metric_value_for_answer(points[0].get("value"), metric_key, label)
+            last_value = format_metric_value_for_answer(points[-1].get("value"), metric_key, label)
+            if label not in answer or (first_value not in answer and last_value not in answer):
+                missing.append(metric_key or label)
+        if not missing:
+            return answer
+        sentence = multi_trend_metric_sentence(question, plan, run_result)
+        if not sentence:
+            return answer
+        stripped = answer.strip()
+        if sentence in stripped:
+            return answer
+        return sentence + "\n\n" + stripped
+
     def _clean_summary_trend_misphrasing(self, answer: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
         if not answer or not run_result or run_result.evidence_gaps:
             return answer
@@ -1144,7 +1344,7 @@ class AnswerComposeService:
         for disclosure in metric_disclosures(plan, run_result.verified_evidence)[:3]:
             name = str(disclosure.get("displayName") or disclosure.get("metricKey") or disclosure.get("metric") or "指标")
             description = str(disclosure.get("description") or disclosure.get("fieldWarning") or "")
-            detail = description or lightweight_metric_description(disclosure)
+            detail = description or lightweight_metric_description(disclosure, include_formula=True)
             lines.append("- %s：%s" % (name, detail or "以已发布语义层定义为准"))
         lines.extend(
             [
@@ -1194,6 +1394,7 @@ class AnswerComposeService:
         question: str,
         plan: QueryPlan,
         run_result: AgentRunResult | None,
+        fallback_answer: str = "",
     ) -> str:
         guarded = self._apply_answer_guard(answer, run_result)
         verification = self.claim_verifier.verify(question, plan, run_result, guarded)
@@ -1201,13 +1402,25 @@ class AnswerComposeService:
             self._record_claim_verification(run_result, verification)
             return guarded
 
-        fallback = deterministic_structured_answer(question, plan, run_result)
+        fallback = fallback_answer or deterministic_structured_answer(question, plan, run_result)
         if not fallback and run_result:
             fallback = self._fallback_data_answer(question, plan, run_result.merged_query_bundle, run_result)
         if fallback:
             fallback = ensure_required_field_answer_coverage(fallback, plan, run_result)
             fallback = self._append_lightweight_metric_disclosure(fallback, question, plan, run_result)
             fallback = self._apply_answer_guard(fallback, run_result)
+            if trusted_single_metric_verified_answer(plan, run_result):
+                facts = build_verified_facts(plan, run_result)
+                if run_result is not None:
+                    run_result.verified_facts = facts
+                trusted_verification = AnswerClaimVerification(
+                    passed=True,
+                    fact_count=len(facts),
+                    fallback_used=True,
+                    fallback_reason=claim_failure_reason(verification) or "trusted_single_metric_tool_result",
+                )
+                self._record_claim_verification(run_result, trusted_verification)
+                return fallback
             fallback_verification = self.claim_verifier.verify(question, plan, run_result, fallback)
             if fallback_verification.passed:
                 fallback_verification = fallback_verification.model_copy(
@@ -1395,19 +1608,18 @@ class AnswerComposeService:
         return "\n".join(lines)
 
     def _no_execution_answer(self, plan: QueryPlan) -> str:
-        trace = "，".join(plan.agent_trace[-4:]) if plan.agent_trace else "无 planner trace"
         trace_lower = "，".join(plan.agent_trace).lower() if plan.agent_trace else ""
         if "timeout" in trace_lower or "provider_error" in trace_lower or "planner_provider_error" in trace_lower:
-            return "本轮没有实际执行数据查询：Planner LLM 调用超时或失败，QueryGraph 没有生成，因此不能判断为业务为 0。Planner 轨迹：%s。" % trace
+            return "这次没有拿到可验证的数据结果，可能是规划步骤超时或模型服务暂时异常；不能把它解释成业务为 0。建议稍后重试，或把问题拆成更明确的指标和时间范围。"
         if "json_parse_error" in trace_lower or "planner_json_parse_error" in trace_lower:
-            return "本轮没有实际执行数据查询：Planner LLM 返回内容无法解析为 QueryGraph JSON，因此不能判断为业务为 0。Planner 轨迹：%s。" % trace
+            return "这次没有形成可执行的数据查询计划，因此没有可验证结果；不能把它解释成业务为 0。建议换一种更明确的问法后重试。"
         if any("planner.no_llm_configured" in item for item in plan.agent_trace):
-            return "本轮没有实际执行数据查询：当前未配置可用 LLM，QueryGraph 没有生成，因此不能判断为业务为 0。"
+            return "当前模型服务未配置完成，所以没有拿到可验证的数据结果；不能把它解释成业务为 0。"
         if any("planner.no_valid_llm_understanding" in item for item in plan.agent_trace):
-            return "本轮没有实际执行数据查询：Planner LLM 没有返回可编译的问题理解，因此 QueryGraph 没有生成；这不是业务为 0。Planner 轨迹：%s。" % trace
+            return "这次没有稳定理解出要查询的指标、范围或条件，因此没有可验证结果；不能把它解释成业务为 0。"
         if not plan.intents:
-            return "本轮没有实际执行数据查询：QueryGraph 没有形成可执行节点，因此不能判断为业务为 0。"
-        return "本轮没有实际执行数据查询：QueryGraph 尚未进入 SQL 执行阶段，因此不能判断为业务为 0。Planner 轨迹：%s。" % trace
+            return "这次没有形成可执行的数据查询计划，因此没有可验证结果；不能把它解释成业务为 0。"
+        return "这次查询没有进入实际取数阶段，因此没有可验证结果；不能把它解释成业务为 0。"
 
 
 def merchant_friendly_data_answer(question: str, plan: QueryPlan, bundle: QueryBundle, run_result: AgentRunResult | None = None) -> str:
@@ -1564,6 +1776,18 @@ def answer_requirement_coverage(question: str, plan: QueryPlan, run_result: Agen
             complete.append(requirement)
         else:
             missing.append(requirement)
+    if missing and complete:
+        complete_labels = {normalized_metric_phrase(item.get("label")) for item in complete if normalized_metric_phrase(item.get("label"))}
+        complete_keys = {normalized_metric_phrase(item.get("key")) for item in complete if normalized_metric_phrase(item.get("key"))}
+        still_missing: List[Dict[str, str]] = []
+        for requirement in missing:
+            label = normalized_metric_phrase(requirement.get("label"))
+            key = normalized_metric_phrase(requirement.get("key"))
+            if (label and label in complete_labels) or (key and key in complete_labels) or (label and label in complete_keys):
+                complete.append(requirement)
+                continue
+            still_missing.append(requirement)
+        missing = still_missing
     asks_ratio = bool(re.search(r"(占多少|占比|比例|率|分别占多少)", str(question or "")))
     has_ratio_result = any(re.search(r"(rate|ratio|share|占比|比例|率)", " ".join(item.get("aliases", [])), flags=re.I) for item in complete)
     should_block = bool(asks_ratio and not has_ratio_result)
@@ -2041,13 +2265,18 @@ def deterministic_structured_answer(
     ranking = deterministic_ranking_answer(question, plan, run_result)
     if ranking:
         return ranking
-    if question_requests_diagnosis(question):
-        return ""
     if run_result:
+        trend_sentence = multi_trend_metric_sentence(question, plan, run_result)
+        if question_requests_diagnosis(question):
+            if trend_sentence:
+                return trend_sentence + chart_hint_sentence(plan, run_result)
+            return ""
+        derived_sentence = derived_metric_sentence(question, plan, run_result)
+        if derived_sentence:
+            return derived_sentence + chart_hint_sentence(plan, run_result)
         summary_sentence = summary_metric_sentence(question, plan, run_result)
         if summary_sentence:
             return summary_sentence + chart_hint_sentence(plan, run_result)
-        trend_sentence = multi_trend_metric_sentence(question, plan, run_result)
         if trend_sentence:
             return trend_sentence + chart_hint_sentence(plan, run_result)
     rows = fallback_rows or (run_result.merged_query_bundle.rows if run_result else [])
@@ -2075,6 +2304,35 @@ def deterministic_structured_answer(
     if sample:
         return sample
     return generic_result_overview_sentence(question, plan, rows, run_result)
+
+
+def derived_metric_sentence(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
+    if not run_result:
+        return ""
+    intent_map = intent_by_task_id(plan)
+    for task in visible_successful_tasks(plan, run_result):
+        intent = intent_map.get(task.task_id)
+        if not intent or intent.answer_mode != AnswerMode.DERIVED or not task.query_bundle.rows:
+            continue
+        rows = task.query_bundle.rows
+        if len(rows) != 1:
+            continue
+        value_column = metric_value_column_for_rows(plan, intent, rows)
+        if not value_column:
+            continue
+        row = rows[0]
+        value = row.get(value_column)
+        if value in (None, ""):
+            continue
+        resolution = intent.metric_resolution or {}
+        metric_key = str(resolution.get("metricKey") or intent.metric_name or value_column)
+        label = str(resolution.get("displayName") or friendly_column_label(plan, value_column))
+        return "%s%s为 %s。" % (
+            answer_time_prefix(question),
+            label,
+            format_metric_value_for_answer(value, metric_key, label),
+        )
+    return ""
 
 
 def deterministic_cross_task_detail_answer(
@@ -3026,6 +3284,21 @@ def deterministic_single_semantic_metric_answer(plan: QueryPlan) -> bool:
     )
 
 
+def trusted_single_metric_verified_answer(plan: QueryPlan, run_result: AgentRunResult | None) -> bool:
+    if not run_result or not deterministic_single_semantic_metric_answer(plan):
+        return False
+    verified = run_result.verified_evidence
+    if not verified or not verified.passed or verified.blocking_gaps or run_result.evidence_gaps:
+        return False
+    tasks = visible_successful_tasks(plan, run_result)
+    if len(tasks) != 1:
+        return False
+    rows = tasks[0].query_bundle.rows
+    if len(rows) != 1:
+        return False
+    return bool(summary_metric_values(plan, run_result))
+
+
 def answer_skill_required(plan: QueryPlan, run_result: AgentRunResult | None = None, has_rule_context: bool = False) -> bool:
     return bool(select_answer_skill(plan, run_result, has_rule_context))
 
@@ -3585,7 +3858,7 @@ def lightweight_metric_disclosures(question: str, plan: QueryPlan, run_result: A
         return []
     items: List[Dict[str, Any]] = []
     for item in metric_disclosures(plan, run_result.verified_evidence):
-        description = lightweight_metric_description(item)
+        description = lightweight_metric_description(item, include_formula=question_asks_metric_disclosure(question))
         if not description:
             continue
         items.append(
@@ -3603,27 +3876,139 @@ def lightweight_metric_disclosure_note(question: str, plan: QueryPlan, run_resul
     if not disclosures:
         return ""
     descriptions = dedupe_strings([str(item.get("description") or "").strip() for item in disclosures])
-    descriptions = [item for item in descriptions if item]
+    descriptions = [merchant_friendly_note_phrase(item) for item in descriptions if item]
+    descriptions = [item for item in dedupe_strings(descriptions) if item]
     if not descriptions:
         return ""
     time_phrase = extract_question_time_phrase(question) or "本次查询时间范围"
-    return "统计说明：%s；时间为%s；范围为当前店铺。" % ("；".join(descriptions[:3]), time_phrase)
+    body = "；".join(description.rstrip("。；") for description in descriptions[:3] if description).strip("。；")
+    if not body:
+        return ""
+    return "统计说明：%s。时间是%s，范围是当前店铺。" % (body, time_phrase)
 
 
-def lightweight_metric_description(item: Dict[str, Any]) -> str:
+def lightweight_metric_description(item: Dict[str, Any], include_formula: bool = False) -> str:
     display_name = str(item.get("displayName") or item.get("metricKey") or item.get("metric") or "指标")
     description = str(item.get("description") or item.get("fieldWarning") or "").strip()
     if description:
-        return "%s：%s" % (display_name, description)
+        friendly = merchant_friendly_metric_description(description)
+        if friendly:
+            return "%s：%s" % (display_name, friendly)
     business_fallback = {
         "order_gmv_amt_1d": "GMV按支付成功订单金额统计，未主动扣除后续退款",
     }.get(str(item.get("metricKey") or item.get("metric") or "").strip())
     if business_fallback:
         return business_fallback
     formula = str(item.get("formula") or "").strip()
-    if formula:
-        return "%s按已发布语义公式 %s 计算" % (display_name, formula)
+    if include_formula and formula:
+        formula_phrase = merchant_friendly_formula_phrase(formula)
+        if formula_phrase:
+            return "%s：%s" % (display_name, formula_phrase)
     return ""
+
+
+def merchant_friendly_metric_description(description: str) -> str:
+    text = str(description or "").strip()
+    if not text:
+        return ""
+    ratio = merchant_friendly_ratio_phrase(text)
+    if ratio:
+        return ratio
+    cleaned = strip_internal_metric_description(text)
+    if not cleaned:
+        return ""
+    ratio = merchant_friendly_ratio_phrase(cleaned)
+    return ratio or cleaned
+
+
+def merchant_friendly_note_phrase(description: str) -> str:
+    text = str(description or "").strip(" 。；")
+    if "：" in text:
+        text = text.split("：", 1)[1].strip(" 。；")
+    if ":" in text:
+        text = text.split(":", 1)[1].strip(" 。；")
+    if text.startswith("按") and text.endswith("的比例"):
+        return "%s统计" % text
+    if text and not text.startswith(("按", "以", "基于")) and re.search(r"(占|按).{0,20}(统计|比例|占比)", text):
+        if text.startswith(("店铺", "跨天", "指定周期")) and "按" in text:
+            text = text[text.index("按") :]
+        elif text.endswith("的比例"):
+            text = "按%s统计" % text
+    return text
+
+
+def merchant_friendly_ratio_phrase(text: str) -> str:
+    normalized = re.sub(r"\s+", "", str(text or ""))
+    if not normalized:
+        return ""
+    match = re.search(
+        r"(?P<numerator>[\u4e00-\u9fa5A-Za-z0-9]+?(?:量|金额|额|GMV|gmv))占(?P<denominator>[\u4e00-\u9fa5A-Za-z0-9]+?(?:量|金额|额|GMV|gmv))(?:的)?(?:比例|占比|比率|率|统计)",
+        normalized,
+        flags=re.I,
+    )
+    if match:
+        numerator = business_component_label(match.group("numerator"))
+        denominator = business_component_label(match.group("denominator"))
+        return "%s占%s的比例" % (numerator, denominator)
+    if "支付成功订单金额" in normalized:
+        return "按支付成功订单金额统计"
+    return ""
+
+
+def business_component_label(value: str) -> str:
+    text = str(value or "").strip()
+    replacements = {
+        "支付gmv": "支付GMV",
+        "支付GMV金额": "支付GMV",
+        "总gmv": "总GMV",
+        "总GMV金额": "总GMV",
+    }
+    return replacements.get(text, text)
+
+
+def merchant_friendly_formula_phrase(formula: str) -> str:
+    text = str(formula or "")
+    columns = [column.lower() for column in re.findall(r"`?([a-z][a-z0-9]+(?:_[a-z0-9]+)+)`?", text, flags=re.I)]
+    column_labels = {
+        "direct_refund_cnt_1d": "直接退款量",
+        "return_cnt_1d": "退货量",
+        "pay_order_cnt_1d": "支付订单量",
+        "refund_rate_1d": "每日退货率",
+        "refund_amt_1d": "退款金额",
+        "pay_gmv_amt_1d": "支付GMV",
+        "order_gmv_amt_1d": "GMV",
+    }
+    labels = [column_labels[column] for column in columns if column in column_labels]
+    if "/" in text and len(labels) >= 2:
+        return "%s占%s的比例" % (labels[0], labels[1])
+    if labels:
+        return "按%s统计" % labels[0]
+    return ""
+
+
+def strip_internal_metric_description(description: str) -> str:
+    text = str(description or "").strip()
+    if not text:
+        return ""
+    text = text.replace("`", "")
+    text = re.sub(r"(?:^|[。；;，,]\s*)(?:公式|计算公式|语义公式)(?:为|是|[:：])\s*[^。；;]+[。；;]?", "。", text, flags=re.I)
+    text = re.sub(r"\b(?:SUM|COUNT|AVG|MAX|MIN|NULLIF|CASE|WHEN|THEN|ELSE|END)\s*\([^)]*\)", "", text, flags=re.I)
+    text = re.sub(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+){2,}\b", "", text, flags=re.I)
+    text = re.sub(r"\s*/\s*", " / ", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[，,；;]\s*(?:和|与)?\s*(?:不同|相同|一致)?\s*$", "", text)
+    text = re.sub(r"。{2,}", "。", text)
+    parts = []
+    for raw_part in re.split(r"[。；;]", text):
+        part = raw_part.strip(" ：:，,。")
+        if not part:
+            continue
+        if is_internal_answer_line(part):
+            continue
+        if re.search(r"\b[A-Za-z][A-Za-z0-9_]*\b", part) and "_" in part:
+            continue
+        parts.append(part)
+    return "；".join(dedupe_strings(parts[:2])).strip("。；")
 
 
 def metric_disclosure_text(item: Dict[str, Any]) -> str:
@@ -3793,6 +4178,21 @@ def merchant_facing_gap_note(value: str) -> str:
 
 def hidden_alternate_metric_terms(plan: QueryPlan) -> List[str]:
     labels = answer_column_labels(plan)
+    visible_business_terms: set[str] = set()
+    for intent in plan.intents:
+        if should_hide_alternate_metric(plan, intent):
+            continue
+        resolution = intent.metric_resolution or {}
+        metric_key = intent_metric_key(intent)
+        for item in [
+            resolution.get("displayName"),
+            resolution.get("sourcePhrase"),
+            labels.get(metric_key),
+            labels.get(str(intent.metric_name or "")),
+        ]:
+            term = str(item or "").strip()
+            if len(term) >= 2:
+                visible_business_terms.add(term)
     terms: List[str] = []
     for intent in plan.intents:
         if not should_hide_alternate_metric(plan, intent):
@@ -3803,13 +4203,11 @@ def hidden_alternate_metric_terms(plan: QueryPlan) -> List[str]:
             metric_key,
             intent.metric_name,
             intent.metric_column,
-            resolution.get("displayName"),
-            labels.get(metric_key),
             labels.get(str(intent.metric_name or "")),
         ]
         for item in candidates:
             term = str(item or "").strip()
-            if len(term) >= 2 and term not in terms:
+            if len(term) >= 2 and term not in visible_business_terms and term not in terms:
                 terms.append(term)
     return terms
 

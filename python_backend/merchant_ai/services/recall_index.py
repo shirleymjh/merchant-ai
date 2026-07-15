@@ -23,28 +23,6 @@ class RecallDocumentProvider(Protocol):
         ...
 
 
-def semantic_docs(root: Path, ref_prefix: str = "") -> list[dict[str, str]]:
-    docs: list[dict[str, str]] = []
-    if not root.exists():
-        return docs
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        if path.suffix.lower() not in {".json", ".md"}:
-            continue
-        relative = path.relative_to(root).as_posix()
-        if ref_prefix:
-            relative = "%s/%s" % (ref_prefix.strip("/"), relative)
-        docs.append({"ref": relative, "path": str(path), "hash": hash_file(path)})
-    return docs
-
-
-def hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def source_hash(docs: list[dict[str, str]]) -> str:
     digest = hashlib.sha256()
     for doc in docs:
@@ -78,14 +56,11 @@ def changed_refs(docs: list[dict[str, str]], previous: dict[str, Any], changed_o
 
 
 def build_index_manifest(
-    root: Path,
+    docs: list[dict[str, str]],
     previous: dict[str, Any],
     changed_only: bool,
-    additional_roots: Iterable[tuple[str, Path]] | None = None,
+    root: str = "",
 ) -> dict[str, Any]:
-    docs = semantic_docs(root)
-    for prefix, additional_root in additional_roots or []:
-        docs.extend(semantic_docs(additional_root, ref_prefix=prefix))
     docs.sort(key=lambda item: item["ref"])
     semantic_source_hash = source_hash(docs)
     updated_refs = changed_refs(docs, previous, changed_only)
@@ -96,8 +71,59 @@ def build_index_manifest(
         "updatedRefs": updated_refs,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
-        "docs": [{"ref": doc["ref"], "hash": doc["hash"]} for doc in docs],
+        "docs": [
+            {
+                "ref": doc["ref"],
+                "hash": doc["hash"],
+                **({"docId": doc["docId"]} if doc.get("docId") else {}),
+                **({"sourceType": doc["sourceType"]} if doc.get("sourceType") else {}),
+                **({"semanticPath": doc["semanticPath"]} if doc.get("semanticPath") else {}),
+            }
+            for doc in docs
+        ],
     }
+
+
+def recall_documents_for_manifest(items: list[RecallItem]) -> list[dict[str, str]]:
+    docs: list[dict[str, str]] = []
+    for item in items:
+        metadata = item.metadata or {}
+        semantic_path = str(metadata.get("semanticPath") or "")
+        semantic_ref = str(metadata.get("semanticRefId") or item.doc_id or "")
+        payload = {
+            "docId": item.doc_id,
+            "title": item.title,
+            "content": item.content,
+            "sourceType": item.source_type,
+            "topic": item.topic,
+            "table": item.table,
+            "answerMode": item.answer_mode,
+            "semanticRefId": semantic_ref,
+            "semanticPath": semantic_path,
+            "metadata": metadata,
+        }
+        digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        docs.append(
+            {
+                "ref": manifest_ref_for_recall_item(item),
+                "hash": digest,
+                "docId": str(item.doc_id or ""),
+                "sourceType": str(item.source_type or ""),
+                "semanticPath": semantic_path,
+            }
+        )
+    docs.sort(key=lambda doc: (doc["ref"], doc.get("docId", "")))
+    return docs
+
+
+def manifest_ref_for_recall_item(item: RecallItem) -> str:
+    metadata = item.metadata or {}
+    semantic_path = str(metadata.get("semanticPath") or "").strip()
+    if semantic_path.startswith("topics/"):
+        return semantic_path.removeprefix("topics/")
+    if semantic_path:
+        return semantic_path
+    return str(metadata.get("semanticRefId") or item.doc_id or "").strip()
 
 
 class EsRecallIndexAdapter:
@@ -275,7 +301,7 @@ class EsRecallIndexAdapter:
         errors: list[str] = []
         for ref in deleted_refs:
             deleted_ref = ref.removeprefix("deleted:")
-            semantic_path = deleted_ref if deleted_ref.startswith("rules/") else "topics/%s" % deleted_ref
+            semantic_path = deleted_ref if deleted_ref.startswith(("rules/", "topics/")) else "topics/%s" % deleted_ref
             query = {"query": {"term": {"semantic_path": semantic_path}}}
             response = requests.post(
                 self._url("%s/_delete_by_query" % self.settings.es_index),
@@ -326,20 +352,22 @@ class RecallIndexManager:
 
     def rebuild(self, changed_only: bool = True, topic: str = "", table_name: str = "") -> dict[str, Any]:
         previous = load_index_manifest(self.manifest_path)
+        self.clear_caches()
+        scoped_docs = self.scoped_documents(topic, table_name)
+        manifest_docs = scoped_docs if topic or table_name else self.scoped_documents()
         manifest = build_index_manifest(
-            self.settings.resolved_topic_path,
+            recall_documents_for_manifest(manifest_docs),
             previous,
             changed_only=changed_only,
-            additional_roots=[("rules", self.settings.resolved_rule_knowledge_path)],
+            root=str(self.settings.resolved_topic_path),
         )
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         updated_refs = filter_changed_refs_for_scope(manifest.get("updatedRefs") or [], topic, table_name)
-        self.clear_caches()
         es_result = {"success": True, "mode": "disabled", "enabled": False}
         replace_all = not changed_only and not topic and not table_name
         if self.settings.es_enabled:
-            docs = self.scoped_documents(topic, table_name) if replace_all else self.changed_documents(updated_refs, topic, table_name)
+            docs = scoped_docs if (replace_all or topic or table_name) else self.changed_documents(updated_refs, topic, table_name)
             deleted_refs = [ref for ref in updated_refs if str(ref).startswith("deleted:")]
             try:
                 es_result = self.es_adapter.sync(docs, deleted_refs, replace_all=replace_all)
@@ -370,7 +398,7 @@ class RecallIndexManager:
         if topic or table_name:
             return docs
         changed_paths = {
-            str(ref) if str(ref).startswith("rules/") else "topics/%s" % str(ref)
+            str(ref) if str(ref).startswith(("rules/", "topics/")) else "topics/%s" % str(ref)
             for ref in updated_refs
             if not str(ref).startswith("deleted:")
         }
@@ -431,7 +459,8 @@ def recall_doc_scope_key(item: RecallItem) -> str:
 def recall_scopes_for_changed_refs(refs: list[str]) -> set[str]:
     scopes: set[str] = set()
     for ref in refs:
-        raw = str(ref).removeprefix("deleted:")
+        raw = str(ref).removeprefix("deleted:").removeprefix("topics/")
+        raw = raw.split("#", 1)[0]
         parts = raw.split("/")
         if len(parts) >= 3 and parts[1] == "tables":
             scopes.add("%s/tables/%s" % (parts[0], parts[2]))
@@ -447,7 +476,7 @@ def filter_changed_refs_for_scope(refs: list[str], topic: str = "", table_name: 
     scoped: list[str] = []
     for ref in refs:
         raw = str(ref)
-        comparable = raw.removeprefix("deleted:")
+        comparable = raw.removeprefix("deleted:").removeprefix("topics/")
         if comparable.startswith(prefix):
             scoped.append(raw)
     return scoped

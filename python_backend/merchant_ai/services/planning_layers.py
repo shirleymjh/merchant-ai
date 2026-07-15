@@ -87,6 +87,13 @@ class UnderstandingExtractor:
                 recalled_metric_plan.agent_trace.extend([trace_reason, "planner.recalled_metric_diagnostic_fallback_after_llm_failure"])
                 return recalled_metric_plan, [], "SEMANTIC_FAST_PATH"
             rejected_trace.extend(fallback_coverage_rejection_trace("recalled_metric_diagnostic", coverage_gaps))
+        metric_plan = self.planner._semantic_metric_fallback(question, asset_pack)
+        if metric_plan.intents:
+            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, metric_plan, asset_pack)
+            if not coverage_gaps:
+                metric_plan.agent_trace.extend([trace_reason, "planner.semantic_metric_fallback_after_llm_failure"])
+                return metric_plan, [], "SEMANTIC_FAST_PATH"
+            rejected_trace.extend(fallback_coverage_rejection_trace("semantic_metric", coverage_gaps))
         trend_plan = self.planner._multi_metric_trend_fallback(question, asset_pack)
         if trend_plan.intents:
             coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, trend_plan, asset_pack)

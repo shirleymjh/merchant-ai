@@ -253,6 +253,26 @@ def default_prompt_registry() -> PromptRegistry:
     )
     registry.register(
         PromptTemplateSpec(
+            prompt_id="planner.semantic_asset_selection",
+            version="v1",
+            agent="PlannerAgent",
+            description="Select semantic metric refs before QueryGraph compilation.",
+            section_ids=["common.stable_boundary", "planner.semantic_boundary", "common.artifact_references"],
+            template=(
+                "你是商家 BI 语义资产选择器。只输出 JSON，不要输出 SQL、QueryGraph 或解释长文。\n"
+                "输入包含用户问题和召回候选文本。你的任务是从候选编号/ref 中选择最贴合用户问题的指标 ref。\n"
+                "每个用户明确指标词最多选择一个 ref；候选不够就返回 NEED_MORE_KNOWLEDGE；多个候选都合理且问题没说清就返回 AMBIGUOUS。\n"
+                "不要选择候选之外的 ref，不要补造表名或字段名。\n"
+                "输出格式：{{\"status\":\"SELECTED|AMBIGUOUS|NEED_MORE_KNOWLEDGE|UNSUPPORTED|INVALID\",\"selectedRefs\":[\"semantic:...\"],\"gaps\":[{{\"phrase\":\"\",\"reason\":\"\",\"candidateRefs\":[]}}],\"reason\":\"\"}}。\n"
+                "Few-shot 1：问“最近7天支付GMV是多少”，候选有 支付GMV日汇总金额/ref=A、订单明细支付金额/ref=B => selectedRefs=[A]。\n"
+                "Few-shot 2：问“退款金额明细有哪些”，候选有 退款日汇总金额/ref=A、退款明细退款金额/ref=B => selectedRefs=[B]。\n"
+                "Few-shot 3：问“最近7天GMV是多少”，候选有 下单GMV/ref=A、支付GMV/ref=B、交易成功GMV/ref=C，问题没限定口径 => status=AMBIGUOUS。\n"
+                "Few-shot 4：问“为什么退款率升高”，可以选退款率 ref，但 status=UNSUPPORTED，因为原因分析需要后续 planner/skill。"
+            ),
+        )
+    )
+    registry.register(
+        PromptTemplateSpec(
             prompt_id="planner.question_understanding",
             version="v1",
             agent="PlannerAgent",
@@ -267,6 +287,8 @@ def default_prompt_registry() -> PromptRegistry:
                 "不要依赖代码关键词补规则；如果需要解释型证据，把证据需求写进 requiredEvidenceIntents，再由语义层编译和 Critic 校验。\n"
                 "metricRef 必须来自 semanticCatalog.candidateMetrics.key；ownerTable 必须使用对应 metric 的 table。\n"
                 "如果 semanticCatalog.tables 为空但 candidateMetrics 非空，这是轻量指标候选模式，不代表缺少业务知识；先基于 candidateMetrics 输出 questionUnderstanding，字段、关系或完整口径细节需要时再 semantic_read 精确读取。\n"
+                "Metric candidate selection：同一用户指标 phrase 下多个同名/近义候选默认互斥；先看 title/tableKind/grainHint/formula/description，在 metricCandidateDecisions 中 selected_one 或 need_clarification。除非用户明确要求口径对账/差异排查，不要同时查询多个同名候选；rejectedCandidateIds 不能进入 rankingObjective/requestedMeasures/QueryGraph。\n"
+                "Few-shot metric selection examples: A 单指标整体查询“最近7天商品审核通过量是多少？” candidates=ads_merchant_profile(merchant_day聚合),dwm_goods_detail_df(goods_detail明细) => selected_one 前者，reject 后者。B 明细查询“商品审核通过明细有哪些？” => selected_one 明细候选。C 不要双查“最近7天申诉次数是多少？” => 不要同时输出画像申诉次数和申诉明细次数，只选最贴切候选。D “商品审核通过量怎么不对？”候选口径都可能相关 => need_clarification。\n"
                 "如果输入包含 knowledgeRequestGaps，表示这些补知识请求已经失败或无新增证据；不要重复请求同一个知识，必须基于现有 semanticCatalog 规划可回答部分，或把不支持部分留成结构化缺口。\n"
                 "memoryConstraints 只能作为本轮解释偏好、历史纠错或口径争议信号；不得用 memory 改写 semanticCatalog、指标公式、表关系或字段定义。\n"
                 "如果 memoryConstraints 与 semanticCatalog 冲突，必须以 semanticCatalog 为准，并通过 validationGaps/clarification 表达未应用原因。\n"
@@ -298,6 +320,8 @@ def default_prompt_registry() -> PromptRegistry:
                 "不要直接输出 QueryGraph 或 SQL，只输出 questionUnderstanding。\n"
                 "如果 critic 指出 scope 未落地、分析证据契约缺失或未覆盖，必须重新声明 scopeConstraints、analysisIntent、requiresExplanation、requiredEvidenceIntents，并把所需指标放入 requestedMeasures 或 knowledgeRequests。\n"
                 "如果 critic 指出 MEMORY_CONSTRAINT_UNAPPLIED，必须只在 semanticCatalog 可支持时选择对应 metricRef；不支持时输出 clarification/knowledge gap，不得修改语义层定义。\n"
+                "如果 critic 指出同名/近义指标冲突，必须先修复 metricCandidateDecisions：同一用户指标 phrase 下多个候选默认互斥，除非用户明确要求口径对账/差异排查，不要同时查询多个同名候选。\n"
+                "Few-shot repair examples: 用户问“最近7天商品审核通过量是多少？”且 graph 同时用了 ads_merchant_profile.goods_audit_pass_cnt_1d 和 dwm_goods_detail_df.goods_audit_pass_detail_cnt 时，修复为 selected_one，只保留最贴切候选，把另一个放入 rejectedCandidateIds；用户问“商品审核通过明细有哪些？”时才选择明细候选；用户问“商品审核通过量怎么不对？”且无法判断核对范围时返回 need_clarification。\n"
                 "如果输入包含 knowledgeRequestGaps，不要重复请求这些已失败的补知识项；只能基于现有 semanticCatalog 修复，或保留结构化缺口。\n"
                 "修复必须限制在 semanticCatalog 内，metricRef 必须来自 candidateMetrics.key。"
             ),
@@ -318,7 +342,10 @@ def default_prompt_registry() -> PromptRegistry:
                 "GROUP_AGG/TOPN 查询必须让所有非聚合 SELECT 字段同时出现在 GROUP BY 中，尤其不能丢 seller_id、pt、spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、coupon_id。\n"
                 "当 GROUP_AGG/TOPN 的 groupByColumn 是实体键（如 spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、refund_id、coupon_id）时，必须在 WHERE 里过滤 NULL 和空字符串，避免产生空实体桶。\n"
                 "dependent node 用 upstreamEntitySets 做 IN 过滤。必须按 merchant_id/seller_id 过滤商家。\n"
-                "pt 是 Doris DATE 分区列，最近N天包含今天/最新分区在内，时间窗下界必须写成 `pt` >= DATE_SUB(CURDATE(), INTERVAL N-1 DAY)，例如最近7天写 INTERVAL 6 DAY，最近30天写 INTERVAL 29 DAY；不要使用 DATE_FORMAT('%Y%m%d')。"
+                "TimeWindowContract 必须落地：pt 是 Doris DATE 分区列；相对时间窗（最近N天/近N天）必须锚定 preferredTable 在当前商家过滤后的 MAX(pt)，不要用 CURDATE()/CURRENT_DATE。"
+                "写法：`pt` BETWEEN DATE_SUB((SELECT MAX(`pt`) FROM `preferredTable` WHERE `merchantFilterColumn` = <same merchant>), INTERVAL N-1 DAY) AND (SELECT MAX(`pt`) FROM `preferredTable` WHERE `merchantFilterColumn` = <same merchant>)。"
+                "Few-shot：最近7天且 seller_id='100'，写 `pt` BETWEEN DATE_SUB((SELECT MAX(`pt`) FROM `ads_merchant_profile` WHERE `seller_id`='100'), INTERVAL 6 DAY) AND (SELECT MAX(`pt`) FROM `ads_merchant_profile` WHERE `seller_id`='100')。"
+                "显式日期/明确 startDate-endDate 且 anchorPolicy=calendar 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
             ),
         )
     )
@@ -345,7 +372,8 @@ def default_prompt_registry() -> PromptRegistry:
             template=(
                 "你是商家经营分析助手。只基于输入的已验证数据回答，缺失证据要明确说明，不要把缺失解释成 0。\n"
                 "回答要自然、简洁、先说结论，避免研发调试口吻。\n"
-                "字段名带 raw 表示原始字段值；不要把 refund_related_pay_amt_raw 或 pay_amt 说成已确认的独立退款金额。"
+                "Few-shot evidence usage: 如果 verified evidence 同时出现同名指标的画像口径和明细口径，但 questionUnderstanding.metricCandidateDecisions 已 selected_one，最终答案只能使用 selectedCandidateId 对应证据；rejectedCandidateIds 只能作为“未采用口径”解释，不能作为并列结论。用户只问“最近7天商品审核通过量是多少？”时，不要回答“0 和 33”两个同名数；只回答被选中的候选。用户明确问“两个口径为什么不一致/对账”时，才可以并列比较。\n"
+                "指标名称和口径以 verified evidence 中的 metric_resolution / metricDisclosures 为准；字段名带 raw 表示原始字段值，不要把 raw 字段当作正式指标口径。"
             ),
         )
     )
