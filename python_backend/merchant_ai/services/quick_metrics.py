@@ -5,17 +5,11 @@ import uuid
 from typing import Any, Dict, Iterable, Optional
 
 from merchant_ai.models import (
-    AgentRunResult,
-    AgentTaskResult,
-    AnswerMode,
+    AnswerClaim,
+    AnswerClaimVerification,
     ChatDataSection,
     ChatResponse,
-    QueryBundle,
-    QueryPlan,
-    QuestionIntent,
-    VerifiedEvidence,
 )
-from merchant_ai.services.answer_claims import AnswerClaimVerifier
 from merchant_ai.services.cache import TTLCache
 from merchant_ai.services.formulas import compile_metric_formula
 from merchant_ai.services.semantic_request import semantic_request_cache_key
@@ -264,61 +258,104 @@ def verify_quick_metric_answer(
     trend_rows: list[Dict[str, Any]],
     total: float,
     answer: str,
-):
-    summary_task_id = "quick_metric_summary"
-    trend_task_id = "quick_metric_trend"
-    date_context_task_id = "quick_metric_date_context"
-    latest_date = str(trend_rows[-1].get("pt") or "") if trend_rows else ""
-    peak_row = max(trend_rows, key=lambda row: float(row.get("value") or 0)) if trend_rows else {}
-    peak_date = str(peak_row.get("pt") or "")
-    first_value = float(trend_rows[0].get("value") or 0) if trend_rows else 0.0
-    last_value = float(trend_rows[-1].get("value") or 0) if trend_rows else 0.0
-    delta_value = abs(last_value - first_value)
-    plan = QueryPlan(
-        intents=[
-            QuestionIntent(
-                question=question,
-                answer_mode=AnswerMode.METRIC,
-                plan_task_id=summary_task_id,
-                preferred_table=metric["table"],
-                metric_name="value",
-                metric_resolution={"metricKey": "value", "displayName": metric["label"]},
-            ),
-            QuestionIntent(
-                question=question,
-                answer_mode=AnswerMode.GROUP_AGG,
-                plan_task_id=trend_task_id,
-                preferred_table=metric["table"],
-                metric_name="value",
-                group_by_column="pt",
-                metric_resolution={"metricKey": "value", "displayName": metric["label"], "displayRole": "trend_context"},
-            ),
-            QuestionIntent(
-                question=question,
-                answer_mode=AnswerMode.DETAIL,
-                plan_task_id=date_context_task_id,
-                preferred_table=metric["table"],
-                output_keys=["数据日期", "峰值日期"],
-            ),
-        ]
+) -> AnswerClaimVerification:
+    supported_claim = AnswerClaim(
+        text="quick_metric_total_coverage",
+        numeric_values=[format_value(total, metric)],
+        supported=True,
     )
-    summary_bundle = QueryBundle(tables=[metric["table"]], rows=[{"value": total}], original_row_count=1)
-    trend_bundle = QueryBundle(tables=[metric["table"]], rows=trend_rows, original_row_count=len(trend_rows))
-    date_context_bundle = QueryBundle(
-        tables=[metric["table"]],
-        rows=[{"数据日期": latest_date, "峰值日期": peak_date, "变化值": delta_value}],
-        original_row_count=1,
+    unsupported_claims: list[AnswerClaim] = []
+    if not answer_contains_number(answer, total):
+        unsupported_claims.append(
+            AnswerClaim(
+                text="quick_metric_total_coverage",
+                numeric_values=[format_value(total, metric)],
+                supported=False,
+                reasons=["missing_quick_metric_total"],
+            )
+        )
+    extra_numbers = unsupported_quick_answer_numbers(answer, question, trend_rows, total)
+    if extra_numbers:
+        unsupported_claims.append(
+            AnswerClaim(
+                text="quick_metric_extra_numbers",
+                numeric_values=extra_numbers,
+                supported=False,
+                reasons=["unsupported_extra_value:%s" % value for value in extra_numbers],
+            )
+        )
+    return AnswerClaimVerification(
+        passed=not unsupported_claims,
+        fact_count=1,
+        claims=[supported_claim] + unsupported_claims,
+        unsupported_claims=unsupported_claims,
     )
-    run_result = AgentRunResult(
-        task_results=[
-            AgentTaskResult(task_id=summary_task_id, success=True, query_bundle=summary_bundle),
-            AgentTaskResult(task_id=trend_task_id, success=True, query_bundle=trend_bundle),
-            AgentTaskResult(task_id=date_context_task_id, success=True, query_bundle=date_context_bundle),
-        ],
-        merged_query_bundle=summary_bundle,
-        verified_evidence=VerifiedEvidence(passed=True),
-    )
-    return AnswerClaimVerifier().verify(question, plan, run_result, answer)
+
+
+def unsupported_quick_answer_numbers(
+    answer: str,
+    question: str,
+    trend_rows: list[Dict[str, Any]],
+    total: float,
+) -> list[str]:
+    allowed = [float(total)]
+    allowed.extend(float(row.get("value") or 0) for row in trend_rows[:40])
+    allowed.extend(value for _, value in numeric_token_pairs(question))
+    unsupported: list[str] = []
+    for raw, value in numeric_token_pairs(answer):
+        if any(numbers_close(value, candidate) for candidate in allowed):
+            continue
+        if abs(value) < 10 and not raw.endswith("%") and "." not in raw:
+            continue
+        unsupported.append(raw)
+    return dedupe_strings(unsupported)
+
+
+def dedupe_strings(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def answer_contains_number(answer: str, expected: Any) -> bool:
+    value = numeric_token_value(expected)
+    return value is not None and any(numbers_close(value, candidate) for _, candidate in numeric_token_pairs(answer))
+
+
+def numeric_token_pairs(text: str) -> list[tuple[str, float]]:
+    scrubbed = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", " ", str(text or ""))
+    pairs: list[tuple[str, float]] = []
+    for match in re.finditer(r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?%?", scrubbed):
+        raw = match.group(0)
+        value = numeric_token_value(raw)
+        if value is not None:
+            pairs.append((raw, value))
+    return pairs
+
+
+def numeric_token_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    percent = text.endswith("%")
+    text = text.rstrip("%")
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number / 100.0 if percent else number
+
+
+def numbers_close(left: float, right: float) -> bool:
+    return abs(left - right) <= max(0.005, abs(right) * 0.000001)
 
 
 def quick_metric_definition_response(question: str, merchant_id: str, metrics: list[Dict[str, Any]]) -> Optional[ChatResponse]:

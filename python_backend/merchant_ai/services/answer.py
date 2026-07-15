@@ -6,11 +6,12 @@ import uuid
 from contextvars import ContextVar
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from merchant_ai.models import (
     AgentRunResult,
     AnswerMode,
+    AnswerClaim,
     AnswerClaimVerification,
     ChatContext,
     ChatDataSection,
@@ -39,12 +40,13 @@ from merchant_ai.services.answer_formatting import (
     identifier_like_column,
     source_aware_metric_label,
 )
-from merchant_ai.services.answer_claims import AnswerClaimVerifier, build_verified_facts
+from merchant_ai.services.answer_claims import build_verified_facts
 
 
 def answer_context_policy() -> str:
     return (
         "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft、mandatoryAnswerSkeleton；不要读取或推断 QueryGraph。"
+        "metricFacts 是本轮必须覆盖的指标事实清单，最终回答必须自然覆盖其中每个指标名称、数值和时间范围；不要遗漏，也不要机械照抄模板。"
         "verifiedFacts 是数字、日期、实体和排序结论的唯一事实来源；任何事实陈述都必须能直接绑定其中的 factId，不能补充未出现的数值或业务实体。"
         "mandatoryAnswerSkeleton 是必须覆盖的答案事实骨架；可以改写成自然语言，但不能遗漏其中的指标、数值、时间范围和缺口说明。"
         "你的输出面向商家，不面向研发或分析师；语气要像经营助手，先直接回答用户问题，再给必要说明和建议。"
@@ -61,13 +63,6 @@ def answer_context_policy() -> str:
         "如果 evidenceGaps 存在，用“说明：”简短提示，不要扩大成失败结论。"
         "最后输出“建议：”，用短横线列出最多 2 条；建议必须结合 businessContext 的商家画像、长期记忆/近期关注和本轮数据，避免泛泛说继续追问。"
     )
-
-
-def claim_failure_reason(verification: Any) -> str:
-    reasons: List[str] = []
-    for claim in getattr(verification, "unsupported_claims", [])[:5]:
-        reasons.extend(str(item) for item in getattr(claim, "reasons", []) if str(item))
-    return ";".join(dedupe_strings(reasons)[:8]) or "unsupported_answer_claim"
 
 
 class AnswerComposeService:
@@ -87,7 +82,6 @@ class AnswerComposeService:
             "answer_compose_used_llm_%x" % id(self),
             default=False,
         )
-        self.claim_verifier = AnswerClaimVerifier()
         self._last_answer_claim_trace: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
             "answer_claim_trace_%x" % id(self),
             default=None,
@@ -486,7 +480,7 @@ class AnswerComposeService:
         )
         if analysis_summary:
             package["analysisDraft"] = analysis_summary[:1800]
-        if mandatory_skeleton:
+        if include_mandatory_skeleton_in_answer_prompt(question, plan, run_result, mandatory_skeleton):
             package["mandatoryAnswerSkeleton"] = mandatory_skeleton[:2400]
         prompt = json.dumps(package, ensure_ascii=False, default=str)
         answer_prompt = self.prompt_assembler.render(
@@ -505,7 +499,8 @@ class AnswerComposeService:
         self.last_compose_used_llm = True
         answer = sanitize_business_answer_text(answer, question, plan, run_result)
         answer = self._ensure_multi_trend_answer_coverage(answer, question, plan, run_result)
-        answer = self._ensure_multi_metric_summary_coverage(answer, question, plan, run_result)
+        if should_proactively_patch_metric_summary(answer, question, plan, run_result):
+            answer = self._ensure_multi_metric_summary_coverage(answer, question, plan, run_result)
         answer = self._correct_metric_total_misread(answer, question, plan, run_result)
         answer = self._clean_summary_trend_misphrasing(answer, plan, run_result)
         return sanitize_business_answer_text(answer, question, plan, run_result)
@@ -558,7 +553,7 @@ class AnswerComposeService:
         trusted_structured: bool = False,
     ) -> str:
         answer = sanitize_business_answer_text(draft or mandatory_skeleton, question, plan, run_result)
-        if mandatory_skeleton:
+        if should_apply_mandatory_skeleton_to_draft(answer, mandatory_skeleton, question, plan, run_result):
             answer = self._ensure_mandatory_answer_skeleton(answer, mandatory_skeleton, question, plan, run_result)
         answer = ensure_required_field_answer_coverage(answer, plan, run_result)
         if append_advice:
@@ -581,20 +576,6 @@ class AnswerComposeService:
             plan,
             run_result,
         )
-        if trusted_structured and trusted_single_metric_verified_answer(plan, run_result):
-            facts = build_verified_facts(plan, run_result)
-            if run_result is not None:
-                run_result.verified_facts = facts
-            self._record_claim_verification(
-                run_result,
-                AnswerClaimVerification(
-                    passed=True,
-                    fact_count=len(facts),
-                    fallback_used=False,
-                    fallback_reason="trusted_single_metric_tool_result",
-                ),
-            )
-            return self._apply_answer_guard(answer, run_result)
         return self._finalize_answer(answer, question, plan, run_result, fallback_answer=skeleton_fallback)
 
     def _ensure_mandatory_answer_skeleton(
@@ -633,9 +614,7 @@ class AnswerComposeService:
             return True
         if run_result:
             for item in summary_metric_values(plan, run_result):
-                label = str(item.get("label") or "")
-                value = format_metric_value_for_answer(item.get("value"), item.get("metricKey") or "", label)
-                if label and value and (label not in answer or value not in answer):
+                if not answer_contains_summary_metric_value(answer, item):
                     return False
             intent_map = intent_by_task_id(plan)
             trend_tasks = []
@@ -1244,7 +1223,7 @@ class AnswerComposeService:
             return answer
         missing = [
             item for item in summaries
-            if str(item.get("label") or "") and str(item.get("label") or "") not in answer
+            if not answer_contains_summary_metric_value(answer, item)
         ]
         if not missing:
             return answer
@@ -1313,6 +1292,8 @@ class AnswerComposeService:
 
     def _append_lightweight_metric_disclosure(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
         if not answer or not run_result or not run_result.merged_query_bundle.rows:
+            return answer
+        if not question_asks_metric_disclosure(question):
             return answer
         if question_asks_metric_reconciliation(question):
             return answer
@@ -1396,59 +1377,38 @@ class AnswerComposeService:
         run_result: AgentRunResult | None,
         fallback_answer: str = "",
     ) -> str:
-        guarded = self._apply_answer_guard(answer, run_result)
-        verification = self.claim_verifier.verify(question, plan, run_result, guarded)
-        if verification.passed:
-            self._record_claim_verification(run_result, verification)
+        if run_result is not None:
+            run_result.verified_facts = build_verified_facts(plan, run_result)
+        guarded = self._apply_answer_guard(answer or fallback_answer, run_result)
+        verification = lightweight_answer_contract_verification(question, plan, run_result, guarded)
+        if verification is None or verification.passed:
+            self._record_lightweight_answer_verification(run_result, verification)
             return guarded
-
         fallback = fallback_answer or deterministic_structured_answer(question, plan, run_result)
-        if not fallback and run_result:
-            fallback = self._fallback_data_answer(question, plan, run_result.merged_query_bundle, run_result)
-        if fallback:
-            fallback = ensure_required_field_answer_coverage(fallback, plan, run_result)
-            fallback = self._append_lightweight_metric_disclosure(fallback, question, plan, run_result)
-            fallback = self._apply_answer_guard(fallback, run_result)
-            if trusted_single_metric_verified_answer(plan, run_result):
-                facts = build_verified_facts(plan, run_result)
-                if run_result is not None:
-                    run_result.verified_facts = facts
-                trusted_verification = AnswerClaimVerification(
-                    passed=True,
-                    fact_count=len(facts),
-                    fallback_used=True,
-                    fallback_reason=claim_failure_reason(verification) or "trusted_single_metric_tool_result",
-                )
-                self._record_claim_verification(run_result, trusted_verification)
-                return fallback
-            fallback_verification = self.claim_verifier.verify(question, plan, run_result, fallback)
-            if fallback_verification.passed:
-                fallback_verification = fallback_verification.model_copy(
-                    update={
-                        "rejected_claims": verification.unsupported_claims,
-                        "fallback_used": True,
-                        "fallback_reason": claim_failure_reason(verification),
-                    }
-                )
-                self._record_claim_verification(run_result, fallback_verification)
-                return fallback
+        fallback = self._apply_answer_guard(fallback or guarded, run_result)
+        fallback_verification = lightweight_answer_contract_verification(question, plan, run_result, fallback)
+        if fallback_verification is not None:
+            fallback_verification = fallback_verification.model_copy(
+                update={
+                    "fallback_used": True,
+                    "fallback_reason": lightweight_answer_failure_reason(verification),
+                    "rejected_claims": verification.unsupported_claims,
+                }
+            )
+            self._record_lightweight_answer_verification(run_result, fallback_verification)
+        return fallback
 
-        safe_answer = "当前查询结果已返回，但生成答案中的部分事实无法与已验证数据逐项对应，因此未展示相关数值。请以结构化数据区域为准。"
-        safe_verification = self.claim_verifier.verify(question, plan, run_result, safe_answer)
-        final_verification = safe_verification.model_copy(
-            update={
-                "rejected_claims": verification.unsupported_claims,
-                "fallback_used": True,
-                "fallback_reason": claim_failure_reason(verification),
-            }
-        )
-        self._record_claim_verification(run_result, final_verification)
-        return self._apply_answer_guard(safe_answer, run_result)
-
-    def _record_claim_verification(self, run_result: AgentRunResult | None, verification: Any) -> None:
+    def _record_lightweight_answer_verification(
+        self,
+        run_result: AgentRunResult | None,
+        verification: AnswerClaimVerification | None,
+    ) -> None:
+        if verification is None:
+            self.last_answer_claim_trace = {}
+            return
         if run_result is not None:
             run_result.answer_claim_verification = verification
-        self.last_answer_claim_trace = verification.model_dump(by_alias=True) if hasattr(verification, "model_dump") else {}
+        self.last_answer_claim_trace = verification.model_dump(by_alias=True)
 
     def contextual_suggestions(
         self,
@@ -2002,19 +1962,31 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
         return []
     values: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    for item in visible_successful_tasks(plan, run_result):
-        intent = intent_by_task_id(plan).get(item.task_id)
-        role = answer_result_role(intent)
-        if role not in {"summary", "group_summary"} or not item.query_bundle.rows:
+    for intent in plan.intents:
+        if not intent:
             continue
-        rows = item.query_bundle.rows
+        role = answer_result_role(intent)
+        if role not in {"summary", "group_summary", "derived"}:
+            continue
+        rows = rows_for_metric_intent(plan, run_result, intent)
+        if not rows:
+            continue
         # A grouped metric with several entities is not a scalar summary. A
         # single grouped row, however, is the governed metric result for that
         # explicitly filtered entity and must outrank same-named columns from
         # other task/table rows.
         if role == "group_summary" and len(rows) != 1:
             continue
-        value_column = metric_value_column_for_rows(plan, intent, rows) if intent else ""
+        metric_spec_values = summary_metric_spec_values(plan, intent, rows)
+        if metric_spec_values:
+            for item in metric_spec_values:
+                metric_key = str(item.get("metricKey") or "")
+                if not metric_key or metric_key in seen:
+                    continue
+                seen.add(metric_key)
+                values.append(item)
+            continue
+        value_column = metric_value_column_for_rows(plan, intent, rows)
         if not value_column:
             continue
         value = rows[0].get(value_column)
@@ -2030,10 +2002,344 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
                 "metricKey": metric_key,
                 "label": str(resolution.get("displayName") or friendly_column_label(plan, value_column)),
                 "value": value,
-                "taskId": item.task_id,
+                "taskId": intent.plan_task_id,
             }
         )
     return values
+
+
+def summary_metric_spec_values(plan: QueryPlan, intent: QuestionIntent, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows or not intent.metric_specs:
+        return []
+    available = set(str(key) for row in rows[:5] for key in row.keys())
+    values: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in intent.metric_specs:
+        if not isinstance(spec, dict):
+            continue
+        metric_key = str(spec.get("metricName") or spec.get("metric_name") or spec.get("metricColumn") or spec.get("metric_column") or "").strip()
+        metric_column = str(spec.get("metricColumn") or spec.get("metric_column") or metric_key).strip()
+        candidates = dedupe_strings(
+            [
+                metric_key,
+                metric_column,
+                *[str(item) for item in (spec.get("sourceColumns") or spec.get("source_columns") or []) if item],
+            ]
+        )
+        value_column = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate in available and any(answer_numeric_value(row.get(candidate)) is not None for row in rows)
+            ),
+            "",
+        )
+        if not value_column:
+            continue
+        value = rows[0].get(value_column)
+        if value in (None, ""):
+            continue
+        key = metric_key or value_column
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(
+            {
+                "metricKey": key,
+                "label": metric_spec_label(plan, intent, spec, key, value_column),
+                "value": value,
+                "taskId": intent.plan_task_id,
+            }
+        )
+    return values
+
+
+def metric_spec_label(
+    plan: QueryPlan,
+    intent: QuestionIntent,
+    spec: Dict[str, Any],
+    metric_key: str,
+    value_column: str,
+) -> str:
+    for key in ["displayName", "display_name", "naturalName", "natural_name", "label", "metricLabel", "metric_label"]:
+        label = str(spec.get(key) or "").strip()
+        if label:
+            return label
+    resolution = intent.metric_resolution or {}
+    if metric_key == str(resolution.get("metricKey") or "") and resolution.get("displayName"):
+        return str(resolution.get("displayName"))
+    for ref in getattr(intent, "knowledge_refs", []) or []:
+        ref_column = str(getattr(ref, "column", "") or (ref.get("column") if isinstance(ref, dict) else "") or "").strip()
+        ref_type = str(getattr(ref, "ref_type", "") or getattr(ref, "refType", "") or (ref.get("refType") if isinstance(ref, dict) else "") or "").upper()
+        if ref_column and ref_column in {metric_key, value_column} and ref_type in {"METRIC", "SEMANTIC_METRIC"}:
+            title = str(getattr(ref, "title", "") or (ref.get("title") if isinstance(ref, dict) else "") or "").strip()
+            if title:
+                return title
+    return friendly_column_label(plan, value_column)
+
+
+def rows_for_metric_intent(plan: QueryPlan, run_result: AgentRunResult, intent: QuestionIntent) -> List[Dict[str, Any]]:
+    """Find verified rows for a metric intent, even when execution coalesced it."""
+
+    if not run_result:
+        return []
+    candidate_groups: List[List[Dict[str, Any]]] = []
+    intent_map = intent_by_task_id(plan)
+    for item in visible_successful_tasks(plan, run_result):
+        rows = list(getattr(getattr(item, "query_bundle", None), "rows", []) or [])
+        if not rows:
+            continue
+        if item.task_id == intent.plan_task_id:
+            candidate_groups.insert(0, rows)
+            continue
+        task_intent = intent_map.get(item.task_id)
+        if task_intent and intent.preferred_table and task_intent.preferred_table != intent.preferred_table:
+            continue
+        candidate_groups.append(rows)
+    merged_rows = list(getattr(getattr(run_result, "merged_query_bundle", None), "rows", []) or [])
+    if merged_rows:
+        candidate_groups.append(merged_rows)
+    for rows in candidate_groups:
+        if metric_value_column_for_rows(plan, intent, rows):
+            return rows
+    return []
+
+
+def answer_metric_facts(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> List[Dict[str, Any]]:
+    summaries = summary_metric_values(plan, run_result) if run_result else []
+    if not summaries:
+        return []
+    time_phrase = extract_question_time_phrase(question) or "本次查询范围"
+    facts: List[Dict[str, Any]] = []
+    for item in summaries[:8]:
+        label = str(item.get("label") or item.get("metricKey") or "指标")
+        metric_key = str(item.get("metricKey") or "")
+        facts.append(
+            {
+                "metricKey": metric_key,
+                "displayName": label,
+                "value": item.get("value"),
+                "formattedValue": format_metric_value_for_answer(item.get("value"), metric_key, label),
+                "timeRange": time_phrase,
+                "taskId": item.get("taskId") or "",
+            }
+        )
+    return facts
+
+
+def include_mandatory_skeleton_in_answer_prompt(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    skeleton: str,
+) -> bool:
+    if not skeleton:
+        return False
+    if not run_result:
+        return True
+    if getattr(run_result, "evidence_gaps", None):
+        return True
+    coverage = answer_requirement_coverage(question, plan, run_result)
+    if coverage.get("shouldBlockDirectAnswer"):
+        return True
+    return not bool(answer_metric_facts(question, plan, run_result))
+
+
+def should_proactively_patch_metric_summary(
+    answer: str,
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+) -> bool:
+    if not run_result:
+        return True
+    if getattr(run_result, "evidence_gaps", None):
+        return True
+    metric_facts = answer_metric_facts(question, plan, run_result)
+    if not metric_facts:
+        return True
+    return any(not answer_contains_metric_fact_value(answer, fact) for fact in metric_facts)
+
+
+def should_apply_mandatory_skeleton_to_draft(
+    answer: str,
+    skeleton: str,
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+) -> bool:
+    if not skeleton:
+        return False
+    if not run_result:
+        return True
+    if getattr(run_result, "evidence_gaps", None):
+        return True
+    metric_facts = answer_metric_facts(question, plan, run_result)
+    if not metric_facts:
+        return True
+    return any(not answer_contains_metric_fact_value(answer, fact) for fact in metric_facts)
+
+
+def lightweight_answer_contract_verification(
+    question: str,
+    plan: QueryPlan,
+    run_result: AgentRunResult | None,
+    answer: str,
+) -> AnswerClaimVerification | None:
+    metric_facts = answer_metric_facts(question, plan, run_result)
+    if not metric_facts:
+        return None
+    claims: List[AnswerClaim] = []
+    unsupported: List[AnswerClaim] = []
+    missing = [fact for fact in metric_facts if not answer_contains_metric_fact_value(answer, fact)]
+    if missing:
+        claim = AnswerClaim(
+            text="metricFacts coverage",
+            numeric_values=[str(item.get("formattedValue") or item.get("value") or "") for item in missing],
+            supported=False,
+            reasons=["missing_metric_fact:%s" % (item.get("metricKey") or item.get("displayName") or "") for item in missing],
+        )
+        claims.append(claim)
+        unsupported.append(claim)
+    extra_numbers = unsupported_answer_numbers(answer, question, run_result, metric_facts)
+    if extra_numbers:
+        claim = AnswerClaim(
+            text="extra numeric values",
+            numeric_values=extra_numbers,
+            supported=False,
+            reasons=["unsupported_extra_value:%s" % value for value in extra_numbers],
+        )
+        claims.append(claim)
+        unsupported.append(claim)
+    if not claims:
+        claims.append(
+            AnswerClaim(
+                text="metricFacts coverage",
+                numeric_values=[str(item.get("formattedValue") or item.get("value") or "") for item in metric_facts],
+                supported=True,
+            )
+        )
+    return AnswerClaimVerification(
+        passed=not unsupported,
+        fact_count=len(metric_facts),
+        claims=claims,
+        unsupported_claims=unsupported,
+    )
+
+
+def lightweight_answer_failure_reason(verification: AnswerClaimVerification | None) -> str:
+    if verification is None:
+        return ""
+    reasons: List[str] = []
+    for claim in verification.unsupported_claims[:5]:
+        reasons.extend(str(item) for item in claim.reasons if str(item))
+    return ";".join(dedupe_strings(reasons)[:8]) or "lightweight_answer_contract_failed"
+
+
+def answer_contains_metric_fact_value(answer: str, fact: Dict[str, Any]) -> bool:
+    answer_numbers = answer_numeric_tokens(answer)
+    expected = numeric_token_value(fact.get("value"))
+    if expected is not None and any(float_close(expected, item) for item in answer_numbers):
+        return True
+    formatted = normalize_answer_value_text(fact.get("formattedValue"))
+    raw = normalize_answer_value_text(fact.get("value"))
+    text = normalize_answer_value_text(answer)
+    return bool((formatted and formatted in text) or (raw and raw in text))
+
+
+def answer_contains_summary_metric_value(answer: str, item: Dict[str, Any]) -> bool:
+    label = str(item.get("label") or "")
+    metric_key = str(item.get("metricKey") or "")
+    return answer_contains_metric_fact_value(
+        answer,
+        {
+            "value": item.get("value"),
+            "formattedValue": format_metric_value_for_answer(item.get("value"), metric_key, label),
+        },
+    )
+
+
+def unsupported_answer_numbers(
+    answer: str,
+    question: str,
+    run_result: AgentRunResult | None,
+    metric_facts: List[Dict[str, Any]],
+) -> List[str]:
+    allowed = allowed_answer_numbers(question, run_result, metric_facts)
+    unsupported: List[str] = []
+    for raw, value in answer_numeric_token_pairs(answer):
+        if any(float_close(value, candidate) for candidate in allowed):
+            continue
+        # Avoid treating list counts and prose scaffolding as business facts.
+        if abs(value) < 10 and not raw.endswith("%") and "." not in raw:
+            continue
+        unsupported.append(raw)
+    return dedupe_strings(unsupported)
+
+
+def allowed_answer_numbers(
+    question: str,
+    run_result: AgentRunResult | None,
+    metric_facts: List[Dict[str, Any]],
+) -> List[float]:
+    values: List[float] = []
+    for fact in metric_facts:
+        value = numeric_token_value(fact.get("value"))
+        if value is not None:
+            values.append(value)
+    if run_result:
+        for row in list(getattr(getattr(run_result, "merged_query_bundle", None), "rows", []) or [])[:20]:
+            for value in row.values():
+                numeric = numeric_token_value(value)
+                if numeric is not None:
+                    values.append(numeric)
+        for task in getattr(run_result, "task_results", []) or []:
+            for row in list(getattr(getattr(task, "query_bundle", None), "rows", []) or [])[:20]:
+                for value in row.values():
+                    numeric = numeric_token_value(value)
+                    if numeric is not None:
+                        values.append(numeric)
+    values.extend(value for _, value in answer_numeric_token_pairs(question))
+    return values
+
+
+def answer_numeric_tokens(text: str) -> List[float]:
+    return [value for _, value in answer_numeric_token_pairs(text)]
+
+
+def answer_numeric_token_pairs(text: str) -> List[Tuple[str, float]]:
+    pairs: List[Tuple[str, float]] = []
+    scrubbed = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", " ", str(text or ""))
+    for match in re.finditer(r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?%?", scrubbed):
+        raw = match.group(0)
+        value = numeric_token_value(raw)
+        if value is None:
+            continue
+        pairs.append((raw, value))
+    return pairs
+
+
+def numeric_token_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    percent = text.endswith("%")
+    text = text.rstrip("%")
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number / 100.0 if percent else number
+
+
+def float_close(left: float, right: float) -> bool:
+    return abs(left - right) <= max(0.005, abs(right) * 0.000001)
+
+
+def normalize_answer_value_text(value: Any) -> str:
+    return re.sub(r"[\s,，元%]+", "", str(value or "").strip().lower())
 
 
 def multi_summary_metric_sentence(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
@@ -3594,7 +3900,7 @@ def answer_data_package(
     merchant: MerchantInfo | None = None,
     personalization_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return verified_answer_context(
+    payload = verified_answer_context(
         question,
         plan,
         run_result,
@@ -3602,6 +3908,10 @@ def answer_data_package(
         merchant=merchant,
         personalization_context=personalization_context,
     ).prompt_payload()
+    metric_facts = answer_metric_facts(question, plan, run_result)
+    if metric_facts:
+        payload["metricFacts"] = metric_facts
+    return payload
 
 
 def verified_answer_context(
