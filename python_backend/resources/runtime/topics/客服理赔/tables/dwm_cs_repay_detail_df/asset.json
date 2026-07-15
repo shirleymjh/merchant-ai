@@ -742,11 +742,12 @@
     },
     {
       "columnName": "repay_amt",
-      "businessName": "支付金额",
+      "businessName": "赔付支付金额",
       "role": "METRIC",
-      "description": "支付金额",
+      "description": "赔付/理赔明细单中的支付金额",
       "aliases": [
-        "支付金额",
+        "赔付支付金额",
+        "理赔支付金额",
         "repay_amt"
       ],
       "enumValues": [],
@@ -1284,7 +1285,7 @@
       "businessName": "赔付明细金额",
       "formula": "SUM(repay_amt)",
       "unit": "元",
-      "description": "赔付/理赔单支付金额",
+      "description": "赔付/理赔明细单中的支付金额",
       "sourceColumns": [
         "repay_amt"
       ],
@@ -1301,8 +1302,9 @@
       "metricGrain": "repay_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "赔付金额",
-      "originalBusinessName": "赔付金额",
+      "naturalName": "赔付明细金额",
+      "originalBusinessName": "赔付明细金额",
+      "naturalAlias": "赔付明细金额",
       "sourceColumnAliases": [
         "repay_amt"
       ]
@@ -1377,12 +1379,10 @@
       "aliases": [
         "赔付明细单量",
         "repay_bill_cnt",
-        "赔付订单量",
-        "赔付订单数",
-        "理赔订单量",
-        "有没有赔付",
-        "有赔付订单",
-        "有产生赔付"
+        "赔付单明细量",
+        "理赔明细单量",
+        "有赔付明细单",
+        "有产生赔付明细"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成",
@@ -1392,9 +1392,9 @@
       "metricGrain": "repay_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "赔付单量",
-      "originalBusinessName": "赔付单量",
-      "naturalAlias": "赔付单量",
+      "naturalName": "赔付明细单量",
+      "originalBusinessName": "赔付明细单量",
+      "naturalAlias": "赔付明细单量",
       "sourceColumnAliases": [
         "bill_id"
       ]
@@ -1529,10 +1529,11 @@
       "evidence": "来自字段 `is_return` 的语义注释"
     },
     {
-      "term": "支付金额",
-      "description": "支付金额",
+      "term": "赔付支付金额",
+      "description": "赔付/理赔明细单中的支付金额",
       "aliases": [
-        "支付金额",
+        "赔付支付金额",
+        "理赔支付金额",
         "repay_amt"
       ],
       "relatedColumns": [

@@ -2554,9 +2554,9 @@
       "aliases": [
         "客服工单明细量",
         "ticket_cnt",
-        "客服工单量高",
         "客服工单明细数",
-        "按商品客服工单量"
+        "工单明细量",
+        "按商品客服工单明细量"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成",
@@ -2566,8 +2566,9 @@
       "metricGrain": "ticket_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "工单量",
-      "originalBusinessName": "工单量",
+      "naturalName": "客服工单明细量",
+      "originalBusinessName": "客服工单明细量",
+      "naturalAlias": "客服工单明细量",
       "sourceColumnAliases": [
         "ticket_id"
       ]

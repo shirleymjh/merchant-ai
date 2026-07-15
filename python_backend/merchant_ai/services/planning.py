@@ -24,6 +24,7 @@ from merchant_ai.models import (
     QuestionIntent,
     QueryPlan,
     RecallBundle,
+    RecallItem,
     TaskRole,
     ToolCachePolicy,
 )
@@ -1196,7 +1197,11 @@ class QueryGraphPlanner:
                 if semantic_metric_plan.intents:
                     return semantic_metric_plan, semantic_metric_plan.knowledge_requests, payload.get("reason", "")
         trace_reason = planner_failure_trace_reason(self.llm.configured, self.llm.last_error)
-        if fast_plan.intents and semantic_failure_candidate_valid(question, fast_plan, asset_pack):
+        fast_plan_is_single_metric_fallback = any(
+            "planner.semantic_fast_path=single_metric_semantic_tool" in str(item)
+            for item in fast_plan.agent_trace or []
+        )
+        if fast_plan.intents and not fast_plan_is_single_metric_fallback and semantic_failure_candidate_valid(question, fast_plan, asset_pack):
             fast_plan.agent_trace.extend([trace_reason, "planner.semantic_fast_path=validated_after_llm_failure"])
             return fast_plan, fast_plan.knowledge_requests, "SEMANTIC_FAST_PATH"
         return self.understanding_extractor.failure_fallback_plan(question, asset_pack, trace_reason)
@@ -1242,6 +1247,20 @@ class QueryGraphPlanner:
 
     def _semantic_metric_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         return compile_semantic_metric_fallback_graph(question, asset_pack)
+
+    def semantic_asset_selection_plan(
+        self,
+        question: str,
+        recall_bundle: RecallBundle,
+        asset_pack: PlanningAssetPack,
+        planner_context: Dict[str, Any] | None = None,
+    ) -> Tuple[QueryPlan, Dict[str, Any]]:
+        return self._semantic_asset_selection_plan(
+            question,
+            recall_bundle,
+            asset_pack,
+            planner_context=planner_context,
+        )
 
     def _multi_metric_trend_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         return compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
@@ -1431,10 +1450,53 @@ class QueryGraphPlanner:
                 "gaps": [],
                 "reason": self.llm.last_error or "empty selector response",
             }
+        payload = self._normalize_semantic_selection_payload(payload, selected_payload)
+        read_refs = self._semantic_selection_read_refs(payload, selected_payload)
+        read_stats: Dict[str, Any] = {}
+        if read_refs:
+            read_payload = dict(selected_payload)
+            read_payload["selectorRound"] = 2
+            read_payload["previousDecision"] = {
+                key: payload.get(key)
+                for key in ["action", "status", "readRefs", "selectedRefs", "reason"]
+                if payload.get(key) not in (None, "", [])
+            }
+            read_payload["semanticReadResults"] = self._semantic_selection_read_results(read_refs, asset_pack, selected_payload)
+            read_payload["outputContract"] = {
+                "format": '{"action":"select|ask_human|unsupported","selectedRefs":["semantic:..."],"clarifications":[{"phrase":"","question":"","options":[{"ref":"","label":""}]}],"reason":""}',
+                "rule": "After semantic_read, do not request another read. Select if enough evidence; otherwise ask_human.",
+            }
+            read_user = json.dumps(read_payload, ensure_ascii=False)
+            read_stats = planner_prompt_stats(prompt.system_prompt, read_user, {})
+            try:
+                read_result = self.llm.json_chat(
+                    prompt.system_prompt,
+                    read_user,
+                    {},
+                    timeout_seconds=self._semantic_asset_selection_timeout_seconds(),
+                )
+            except TypeError:
+                read_result = self.llm.json_chat(prompt.system_prompt, read_user, {})
+            if isinstance(read_result, dict) and read_result:
+                payload = self._normalize_semantic_selection_payload(read_result, read_payload, allow_read=False)
+                payload["_previousSelectorDecision"] = read_payload["previousDecision"]
+                payload["_semanticReadResults"] = read_payload["semanticReadResults"]
+            else:
+                payload = {
+                    "status": "INVALID",
+                    "selectedRefs": [],
+                    "gaps": [],
+                    "reason": self.llm.last_error or "empty selector read response",
+                    "_previousSelectorDecision": read_payload["previousDecision"],
+                    "_semanticReadResults": read_payload["semanticReadResults"],
+                }
         payload["_promptStats"] = selected_stats
         payload["_promptStats"]["budgetTrace"] = budget_trace
+        if read_stats:
+            payload["_promptStats"]["semanticReadRound"] = read_stats
         payload["_promptTrace"] = prompt.trace()
         payload["_retrievedCandidates"] = list(selected_payload.get("retrievedCandidates") or [])
+        payload["_candidateGroups"] = list(selected_payload.get("candidateGroups") or [])
         self.artifact_store.write_json("planner", "semantic_asset_selection_prompt.json", selected_payload, preview_chars=0)
         self.artifact_store.write_json("planner", "semantic_asset_selection_payload.json", payload, preview_chars=0)
         return payload
@@ -1448,14 +1510,16 @@ class QueryGraphPlanner:
         budget_level: int = 0,
     ) -> Dict[str, Any]:
         candidate_limit = 8 if budget_level == 0 else 6 if budget_level == 1 else 4
-        preview_chars = 360 if budget_level == 0 else 260 if budget_level == 1 else 180
-        candidates = self._semantic_selection_recalled_candidates(recall_bundle, asset_pack, candidate_limit, preview_chars)
+        metric_phrases = self._semantic_selection_metric_phrases(question, planner_context, asset_pack)
+        candidates = self._semantic_selection_recalled_candidates(recall_bundle, asset_pack, candidate_limit, metric_phrases)
         return {
             "question": question,
+            "metricPhrases": metric_phrases,
             "retrievedCandidates": candidates,
+            "candidateGroups": self._semantic_selection_candidate_groups(metric_phrases, candidates),
             "outputContract": {
-                "format": '{"status":"SELECTED|AMBIGUOUS|NEED_MORE_KNOWLEDGE|UNSUPPORTED|INVALID","selectedRefs":["semantic:..."],"gaps":[{"phrase":"","reason":"","candidateRefs":[]}],"reason":""}',
-                "rule": "selectedRefs must come from retrievedCandidates.ref",
+                "format": '{"action":"select|semantic_read|ask_human|unsupported","selectedRefs":["semantic:..."],"readRefs":["semantic:..."],"clarifications":[{"phrase":"","question":"","options":[{"ref":"","label":""}]}],"reason":""}',
+                "rule": "Use short cards first. If a metric definition is needed, request semantic_read for at most 3 refs. Do not generate SQL or QueryGraph.",
             },
             "plannerBudgetLevel": budget_level,
         }
@@ -1465,7 +1529,7 @@ class QueryGraphPlanner:
         recall_bundle: RecallBundle,
         asset_pack: PlanningAssetPack,
         limit: int,
-        preview_chars: int,
+        metric_phrases: List[str],
     ) -> List[Dict[str, Any]]:
         source_items = list(recall_bundle.items or [])
         if not source_items:
@@ -1482,19 +1546,363 @@ class QueryGraphPlanner:
             if not ref or ref in seen:
                 continue
             seen.add(ref)
-            candidates.append(
-                {
-                    "id": "M%d" % len(candidates),
-                    "ref": ref,
-                    "title": str(item.title or metadata.get("businessName") or metadata.get("metricKey") or "")[:120],
-                    "topic": str(item.topic or metadata.get("topic") or "")[:80],
-                    "table": str(item.table or metadata.get("tableName") or metadata.get("ownerTable") or "")[:120],
-                    "text": trim_text(item.content or json.dumps(metadata, ensure_ascii=False), preview_chars),
-                }
-            )
+            candidates.append(self._semantic_selection_candidate_card(item, asset_pack, "M%d" % len(candidates), metric_phrases))
             if len(candidates) >= max(1, limit):
                 break
         return candidates
+
+    def _semantic_selection_metric_phrases(
+        self,
+        question: str,
+        planner_context: Dict[str, Any] | None,
+        asset_pack: PlanningAssetPack,
+    ) -> List[str]:
+        fast = (planner_context or {}).get("fastUnderstanding") or (asset_pack.metric_compaction or {}).get("fastUnderstanding") or {}
+        phrases = fast.get("metricPhrases") or fast.get("metric_phrases") or []
+        if isinstance(phrases, str):
+            phrases = [phrases]
+        return dedupe_strings([str(item).strip() for item in phrases if str(item or "").strip()])[:8]
+
+    def _semantic_selection_candidate_card(
+        self,
+        item: RecallItem,
+        asset_pack: PlanningAssetPack,
+        candidate_id: str,
+        metric_phrases: List[str],
+    ) -> Dict[str, Any]:
+        metadata = dict(item.metadata or {})
+        ref = str(metadata.get("semanticRefId") or item.doc_id or "")
+        table = str(item.table or metadata.get("tableName") or metadata.get("ownerTable") or "")
+        metric = metric_entry_by_ref(ref, asset_pack, table)
+        metric_metadata = dict(getattr(metric, "metadata", {}) or {})
+        merged = {**metric_metadata, **metadata}
+        metric_key = str(merged.get("metricKey") or merged.get("canonicalMetricKey") or getattr(metric, "key", "") or ref.rsplit(":", 1)[-1])
+        name = str(
+            merged.get("displayName")
+            or merged.get("businessName")
+            or getattr(metric, "title", "")
+            or item.title
+            or metric_key
+        )
+        aliases = dedupe_strings(
+            [
+                str(name),
+                metric_key,
+                *[str(alias) for alias in getattr(metric, "aliases", []) or []],
+                *[str(alias) for alias in merged.get("aliases") or []],
+            ]
+        )
+        matched = str(merged.get("matchedMetricLabel") or merged.get("matchedExactMetricLabel") or "").strip()
+        if not matched:
+            matched = self._semantic_selection_best_phrase_match(metric_phrases, [name, metric_key, *aliases])
+        confidence = merged.get("metricResolutionConfidence")
+        try:
+            confidence_value = round(float(confidence), 3)
+        except (TypeError, ValueError):
+            confidence_value = round(float(item.fusion_score or 0.0), 3)
+        grain = str(
+            merged.get("metricGrain")
+            or merged.get("grainHint")
+            or merged.get("dataGrain")
+            or merged.get("metricLevel")
+            or ""
+        )[:80]
+        return {
+            "id": candidate_id,
+            "ref": ref,
+            "metricKey": metric_key[:120],
+            "name": name[:80],
+            "matched": matched[:80],
+            "matchType": str(merged.get("metricResolutionType") or "")[:40],
+            "confidence": confidence_value,
+            "topic": str(item.topic or merged.get("topic") or "")[:50],
+            "table": table[:100],
+            "grain": grain,
+            "kind": self._semantic_selection_metric_kind(merged),
+            "description": trim_text(
+                merged.get("selectionGuidance")
+                or merged.get("disambiguationName")
+                or merged.get("description")
+                or getattr(metric, "description", "")
+                or "",
+                80,
+            ),
+            "readableRefs": self._semantic_selection_readable_refs(candidate_id, ref, table, str(item.topic or merged.get("topic") or ""), merged, asset_pack),
+        }
+
+    def _semantic_selection_best_phrase_match(self, phrases: List[str], labels: List[str]) -> str:
+        normalized_labels = [normalize_semantic_text(label) for label in labels if str(label or "").strip()]
+        for phrase in phrases:
+            normalized = normalize_semantic_text(phrase)
+            if normalized and any(normalized in label or label in normalized for label in normalized_labels if label):
+                return str(phrase)
+        return ""
+
+    def _semantic_selection_metric_kind(self, metadata: Dict[str, Any]) -> str:
+        for key in [
+            "metricKind",
+            "metricLevel",
+            "metricLayer",
+            "dataGrain",
+            "aggregationLevel",
+            "semanticKind",
+        ]:
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value[:60]
+        return ""
+
+    def _semantic_selection_readable_refs(
+        self,
+        candidate_id: str,
+        metric_ref: str,
+        table: str,
+        topic: str,
+        metadata: Dict[str, Any],
+        asset_pack: PlanningAssetPack,
+    ) -> List[Dict[str, str]]:
+        refs: List[Dict[str, str]] = []
+
+        def add(ref: str, ref_type: str, label: str) -> None:
+            if not ref:
+                return
+            if any(item.get("ref") == ref for item in refs):
+                return
+            refs.append({"id": "%s.R%d" % (candidate_id, len(refs)), "ref": ref, "type": ref_type, "label": label[:48]})
+
+        add(metric_ref, "metric", str(metadata.get("businessName") or metadata.get("displayName") or metadata.get("metricKey") or metric_ref))
+        if topic and table:
+            add("semantic:%s:%s:table" % (topic, table), "table", table)
+        for column in metadata.get("sourceColumns") or metadata.get("source_columns") or []:
+            if topic and table and str(column or "").strip():
+                add("semantic:%s:%s:field:%s" % (topic, table, str(column).strip()), "field", str(column).strip())
+            if len(refs) >= 6:
+                break
+        if len(refs) < 6:
+            for rule in asset_pack.rules:
+                if rule.topic == topic and (not rule.table or rule.table == table):
+                    add(rule.source_ref_id, "rule", rule.title or rule.key)
+                if len(refs) >= 6:
+                    break
+        return refs[:6]
+
+    def _semantic_selection_candidate_groups(self, metric_phrases: List[str], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        groups: List[Dict[str, Any]] = []
+        for phrase in metric_phrases:
+            normalized = normalize_semantic_text(phrase)
+            ids = []
+            for card in candidates:
+                labels = [card.get("matched"), card.get("name"), card.get("metricKey"), *(card.get("aliases") or [])]
+                if normalized and any(normalized in normalize_semantic_text(label) or normalize_semantic_text(label) in normalized for label in labels if label):
+                    ids.append(card.get("id"))
+            if ids:
+                groups.append({"phrase": phrase, "candidateIds": dedupe_strings([str(item) for item in ids if item])[:4]})
+        return groups
+
+    def _normalize_semantic_selection_payload(
+        self,
+        payload: Dict[str, Any],
+        request_payload: Dict[str, Any],
+        allow_read: bool = True,
+    ) -> Dict[str, Any]:
+        normalized = dict(payload or {})
+        ref_by_id: Dict[str, str] = {}
+        for item in request_payload.get("retrievedCandidates") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") and item.get("ref"):
+                ref_by_id[str(item.get("id") or "")] = str(item.get("ref") or "")
+            for related in item.get("readableRefs") or []:
+                if isinstance(related, dict) and related.get("id") and related.get("ref"):
+                    ref_by_id[str(related.get("id") or "")] = str(related.get("ref") or "")
+
+        def refs_from(*keys: str) -> List[str]:
+            refs: List[str] = []
+            for key in keys:
+                value = normalized.get(key)
+                if isinstance(value, str):
+                    value = [value]
+                if not isinstance(value, list):
+                    continue
+                for raw in value:
+                    text = str(raw or "").strip()
+                    if not text:
+                        continue
+                    refs.append(ref_by_id.get(text, text))
+            return dedupe_strings(refs)
+
+        selected_refs = refs_from("selectedRefs", "selected_refs", "selectedIds", "selected_ids")
+        read_refs = refs_from("readRefs", "read_refs", "refs")
+        uncovered_phrases = self._semantic_selection_uncovered_phrases(selected_refs, request_payload)
+        action = str(normalized.get("action") or normalized.get("tool") or "").strip().lower()
+        status = str(normalized.get("status") or "").strip().upper()
+        if allow_read and read_refs and (action in {"semantic_read", "read", "need_read"} or status == "NEED_READ"):
+            status = "NEED_READ"
+            action = "semantic_read"
+        elif allow_read and read_refs and uncovered_phrases:
+            status = "NEED_READ"
+            action = "semantic_read"
+        elif action in {"select", "selected"} or selected_refs:
+            status = "SELECTED"
+            action = "select"
+        elif allow_read and (action in {"semantic_read", "read", "need_read"} or status == "NEED_READ" or read_refs):
+            status = "NEED_READ"
+            action = "semantic_read"
+        elif action in {"ask_human", "clarify", "clarification"} or status in {"AMBIGUOUS", "NEED_CLARIFICATION"}:
+            status = "NEED_CLARIFICATION"
+            action = "ask_human"
+        elif action in {"unsupported", "fail"} or status == "UNSUPPORTED":
+            status = "UNSUPPORTED"
+            action = "unsupported"
+        elif not status:
+            status = "INVALID"
+        normalized["action"] = action or status.lower()
+        normalized["status"] = status
+        normalized["selectedRefs"] = selected_refs
+        normalized["readRefs"] = read_refs[:3]
+        if uncovered_phrases:
+            normalized["_uncoveredPhrases"] = uncovered_phrases
+        return normalized
+
+    def _semantic_selection_uncovered_phrases(self, selected_refs: List[str], request_payload: Dict[str, Any]) -> List[str]:
+        if not selected_refs:
+            return [
+                str(group.get("phrase") or "")
+                for group in request_payload.get("candidateGroups") or []
+                if isinstance(group, dict) and str(group.get("phrase") or "")
+            ]
+        candidate_id_by_ref = {
+            str(item.get("ref") or ""): str(item.get("id") or "")
+            for item in request_payload.get("retrievedCandidates") or []
+            if isinstance(item, dict) and item.get("ref") and item.get("id")
+        }
+        selected_ids = {candidate_id_by_ref.get(ref, ref) for ref in selected_refs}
+        uncovered: List[str] = []
+        for group in request_payload.get("candidateGroups") or []:
+            if not isinstance(group, dict):
+                continue
+            candidate_ids = {str(item) for item in group.get("candidateIds") or [] if str(item or "")}
+            if candidate_ids and candidate_ids.isdisjoint(selected_ids):
+                phrase = str(group.get("phrase") or "")
+                if phrase:
+                    uncovered.append(phrase)
+        return uncovered
+
+    def _semantic_selection_read_refs(self, payload: Dict[str, Any], request_payload: Dict[str, Any]) -> List[str]:
+        if str(payload.get("status") or "").upper() != "NEED_READ":
+            return []
+        allowed: Set[str] = set()
+        for item in request_payload.get("retrievedCandidates") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ref"):
+                allowed.add(str(item.get("ref") or ""))
+            for related in item.get("readableRefs") or []:
+                if isinstance(related, dict) and related.get("ref"):
+                    allowed.add(str(related.get("ref") or ""))
+        refs = [ref for ref in payload.get("readRefs") or [] if ref in allowed]
+        return dedupe_strings(refs)[:3]
+
+    def _semantic_selection_read_results(
+        self,
+        refs: List[str],
+        asset_pack: PlanningAssetPack,
+        request_payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        cards: Dict[str, Dict[str, Any]] = {}
+        for item in request_payload.get("retrievedCandidates") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ref"):
+                cards[str(item.get("ref") or "")] = item
+            for related in item.get("readableRefs") or []:
+                if isinstance(related, dict) and related.get("ref"):
+                    cards[str(related.get("ref") or "")] = {
+                        "table": item.get("table"),
+                        "topic": item.get("topic"),
+                        "parentRef": item.get("ref"),
+                        **related,
+                    }
+        results: List[Dict[str, Any]] = []
+        for ref in refs[:3]:
+            results.append(self._semantic_selection_read_ref(ref, asset_pack, cards.get(ref) or {}))
+        return results
+
+    def _semantic_selection_read_ref(
+        self,
+        ref: str,
+        asset_pack: PlanningAssetPack,
+        card: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        table = str(card.get("table") or "")
+        metric = metric_entry_by_ref(ref, asset_pack, table)
+        if metric:
+            metadata = dict(metric.metadata or {})
+            return {
+                "ref": ref,
+                "type": "metric",
+                "metricKey": metric.key,
+                "name": str(metadata.get("displayName") or metadata.get("businessName") or metric.title or metric.key)[:120],
+                "table": metric.table,
+                "topic": metric.topic,
+                "formula": trim_text(metadata.get("formula") or metadata.get("metricFormula") or "", 240),
+                "sourceColumns": [str(item) for item in (metadata.get("sourceColumns") or metric.columns or [])[:8] if str(item or "")],
+                "aliases": dedupe_strings([metric.title, metric.key, *metric.aliases, *[str(item) for item in metadata.get("aliases") or []]])[:8],
+                "description": trim_text(metadata.get("description") or metric.description or "", 260),
+                "grain": str(metadata.get("metricGrain") or metadata.get("dataGrain") or metadata.get("metricLevel") or "")[:120],
+                "usage": trim_text(metadata.get("selectionGuidance") or metadata.get("usage") or metadata.get("disambiguationName") or "", 220),
+            }
+        entry = self._semantic_selection_asset_entry_by_ref(ref, asset_pack)
+        if entry:
+            metadata = dict(entry.metadata or {})
+            return {
+                "ref": ref,
+                "type": str(metadata.get("semanticKind") or metadata.get("kind") or "asset").lower(),
+                "key": entry.key,
+                "name": str(metadata.get("displayName") or metadata.get("businessName") or entry.title or entry.key)[:120],
+                "table": entry.table,
+                "topic": entry.topic,
+                "columns": entry.columns[:16],
+                "aliases": dedupe_strings([entry.title, entry.key, *entry.aliases, *[str(item) for item in metadata.get("aliases") or []]])[:8],
+                "description": trim_text(metadata.get("description") or entry.description or "", 320),
+                "grain": str(metadata.get("dataGrain") or metadata.get("grain") or "")[:120],
+            }
+        rel = self._semantic_selection_relationship_by_ref(ref, asset_pack)
+        if rel:
+            return {
+                "ref": ref,
+                "type": "relationship",
+                "relationshipId": rel.relationship_id,
+                "leftTable": rel.left_table,
+                "rightTable": rel.right_table,
+                "joinKeys": rel.join_keys[:4],
+                "grain": rel.grain,
+                "semantics": rel.path_semantics[:6],
+                "description": trim_text(rel.description or " ".join(rel.use_cases or []), 260),
+            }
+        item = asset_pack.source_refs.get(ref)
+        metadata = dict(getattr(item, "metadata", {}) or {}) if item else {}
+        return {
+            "ref": ref,
+            "type": str(metadata.get("semanticKind") or metadata.get("sourceType") or getattr(item, "source_type", "") or "asset").lower(),
+            "name": str(metadata.get("displayName") or metadata.get("businessName") or getattr(item, "title", "") or ref)[:120],
+            "table": str(metadata.get("tableName") or metadata.get("ownerTable") or getattr(item, "table", "") or "")[:120],
+            "topic": str(metadata.get("topic") or getattr(item, "topic", "") or "")[:80],
+            "content": trim_text(getattr(item, "content", "") if item else "", 420),
+        }
+
+    def _semantic_selection_asset_entry_by_ref(self, ref: str, asset_pack: PlanningAssetPack) -> PlanningAssetEntry | None:
+        for collection in [asset_pack.tables, asset_pack.fields, asset_pack.metrics, asset_pack.rules, asset_pack.terms, asset_pack.entity_keys, asset_pack.freshness]:
+            for entry in collection:
+                if ref and ref in {entry.source_ref_id, entry.key, entry.table}:
+                    return entry
+        return None
+
+    def _semantic_selection_relationship_by_ref(self, ref: str, asset_pack: PlanningAssetPack) -> Any:
+        for rel in asset_pack.relationships:
+            if ref and ref in {rel.source_ref_id, rel.relationship_id}:
+                return rel
+        return None
 
     def _semantic_selection_coverage_gaps(
         self,
@@ -1502,11 +1910,18 @@ class QueryGraphPlanner:
         plan: QueryPlan,
         asset_pack: PlanningAssetPack,
     ) -> List[GraphValidationGap]:
+        understanding = plan.question_understanding or {}
+        if isinstance(understanding, dict) and str(understanding.get("source") or "") == "semantic_asset_selection":
+            # The semantic selector has already bound every metric phrase to a
+            # formal semantic ref.  Do not re-interpret the raw question with a
+            # keyword domain scan here; profile-level metrics can legitimately
+            # cover refund/coupon/order business concepts.
+            return explicit_object_ref_filter_gaps(question, plan, asset_pack)
         return query_plan_question_coverage_gaps(question, plan, asset_pack)
 
     def _semantic_asset_selection_timeout_seconds(self) -> int:
         planner_timeout = int(getattr(self.settings, "llm_planner_timeout_seconds", 20) or 20)
-        return max(5, min(10, planner_timeout))
+        return max(5, planner_timeout)
 
     def _compile_semantic_asset_selection_payload(
         self,
@@ -1555,6 +1970,11 @@ class QueryGraphPlanner:
                     "ownerTable": item["metric"].table,
                     "sourcePhrase": item["sourcePhrase"],
                     "groupByColumn": group_by,
+                    "resolvedMetricRef": item["metric"].key,
+                    "resolvedOwnerTable": item["metric"].table,
+                    "semanticRefId": item["metric"].source_ref_id,
+                    "metricResolutionSource": "semantic_metric_ref",
+                    "metricGovernanceMode": "published_semantic",
                 }
             )
         understanding = {
@@ -1571,6 +1991,11 @@ class QueryGraphPlanner:
                 "groupByColumn": ranking_group_by,
                 "order": "desc",
                 "limit": max(2, time_window_days) if time_series else 1,
+                "resolvedMetricRef": ranking_item["metric"].key,
+                "resolvedOwnerTable": ranking_item["metric"].table,
+                "semanticRefId": ranking_item["metric"].source_ref_id,
+                "metricResolutionSource": "semantic_metric_ref",
+                "metricGovernanceMode": "published_semantic",
             },
             "requestedMeasures": requested_measures,
             "metricCandidateDecisions": self._semantic_selection_metric_decisions(payload, selected),
@@ -1612,7 +2037,15 @@ class QueryGraphPlanner:
             raw_items = [
                 {
                     "semanticRefId": ref,
-                    "sourcePhrase": str((candidate_by_ref.get(ref) or {}).get("title") or ref.rsplit(":", 1)[-1]),
+                    "sourcePhrase": str(
+                        (candidate_by_ref.get(ref) or {}).get("matched")
+                        or (candidate_by_ref.get(ref) or {}).get("name")
+                        or (candidate_by_ref.get(ref) or {}).get("metricKey")
+                        or ref.rsplit(":", 1)[-1]
+                    ),
+                    "ownerTable": str((candidate_by_ref.get(ref) or {}).get("table") or ""),
+                    "metricRef": str((candidate_by_ref.get(ref) or {}).get("metricKey") or ""),
+                    "confidence": str((candidate_by_ref.get(ref) or {}).get("confidence") or ""),
                 }
                 for ref in selected_refs
             ]
@@ -4701,19 +5134,8 @@ def diagnostic_catalog_table_entries(asset_pack: PlanningAssetPack, question: st
 
 
 def prompt_table_entries(asset_pack: PlanningAssetPack, question: str) -> List[Any]:
-    requested_domains = set(requested_semantic_domains(question, asset_pack))
     ranked = rank_asset_entries(asset_pack.tables, question)
-    if not requested_domains:
-        return ranked[:8]
-    selected: List[Any] = []
-    for table in ranked:
-        table_name = table.table or table.key
-        domain = semantic_domain_for_table(table_name)
-        if domain in requested_domains or domain == "order":
-            selected.append(table)
-    if not selected:
-        selected = ranked[:8]
-    return selected[:8]
+    return ranked[:8]
 
 
 def planner_catalog_table_entries(asset_pack: PlanningAssetPack, question: str, metrics: List[Any], limit: int = 3) -> List[Any]:
@@ -4786,7 +5208,7 @@ def question_understanding_expanded_tables(asset_pack: PlanningAssetPack) -> Lis
 
 
 def planner_catalog_seed_domains(question: str, asset_pack: PlanningAssetPack) -> List[str]:
-    return requested_semantic_domains(question, asset_pack)
+    return []
 
 
 def best_catalog_table_for_domain(domain: str, tables: List[str], question: str) -> str:
@@ -5023,6 +5445,42 @@ def promote_more_specific_ranking_understanding(understanding: Dict[str, Any]) -
     ]
 
 
+def understanding_metric_contract_is_sealed(item: Dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    semantic_ref_id = str(item.get("semanticRefId") or item.get("semantic_ref_id") or "")
+    if not semantic_ref_id.startswith("semantic:") or semantic_ref_id.startswith("semantic:compiled_local:"):
+        return False
+    metric_ref = str(
+        item.get("resolvedMetricRef")
+        or item.get("resolved_metric_ref")
+        or item.get("metricRef")
+        or item.get("metric_ref")
+        or ""
+    )
+    owner_table = str(
+        item.get("resolvedOwnerTable")
+        or item.get("resolved_owner_table")
+        or item.get("ownerTable")
+        or item.get("owner_table")
+        or ""
+    )
+    return bool(metric_ref and owner_table)
+
+
+def allow_phrase_override_for_understanding_metric(
+    understanding: Dict[str, Any],
+    item: Dict[str, Any],
+    default: bool | None = None,
+) -> bool:
+    if understanding_metric_contract_is_sealed(item):
+        return False
+    phrase = str(item.get("sourcePhrase") or item.get("source_phrase") or "")
+    if default is not None and not phrase:
+        return default
+    return not source_phrase_declared_as_scope(understanding, phrase)
+
+
 def compile_query_graph_from_understanding(question: str, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
     if not isinstance(understanding, dict):
         return QueryPlan(agent_trace=["planner.understanding_compile.invalid_payload"], compiler_trace=["INVALID_UNDERSTANDING"])
@@ -5061,7 +5519,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
                 metric_ref=str(ranking.get("metricRef") or ranking.get("metric_ref") or ""),
                 owner_table=str(ranking.get("ownerTable") or ranking.get("owner_table") or ""),
                 source_phrase=str(ranking.get("sourcePhrase") or ranking.get("source_phrase") or ""),
-                allow_phrase_override=False,
+                allow_phrase_override=allow_phrase_override_for_understanding_metric(understanding, ranking, default=False),
             )
             if ranking_resolution.metric:
                 index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
@@ -5091,7 +5549,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
         metric_ref=str(ranking.get("metricRef") or ranking.get("metric_ref") or ""),
         owner_table=str(ranking.get("ownerTable") or ranking.get("owner_table") or ""),
         source_phrase=ranking_source_phrase,
-        allow_phrase_override=not source_phrase_declared_as_scope(understanding, ranking_source_phrase),
+        allow_phrase_override=allow_phrase_override_for_understanding_metric(understanding, ranking),
     )
     ranking_metric = ranking_resolution.metric
     if not ranking_metric:
@@ -5219,10 +5677,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
             metric_ref=metric_ref,
             owner_table=owner_table,
             source_phrase=str(measure.get("sourcePhrase") or measure.get("source_phrase") or ""),
-            allow_phrase_override=not source_phrase_declared_as_scope(
-                understanding,
-                str(measure.get("sourcePhrase") or measure.get("source_phrase") or ""),
-            ),
+            allow_phrase_override=allow_phrase_override_for_understanding_metric(understanding, measure),
         )
         metric = metric_resolution.metric
         if not metric:
@@ -6626,7 +7081,7 @@ def append_requested_measures_to_existing_plan(
             metric_ref=metric_ref,
             owner_table=owner_table,
             source_phrase=source_phrase,
-            allow_phrase_override=not source_phrase_declared_as_scope(understanding, source_phrase),
+            allow_phrase_override=allow_phrase_override_for_understanding_metric(understanding, measure),
         )
         metric = resolution.metric
         if not metric:
@@ -7552,6 +8007,8 @@ def semantic_fast_path_can_bypass_configured_llm(
 ) -> bool:
     if force_planner_llm:
         return False
+    if any("planner.semantic_fast_path=single_metric_semantic_tool" in str(item) for item in plan.agent_trace or []):
+        return False
     registry = capability_registry or CapabilityRegistry.load(None)
     validation_pack = asset_pack or PlanningAssetPack()
     if query_plan_question_coverage_gaps(question, plan, validation_pack):
@@ -7638,19 +8095,7 @@ def query_plan_question_coverage_gaps(
     QueryGraphContractValidator.
     """
 
-    requested_domains = semantic_domains_mentioned_in_question(question)
-    covered_domains = query_plan_covered_semantic_domains(plan, asset_pack)
-    gaps = [
-        GraphValidationGap(
-            code="QUESTION_DOMAIN_NOT_COVERED",
-            evidence=domain,
-            reason="candidate QueryGraph does not cover a semantic domain explicitly requested by the user",
-        )
-        for domain in requested_domains
-        if domain not in covered_domains
-    ]
-    gaps.extend(explicit_object_ref_filter_gaps(question, plan, asset_pack))
-    return dedupe_graph_validation_gaps(gaps)
+    return dedupe_graph_validation_gaps(explicit_object_ref_filter_gaps(question, plan, asset_pack))
 
 
 def query_plan_covered_semantic_domains(plan: QueryPlan, asset_pack: PlanningAssetPack) -> set[str]:
@@ -7665,21 +8110,6 @@ def query_plan_covered_semantic_domains(plan: QueryPlan, asset_pack: PlanningAss
         if metric_domain:
             covered.add(metric_domain)
     return covered
-
-
-def semantic_domains_mentioned_in_question(question: str) -> List[str]:
-    text = normalize_text(question)
-    domain_terms = {
-        "order": ["订单", "子订单", "下单", "gmv", "成交", "支付"],
-        "refund": ["退款", "退货", "售后"],
-        "goods": ["商品", "spu", "sku", "新品", "审核", "发布"],
-        "ticket": ["工单", "客服"],
-        "repay": ["赔付", "理赔", "补偿"],
-        "coupon": ["优惠券", "用券", "券金额", "券订单"],
-        "scm": ["供应链", "入库", "出库"],
-        "merchant": ["保证金", "申诉", "处罚", "结算"],
-    }
-    return [domain for domain, terms in domain_terms.items() if any(term in text for term in terms)]
 
 
 def dedupe_graph_validation_gaps(gaps: List[GraphValidationGap]) -> List[GraphValidationGap]:
@@ -8001,11 +8431,7 @@ def semantic_metric_fallback_safe(question: str, asset_pack: PlanningAssetPack, 
     metric just because one phrase matched the semantic catalog.
     """
 
-    metric_domain = semantic_domain_for_metric(metric)
-    requested_domains = requested_semantic_domains(question, asset_pack)
-    if len(requested_domains) > 1:
-        return False
-    if requested_domains and metric_domain not in set(requested_domains):
+    if len(semantic_metric_fallback_metric_phrases(question, asset_pack)) > 1:
         return False
     text = normalize_text(question)
     if re.search(r"(order_id|sub_order_id|spu_id|sku_id|refund_id|ticket_id|bill_id)_[a-z0-9_]+", text):
@@ -8013,6 +8439,23 @@ def semantic_metric_fallback_safe(question: str, asset_pack: PlanningAssetPack, 
     if any(term in text for term in ["明细", "详情", "关联", "对应", "状态", "列表", "记录"]):
         return False
     return True
+
+
+def semantic_metric_fallback_metric_phrases(question: str, asset_pack: PlanningAssetPack) -> List[str]:
+    fast = (asset_pack.metric_compaction or {}).get("fastUnderstanding") or {}
+    phrases = fast.get("metricPhrases") or fast.get("metric_phrases") or []
+    if isinstance(phrases, str):
+        phrases = [phrases]
+    normalized = [str(item).strip() for item in phrases if str(item or "").strip()]
+    if normalized:
+        return dedupe_strings(normalized)
+    metrics = semantic_fast_path_explicit_metrics(question, asset_pack)
+    labels = [
+        semantic_fast_path_metric_phrase(metric, question)
+        or str(getattr(metric, "title", "") or getattr(metric, "key", "") or "")
+        for metric in metrics
+    ]
+    return dedupe_strings([label for label in labels if label])
 
 
 def semantic_entity_chain_anchor_table(asset_pack: PlanningAssetPack) -> str:
@@ -9162,10 +9605,7 @@ def attach_metric_resolutions_from_understanding(
             metric_ref=str(item.get("metricRef") or item.get("metric_ref") or ""),
             owner_table=str(item.get("ownerTable") or item.get("owner_table") or ""),
             source_phrase=str(item.get("sourcePhrase") or item.get("source_phrase") or ""),
-            allow_phrase_override=not source_phrase_declared_as_scope(
-                understanding,
-                str(item.get("sourcePhrase") or item.get("source_phrase") or ""),
-            ),
+            allow_phrase_override=allow_phrase_override_for_understanding_metric(understanding, item),
         )
         if resolution.metric:
             resolutions.append(resolution)
@@ -9240,7 +9680,6 @@ def best_detail_anchor_table(filter_column: str, question: str, asset_pack: Plan
     candidates = [table for table in asset_pack.known_tables() if filter_column in asset_pack.known_columns(table)]
     if not candidates:
         return ""
-    requested_domains = requested_semantic_domains(question, asset_pack)
     domain_priority = {
         "sub_order_id": ["order", "refund", "ticket", "repay"],
         "order_id": ["order", "refund", "ticket", "repay"],
@@ -9249,8 +9688,8 @@ def best_detail_anchor_table(filter_column: str, question: str, asset_pack: Plan
         "bill_id": ["repay", "ticket", "order"],
         "coupon_id": ["coupon", "order"],
         "spu_id": ["goods", "order", "scm", "refund"],
-    }.get(filter_column, requested_domains)
-    for domain in requested_domains + domain_priority:
+    }.get(filter_column, [])
+    for domain in domain_priority:
         for table in candidates:
             if semantic_domain_for_table(table) == domain:
                 return table
@@ -12964,26 +13403,6 @@ def semantic_domain_for_table(table: str) -> str:
     if "order" in lower or "trade" in lower:
         return "order"
     return "unknown"
-
-
-def requested_semantic_domains(question: str, asset_pack: PlanningAssetPack) -> List[str]:
-    text = normalize_text(question)
-    domain_terms = {
-        "order": ["订单", "子订单", "下单", "gmv", "成交", "支付"],
-        "refund": ["退款", "退货", "售后"],
-        "goods": ["商品", "spu", "新品", "审核", "发布"],
-        "ticket": ["工单", "客服"],
-        "repay": ["赔付", "理赔", "补偿"],
-        "coupon": ["优惠券", "券", "补贴"],
-        "scm": ["供应链", "入库", "出库"],
-        "merchant": ["保证金", "申诉", "处罚", "结算"],
-    }
-    available = {semantic_domain_for_table(table) for table in asset_pack.known_tables()}
-    domains: List[str] = []
-    for domain, terms in domain_terms.items():
-        if domain in available and any(term in text for term in terms):
-            domains.append(domain)
-    return domains
 
 
 def requested_semantic_domains_for_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPack) -> List[str]:

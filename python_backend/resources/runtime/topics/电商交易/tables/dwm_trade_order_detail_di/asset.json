@@ -2707,11 +2707,11 @@
     },
     {
       "columnName": "platform_subsidy_amt",
-      "businessName": "平台补贴金额",
+      "businessName": "订单明细平台补贴金额",
       "role": "METRIC",
-      "description": "平台补贴金额",
+      "description": "订单明细中的平台补贴金额",
       "aliases": [
-        "平台补贴金额",
+        "订单明细平台补贴金额",
         "platform_subsidy_amt"
       ],
       "enumValues": [],
@@ -2721,11 +2721,11 @@
     },
     {
       "columnName": "seller_subsidy_amt",
-      "businessName": "商家补贴金额",
+      "businessName": "订单明细商家补贴金额",
       "role": "METRIC",
-      "description": "商家补贴金额",
+      "description": "订单明细中的商家补贴金额",
       "aliases": [
-        "商家补贴金额",
+        "订单明细商家补贴金额",
         "seller_subsidy_amt"
       ],
       "enumValues": [],
@@ -2949,13 +2949,13 @@
     },
     {
       "columnName": "pay_amt",
-      "businessName": "支付金额",
+      "businessName": "订单明细支付金额",
       "role": "METRIC",
-      "description": "支付金额，分",
+      "description": "订单明细中的支付金额，单位分",
       "aliases": [
-        "支付金额",
+        "订单明细支付金额",
         "pay_amt",
-        "支付金额，分"
+        "订单明细支付金额分"
       ],
       "enumValues": [],
       "metricFormula": "SUM(pay_amt)",
@@ -3847,8 +3847,9 @@
         "下单"
       ],
       "summaryMetricRef": "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d",
-      "naturalName": "下单数",
-      "originalBusinessName": "下单数",
+      "naturalName": "订单明细去重下单数",
+      "originalBusinessName": "订单明细去重下单数",
+      "naturalAlias": "订单明细去重下单数",
       "sourceColumnAliases": [
         "sub_order_id"
       ]
@@ -3979,7 +3980,7 @@
       "businessName": "订单明细平台补贴金额",
       "formula": "SUM(platform_subsidy_amt)",
       "unit": "元",
-      "description": "平台补贴金额",
+      "description": "订单明细中的平台补贴金额",
       "sourceColumns": [
         "platform_subsidy_amt"
       ],
@@ -3997,9 +3998,9 @@
       "metricGrain": "order_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "平台补贴金额",
-      "originalBusinessName": "平台补贴金额",
-      "naturalAlias": "平台补贴金额",
+      "naturalName": "订单明细平台补贴金额",
+      "originalBusinessName": "订单明细平台补贴金额",
+      "naturalAlias": "订单明细平台补贴金额",
       "sourceColumnAliases": [
         "platform_subsidy_amt"
       ]
@@ -4009,7 +4010,7 @@
       "businessName": "订单明细商家补贴金额",
       "formula": "SUM(seller_subsidy_amt)",
       "unit": "元",
-      "description": "商家补贴金额",
+      "description": "订单明细中的商家补贴金额",
       "sourceColumns": [
         "seller_subsidy_amt"
       ],
@@ -4027,9 +4028,9 @@
       "metricGrain": "order_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "商家补贴金额",
-      "originalBusinessName": "商家补贴金额",
-      "naturalAlias": "商家补贴金额",
+      "naturalName": "订单明细商家补贴金额",
+      "originalBusinessName": "订单明细商家补贴金额",
+      "naturalAlias": "订单明细商家补贴金额",
       "sourceColumnAliases": [
         "seller_subsidy_amt"
       ]
@@ -4649,10 +4650,10 @@
       "evidence": "来自字段 `subsidy_json` 的语义注释"
     },
     {
-      "term": "平台补贴金额",
-      "description": "平台补贴金额",
+      "term": "订单明细平台补贴金额",
+      "description": "订单明细中的平台补贴金额",
       "aliases": [
-        "平台补贴金额",
+        "订单明细平台补贴金额",
         "platform_subsidy_amt"
       ],
       "relatedColumns": [
@@ -4661,10 +4662,10 @@
       "evidence": "来自字段 `platform_subsidy_amt` 的语义注释"
     },
     {
-      "term": "商家补贴金额",
-      "description": "商家补贴金额",
+      "term": "订单明细商家补贴金额",
+      "description": "订单明细中的商家补贴金额",
       "aliases": [
-        "商家补贴金额",
+        "订单明细商家补贴金额",
         "seller_subsidy_amt"
       ],
       "relatedColumns": [
@@ -4845,12 +4846,12 @@
       "evidence": "来自字段 `out_pay_id` 的语义注释"
     },
     {
-      "term": "支付金额",
-      "description": "支付金额，分",
+      "term": "订单明细支付金额",
+      "description": "订单明细中的支付金额，单位分",
       "aliases": [
-        "支付金额",
+        "订单明细支付金额",
         "pay_amt",
-        "支付金额，分"
+        "订单明细支付金额分"
       ],
       "relatedColumns": [
         "pay_amt"

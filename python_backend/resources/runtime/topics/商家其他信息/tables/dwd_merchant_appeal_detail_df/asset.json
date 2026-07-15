@@ -679,9 +679,9 @@
       "metricGrain": "appeal_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "申诉次数",
-      "originalBusinessName": "申诉次数",
-      "naturalAlias": "申诉次数",
+      "naturalName": "申诉明细次数",
+      "originalBusinessName": "申诉明细次数",
+      "naturalAlias": "申诉明细次数",
       "sourceColumnAliases": [
         "appeal_id"
       ]
@@ -756,8 +756,7 @@
       "aliases": [
         "申诉明细成功率",
         "appeal_success_rate",
-        "申诉成功率",
-        "申诉通过率"
+        "申诉明细通过率"
       ],
       "confidence": 0.9,
       "evidence": "语义层派生指标：申诉通过次数 / 申诉次数",
@@ -767,9 +766,9 @@
       "metricGrain": "appeal_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "申诉成功率",
-      "originalBusinessName": "申诉成功率",
-      "naturalAlias": "申诉成功率",
+      "naturalName": "申诉明细成功率",
+      "originalBusinessName": "申诉明细成功率",
+      "naturalAlias": "申诉明细成功率",
       "sourceColumnAliases": [
         "appeal_cnt",
         "appeal_pass_cnt"

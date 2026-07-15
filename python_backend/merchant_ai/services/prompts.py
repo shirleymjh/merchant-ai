@@ -254,20 +254,24 @@ def default_prompt_registry() -> PromptRegistry:
     registry.register(
         PromptTemplateSpec(
             prompt_id="planner.semantic_asset_selection",
-            version="v1",
+            version="v2",
             agent="PlannerAgent",
             description="Select semantic metric refs before QueryGraph compilation.",
             section_ids=["common.stable_boundary", "planner.semantic_boundary", "common.artifact_references"],
             template=(
                 "你是商家 BI 语义资产选择器。只输出 JSON，不要输出 SQL、QueryGraph 或解释长文。\n"
-                "输入包含用户问题和召回候选文本。你的任务是从候选编号/ref 中选择最贴合用户问题的指标 ref。\n"
-                "每个用户明确指标词最多选择一个 ref；候选不够就返回 NEED_MORE_KNOWLEDGE；多个候选都合理且问题没说清就返回 AMBIGUOUS。\n"
-                "不要选择候选之外的 ref，不要补造表名或字段名。\n"
-                "输出格式：{{\"status\":\"SELECTED|AMBIGUOUS|NEED_MORE_KNOWLEDGE|UNSUPPORTED|INVALID\",\"selectedRefs\":[\"semantic:...\"],\"gaps\":[{{\"phrase\":\"\",\"reason\":\"\",\"candidateRefs\":[]}}],\"reason\":\"\"}}。\n"
-                "Few-shot 1：问“最近7天支付GMV是多少”，候选有 支付GMV日汇总金额/ref=A、订单明细支付金额/ref=B => selectedRefs=[A]。\n"
-                "Few-shot 2：问“退款金额明细有哪些”，候选有 退款日汇总金额/ref=A、退款明细退款金额/ref=B => selectedRefs=[B]。\n"
-                "Few-shot 3：问“最近7天GMV是多少”，候选有 下单GMV/ref=A、支付GMV/ref=B、交易成功GMV/ref=C，问题没限定口径 => status=AMBIGUOUS。\n"
-                "Few-shot 4：问“为什么退款率升高”，可以选退款率 ref，但 status=UNSUPPORTED，因为原因分析需要后续 planner/skill。"
+                "输入包含用户问题、metricPhrases、候选短卡 retrievedCandidates、候选分组 candidateGroups，可能包含 semanticReadResults。\n"
+                "你的任务是在候选 ref 中选择能回答用户指标词的语义资产；短卡不够判断时，可以请求 semantic_read 读取少量 ref 的完整定义。\n"
+                "第一轮可输出 action=semantic_read，readRefs 最多 3 个，ref 必须来自候选或候选的 readableRefs；第二轮已有 semanticReadResults 时不能再次 read。\n"
+                "如果读完仍无法安全判断业务口径，输出 action=ask_human 并给出需要用户确认的问题；不要自己猜不存在的口径。\n"
+                "如果问题需要排行、明细列表、原因分析、建议或跨节点依赖，当前选择器只负责选择已明确的指标；不能形成简单指标查询时输出 action=unsupported。\n"
+                "不要选择候选之外的 ref，不要补造表名、字段名或指标名。\n"
+                "输出格式：{{\"action\":\"select|semantic_read|ask_human|unsupported\",\"selectedRefs\":[\"semantic:...\"],\"readRefs\":[\"semantic:...\"],\"clarifications\":[{{\"phrase\":\"\",\"question\":\"\",\"options\":[{{\"ref\":\"\",\"label\":\"\"}}]}}],\"reason\":\"\"}}。\n"
+                "Few-shot 1：问“最近7天支付GMV是多少”，短卡里支付GMV定义已清楚 => action=select, selectedRefs=[支付GMVref]。\n"
+                "Few-shot 2：问“退款金额是多少”，候选同时有退款汇总金额和订单支付金额，短卡说明不够 => action=semantic_read, readRefs=[这两个ref]；读完选择真实退款金额。\n"
+                "Few-shot 3：问“最近7天GMV是多少”，候选有下单GMV、支付GMV、交易成功GMV且用户没限定口径；读定义后仍都合理 => action=ask_human。\n"
+                "Few-shot 4：问“支付GMV、退款金额分别是多少”，两个指标都能选 => action=select, selectedRefs=[支付GMVref,退款金额ref]。\n"
+                "Few-shot 5：问“为什么退款率升高”，可以选择退款率 ref，但 action=unsupported，因为原因分析要交给后续 planner/skill。"
             ),
         )
     )

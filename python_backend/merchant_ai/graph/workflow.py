@@ -3598,10 +3598,25 @@ class MerchantQaWorkflow:
         state["query_metric_completed"] = False
         self.invalidate_execution_outputs(state, "query_metric 重新生成受控 QueryGraph")
         pack = state.get("planning_asset_pack") or PlanningAssetPack()
-        ambiguity = self.query_metric_ambiguity(pack, state.get("question", ""))
-        if ambiguity:
-            return self.request_query_metric_ambiguity_clarification(state, ambiguity, started, step)
-        plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
+        planner_context = {
+            "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
+            "memoryConstraints": state.get("memory_constraints", []),
+        }
+        selection_payload: Dict[str, Any] = {}
+        plan = QueryPlan(agent_trace=["query_metric.semantic_asset_selection.skipped"])
+        selector_attempted = False
+        if getattr(getattr(self.planner, "llm", None), "configured", False) and hasattr(self.planner, "semantic_asset_selection_plan"):
+            selector_attempted = True
+            plan, selection_payload = self.planner.semantic_asset_selection_plan(
+                state.get("question", ""),
+                state.get("recall_bundle") or RecallBundle(),
+                pack,
+                planner_context=planner_context,
+            )
+            if plan.intents:
+                plan.agent_trace.append("query_metric.semantic_asset_selection=compiled")
+        if not plan.intents and not selector_attempted:
+            plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
         catalog_expansion_traces: List[str] = []
         if not plan.intents:
             catalog_expansion_traces = self.asset_builder.expand_for_metric_catalog_resolution(
@@ -3610,18 +3625,20 @@ class MerchantQaWorkflow:
             )
             if catalog_expansion_traces:
                 state["planning_asset_pack"] = pack
-                catalog_candidates = [
-                    item
-                    for item in (pack.metric_compaction or {}).get("catalogMetricCandidates") or []
-                    if isinstance(item, dict)
-                ]
-                candidate_identities = {
-                    (str(item.get("ownerTable") or ""), str(item.get("metricKey") or ""))
-                    for item in catalog_candidates
-                    if str(item.get("ownerTable") or "") and str(item.get("metricKey") or "") and not bool(item.get("ambiguous"))
-                }
-                if len(candidate_identities) == 1 and not any(bool(item.get("ambiguous")) for item in catalog_candidates):
+                if selector_attempted:
+                    plan, selection_payload = self.planner.semantic_asset_selection_plan(
+                        state.get("question", ""),
+                        state.get("recall_bundle") or RecallBundle(),
+                        pack,
+                        planner_context=planner_context,
+                    )
+                    if plan.intents:
+                        plan.agent_trace.append("query_metric.semantic_asset_selection=compiled_after_catalog_expansion")
+                else:
                     plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
+            fast = state.get("fast_understanding") or FastUnderstandingResult()
+            metric_phrase_count = len([phrase for phrase in fast.metric_phrases if str(phrase or "").strip()])
+            if not plan.intents and not selector_attempted and metric_phrase_count <= 1:
                 ambiguity = self.query_metric_ambiguity(pack, state.get("question", ""))
                 if ambiguity:
                     return self.request_query_metric_ambiguity_clarification(state, ambiguity, started, step)
@@ -3631,6 +3648,12 @@ class MerchantQaWorkflow:
             "compilerTrace": list(plan.compiler_trace or []),
             "catalogExpansion": list(catalog_expansion_traces),
             "catalogMetricCandidates": list((pack.metric_compaction or {}).get("catalogMetricCandidates") or []),
+            "semanticAssetSelection": {
+                "status": str(selection_payload.get("status") or ""),
+                "action": str(selection_payload.get("action") or ""),
+                "selectedRefs": list(selection_payload.get("selectedRefs") or []),
+                "reason": str(selection_payload.get("reason") or ""),
+            } if selection_payload else {},
         }
         if not plan.intents:
             self.escalate_fast_request(state, "query_metric could not resolve one governed semantic metric from the current Topic workspace")

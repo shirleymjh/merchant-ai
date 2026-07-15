@@ -4403,9 +4403,9 @@
       "metricGrain": "supply_chain_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "鉴定为假货量",
-      "originalBusinessName": "鉴定为假货量",
-      "naturalAlias": "鉴定为假货量",
+      "naturalName": "供应链明细鉴定为假货量",
+      "originalBusinessName": "供应链明细鉴定为假货量",
+      "naturalAlias": "供应链明细鉴定为假货量",
       "sourceColumnAliases": [
         "identify_result_code",
         "identify_result_name"

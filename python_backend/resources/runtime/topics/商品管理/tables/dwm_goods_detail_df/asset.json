@@ -2025,8 +2025,8 @@
         "goods_audit_pass_detail_cnt",
         "按商品审核通过量",
         "按SPU审核通过量",
-        "审核通过商品量",
-        "审核通过商品"
+        "审核通过商品明细量",
+        "审核通过商品明细"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成",
@@ -2037,8 +2037,9 @@
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
       "summaryMetricRef": "semantic:经营画像:ads_merchant_profile:metric:goods_audit_pass_cnt_1d",
-      "naturalName": "商品审核通过量",
-      "originalBusinessName": "商品审核通过量",
+      "naturalName": "商品审核通过明细量",
+      "originalBusinessName": "商品审核通过明细量",
+      "naturalAlias": "商品审核通过明细量",
       "sourceColumnAliases": [
         "is_audit_pass"
       ]
@@ -2057,10 +2058,10 @@
         "goods_audit_reject_detail_cnt",
         "按商品审核拒绝量",
         "按SPU审核拒绝量",
-        "被拒商品量",
-        "被拒SPU量",
-        "驳回商品量",
-        "审核拒绝商品量"
+        "被拒商品明细量",
+        "被拒SPU明细量",
+        "驳回商品明细量",
+        "审核拒绝商品明细量"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成",
@@ -2071,8 +2072,9 @@
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
       "summaryMetricRef": "semantic:经营画像:ads_merchant_profile:metric:goods_audit_reject_cnt_1d",
-      "naturalName": "商品审核拒绝量",
-      "originalBusinessName": "商品审核拒绝量",
+      "naturalName": "商品审核拒绝明细量",
+      "originalBusinessName": "商品审核拒绝明细量",
+      "naturalAlias": "商品审核拒绝明细量",
       "sourceColumnAliases": [
         "is_audit_pass"
       ]
@@ -2090,16 +2092,16 @@
       "aliases": [
         "商品上架明细量",
         "goods_online_detail_cnt",
-        "商品上架量",
+        "商品上架明细数",
         "按商品上架商品量",
         "按SPU上架商品量",
-        "发布成功商品量",
-        "发布成功商品",
-        "重新发布成功商品量",
-        "重新发布成功商品",
+        "发布成功商品明细量",
+        "发布成功商品明细",
+        "重新发布成功商品明细量",
+        "重新发布成功商品明细",
         "重新发布成功",
-        "重新上架商品量",
-        "上架成功商品量"
+        "重新上架商品明细量",
+        "上架成功商品明细量"
       ],
       "confidence": 0.82,
       "evidence": "由 Topic Builder 基于字段组合自动生成",
@@ -2109,9 +2111,9 @@
       "metricGrain": "goods_detail",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "上架商品量",
-      "originalBusinessName": "上架商品量",
-      "naturalAlias": "上架商品量",
+      "naturalName": "商品上架明细量",
+      "originalBusinessName": "商品上架明细量",
+      "naturalAlias": "商品上架明细量",
       "sourceColumnAliases": [
         "spu_status_code",
         "spu_status_name"
