@@ -335,6 +335,31 @@ def test_policy_never_executes_the_first_business_candidate_before_lead_arbitrat
     assert decision.source == "lead_arbitration_pending"
 
 
+def test_policy_aggregates_multiple_contract_blocks_without_selecting_the_first() -> None:
+    class CandidatePolicy(V2AgentPolicy):
+        def _candidate_action_ids(self, _state: AgentState):
+            return ["execute_graph", "validate_graph"], "unordered blocked catalog", False
+
+    state = {}
+
+    decision = CandidatePolicy().decide(state)
+
+    assert decision.selected_action == "observe_contract_block"
+    assert state["contract_block_observation"]["blockedAction"] == ""
+    assert state["contract_block_observation"]["blockedActions"] == [
+        "execute_graph",
+        "validate_graph",
+    ]
+    assert state["contract_block_observation"]["missingStateKeys"] == [
+        "plan.intents",
+        "query_graph_validation_result",
+    ]
+    assert state["contract_block_observation"]["missingStateFlags"] == [
+        "planning_assets_compacted",
+        "query_graph_validation_passed",
+    ]
+
+
 def test_contract_block_observation_consumes_round_and_returns_to_lead() -> None:
     workflow = object.__new__(MerchantQaWorkflow)
     workflow.start_run_step = lambda *_args, **_kwargs: None

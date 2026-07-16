@@ -1950,11 +1950,16 @@ class QueryGraphPlanner:
             normalized = normalize_semantic_text(phrase)
             ids = []
             for card in candidates:
-                if normalized and normalize_semantic_text(card.get("matched")) == normalized:
+                match_type = str(card.get("matchType") or "")
+                if (
+                    match_type == "exact_label"
+                    and normalized
+                    and normalize_semantic_text(card.get("matched")) == normalized
+                ):
                     ids.append(card.get("id"))
                     continue
                 labels = [card.get("name"), card.get("metricKey"), *(card.get("aliases") or [])]
-                if str(card.get("matchType") or "") != "partial_label":
+                if match_type != "partial_label":
                     labels.insert(0, card.get("matched"))
                 if normalized and any(
                     normalize_semantic_text(label) == normalized
@@ -2497,13 +2502,17 @@ class QueryGraphPlanner:
                     "groupByColumn": self._semantic_selection_group_by(metric, asset_pack, time_series=time_series),
                 }
             )
-        first_metric = selected[0]["metric"] if selected else None
-        first_group_by = selected_metrics[0].get("groupByColumn", "") if selected_metrics else ""
-        analysis_grain = (
-            semantic_fast_path_grain("", first_group_by, asset_pack, first_metric.table)
-            if first_metric and first_group_by
-            else "metric"
-        )
+        grain_candidates = {
+            semantic_fast_path_grain(
+                "",
+                str(selected_metric.get("groupByColumn") or ""),
+                asset_pack,
+                item["metric"].table,
+            )
+            for item, selected_metric in zip(selected, selected_metrics)
+            if selected_metric.get("groupByColumn")
+        }
+        analysis_grain = next(iter(grain_candidates)) if len(grain_candidates) == 1 else "metric"
         understanding = {
             "originalQuestion": question,
             "analysisGrain": analysis_grain or "metric",
@@ -8917,7 +8926,8 @@ def semantic_metric_fallback_source_phrases(question: str, asset_pack: PlanningA
             phrases.append(matched)
     explicit_metrics = semantic_fast_path_explicit_metrics(question, asset_pack)
     if len(explicit_metrics) == 1:
-        phrases.append(semantic_fast_path_metric_phrase(explicit_metrics[0], question))
+        (explicit_metric,) = explicit_metrics
+        phrases.append(semantic_fast_path_metric_phrase(explicit_metric, question))
     deduped: List[str] = []
     seen: set[str] = set()
     for phrase in phrases:
@@ -9864,8 +9874,6 @@ def compile_asset_driven_multi_metric_fallback_graph(
                 )
             group_by_columns[(metric.table, metric.key)] = time_column
 
-    primary, primary_phrase = selected[0]
-    primary_group_by = group_by_columns.get((primary.table, primary.key), "")
     metric_items = [
         asset_fallback_understanding_metric_item(
             metric,
@@ -9874,9 +9882,53 @@ def compile_asset_driven_multi_metric_fallback_graph(
         )
         for metric, phrase in selected
     ]
+    selected_identities = {(metric.table, metric.key) for metric, _ in selected}
+    primary_identities: set[Tuple[str, str]] = set()
+    for source in (structured, fast):
+        ranking = source.get("rankingObjective") or source.get("ranking_objective") or {}
+        if not isinstance(ranking, dict) or not ranking:
+            continue
+        ranked_metric = resolve_asset_fallback_metric(ranking, asset_pack)
+        if ranked_metric and (ranked_metric.table, ranked_metric.key) in selected_identities:
+            primary_identities.add((ranked_metric.table, ranked_metric.key))
+    if len(primary_identities) > 1:
+        return QueryPlan(
+            agent_trace=["planner.asset_driven_fallback.conflicting_primary_metric_contracts"],
+            compiler_trace=["ASSET_DRIVEN_FALLBACK_PRIMARY_METRIC_AMBIGUOUS"],
+        )
+
+    primary_identity = next(iter(primary_identities), None)
+    ranking_items = [
+        metric_item
+        for (metric, _), metric_item in zip(selected, metric_items)
+        if (metric.table, metric.key) == primary_identity
+    ]
+    ranking_objective: Dict[str, Any] = {}
+    if len(ranking_items) == 1:
+        (ranking_item,) = ranking_items
+        ranking_objective = {
+            **ranking_item,
+            "objectiveType": "trend_anchor" if time_series else "metric_total",
+            "limit": max(2, days) if time_series else 1,
+        }
+    requested_measures = [
+        metric_item
+        for (metric, _), metric_item in zip(selected, metric_items)
+        if (metric.table, metric.key) != primary_identity
+    ]
+    grain_candidates = {
+        semantic_fast_path_grain(
+            "",
+            group_by_columns.get((metric.table, metric.key), ""),
+            asset_pack,
+            metric.table,
+        )
+        for metric, _ in selected
+        if group_by_columns.get((metric.table, metric.key), "")
+    }
     understanding = {
         "analysisGrain": (
-            semantic_fast_path_grain("", primary_group_by, asset_pack, primary.table) or "time"
+            next(iter(grain_candidates)) if len(grain_candidates) == 1 else "time"
             if time_series
             else "unknown"
         ),
@@ -9897,12 +9949,8 @@ def compile_asset_driven_multi_metric_fallback_graph(
             }
             for metric, phrase in selected
         ],
-        "rankingObjective": {
-            **metric_items[0],
-            "objectiveType": "trend_anchor" if time_series else "metric_total",
-            "limit": max(2, days) if time_series else 1,
-        },
-        "requestedMeasures": metric_items[1:],
+        "rankingObjective": ranking_objective,
+        "requestedMeasures": requested_measures,
         "filters": [],
         "timeWindowDays": days,
         "timeRange": resolved_time_range.model_dump(by_alias=True),

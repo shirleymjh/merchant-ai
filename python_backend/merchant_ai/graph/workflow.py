@@ -591,12 +591,15 @@ class MerchantQaWorkflow:
 
         started = now_ms()
         observation = dict(state.get("contract_block_observation") or {})
+        blocked_label = str(observation.get("blockedAction") or "").strip() or ",".join(
+            str(item) for item in observation.get("blockedActions") or []
+        )
         step = self.start_run_step(
             state,
             "observe_contract_block",
             "Runtime",
             "OBSERVE_CONTRACT_BLOCK",
-            input_summary="blockedAction=%s" % observation.get("blockedAction", ""),
+            input_summary="blockedAction=%s" % blocked_label,
         )
         increment_round(state)
         emit(state, "node.started", "OBSERVE_CONTRACT_BLOCK", observation)
@@ -613,7 +616,7 @@ class MerchantQaWorkflow:
         add_step(
             state,
             "ActionContract：动作 %s 前置条件未满足，已作为 observation 返回 LeadAgent；未执行任何业务 fallback"
-            % observation.get("blockedAction", "unknown"),
+            % (blocked_label or "unknown"),
         )
         emit(state, "node.completed", "OBSERVE_CONTRACT_BLOCK", observation)
         self.record_span(
@@ -4205,38 +4208,40 @@ class MerchantQaWorkflow:
         self.configure_artifact_roots(state)
         state["worker_dispatch_context"] = self.worker_dispatch_context(state)
         emit(state, "node.started", "EXECUTE_QUERY_GRAPH", {"workerDispatch": state.get("worker_dispatch_context", {})})
-        try:
-            execution_preparation = self.node_worker.prepare_runtime_execution_graph(
-                state["merchant"].merchant_id,
-                state["plan"],
-                state.get("planning_asset_pack") or PlanningAssetPack(),
-                state["question"],
-                graph_validator=self.graph_validator,
-                memory_constraints=state.get("memory_constraints", []),
-                access_role=state.get("access_role", "merchant_operator"),
-                user_scope=state.get("user_identity", {}),
-            )
-            state["plan"] = execution_preparation.plan
-            record_graph_validation(state, execution_preparation.validation, execution_preparation.plan)
-        except Exception as exc:
-            execution_preparation = None
-            record_graph_validation(
-                state,
-                GraphValidationResult(
-                    valid=False,
-                    repairable=False,
-                    gaps=[
-                        GraphValidationGap(
-                            code="EXECUTION_GRAPH_PREPARATION_FAILED",
-                            reason="QueryGraph could not be normalized and validated before SQL dispatch: %s"
-                            % str(exc)[:240],
-                        )
-                    ],
-                ),
-                state["plan"],
-            )
-        validation = state.get("query_graph_validation_result")
         validation_failure = graph_validation_failure_reason(state)
+        execution_preparation = None
+        if not validation_failure:
+            try:
+                execution_preparation = self.node_worker.prepare_runtime_execution_graph(
+                    state["merchant"].merchant_id,
+                    state["plan"],
+                    state.get("planning_asset_pack") or PlanningAssetPack(),
+                    state["question"],
+                    graph_validator=self.graph_validator,
+                    memory_constraints=state.get("memory_constraints", []),
+                    access_role=state.get("access_role", "merchant_operator"),
+                    user_scope=state.get("user_identity", {}),
+                )
+                state["plan"] = execution_preparation.plan
+                record_graph_validation(state, execution_preparation.validation, execution_preparation.plan)
+            except Exception as exc:
+                record_graph_validation(
+                    state,
+                    GraphValidationResult(
+                        valid=False,
+                        repairable=False,
+                        gaps=[
+                            GraphValidationGap(
+                                code="EXECUTION_GRAPH_PREPARATION_FAILED",
+                                reason="QueryGraph could not be normalized and validated before SQL dispatch: %s"
+                                % str(exc)[:240],
+                            )
+                        ],
+                    ),
+                    state["plan"],
+                )
+            validation_failure = graph_validation_failure_reason(state)
+        validation = state.get("query_graph_validation_result")
         if validation_failure:
             if validation_failure == "QUERY_GRAPH_CHANGED_AFTER_VALIDATION":
                 mark_graph_validation_stale(state)

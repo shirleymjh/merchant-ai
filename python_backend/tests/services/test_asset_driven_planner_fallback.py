@@ -100,6 +100,47 @@ def test_asset_driven_timeout_fallback_compiles_cross_table_time_series_from_con
     assert all(intent.days == 13 and intent.time_range.days == 13 for intent in plan.intents)
     assert plan.question_understanding["timeRange"]["source"] == "runtime_contract"
     assert "planner=asset_driven_multi_metric_failure_fallback" in plan.agent_trace
+    assert plan.question_understanding["rankingObjective"] == {}
+
+
+def test_asset_driven_fallback_does_not_promote_the_first_unranked_metric() -> None:
+    alpha = metric("fact_runtime", "alpha_value", "Alpha value", "alpha_amount")
+    beta = metric("fact_runtime", "beta_value", "Beta value", "beta_amount")
+    runtime_table = table("fact_runtime", "event_day", ["alpha_amount", "beta_amount"])
+
+    def compile_with_order(metric_phrases: list[str]):
+        return compile_asset_driven_multi_metric_fallback_graph(
+            "opaque",
+            PlanningAssetPack(
+                tables=[runtime_table],
+                metrics=[alpha, beta],
+                metric_compaction={
+                    "fastUnderstanding": {
+                        "analysisIntent": "trend",
+                        "metricPhrases": metric_phrases,
+                        "timeWindowDays": 7,
+                        "timeRange": {"kind": "rolling", "days": 7},
+                    },
+                    "recalledMetricEvidence": [
+                        evidence(alpha, "Alpha value"),
+                        evidence(beta, "Beta value"),
+                    ],
+                },
+            ),
+        )
+
+    forward = compile_with_order(["Alpha value", "Beta value"])
+    reversed_order = compile_with_order(["Beta value", "Alpha value"])
+
+    assert forward.question_understanding["rankingObjective"] == {}
+    assert reversed_order.question_understanding["rankingObjective"] == {}
+    assert {
+        (item["ownerTable"], item["metricRef"])
+        for item in forward.question_understanding["requestedMeasures"]
+    } == {
+        (item["ownerTable"], item["metricRef"])
+        for item in reversed_order.question_understanding["requestedMeasures"]
+    }
 
 
 def test_asset_driven_timeout_fallback_compiles_overview_from_structured_understanding() -> None:

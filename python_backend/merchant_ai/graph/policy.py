@@ -335,15 +335,43 @@ class V2AgentPolicy:
         action_ids, blocked = self.contract_safe_action_ids(state, action_ids)
         state["action_catalog_contract_blocks"] = blocked
         if not action_ids and blocked:
-            blocked_action = self.registry.get(str(blocked[0]["action"]))
-            observation = contract_block_observation(
-                blocked_action,
-                list(blocked[0]["missingStateKeys"]),
-                list(blocked[0]["missingStateFlags"]),
-                reason=reason,
-                source="policy_catalog_filter",
-            )
-            observation["blockedCatalog"] = blocked
+            if len(blocked) == 1:
+                (blocked_contract,) = blocked
+                blocked_action = self.registry.get(str(blocked_contract["action"]))
+                observation = contract_block_observation(
+                    blocked_action,
+                    list(blocked_contract["missingStateKeys"]),
+                    list(blocked_contract["missingStateFlags"]),
+                    reason=reason,
+                    source="policy_catalog_filter",
+                )
+                observation["blockedCatalog"] = blocked
+            else:
+                blocked_catalog = sorted(blocked, key=lambda item: str(item["action"]))
+                observation = {
+                    "status": "pending",
+                    "source": "policy_catalog_filter",
+                    "blockedAction": "",
+                    "blockedNode": "",
+                    "blockedActions": [str(item["action"]) for item in blocked_catalog],
+                    "blockedNodes": sorted({str(item["node"]) for item in blocked_catalog}),
+                    "missingStateKeys": sorted(
+                        {
+                            str(key)
+                            for item in blocked_catalog
+                            for key in item["missingStateKeys"]
+                        }
+                    ),
+                    "missingStateFlags": sorted(
+                        {
+                            str(flag)
+                            for item in blocked_catalog
+                            for flag in item["missingStateFlags"]
+                        }
+                    ),
+                    "decisionReason": str(reason or "")[:500],
+                    "blockedCatalog": blocked_catalog,
+                }
             state["contract_block_observation"] = observation
             state["contract_block_observed"] = False
             action_ids = ["observe_contract_block"]
@@ -357,7 +385,7 @@ class V2AgentPolicy:
             selected_action = "lead_arbitrate"
             decision_source = "lead_arbitration_pending"
         else:
-            selected_action = action_ids[0] if action_ids else "ask_human"
+            selected_action = next(iter(action_ids), "ask_human")
             decision_source = "runtime_single_action"
         action = self.registry.get(selected_action)
         return AgentDecision(

@@ -70,7 +70,7 @@ def quick_metric_response(
     temporal_mode = quick_metric_temporal_mode(time_range, temporal_contract)
     if temporal_mode == "unsupported":
         return None
-    original_metric = matched_metrics[0]
+    (original_metric,) = matched_metrics
     metric = resolve_quick_metric_temporal_variant(original_metric, semantic_metrics, temporal_mode)
     if metric is None:
         return None
@@ -615,8 +615,10 @@ def metric_definition_category_name(metrics: list[Dict[str, Any]]) -> str:
 
 
 def metric_definition_suggestions(metrics: list[Dict[str, Any]]) -> list[str]:
-    metric = metrics[0] if metrics else {}
-    label = str(metric.get("label") or metric.get("key") or "该指标").strip()
+    labels = dedupe_texts(
+        str(metric.get("label") or metric.get("key") or "").strip() for metric in metrics
+    )
+    label = "、".join(labels) or "该指标"
     return [
         "最近7天%s趋势" % label,
         "昨天%s是多少？" % label,
@@ -625,7 +627,8 @@ def metric_definition_suggestions(metrics: list[Dict[str, Any]]) -> list[str]:
 
 
 def metric_definition_advice(question: str, metrics: list[Dict[str, Any]]) -> list[str]:
-    label = str((metrics[0] if metrics else {}).get("label") or "该指标").strip()
+    labels = dedupe_texts(str(metric.get("label") or "").strip() for metric in metrics)
+    label = "、".join(labels) or "该指标"
     return ["后续分析请沿用“%s”的已发布语义口径。" % label, "把来源表、公式和单位一起展示，避免不同报表口径混用。"]
 
 
