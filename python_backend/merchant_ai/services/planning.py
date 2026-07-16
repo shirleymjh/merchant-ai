@@ -1553,6 +1553,7 @@ class QueryGraphPlanner:
         payload["_promptTrace"] = prompt.trace()
         payload["_retrievedCandidates"] = list(selected_payload.get("retrievedCandidates") or [])
         payload["_candidateGroups"] = list(selected_payload.get("candidateGroups") or [])
+        payload["planningContract"] = dict(selected_payload.get("planningContract") or {})
         self.artifact_store.write_json("planner", "semantic_asset_selection_prompt.json", selected_payload, preview_chars=0)
         self.artifact_store.write_json("planner", "semantic_asset_selection_payload.json", payload, preview_chars=0)
         return payload
@@ -1587,7 +1588,12 @@ class QueryGraphPlanner:
         return {
             "question": question,
             "metricPhrases": metric_phrases,
-            "planningContract": compact_asset_planning_contract(asset_pack, budget_level=budget_level),
+            "planningContract": compact_asset_planning_contract(
+                asset_pack,
+                budget_level=budget_level,
+                fast_understanding=(planner_context or {}).get("fastUnderstanding")
+                or (planner_context or {}).get("fast_understanding"),
+            ),
             "retrievedCandidates": candidates,
             "candidateGroups": self._semantic_selection_candidate_groups(metric_phrases, candidates),
             "outputContract": {
@@ -1944,6 +1950,9 @@ class QueryGraphPlanner:
             normalized = normalize_semantic_text(phrase)
             ids = []
             for card in candidates:
+                if normalized and normalize_semantic_text(card.get("matched")) == normalized:
+                    ids.append(card.get("id"))
+                    continue
                 labels = [card.get("name"), card.get("metricKey"), *(card.get("aliases") or [])]
                 if str(card.get("matchType") or "") != "partial_label":
                     labels.insert(0, card.get("matched"))
@@ -1953,6 +1962,27 @@ class QueryGraphPlanner:
                     if label
                 ):
                     ids.append(card.get("id"))
+            # A preflight extractor may return a context-wrapped phrase (for
+            # example a time-qualified span) while the semantic catalog stores
+            # the exact metric label.  Only when no exact group exists, bind to
+            # the longest complete catalog label contained in that span.  This
+            # remains vocabulary-agnostic and does not let a shorter bare label
+            # compete with an already matched qualified metric.
+            if normalized and not ids:
+                contained: List[Tuple[int, str]] = []
+                for card in candidates:
+                    labels = [card.get("name"), card.get("metricKey"), *(card.get("aliases") or [])]
+                    lengths = [
+                        len(label_normalized)
+                        for label in labels
+                        if (label_normalized := normalize_semantic_text(label))
+                        and label_normalized in normalized
+                    ]
+                    if lengths and card.get("id"):
+                        contained.append((max(lengths), str(card.get("id"))))
+                if contained:
+                    longest = max(length for length, _ in contained)
+                    ids.extend(candidate_id for length, candidate_id in contained if length == longest)
             groups.append({"phrase": phrase, "candidateIds": dedupe_strings([str(item) for item in ids if item])[:4]})
         return groups
 
@@ -2020,6 +2050,13 @@ class QueryGraphPlanner:
         if action in {"unsupported", "fail"} or status == "UNSUPPORTED":
             status = "UNSUPPORTED"
             action = "unsupported"
+        elif selected_refs and not uncovered_phrases and not has_clarifications:
+            # A selector occasionally emits ask_human together with a complete
+            # selectedRefs decision but no actual clarification contract. Treat
+            # the typed selection as authoritative; an empty clarification is
+            # not a usable user interaction.
+            status = "SELECTED"
+            action = "select"
         elif has_clarifications or action in {"ask_human", "clarify", "clarification"} or status in {"AMBIGUOUS", "NEED_CLARIFICATION"}:
             status = "NEED_CLARIFICATION"
             action = "ask_human"
@@ -5560,9 +5597,12 @@ def filesystem_workspace_index_catalog(
 def compact_asset_planning_contract(
     asset_pack: PlanningAssetPack,
     budget_level: int = 0,
+    fast_understanding: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    fast = (asset_pack.metric_compaction or {}).get("fastUnderstanding") or {}
-    fast = fast if isinstance(fast, dict) else {}
+    stored_fast = (asset_pack.metric_compaction or {}).get("fastUnderstanding") or {}
+    stored_fast = stored_fast if isinstance(stored_fast, dict) else {}
+    runtime_fast = fast_understanding if isinstance(fast_understanding, dict) else {}
+    fast = {**stored_fast, **runtime_fast}
     phrase_limit = 4 if budget_level >= 2 else 8 if budget_level >= 1 else 16
     raw_phrases = fast.get("metricPhrases") or fast.get("metric_phrases") or []
     if isinstance(raw_phrases, str):
@@ -11890,6 +11930,8 @@ class SemanticMetricResolution:
             "naturalName": str(metadata.get("naturalName") or ""),
             "metricGrain": str(metadata.get("metricGrain") or ""),
             "metricIntent": str(metadata.get("metricIntent") or ""),
+            "aggregationPolicy": str(metadata.get("aggregationPolicy") or metadata.get("aggregation_policy") or ""),
+            "applicableTimeGrain": str(metadata.get("applicableTimeGrain") or metadata.get("applicable_time_grain") or ""),
             "selectionGuidance": str(metadata.get("selectionGuidance") or ""),
             "confidence": self.confidence,
             "resolutionSource": self.resolution_source,
@@ -12961,11 +13003,25 @@ def compiled_domain_lookup_intent(
 
 
 def best_metric_for_domain(domain: str, table: str, asset_pack: PlanningAssetPack, question: str) -> Any:
-    metrics = [metric for metric in rank_asset_entries(asset_pack.metrics, question) if metric.table == table]
-    for metric in metrics:
-        if semantic_domain_for_metric(metric, asset_pack) == domain:
-            return metric
-    return metrics[0] if metrics else None
+    domain_metrics = [
+        metric
+        for metric in asset_pack.metrics
+        if metric.table == table and semantic_domain_for_metric(metric, asset_pack) == domain
+    ]
+    unique_metrics = {
+        (str(metric.table or ""), str(metric.key or ""), str(metric.source_ref_id or "")): metric
+        for metric in domain_metrics
+    }
+    if len(unique_metrics) == 1:
+        return next(iter(unique_metrics.values()))
+    if not unique_metrics:
+        return None
+
+    terms = extract_question_terms(question)
+    scored = [(asset_entry_score(metric, terms), identity, metric) for identity, metric in unique_metrics.items()]
+    highest = max(score for score, _identity, _metric in scored)
+    winners = [metric for score, _identity, metric in scored if score == highest and score > 0]
+    return next(iter(winners)) if len(winners) == 1 else None
 
 
 def preferred_dependent_group_column(
@@ -15379,9 +15435,20 @@ def compatible_group_by(
             candidate = grain_column_for_table(requested_grain, columns, asset_pack, table)
             if candidate:
                 return candidate
-        candidates = generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)
-        if candidates:
-            return candidates[0]
+        declared_candidates = [
+            candidate
+            for candidate in table_grouping_contract_columns(asset_pack, table)
+            if group_by_column_contract(asset_pack, table, candidate)[0]
+        ]
+        if declared_candidates:
+            return next(iter(declared_candidates)) if len(declared_candidates) == 1 else ""
+        governed_candidates = [
+            candidate
+            for candidate in generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)
+            if group_by_column_contract(asset_pack, table, candidate)[0]
+        ]
+        if len(governed_candidates) == 1:
+            return next(iter(governed_candidates))
     return ""
 
 
@@ -15567,23 +15634,48 @@ def normalize_query_graph_payload(question: str, payload: Dict[str, Any], asset_
         for node_id, node in node_by_id.items()
         if "anchor" in str(node.get("role") or node.get("taskRole") or "").lower()
     ]
+    raw_dependencies = payload.get("edges") or payload.get("dependencies") or []
+    dependencies = normalize_dependencies(raw_dependencies, node_by_id, anchor_ids, asset_pack)
+    compiler_trace: List[str] = []
     if not anchor_ids:
-        anchor_ids = [next(iter(node_by_id))]
+        dependent_ids = {dependency.dependent_task_id for dependency in dependencies}
+        inferred_roots = set(node_by_id) - dependent_ids
+        if len(inferred_roots) != 1:
+            return QueryPlan(
+                compiler_trace=[
+                    "QUERY_GRAPH_ANCHOR_UNRESOLVED:rootCandidates=%s"
+                    % ",".join(sorted(inferred_roots))
+                ]
+            )
+        inferred_anchor = next(iter(inferred_roots))
+        anchor_ids = [inferred_anchor]
+        compiler_trace.append("QUERY_GRAPH_ANCHOR_INFERRED_FROM_DEPENDENCIES:%s" % inferred_anchor)
 
-    dependencies = normalize_dependencies(payload.get("edges") or payload.get("dependencies") or [], node_by_id, anchor_ids, asset_pack)
     depends_by_node: Dict[str, List[str]] = {}
     for dep in dependencies:
         depends_by_node.setdefault(dep.dependent_task_id, [])
         if dep.anchor_task_id not in depends_by_node[dep.dependent_task_id]:
             depends_by_node[dep.dependent_task_id].append(dep.anchor_task_id)
+    unique_anchor = next(iter(anchor_ids)) if len(anchor_ids) == 1 else ""
+    unattached_nodes = [
+        node_id
+        for node_id in node_by_id
+        if node_id not in anchor_ids and node_id not in depends_by_node
+    ]
+    if unattached_nodes and not unique_anchor:
+        return QueryPlan(
+            compiler_trace=[
+                "QUERY_GRAPH_ANCHOR_UNRESOLVED:unattachedNodes=%s"
+                % ",".join(sorted(unattached_nodes))
+            ]
+        )
     for node_id in node_by_id:
         if node_id not in anchor_ids and node_id not in depends_by_node:
-            anchor = anchor_ids[0]
-            if anchor != node_id:
-                dependency = make_dependency(anchor, node_id, node_by_id, asset_pack)
+            if unique_anchor != node_id:
+                dependency = make_dependency(unique_anchor, node_id, node_by_id, asset_pack)
                 if dependency.join_key:
                     add_dependency_if_valid(dependencies, dependency)
-                    depends_by_node.setdefault(node_id, []).append(anchor)
+                    depends_by_node.setdefault(node_id, []).append(unique_anchor)
 
     intents: List[QuestionIntent] = []
     for index, (node_id, node) in enumerate(node_by_id.items()):
@@ -15616,6 +15708,7 @@ def normalize_query_graph_payload(question: str, payload: Dict[str, Any], asset_
         dependencies=dependencies,
         final_required_evidence=normalize_output_evidence(payload),
         display_title=str(payload.get("intent") or payload.get("title") or ""),
+        compiler_trace=compiler_trace,
     )
 
 
@@ -16284,6 +16377,7 @@ def compact_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "semanticRole",
         "dataType",
         "aggregationPolicy",
+        "applicableTimeGrain",
         "selectionGuidance",
         "temporalVariants",
         "linkedVariantOf",

@@ -1900,6 +1900,7 @@ class SkillDraft(APIModel):
 
 
 class AgentRunResult(APIModel):
+    executed_query_graph_fingerprint: str = ""
     tasks: List[AgentTask] = Field(default_factory=list)
     task_results: List[AgentTaskResult] = Field(default_factory=list)
     query_bundles: List[QueryBundle] = Field(default_factory=list)

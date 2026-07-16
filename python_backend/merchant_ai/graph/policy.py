@@ -54,6 +54,13 @@ class AgentActionRegistry:
                 expected_state_flags=["contract_block_observed"],
             ),
             AgentAction(
+                id="lead_arbitrate",
+                node="lead_arbitrate",
+                agent="LeadAgent",
+                description="internal placeholder requiring the Lead model to select one safe catalog action",
+                expected_state_flags=["lead_arbitration_observed"],
+            ),
+            AgentAction(
                 id="fast_understand",
                 node="fast_understand",
                 agent="LeadAgent",
@@ -97,7 +104,7 @@ class AgentActionRegistry:
                 id="query_metric",
                 node="query_metric",
                 agent="MetricTool",
-                description="resolve, validate, execute and verify one governed semantic metric inside the current Topic workspace",
+                description="resolve and validate one governed semantic metric graph, then return the observation to LeadAgent",
                 required_state_flags=["planning_assets_compacted"],
                 expected_state_flags=["query_metric_attempted"],
             ),
@@ -242,7 +249,7 @@ class AgentActionRegistry:
                 expected_state_flags=["chat_bi_completed"],
             ),
         ]
-        self._internal_ids = {"observe_contract_block"}
+        self._internal_ids = {"observe_contract_block", "lead_arbitrate"}
         self._aliases = {"answer": "answer_data"}
         self._by_id: Dict[str, AgentAction] = {action.id: action for action in actions}
         self._by_node: Dict[str, AgentAction] = {action.node: action for action in actions}
@@ -346,7 +353,12 @@ class V2AgentPolicy:
                 reason,
                 [item["action"] for item in blocked],
             )
-        selected_action = action_ids[0] if action_ids else "answer_data"
+        if len(action_ids) > 1:
+            selected_action = "lead_arbitrate"
+            decision_source = "lead_arbitration_pending"
+        else:
+            selected_action = action_ids[0] if action_ids else "ask_human"
+            decision_source = "runtime_single_action"
         action = self.registry.get(selected_action)
         return AgentDecision(
             selected_action=action.id,
@@ -354,6 +366,7 @@ class V2AgentPolicy:
             available_actions=action_ids,
             reason=reason,
             budget_exhausted=budget_exhausted,
+            source=decision_source,
         )
 
     def contract_safe_action_ids(
@@ -428,237 +441,148 @@ class V2AgentPolicy:
             return ["answer_data"], "main agent action budget exhausted", True
         if not state.get("topic_routed"):
             return ["route_topic"], "topic has not been routed", False
-        if self.memory_recall_required(state):
-            return ["recall_memory"], "topic workspace is ready; recall governed merchant memory with topic-aware context", False
-        if bool(getattr(self.settings, "lead_agent_autonomous_enabled", False)):
-            actions = self.autonomous_candidate_action_ids(state)
-            if actions:
-                reflection = normalize_reflection(state.get("planner_reflection"))
-                if reflection and not reflection.passed:
-                    reason = self.repair_decision_reason(reflection, actions[0])
-                elif state.get("planner_provider_error"):
-                    reason = "Planner provider failed; autonomous Lead Agent must validate and close with an explicit gap"
-                else:
-                    reason = "autonomous Lead Agent tool catalog filtered only by runtime safety contracts"
-                return actions, reason, bool(state.get("planner_provider_error") and not (state.get("plan") and state["plan"].intents))
-        if not state.get("data_discovered"):
-            if not state.get("fast_understood") and state.get("route_slots"):
-                return ["fast_understand"], "fast understanding has not classified complexity and intent kind", False
-            fast = state.get("fast_understanding")
-            if fast and getattr(fast, "intent_kind", "") == "rule_only":
-                return ["retrieve_knowledge", "answer_rule"], "fast understanding classified rule-only; retrieve rule knowledge first", False
-            if state.get("fast_metric_completed"):
-                return ["cache_answer"], "Lead Agent accepted a verified single semantic metric result", False
-            if self.general_delegation_needed(state):
-                return ["delegate_subagent", "retrieve_knowledge"], "request contains bounded document or Python work suitable for an isolated Sub-Agent", False
-            return ["retrieve_knowledge"], self.fast_understanding_reason(state, "semantic knowledge refresh is required before metric/query tools"), False
-        if self.has_rule_recall_ready(state):
-            return ["answer_rule"], "platform rule knowledge is ready; answer without BI QueryGraph", False
-        if self.has_rule_answer_plan(state):
-            return ["answer_rule"], "platform rule answer plan is ready", False
-        if not state.get("planning_assets_compacted"):
-            return ["compact_assets"], "planning asset pack has not been compacted", False
-        plan = state.get("plan")
-        if self.has_pending_knowledge_requests(state):
-            if self.knowledge_recall_stalled(state):
-                return self.stalled_knowledge_actions(state), "KnowledgeRequest recall produced no new refs; continue with current assets or close with gap", False
-            if self.can_retrieve_supplemental(state):
-                return ["retrieve_knowledge", "compact_assets", "plan_graph", "repair_graph", "answer_data"], self.pending_knowledge_reason(state), False
-            if not self.graph_validation_attempted(state):
-                return ["validate_graph"], "knowledge request budget exhausted; validate current graph as structured gap", True
-        if state.get("query_metric_completed") and self.evidence_verification_passed(state):
-            return ["answer_data"], "query_metric executed and verified one governed semantic metric", False
-        if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
-            return ["query_metric", "plan_graph"], "single governed metric can be resolved through query_metric after Topic workspace recall", False
-        if (not plan or not plan.intents) and state.get("planner_provider_error"):
-            if not self.graph_validation_attempted(state):
-                return ["validate_graph"], "Planner provider failed; validate empty graph as structured gap", True
-            return ["answer_data"], "Planner provider failed; answer with structured planning gap", True
-        if (not plan or not plan.intents) and int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
-            return ["plan_graph", "retrieve_knowledge"], "QueryGraph has not been planned", False
-        if plan and plan.intents and not state.get("query_graph_reflected"):
-            if self.fast_path_bypasses_reflection(state):
-                if not self.graph_validation_attempted(state):
-                    return ["validate_graph"], "fast candidate skips Planner Reflection but must pass deterministic validation", False
+        actions = self.autonomous_candidate_action_ids(state)
+        if actions:
+            reflection = normalize_reflection(state.get("planner_reflection"))
+            if reflection and not reflection.passed:
+                reason = "Lead Agent received a runtime-safe repair catalog from PlannerCritic observations"
+            elif state.get("planner_provider_error"):
+                reason = "Planner provider failed; Lead Agent must select a safe recovery or close with an explicit gap"
             else:
-                return ["reflect_plan", "validate_graph"], "QueryGraph needs planner reflection before validation", False
-        reflection = normalize_reflection(state.get("planner_reflection"))
-        if reflection and not reflection.passed:
-            repair_actions = self.repair_request_actions(reflection)
-            if "semantic_read" in repair_actions and self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state):
-                return ["retrieve_knowledge", "compact_assets", "repair_graph", "plan_graph", "answer_data"], self.repair_decision_reason(reflection, "retrieve_knowledge"), False
-            if "semantic_read" in repair_actions and self.knowledge_recall_stalled(state):
-                return self.stalled_knowledge_actions(state), "PlannerCritic requested semantic knowledge but recall has no new refs; continue without another retrieve", False
-            if self.has_structural_anchor_repair_issue(reflection) and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"], self.repair_decision_reason(reflection, "repair_graph"), False
-            if "re_understand" in repair_actions and self.can_reunderstand(state):
-                return ["plan_graph", "repair_graph", "answer_data"], self.repair_decision_reason(reflection, "plan_graph"), False
-            if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "retrieve_knowledge", "answer_data"], self.repair_decision_reason(reflection, "repair_graph"), False
-            if "answer_with_gap" in repair_actions:
-                if not self.graph_validation_attempted(state):
-                    return ["validate_graph"], "PlannerCritic requested answer_with_gap; validate QueryGraph before answering", True
-                return ["answer_data"], self.repair_decision_reason(reflection, "answer_data"), True
-            has_blocking_issue = any(str(issue.get("severity") or "") == "error" for issue in reflection.issues)
-            if (
-                reflection.suggested_knowledge_requests
-                and (reflection.repair_reason or has_blocking_issue)
-                and self.can_retrieve_supplemental(state)
-            ):
-                return ["retrieve_knowledge", "repair_graph", "answer_data"], "planner reflection requested more knowledge", False
-            if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"], "planner reflection found repairable graph issues", False
-            if not self.graph_validation_attempted(state):
-                return ["validate_graph"], "planner reflection repair budget exhausted; validate QueryGraph before answer", True
-            return ["answer_data"], "planner reflection failed and repair budget is exhausted", True
-        if not self.graph_validation_attempted(state):
-            return ["validate_graph"], "QueryGraph has not been validated", False
-        validation = state.get("query_graph_validation_result")
-        if validation and not validation.valid:
-            if self.validation_requires_knowledge(validation) and self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state):
-                return ["retrieve_knowledge", "compact_assets", "repair_graph", "answer_data"], "validator requested missing semantic knowledge before graph repair", False
-            if self.validation_requires_knowledge(validation) and self.knowledge_recall_stalled(state):
-                if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
-                    return ["plan_graph", "repair_graph", "answer_data"], "validator requested knowledge but recall stalled; rerun understanding or repair current graph", False
-                if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                    return ["repair_graph", "answer_data"], "validator requested knowledge but recall stalled; repair current graph", False
-            if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
-                return ["plan_graph", "answer_data"], "validator found contract mismatch; rerun LLM understanding", False
-            if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"], "validator found repairable graph gaps", False
-            return ["answer_data"], "QueryGraph validation failed and cannot be repaired in budget", True
-        if self.has_blocking_reflection_issues(state):
-            return ["answer_data"], "PlannerCritic still has blocking errors; do not execute even if structural validation passed", True
-        if self.has_validated_executable_plan(state) and not state.get("sql_generated"):
-            actions = self.execution_action_ids(state)
-            return actions, "validated QueryGraph is ready; LeadAgent selects direct worker or bounded Sub-Agent from runtime cost signals", False
-        if self.has_graph_repairable_execution_gap(state):
-            if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"], "NodeAgent found graph-repairable plan contract gaps", False
-            return ["answer_data"], "graph-repairable execution gaps remain but repair budget is exhausted", True
-        if not state.get("sql_repair_reviewed") and self.has_sql_failure(state):
-            return ["repair_sql", "verify_evidence"], "one or more node SQL executions failed", False
-        if self.has_task_results(state) and not self.evidence_verification_attempted(state):
-            return ["verify_evidence"], "evidence has not been verified", False
-        if self.has_graph_repairable_execution_gap(state):
-            if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"], "evidence verifier found graph-repairable dependency gaps", False
-            return ["answer_data"], "graph-repairable evidence gaps remain but repair budget is exhausted", True
-        if self.analysis_worker_needed(state) or self.analysis_skill_needed(state):
-            actions = []
-            if self.analysis_skill_needed(state):
-                actions.append("run_analysis_skill")
-            if self.analysis_worker_needed(state):
-                actions.append("run_analysis_worker")
-            actions.append("answer_data")
-            if not state.get("subagent_delegation_attempted"):
-                actions.insert(1, "delegate_subagent")
-            return actions, "verified evidence is ready; LeadAgent may choose direct answer, generic AnalysisWorker, or matched SkillWorker", False
-        if not state.get("chat_bi_completed"):
-            return ["answer_data"], "ready to compose BI answer", False
-        return ["cache_answer"], "answer is complete and can be cached", False
+                reason = "Lead Agent tool catalog filtered only by declarative prerequisites and runtime safety contracts"
+            return actions, reason, bool(
+                state.get("planner_provider_error")
+                and not (state.get("plan") and state["plan"].intents)
+            )
+        return ["ask_human"], "no runtime-safe Lead action is currently eligible", True
 
     def autonomous_candidate_action_ids(self, state: AgentState) -> List[str]:
-        """Expose every currently safe tool instead of prescribing a workflow stage."""
+        """Build an unordered ReAct tool catalog from state contracts.
+
+        This method only decides whether an action is currently safe and useful.
+        It never ranks business actions: when several actions remain, the Lead
+        model must select one; model failure is handled by the fail-closed path.
+        """
+
+        eligible: set[str] = set()
         plan = state.get("plan")
         validation = state.get("query_graph_validation_result")
         run_result = state.get("agent_run_result")
         reflection = normalize_reflection(state.get("planner_reflection"))
         has_plan = bool(plan and getattr(plan, "intents", None))
         has_tasks = bool(getattr(run_result, "task_results", None))
+
         if state.get("fast_metric_completed"):
             return ["cache_answer"]
-        early_understanding = not state.get("data_discovered") and not has_plan and not has_tasks
-        if early_understanding and not state.get("fast_understood"):
-            return ["fast_understand"]
-        if self.has_pending_knowledge_requests(state):
-            if self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state):
-                return ["retrieve_knowledge"]
-            return self.stalled_knowledge_actions(state)
-        if not state.get("data_discovered"):
-            if self.general_delegation_needed(state):
-                return ["delegate_subagent", "retrieve_knowledge"]
-            return ["retrieve_knowledge"]
+
+        if self.memory_recall_required(state):
+            eligible.add("recall_memory")
+        if (
+            not state.get("fast_understood")
+            and not has_tasks
+            and not state.get("planner_provider_error")
+            and not self.graph_validation_attempted(state)
+        ):
+            eligible.add("fast_understand")
+        if self.general_delegation_needed(state):
+            eligible.add("delegate_subagent")
+
+        pending_knowledge = self.has_pending_knowledge_requests(state)
+        knowledge_can_progress = self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state)
+        if not state.get("data_discovered") or (pending_knowledge and knowledge_can_progress):
+            eligible.add("retrieve_knowledge")
+
         if self.has_rule_recall_ready(state) or self.has_rule_answer_plan(state):
-            return ["answer_rule"]
-        if state.get("data_discovered") and not state.get("planning_assets_compacted"):
-            return ["compact_assets"]
-        if state.get("query_metric_completed") and self.evidence_verification_passed(state):
-            return ["answer_data"]
-        if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
-            return ["query_metric", "plan_graph"]
-        if not has_plan:
-            if self.graph_validation_attempted(state):
-                return ["answer_data"]
-            if state.get("planner_provider_error"):
-                return ["validate_graph"]
-            if int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
-                return ["plan_graph", "retrieve_knowledge"]
-            return ["validate_graph", "answer_data"]
-        repair_actions = self.repair_request_actions(reflection) if reflection and not reflection.passed else []
-        if reflection and not reflection.passed:
-            if "semantic_read" in repair_actions and self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state):
-                return ["retrieve_knowledge", "repair_graph", "answer_data"]
-            if "semantic_read" in repair_actions and self.knowledge_recall_stalled(state):
-                return self.stalled_knowledge_actions(state)
-            if self.has_structural_anchor_repair_issue(reflection) and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"]
-            if "re_understand" in repair_actions and self.can_reunderstand(state):
-                return ["plan_graph", "repair_graph", "answer_data"]
-            if "graph_repair" in repair_actions and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "retrieve_knowledge", "answer_data"]
-        if has_plan and not state.get("query_graph_reflected"):
-            if self.fast_path_bypasses_reflection(state):
-                if not self.graph_validation_attempted(state):
-                    return ["validate_graph"]
+            eligible.add("answer_rule")
+
+        assets_ready = bool(state.get("planning_assets_compacted"))
+        if state.get("data_discovered") and not assets_ready:
+            eligible.add("compact_assets")
+
+        if assets_ready:
+            if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
+                eligible.add("query_metric")
+
+            if not has_plan:
+                if state.get("planner_provider_error"):
+                    if not self.graph_validation_attempted(state):
+                        eligible.add("validate_graph")
+                    else:
+                        eligible.add("answer_data")
+                elif int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
+                    eligible.add("plan_graph")
+                    if self.can_retrieve_supplemental(state):
+                        eligible.add("retrieve_knowledge")
             else:
-                return ["reflect_plan", "validate_graph"]
-        if has_plan and not self.graph_validation_attempted(state):
-            if reflection and not reflection.passed and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "validate_graph", "answer_data"]
-            return ["validate_graph"]
-        if validation and not validation.valid:
-            if self.validation_requires_knowledge(validation) and self.can_retrieve_supplemental(state) and not self.knowledge_recall_stalled(state):
-                return ["retrieve_knowledge", "compact_assets", "repair_graph", "answer_data"]
-            if self.validation_requires_knowledge(validation) and self.knowledge_recall_stalled(state):
-                if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
-                    return ["plan_graph", "repair_graph", "answer_data"]
-                if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                    return ["repair_graph", "answer_data"]
-            if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
-                return ["plan_graph", "answer_data"]
-            if validation.repairable and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"]
-            return ["answer_data"]
-        if self.has_blocking_reflection_issues(state):
-            return ["answer_data"]
-        if self.has_validated_executable_plan(state) and not state.get("sql_generated"):
-            return self.execution_action_ids(state)
-        if self.has_graph_repairable_execution_gap(state):
-            if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"]
-            return ["answer_data"]
+                repair_actions = self.repair_request_actions(reflection) if reflection and not reflection.passed else []
+                repair_budget = int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions
+
+                if not state.get("query_graph_reflected") and not self.fast_path_bypasses_reflection(state):
+                    eligible.add("reflect_plan")
+                if not self.graph_validation_attempted(state):
+                    eligible.add("validate_graph")
+
+                if reflection and not reflection.passed:
+                    if "semantic_read" in repair_actions and knowledge_can_progress:
+                        eligible.add("retrieve_knowledge")
+                    if "re_understand" in repair_actions and self.can_reunderstand(state):
+                        eligible.add("plan_graph")
+                    if repair_budget and (
+                        "graph_repair" in repair_actions
+                        or self.has_structural_anchor_repair_issue(reflection)
+                        or bool(reflection.issues)
+                    ):
+                        eligible.add("repair_graph")
+                    if "answer_with_gap" in repair_actions and self.graph_validation_attempted(state):
+                        eligible.add("answer_data")
+
+                if validation and not validation.valid:
+                    if self.validation_requires_knowledge(validation) and knowledge_can_progress:
+                        eligible.add("retrieve_knowledge")
+                    if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
+                        eligible.add("plan_graph")
+                    if validation.repairable and repair_budget:
+                        eligible.add("repair_graph")
+                    if not eligible.intersection({"retrieve_knowledge", "plan_graph", "repair_graph"}):
+                        eligible.add("answer_data")
+
+                if self.has_blocking_reflection_issues(state):
+                    eligible.add("answer_data")
+                elif self.has_validated_executable_plan(state) and not state.get("sql_generated"):
+                    eligible.update(self.execution_action_ids(state))
+
         if state.get("sql_generated") and self.has_sql_failure(state) and not state.get("sql_repair_reviewed"):
-            return ["repair_sql", "verify_evidence"]
+            eligible.add("repair_sql")
         if has_tasks and not self.evidence_verification_attempted(state):
-            return ["verify_evidence"]
+            eligible.add("verify_evidence")
+
         if self.has_graph_repairable_execution_gap(state):
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
-                return ["repair_graph", "answer_data"]
-            return ["answer_data"]
-        if self.evidence_verification_passed(state) and (self.analysis_worker_needed(state) or self.analysis_skill_needed(state)):
-            actions = []
+                eligible.add("repair_graph")
+            else:
+                eligible.add("answer_data")
+
+        if self.evidence_verification_passed(state):
             if self.analysis_skill_needed(state):
-                actions.append("run_analysis_skill")
+                eligible.add("run_analysis_skill")
             if self.analysis_worker_needed(state):
-                actions.append("run_analysis_worker")
-            actions.append("answer_data")
-            return actions if state.get("subagent_delegation_attempted") else [actions[0], "delegate_subagent"] + actions[1:]
-        if self.evidence_verification_attempted(state) or state.get("planner_provider_error") or (has_plan and validation and not validation.valid):
-            return ["answer_data"]
-        if state.get("chat_bi_completed"):
-            return ["cache_answer"]
-        return []
+                eligible.add("run_analysis_worker")
+            if not state.get("subagent_delegation_attempted"):
+                eligible.add("delegate_subagent")
+            eligible.add("answer_data")
+        elif self.evidence_verification_attempted(state):
+            eligible.add("answer_data")
+
+        if state.get("query_metric_completed") and self.evidence_verification_passed(state):
+            eligible.add("answer_data")
+        if state.get("planner_provider_error") and self.graph_validation_attempted(state):
+            eligible.add("answer_data")
+
+        return [
+            action_id
+            for action_id in self.registry.public_action_ids()
+            if action_id in eligible
+        ]
 
     def memory_recall_required(self, state: AgentState) -> bool:
         route = state.get("routing_decision")

@@ -35,6 +35,8 @@ SQL_FUNCTION_PATTERN = re.compile(
 )
 MARKDOWN_SEPARATOR_CELL_PATTERN = re.compile(r"^:?-{3,}:?$")
 
+DerivedNumber = Tuple[Decimal, List[str], List[str], str]
+
 
 class AnswerClaimVerifier:
     """Reject factual values that cannot be traced to executed result rows."""
@@ -107,6 +109,7 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
         governed_columns = governed_fact_columns(intent, task)
         column_labels = governed_column_labels(intent, task)
         column_label_aliases = governed_column_label_aliases(intent, task)
+        column_aggregation_policies = governed_column_aggregation_policies(intent, task)
         for row_index, row in enumerate(task_rows[:200]):
             for column, value in row.items():
                 if value in (None, "") or str(column).startswith("__"):
@@ -140,6 +143,7 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
                         value=value,
                         value_type=fact_value_type(str(column), value, {time_column} if time_column else set()),
                         result_role=role,
+                        aggregation_policy=str(column_aggregation_policies.get(str(column)) or ""),
                     )
                 )
     merged_rows, _ = query_bundle_complete_rows(run_result.merged_query_bundle)
@@ -370,7 +374,7 @@ def support_for_claim(
     claim: AnswerClaim,
     question: str,
     facts: List[VerifiedFact],
-    allowed_numbers: List[Tuple[Decimal, List[str], List[str]]],
+    allowed_numbers: List[DerivedNumber],
     allowed_entities: Set[str],
 ) -> Tuple[List[str], List[str]]:
     fact_ids: List[str] = []
@@ -530,14 +534,14 @@ def direction_word(text: str) -> str:
     return ""
 
 
-def supported_numbers(facts: List[VerifiedFact]) -> List[Tuple[Decimal, List[str], List[str]]]:
+def supported_numbers(facts: List[VerifiedFact]) -> List[DerivedNumber]:
     grouped: Dict[Tuple[str, str], List[VerifiedFact]] = {}
     for fact in facts:
         number = decimal_value(fact.value)
         if number is None:
             continue
         grouped.setdefault((fact.task_id, fact.column), []).append(fact)
-    derived: List[Tuple[Decimal, List[str], List[str]]] = []
+    derived: List[DerivedNumber] = []
     for fact_group in grouped.values():
         labels = fact_label_candidates(fact_group[0])
         source_fact_ids = [fact.fact_id for fact in fact_group]
@@ -550,18 +554,25 @@ def supported_numbers(facts: List[VerifiedFact]) -> List[Tuple[Decimal, List[str
         first, last = numbers[0], numbers[-1]
         derived.extend(
             [
-                (last - first, labels, source_fact_ids),
-                (abs(last - first), labels, source_fact_ids),
+                (last - first, labels, source_fact_ids, "window_delta"),
+                (abs(last - first), labels, source_fact_ids, "window_delta"),
             ]
         )
         if first != 0:
             percent = (last - first) / abs(first) * Decimal("100")
             derived.extend(
                 [
-                    (percent, labels, source_fact_ids),
-                    (abs(percent), labels, source_fact_ids),
+                    (percent, labels, source_fact_ids, "window_change_rate"),
+                    (abs(percent), labels, source_fact_ids, "window_change_rate"),
                 ]
             )
+        policies = {
+            str(fact.aggregation_policy or "").strip().lower()
+            for fact in fact_group
+            if str(fact.aggregation_policy or "").strip()
+        }
+        if policies == {"period_rollup"}:
+            derived.append((sum(numbers, Decimal("0")), labels, source_fact_ids, "period_rollup"))
         for previous, current in zip(fact_group, fact_group[1:]):
             previous_value = decimal_value(previous.value)
             current_value = decimal_value(current.value)
@@ -571,16 +582,16 @@ def supported_numbers(facts: List[VerifiedFact]) -> List[Tuple[Decimal, List[str
             adjacent_delta = current_value - previous_value
             derived.extend(
                 [
-                    (adjacent_delta, labels, adjacent_ids),
-                    (abs(adjacent_delta), labels, adjacent_ids),
+                    (adjacent_delta, labels, adjacent_ids, "adjacent_delta"),
+                    (abs(adjacent_delta), labels, adjacent_ids, "adjacent_delta"),
                 ]
             )
             if previous_value != 0:
                 adjacent_percent = adjacent_delta / abs(previous_value) * Decimal("100")
                 derived.extend(
                     [
-                        (adjacent_percent, labels, adjacent_ids),
-                        (abs(adjacent_percent), labels, adjacent_ids),
+                        (adjacent_percent, labels, adjacent_ids, "adjacent_change_rate"),
+                        (abs(adjacent_percent), labels, adjacent_ids, "adjacent_change_rate"),
                     ]
                 )
     return dedupe_derived_numbers(derived)
@@ -781,16 +792,17 @@ def is_business_entity_token(value: str, non_entity_tokens: Set[str] | None = No
 def supported_derived_numeric_token(
     raw: str,
     claim_text: str,
-    allowed: Iterable[Tuple[Decimal, List[str], List[str]]],
+    allowed: Iterable[DerivedNumber],
 ) -> List[str]:
     target = decimal_token(raw)
     if target is None:
         return []
-    if claim_asserts_direct_metric_value(claim_text):
-        return []
+    direct_claim = claim_asserts_direct_metric_value(claim_text)
     normalized_claim = normalize_label_text(claim_text)
     matched_ids: List[str] = []
-    for candidate, labels, fact_ids in allowed:
+    for candidate, labels, fact_ids, derivation in allowed:
+        if direct_claim and derivation != "period_rollup":
+            continue
         if decimal_close(target, candidate) and any(label and label in normalized_claim for label in labels):
             matched_ids.extend(fact_ids)
     return dedupe_texts(matched_ids)
@@ -910,6 +922,69 @@ def governed_column_label_aliases(intent: Any, task: Any) -> Dict[str, List[str]
         if len(source_columns) == 1:
             add(source_columns[0], values)
     return aliases
+
+
+def governed_column_aggregation_policies(intent: Any, task: Any) -> Dict[str, str]:
+    """Bind a result column only to an explicitly published rollup policy.
+
+    Policies are never inferred from identifiers, tables, formulas, or values.
+    Conflicting contracts deliberately leave the column ungoverned so that a
+    derived period total cannot pass answer verification.
+    """
+
+    candidates: Dict[str, Set[str]] = {}
+
+    def add(column: Any, policy: Any) -> None:
+        key = str(column or "").strip()
+        value = str(policy or "").strip().lower()
+        if key and value:
+            candidates.setdefault(key, set()).add(value)
+
+    if intent is not None:
+        resolution = dict(getattr(intent, "metric_resolution", {}) or {})
+        resolution_policy = resolution.get("aggregationPolicy") or resolution.get("aggregation_policy")
+        resolution_columns = dedupe_texts(
+            [
+                getattr(intent, "metric_name", ""),
+                getattr(intent, "metric_column", ""),
+                resolution.get("metricKey"),
+                resolution.get("metric_key"),
+            ]
+        )
+        source_columns = resolution.get("sourceColumns") or resolution.get("source_columns") or []
+        if len(source_columns) == 1:
+            resolution_columns.append(str(source_columns[0]))
+        for column in resolution_columns:
+            add(column, resolution_policy)
+
+    contract = getattr(task, "node_plan_contract", None)
+    specs = [
+        *(getattr(intent, "metric_specs", []) or [] if intent is not None else []),
+        *(getattr(contract, "metric_specs", []) or []),
+    ]
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        policy = spec.get("aggregationPolicy") or spec.get("aggregation_policy")
+        columns = dedupe_texts(
+            [
+                spec.get("metricName"),
+                spec.get("metric_name"),
+                spec.get("metricColumn"),
+                spec.get("metric_column"),
+            ]
+        )
+        source_columns = spec.get("sourceColumns") or spec.get("source_columns") or []
+        if len(source_columns) == 1:
+            columns.append(str(source_columns[0]))
+        for column in columns:
+            add(column, policy)
+
+    return {
+        column: next(iter(policies))
+        for column, policies in candidates.items()
+        if len(policies) == 1
+    }
 
 
 def decimal_close(left: Decimal, right: Decimal) -> bool:
@@ -1044,16 +1119,16 @@ def dedupe_texts(values: Iterable[str]) -> List[str]:
 
 
 def dedupe_derived_numbers(
-    values: Iterable[Tuple[Decimal, List[str], List[str]]],
-) -> List[Tuple[Decimal, List[str], List[str]]]:
-    result: List[Tuple[Decimal, List[str], List[str]]] = []
+    values: Iterable[DerivedNumber],
+) -> List[DerivedNumber]:
+    result: List[DerivedNumber] = []
     seen: Set[Tuple[str, Tuple[str, ...]]] = set()
-    for number, labels, fact_ids in values:
-        key = (str(number.normalize()), tuple(sorted(labels)))
+    for number, labels, fact_ids, derivation in values:
+        key = ("%s:%s" % (derivation, number.normalize()), tuple(sorted(labels)))
         if key in seen:
             continue
         seen.add(key)
-        result.append((number, labels, fact_ids))
+        result.append((number, labels, fact_ids, derivation))
     return result
 
 

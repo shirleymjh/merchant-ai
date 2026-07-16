@@ -82,6 +82,49 @@ def test_ratio_metric_requires_an_explicit_rollup_contract() -> None:
     assert "RATIO_AGGREGATION_POLICY_UNDECLARED" in validation_codes(asset)
 
 
+def test_every_metric_requires_a_supported_aggregation_policy() -> None:
+    missing = {
+        "tableName": "metric_table",
+        "schemaColumns": [{"columnName": "metric_value"}],
+        "metrics": [
+            {
+                "metricKey": "metric_value",
+                "formula": "SUM(metric_value)",
+                "sourceColumns": ["metric_value"],
+            }
+        ],
+    }
+    invalid = {
+        **missing,
+        "metrics": [
+            {
+                **missing["metrics"][0],
+                "aggregationPolicy": "guess_from_metric_name",
+            }
+        ],
+    }
+
+    assert "METRIC_AGGREGATION_POLICY_UNDECLARED" in validation_codes(missing)
+    assert "METRIC_AGGREGATION_POLICY_INVALID" in validation_codes(invalid)
+
+
+def test_additive_period_rollup_cannot_publish_an_average_formula() -> None:
+    asset = {
+        "tableName": "metric_table",
+        "schemaColumns": [{"columnName": "metric_value"}],
+        "metrics": [
+            {
+                "metricKey": "metric_value",
+                "formula": "AVG(metric_value)",
+                "sourceColumns": ["metric_value"],
+                "aggregationPolicy": "period_rollup",
+            }
+        ],
+    }
+
+    assert "PERIOD_ROLLUP_NON_ADDITIVE_FORMULA" in validation_codes(asset)
+
+
 def test_checked_in_catalog_satisfies_role_and_daily_value_contracts() -> None:
     assets = TopicAssetService(get_settings())
     governed_codes = {
@@ -89,6 +132,9 @@ def test_checked_in_catalog_satisfies_role_and_daily_value_contracts() -> None:
         "DAILY_VALUE_TIME_GRAIN_UNDECLARED",
         "DAILY_VALUE_CROSS_DAY_AGGREGATION_FORBIDDEN",
         "RATIO_AGGREGATION_POLICY_UNDECLARED",
+        "METRIC_AGGREGATION_POLICY_UNDECLARED",
+        "METRIC_AGGREGATION_POLICY_INVALID",
+        "PERIOD_ROLLUP_NON_ADDITIVE_FORMULA",
     }
 
     violations = []

@@ -1132,28 +1132,28 @@
     {
       "columnName": "coupon_rule_a",
       "businessName": "满多少元",
-      "role": "METRIC",
+      "role": "OTHER",
       "description": "满多少元",
       "aliases": [
         "满多少元",
         "coupon_rule_a"
       ],
       "enumValues": [],
-      "metricFormula": "SUM(coupon_rule_a)",
+      "metricFormula": "",
       "confidence": 0.78,
       "evidence": "schema comment=满多少元"
     },
     {
       "columnName": "coupon_rule_b",
       "businessName": "减多少元",
-      "role": "METRIC",
+      "role": "OTHER",
       "description": "减多少元",
       "aliases": [
         "减多少元",
         "coupon_rule_b"
       ],
       "enumValues": [],
-      "metricFormula": "SUM(coupon_rule_b)",
+      "metricFormula": "",
       "confidence": 0.78,
       "evidence": "schema comment=减多少元"
     },
@@ -1307,70 +1307,13 @@
       "tableKind": "detail_fact",
       "metricGrain": "repay_detail",
       "metricIntent": "detail_drilldown",
+      "aggregationPolicy": "period_rollup",
       "ambiguousAliases": [],
       "naturalName": "赔付明细金额",
       "originalBusinessName": "赔付明细金额",
       "naturalAlias": "赔付明细金额",
       "sourceColumnAliases": [
         "repay_amt"
-      ]
-    },
-    {
-      "metricKey": "coupon_rule_a",
-      "businessName": "赔付明细满多少元",
-      "formula": "SUM(coupon_rule_a)",
-      "unit": "元",
-      "description": "满多少元",
-      "sourceColumns": [
-        "coupon_rule_a"
-      ],
-      "aliases": [
-        "赔付明细满多少元",
-        "coupon_rule_a",
-        "赔付满多少元"
-      ],
-      "confidence": 0.78,
-      "evidence": "schema comment=满多少元",
-      "displayName": "赔付明细满多少元",
-      "disambiguationName": "赔付明细满多少元",
-      "tableKind": "detail_fact",
-      "metricGrain": "repay_detail",
-      "metricIntent": "detail_drilldown",
-      "ambiguousAliases": [],
-      "naturalName": "满多少元",
-      "originalBusinessName": "满多少元",
-      "naturalAlias": "满多少元",
-      "sourceColumnAliases": [
-        "coupon_rule_a"
-      ]
-    },
-    {
-      "metricKey": "coupon_rule_b",
-      "businessName": "赔付明细减多少元",
-      "formula": "SUM(coupon_rule_b)",
-      "unit": "元",
-      "description": "减多少元",
-      "sourceColumns": [
-        "coupon_rule_b"
-      ],
-      "aliases": [
-        "赔付明细减多少元",
-        "coupon_rule_b",
-        "赔付减多少元"
-      ],
-      "confidence": 0.78,
-      "evidence": "schema comment=减多少元",
-      "displayName": "赔付明细减多少元",
-      "disambiguationName": "赔付明细减多少元",
-      "tableKind": "detail_fact",
-      "metricGrain": "repay_detail",
-      "metricIntent": "detail_drilldown",
-      "ambiguousAliases": [],
-      "naturalName": "减多少元",
-      "originalBusinessName": "减多少元",
-      "naturalAlias": "减多少元",
-      "sourceColumnAliases": [
-        "coupon_rule_b"
       ]
     },
     {
@@ -1397,6 +1340,7 @@
       "tableKind": "detail_fact",
       "metricGrain": "repay_detail",
       "metricIntent": "detail_drilldown",
+      "aggregationPolicy": "period_rollup",
       "ambiguousAliases": [],
       "naturalName": "赔付明细单量",
       "originalBusinessName": "赔付明细单量",
@@ -1465,6 +1409,7 @@
       "tableKind": "detail_fact",
       "metricGrain": "repay_detail",
       "metricIntent": "detail_drilldown",
+      "aggregationPolicy": "period_rollup",
       "ambiguousAliases": [],
       "naturalName": "打款成功赔付金额",
       "originalBusinessName": "打款成功赔付金额",

@@ -67,8 +67,8 @@ def test_policy_offers_general_delegation_for_attachment():
 
     decision = policy.decide(state)
 
-    assert decision.selected_action == "delegate_subagent"
-    assert "retrieve_knowledge" in decision.available_actions
+    assert decision.selected_action == "lead_arbitrate"
+    assert {"delegate_subagent", "retrieve_knowledge"} <= set(decision.available_actions)
 
 
 def test_policy_does_not_delegate_without_real_attachment_input():

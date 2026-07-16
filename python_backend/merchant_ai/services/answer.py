@@ -2743,7 +2743,7 @@ def multi_trend_metric_sentence(question: str, plan: QueryPlan, run_result: Agen
             if aggregation_policy == "period_rollup":
                 period_total = sum(
                     (
-                        value
+                        Decimal(str(value))
                         for point in points
                         if (value := answer_numeric_value(point.get("value"))) is not None
                     ),

@@ -34,6 +34,17 @@ from merchant_ai.services.time_semantics import resolve_time_range
 from merchant_ai.services.tools import AgentToolDefinition
 
 
+SUPPORTED_METRIC_AGGREGATION_POLICIES = frozenset(
+    {
+        "period_rollup",
+        "period_recompute",
+        "latest_value_only",
+        "daily_value_only",
+        "ratio_of_sums",
+    }
+)
+
+
 class TopicAssetService:
     SEMANTIC_LIST_FIELDS = {
         "schemaColumns",
@@ -765,7 +776,7 @@ class SemanticCatalogService:
         }, ref_id=semantic_manifest_ref_id(topic), topic=topic, kind=self.MANIFEST_KIND, path=semantic_manifest_path(topic))
 
     def table_ref(self, topic: str, table: str, asset: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        asset = asset or self.topic_assets.load_table_asset(topic, table)
+        asset = enforce_sample_evidence_governance(asset or self.topic_assets.load_table_asset(topic, table))
         content = json.dumps(asset, ensure_ascii=False, indent=2)
         layers = {
             "schemaColumns": len(asset.get("schemaColumns") or []),
@@ -1500,15 +1511,76 @@ def compact_table_metadata(asset: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def semantic_enum_business_approved(column: Dict[str, Any]) -> bool:
+    metadata = column.get("enumMetadata") if isinstance(column.get("enumMetadata"), dict) else {}
+    return str(metadata.get("reviewStatus") or "UNREVIEWED").strip().upper() == "APPROVED"
+
+
+def populated_semantic_enum_fields(column: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key in ("enumValues", "enumMappings", "enumMeanings", "valueLabels")
+        if (value := column.get(key)) not in (None, [], {})
+    }
+
+
+def quarantine_unapproved_semantic_enums(column: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove unreviewed enum evidence from the runtime semantic view.
+
+    Discovery output remains in the source asset for review.  Planner and
+    semantic_read consumers receive only values explicitly approved by the
+    asset contract, independent of any domain, table, or column name.
+    """
+
+    populated_fields = populated_semantic_enum_fields(column)
+    if not populated_fields or semantic_enum_business_approved(column):
+        return column
+    sanitized = dict(column)
+    suppressed_count = 0
+    for key, value in populated_fields.items():
+        suppressed_count += len(value) if isinstance(value, (list, tuple, set, dict)) else 1
+        sanitized[key] = {} if isinstance(value, dict) else []
+    sanitized.pop("sampleValues", None)
+    evidence = sanitized.get("evidence")
+    if isinstance(evidence, str):
+        sanitized["evidence"] = re.sub(r";?\s*samples=\[[^\]]*\]", "", evidence).strip()
+    metadata = dict(column.get("enumMetadata") or {})
+    metadata.setdefault("reviewStatus", "UNREVIEWED")
+    metadata.update(
+        {
+            "runtimePolicy": "QUARANTINED_UNTIL_APPROVED",
+            "runtimeSuppressed": True,
+            "suppressedValueCount": suppressed_count,
+        }
+    )
+    sanitized["enumMetadata"] = metadata
+    return sanitized
+
+
 def enforce_sample_evidence_governance(asset: Dict[str, Any]) -> Dict[str, Any]:
     governance = asset.get("sampleEvidenceGovernance") if isinstance(asset.get("sampleEvidenceGovernance"), dict) else {}
-    if governance.get("usableForSemanticDecisions") is not False:
-        return asset
+    strip_sample_evidence = governance.get("usableForSemanticDecisions") is False
     sanitized = dict(asset)
+    changed = False
+
+    semantic_columns: List[Any] = []
+    for raw in asset.get("semanticColumns") or []:
+        if not isinstance(raw, dict):
+            semantic_columns.append(raw)
+            continue
+        item = quarantine_unapproved_semantic_enums(raw)
+        changed = changed or item is not raw
+        semantic_columns.append(item)
+    if changed:
+        sanitized["semanticColumns"] = semantic_columns
+
+    if not strip_sample_evidence:
+        return sanitized if changed else asset
+
     sanitized["profiles"] = []
     for field in ("semanticColumns", "metrics", "terms", "knowledgeRules"):
         items: List[Dict[str, Any]] = []
-        for raw in asset.get(field) or []:
+        for raw in sanitized.get(field) or []:
             if not isinstance(raw, dict):
                 continue
             item = dict(raw)
@@ -4978,9 +5050,11 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_ALLOWED_ROLES", "column": column_name})
         if visibility.get("level") == "restricted" and masking.get("strategy") == "none":
             warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_MASKING", "column": column_name})
-        enum_values = field.get("enumValues") or []
         enum_metadata = field.get("enumMetadata") if isinstance(field.get("enumMetadata"), dict) else {}
-        if enum_values and str(enum_metadata.get("reviewStatus") or "UNREVIEWED").upper() != "APPROVED":
+        if (
+            populated_semantic_enum_fields(field)
+            and str(enum_metadata.get("reviewStatus") or "UNREVIEWED").upper() != "APPROVED"
+        ) or bool(enum_metadata.get("runtimeSuppressed")):
             warnings.append({"code": "ENUM_VALUES_NOT_BUSINESS_APPROVED", "column": column_name})
         field_aggregation_policy = str(field.get("aggregationPolicy") or "").strip().lower()
         if field_aggregation_policy == "daily_value_only":
@@ -5026,6 +5100,24 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         formula = str(metric.get("formula") or metric.get("metricFormula") or "").strip()
         metric_type = str(metric.get("metricType") or "").strip().upper()
         ratio_metric = metric_type == "RATIO" or "/" in formula
+        if not aggregation_policy:
+            errors.append({"code": "METRIC_AGGREGATION_POLICY_UNDECLARED", "metricKey": metric_key})
+        elif aggregation_policy not in SUPPORTED_METRIC_AGGREGATION_POLICIES:
+            errors.append(
+                {
+                    "code": "METRIC_AGGREGATION_POLICY_INVALID",
+                    "metricKey": metric_key,
+                    "aggregationPolicy": aggregation_policy,
+                }
+            )
+        if aggregation_policy == "period_rollup" and re.search(r"\bAVG\s*\(", formula, flags=re.IGNORECASE):
+            errors.append(
+                {
+                    "code": "PERIOD_ROLLUP_NON_ADDITIVE_FORMULA",
+                    "metricKey": metric_key,
+                    "formula": formula,
+                }
+            )
         if ratio_metric and aggregation_policy not in {"ratio_of_sums", "daily_value_only", "period_rollup"}:
             errors.append({"code": "RATIO_AGGREGATION_POLICY_UNDECLARED", "metricKey": metric_key})
         if aggregation_policy == "daily_value_only":
@@ -5642,6 +5734,8 @@ def semantic_ratio_alias_label(alias: str) -> bool:
 
 
 def semantic_enum_labels(column: Dict[str, Any]) -> List[Tuple[str, str]]:
+    if not semantic_enum_business_approved(column):
+        return []
     labels: List[Tuple[str, str]] = []
     for key in ("enumMappings", "enumMeanings", "valueLabels"):
         mapping = column.get(key)

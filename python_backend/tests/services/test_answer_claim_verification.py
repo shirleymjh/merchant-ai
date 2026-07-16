@@ -223,6 +223,73 @@ def test_verified_facts_load_complete_offloaded_rows_beyond_inline_preview(tmp_p
     assert any(fact.column == "metric_value" and fact.value == 29 for fact in facts)
 
 
+def temporal_series_plan_and_run(aggregation_policy):
+    question = "最近3天流量指标是多少？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="metric_series",
+                preferred_table="daily_profile",
+                metric_name="metric_value",
+                metric_column="metric_value",
+                group_by_column="business_date",
+                output_keys=["business_date"],
+                metric_resolution={
+                    "metricKey": "metric_value",
+                    "displayName": "流量指标",
+                    "sourceColumns": ["metric_value"],
+                    "aggregationPolicy": aggregation_policy,
+                },
+            )
+        ]
+    )
+    rows = [
+        {"business_date": "2026-07-01", "metric_value": 1},
+        {"business_date": "2026-07-02", "metric_value": 2},
+        {"business_date": "2026-07-03", "metric_value": 3},
+    ]
+    bundle = QueryBundle(tables=["daily_profile"], rows=rows, original_row_count=3)
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="metric_series", success=True, query_bundle=bundle)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    return question, plan, run
+
+
+def test_claim_verifier_accepts_period_total_only_for_published_period_rollup():
+    question, plan, run = temporal_series_plan_and_run("period_rollup")
+
+    result = AnswerClaimVerifier().verify(
+        question,
+        plan,
+        run,
+        "最近3天，流量指标周期合计为 6。",
+    )
+
+    assert result.passed is True
+    assert {fact.aggregation_policy for fact in run.verified_facts if fact.column == "metric_value"} == {
+        "period_rollup"
+    }
+
+
+def test_claim_verifier_rejects_series_sum_for_non_additive_policies():
+    for aggregation_policy in ["latest_value_only", "daily_value_only", "ratio_of_sums", ""]:
+        question, plan, run = temporal_series_plan_and_run(aggregation_policy)
+
+        result = AnswerClaimVerifier().verify(
+            question,
+            plan,
+            run,
+            "最近3天，流量指标周期合计为 6。",
+        )
+
+        assert result.passed is False, aggregation_policy
+
+
 def test_multi_metric_long_claim_binds_each_value_to_contract_alias_in_its_clause():
     question = "最近30天指标甲和指标乙有什么变化？"
     plan = QueryPlan(

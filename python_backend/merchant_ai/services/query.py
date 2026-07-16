@@ -7,7 +7,7 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextvars import copy_context
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -155,6 +155,9 @@ class ExecutionGraphPreparation:
     changed: bool
     optimization_notes: Tuple[str, ...] = ()
     validator_name: str = ""
+    freshness_reports: Tuple[FreshnessCheckResult, ...] = ()
+    runtime_fallback_task_ids: Tuple[str, ...] = ()
+    runtime_source_plan_fingerprint: str = ""
 
     @property
     def executable(self) -> bool:
@@ -168,6 +171,12 @@ class ExecutionGraphPreparation:
             "normalized execution graph is invalid; gaps=%s"
             % (",".join(gap_codes[:8]) or "QUERY_GRAPH_VALIDATION_FAILED")
         )
+
+    @property
+    def freshness_bound(self) -> bool:
+        """Whether runtime freshness was evaluated for this execution hand-off."""
+
+        return bool(self.runtime_source_plan_fingerprint)
 
 
 def execution_question_fingerprint(question: str) -> str:
@@ -509,6 +518,95 @@ class NodeWorkerExecutor:
     def with_artifact_root(self, root: str) -> None:
         self.artifact_store.set_context_root(root)
 
+    def prepare_runtime_execution_graph(
+        self,
+        merchant_id: str,
+        plan: QueryPlan,
+        asset_pack: PlanningAssetPack,
+        question: str,
+        *,
+        graph_validator: Any = None,
+        memory_constraints: Optional[List[Dict[str, Any]]] = None,
+        access_role: str = DEFAULT_ACCESS_ROLE,
+        user_scope: Optional[Dict[str, Any]] = None,
+    ) -> ExecutionGraphPreparation:
+        """Bind freshness routing to the exact graph that may reach SQL.
+
+        The logical graph is normalized and validated first.  Freshness may then
+        select an asset-declared realtime table.  Any such selection creates a new
+        graph version, rebuilds its evidence contract, and runs the complete graph
+        preparation/validation pipeline again.  The returned preparation is the
+        only graph hand-off accepted by :meth:`execute_plan`.
+        """
+
+        initial = prepare_execution_graph(
+            question,
+            plan,
+            asset_pack,
+            graph_validator,
+            memory_constraints or [],
+        )
+        if not initial.executable:
+            return initial
+
+        runtime_source_fingerprint = initial.execution_plan_fingerprint
+        runtime_plan = initial.plan.model_copy(deep=True)
+        reports: List[FreshnessCheckResult] = []
+        fallback_task_ids: List[str] = []
+        scope = dict(user_scope or {})
+        for index, intent in enumerate(runtime_plan.intents):
+            if intent.intent_type != IntentType.VALID or intent.answer_mode == AnswerMode.RULE:
+                continue
+            context = NodeExecutionContext(
+                merchant_id=merchant_id,
+                effective_user_id=str(scope.get("userId") or scope.get("user_id") or ""),
+                authorized_region=str(scope.get("region") or ""),
+                authorized_store_ids=[
+                    str(item)
+                    for item in (scope.get("storeIds") or scope.get("store_ids") or [])
+                    if str(item or "").strip()
+                ],
+                access_role=access_role or DEFAULT_ACCESS_ROLE,
+                question=question or intent.question,
+                context_package={"userScope": scope},
+            )
+            report = self._check_freshness(intent, asset_pack, context)
+            fallback_intent = self._maybe_realtime_fallback_intent(intent, asset_pack, report)
+            if fallback_intent is not None:
+                report.status = "STALE_USE_REALTIME_FALLBACK"
+                report.fallback_table = fallback_intent.preferred_table
+                report.reason = "%s; switch_to_realtime=%s" % (
+                    report.reason or "offline table stale",
+                    fallback_intent.preferred_table,
+                )
+                runtime_plan.intents[index] = fallback_intent
+                fallback_task_ids.append(intent.plan_task_id)
+            reports.append(report)
+
+        final = initial
+        if fallback_task_ids:
+            evidence_builder = EvidenceContractBuilder()
+            runtime_plan.evidence_contracts = evidence_builder.contracts_from_intents(runtime_plan.intents)
+            runtime_plan.final_required_evidence = evidence_builder.final_evidence_labels(runtime_plan.intents)
+            runtime_plan.agent_trace.append(
+                "execution_runtime.realtime_fallback=%s" % ",".join(fallback_task_ids)
+            )
+            final = prepare_execution_graph(
+                question,
+                runtime_plan,
+                asset_pack,
+                graph_validator,
+                memory_constraints or [],
+            )
+
+        return replace(
+            final,
+            changed=bool(final.changed or fallback_task_ids),
+            freshness_reports=tuple(report.model_copy(deep=True) for report in reports),
+            runtime_fallback_task_ids=tuple(fallback_task_ids),
+            runtime_source_plan_fingerprint=runtime_source_fingerprint,
+        )
+
     def execute_plan(
         self,
         merchant_id: str,
@@ -529,7 +627,12 @@ class NodeWorkerExecutor:
             question,
             execution_preparation=execution_preparation,
         )
-        result = AgentRunResult()
+        result = AgentRunResult(executed_query_graph_fingerprint=query_graph_fingerprint(plan))
+        prepared_freshness_by_task = {
+            report.task_id: report.model_copy(deep=True)
+            for report in (execution_preparation.freshness_reports if execution_preparation else ())
+            if report.task_id
+        }
         execution_run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
         executable = [intent for intent in plan.intents if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE]
         tasks_by_id = {intent.plan_task_id or "node_%s" % (index + 1): intent for index, intent in enumerate(executable)}
@@ -595,6 +698,7 @@ class NodeWorkerExecutor:
                 access_role=access_role,
                 user_scope=user_scope,
                 execution_mode=execution_mode,
+                prepared_freshness_by_task=prepared_freshness_by_task,
             )
             result.node_execution_batches.append(batch_trace)
             for task_id, task_result in batch_results.items():
@@ -777,6 +881,7 @@ class NodeWorkerExecutor:
         access_role: str = DEFAULT_ACCESS_ROLE,
         user_scope: Optional[Dict[str, Any]] = None,
         execution_mode: str = "auto",
+        prepared_freshness_by_task: Optional[Dict[str, FreshnessCheckResult]] = None,
     ) -> tuple[Dict[str, AgentTaskResult], NodeExecutionBatch]:
         started = time.perf_counter()
         run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
@@ -832,6 +937,12 @@ class NodeWorkerExecutor:
                         access_role=access_role,
                         user_scope=user_scope,
                     )
+                    prepared_freshness = (prepared_freshness_by_task or {}).get(task_id)
+                    if prepared_freshness is not None:
+                        context.context_package["preparedFreshnessReport"] = prepared_freshness.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
                     context.cancel_event = Event()
                     distributed = bool(self.distributed_subagent_client and task_mode == "subagent")
                     if distributed:
@@ -1640,8 +1751,11 @@ class NodeWorkerExecutor:
                 node_plan_critique=critique,
             )
         freshness_started = time.perf_counter()
-        freshness = self._check_freshness(intent, asset_pack, context)
-        freshness_duration_ms = int((time.perf_counter() - freshness_started) * 1000)
+        freshness = self._prepared_freshness_report(intent, context)
+        freshness_prepared = freshness is not None
+        if freshness is None:
+            freshness = self._check_freshness(intent, asset_pack, context)
+        freshness_duration_ms = 0 if freshness_prepared else int((time.perf_counter() - freshness_started) * 1000)
         record_tool(
             tool_traces,
             intent,
@@ -1652,18 +1766,14 @@ class NodeWorkerExecutor:
             freshness.status if freshness.status not in {"AVAILABLE", "SKIPPED", "NO_PT_COLUMN"} else "",
             duration_ms=freshness_duration_ms,
         )
-        fallback_intent = self._maybe_realtime_fallback_intent(intent, asset_pack, freshness)
-        if fallback_intent:
-            freshness.status = "STALE_USE_REALTIME_FALLBACK"
-            freshness.fallback_table = fallback_intent.preferred_table
-            freshness.reason = "%s; switch_to_realtime=%s" % (freshness.reason or "offline table stale", fallback_intent.preferred_table)
+        if freshness.status == "STALE_USE_REALTIME_FALLBACK":
             record_tool(
                 tool_traces,
                 intent,
                 "select_realtime_fallback",
                 "success",
-                intent.preferred_table,
-                "fallbackTable=%s maxPt=%s" % (fallback_intent.preferred_table, freshness.max_pt),
+                freshness.table,
+                "fallbackTable=%s maxPt=%s" % (intent.preferred_table, freshness.max_pt),
                 "STALE_USE_REALTIME_FALLBACK",
             )
             trace.append(
@@ -1671,34 +1781,60 @@ class NodeWorkerExecutor:
                     round=2,
                     reason="离线表近实时分区滞后，切换到实时 fallback 表",
                     action="select_realtime_fallback",
-                    observation="%s -> %s" % (intent.preferred_table, fallback_intent.preferred_table),
+                    observation="%s -> %s" % (freshness.table, intent.preferred_table),
                 )
             )
-            intent = fallback_intent
-            self._record_schema_tools(tool_traces, intent, asset_pack)
-            contract = self._node_plan_contract(intent, asset_pack, context)
-            critique_started = time.perf_counter()
-            critique = self.node_plan_critic.review(contract)
-            critique_duration_ms = int((time.perf_counter() - critique_started) * 1000)
-            node_task_profile.contract_status = "passed" if critique.valid else "failed"
-            node_task_profile.contract_critique_reason = critique.message or critique.code
-            record_tool(
-                tool_traces,
-                intent,
-                "contract_critic",
-                "success" if critique.valid else "failed",
-                contract.preferred_table,
-                critique.message or "fallback contract passed",
-                critique.code,
-                duration_ms=critique_duration_ms,
-            )
-            if not critique.valid:
-                message = "%s：%s" % (critique.code or "REALTIME_FALLBACK_CONTRACT_MISMATCH", critique.message)
-                record_tool(tool_traces, intent, "summarize_node_result", "failed", "realtime fallback contract", message, critique.code)
+        else:
+            fallback_intent = self._maybe_realtime_fallback_intent(intent, asset_pack, freshness)
+            if fallback_intent is not None:
+                freshness.status = "STALE_REQUIRES_GRAPH_REPREPARATION"
+                freshness.fallback_table = fallback_intent.preferred_table
+                freshness.reason = "%s; blocked_unprepared_realtime=%s" % (
+                    freshness.reason or "offline table stale",
+                    fallback_intent.preferred_table,
+                )
+                message = (
+                    "EXECUTION_GRAPH_CHANGED_AFTER_PREPARATION：freshness selected realtime table %s "
+                    "but the validated execution graph still targets %s"
+                    % (fallback_intent.preferred_table, intent.preferred_table)
+                )
+                node_task_profile.contract_status = "EXECUTION_GRAPH_CHANGED_AFTER_PREPARATION"
+                node_task_profile.contract_critique_reason = message
+                trace.append(
+                    ReActStep(
+                        round=2,
+                        reason=message,
+                        action="select_realtime_fallback.blocked",
+                        observation="%s -> %s" % (intent.preferred_table, fallback_intent.preferred_table),
+                    )
+                )
+                record_tool(
+                    tool_traces,
+                    intent,
+                    "select_realtime_fallback",
+                    "failed",
+                    intent.preferred_table,
+                    message,
+                    "EXECUTION_GRAPH_CHANGED_AFTER_PREPARATION",
+                )
+                record_tool(
+                    tool_traces,
+                    intent,
+                    "summarize_node_result",
+                    "failed",
+                    "runtime execution graph",
+                    message,
+                    "EXECUTION_GRAPH_CHANGED_AFTER_PREPARATION",
+                )
                 return AgentTaskResult(
                     success=False,
                     summary=message,
-                    query_bundle=QueryBundle(tables=[intent.preferred_table] if intent.preferred_table else [], failed=True, error=message, summary=message),
+                    query_bundle=QueryBundle(
+                        tables=[intent.preferred_table] if intent.preferred_table else [],
+                        failed=True,
+                        error=message,
+                        summary=message,
+                    ),
                     react_trace=trace,
                     node_tool_traces=tool_traces,
                     node_task_profile=node_task_profile,
@@ -2687,6 +2823,31 @@ class NodeWorkerExecutor:
             ",".join(requested[:16]),
             "" if requested else "NO_REQUIRED_COLUMNS",
         )
+
+    def _prepared_freshness_report(
+        self,
+        intent: QuestionIntent,
+        context: NodeExecutionContext,
+    ) -> Optional[FreshnessCheckResult]:
+        """Return only a freshness report bound to the current execution node."""
+
+        raw = (context.context_package or {}).get("preparedFreshnessReport")
+        if not raw:
+            return None
+        try:
+            report = raw if isinstance(raw, FreshnessCheckResult) else FreshnessCheckResult.model_validate(raw)
+        except Exception:
+            return None
+        if report.task_id and report.task_id != intent.plan_task_id:
+            return None
+        if report.table == intent.preferred_table:
+            return report.model_copy(deep=True)
+        if (
+            report.status == "STALE_USE_REALTIME_FALLBACK"
+            and report.fallback_table == intent.preferred_table
+        ):
+            return report.model_copy(deep=True)
+        return None
 
     def _check_freshness(
         self,
@@ -4652,6 +4813,7 @@ def normalize_metric_spec(spec: Dict[str, Any], intent: QuestionIntent, table: s
         "decimalPlaces": ("decimalPlaces", "decimal_places"),
         "metricType": ("metricType", "metric_type"),
         "aggregationPolicy": ("aggregationPolicy", "aggregation_policy"),
+        "applicableTimeGrain": ("applicableTimeGrain", "applicable_time_grain"),
         "semanticRefId": ("semanticRefId", "semantic_ref_id"),
         "ownerTable": ("ownerTable", "owner_table"),
     }

@@ -107,10 +107,13 @@ class AgentState(TypedDict, total=False):
     bounded_lead_llm_trace: Dict[str, Any]
     fast_gate_decision_trace: Dict[str, Any]
     lead_decision_context: Dict[str, Any]
+    capability_decisions: Dict[str, Any]
     recall_strategy: Dict[str, Any]
     worker_dispatch_context: Dict[str, Any]
     skill_dispatch_context: Dict[str, Any]
     main_agent_observations: List[Dict[str, Any]]
+    preflight_understanding: Dict[str, Any]
+    semantic_preflight_route_trace: Dict[str, Any]
     extracted_keywords: Any
     plan: QueryPlan
     recall_bundle: RecallBundle
@@ -132,6 +135,8 @@ class AgentState(TypedDict, total=False):
     knowledge_request_fingerprints: Dict[str, str]
     blocked_knowledge_request_keys: List[str]
     knowledge_request_gaps: List[Dict[str, Any]]
+    knowledge_expanded_topics: List[QuestionCategory]
+    knowledge_recall_coverage: Dict[str, Any]
     agent_run_result: AgentRunResult
     query_bundle: QueryBundle
     query_bundles: List[QueryBundle]
@@ -144,9 +149,11 @@ class AgentState(TypedDict, total=False):
     contract_block_observation: Dict[str, Any]
     contract_block_observed: bool
     contract_block_generation: int
+    lead_arbitration_observed: bool
     _pending_action_contract: Dict[str, Any]
     last_action_result: ActionResult
     planner_reflection: PlannerReflectionResult
+    last_query_graph_validation_gaps: List[GraphValidationGap]
     node_tool_traces: List[NodeToolCall]
     freshness_reports: List[FreshnessCheckResult]
     context_snapshots: List[ContextSnapshot]
@@ -189,6 +196,7 @@ class AgentState(TypedDict, total=False):
     planner_repair_reason: str
     planner_provider_error: str
     planner_degraded: Dict[str, Any]
+    time_window_contract: Dict[str, Any]
 
     base_knowledge_context: str
     topic_asset_context: str
@@ -230,6 +238,7 @@ class AgentState(TypedDict, total=False):
 
     answer: str
     analysis_summary: str
+    analysis_worker_result: Dict[str, Any]
     analysis_worker_trace: Dict[str, Any]
     analysis_worker_completed: bool
     analysis_worker_status: Dict[str, Any]
@@ -241,6 +250,7 @@ class AgentState(TypedDict, total=False):
     confirmation_evidence_reused: bool
     confirmation_token: str
     confirmation_source_run_id: str
+    confirmation_restore_status: Dict[str, Any]
     analysis_skill_bypassed: bool
     skill_worker_completed: bool
     analysis_skill_status: Dict[str, Any]
@@ -290,6 +300,8 @@ class AgentState(TypedDict, total=False):
     chat_bi_completed: bool
     run_canceled: bool
     middleware_loop_blocked: bool
+    middleware_blocked: bool
+    middleware_action_context_hashes: Dict[str, str]
     runtime_guard_gaps: List[GraphValidationGap]
     terminal_status: Dict[str, Any]
     should_persist: bool
@@ -301,6 +313,29 @@ class AgentState(TypedDict, total=False):
     human_clarification_stage: str
     human_clarification_type: str
     human_clarification_options: List[str]
+
+    # Internal orchestration channels still cross LangGraph node boundaries.
+    # They must be part of the TypedDict schema or StateGraph silently drops
+    # them from node updates/checkpoints.
+    _active_step_id: str
+    _answer_ready_emitted: bool
+    _clarification_tool_intercepted: bool
+    _emitted_tool_runtime_event_ids: List[str]
+    _lead_llm_decision_fingerprint: str
+    _lead_previous_gap_counts: Dict[str, int]
+    _lead_seen_recall_refs: List[str]
+    _memory_middleware_retry_attempted: bool
+    _memory_middleware_snapshot_ready: bool
+    _memory_semantic_refresh_attempted: bool
+    _memory_snapshot_locked: bool
+    _middleware_offloaded_tasks: List[str]
+    _preflight_question: str
+    _preflight_requires_full_context: bool
+    _route_slots_bootstrapped: bool
+    _route_understanding_question: str
+    _runtime_context_stale: bool
+    _skill_middleware_loaded: List[str]
+    _summarized_stages: List[str]
     _next_action: str
 
 

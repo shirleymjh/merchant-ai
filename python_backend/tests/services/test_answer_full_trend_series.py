@@ -40,7 +40,11 @@ def trend_plan_and_run(tmp_path, series, preview_limit=20, persist_artifacts=Tru
             metric_name=metric_key,
             metric_column=metric_key,
             group_by_column="pt",
-            metric_resolution={"metricKey": metric_key, "displayName": label},
+            metric_resolution={
+                "metricKey": metric_key,
+                "displayName": label,
+                "aggregationPolicy": payload.get("aggregationPolicy", ""),
+            },
         )
         artifacts = []
         if persist_artifacts:
@@ -121,6 +125,48 @@ def test_trend_answer_does_not_treat_truncated_preview_as_complete_series(tmp_pa
     assert "按日数据未加载完整" in answer
     assert "变化到 2026-06-20" not in answer
     assert "最大单日变化点" not in answer
+
+
+def test_period_rollup_series_reports_governed_period_total(tmp_path):
+    plan, run = trend_plan_and_run(
+        tmp_path,
+        {
+            "metric_flow": {
+                "label": "流量指标",
+                "aggregationPolicy": "period_rollup",
+                "points": daily_points([1000, 2000, 0, 500, 1500]),
+            }
+        },
+    )
+
+    answer = multi_trend_metric_sentence("最近5天流量指标表现如何？", plan, run)
+
+    assert "流量指标周期合计为 5000" in answer
+    assert "从 2026-06-01 的 1000 变化到 2026-06-05 的 1500" in answer
+
+
+def test_snapshot_and_daily_value_policies_never_sum_the_series(tmp_path):
+    plan, run = trend_plan_and_run(
+        tmp_path,
+        {
+            "metric_snapshot": {
+                "label": "快照指标",
+                "aggregationPolicy": "latest_value_only",
+                "points": daily_points([8700, 8800]),
+            },
+            "metric_daily": {
+                "label": "日值指标",
+                "aggregationPolicy": "daily_value_only",
+                "points": daily_points([0.1, 0.2]),
+            },
+        },
+    )
+
+    answer = multi_trend_metric_sentence("最近2天快照指标和日值指标表现如何？", plan, run)
+
+    assert "快照指标截至 2026-06-02 为 8800" in answer
+    assert "17500" not in answer
+    assert "日值指标周期合计" not in answer
 
 
 def test_sync_up_uses_aligned_daily_direction_coverage_not_only_first_and_last(tmp_path):

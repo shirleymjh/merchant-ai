@@ -60,13 +60,27 @@ def test_catalog_blocks_two_labels_for_same_enum_value(tmp_path):
         tmp_path,
         "trade",
         "order_detail",
-        {"semanticColumns": [{"columnName": "status", "enumMappings": {"1": "paid"}}]},
+        {
+            "semanticColumns": [
+                {
+                    "columnName": "status",
+                    "enumMappings": {"1": "paid"},
+                    "enumMetadata": {"reviewStatus": "APPROVED"},
+                }
+            ]
+        },
     )
     candidate = {
         "topic": "trade_v2",
         "tableName": "order_detail",
         "status": "PUBLISHED",
-        "semanticColumns": [{"columnName": "status", "enumMappings": {"1": "created"}}],
+        "semanticColumns": [
+            {
+                "columnName": "status",
+                "enumMappings": {"1": "created"},
+                "enumMetadata": {"reviewStatus": "APPROVED"},
+            }
+        ],
     }
 
     report = semantic_catalog_conflict_detection(service, "trade_v2", "order_detail", candidate)

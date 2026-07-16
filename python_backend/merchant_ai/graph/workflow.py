@@ -147,6 +147,7 @@ from merchant_ai.services.planning import (
     query_plan_question_coverage_gaps,
     semantic_workspace_manifest_from_asset_pack,
 )
+from merchant_ai.services.planning_tooling import planner_llm_terminal_error
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
 from merchant_ai.services.query import (
@@ -378,6 +379,7 @@ class MerchantQaWorkflow:
             contract_block_observation={},
             contract_block_observed=False,
             contract_block_generation=0,
+            lead_arbitration_observed=False,
             last_action_result=ActionResult(),
             planner_reflection=PlannerReflectionResult(),
             node_tool_traces=[],
@@ -634,6 +636,17 @@ class MerchantQaWorkflow:
             ),
             error_code="ACTION_CONTRACT_BLOCKED",
         )
+        return state
+
+    def lead_arbitrate(self, state: AgentState) -> AgentState:
+        """Fail closed if an unresolved Lead arbitration ever reaches dispatch."""
+
+        state["lead_arbitration_observed"] = True
+        state["human_clarification_required"] = True
+        state["human_clarification_question"] = "主 Agent 未能完成安全工具选择，请稍后重试。"
+        state["human_clarification_stage"] = "LEAD_DECISION"
+        state["human_clarification_type"] = "lead_decision_unavailable"
+        state["human_clarification_options"] = []
         return state
 
     def terminal_or_human_node(self, state: AgentState) -> str:
@@ -1536,7 +1549,7 @@ class MerchantQaWorkflow:
         return base + (
             "当前已完成 Topic workspace 召回和资产压缩：只有一个受控语义指标、无需归因/排行/明细/跨域分析时可选择 query_metric；"
             "如果指标歧义、资产缺口、需要解释原因或多轮探索，选择 plan_graph 或后续 ask_human。"
-            "query_metric 只接收当前 Topic 资产包里的语义引用，并会自行完成校验、执行和证据门禁。"
+            "query_metric 只接收当前 Topic 资产包里的语义引用并产出已校验 QueryGraph；执行与证据校验必须作为后续独立动作再次由 Lead 选择。"
         )
 
     def main_agent_observation(self, state: AgentState) -> Dict[str, Any]:
@@ -3478,18 +3491,42 @@ class MerchantQaWorkflow:
         selection_payload: Dict[str, Any] = {}
         plan = QueryPlan(agent_trace=["query_metric.semantic_asset_selection.skipped"])
         selector_attempted = False
-        if getattr(getattr(self.planner, "llm", None), "configured", False) and hasattr(self.planner, "semantic_asset_selection_plan"):
+        recall_bundle = state.get("recall_bundle") or RecallBundle()
+        selector_has_candidates = bool(pack.metrics or recall_bundle.items)
+        if (
+            selector_has_candidates
+            and getattr(getattr(self.planner, "llm", None), "configured", False)
+            and hasattr(self.planner, "semantic_asset_selection_plan")
+        ):
             selector_attempted = True
             plan, selection_payload = self.planner.semantic_asset_selection_plan(
                 state.get("question", ""),
-                state.get("recall_bundle") or RecallBundle(),
+                recall_bundle,
                 pack,
                 planner_context=planner_context,
             )
             if plan.intents:
                 plan.agent_trace.append("query_metric.semantic_asset_selection=compiled")
-        if not plan.intents and not selector_attempted:
+        selector_provider_failure = bool(
+            selector_attempted
+            and planner_llm_terminal_error(str(getattr(getattr(self.planner, "llm", None), "last_error", "") or ""))
+        )
+        fast = state.get("fast_understanding") or FastUnderstandingResult()
+        metric_phrase_count = len([phrase for phrase in fast.metric_phrases if str(phrase or "").strip()])
+        if not plan.intents and (not selector_attempted or selector_provider_failure) and metric_phrase_count <= 1:
+            ambiguity = self.query_metric_ambiguity(pack, state.get("question", ""))
+            if ambiguity:
+                return self.request_query_metric_ambiguity_clarification(state, ambiguity, started, step)
+        if not plan.intents and (not selector_attempted or selector_provider_failure):
             plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
+            if plan.intents and selector_provider_failure:
+                plan.agent_trace.extend(
+                    [
+                        "query_metric.recovery_candidate.type=deterministic_semantic",
+                        "query_metric.recovery_candidate.trigger=provider_failure",
+                        "query_metric.recovery_candidate.provenance=published_asset_contract",
+                    ]
+                )
         catalog_expansion_traces: List[str] = []
         if not plan.intents:
             catalog_expansion_traces = self.asset_builder.expand_for_metric_catalog_resolution(
@@ -3498,7 +3535,13 @@ class MerchantQaWorkflow:
             )
             if catalog_expansion_traces:
                 state["planning_asset_pack"] = pack
-                if selector_attempted:
+                selector_provider_failure = bool(
+                    selector_attempted
+                    and planner_llm_terminal_error(
+                        str(getattr(getattr(self.planner, "llm", None), "last_error", "") or "")
+                    )
+                )
+                if selector_attempted and not selector_provider_failure:
                     plan, selection_payload = self.planner.semantic_asset_selection_plan(
                         state.get("question", ""),
                         state.get("recall_bundle") or RecallBundle(),
@@ -3509,9 +3552,7 @@ class MerchantQaWorkflow:
                         plan.agent_trace.append("query_metric.semantic_asset_selection=compiled_after_catalog_expansion")
                 else:
                     plan = compile_semantic_metric_fallback_graph(state.get("question", ""), pack)
-            fast = state.get("fast_understanding") or FastUnderstandingResult()
-            metric_phrase_count = len([phrase for phrase in fast.metric_phrases if str(phrase or "").strip()])
-            if not plan.intents and not selector_attempted and metric_phrase_count <= 1:
+            if not plan.intents and (not selector_attempted or selector_provider_failure) and metric_phrase_count <= 1:
                 ambiguity = self.query_metric_ambiguity(pack, state.get("question", ""))
                 if ambiguity:
                     return self.request_query_metric_ambiguity_clarification(state, ambiguity, started, step)
@@ -3669,119 +3710,38 @@ class MerchantQaWorkflow:
             )
             emit(state, "node.completed", "QUERY_METRIC", {"supported": True, "valid": False, "gaps": len(validation.gaps)})
             return state
-        state["worker_dispatch_context"] = {
-            **self.worker_dispatch_context(state),
-            "tool": "query_metric",
-            "executionMode": "direct",
-            "reason": "single_metric_tool_executes_governed_query_graph",
+        state["query_metric_trace"] = {
+            **dict(state.get("query_metric_trace") or {}),
+            "status": "validated",
+            "executionDeferredToLead": True,
+            "validatedQueryGraphFingerprint": state.get("validated_query_graph_fingerprint", ""),
+            "sourceQueryGraphFingerprint": (
+                execution_preparation.source_plan_fingerprint
+                if execution_preparation is not None
+                else ""
+            ),
         }
-        try:
-            node_package = self.prepare_scoped_context_package(
-                state,
-                "query_metric",
-                "MetricTool",
-                allowed_tables=pack.known_tables()[:12],
-                allowed_metrics=self.planning_metric_keys_for_context(pack)[:24],
-            )
-            node_knowledge_context = append_context_section(
-                knowledge_context(state),
-                self.render_context_package_for_prompt(node_package),
-                max_chars=int(self.settings.context_runtime_budget_chars or 6000),
-            )
-            run_result = self.node_worker.execute_plan(
-                state["merchant"].merchant_id,
-                plan,
-                pack,
-                node_knowledge_context,
-                state["question"],
-                resume_task_results=[],
-                run_id=state.get("run_id", ""),
-                access_role=state.get("access_role", "merchant_operator"),
-                user_scope=state.get("user_identity", {}),
-                execution_mode="direct",
-                execution_preparation=execution_preparation,
-            )
-        except Exception as exc:
-            run_result = AgentRunResult(
-                merged_query_bundle=QueryBundle(failed=True, error=str(exc), summary="query_metric NodeWorker 执行失败"),
-                reflection_notes=["query_metric NodeWorker 执行失败: %s" % str(exc)[:200]],
-            )
-        archive_execution_attempt(state, run_result, "query_metric")
-        state["agent_run_result"] = run_result
-        state["query_bundle"] = run_result.merged_query_bundle
-        state["query_bundles"] = run_result.query_bundles
-        state["node_tool_traces"] = run_result.node_tool_traces
-        state["freshness_reports"] = run_result.freshness_reports
-        state["sql_generated"] = True
-        state["result_generation"] = int(state.get("execution_generation") or 0)
-        self.sync_tool_runtime_state(state)
-        verified = self.evidence_verifier.verify(
-            state["question"],
-            plan,
-            run_result,
-            state.get("memory_constraints", []),
-            recall_knowledge_ref_ids(state),
+        state["query_metric_completed"] = False
+        add_step(
+            state,
+            "Metric Tool query_metric：受控单指标 QueryGraph 已解析并校验，执行动作交回 LeadAgent 选择",
         )
-        run_result.verified_evidence = verified
-        run_result.evidence_gaps = verified.gaps
-        run_result.partial_answer_reason = verified.partial_answer_reason
-        graph_repair_gaps = graph_repair_validation_gaps(verified.gaps)
-        if graph_repair_gaps:
-            record_graph_validation(
-                state,
-                GraphValidationResult(
-                    valid=False,
-                    gaps=graph_repair_gaps,
-                    repairable=True,
-                ),
-            )
-        state["evidence_graph_verified"] = True
-        state["verification_status"] = "passed" if verified.passed else "failed"
-        state["evidence_accepted"] = bool(verified.passed)
-        state["evidence_generation"] = int(state.get("execution_generation") or 0) if verified.passed else -1
-        state["agent_run_result"] = run_result
-        self.planner.artifact_store.write_json("node", "query_metric_agent_run_result.json", run_result.model_dump(by_alias=True), preview_chars=0)
-        failed_tasks = sum(1 for item in run_result.task_results if item.query_bundle.failed)
-        if verified.passed and not failed_tasks:
-            state["query_metric_completed"] = True
-            state["should_persist"] = True
-            state["latency_optimization"] = self.latency_optimizer.mark_verified(
-                state.get("latency_optimization") or {},
-                "query_metric resolved, executed and verified one governed semantic metric",
-            )
-            self.reconcile_fast_request_agent_gates(state)
-            add_step(state, "Metric Tool query_metric：受控单指标 QueryGraph 执行并通过证据校验")
-        else:
-            self.escalate_fast_request(state, "query_metric evidence verification failed")
-            add_step(
-                state,
-                "Metric Tool query_metric：执行后证据未通过，failedTasks=%d gaps=%d，交回标准链路"
-                % (failed_tasks, len(verified.gaps)),
-            )
         self.record_span(
             state,
             "semantic_tool",
             "query_metric",
             started,
-            status="success" if state.get("query_metric_completed") else "failed",
-            row_count=run_result.merged_query_bundle.effective_row_count(),
-            error_code="" if state.get("query_metric_completed") else (",".join(gap.code for gap in verified.gaps[:4]) or "QUERY_METRIC_EVIDENCE_FAILED"),
+            status="success",
             metadata={
-                "tasks": len(run_result.tasks),
-                "failedTasks": failed_tasks,
                 "validationGaps": len(validation.gaps),
-                "evidenceGaps": len(verified.gaps),
                 "trace": state.get("query_metric_trace") or {},
             },
         )
         self.finish_run_step(
             state,
             step,
-            "success" if state.get("query_metric_completed") else "gap",
-            output_summary="tasks=%d rows=%d evidencePassed=%s"
-            % (len(run_result.tasks), run_result.merged_query_bundle.effective_row_count(), verified.passed),
-            error_code="" if state.get("query_metric_completed") else (",".join(gap.code for gap in verified.gaps[:4]) or "QUERY_METRIC_EVIDENCE_FAILED"),
-            artifact_paths=[str(Path(state["thread_data"].outputs_path) / "artifacts" / "node" / "query_metric_agent_run_result.json")],
+            "success",
+            output_summary="validated metric graph; execution deferred to LeadAgent",
         )
         emit(
             state,
@@ -3790,9 +3750,7 @@ class MerchantQaWorkflow:
             {
                 "supported": True,
                 "valid": True,
-                "tasks": len(run_result.tasks),
-                "rows": run_result.merged_query_bundle.effective_row_count(),
-                "evidencePassed": verified.passed,
+                "executionDeferredToLead": True,
             },
         )
         return state
@@ -4248,12 +4206,15 @@ class MerchantQaWorkflow:
         state["worker_dispatch_context"] = self.worker_dispatch_context(state)
         emit(state, "node.started", "EXECUTE_QUERY_GRAPH", {"workerDispatch": state.get("worker_dispatch_context", {})})
         try:
-            execution_preparation = prepare_execution_graph(
-                state["question"],
+            execution_preparation = self.node_worker.prepare_runtime_execution_graph(
+                state["merchant"].merchant_id,
                 state["plan"],
                 state.get("planning_asset_pack") or PlanningAssetPack(),
-                self.graph_validator,
-                state.get("memory_constraints", []),
+                state["question"],
+                graph_validator=self.graph_validator,
+                memory_constraints=state.get("memory_constraints", []),
+                access_role=state.get("access_role", "merchant_operator"),
+                user_scope=state.get("user_identity", {}),
             )
             state["plan"] = execution_preparation.plan
             record_graph_validation(state, execution_preparation.validation, execution_preparation.plan)
@@ -4368,6 +4329,27 @@ class MerchantQaWorkflow:
                 execution_mode=state.get("node_execution_mode", "auto"),
                 execution_preparation=execution_preparation,
             )
+            executed_fingerprint = str(run_result.executed_query_graph_fingerprint or "")
+            validated_fingerprint = str(state.get("validated_query_graph_fingerprint") or "")
+            if executed_fingerprint != validated_fingerprint:
+                run_result = AgentRunResult(
+                    executed_query_graph_fingerprint=executed_fingerprint,
+                    merged_query_bundle=QueryBundle(
+                        failed=True,
+                        error="EXECUTED_QUERY_GRAPH_FINGERPRINT_MISMATCH",
+                        summary="NodeWorker result was rejected because its graph fingerprint differs from the validated execution graph",
+                    ),
+                    evidence_gaps=[
+                        EvidenceGap(
+                            code="EXECUTED_QUERY_GRAPH_FINGERPRINT_MISMATCH",
+                            reason="validated=%s executed=%s" % (validated_fingerprint, executed_fingerprint),
+                            severity="blocking",
+                            source="execution_graph_contract",
+                            answer_instruction="禁止使用该 SQL 结果；重新准备并校验最终执行图。",
+                        )
+                    ],
+                    reflection_notes=["NodeWorker execution graph fingerprint did not match workflow validation"],
+                )
         except Exception as exc:
             run_result = AgentRunResult(
                 merged_query_bundle=QueryBundle(failed=True, error=str(exc), summary="NodeWorker 执行失败"),

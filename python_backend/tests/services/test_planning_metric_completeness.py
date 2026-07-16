@@ -8,6 +8,7 @@ from merchant_ai.models import (
     QueryBundle,
     QueryPlan,
     QuestionIntent,
+    RecallBundle,
 )
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.planning import (
@@ -21,6 +22,28 @@ class UnconfiguredLlm:
     configured = False
     last_error = ""
     error_events = []
+
+
+def test_semantic_selector_planning_contract_uses_current_runtime_understanding():
+    planner = QueryGraphPlanner(UnconfiguredLlm())
+
+    payload = planner._semantic_asset_selection_payload(
+        "runtime question",
+        RecallBundle(),
+        PlanningAssetPack(),
+        {
+            "fastUnderstanding": {
+                "intentKind": "metric_query",
+                "analysisIntent": "lookup",
+                "metricPhrases": ["runtime metric"],
+                "timeWindowDays": 7,
+            }
+        },
+    )
+
+    assert payload["planningContract"]["intentKind"] == "metric_query"
+    assert payload["planningContract"]["timeWindowDays"] == 7
+    assert payload["metricPhrases"] == ["runtime metric"]
 
 
 def test_partial_semantic_selection_with_clarification_cannot_compile():
@@ -58,6 +81,32 @@ def test_partial_semantic_selection_with_clarification_cannot_compile():
     assert not plan.intents
     assert "SEMANTIC_SELECTION_INCOMPLETE:退款率" in plan.compiler_trace
     assert "请选择退款率口径" in plan.clarification_needs
+
+
+def test_complete_selected_refs_override_empty_ask_human_shell():
+    planner = QueryGraphPlanner(UnconfiguredLlm())
+    request_payload = {
+        "retrievedCandidates": [
+            {"id": "M0", "ref": "semantic:test:profile:metric:orders"},
+        ],
+        "candidateGroups": [
+            {"phrase": "订单量", "candidateIds": ["M0"]},
+        ],
+    }
+
+    payload = planner._normalize_semantic_selection_payload(
+        {
+            "action": "ask_human",
+            "selectedRefs": ["M0"],
+            "clarifications": [],
+        },
+        request_payload,
+        allow_read=False,
+    )
+
+    assert payload["status"] == "SELECTED"
+    assert payload["action"] == "select"
+    assert payload["selectedRefs"] == ["semantic:test:profile:metric:orders"]
 
 
 def test_question_coverage_uses_frozen_metric_phrases_and_recalled_bindings():
@@ -155,6 +204,7 @@ def daily_value_metric_pack() -> tuple[PlanningAssetPack, str]:
                         "formula": "AVG(refund_rate_1d)",
                         "sourceColumns": ["refund_rate_1d"],
                         "aggregationPolicy": "daily_value_only",
+                        "applicableTimeGrain": "day",
                     },
                     source_ref_id=ref,
                 )
@@ -210,6 +260,8 @@ def test_daily_value_only_metric_uses_structured_time_series_contract_and_forces
 
     assert plan.intents
     assert all(intent.group_by_column == "pt" for intent in plan.intents)
+    assert all(intent.metric_resolution.get("aggregationPolicy") == "daily_value_only" for intent in plan.intents)
+    assert all(intent.metric_resolution.get("applicableTimeGrain") == "day" for intent in plan.intents)
     assert "SEMANTIC_SELECTION_DAILY_VALUE_FORCED_PT" in plan.compiler_trace
 
 
@@ -282,6 +334,32 @@ def test_candidate_group_requires_exact_metric_phrase_match():
     groups = planner._semantic_selection_candidate_groups(["订单量"], candidates)
 
     assert groups == [{"phrase": "订单量", "candidateIds": ["M0"]}]
+
+
+def test_candidate_group_binds_context_wrapped_phrase_to_longest_complete_asset_label():
+    planner = QueryGraphPlanner(UnconfiguredLlm())
+    candidates = [
+        {
+            "id": "M0",
+            "metricKey": "metric_base",
+            "name": "基础指标",
+            "aliases": ["指标"],
+            "matched": "指标",
+            "matchType": "exact_label",
+        },
+        {
+            "id": "M1",
+            "metricKey": "metric_qualified",
+            "name": "限定指标",
+            "aliases": ["限定指标"],
+            "matched": "限定指标",
+            "matchType": "exact_label",
+        },
+    ]
+
+    groups = planner._semantic_selection_candidate_groups(["最近窗口限定指标"], candidates)
+
+    assert groups == [{"phrase": "最近窗口限定指标", "candidateIds": ["M1"]}]
 
 
 def test_metric_phrases_are_deduplicated_by_normalized_text():

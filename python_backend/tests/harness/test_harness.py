@@ -4476,11 +4476,11 @@ def test_lead_policy_routes_single_metric_to_retrieve_then_query_metric():
     )
     decision = policy.decide(state)
 
-    assert decision.selected_action == "query_metric"
-    assert "plan_graph" in decision.available_actions
+    assert decision.selected_action == "lead_arbitrate"
+    assert {"query_metric", "plan_graph"} <= set(decision.available_actions)
 
 
-def test_query_metric_tool_executes_compiled_single_metric_graph(monkeypatch, tmp_path):
+def test_query_metric_tool_prepares_validated_graph_and_returns_to_lead(monkeypatch, tmp_path):
     settings = get_settings().model_copy(update={"harness_workspace_path": str(tmp_path), "lead_action_llm_mode": "off"})
     workflow = create_workflow(settings)
     question = "最近7天订单量是多少"
@@ -4507,6 +4507,16 @@ def test_query_metric_tool_executes_compiled_single_metric_graph(monkeypatch, tm
             "planning_assets_compacted": True,
             "planning_asset_pack": pack,
             "recall_bundle": recall,
+            "fast_understanding": FastUnderstandingResult(
+                intent_kind="metric_query",
+                analysis_intent="lookup",
+                topics=[QuestionCategory.TRADE],
+                time_window_days=7,
+                metric_phrases=["订单量"],
+                needs_planner=False,
+                needs_knowledge=False,
+                confidence=1.0,
+            ),
             "latency_optimization": {
                 "eligible": True,
                 "state": "fast_candidate",
@@ -4515,12 +4525,19 @@ def test_query_metric_tool_executes_compiled_single_metric_graph(monkeypatch, tm
             },
         }
     )
+    captured_execution = {}
 
     def fake_execute_plan(merchant_id, plan, *_args, **_kwargs):
+        captured_execution.update(_kwargs)
         intent = plan.intents[0]
+        metric_key = str(
+            (intent.metric_resolution or {}).get("metricKey")
+            or intent.metric_name
+            or intent.metric_column
+        )
         bundle = QueryBundle(
             tables=[intent.preferred_table],
-            rows=[{"merchant_id": merchant_id, "order_cnt_1d": 188, "value": 188}],
+            rows=[{"merchant_id": merchant_id, metric_key: 188}],
             original_row_count=1,
             summary="mocked governed metric result",
         )
@@ -4535,10 +4552,21 @@ def test_query_metric_tool_executes_compiled_single_metric_graph(monkeypatch, tm
     state = workflow.query_metric(state)
 
     assert state["query_metric_attempted"] is True
-    assert state["query_metric_completed"] is True
-    assert state["evidence_accepted"] is True
-    assert state["plan"].intents[0].preferred_table == "ads_merchant_profile"
-    assert state["plan"].intents[0].metric_resolution["metricKey"] == "order_cnt_1d"
+    assert state["query_metric_completed"] is False
+    assert state["sql_generated"] is False
+    assert state["evidence_accepted"] is False
+    resolution = state["plan"].intents[0].metric_resolution
+    assert resolution["semanticRefId"].startswith("semantic:")
+    assert resolution["metricKey"]
+    assert resolution["aggregationPolicy"] in {"period_rollup", "period_recompute", "latest_value_only"}
+    assert captured_execution == {}
+    assert state["query_graph_validation_passed"] is True
+    assert state["validated_query_graph_fingerprint"]
+    assert state["query_metric_trace"]["executionDeferredToLead"] is True
+    assert (
+        state["query_metric_trace"]["validatedQueryGraphFingerprint"]
+        == state["validated_query_graph_fingerprint"]
+    )
 
 
 def test_query_metric_requests_clarification_for_ambiguous_metric_candidates(tmp_path):

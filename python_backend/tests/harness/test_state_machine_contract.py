@@ -4,12 +4,15 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict
 
 import pytest
+from langgraph.graph import END as LANGGRAPH_END
+from langgraph.graph import START as LANGGRAPH_START
+from langgraph.graph import StateGraph
 
 import merchant_ai.graph.workflow as workflow_module
 from merchant_ai.graph.policy import AgentActionRegistry, V2AgentPolicy
 from merchant_ai.graph.state import AgentState
 from merchant_ai.graph.workflow import MerchantQaWorkflow
-from merchant_ai.models import AgentActionTrace, AgentDecision
+from merchant_ai.models import AgentActionTrace, AgentDecision, GraphValidationGap, QuestionCategory
 from merchant_ai.services.middleware import ActionContractMiddleware, MiddlewareChain
 
 
@@ -62,6 +65,66 @@ def test_action_registry_has_unique_nodes_and_closed_contracts() -> None:
 
 def test_graph_repair_attempt_flag_has_a_persisted_state_channel() -> None:
     assert "query_graph_repair_attempted" in AgentState.__annotations__
+
+
+def test_cross_node_control_channels_round_trip_through_langgraph_state_schema() -> None:
+    samples: Dict[str, Any] = {
+        "_active_step_id": "step_1",
+        "_answer_ready_emitted": True,
+        "_clarification_tool_intercepted": True,
+        "_emitted_tool_runtime_event_ids": ["event_1"],
+        "_lead_llm_decision_fingerprint": "lead_fingerprint",
+        "_lead_previous_gap_counts": {"graphGaps": 2},
+        "_lead_seen_recall_refs": ["semantic:domain:table:metric:measure"],
+        "_memory_middleware_retry_attempted": True,
+        "_memory_middleware_snapshot_ready": True,
+        "_memory_semantic_refresh_attempted": True,
+        "_memory_snapshot_locked": True,
+        "_middleware_offloaded_tasks": ["task_1"],
+        "_preflight_question": "governed question",
+        "_preflight_requires_full_context": True,
+        "_route_slots_bootstrapped": True,
+        "_route_understanding_question": "governed question",
+        "_runtime_context_stale": True,
+        "_skill_middleware_loaded": ["analysis_skill"],
+        "_summarized_stages": ["policy_round_1"],
+        "analysis_worker_result": {"status": "completed"},
+        "capability_decisions": {"metricFastEntry": {"allowed": True}},
+        "confirmation_restore_status": {"status": "restored"},
+        "knowledge_expanded_topics": [QuestionCategory.ORDER],
+        "knowledge_recall_coverage": {"topicExpansion": {"reason": "coverage_gap"}},
+        "last_query_graph_validation_gaps": [
+            GraphValidationGap(code="MISSING_METRIC", reason="metric contract missing")
+        ],
+        "middleware_action_context_hashes": {"plan_graph": "context_hash"},
+        "middleware_blocked": True,
+        "preflight_understanding": {"surfaceSignals": {"business": True}},
+        "semantic_preflight_route_trace": {"source": "semantic_assets"},
+        "time_window_contract": {"kind": "rolling", "days": 30},
+    }
+    assert set(samples) <= set(AgentState.__annotations__)
+
+    observed: Dict[str, Any] = {}
+
+    def produce(_: AgentState) -> Dict[str, Any]:
+        return dict(samples)
+
+    def consume(state: AgentState) -> Dict[str, Any]:
+        observed.update({key: state.get(key) for key in samples})
+        return {"_next_action": "done"}
+
+    builder = StateGraph(AgentState)
+    builder.add_node("produce", produce)
+    builder.add_node("consume", consume)
+    builder.add_edge(LANGGRAPH_START, "produce")
+    builder.add_edge("produce", "consume")
+    builder.add_edge("consume", LANGGRAPH_END)
+
+    result = builder.compile().invoke({})
+
+    assert observed == samples
+    assert {key: result.get(key) for key in samples} == samples
+    assert result["_next_action"] == "done"
 
 
 def test_workflow_registers_and_routes_every_action_node(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -252,6 +315,24 @@ def test_policy_filters_unsafe_catalog_entries_before_lead_selection() -> None:
             "missingStateFlags": ["query_graph_validation_passed"],
         }
     ]
+
+
+def test_policy_never_executes_the_first_business_candidate_before_lead_arbitration() -> None:
+    class CandidatePolicy(V2AgentPolicy):
+        def _candidate_action_ids(self, _state: AgentState):
+            return ["plan_graph", "retrieve_knowledge"], "unordered safe catalog", False
+
+    decision = CandidatePolicy().decide(
+        {
+            "planning_assets_compacted": True,
+            "topic_routed": True,
+        }
+    )
+
+    assert decision.selected_action == "lead_arbitrate"
+    assert decision.selected_action not in decision.available_actions
+    assert decision.available_actions == ["plan_graph", "retrieve_knowledge"]
+    assert decision.source == "lead_arbitration_pending"
 
 
 def test_contract_block_observation_consumes_round_and_returns_to_lead() -> None:
