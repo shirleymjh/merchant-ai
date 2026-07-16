@@ -7,11 +7,15 @@
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
   "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "resultAccessPolicies": {
+    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
+    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  },
   "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
-  "version": "v20260615181734",
+  "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:17:34",
-  "reviewedAt": "2026-06-15T18:17:34",
+  "reviewedAt": "2026-07-16T10:53:35+10:00",
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 领域启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "供应链全流程明细表，承载入库、质检、鉴定、出库、履约和发货超时判断",
@@ -3395,7 +3399,7 @@
     {
       "columnName": "first_check_is_operate_pass",
       "businessName": "首次质检结果",
-      "role": "METRIC",
+      "role": "DIMENSION",
       "description": "首次质检结果,不通过=0,通过=1",
       "aliases": [
         "首次质检结果",
@@ -3403,7 +3407,7 @@
         "首次质检结果,不通过=0,通过=1"
       ],
       "enumValues": [],
-      "metricFormula": "AVG(first_check_is_operate_pass)",
+      "metricFormula": "",
       "confidence": 0.78,
       "evidence": "schema comment=首次质检结果,不通过=0,通过=1"
     },
@@ -4229,36 +4233,6 @@
       "naturalAlias": "审核次数",
       "sourceColumnAliases": [
         "check_cnt"
-      ]
-    },
-    {
-      "metricKey": "first_check_is_operate_pass",
-      "businessName": "供应链明细首次质检结果",
-      "formula": "AVG(first_check_is_operate_pass)",
-      "unit": "%",
-      "description": "首次质检结果,不通过=0,通过=1",
-      "sourceColumns": [
-        "first_check_is_operate_pass"
-      ],
-      "aliases": [
-        "供应链明细首次质检结果",
-        "first_check_is_operate_pass",
-        "供应链首次质检结果",
-        "首次质检结果,不通过=0,通过=1"
-      ],
-      "confidence": 0.78,
-      "evidence": "schema comment=首次质检结果,不通过=0,通过=1",
-      "displayName": "供应链明细首次质检结果",
-      "disambiguationName": "供应链明细首次质检结果",
-      "tableKind": "detail_fact",
-      "metricGrain": "supply_chain_detail",
-      "metricIntent": "detail_drilldown",
-      "ambiguousAliases": [],
-      "naturalName": "首次质检结果",
-      "originalBusinessName": "首次质检结果",
-      "naturalAlias": "首次质检结果",
-      "sourceColumnAliases": [
-        "first_check_is_operate_pass"
       ]
     },
     {

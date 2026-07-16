@@ -247,6 +247,7 @@ from merchant_ai.services.query import (
     merge_task_result_bundles,
     multi_entity_transfer_values,
     node_execution_contract_hash,
+    prepare_execution_graph,
     serialize_tool_execution_result,
     semantic_table_access_hint,
 )
@@ -832,10 +833,23 @@ def test_main_agent_exposes_independent_hypothesis_query_tool_for_attribution_qu
         "evidence_graph_verified": True,
         "hypothesis_exploration_completed": False,
         "hypothesis_exploration": {
-            "questionSignals": {"mentionsAttribution": True, "mentionsDrop": True},
             "hypotheses": [{"hypothesisId": "h1"}, {"hypothesisId": "h2"}, {"hypothesisId": "h3"}],
         },
-        "plan": QueryPlan(intents=[QuestionIntent(plan_task_id="main", intent_type=IntentType.VALID, answer_mode=AnswerMode.METRIC, preferred_table="trade")]),
+        "plan": QueryPlan(
+            intents=[
+                QuestionIntent(
+                    plan_task_id="main",
+                    intent_type=IntentType.VALID,
+                    answer_mode=AnswerMode.METRIC,
+                    preferred_table="trade",
+                )
+            ],
+            question_understanding={
+                "analysisIntent": "attribution",
+                "requiresExplanation": True,
+                "requiredEvidenceIntents": [{"intent": "driver_analysis"}],
+            },
+        ),
         "agent_run_result": AgentRunResult(
             task_results=[AgentTaskResult(task_id="main", success=True, query_bundle=QueryBundle(rows=[{"metric_value": 1}]))],
             verified_evidence=VerifiedEvidence(passed=True),
@@ -1326,6 +1340,13 @@ def test_semantic_catalog_exposes_filesystem_context_tools():
     assert "dwm_trade_order_detail_di" in content["content"]
     hits = catalog.grep("order_detail_cnt", topic="电商交易", limit=5)
     assert any(hit["refId"] == order_ref["refId"] for hit in hits)
+    metric_ref = "semantic:电商交易:dwm_trade_order_detail_di:metric:order_detail_cnt"
+    metric_content = catalog.read(ref_id=metric_ref, max_chars=4_000)
+    assert metric_content["success"]
+    assert metric_content["refId"] == metric_ref
+    assert metric_content["path"].endswith("asset.json#metric:order_detail_cnt")
+    assert '"metricKey": "order_detail_cnt"' in metric_content["content"]
+    assert '"pay_amt"' not in metric_content["content"]
 
 
 def test_semantic_workspace_manifest_uses_layered_context_uris():
@@ -2193,7 +2214,7 @@ def test_clear_analysis_outputs_resets_runtime_status_without_overriding_user_de
     assert state["analysis_skill_status"] == {"status": "declined", "source": "user"}
 
 
-def test_action_contract_reroutes_execution_before_graph_validation():
+def test_action_contract_blocks_execution_before_graph_validation_without_fallback():
     state = {
         "query_graph_validated": False,
         "middleware_events": [],
@@ -2217,10 +2238,11 @@ def test_action_contract_reroutes_execution_before_graph_validation():
 
     ActionContractMiddleware().before_action(state, decision)
 
-    assert decision.selected_action == "validate_graph"
-    assert decision.selected_node == "validate_query_graph"
-    assert decision.source == "contract"
-    assert state["middleware_events"][-1].code == "ACTION_CONTRACT_MISSING_PREREQUISITE"
+    assert decision.selected_action == "observe_contract_block"
+    assert decision.selected_node == "observe_contract_block"
+    assert decision.source == "contract_block"
+    assert decision.available_actions == ["observe_contract_block"]
+    assert state["middleware_events"][-1].code == "ACTION_CONTRACT_BLOCKED"
     assert state["middleware_events"][-1].metadata["missingStateFlags"] == ["query_graph_validation_passed"]
 
 
@@ -4174,6 +4196,7 @@ def test_multi_metric_trend_graph_backfills_explicit_metric_from_another_table()
                 table=table,
                 topic=topic,
                 columns=columns,
+                metadata={"timeColumn": "pt", "timeGrain": "day"},
                 source_ref_id=f"semantic:{topic}:{table}:table",
             )
         )
@@ -4192,6 +4215,25 @@ def test_multi_metric_trend_graph_backfills_explicit_metric_from_another_table()
                 )
             )
 
+    pack.metric_compaction = {
+        "fastUnderstanding": {
+            "analysisIntent": "trend_check",
+            "analysisGrain": "day",
+            "timeWindowDays": 7,
+            "rankingObjective": {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "订单量",
+            },
+            "requestedMeasures": [
+                {
+                    "metricRef": "pay_amt",
+                    "ownerTable": "dwm_trade_refund_detail_di",
+                    "sourcePhrase": "退款金额",
+                }
+            ],
+        }
+    }
     plan = compile_semantic_multi_metric_trend_fallback_graph("最近7天订单量和退款金额有什么变化？", pack)
     plan.agent_trace.append("planner.semantic_fast_path=multi_metric_trend")
 
@@ -4200,7 +4242,11 @@ def test_multi_metric_trend_graph_backfills_explicit_metric_from_another_table()
         ("dwm_trade_order_detail_di", "order_detail_cnt"),
     }
     assert all(intent.group_by_column == "pt" for intent in plan.intents)
-    assert semantic_fast_path_can_bypass_configured_llm("最近7天订单量和退款金额有什么变化？", plan)
+    assert semantic_fast_path_can_bypass_configured_llm(
+        "最近7天订单量和退款金额有什么变化？",
+        plan,
+        asset_pack=pack,
+    )
 
 
 def test_profile_fast_path_does_not_bypass_when_understanding_requires_planner():
@@ -16120,7 +16166,8 @@ def test_node_worker_merges_same_table_metric_nodes_before_execution():
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
-                output_keys=["seller_id", "pt"],
+                metric_formula="SUM(`order_gmv_amt_1d`)",
+                output_keys=["pt"],
                 days=30,
                 limit=5,
                 sql_strategy="structured_first",
@@ -16134,7 +16181,8 @@ def test_node_worker_merges_same_table_metric_nodes_before_execution():
                 group_by_column="pt",
                 metric_column="refund_amt_1d",
                 metric_name="refund_amt_1d",
-                output_keys=["seller_id", "pt"],
+                metric_formula="SUM(`refund_amt_1d`)",
+                output_keys=["pt"],
                 days=30,
                 limit=5,
                 sql_strategy="structured_first",
@@ -16148,7 +16196,8 @@ def test_node_worker_merges_same_table_metric_nodes_before_execution():
                 group_by_column="pt",
                 metric_column="cs_ticket_cnt_1d",
                 metric_name="cs_ticket_cnt_1d",
-                output_keys=["seller_id", "pt"],
+                metric_formula="SUM(`cs_ticket_cnt_1d`)",
+                output_keys=["pt"],
                 days=30,
                 limit=5,
                 sql_strategy="structured_first",
@@ -16158,19 +16207,30 @@ def test_node_worker_merges_same_table_metric_nodes_before_execution():
             {"taskId": "refund_metric", "table": "ads_merchant_profile", "columns": ["refund_amt_1d"], "semanticLabel": "退款金额"}
         ],
     )
-    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天，同时看退款金额和工单量")
-    assert len(plan.intents) == 1
+    question = "最近30天GMV最高的前5天，同时看退款金额和工单量"
+    prepared = prepare_execution_graph(question, plan, pack)
+    assert prepared.validation.valid
+    result = worker.execute_plan(
+        "100",
+        prepared.plan,
+        pack,
+        "",
+        question,
+        execution_preparation=prepared,
+    )
+    assert len(plan.intents) == 3
+    assert len(prepared.plan.intents) == 1
     assert len(result.task_results) == 1
-    assert len(plan.intents[0].metric_specs) == 3
-    assert plan.evidence_contracts[0]["taskId"] == "anchor_gmv"
+    assert len(prepared.plan.intents[0].metric_specs) == 3
+    assert prepared.plan.evidence_contracts[0]["taskId"] == "anchor_gmv"
     sql = result.task_results[0].query_bundle.sql
     assert "SUM(`order_gmv_amt_1d`) AS `order_gmv_amt_1d`" in sql
     assert "SUM(`refund_amt_1d`) AS `refund_amt_1d`" in sql
     assert "SUM(`cs_ticket_cnt_1d`) AS `cs_ticket_cnt_1d`" in sql
     assert "COUNT(*) AS `order_cnt`" not in sql
     assert "LIMIT 5" in sql
-    assert any("same_table_metric_merge" in item for item in plan.agent_trace)
-    package = answer_data_package("最近30天GMV最高的前5天，同时看退款金额和工单量", plan, result)
+    assert any("same_table_metric_merge" in item for item in prepared.plan.agent_trace)
+    package = answer_data_package(question, prepared.plan, result)
     disclosed = {item.get("metricKey") for item in package["metricDisclosures"]}
     assert {"order_gmv_amt_1d", "refund_amt_1d", "cs_ticket_cnt_1d"} <= disclosed
 
@@ -16192,7 +16252,8 @@ def test_node_worker_same_table_merge_keeps_topn_anchor_when_not_first():
                 group_by_column="pt",
                 metric_column="refund_amt_1d",
                 metric_name="refund_amt_1d",
-                output_keys=["seller_id", "pt"],
+                metric_formula="SUM(`refund_amt_1d`)",
+                output_keys=["pt"],
                 days=30,
                 limit=20,
                 sql_strategy="structured_first",
@@ -16206,16 +16267,28 @@ def test_node_worker_same_table_merge_keeps_topn_anchor_when_not_first():
                 group_by_column="pt",
                 metric_column="order_gmv_amt_1d",
                 metric_name="order_gmv_amt_1d",
-                output_keys=["seller_id", "pt"],
+                metric_formula="SUM(`order_gmv_amt_1d`)",
+                output_keys=["pt"],
                 days=30,
                 limit=5,
                 sql_strategy="structured_first",
             ),
         ],
     )
-    result = worker.execute_plan("100", plan, pack, "", "最近30天GMV最高的前5天，同时看退款金额")
-    assert len(plan.intents) == 1
-    assert plan.intents[0].plan_task_id == "anchor_gmv"
+    question = "最近30天GMV最高的前5天，同时看退款金额"
+    prepared = prepare_execution_graph(question, plan, pack)
+    assert prepared.validation.valid
+    result = worker.execute_plan(
+        "100",
+        prepared.plan,
+        pack,
+        "",
+        question,
+        execution_preparation=prepared,
+    )
+    assert len(plan.intents) == 2
+    assert len(prepared.plan.intents) == 1
+    assert prepared.plan.intents[0].plan_task_id == "anchor_gmv"
     sql = result.task_results[0].query_bundle.sql
     assert "ORDER BY `order_gmv_amt_1d` DESC LIMIT 5" in sql
 
@@ -17227,8 +17300,8 @@ def test_lead_policy_fast_verified_graph_does_not_repeat_validation():
     assert decision.selected_action != "validate_graph"
 
 
-def test_fast_candidate_hard_gate_blocks_bounded_lead_llm():
-    class UnexpectedLeadLlm:
+def test_fast_candidate_still_uses_lead_llm_when_multiple_safe_actions_exist():
+    class ChoosingLeadLlm:
         configured = True
 
         def __init__(self):
@@ -17236,10 +17309,10 @@ def test_fast_candidate_hard_gate_blocks_bounded_lead_llm():
 
         def json_chat(self, *_args, **_kwargs):
             self.calls += 1
-            return {"selectedAction": "retrieve_knowledge"}
+            return {"selectedAction": "plan_graph", "reason": "planner is safer for this request"}
 
     workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "always"}))
-    llm = UnexpectedLeadLlm()
+    llm = ChoosingLeadLlm()
     workflow.planner.llm = llm
     state = workflow._initial_state("最近7天GMV是多少", "100", ChatContext(), None, "", "")
     state["latency_optimization"] = {
@@ -17257,9 +17330,9 @@ def test_fast_candidate_hard_gate_blocks_bounded_lead_llm():
 
     selected = workflow.apply_bounded_lead_llm_decision(state, decision)
 
-    assert selected.selected_action == "query_metric"
-    assert llm.calls == 0
-    assert state["bounded_lead_llm_trace"]["reason"] == "simple_request_fast_path_blocks_lead_llm"
+    assert selected.selected_action == "plan_graph"
+    assert llm.calls == 1
+    assert state["bounded_lead_llm_trace"]["status"] == "accepted"
 
 
 def test_fast_request_agent_gates_reopen_after_standard_path_escalation():
@@ -24187,6 +24260,27 @@ def profile_daily_pack():
                     "seller_repay_amt_1d",
                     "cs_ticket_cnt_1d",
                 ],
+                metadata={
+                    "timeColumn": "pt",
+                    "merchantFilterColumn": "seller_id",
+                    "rowAccessPolicy": {
+                        "scopeType": "merchant",
+                        "filterColumn": "seller_id",
+                        "operator": "eq",
+                        "valueSource": "merchant_id",
+                        "required": True,
+                    },
+                    "resultAccessPolicies": {
+                        "METRIC": {
+                            "visibilityPolicy": {"level": "public"},
+                            "maskingPolicy": {"strategy": "none"},
+                        },
+                        "TIME": {
+                            "visibilityPolicy": {"level": "public"},
+                            "maskingPolicy": {"strategy": "none"},
+                        },
+                    },
+                },
             ),
             PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "pt", "sub_order_id", "pay_amt"]),
             PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "pt", "refund_id", "pay_amt"]),

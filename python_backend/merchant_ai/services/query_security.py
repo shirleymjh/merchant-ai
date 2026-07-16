@@ -4,7 +4,11 @@ import hashlib
 from typing import Any, Dict, List, Set, Tuple
 
 from merchant_ai.models import NodePlanContract, PlanningAssetPack
-from merchant_ai.services.assets import normalize_column_display_policy
+from merchant_ai.services.assets import (
+    normalize_column_display_policy,
+    normalize_masking_policy,
+    normalize_visibility_policy,
+)
 
 
 DEFAULT_ACCESS_ROLE = "merchant_analyst"
@@ -27,6 +31,29 @@ def table_field_semantics(asset_pack: PlanningAssetPack, table: str) -> Dict[str
         if isinstance(semantic, dict):
             result[entry.key] = semantic
     return result
+
+
+def declared_result_access_policy(table_metadata: Dict[str, Any], semantic_role: str) -> Dict[str, Any]:
+    """Return an explicitly declared result policy for a semantic output role.
+
+    A result policy is intentionally separate from raw-column access.  For
+    example, a governed aggregate may be publishable while its physical source
+    column remains unavailable to detail queries.  Missing roles fail closed.
+    """
+
+    policies = table_metadata.get("resultAccessPolicies")
+    if not isinstance(policies, dict):
+        return {}
+    role = str(semantic_role or "").strip().upper()
+    declared = policies.get(role) or policies.get("*")
+    if not role or not isinstance(declared, dict):
+        return {}
+    return {
+        "semanticRole": role,
+        "visibilityPolicy": normalize_visibility_policy(declared.get("visibilityPolicy") or {}),
+        "maskingPolicy": normalize_masking_policy(declared.get("maskingPolicy") or {}),
+        **normalize_column_display_policy(declared),
+    }
 
 
 def configured_default_detail_columns(asset_pack: PlanningAssetPack, table: str, columns: Set[str]) -> List[str]:

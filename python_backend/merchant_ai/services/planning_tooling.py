@@ -153,12 +153,37 @@ def parse_json_object(text: str) -> Dict[str, Any]:
 
 
 def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
-    limit = max(1000, int(max_chars or 12000))
-    payload = json.dumps(result or {}, ensure_ascii=False, default=str)
+    limit = max(200, int(max_chars or 12000))
+    result = compact_semantic_metric_read_result(result or {})
+    payload = json.dumps(result, ensure_ascii=False, default=str)
     if len(payload) <= limit:
-        return result or {}
-    compact = dict(result or {})
-    if "content" in compact:
+        return result
+    compact = dict(result)
+    if str(compact.get("kind") or "").upper() == "METRIC" and isinstance(compact.get("metric"), dict):
+        metric = compact.get("metric") or {}
+        compact = {
+            key: value
+            for key, value in {
+                "success": compact.get("success"),
+                "refId": compact.get("refId"),
+                "kind": compact.get("kind"),
+                "table": compact.get("table"),
+                "metric": {
+                    key: value
+                    for key, value in {
+                        "metricKey": metric.get("metricKey"),
+                        "businessName": metric.get("businessName"),
+                        "aliases": list(metric.get("aliases") or [])[:3],
+                        "formula": str(metric.get("formula") or "")[:300],
+                        "sourceColumns": list(metric.get("sourceColumns") or [])[:8],
+                        "aggregationPolicy": metric.get("aggregationPolicy"),
+                    }.items()
+                    if value not in (None, "", [], {})
+                },
+            }.items()
+            if value not in (None, "", [], {})
+        }
+    elif "content" in compact:
         content = str(compact.get("content") or "")
         compact["content"] = content[:limit]
         compact["truncated"] = True
@@ -171,31 +196,131 @@ def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Di
         compact["truncated"] = True
     else:
         compact = {"preview": payload[:limit], "truncated": True}
+    if (
+        len(json.dumps(compact, ensure_ascii=False, default=str)) > limit
+        and str(compact.get("kind") or "").upper() == "METRIC"
+        and isinstance(compact.get("metric"), dict)
+    ):
+        metric = compact.get("metric") or {}
+        compact["metric"] = {
+            key: value
+            for key, value in {
+                "metricKey": metric.get("metricKey"),
+                "businessName": metric.get("businessName"),
+                "sourceColumns": list(metric.get("sourceColumns") or [])[:4],
+            }.items()
+            if value not in (None, "", [], {})
+        }
+        compact["truncated"] = True
     return compact
+
+
+def compact_semantic_metric_read_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep one metric definition useful without replaying its whole asset.
+
+    ``semantic_read`` metric refs are virtual projections from ``asset.json``.
+    The Planner needs the governed identity and selection contract, not every
+    governance annotation on the table asset.  This compaction is structural
+    and independent of metric names, domains, or physical columns.
+    """
+
+    if str(result.get("kind") or "").upper() != "METRIC" or not result.get("content"):
+        return result
+    try:
+        parsed = json.loads(str(result.get("content") or ""))
+    except Exception:
+        return result
+    metric = parsed.get("metric") if isinstance(parsed, dict) else None
+    if not isinstance(metric, dict):
+        return result
+    definition_keys = {
+        "metricKey",
+        "businessName",
+        "aliases",
+        "canonicalMetricKey",
+        "aliasOf",
+        "metricLevel",
+        "metricGrain",
+        "grainHint",
+        "metricIntent",
+        "aggregationPolicy",
+        "selectionGuidance",
+        "preferredUseCases",
+        "notPreferredUseCases",
+        "formula",
+        "sourceColumns",
+        "unit",
+        "timeColumn",
+        "timeGrain",
+        "timeSemantics",
+        "status",
+        "version",
+    }
+    compact_metric = {key: value for key, value in metric.items() if key in definition_keys}
+    for key in ["aliases", "preferredUseCases", "notPreferredUseCases", "sourceColumns"]:
+        if isinstance(compact_metric.get(key), list):
+            compact_metric[key] = compact_metric[key][:8]
+    for key, value in list(compact_metric.items()):
+        if isinstance(value, str):
+            compact_metric[key] = value[:500] if key == "formula" else value[:240]
+    return {
+        key: value
+        for key, value in {
+            "success": result.get("success"),
+            "refId": result.get("refId"),
+            "path": result.get("path"),
+            "kind": result.get("kind"),
+            "topic": result.get("topic"),
+            "table": result.get("table"),
+            "metric": compact_metric,
+            "truncated": result.get("truncated", False),
+        }.items()
+        if value not in (None, "", [], {})
+    }
 
 
 def planner_tool_results_for_prompt(results: List[Dict[str, Any]], max_items: int = 4, max_chars: int = 12000) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
-    budget = max(1000, int(max_chars or 12000))
+    budget = max(200, int(max_chars or 12000))
     used = 0
-    for item in list(results or [])[-max(1, max_items) :]:
-        compact = dict(item or {})
-        if "result" in compact:
-            compact["result"] = compact_tool_result_for_prompt(compact.get("result") or {}, max(1000, int(budget / max(1, max_items))))
-        for key in ["promptArtifact", "artifact"]:
-            if key in compact and isinstance(compact[key], dict):
-                compact[key] = {
-                    "relativePath": compact[key].get("relativePath") or compact[key].get("path", ""),
-                    "sha256": compact[key].get("sha256", ""),
-                    "estimatedChars": compact[key].get("estimatedChars", 0),
-                }
+    source_results = list(results or [])
+    if any(
+        str((item or {}).get("name") or "").startswith(("semantic_", "artifact_"))
+        for item in source_results
+        if isinstance(item, dict)
+    ):
+        source_results = [
+            item
+            for item in source_results
+            if str((item or {}).get("name") or "") != "load_tool_schemas"
+        ]
+    for item in source_results[-max(1, max_items) :]:
+        source = dict(item or {})
+        compact = {
+            key: source.get(key)
+            for key in ["id", "name", "status", "round", "errorType", "errorCode", "errorMessage"]
+            if source.get(key) not in (None, "", [], {})
+        }
+        if "result" in source:
+            compact["result"] = compact_tool_result_for_prompt(
+                source.get("result") or {},
+                max(200, int(budget / max(1, min(max_items, len(results or []) or 1)))),
+            )
+        artifact = source.get("artifact")
+        result = source.get("result") or {}
+        if (
+            not (isinstance(result, dict) and result.get("refId"))
+            and isinstance(artifact, dict)
+            and (artifact.get("relativePath") or artifact.get("path"))
+        ):
+            compact["artifactPath"] = artifact.get("relativePath") or artifact.get("path", "")
         raw = json.dumps(compact, ensure_ascii=False, default=str)
         if used + len(raw) > budget and selected:
             selected.append(
                 {
                     "offloaded": True,
                     "reason": "planner tool results exceeded prompt budget",
-                    "omittedCount": max(0, len(results or []) - len(selected)),
+                    "omittedCount": max(0, len(source_results) - len(selected)),
                 }
             )
             break

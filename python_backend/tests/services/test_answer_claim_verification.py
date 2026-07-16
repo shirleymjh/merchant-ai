@@ -7,6 +7,7 @@ from merchant_ai.models import (
     AgentTaskResult,
     AnswerMode,
     MerchantInfo,
+    NodePlanContract,
     QueryBundle,
     QueryPlan,
     QuestionIntent,
@@ -175,6 +176,182 @@ def test_verified_facts_are_task_and_cell_bound():
         ("order_detail", "pay_amt", 121.5),
     }
     assert all(fact.fact_id.startswith("fact_") for fact in facts)
+
+
+def test_verified_facts_load_complete_offloaded_rows_beyond_inline_preview(tmp_path):
+    rows = [
+        {"business_date": "2026-07-%02d" % day, "metric_value": day - 1}
+        for day in range(1, 31)
+    ]
+    artifact = tmp_path / "metric_series_rows.json"
+    artifact.write_text(json.dumps(rows), encoding="utf-8")
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="show the governed daily series",
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="metric_series",
+                preferred_table="daily_profile",
+                metric_name="metric_value",
+                metric_column="metric_value",
+                group_by_column="business_date",
+                output_keys=["business_date"],
+                metric_resolution={
+                    "metricKey": "metric_value",
+                    "ownerTable": "daily_profile",
+                    "sourceColumns": ["metric_value"],
+                },
+            )
+        ]
+    )
+    bundle = QueryBundle(
+        tables=["daily_profile"],
+        rows=rows[:20],
+        original_row_count=30,
+        offloaded_files=[str(artifact)],
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="metric_series", success=True, query_bundle=bundle)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    facts = build_verified_facts(plan, run)
+
+    assert any(fact.column == "business_date" and fact.value == "2026-07-30" for fact in facts)
+    assert any(fact.column == "metric_value" and fact.value == 29 for fact in facts)
+
+
+def test_multi_metric_long_claim_binds_each_value_to_contract_alias_in_its_clause():
+    question = "最近30天指标甲和指标乙有什么变化？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="multi_metric",
+                preferred_table="daily_profile",
+                metric_name="metric_a",
+                metric_column="metric_a",
+                group_by_column="business_date",
+                output_keys=["business_date"],
+                metric_resolution={"metricKey": "metric_a", "displayName": "指标甲"},
+            )
+        ]
+    )
+    rows = [
+        {"business_date": "2026-07-01", "metric_a": 9, "metric_b": 100071},
+        {"business_date": "2026-07-02", "metric_a": 2, "metric_b": 100100},
+    ]
+    bundle = QueryBundle(tables=["daily_profile"], rows=rows, original_row_count=2)
+    contract = NodePlanContract(
+        task_id="multi_metric",
+        visible_columns=["business_date", "metric_a", "metric_b"],
+        metric_specs=[
+            {"metricName": "metric_a", "metricColumn": "metric_a", "displayName": "指标甲", "naturalName": "甲指标"},
+            {"metricName": "metric_b", "metricColumn": "metric_b", "displayName": "指标乙", "naturalName": "乙指标"},
+        ],
+        group_by_column="business_date",
+        time_window_contract={"timeColumn": "business_date"},
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="multi_metric", success=True, query_bundle=bundle, node_plan_contract=contract)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    verification = AnswerClaimVerifier().verify(
+        question,
+        plan,
+        run,
+        "指标甲从 9 下降到 2，减少 7；指标乙从 100071 上升到 100100，增加 29。",
+    )
+
+    assert verification.passed is True
+    facts = build_verified_facts(plan, run)
+    assert all({"指标乙", "乙指标"} <= set(fact.label_aliases) for fact in facts if fact.column == "metric_b")
+
+
+def test_multi_metric_long_claim_cannot_borrow_a_different_clause_label():
+    plan = detail_plan()
+    bundle = QueryBundle(
+        tables=["orders"],
+        rows=[{"order_id": "order_1", "refund_amt": 122, "pay_amt": 121.5}],
+        original_row_count=1,
+    )
+    contract = NodePlanContract(
+        task_id="order_detail",
+        visible_columns=["order_id", "refund_amt", "pay_amt"],
+        metric_specs=[
+            {"metricColumn": "refund_amt", "displayName": "退款金额"},
+            {"metricColumn": "pay_amt", "displayName": "支付金额"},
+        ],
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="order_detail", success=True, query_bundle=bundle, node_plan_contract=contract)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    verification = AnswerClaimVerifier().verify(
+        "订单 order_1 的支付金额和退款金额是多少？",
+        plan,
+        run,
+        "支付金额为 122；退款金额为 122。",
+    )
+
+    assert verification.passed is False
+    assert verification.unsupported_claims[0].reasons == ["unsupported_value:122"]
+
+
+def test_local_day_direction_is_checked_against_adjacent_points_not_overall_trend():
+    question = "最近3天指标值有什么变化？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="metric_series",
+                preferred_table="daily_profile",
+                metric_name="metric_value",
+                metric_column="metric_value",
+                group_by_column="business_date",
+                output_keys=["business_date"],
+                metric_resolution={"metricKey": "metric_value", "displayName": "指标值"},
+            )
+        ]
+    )
+    rows = [
+        {"business_date": "2026-07-01", "metric_value": 10},
+        {"business_date": "2026-07-02", "metric_value": 20},
+        {"business_date": "2026-07-03", "metric_value": 5},
+    ]
+    bundle = QueryBundle(tables=["daily_profile"], rows=rows, original_row_count=3)
+    contract = NodePlanContract(
+        task_id="metric_series",
+        visible_columns=["business_date", "metric_value"],
+        metric_specs=[{"metricName": "metric_value", "metricColumn": "source_value", "displayName": "指标值"}],
+        group_by_column="business_date",
+        time_window_contract={"timeColumn": "business_date"},
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="metric_series", success=True, query_bundle=bundle, node_plan_contract=contract)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    verification = AnswerClaimVerifier().verify(
+        question,
+        plan,
+        run,
+        "指标值从 2026-07-01 的 10 变化到 2026-07-03 的 5，整体下降 5；"
+        "指标值在 2026-07-02 较前一日上升 10。",
+    )
+
+    assert verification.passed is True
 
 
 def test_answer_claim_verifier_rejects_value_missing_from_evidence():

@@ -7,9 +7,10 @@ import pytest
 
 import merchant_ai.graph.workflow as workflow_module
 from merchant_ai.graph.policy import AgentActionRegistry, V2AgentPolicy
+from merchant_ai.graph.state import AgentState
 from merchant_ai.graph.workflow import MerchantQaWorkflow
-from merchant_ai.models import AgentDecision
-from merchant_ai.services.middleware import ActionContractMiddleware
+from merchant_ai.models import AgentActionTrace, AgentDecision
+from merchant_ai.services.middleware import ActionContractMiddleware, MiddlewareChain
 
 
 class RecordingStateGraph:
@@ -43,15 +44,24 @@ class RecordingStateGraph:
 def test_action_registry_has_unique_nodes_and_closed_contracts() -> None:
     registry = AgentActionRegistry()
     actions = registry.actions(registry.public_action_ids())
+    routing_actions = registry.actions(registry.routing_action_ids())
 
     assert len({action.id for action in actions}) == len(actions)
     assert len({action.node for action in actions}) == len(actions)
-    assert registry.policy_routing_map() == {action.node: action.node for action in actions}
+    assert registry.policy_routing_map() == {
+        action.node: action.node for action in routing_actions
+    }
+    assert "observe_contract_block" not in registry.public_action_ids()
+    assert not any(action.fallback_action for action in routing_actions)
     assert registry.get("answer").id == "answer_data"
     assert "answer" not in registry.public_action_ids()
     assert all(action.expected_state_keys or action.expected_state_flags for action in actions)
     with pytest.raises(KeyError):
         registry.get("unregistered_action")
+
+
+def test_graph_repair_attempt_flag_has_a_persisted_state_channel() -> None:
+    assert "query_graph_repair_attempted" in AgentState.__annotations__
 
 
 def test_workflow_registers_and_routes_every_action_node(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,6 +88,80 @@ def test_workflow_registers_and_routes_every_action_node(monkeypatch: pytest.Mon
         for target in path_map.values()
     }
     assert edge_targets | conditional_targets <= valid_targets
+    terminal_nodes = {
+        workflow.policy.registry.node_for("ask_human"),
+        workflow.policy.registry.node_for("cache_answer"),
+        workflow.policy.registry.node_for("terminal_end"),
+    }
+    assert {(node, "finalize_action_contract") for node in terminal_nodes} <= set(graph.edges)
+    assert ("finalize_action_contract", workflow_module.END) in graph.edges
+    assert {
+        (node, "policy")
+        for node in registered_nodes - terminal_nodes
+    } <= set(graph.edges)
+    assert not {
+        (source, target)
+        for source, target in graph.edges
+        if source in registered_nodes and target in registered_nodes
+    }
+    assert set(graph.conditionals) == {"preflight_route", "policy"}
+
+
+def test_terminal_finalizer_closes_the_selected_action_contract() -> None:
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.middleware_chain = MiddlewareChain([ActionContractMiddleware()])
+    decision = AgentDecision(
+        selected_action="answer_data",
+        selected_node="answer_analysis",
+        available_actions=["answer_data"],
+    )
+    state = {
+        "answer": "",
+        "action_history": [
+            AgentActionTrace(action="answer_data", node="answer_analysis", status="selected")
+        ],
+        "action_outcomes": [],
+        "middleware_events": [],
+    }
+    workflow.middleware_chain.capture_action(state, decision)
+    state["answer"] = "complete"
+
+    finalized = workflow.finalize_action_contract(state)
+
+    assert not finalized.get("_pending_action_contract")
+    assert finalized["action_history"][-1].status == "success"
+    assert finalized["last_action_result"].status == "success"
+    assert finalized["action_outcomes"][-1]["status"] == "success"
+
+    finalized_again = workflow.finalize_action_contract(finalized)
+    assert len(finalized_again["action_outcomes"]) == 1
+
+
+def test_action_contract_counts_declared_postcondition_change_as_progress() -> None:
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.middleware_chain = MiddlewareChain([ActionContractMiddleware()])
+    decision = AgentDecision(
+        selected_action="cache_answer",
+        selected_node="cache_answer",
+        available_actions=["cache_answer"],
+    )
+    state = {
+        "answer": "complete",
+        "response_context": None,
+        "action_history": [
+            AgentActionTrace(action="cache_answer", node="cache_answer", status="selected")
+        ],
+        "action_outcomes": [],
+        "middleware_events": [],
+    }
+    workflow.middleware_chain.capture_action(state, decision)
+    state["response_context"] = {"question": "governed question"}
+
+    finalized = workflow.finalize_action_contract(state)
+
+    assert finalized["last_action_result"].status == "success"
+    assert finalized["action_history"][-1].status == "success"
+    assert len(finalized["action_outcomes"]) == 1
 
 
 def test_validation_and_execution_actions_fail_closed_on_missing_prerequisites() -> None:
@@ -94,13 +178,12 @@ def test_validation_and_execution_actions_fail_closed_on_missing_prerequisites()
         available_actions=["validate_graph"],
     )
     contract.before_action({"middleware_events": []}, validation_decision)
-    assert validation_decision.selected_action == "compact_assets"
+    assert validation_decision.selected_action == "observe_contract_block"
 
     for action_id in ("execute_graph", "execute_graph_direct", "execute_graph_agent"):
         execution = registry.get(action_id)
         assert "query_graph_validation_passed" in execution.required_state_flags
-        assert "sql_generated" in execution.expected_state_flags
-        assert "sql_repair_reviewed" in execution.expected_state_flags
+        assert execution.expected_state_flags == ["sql_generated"]
 
         execution_decision = AgentDecision(
             selected_action=action_id,
@@ -116,4 +199,188 @@ def test_validation_and_execution_actions_fail_closed_on_missing_prerequisites()
             },
             execution_decision,
         )
-        assert execution_decision.selected_action == "validate_graph"
+        assert execution_decision.selected_action == "observe_contract_block"
+        assert execution_decision.available_actions == ["observe_contract_block"]
+
+
+def test_invalid_action_is_observed_without_implicit_business_fallback() -> None:
+    decision = AgentDecision(
+        selected_action="execute_graph",
+        selected_node="execute_query_graph",
+        available_actions=["execute_graph", "validate_graph", "answer_data"],
+        reason="injected invalid selection",
+    )
+    state = {
+        "plan": {"intents": [{"node": "metric"}]},
+        "query_graph_validation_result": {"valid": False},
+        "middleware_events": [],
+    }
+
+    ActionContractMiddleware().before_action(state, decision)
+
+    assert decision.selected_action == "observe_contract_block"
+    assert decision.selected_node == "observe_contract_block"
+    assert decision.source == "contract_block"
+    assert "validate_graph" not in decision.available_actions
+    assert "answer_data" not in decision.available_actions
+    assert state["contract_block_observation"]["blockedAction"] == "execute_graph"
+    assert state["contract_block_observation"]["missingStateFlags"] == [
+        "query_graph_validation_passed"
+    ]
+    assert state["middleware_events"][-1].code == "ACTION_CONTRACT_BLOCKED"
+
+
+def test_policy_filters_unsafe_catalog_entries_before_lead_selection() -> None:
+    class CandidatePolicy(V2AgentPolicy):
+        def _candidate_action_ids(self, _state: AgentState):
+            return ["execute_graph", "answer_data"], "test catalog", False
+
+    state = {
+        "plan": {"intents": [{"node": "metric"}]},
+        "query_graph_validation_result": {"valid": False},
+    }
+
+    decision = CandidatePolicy().decide(state)
+
+    assert decision.available_actions == ["answer_data"]
+    assert decision.selected_action == "answer_data"
+    assert state["action_catalog_contract_blocks"] == [
+        {
+            "action": "execute_graph",
+            "node": "execute_query_graph",
+            "missingStateKeys": [],
+            "missingStateFlags": ["query_graph_validation_passed"],
+        }
+    ]
+
+
+def test_contract_block_observation_consumes_round_and_returns_to_lead() -> None:
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.start_run_step = lambda *_args, **_kwargs: None
+    workflow.finish_run_step = lambda *_args, **_kwargs: None
+    workflow.record_span = lambda *_args, **_kwargs: None
+    state = {
+        "react_round": 3,
+        "contract_block_generation": 0,
+        "contract_block_observation": {
+            "status": "pending",
+            "blockedAction": "execute_graph",
+            "missingStateFlags": ["query_graph_validation_passed"],
+        },
+        "thinking_steps": [],
+    }
+
+    observed = workflow.observe_contract_block(state)
+
+    assert observed["react_round"] == 4
+    assert observed["contract_block_generation"] == 1
+    assert observed["contract_block_observed"] is True
+    assert observed["contract_block_observation"]["status"] == "observed"
+
+
+def test_adaptive_lead_selects_between_any_multiple_safe_actions() -> None:
+    class ChoosingLeadLlm:
+        configured = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def tool_json_chat(self, *_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            self.calls += 1
+            return {"actionId": "retrieve_knowledge", "reason": "inspect semantic assets first"}
+
+    llm = ChoosingLeadLlm()
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.settings = SimpleNamespace(
+        lead_action_llm_mode="adaptive",
+        run_budget_max_duration_seconds=90,
+        run_budget_fast_duration_seconds=25,
+        llm_request_timeout_seconds=20,
+        openai_model="test-model",
+        openai_base_url="test-provider",
+    )
+    workflow.policy = V2AgentPolicy()
+    workflow.planner = SimpleNamespace(llm=llm)
+    workflow.record_span = lambda *_args, **_kwargs: None
+    decision = AgentDecision(
+        selected_action="plan_graph",
+        selected_node=workflow.policy.registry.node_for("plan_graph"),
+        available_actions=["plan_graph", "retrieve_knowledge"],
+        reason="safe catalog fallback",
+    )
+    state = {
+        "question": "analyse the governed business question",
+        "main_agent_observations": [{"summary": "two safe tools remain"}],
+        "action_history": [],
+        "pending_knowledge_requests": [],
+        "planner_repair_requests": [],
+    }
+
+    selected = workflow.arbitrate_lead_action_if_needed(state, decision)
+
+    assert selected.selected_action == "retrieve_knowledge"
+    assert selected.source == "lead_llm_tool"
+    assert llm.calls == 1
+    assert state["bounded_lead_llm_trace"]["status"] == "accepted"
+
+    repeated = workflow.arbitrate_lead_action_if_needed(state, decision)
+    assert repeated.selected_action == "ask_human"
+    assert repeated.source == "runtime_fail_closed"
+    assert llm.calls == 1
+    assert state["bounded_lead_llm_trace"]["errorCode"] == "LEAD_DECISION_UNAVAILABLE"
+
+
+def test_lead_catalog_preserves_safe_answer_action_without_business_preference() -> None:
+    workflow = object.__new__(MerchantQaWorkflow)
+
+    assert workflow.lead_llm_action_catalog(
+        ["repair_graph", "answer_data", "repair_graph"]
+    ) == ["repair_graph", "answer_data"]
+
+
+def test_completed_answer_closes_through_cache_before_other_policy_branches() -> None:
+    decision = V2AgentPolicy().decide(
+        {
+            "chat_bi_completed": True,
+            "run_budget_exhausted": True,
+            "evidence_graph_verified": True,
+        }
+    )
+
+    assert decision.selected_action == "cache_answer"
+    assert decision.available_actions == ["cache_answer"]
+    assert decision.budget_exhausted is False
+
+
+def test_hypothesis_catalog_uses_structured_analysis_contract_not_complexity_hint() -> None:
+    policy = V2AgentPolicy()
+    policy.settings = SimpleNamespace(hypothesis_query_exploration_enabled=True)
+    state = {
+        "fast_understanding": SimpleNamespace(complexity="complex"),
+        "evidence_graph_verified": True,
+        "evidence_accepted": True,
+        "agent_run_result": SimpleNamespace(
+            verified_evidence=SimpleNamespace(passed=True)
+        ),
+        "hypothesis_exploration": {
+            "hypotheses": [{"hypothesisId": "h1"}, {"hypothesisId": "h2"}],
+            "questionSignals": {"mentionsAttribution": True, "mentionsDrop": True},
+        },
+        "plan": SimpleNamespace(
+            intents=[object()],
+            question_understanding={
+                "analysisIntent": "comparison",
+                "requiresExplanation": False,
+                "requiredEvidenceIntents": [],
+            },
+        ),
+    }
+
+    assert policy.hypothesis_exploration_needed(state) is False
+
+    state["plan"].question_understanding = {
+        "analysisIntent": "diagnostic",
+        "requiresExplanation": True,
+        "requiredEvidenceIntents": [{"intent": "driver_analysis"}],
+    }
+    assert policy.hypothesis_exploration_needed(state) is True

@@ -270,6 +270,10 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
         understanding = dict(plan.question_understanding or understanding)
         understanding["timeWindowContract"] = contract
         understanding["analysisGrain"] = "day"
+    elif str(contract.get("grain") or "").strip().lower() == "period":
+        plan = apply_period_grain_to_plan(plan, contract)
+        understanding = dict(plan.question_understanding or understanding)
+        understanding["timeWindowContract"] = contract
     if contract.get("requiresComparison"):
         understanding["analysisIntent"] = "comparison"
         plan = add_comparison_baseline_to_plan(plan, contract)
@@ -277,6 +281,116 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
         understanding["timeWindowContract"] = contract
         understanding["analysisIntent"] = "comparison"
     return plan.model_copy(update={"question_understanding": understanding})
+
+
+def apply_period_grain_to_plan(plan: QueryPlan, time_contract: Dict[str, Any]) -> QueryPlan:
+    """Turn an explicitly period-grained temporal aggregate into a scalar.
+
+    This is deliberately driven by the structured analysis/time contracts.  It
+    never guesses a physical date field from its identifier, and it leaves
+    entity/ranking groups untouched.
+    """
+
+    if not plan.intents:
+        return plan
+    understanding = dict(plan.question_understanding or {})
+    analysis_grain = str(
+        understanding.get("analysisGrain") or understanding.get("analysis_grain") or ""
+    ).strip().lower()
+    temporal_grains = {"time", "temporal", "date", "day", "daily", "time_series"}
+    intents = []
+    scalarized_task_ids: list[str] = []
+    for intent in plan.intents:
+        mode = str(getattr(intent.answer_mode, "value", intent.answer_mode) or "").upper()
+        group_column = str(intent.group_by_column or "").strip()
+        if mode not in {"METRIC", "GROUP_AGG"} or not group_column:
+            intents.append(intent)
+            continue
+        resolution = dict(intent.metric_resolution or {})
+        resolution_grain = str(
+            resolution.get("timeGrain")
+            or resolution.get("time_grain")
+            or resolution.get("analysisGrain")
+            or resolution.get("analysis_grain")
+            or ""
+        ).strip().lower()
+        explicitly_declared_time_columns = {
+            str(value).strip()
+            for source in [
+                time_contract,
+                resolution,
+                resolution.get("timeWindowContract") or resolution.get("time_window_contract") or {},
+            ]
+            if isinstance(source, dict)
+            for value in [
+                source.get("timeColumn"),
+                source.get("time_column"),
+                source.get("partitionColumn"),
+                source.get("partition_column"),
+            ]
+            if str(value or "").strip()
+        }
+        temporal_group = bool(
+            analysis_grain in temporal_grains
+            or resolution_grain in temporal_grains
+            or group_column in explicitly_declared_time_columns
+        )
+        if not temporal_group:
+            intents.append(intent)
+            continue
+        for key in ["groupByColumn", "group_by_column"]:
+            if str(resolution.get(key) or "").strip() == group_column:
+                resolution.pop(key, None)
+        resolution["timeWindowGrain"] = "period"
+        resolution["displayRole"] = "summary"
+        if str(resolution.get("visualization") or "").lower() in {
+            "line_chart",
+            "area_chart",
+            "time_series",
+        }:
+            resolution.pop("visualization", None)
+        intents.append(
+            intent.model_copy(
+                update={
+                    "answer_mode": AnswerMode.METRIC,
+                    "group_by_column": "",
+                    "limit": 1,
+                    "required_evidence": [
+                        item for item in intent.required_evidence if str(item or "") != group_column
+                    ],
+                    "output_keys": [
+                        item for item in intent.output_keys if str(item or "") != group_column
+                    ],
+                    "metric_resolution": resolution,
+                    "analysis_note": append_note(intent.analysis_note, "time grain period scalar"),
+                }
+            )
+        )
+        if intent.plan_task_id:
+            scalarized_task_ids.append(intent.plan_task_id)
+    if not scalarized_task_ids:
+        return plan
+    selected_metrics = []
+    for item in understanding.get("selectedMetrics") or understanding.get("selected_metrics") or []:
+        if not isinstance(item, dict):
+            continue
+        selected = dict(item)
+        for key in ["groupByColumn", "group_by_column"]:
+            selected.pop(key, None)
+        selected_metrics.append(selected)
+    if "selectedMetrics" in understanding or selected_metrics:
+        understanding["selectedMetrics"] = selected_metrics
+    understanding["analysisGrain"] = "period"
+    trace = list(plan.compiler_trace or [])
+    trace.append("TIME_WINDOW_GRAIN:period:%s" % ",".join(scalarized_task_ids))
+    updated = plan.model_copy(
+        update={
+            "intents": intents,
+            "question_understanding": understanding,
+            "compiler_trace": trace,
+        }
+    )
+    return updated.model_copy(update={"evidence_contracts": evidence_contracts_from_current_intents(updated)})
 
 
 def apply_time_grain_to_plan(

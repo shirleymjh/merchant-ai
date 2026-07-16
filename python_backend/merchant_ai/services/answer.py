@@ -4,6 +4,7 @@ import json
 import re
 from contextvars import ContextVar
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -210,6 +211,9 @@ class AnswerComposeService:
                 personalization_context,
             )
         if primary.intent_type == "VALID" and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT} and (not run_result or not run_result.task_results):
+            validation_gap_answer = blocking_evidence_partial_answer(question, plan, run_result)
+            if validation_gap_answer:
+                return self._finalize_answer(validation_gap_answer, question, plan, run_result)
             return self._no_execution_answer(plan)
         if run_result and run_result.task_results and all(result.query_bundle.failed for result in run_result.task_results):
             return self._finalize_answer(
@@ -1990,13 +1994,18 @@ def metric_value_column_for_rows(plan: QueryPlan, intent: QuestionIntent, rows: 
 def metric_display_contract(intent: QuestionIntent, spec: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Return only runtime metric presentation metadata, without guessing from identifiers."""
     contract: Dict[str, Any] = {}
-    sources = [intent.metric_resolution or {}, spec or {}]
+    # A merged execution intent can carry several independently governed
+    # metricSpecs.  Per-metric metadata must outrank the primary intent's
+    # presentation contract or every merged value is rendered as metric #1.
+    sources = [spec or {}, intent.metric_resolution or {}]
     aliases = {
         "displayName": ["displayName", "display_name"],
         "description": ["description"],
         "unit": ["unit"],
         "valueFormat": ["valueFormat", "value_format"],
         "sourceColumnLabels": ["sourceColumnLabels", "source_column_labels"],
+        "aggregationPolicy": ["aggregationPolicy", "aggregation_policy"],
+        "applicableTimeGrain": ["applicableTimeGrain", "applicable_time_grain"],
     }
     for target, keys in aliases.items():
         for source in sources:
@@ -2686,20 +2695,25 @@ def multi_trend_metric_sentence(question: str, plan: QueryPlan, run_result: Agen
             metric_key = str(group.get("metricKey") or "")
             label = str(group.get("label") or friendly_column_label(plan, metric_key) or "指标")
             display_metadata = group.get("displayMetadata") if isinstance(group.get("displayMetadata"), dict) else {}
+            aggregation_policy = str(
+                display_metadata.get("aggregationPolicy")
+                or display_metadata.get("aggregation_policy")
+                or ""
+            ).strip().lower()
             if not complete:
                 incomplete_labels.append(label)
                 continue
             if len(points) < 2:
                 if len(points) == 1:
                     point = points[0]
-                    single_point_parts.append(
-                        "%s在 %s 的值为 %s"
-                        % (
-                            label,
-                            format_cell(point.get(TIME_DIMENSION_KEY)),
-                            format_metric_value_for_answer(point.get("value"), metric_key, label, display_metadata),
-                        )
+                    point_date = format_cell(point.get(TIME_DIMENSION_KEY))
+                    point_value = format_metric_value_for_answer(
+                        point.get("value"), metric_key, label, display_metadata
                     )
+                    if aggregation_policy == "latest_value_only":
+                        single_point_parts.append("%s截至 %s 为 %s" % (label, point_date, point_value))
+                    else:
+                        single_point_parts.append("%s在 %s 的值为 %s" % (label, point_date, point_value))
                 continue
             first, last = points[0], points[-1]
             first_value = answer_numeric_value(first.get("value"))
@@ -2715,7 +2729,7 @@ def multi_trend_metric_sentence(question: str, plan: QueryPlan, run_result: Agen
                     direction,
                     format_metric_value_for_answer(abs(delta), metric_key, label, display_metadata),
                 )
-            parts.append(
+            trend_text = (
                 "%s从 %s 的 %s 变化到 %s 的 %s，%s"
                 % (
                     label,
@@ -2726,6 +2740,28 @@ def multi_trend_metric_sentence(question: str, plan: QueryPlan, run_result: Agen
                     change_text,
                 )
             )
+            if aggregation_policy == "period_rollup":
+                period_total = sum(
+                    (
+                        value
+                        for point in points
+                        if (value := answer_numeric_value(point.get("value"))) is not None
+                    ),
+                    Decimal("0"),
+                )
+                trend_text = "%s周期合计为 %s，%s" % (
+                    label,
+                    format_metric_value_for_answer(period_total, metric_key, label, display_metadata),
+                    trend_text,
+                )
+            elif aggregation_policy == "latest_value_only":
+                trend_text = "%s截至 %s 为 %s，%s" % (
+                    label,
+                    format_cell(last.get(TIME_DIMENSION_KEY)),
+                    format_metric_value_for_answer(last.get("value"), metric_key, label, display_metadata),
+                    trend_text,
+                )
+            parts.append(trend_text)
     if not parts and not single_point_parts and not incomplete_labels:
         return ""
     time_phrase = extract_question_time_phrase(question)

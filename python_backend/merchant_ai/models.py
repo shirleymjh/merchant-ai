@@ -1611,9 +1611,11 @@ class VerifiedFact(APIModel):
     row_index: int = 0
     column: str = ""
     label: str = ""
+    label_aliases: List[str] = Field(default_factory=list)
     value: Any = None
     value_type: str = "text"
     result_role: str = "result"
+    aggregation_policy: str = ""
 
 
 class AnswerClaim(APIModel):
@@ -1811,6 +1813,24 @@ class AgentTaskResult(APIModel):
     file_tool_results: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class ExecutionAttemptArtifact(APIModel):
+    """Append-only audit record for one NodeWorker execution attempt."""
+
+    attempt_id: str = ""
+    phase: str = ""
+    execution_generation: int = 0
+    query_graph_fingerprint: str = ""
+    recorded_at: str = ""
+    failed: bool = False
+    error: str = ""
+    task_results: List[AgentTaskResult] = Field(default_factory=list)
+    query_bundles: List[QueryBundle] = Field(default_factory=list)
+    merged_query_bundle: QueryBundle = Field(default_factory=QueryBundle)
+    sql_repairs: List[SqlRepairAttempt] = Field(default_factory=list)
+    node_tool_traces: List[NodeToolCall] = Field(default_factory=list)
+    reflection_notes: List[str] = Field(default_factory=list)
+
+
 class EvidenceCheckResult(APIModel):
     passed: bool = False
     summary: str = ""
@@ -1903,6 +1923,7 @@ class AgentRunResult(APIModel):
     degraded_reasons: List[Dict[str, Any]] = Field(default_factory=list)
     verified_facts: List[VerifiedFact] = Field(default_factory=list)
     answer_claim_verification: AnswerClaimVerification = Field(default_factory=AnswerClaimVerification)
+    execution_attempt_artifacts: List[ExecutionAttemptArtifact] = Field(default_factory=list)
 
 
 class HypothesisEvidenceRecord(APIModel):

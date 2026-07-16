@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from merchant_ai.config import Settings
+from merchant_ai.graph.action_contract import action_prerequisite_gaps, contract_block_observation
 from merchant_ai.graph.state import AgentState
 from merchant_ai.graph.query_graph_contract import graph_validation_attempted, graph_validation_passed
 from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute, SkillMatchState
@@ -28,6 +29,8 @@ REPAIRABLE_QUERY_GRAPH_GAP_CODES = {
     "MISSING_UPSTREAM_ENTITY",
     "CONTRACT_REQUIRED_EVIDENCE_GAP",
     "MEMORY_CONSTRAINT_UNAPPLIED",
+    "AGGREGATE_OUTPUT_CONTRACT_MISMATCH",
+    "GROUP_BY_CONTRACT_MISMATCH",
 }
 
 
@@ -44,13 +47,19 @@ class AgentActionRegistry:
                 expected_state_flags=["topic_routed"],
             ),
             AgentAction(
+                id="observe_contract_block",
+                node="observe_contract_block",
+                agent="Runtime",
+                description="record a blocked action contract and return its observation to LeadAgent",
+                expected_state_flags=["contract_block_observed"],
+            ),
+            AgentAction(
                 id="fast_understand",
                 node="fast_understand",
                 agent="LeadAgent",
                 description="cheap complexity and intent sketch before heavy planning",
                 required_state_flags=["topic_routed"],
                 expected_state_flags=["fast_understood"],
-                fallback_action="route_topic",
             ),
             AgentAction(
                 id="recall_memory",
@@ -59,7 +68,6 @@ class AgentActionRegistry:
                 description="recall governed merchant memory after topic routing",
                 required_state_flags=["topic_routed"],
                 expected_state_flags=["memory_recalled"],
-                fallback_action="route_topic",
             ),
             AgentAction(
                 id="try_fast_metric",
@@ -68,7 +76,6 @@ class AgentActionRegistry:
                 description="legacy compatibility path for one uniquely matched published semantic metric",
                 required_state_flags=["fast_understood"],
                 expected_state_flags=["fast_metric_attempted"],
-                fallback_action="retrieve_knowledge",
             ),
             AgentAction(
                 id="retrieve_knowledge",
@@ -77,7 +84,6 @@ class AgentActionRegistry:
                 description="retrieve semantic rules, terms and thin skill policies",
                 required_state_flags=["topic_routed"],
                 expected_state_flags=["data_discovered"],
-                fallback_action="route_topic",
             ),
             AgentAction(
                 id="compact_assets",
@@ -86,7 +92,6 @@ class AgentActionRegistry:
                 description="build semantic asset pack",
                 required_state_flags=["data_discovered"],
                 expected_state_flags=["planning_assets_compacted"],
-                fallback_action="retrieve_knowledge",
             ),
             AgentAction(
                 id="query_metric",
@@ -95,7 +100,6 @@ class AgentActionRegistry:
                 description="resolve, validate, execute and verify one governed semantic metric inside the current Topic workspace",
                 required_state_flags=["planning_assets_compacted"],
                 expected_state_flags=["query_metric_attempted"],
-                fallback_action="plan_graph",
             ),
             AgentAction(
                 id="plan_graph",
@@ -104,7 +108,6 @@ class AgentActionRegistry:
                 description="build QueryGraph",
                 required_state_flags=["planning_assets_compacted"],
                 expected_state_keys=["plan.intents"],
-                fallback_action="compact_assets",
             ),
             AgentAction(
                 id="reflect_plan",
@@ -113,7 +116,6 @@ class AgentActionRegistry:
                 description="review QueryGraph before validation",
                 required_state_keys=["plan.intents"],
                 expected_state_flags=["query_graph_reflected"],
-                fallback_action="plan_graph",
             ),
             AgentAction(
                 id="validate_graph",
@@ -123,7 +125,6 @@ class AgentActionRegistry:
                 required_state_flags=["planning_assets_compacted"],
                 expected_state_keys=["query_graph_validation_result"],
                 expected_state_flags=["query_graph_validation_attempted"],
-                fallback_action="compact_assets",
             ),
             AgentAction(
                 id="repair_graph",
@@ -133,7 +134,6 @@ class AgentActionRegistry:
                 required_state_keys=["plan.intents"],
                 required_state_flags=["planning_assets_compacted"],
                 expected_state_flags=["query_graph_repair_attempted"],
-                fallback_action="plan_graph",
             ),
             AgentAction(
                 id="execute_graph",
@@ -142,8 +142,7 @@ class AgentActionRegistry:
                 description="execute QueryGraph nodes",
                 required_state_keys=["plan.intents", "query_graph_validation_result"],
                 required_state_flags=["query_graph_validation_passed"],
-                expected_state_flags=["sql_generated", "sql_repair_reviewed"],
-                fallback_action="validate_graph",
+                expected_state_flags=["sql_generated"],
             ),
             AgentAction(
                 id="execute_graph_direct",
@@ -152,8 +151,7 @@ class AgentActionRegistry:
                 description="execute the validated QueryGraph with the lightweight direct worker path",
                 required_state_keys=["plan.intents", "query_graph_validation_result"],
                 required_state_flags=["query_graph_validation_passed"],
-                expected_state_flags=["sql_generated", "sql_repair_reviewed"],
-                fallback_action="execute_graph_agent",
+                expected_state_flags=["sql_generated"],
             ),
             AgentAction(
                 id="execute_graph_agent",
@@ -162,8 +160,7 @@ class AgentActionRegistry:
                 description="execute the validated QueryGraph with autonomous bounded Sub-Agent loops",
                 required_state_keys=["plan.intents", "query_graph_validation_result"],
                 required_state_flags=["query_graph_validation_passed"],
-                expected_state_flags=["sql_generated", "sql_repair_reviewed"],
-                fallback_action="execute_graph_direct",
+                expected_state_flags=["sql_generated"],
             ),
             AgentAction(
                 id="repair_sql",
@@ -173,7 +170,6 @@ class AgentActionRegistry:
                 required_state_keys=["agent_run_result.task_results"],
                 required_state_flags=["sql_generated"],
                 expected_state_flags=["sql_repair_reviewed"],
-                fallback_action="execute_graph",
             ),
             AgentAction(
                 id="verify_evidence",
@@ -183,7 +179,6 @@ class AgentActionRegistry:
                 required_state_keys=["agent_run_result.task_results"],
                 required_state_flags=["sql_generated"],
                 expected_state_flags=["evidence_graph_verified"],
-                fallback_action="execute_graph",
             ),
             AgentAction(
                 id="run_analysis_skill",
@@ -193,7 +188,6 @@ class AgentActionRegistry:
                 required_state_keys=["agent_run_result.task_results"],
                 required_state_flags=["sql_generated", "evidence_graph_verified"],
                 expected_state_keys=["analysis_summary"],
-                fallback_action="verify_evidence",
             ),
             AgentAction(
                 id="run_analysis_worker",
@@ -203,7 +197,6 @@ class AgentActionRegistry:
                 required_state_keys=["agent_run_result.task_results"],
                 required_state_flags=["sql_generated", "evidence_graph_verified"],
                 expected_state_keys=["analysis_summary"],
-                fallback_action="answer_data",
             ),
             AgentAction(
                 id="delegate_subagent",
@@ -211,15 +204,6 @@ class AgentActionRegistry:
                 agent="LeadAgent",
                 description="delegate bounded document, Python, hypothesis, Skill or query work to isolated Sub-Agents",
                 expected_state_flags=["subagent_delegation_completed"],
-                fallback_action="answer_data",
-            ),
-            AgentAction(
-                id="explore_hypotheses",
-                node="explore_hypotheses",
-                agent="LeadAgent",
-                description="generate, validate and execute independent QueryGraphs for competing merchant hypotheses, then prune or expand them",
-                expected_state_flags=["hypothesis_exploration_completed"],
-                fallback_action="answer_data",
             ),
             AgentAction(
                 id="answer_rule",
@@ -258,6 +242,7 @@ class AgentActionRegistry:
                 expected_state_flags=["chat_bi_completed"],
             ),
         ]
+        self._internal_ids = {"observe_contract_block"}
         self._aliases = {"answer": "answer_data"}
         self._by_id: Dict[str, AgentAction] = {action.id: action for action in actions}
         self._by_node: Dict[str, AgentAction] = {action.node: action for action in actions}
@@ -278,6 +263,9 @@ class AgentActionRegistry:
         return [self.get(action_id) for action_id in action_ids]
 
     def public_action_ids(self) -> List[str]:
+        return [action_id for action_id in self._by_id if action_id not in self._internal_ids]
+
+    def routing_action_ids(self) -> List[str]:
         return list(self._by_id.keys())
 
     def node_for(self, action_id: str) -> str:
@@ -301,8 +289,6 @@ class AgentActionRegistry:
             if alias in self._by_id or canonical_id not in self._by_id:
                 raise ValueError("invalid agent action alias: %s" % alias)
         for action in actions:
-            if action.fallback_action and action.fallback_action not in self._by_id:
-                raise ValueError("fallback action is not registered: %s" % action.fallback_action)
             if not action.expected_state_keys and not action.expected_state_flags:
                 raise ValueError("agent action has no declared postcondition: %s" % action.id)
 
@@ -339,6 +325,27 @@ class V2AgentPolicy:
 
     def decide(self, state: AgentState) -> AgentDecision:
         action_ids, reason, budget_exhausted = self._candidate_action_ids(state)
+        action_ids, blocked = self.contract_safe_action_ids(state, action_ids)
+        state["action_catalog_contract_blocks"] = blocked
+        if not action_ids and blocked:
+            blocked_action = self.registry.get(str(blocked[0]["action"]))
+            observation = contract_block_observation(
+                blocked_action,
+                list(blocked[0]["missingStateKeys"]),
+                list(blocked[0]["missingStateFlags"]),
+                reason=reason,
+                source="policy_catalog_filter",
+            )
+            observation["blockedCatalog"] = blocked
+            state["contract_block_observation"] = observation
+            state["contract_block_observed"] = False
+            action_ids = ["observe_contract_block"]
+            reason = "all proposed actions were removed by declarative prerequisite contracts"
+        elif blocked:
+            reason = "%s; contract filter removed unsafe actions=%s" % (
+                reason,
+                [item["action"] for item in blocked],
+            )
         selected_action = action_ids[0] if action_ids else "answer_data"
         action = self.registry.get(selected_action)
         return AgentDecision(
@@ -348,6 +355,29 @@ class V2AgentPolicy:
             reason=reason,
             budget_exhausted=budget_exhausted,
         )
+
+    def contract_safe_action_ids(
+        self,
+        state: AgentState,
+        action_ids: List[str],
+    ) -> tuple[List[str], List[Dict[str, object]]]:
+        safe: List[str] = []
+        blocked: List[Dict[str, object]] = []
+        for action_id in action_ids:
+            action = self.registry.get(action_id)
+            missing_keys, missing_flags = action_prerequisite_gaps(state, action)
+            if missing_keys or missing_flags:
+                blocked.append(
+                    {
+                        "action": action.id,
+                        "node": action.node,
+                        "missingStateKeys": missing_keys,
+                        "missingStateFlags": missing_flags,
+                    }
+                )
+                continue
+            safe.append(action.id)
+        return safe, blocked
 
     def next_action(self, state: AgentState) -> str:
         return self.decide(state).selected_node
@@ -362,6 +392,8 @@ class V2AgentPolicy:
         terminal = state.get("terminal_status") or {}
         if terminal.get("active"):
             return ["terminal_end"], "terminal runtime guard stops all further orchestration", True
+        if state.get("chat_bi_completed"):
+            return ["cache_answer"], "answer action completed; close the run through the terminal cache contract", False
         if state.get("run_budget_exhausted"):
             if self.has_task_results(state) and not state.get("evidence_graph_verified"):
                 return ["verify_evidence"], "run budget exhausted after SQL execution; evidence verification is still mandatory", True
@@ -438,13 +470,6 @@ class V2AgentPolicy:
             return ["answer_data"], "query_metric executed and verified one governed semantic metric", False
         if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
             return ["query_metric", "plan_graph"], "single governed metric can be resolved through query_metric after Topic workspace recall", False
-        if (
-            (not plan or not plan.intents)
-            and state.get("planner_provider_error")
-            and not self.planner_degraded_fail_fast(state)
-            and self.hypothesis_recovery_needed(state)
-        ):
-            return ["explore_hypotheses", "validate_graph", "answer_data"], "Planner provider failed; independently seed and execute bounded hypothesis QueryGraphs from semantic assets", False
         if (not plan or not plan.intents) and state.get("planner_provider_error"):
             if not self.graph_validation_attempted(state):
                 return ["validate_graph"], "Planner provider failed; validate empty graph as structured gap", True
@@ -519,16 +544,6 @@ class V2AgentPolicy:
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"], "evidence verifier found graph-repairable dependency gaps", False
             return ["answer_data"], "graph-repairable evidence gaps remain but repair budget is exhausted", True
-        if self.hypothesis_exploration_needed(state):
-            actions = ["explore_hypotheses"]
-            if self.analysis_skill_needed(state):
-                actions.append("run_analysis_skill")
-            if self.analysis_worker_needed(state):
-                actions.append("run_analysis_worker")
-            actions.append("answer_data")
-            if not state.get("subagent_delegation_attempted"):
-                actions.insert(1, "delegate_subagent")
-            return actions, "verified baseline evidence is ready; LeadAgent may independently delegate or test competing hypotheses", False
         if self.analysis_worker_needed(state) or self.analysis_skill_needed(state):
             actions = []
             if self.analysis_skill_needed(state):
@@ -576,8 +591,6 @@ class V2AgentPolicy:
             if self.graph_validation_attempted(state):
                 return ["answer_data"]
             if state.get("planner_provider_error"):
-                if not self.planner_degraded_fail_fast(state) and self.hypothesis_recovery_needed(state):
-                    return ["explore_hypotheses", "validate_graph", "answer_data"]
                 return ["validate_graph"]
             if int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
                 return ["plan_graph", "retrieve_knowledge"]
@@ -633,14 +646,6 @@ class V2AgentPolicy:
             if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
                 return ["repair_graph", "answer_data"]
             return ["answer_data"]
-        if self.evidence_verification_passed(state) and self.hypothesis_exploration_needed(state):
-            actions = ["explore_hypotheses"]
-            if self.analysis_skill_needed(state):
-                actions.append("run_analysis_skill")
-            if self.analysis_worker_needed(state):
-                actions.append("run_analysis_worker")
-            actions.append("answer_data")
-            return actions if state.get("subagent_delegation_attempted") else [actions[0], "delegate_subagent"] + actions[1:]
         if self.evidence_verification_passed(state) and (self.analysis_worker_needed(state) or self.analysis_skill_needed(state)):
             actions = []
             if self.analysis_skill_needed(state):
@@ -949,22 +954,17 @@ class V2AgentPolicy:
             return False
         if state.get("hypothesis_exploration_completed") or not self.evidence_verification_passed(state):
             return False
-        if not self.evidence_verification_passed(state):
-            return False
         hypotheses = list((state.get("hypothesis_exploration") or {}).get("hypotheses") or [])
         if len(hypotheses) < 2:
             return False
-        signals = (state.get("hypothesis_exploration") or {}).get("questionSignals") or {}
-        fast = state.get("fast_understanding")
-        complex_signal = bool(signals.get("mentionsAttribution") or signals.get("mentionsDrop"))
-        complex_signal = complex_signal or bool(
-            getattr(fast, "requires_explanation", False)
-            or str(getattr(fast, "complexity", "") or "") == "complex"
-        )
-        if not complex_signal:
-            return False
         plan = state.get("plan")
         understanding = getattr(plan, "question_understanding", {}) or {} if plan else {}
+        requires_explanation = str(
+            understanding.get("requiresExplanation", understanding.get("requires_explanation", False))
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        required_evidence = understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []
+        if not requires_explanation and not required_evidence:
+            return False
         if str(understanding.get("source") or "") == "canonical_recalled_metric_diagnostic_fallback":
             driver_contracts = understanding.get("diagnosticDriverContracts") or understanding.get("diagnostic_driver_contracts") or []
             if not driver_contracts:

@@ -10,8 +10,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings
+from merchant_ai.graph.action_contract import (
+    action_prerequisite_gaps,
+    action_state_flag_ready,
+    contract_block_observation,
+    state_path_ready,
+    state_path_value,
+)
 from merchant_ai.graph.state import AgentState, mark_terminal_status, merge_agent_state_update
-from merchant_ai.graph.query_graph_contract import graph_validation_passed, query_graph_fingerprint
+from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
 from merchant_ai.models import (
     ActionResult,
     AgentDecision,
@@ -99,7 +106,10 @@ class MiddlewareChain:
         self._record_chain_order(state, "after_action")
         for middleware in self.middlewares:
             state = self._safe_call(middleware, "after_action", state)
-        state.pop("_pending_action_contract", None)
+        # LangGraph state updates cannot observe a local key deletion. Persist
+        # an explicit empty value so a terminal finalizer cannot replay the
+        # same contract on the following graph edge.
+        state["_pending_action_contract"] = {}
         return state
 
     def _safe_call(self, middleware: HarnessMiddleware, method: str, state: AgentState, *args: Any) -> AgentState:
@@ -297,40 +307,44 @@ class ActionContractMiddleware(HarnessMiddleware):
 
     def before_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
         action = self.registry.get(decision.selected_action)
-        missing_keys = [key for key in action.required_state_keys if not state_path_ready(state, key)]
-        missing_flags = [flag for flag in action.required_state_flags if not action_state_flag_ready(state, flag)]
+        missing_keys, missing_flags = action_prerequisite_gaps(state, action)
         if not missing_keys and not missing_flags:
+            if action.id != "observe_contract_block":
+                state["contract_block_observation"] = {}
+                state["contract_block_observed"] = False
             return state
 
-        fallback_id = self.fallback_action(action.fallback_action, missing_keys, missing_flags)
-        fallback = self.registry.get(fallback_id)
         original_action = decision.selected_action
         original_node = decision.selected_node
-        if fallback.id == original_action:
-            fallback = self.registry.get("answer_data")
-            fallback_id = fallback.id
-
-        decision.selected_action = fallback.id
-        decision.selected_node = fallback.node
-        decision.source = "contract"
+        observation_action = self.registry.get("observe_contract_block")
+        state["contract_block_observation"] = contract_block_observation(
+            action,
+            missing_keys,
+            missing_flags,
+            reason=decision.reason,
+        )
+        state["contract_block_observed"] = False
+        decision.selected_action = observation_action.id
+        decision.selected_node = observation_action.node
+        decision.source = "contract_block"
         decision.reason = (
-            "Action contract rerouted %s to %s; missing keys=%s flags=%s. %s"
-            % (original_action, fallback.id, missing_keys, missing_flags, decision.reason or "")
+            "Action contract blocked %s; return the missing prerequisite observation to LeadAgent "
+            "without executing a fallback. missing keys=%s flags=%s. %s"
+            % (original_action, missing_keys, missing_flags, decision.reason or "")
         ).strip()
-        available = [fallback.id] + [item for item in decision.available_actions if item != fallback.id]
-        decision.available_actions = available
+        decision.available_actions = [observation_action.id]
         append_middleware_event(
             state,
             self.name,
             "before_action",
-            status="rerouted",
-            code="ACTION_CONTRACT_MISSING_PREREQUISITE",
-            message="selected action was rerouted before execution because required state was not ready",
+            status="blocked",
+            code="ACTION_CONTRACT_BLOCKED",
+            message="selected action was blocked; no business fallback was executed",
             metadata={
                 "fromAction": original_action,
                 "fromNode": original_node,
-                "toAction": fallback.id,
-                "toNode": fallback.node,
+                "observationAction": observation_action.id,
+                "observationNode": observation_action.node,
                 "missingStateKeys": missing_keys,
                 "missingStateFlags": missing_flags,
             },
@@ -347,13 +361,15 @@ class ActionContractMiddleware(HarnessMiddleware):
         missing_keys = [key for key in expected_keys if not state_path_ready(state, key)]
         missing_flags = [flag for flag in expected_flags if not action_state_flag_ready(state, flag)]
         post_values = action_contract_values(state, expected_keys, expected_flags)
+        pre_values = snapshot.get("preValues") or {}
+        contract_progressed = stable_json_hash(pre_values) != stable_json_hash(post_values)
         output_fingerprint = orchestration_progress_fingerprint(state)
         input_fingerprint = str(snapshot.get("inputFingerprint") or "")
         if missing_keys or missing_flags:
             status = "failed"
             retryable = True
             message = "action did not establish declared postconditions"
-        elif output_fingerprint == input_fingerprint:
+        elif output_fingerprint == input_fingerprint and not contract_progressed:
             status = "no_progress"
             retryable = True
             message = "action completed without observable contract progress"
@@ -380,7 +396,7 @@ class ActionContractMiddleware(HarnessMiddleware):
             "outputFingerprint": output_fingerprint,
             "missingStateKeys": missing_keys,
             "missingStateFlags": missing_flags,
-            "preValues": snapshot.get("preValues") or {},
+            "preValues": pre_values,
             "postValues": post_values,
         }
         state.setdefault("action_outcomes", []).append(outcome)
@@ -395,26 +411,6 @@ class ActionContractMiddleware(HarnessMiddleware):
             metadata=outcome,
         )
         return state
-
-    def fallback_action(self, configured: str, missing_keys: List[str], missing_flags: List[str]) -> str:
-        if "topic_routed" in missing_flags:
-            return "route_topic"
-        if "data_discovered" in missing_flags:
-            return "retrieve_knowledge"
-        if "planning_assets_compacted" in missing_flags:
-            return "compact_assets"
-        if "plan.intents" in missing_keys:
-            return "plan_graph"
-        if "query_graph_validated" in missing_flags or "query_graph_validation_passed" in missing_flags:
-            return "validate_graph"
-        if "sql_generated" in missing_flags:
-            return "execute_graph"
-        if "evidence_graph_verified" in missing_flags:
-            return "verify_evidence"
-        if "agent_run_result.task_results" in missing_keys:
-            return "execute_graph"
-        return configured or "answer_data"
-
 
 class ContextBudgetMiddleware(HarnessMiddleware):
     name = "context_budget"
@@ -1422,12 +1418,6 @@ def retain_middleware_events(events: List[MiddlewareEvent], limit: int = 200) ->
     return merged[-limit:]
 
 
-def action_state_flag_ready(state: AgentState, flag: str) -> bool:
-    if flag == "query_graph_validation_passed":
-        return graph_validation_passed(state)
-    return bool(state.get(flag))
-
-
 def append_runtime_guard_gap(state: AgentState, gap: GraphValidationGap) -> None:
     gaps = list(state.get("runtime_guard_gaps") or [])
     fingerprint = (gap.code, gap.task_id, gap.evidence, gap.reason)
@@ -1443,20 +1433,6 @@ def action_contract_values(state: AgentState, keys: List[str], flags: List[str])
     for flag in flags:
         values["flag:%s" % flag] = action_state_flag_ready(state, flag)
     return values
-
-
-def state_path_value(state: AgentState, path: str) -> Any:
-    value: Any = state
-    for part in [item for item in str(path or "").split(".") if item]:
-        if isinstance(value, dict):
-            value = value.get(part)
-        else:
-            value = getattr(value, part, None)
-        if value is None:
-            break
-    if hasattr(value, "model_dump"):
-        return value.model_dump(by_alias=True)
-    return value
 
 
 def orchestration_progress_fingerprint(state: AgentState) -> str:
@@ -1476,6 +1452,7 @@ def orchestration_progress_fingerprint(state: AgentState) -> str:
             "result": state.get("result_generation"),
             "evidence": state.get("evidence_generation"),
             "analysis": state.get("analysis_generation"),
+            "contractBlock": state.get("contract_block_generation"),
         },
         "flags": {
             key: bool(state.get(key))
@@ -1515,17 +1492,6 @@ def orchestration_progress_fingerprint(state: AgentState) -> str:
         },
     }
     return stable_json_hash(payload)
-
-
-def state_path_ready(state: AgentState, path: str) -> bool:
-    value = state_path_value(state, path)
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (list, tuple, set, dict)):
-        return bool(value)
-    return True
 
 
 def format_clarification_message(question: str, options: List[str]) -> str:
@@ -1859,6 +1825,10 @@ def build_runtime_checkpoint_payload(state: AgentState, stage: str) -> Dict[str,
         ]
         if run_result is not None
         else [],
+        "executionAttemptArtifacts": [
+            item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+            for item in state.get("execution_attempt_artifacts", [])[-12:]
+        ],
         "memoryConstraints": state.get("memory_constraints", []),
         "memoryConstraintTrace": state.get("memory_constraint_trace", {}),
         "runtimeInjection": state.get("runtime_injection", {}),

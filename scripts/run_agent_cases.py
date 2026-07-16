@@ -60,6 +60,20 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
         body = response.json()
         debug = body.get("debugTrace") or {}
         harness_debug = debug.get("harness") or {}
+        execution_attempts = debug.get("executionAttemptArtifacts", [])
+        audited_sql = []
+        for task in debug.get("taskResults", []):
+            sql = ((task.get("queryBundle") or {}).get("sql") or "")
+            if sql and sql not in audited_sql:
+                audited_sql.append(sql)
+        for attempt in execution_attempts:
+            for task in attempt.get("taskResults", []):
+                sql = ((task.get("queryBundle") or {}).get("sql") or "")
+                if sql and sql not in audited_sql:
+                    audited_sql.append(sql)
+            merged_sql = ((attempt.get("mergedQueryBundle") or {}).get("sql") or "")
+            if merged_sql and merged_sql not in audited_sql:
+                audited_sql.append(merged_sql)
         queue.put(
             {
                 "case": case_index,
@@ -84,11 +98,9 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
                     "dependencies": debug.get("dependencies", []),
                     "validation": debug.get("queryGraphValidation", {}),
                 },
-                "sql": [
-                    ((task.get("queryBundle") or {}).get("sql") or "")
-                    for task in debug.get("taskResults", [])
-                ],
+                "sql": audited_sql,
                 "taskResults": debug.get("taskResults", []),
+                "executionAttemptArtifacts": execution_attempts,
                 "nodeToolTraces": debug.get("nodeToolTraces", []),
                 "freshnessReports": debug.get("freshnessReports", []),
                 "evidenceGaps": debug.get("evidenceGaps", []),

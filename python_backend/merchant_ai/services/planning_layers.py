@@ -67,7 +67,13 @@ class UnderstandingExtractor:
             **kwargs,
         )
 
-    def failure_fallback_plan(self, question: str, asset_pack: PlanningAssetPack, trace_reason: str) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
+    def failure_fallback_plan(
+        self,
+        question: str,
+        asset_pack: PlanningAssetPack,
+        trace_reason: str,
+        structured_understanding: Dict[str, Any] | None = None,
+    ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
         if has_knowledge_request_gaps(asset_pack):
             return QueryPlan(agent_trace=[trace_reason, "planner.failure_fallback=blocked_by_knowledge_request_gaps"]), [], trace_reason
         rejected_trace: List[str] = []
@@ -80,6 +86,21 @@ class UnderstandingExtractor:
                 )
                 return entity_plan, [], "SEMANTIC_FAST_PATH"
             rejected_trace.extend(fallback_coverage_rejection_trace("entity_detail", coverage_gaps))
+        asset_plan = self.planner._asset_driven_multi_metric_fallback(
+            question,
+            asset_pack,
+            structured_understanding=structured_understanding,
+        )
+        if asset_plan.intents:
+            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, asset_plan, asset_pack)
+            if not coverage_gaps:
+                asset_plan.agent_trace.extend(
+                    [trace_reason, "planner.asset_driven_multi_metric_fallback_after_llm_failure"]
+                )
+                return asset_plan, [], "SEMANTIC_FAST_PATH"
+            rejected_trace.extend(fallback_coverage_rejection_trace("asset_driven_multi_metric", coverage_gaps))
+        else:
+            rejected_trace.extend(asset_plan.agent_trace)
         recalled_metric_plan = self.planner._recalled_metric_diagnostic_fallback(question, asset_pack)
         if recalled_metric_plan.intents:
             coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, recalled_metric_plan, asset_pack)
@@ -97,13 +118,7 @@ class UnderstandingExtractor:
                 rejected_trace.extend(fallback_coverage_rejection_trace("semantic_metric", coverage_gaps))
         else:
             rejected_trace.append("semantic_metric_fallback_skipped_after_llm_failure")
-        trend_plan = self.planner._multi_metric_trend_fallback(question, asset_pack)
-        if trend_plan.intents:
-            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, trend_plan, asset_pack)
-            if not coverage_gaps:
-                trend_plan.agent_trace.extend([trace_reason, "planner.multi_metric_trend_fallback_after_llm_failure"])
-                return trend_plan, [], "SEMANTIC_FAST_PATH"
-            rejected_trace.extend(fallback_coverage_rejection_trace("multi_metric_trend", coverage_gaps))
+        rejected_trace.append("planner.legacy_question_text_multi_metric_fallback=disabled")
         topn_plan = self.planner._semantic_topn_metric_fallback(question, asset_pack)
         if topn_plan.intents:
             coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, topn_plan, asset_pack)

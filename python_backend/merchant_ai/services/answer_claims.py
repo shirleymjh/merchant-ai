@@ -14,6 +14,7 @@ from merchant_ai.models import (
     VerifiedFact,
 )
 from merchant_ai.services.answer_formatting import source_aware_metric_label
+from merchant_ai.services.query import query_bundle_complete_rows
 from merchant_ai.services.time_semantics import declared_time_column_for_intent
 
 
@@ -81,7 +82,8 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
     facts: List[VerifiedFact] = []
     seen: Set[Tuple[str, int, str, str]] = set()
     for task in run_result.task_results:
-        if task.query_bundle.failed or not task.query_bundle.rows:
+        task_rows, _ = query_bundle_complete_rows(task.query_bundle)
+        if task.query_bundle.failed or not task_rows:
             continue
         intent = intent_by_task.get(task.task_id) or singleton_intent
         table = next(iter(task.query_bundle.tables or []), "") or str(getattr(intent, "preferred_table", "") or "")
@@ -104,7 +106,8 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
         )
         governed_columns = governed_fact_columns(intent, task)
         column_labels = governed_column_labels(intent, task)
-        for row_index, row in enumerate(task.query_bundle.rows[:200]):
+        column_label_aliases = governed_column_label_aliases(intent, task)
+        for row_index, row in enumerate(task_rows[:200]):
             for column, value in row.items():
                 if value in (None, "") or str(column).startswith("__"):
                     continue
@@ -119,6 +122,12 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
                     if metric_key and str(column) == metric_key
                     else str(column_labels.get(str(column)) or column)
                 )
+                aliases = dedupe_texts(
+                    [
+                        label,
+                        *column_label_aliases.get(str(column), []),
+                    ]
+                )
                 facts.append(
                     VerifiedFact(
                         fact_id=fact_id(task.task_id, row_index, str(column)),
@@ -127,19 +136,21 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
                         row_index=row_index,
                         column=str(column),
                         label=label,
+                        label_aliases=aliases,
                         value=value,
                         value_type=fact_value_type(str(column), value, {time_column} if time_column else set()),
                         result_role=role,
                     )
                 )
-    if facts or not run_result.merged_query_bundle.rows:
+    merged_rows, _ = query_bundle_complete_rows(run_result.merged_query_bundle)
+    if facts or not merged_rows:
         return facts
     time_columns = {
         declared_time_column_for_intent(intent)
         for intent in plan.intents
         if declared_time_column_for_intent(intent)
     }
-    for row_index, row in enumerate(run_result.merged_query_bundle.rows[:200]):
+    for row_index, row in enumerate(merged_rows[:200]):
         for column, value in row.items():
             if value in (None, "") or str(column).startswith("__"):
                 continue
@@ -370,19 +381,24 @@ def support_for_claim(
     if direction_reason:
         reasons.append(direction_reason)
     for raw in claim.numeric_values:
-        matching = fact_ids_for_value(raw, facts, claim.text)
-        if matching:
-            fact_ids.extend(matching)
-            continue
-        if contextual_question_date_supported(raw, claim.text, question):
-            continue
-        if contextual_question_number_supported(raw, claim.text, question):
-            continue
-        derived_fact_ids = supported_derived_numeric_token(raw, claim.text, allowed_numbers)
-        if derived_fact_ids:
-            fact_ids.extend(derived_fact_ids)
-            continue
-        reasons.append("unsupported_value:%s" % raw)
+        contexts = claim_contexts_for_value(raw, claim.text) or [claim.text]
+        unsupported_occurrence = False
+        for context in contexts:
+            matching = fact_ids_for_value(raw, facts, context)
+            if matching:
+                fact_ids.extend(matching)
+                continue
+            if contextual_question_date_supported(raw, context, question):
+                continue
+            if contextual_question_number_supported(raw, context, question):
+                continue
+            derived_fact_ids = supported_derived_numeric_token(raw, context, allowed_numbers)
+            if derived_fact_ids:
+                fact_ids.extend(derived_fact_ids)
+                continue
+            unsupported_occurrence = True
+        if unsupported_occurrence:
+            reasons.append("unsupported_value:%s" % raw)
     for raw in claim.entity_values:
         normalized = normalize_entity(raw)
         matching = [fact.fact_id for fact in facts if normalize_entity(fact.value) == normalized]
@@ -399,20 +415,22 @@ def trend_direction_support(claim_text: str, facts: List[VerifiedFact]) -> Tuple
     text = str(claim_text or "")
     if not re.search(r"(上升|增加|提升|上涨|下降|减少|降低|下滑|持平)", text):
         return "", []
-    for trend in trend_fact_groups(facts):
-        labels = [label for label in trend["labels"] if label]
-        matched_label = next((label for label in labels if label in normalize_label_text(text)), "")
-        if not matched_label:
-            continue
-        segment = claim_segment_for_label(text, matched_label)
-        expected = str(trend["direction"])
-        claimed = direction_word(segment)
-        if not claimed:
-            continue
-        if claimed != expected:
-            return "unsupported_trend_direction:%s" % claimed, list(trend["fact_ids"])
-        return "", list(trend["fact_ids"])
-    return "", []
+    matched_fact_ids: List[str] = []
+    clauses = [item.strip() for item in re.split(r"[；;。.!！?？\n]+", text) if item.strip()]
+    for clause in clauses:
+        normalized_clause = normalize_label_text(clause)
+        for trend in trend_fact_groups(facts):
+            labels = [label for label in trend["labels"] if label]
+            if not any(label in normalized_clause for label in labels):
+                continue
+            claimed = direction_word(clause)
+            if not claimed:
+                continue
+            expected = expected_trend_direction_for_clause(trend, clause)
+            if claimed != expected:
+                return "unsupported_trend_direction:%s" % claimed, list(trend["fact_ids"])
+            matched_fact_ids.extend(trend["fact_ids"])
+    return "", dedupe_texts(matched_fact_ids)
 
 
 def trend_fact_groups(facts: List[VerifiedFact]) -> List[Dict[str, Any]]:
@@ -464,9 +482,32 @@ def trend_fact_groups(facts: List[VerifiedFact]) -> List[Dict[str, Any]]:
                 ),
                 "direction": direction,
                 "fact_ids": dedupe_texts(fact_ids),
+                "points": ordered,
             }
         )
     return groups
+
+
+def expected_trend_direction_for_clause(trend: Dict[str, Any], clause: str) -> str:
+    points = list(trend.get("points") or [])
+    if not points:
+        return str(trend.get("direction") or "")
+    claim_dates = [normalize_temporal_token(item) for item in DATE_PATTERN.findall(str(clause or ""))]
+    if re.search(r"较\s*前(?:一|1)?(?:日|天)", str(clause or "")) and claim_dates:
+        target_date = claim_dates[-1]
+        for index, point in enumerate(points):
+            if str(point.get("date") or "") != target_date or index <= 0:
+                continue
+            delta = point["value"] - points[index - 1]["value"]
+            return "up" if delta > 0 else "down" if delta < 0 else "flat"
+    if len(claim_dates) >= 2:
+        by_date = {str(point.get("date") or ""): point for point in points}
+        first = by_date.get(claim_dates[0])
+        last = by_date.get(claim_dates[-1])
+        if first is not None and last is not None:
+            delta = last["value"] - first["value"]
+            return "up" if delta > 0 else "down" if delta < 0 else "flat"
+    return str(trend.get("direction") or "")
 
 
 def claim_segment_for_label(text: str, normalized_label: str) -> str:
@@ -521,6 +562,27 @@ def supported_numbers(facts: List[VerifiedFact]) -> List[Tuple[Decimal, List[str
                     (abs(percent), labels, source_fact_ids),
                 ]
             )
+        for previous, current in zip(fact_group, fact_group[1:]):
+            previous_value = decimal_value(previous.value)
+            current_value = decimal_value(current.value)
+            if previous_value is None or current_value is None:
+                continue
+            adjacent_ids = [previous.fact_id, current.fact_id]
+            adjacent_delta = current_value - previous_value
+            derived.extend(
+                [
+                    (adjacent_delta, labels, adjacent_ids),
+                    (abs(adjacent_delta), labels, adjacent_ids),
+                ]
+            )
+            if previous_value != 0:
+                adjacent_percent = adjacent_delta / abs(previous_value) * Decimal("100")
+                derived.extend(
+                    [
+                        (adjacent_percent, labels, adjacent_ids),
+                        (abs(adjacent_percent), labels, adjacent_ids),
+                    ]
+                )
     return dedupe_derived_numbers(derived)
 
 
@@ -566,7 +628,7 @@ def fact_ids_for_value(raw: str, facts: List[VerifiedFact], claim_text: str = ""
         if any(decimal_close(target, candidate) for candidate in candidates):
             if fact_semantically_matches_claim(fact, claim_text, facts):
                 matched.append(fact.fact_id)
-    return matched
+    return dedupe_texts(matched)
 
 
 def fact_semantically_matches_claim(fact: VerifiedFact, claim_text: str, facts: List[VerifiedFact]) -> bool:
@@ -588,9 +650,48 @@ def fact_label_candidates(fact: VerifiedFact) -> List[str]:
     return dedupe_texts(
         [
             normalize_label_text(fact.label),
+            *(normalize_label_text(item) for item in fact.label_aliases),
             normalize_label_text(fact.column),
         ]
     )
+
+
+def claim_contexts_for_value(raw: str, claim_text: str) -> List[str]:
+    """Return only clauses that actually contain the numeric token being checked.
+
+    A generated answer may place several metrics in one Chinese sentence separated
+    by semicolons.  Binding against the whole sentence lets a label from metric A
+    accidentally validate a value asserted for metric B.  Clause-local context
+    preserves strict metric/value binding without relying on business vocabulary.
+    """
+
+    text = str(claim_text or "")
+    clauses = [item.strip() for item in re.split(r"[；;。.!！?？\n]+", text) if item.strip()]
+    contexts: List[str] = []
+    for clause in clauses:
+        segments = [item.strip() for item in re.split(r"[，,]+", clause) if item.strip()]
+        for index, segment in enumerate(segments):
+            occurrences = sum(
+                1
+                for token in extract_numeric_tokens(segment)
+                if numeric_tokens_equivalent(raw, token)
+            )
+            if not occurrences:
+                continue
+            # Carry the metric label and grammatical subject from preceding
+            # comma segments, while keeping repeated direct/delta occurrences
+            # as separate verification contexts.
+            context = "，".join(segments[: index + 1])
+            contexts.extend([context] * occurrences)
+    return contexts
+
+
+def numeric_tokens_equivalent(left: str, right: str) -> bool:
+    if DATETIME_PATTERN.fullmatch(str(left or "")) or DATE_PATTERN.fullmatch(str(left or "")):
+        return normalize_temporal_token(left) == normalize_temporal_token(right)
+    left_number = decimal_token(left)
+    right_number = decimal_token(right)
+    return left_number is not None and right_number is not None and decimal_close(left_number, right_number)
 
 
 def claim_has_competing_fact_label(
@@ -688,10 +789,11 @@ def supported_derived_numeric_token(
     if claim_asserts_direct_metric_value(claim_text):
         return []
     normalized_claim = normalize_label_text(claim_text)
+    matched_ids: List[str] = []
     for candidate, labels, fact_ids in allowed:
         if decimal_close(target, candidate) and any(label and label in normalized_claim for label in labels):
-            return fact_ids
-    return []
+            matched_ids.extend(fact_ids)
+    return dedupe_texts(matched_ids)
 
 
 def claim_asserts_direct_metric_value(claim_text: str) -> bool:
@@ -746,6 +848,68 @@ def governed_column_labels(intent: Any, task: Any) -> Dict[str, str]:
         if label:
             labels[str(column)] = str(label)
     return labels
+
+
+def governed_column_label_aliases(intent: Any, task: Any) -> Dict[str, List[str]]:
+    aliases: Dict[str, List[str]] = {}
+
+    def add(column: Any, values: Iterable[Any]) -> None:
+        key = str(column or "").strip()
+        if not key:
+            return
+        aliases[key] = dedupe_texts([*aliases.get(key, []), *(str(value) for value in values if str(value or "").strip())])
+
+    if intent is not None:
+        resolution = dict(getattr(intent, "metric_resolution", {}) or {})
+        primary_column = str(
+            getattr(intent, "metric_column", "")
+            or resolution.get("metricKey")
+            or getattr(intent, "metric_name", "")
+            or ""
+        )
+        add(
+            primary_column,
+            [
+                resolution.get("displayName"),
+                resolution.get("naturalName"),
+                resolution.get("description"),
+                resolution.get("sourcePhrase"),
+            ],
+        )
+        for key in ["sourceColumnLabels", "columnLabels", "outputColumnLabels"]:
+            raw = resolution.get(key)
+            if isinstance(raw, dict):
+                for column, label in raw.items():
+                    add(column, [label])
+
+    contract = getattr(task, "node_plan_contract", None)
+    specs = [
+        *(getattr(intent, "metric_specs", []) or [] if intent is not None else []),
+        *(getattr(contract, "metric_specs", []) or []),
+    ]
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        metric_column = spec.get("metricColumn") or spec.get("metric_column")
+        metric_name = spec.get("metricName") or spec.get("metric_name")
+        values = [
+            spec.get("displayName"),
+            spec.get("display_name"),
+            spec.get("naturalName"),
+            spec.get("natural_name"),
+            spec.get("description"),
+            spec.get("sourcePhrase"),
+            spec.get("source_phrase"),
+        ]
+        # SQL may alias an expression to metricName while metricColumn remains
+        # a physical source field (for example COUNT(id) AS metric_count).
+        # Both governed identifiers refer to the same published result metric.
+        add(metric_column, values)
+        add(metric_name, values)
+        source_columns = spec.get("sourceColumns") or spec.get("source_columns") or []
+        if len(source_columns) == 1:
+            add(source_columns[0], values)
+    return aliases
 
 
 def decimal_close(left: Decimal, right: Decimal) -> bool:

@@ -19,6 +19,7 @@ class EvidenceVerifier:
         gaps: List[EvidenceGap] = []
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
+        gaps.extend(self._metric_spec_gaps(plan, derived_evidence))
         zero_filled_component_tasks, zero_filled_edges = self._zero_filled_derived_components(plan, run_result)
         table_names = set(run_result.merged_query_bundle.tables)
         if plan.evidence_contracts:
@@ -110,25 +111,239 @@ class EvidenceVerifier:
         derived: List[Dict[str, Any]] = []
         results_by_task = {item.task_id: item for item in run_result.task_results}
         for intent in plan.intents:
-            if not intent.metric_formula:
-                continue
             task_result = results_by_task.get(intent.plan_task_id)
-            row_columns = self._row_columns(task_result.query_bundle.rows) if task_result else set()
-            metric_alias = intent.metric_name or intent.metric_column
-            covered = bool(metric_alias and metric_alias in row_columns)
-            if not covered and metric_alias:
-                covered = self._column_covered(metric_alias, row_columns)
-            derived.append(
+            rows = task_result.query_bundle.rows if task_result else []
+            row_columns = self._row_columns(rows)
+            observed_roles = sorted(
                 {
-                    "taskId": intent.plan_task_id,
-                    "table": intent.preferred_table,
-                    "metric": metric_alias,
-                    "formula": intent.metric_formula,
-                    "sourceColumns": formula_columns(intent.metric_formula),
-                    "covered": covered,
+                    str(row.get("__timeWindowRole") or "").strip()
+                    for row in rows
+                    if str(row.get("__timeWindowRole") or "").strip()
                 }
             )
+            expected_role = str(
+                getattr(intent.time_range, "window_role", "")
+                or (intent.metric_resolution or {}).get("timeWindowRole")
+                or ""
+            ).strip()
+            raw_specs = [item for item in intent.metric_specs if isinstance(item, dict)]
+            specs = raw_specs or (
+                [
+                    {
+                        "metricName": intent.metric_name or intent.metric_column,
+                        "metricColumn": intent.metric_column,
+                        "metricFormula": intent.metric_formula,
+                        "sourceColumns": formula_columns(intent.metric_formula),
+                        "sourceTaskId": intent.plan_task_id,
+                    }
+                ]
+                if intent.metric_formula or intent.metric_name or intent.metric_column
+                else []
+            )
+            for spec in specs:
+                metric_alias = str(
+                    spec.get("metricName")
+                    or spec.get("metric_name")
+                    or spec.get("metricColumn")
+                    or spec.get("metric_column")
+                    or ""
+                ).strip()
+                formula = str(spec.get("metricFormula") or spec.get("metric_formula") or "").strip()
+                source_columns = [
+                    str(item)
+                    for item in spec.get("sourceColumns")
+                    or spec.get("source_columns")
+                    or formula_columns(formula)
+                    if str(item or "").strip()
+                ]
+                alias_covered = bool(metric_alias and metric_alias in row_columns)
+                value_covered = bool(
+                    alias_covered
+                    and any(row.get(metric_alias) not in (None, "") for row in rows)
+                )
+                source_covered = self._metric_spec_source_covered(intent, spec, task_result)
+                role_covered = not expected_role or expected_role in observed_roles
+                task_succeeded = bool(task_result and not task_result.query_bundle.failed)
+                has_rows = bool(rows)
+                derived.append(
+                    {
+                        "taskId": intent.plan_task_id,
+                        "sourceTaskId": str(
+                            spec.get("sourceTaskId") or spec.get("source_task_id") or intent.plan_task_id or ""
+                        ),
+                        "table": intent.preferred_table,
+                        "metric": metric_alias,
+                        "formula": formula,
+                        "sourceColumns": source_columns,
+                        "semanticRefId": str(
+                            spec.get("semanticRefId")
+                            or spec.get("semantic_ref_id")
+                            or (intent.metric_resolution or {}).get("semanticRefId")
+                            or ""
+                        ),
+                        "expectedTimeWindowRole": expected_role,
+                        "observedTimeWindowRoles": observed_roles,
+                        "timeWindowRole": expected_role if role_covered else "",
+                        "aliasCovered": alias_covered,
+                        "valueCovered": value_covered,
+                        "sourceCovered": source_covered,
+                        "timeWindowRoleCovered": role_covered,
+                        "taskSucceeded": task_succeeded,
+                        "hasRows": has_rows,
+                        "metricSpec": bool(raw_specs),
+                        "covered": bool(
+                            task_succeeded
+                            and has_rows
+                            and alias_covered
+                            and value_covered
+                            and source_covered
+                            and role_covered
+                        ),
+                    }
+                )
         return derived
+
+    def _metric_spec_source_covered(self, intent: Any, spec: Dict[str, Any], task_result: Any) -> bool:
+        if not task_result:
+            return False
+        contract = task_result.node_plan_contract
+        if intent.preferred_table and str(contract.preferred_table or "") != str(intent.preferred_table):
+            return False
+        expected_alias = str(
+            spec.get("metricName") or spec.get("metric_name") or spec.get("metricColumn") or spec.get("metric_column") or ""
+        ).strip()
+        expected_formula = canonical_formula(spec.get("metricFormula") or spec.get("metric_formula") or "")
+        expected_columns = {
+            str(item)
+            for item in spec.get("sourceColumns")
+            or spec.get("source_columns")
+            or formula_columns(str(spec.get("metricFormula") or spec.get("metric_formula") or ""))
+            if str(item or "").strip()
+        }
+        expected_source_task = str(spec.get("sourceTaskId") or spec.get("source_task_id") or "").strip()
+        for contract_spec in contract.metric_specs or []:
+            if not isinstance(contract_spec, dict):
+                continue
+            actual_alias = str(
+                contract_spec.get("metricName")
+                or contract_spec.get("metric_name")
+                or contract_spec.get("metricColumn")
+                or contract_spec.get("metric_column")
+                or ""
+            ).strip()
+            if not expected_alias or actual_alias != expected_alias:
+                continue
+            actual_formula = canonical_formula(
+                contract_spec.get("metricFormula") or contract_spec.get("metric_formula") or ""
+            )
+            if expected_formula and actual_formula != expected_formula:
+                continue
+            actual_columns = {
+                str(item)
+                for item in contract_spec.get("sourceColumns")
+                or contract_spec.get("source_columns")
+                or formula_columns(str(contract_spec.get("metricFormula") or contract_spec.get("metric_formula") or ""))
+                if str(item or "").strip()
+            }
+            if expected_columns and actual_columns != expected_columns:
+                continue
+            actual_source_task = str(
+                contract_spec.get("sourceTaskId") or contract_spec.get("source_task_id") or ""
+            ).strip()
+            if expected_source_task and actual_source_task != expected_source_task:
+                continue
+            return True
+        return False
+
+    def _metric_spec_gaps(
+        self,
+        plan: QueryPlan,
+        derived_evidence: List[Dict[str, Any]],
+    ) -> List[EvidenceGap]:
+        gaps: List[EvidenceGap] = []
+        for item in derived_evidence:
+            if not item.get("metricSpec") or not item.get("taskSucceeded") or not item.get("hasRows"):
+                continue
+            metric = str(item.get("metric") or "")
+            task_id = str(item.get("taskId") or "")
+            source_task_id = str(item.get("sourceTaskId") or "")
+            details = {
+                "metric": metric,
+                "sourceTaskId": source_task_id,
+                "expectedTimeWindowRole": item.get("expectedTimeWindowRole") or "",
+                "observedTimeWindowRoles": item.get("observedTimeWindowRoles") or [],
+            }
+            if not item.get("aliasCovered"):
+                gaps.append(
+                    EvidenceGap(
+                        code="MISSING_METRIC_ALIAS",
+                        task_id=task_id,
+                        evidence=metric,
+                        reason="metricSpecs 声明的结果别名未由执行结果精确产出",
+                        details=details,
+                    )
+                )
+            elif not item.get("valueCovered"):
+                gaps.append(
+                    EvidenceGap(
+                        code="MISSING_METRIC_VALUE",
+                        task_id=task_id,
+                        evidence=metric,
+                        reason="metricSpecs 声明的结果别名没有可验证值",
+                        details=details,
+                    )
+                )
+            if not item.get("sourceCovered"):
+                gaps.append(
+                    EvidenceGap(
+                        code="METRIC_SOURCE_CONTRACT_MISMATCH",
+                        task_id=task_id,
+                        evidence=metric,
+                        reason="结果指标的别名、公式、sourceColumns 或 sourceTaskId 与 NodePlanContract 不一致",
+                        details=details,
+                    )
+                )
+            if not item.get("timeWindowRoleCovered"):
+                gaps.append(
+                    EvidenceGap(
+                        code="TIME_WINDOW_ROLE_MISMATCH",
+                        task_id=task_id,
+                        evidence=metric,
+                        reason="结果行的时间窗口角色与计划契约不一致",
+                        details=details,
+                    )
+                )
+        time_contract = (plan.question_understanding or {}).get("timeWindowContract") or {}
+        if not isinstance(time_contract, dict) or not time_contract.get("requiresComparison"):
+            return gaps
+        metric_identities = {
+            str(item.get("semanticRefId") or item.get("metric") or "")
+            for item in derived_evidence
+            if item.get("metricSpec") and str(item.get("semanticRefId") or item.get("metric") or "")
+        }
+        covered_roles = {
+            (
+                str(item.get("semanticRefId") or item.get("metric") or ""),
+                str(item.get("timeWindowRole") or ""),
+            )
+            for item in derived_evidence
+            if item.get("covered")
+        }
+        for metric_identity in sorted(metric_identities):
+            for role in ["primary", "comparison"]:
+                if (metric_identity, role) in covered_roles:
+                    continue
+                gaps.append(
+                    EvidenceGap(
+                        code="MISSING_TIME_WINDOW_EVIDENCE",
+                        evidence=metric_identity,
+                        reason="对比契约缺少指标在 %s 窗口的完整证据" % role,
+                        missing_metric=metric_identity,
+                        missing_time_range=role,
+                        details={"metricIdentity": metric_identity, "timeWindowRole": role},
+                    )
+                )
+        return gaps
 
     def _contract_gaps(
         self,
@@ -389,6 +604,12 @@ def formula_columns(formula: str) -> List[str]:
         if token not in columns:
             columns.append(token)
     return columns
+
+
+def canonical_formula(value: Any) -> str:
+    """Normalize formatting only; keep the published calculation semantics."""
+
+    return re.sub(r"\s+", "", str(value or "").replace("`", "")).lower()
 
 
 def normalize_semantic_aliases(value: Any) -> Dict[str, Set[str]]:

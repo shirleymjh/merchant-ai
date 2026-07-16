@@ -7,6 +7,10 @@
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
   "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "resultAccessPolicies": {
+    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
+    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  },
   "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "ADS", "queryableByAgent": true, "authorityLevel": 95, "topicRole": "PROFILE"},
   "sampleEvidenceGovernance": {
     "status": "STALE",
@@ -15,9 +19,9 @@
     "reason": "The checked-in builder sample snapshot is synthetic/stale and no longer matches current Doris rows; semantic formulas remain governed, but all sample values must be rebuilt before use."
   },
   "status": "PUBLISHED",
-  "version": "v20260615180836",
+  "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:08:36",
-  "reviewedAt": "2026-06-15T18:08:36",
+  "reviewedAt": "2026-07-16T10:53:35+10:00",
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
   "dailyReportProfile": {
@@ -2198,9 +2202,11 @@
         "入驻审核平均时效小时-最近1天"
       ],
       "enumValues": [],
-      "metricFormula": "SUM(entry_audit_duration_hours_1d)",
+      "metricFormula": "MAX(entry_audit_duration_hours_1d)",
       "confidence": 0.78,
-      "evidence": "schema comment=入驻审核平均时效小时-最近1天"
+      "evidence": "schema comment=入驻审核平均时效小时-最近1天",
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day"
     },
     {
       "columnName": "deposit_pay_cnt_1d",
@@ -2228,9 +2234,11 @@
         "入驻成功平均总时长小时-最近1天"
       ],
       "enumValues": [],
-      "metricFormula": "SUM(entry_success_duration_hours_1d)",
+      "metricFormula": "MAX(entry_success_duration_hours_1d)",
       "confidence": 0.78,
-      "evidence": "schema comment=入驻成功平均总时长小时-最近1天"
+      "evidence": "schema comment=入驻成功平均总时长小时-最近1天",
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day"
     },
     {
       "columnName": "punish_cnt_1d",
@@ -2449,9 +2457,11 @@
         "支付成功客单价元-最近1天"
       ],
       "enumValues": [],
-      "metricFormula": "AVG(avg_pay_order_amt_1d)",
+      "metricFormula": "MAX(avg_pay_order_amt_1d)",
       "confidence": 0.78,
-      "evidence": "schema comment=支付成功客单价元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=支付成功客单价元-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day"
     },
     {
       "columnName": "order_close_cnt_1d",
@@ -2555,9 +2565,11 @@
         "支付成功优惠金额占支付gmv比例-最近1天"
       ],
       "enumValues": [],
-      "metricFormula": "AVG(pay_discount_rate_1d)",
+      "metricFormula": "MAX(pay_discount_rate_1d)",
       "confidence": 0.78,
-      "evidence": "schema comment=支付成功优惠金额占支付gmv比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]"
+      "evidence": "schema comment=支付成功优惠金额占支付gmv比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]",
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day"
     },
     {
       "columnName": "refund_amt_1d",
@@ -2700,9 +2712,11 @@
         "平均工单评价分-最近1天"
       ],
       "enumValues": [],
-      "metricFormula": "AVG(avg_ticket_score_1d)",
+      "metricFormula": "MAX(avg_ticket_score_1d)",
       "confidence": 0.78,
-      "evidence": "schema comment=平均工单评价分-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]"
+      "evidence": "schema comment=平均工单评价分-最近1天; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day"
     },
     {
       "columnName": "goods_audit_pass_cnt_1d",
@@ -3215,7 +3229,7 @@
     {
       "metricKey": "entry_audit_duration_hours_1d",
       "businessName": "入驻审核平均时效小时（日汇总）",
-      "formula": "SUM(entry_audit_duration_hours_1d)",
+      "formula": "MAX(entry_audit_duration_hours_1d)",
       "unit": "小时",
       "description": "入驻审核平均时效小时-最近1天",
       "sourceColumns": [
@@ -3224,7 +3238,6 @@
       "aliases": [
         "入驻审核平均时效小时（日汇总）",
         "entry_audit_duration_hours_1d",
-        "入驻审核平均时效小时",
         "入驻审核平均时效小时-最近1天"
       ],
       "confidence": 0.78,
@@ -3239,7 +3252,10 @@
       "originalBusinessName": "入驻审核平均时效小时",
       "sourceColumnAliases": [
         "entry_audit_duration_hours_1d"
-      ]
+      ],
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day",
+      "selectionGuidance": "仅用于单日或按已声明时间列分组的逐日结果；缺少加权分子分母，禁止跨日 SUM/AVG。"
     },
     {
       "metricKey": "deposit_pay_cnt_1d",
@@ -3273,7 +3289,7 @@
     {
       "metricKey": "entry_success_duration_hours_1d",
       "businessName": "入驻成功平均总时长小时（日汇总）",
-      "formula": "SUM(entry_success_duration_hours_1d)",
+      "formula": "MAX(entry_success_duration_hours_1d)",
       "unit": "小时",
       "description": "入驻成功平均总时长小时-最近1天",
       "sourceColumns": [
@@ -3282,7 +3298,6 @@
       "aliases": [
         "入驻成功平均总时长小时（日汇总）",
         "entry_success_duration_hours_1d",
-        "入驻成功平均总时长小时",
         "入驻成功平均总时长小时-最近1天"
       ],
       "confidence": 0.78,
@@ -3297,7 +3312,10 @@
       "originalBusinessName": "入驻成功平均总时长小时",
       "sourceColumnAliases": [
         "entry_success_duration_hours_1d"
-      ]
+      ],
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day",
+      "selectionGuidance": "仅用于单日或按已声明时间列分组的逐日结果；缺少加权分子分母，禁止跨日 SUM/AVG。"
     },
     {
       "metricKey": "punish_cnt_1d",
@@ -3699,7 +3717,7 @@
     {
       "metricKey": "avg_pay_order_amt_1d",
       "businessName": "支付成功客单价元（日汇总）",
-      "formula": "AVG(avg_pay_order_amt_1d)",
+      "formula": "MAX(avg_pay_order_amt_1d)",
       "unit": "元",
       "description": "支付成功客单价元-最近1天",
       "sourceColumns": [
@@ -3708,8 +3726,6 @@
       "aliases": [
         "支付成功客单价元（日汇总）",
         "avg_pay_order_amt_1d",
-        "支付成功客单价元",
-        "支付成功客单价",
         "支付成功客单价元-最近1天"
       ],
       "confidence": 0.78,
@@ -3724,7 +3740,10 @@
       "originalBusinessName": "支付成功客单价元",
       "sourceColumnAliases": [
         "avg_pay_order_amt_1d"
-      ]
+      ],
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day",
+      "selectionGuidance": "仅用于单日或逐日走势；周期客单价必须使用支付GMV与支付订单量的周期比值。"
     },
     {
       "metricKey": "order_close_cnt_1d",
@@ -3907,7 +3926,7 @@
     {
       "metricKey": "pay_discount_rate_1d",
       "businessName": "支付成功优惠日汇总金额占支付gmv比例",
-      "formula": "AVG(pay_discount_rate_1d)",
+      "formula": "MAX(pay_discount_rate_1d)",
       "unit": "%",
       "description": "支付成功优惠金额占支付gmv比例-最近1天",
       "sourceColumns": [
@@ -3916,11 +3935,7 @@
       "aliases": [
         "支付成功优惠日汇总金额占支付gmv比例",
         "pay_discount_rate_1d",
-        "支付成功优惠金额占支付gmv比例",
-        "支付成功优惠金额占支付gmv比例-最近1天",
-        "优惠占比",
-        "支付优惠占比",
-        "优惠金额占比"
+        "支付成功优惠金额占支付gmv比例-最近1天"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=支付成功优惠金额占支付gmv比例-最近1天; samples=[11.6100, 12.7200, 13.8300, 14.9400, 16.0500, 17.1600, 18.2700, 19.3800]",
@@ -3934,7 +3949,10 @@
       "originalBusinessName": "支付成功优惠金额占支付gmv比例",
       "sourceColumnAliases": [
         "pay_discount_rate_1d"
-      ]
+      ],
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day",
+      "selectionGuidance": "仅用于单日或逐日走势；周期优惠占比必须使用优惠金额与支付GMV的周期比值。"
     },
     {
       "metricKey": "refund_amt_1d",
@@ -4084,7 +4102,8 @@
       "metricIntent": "store_summary",
       "metricLevel": "business",
       "canonicalMetricKey": "direct_refund_rate_by_pay_order",
-      "aggregationPolicy": "period_rollup",
+      "metricType": "RATIO",
+      "aggregationPolicy": "ratio_of_sums",
       "selectionGuidance": "仅在用户明确说“直接退款率”时使用；不响应裸“退款率”或“退货率”。"
     },
     {
@@ -4232,7 +4251,7 @@
     {
       "metricKey": "avg_ticket_score_1d",
       "businessName": "平均工单评价分（日汇总）",
-      "formula": "AVG(avg_ticket_score_1d)",
+      "formula": "MAX(avg_ticket_score_1d)",
       "unit": "",
       "description": "平均工单评价分-最近1天",
       "sourceColumns": [
@@ -4241,7 +4260,6 @@
       "aliases": [
         "平均工单评价分（日汇总）",
         "avg_ticket_score_1d",
-        "平均工单评价分",
         "平均工单评价分-最近1天"
       ],
       "confidence": 0.78,
@@ -4256,7 +4274,10 @@
       "originalBusinessName": "平均工单评价分",
       "sourceColumnAliases": [
         "avg_ticket_score_1d"
-      ]
+      ],
+      "aggregationPolicy": "daily_value_only",
+      "applicableTimeGrain": "day",
+      "selectionGuidance": "仅用于单日或逐日走势；缺少评价总分与评价数，禁止跨日 AVG 伪装成周期总体均分。"
     },
     {
       "metricKey": "goods_audit_pass_cnt_1d",
@@ -4317,6 +4338,8 @@
       "tableKind": "aggregate_profile",
       "metricGrain": "merchant_day_summary",
       "metricIntent": "store_summary",
+      "metricType": "RATIO",
+      "aggregationPolicy": "ratio_of_sums",
       "ambiguousAliases": [],
       "naturalName": "申诉成功率",
       "originalBusinessName": "申诉成功率",
@@ -4400,7 +4423,8 @@
       "metricLevel": "business",
       "canonicalMetricKey": "return_rate_by_order",
       "aliasConflictScope": "GLOBAL",
-      "aggregationPolicy": "period_rollup",
+      "metricType": "RATIO",
+      "aggregationPolicy": "ratio_of_sums",
       "selectionGuidance": "用于多日总值和周期对比，必须按 SUM(return_cnt_1d) / SUM(order_cnt_1d) 重算；逐日走势改用 refund_rate_1d。",
       "preferredUseCases": [
         "period_return_rate_total",
@@ -4474,6 +4498,66 @@
         "periodComputation": "ratio_of_period_sums"
       },
       "evidence": "语义层已发布分子 cs_ticket_cnt_1d（咨询工单量）与分母 order_cnt_1d（总订单量）。"
+    },
+    {
+      "metricKey": "avg_pay_order_amt_by_period",
+      "canonicalMetricKey": "avg_pay_order_amt_by_period",
+      "businessName": "周期支付客单价",
+      "formula": "SUM(pay_gmv_amt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+      "unit": "元",
+      "metricType": "RATIO",
+      "description": "指定周期支付GMV合计除以支付订单量合计，不对每日客单价做简单平均。",
+      "sourceColumns": [
+        "pay_gmv_amt_1d",
+        "pay_order_cnt_1d"
+      ],
+      "aliases": [
+        "支付成功客单价元",
+        "支付成功客单价",
+        "支付客单价",
+        "客单价"
+      ],
+      "metricGrain": "merchant_period",
+      "metricIntent": "store_summary",
+      "metricLevel": "business",
+      "aggregationPolicy": "ratio_of_sums",
+      "aliasConflictScope": "GLOBAL",
+      "selectionGuidance": "多日或周期总值使用；逐日客单价走势使用 avg_pay_order_amt_1d。",
+      "temporalVariants": {
+        "dailySeriesMetricKey": "avg_pay_order_amt_1d",
+        "periodComputation": "ratio_of_period_sums"
+      },
+      "evidence": "语义层已发布支付GMV与支付订单量，可按周期比值重算。"
+    },
+    {
+      "metricKey": "pay_discount_rate_by_gmv",
+      "canonicalMetricKey": "pay_discount_rate_by_gmv",
+      "businessName": "周期支付优惠金额占比",
+      "formula": "SUM(pay_success_discount_amt_1d) / NULLIF(SUM(pay_gmv_amt_1d), 0)",
+      "unit": "%",
+      "metricType": "RATIO",
+      "description": "指定周期支付成功优惠金额合计占支付GMV合计的比例，不对每日比例做简单平均。",
+      "sourceColumns": [
+        "pay_success_discount_amt_1d",
+        "pay_gmv_amt_1d"
+      ],
+      "aliases": [
+        "支付成功优惠金额占支付gmv比例",
+        "优惠占比",
+        "支付优惠占比",
+        "优惠金额占比"
+      ],
+      "metricGrain": "merchant_period",
+      "metricIntent": "store_summary",
+      "metricLevel": "business",
+      "aggregationPolicy": "ratio_of_sums",
+      "aliasConflictScope": "GLOBAL",
+      "selectionGuidance": "多日或周期总值使用；逐日优惠占比走势使用 pay_discount_rate_1d。",
+      "temporalVariants": {
+        "dailySeriesMetricKey": "pay_discount_rate_1d",
+        "periodComputation": "ratio_of_period_sums"
+      },
+      "evidence": "语义层已发布支付成功优惠金额与支付GMV，可按周期比值重算。"
     }
   ],
   "terms": [

@@ -568,6 +568,7 @@ class SemanticCatalogService:
 
     MANIFEST_KIND = "TOPIC_MANIFEST"
     TABLE_KIND = "TABLE_ASSET"
+    METRIC_KIND = "METRIC"
     RELATIONSHIP_KIND = "RELATIONSHIPS"
     OFFLOAD_THRESHOLD_CHARS = 20_000
 
@@ -806,6 +807,65 @@ class SemanticCatalogService:
             "searchText": json.dumps(relationships, ensure_ascii=False),
         }, ref_id=semantic_relationship_ref_id(topic), topic=topic, kind=self.RELATIONSHIP_KIND, path=semantic_relationship_path(topic))
 
+    def metric_ref(
+        self,
+        topic: str,
+        table: str,
+        metric_key: str,
+        metric: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any] | None:
+        """Expose one published metric as an addressable virtual semantic file.
+
+        Metric documents indexed for retrieval already publish
+        ``semantic:<topic>:<table>:metric:<key>`` refs.  The filesystem reader
+        must resolve that same identity without loading the whole table asset
+        into a Planner prompt.  The underlying source remains the table's
+        canonical ``asset.json``; the ``#metric:`` fragment is a read-only
+        projection of one metric definition.
+        """
+
+        asset = self.topic_assets.load_table_asset(topic, table)
+        selected = metric
+        if not isinstance(selected, dict):
+            matches = [
+                item
+                for item in asset.get("metrics") or []
+                if isinstance(item, dict) and str(item.get("metricKey") or "") == metric_key
+            ]
+            selected = matches[0] if len(matches) == 1 else None
+        if not isinstance(selected, dict):
+            return None
+        payload = {
+            "topic": topic,
+            "tableName": table,
+            "metric": selected,
+        }
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        ref_id = semantic_metric_ref_id(topic, table, metric_key)
+        path = semantic_metric_path(topic, table, metric_key)
+        title = str(selected.get("businessName") or selected.get("title") or metric_key)
+        return add_context_uri(
+            {
+                "refId": ref_id,
+                "kind": self.METRIC_KIND,
+                "topic": topic,
+                "table": table,
+                "path": path,
+                "title": "%s/%s/%s" % (topic, table, title),
+                "summary": title,
+                "layers": {"metric": metric_key, "layer": "metric_definition"},
+                "estimatedChars": len(content),
+                "offloadRecommended": len(content) > self.OFFLOAD_THRESHOLD_CHARS,
+                "content": content,
+                "searchText": compact_metric_for_recall(topic, table, selected),
+            },
+            ref_id=ref_id,
+            topic=topic,
+            table=table,
+            kind=self.METRIC_KIND,
+            path=path,
+        )
+
     def _topics(self, topic_categories: Iterable[QuestionCategory] | None, topic: str) -> List[str]:
         if topic:
             return [topic]
@@ -836,6 +896,9 @@ class SemanticCatalogService:
     def _resolve_ref(self, ref_id: str, path: str) -> Dict[str, Any] | None:
         wanted_ref = ref_id.strip()
         wanted_path = normalize_semantic_path(path)
+        metric_identity = parse_semantic_metric_identity(wanted_ref, wanted_path)
+        if metric_identity:
+            return self.metric_ref(*metric_identity)
         for ref in self._all_refs():
             if wanted_ref and ref["refId"] == wanted_ref:
                 return ref
@@ -1332,6 +1395,7 @@ def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
         "timeColumn": asset.get("timeColumn"),
         "merchantFilterColumn": asset.get("merchantFilterColumn"),
         "rowAccessPolicy": asset.get("rowAccessPolicy") or {},
+        "resultAccessPolicies": normalize_result_access_policies(asset.get("resultAccessPolicies") or {}),
         "manualNotes": asset.get("manualNotes"),
         "tableUsageProfile": normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, str(asset.get("tableName") or "")),
         "metrics": [
@@ -1428,6 +1492,7 @@ def compact_table_metadata(asset: Dict[str, Any]) -> Dict[str, Any]:
         "timeColumn": asset.get("timeColumn"),
         "merchantFilterColumn": asset.get("merchantFilterColumn"),
         "rowAccessPolicy": asset.get("rowAccessPolicy") or {},
+        "resultAccessPolicies": normalize_result_access_policies(asset.get("resultAccessPolicies") or {}),
         "manualNotes": asset.get("manualNotes"),
         "tableUsageProfile": normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, str(asset.get("tableName") or "")),
         "status": asset.get("status"),
@@ -2821,6 +2886,10 @@ def semantic_relationship_ref_id(topic: str) -> str:
     return "semantic:%s:relationships" % topic
 
 
+def semantic_metric_ref_id(topic: str, table: str, metric_key: str) -> str:
+    return "semantic:%s:%s:metric:%s" % (topic, table, metric_key)
+
+
 def semantic_manifest_path(topic: str) -> str:
     return "topics/%s/manifest.json" % topic
 
@@ -2829,8 +2898,25 @@ def semantic_table_path(topic: str, table: str) -> str:
     return "topics/%s/tables/%s/asset.json" % (topic, table)
 
 
+def semantic_metric_path(topic: str, table: str, metric_key: str) -> str:
+    return "%s#metric:%s" % (semantic_table_path(topic, table), metric_key)
+
+
 def semantic_relationship_path(topic: str) -> str:
     return "topics/%s/relationships.json" % topic
+
+
+def parse_semantic_metric_identity(ref_id: str, path: str) -> Tuple[str, str, str] | None:
+    ref_match = re.fullmatch(r"semantic:([^:]+):([^:]+):metric:(.+)", str(ref_id or "").strip())
+    if ref_match:
+        return tuple(str(item) for item in ref_match.groups())
+    path_match = re.fullmatch(
+        r"topics/([^/]+)/tables/([^/]+)/asset\.json#metric:(.+)",
+        normalize_semantic_path(path),
+    )
+    if path_match:
+        return tuple(str(item) for item in path_match.groups())
+    return None
 
 
 def normalize_physical_table_metadata(payload: Any) -> Dict[str, Any]:
@@ -3482,6 +3568,11 @@ class TopicBuilderWorkflow:
                 generated.get("rowAccessPolicy")
                 or existing.get("rowAccessPolicy")
             ),
+            "resultAccessPolicies": normalize_result_access_policies(
+                generated.get("resultAccessPolicies")
+                or existing.get("resultAccessPolicies")
+                or {}
+            ),
             "manualNotes": request.manual_notes or str(existing.get("manualNotes") or ""),
             "businessKnowledge": request.business_knowledge or str(existing.get("businessKnowledge") or ""),
             "sampleSqls": request.sample_sqls or list(existing.get("sampleSqls") or []),
@@ -3897,6 +3988,7 @@ class TopicBuilderWorkflow:
                 "timeColumn": existing.get("timeColumn"),
                 "merchantFilterColumn": existing.get("merchantFilterColumn"),
                 "rowAccessPolicy": existing.get("rowAccessPolicy") or {},
+                "resultAccessPolicies": existing.get("resultAccessPolicies") or {},
                 "semanticColumns": existing.get("semanticColumns") or [],
                 "metrics": existing.get("metrics") or [],
                 "terms": existing.get("terms") or [],
@@ -3912,6 +4004,8 @@ class TopicBuilderWorkflow:
             "指标必须引用真实存在的 sourceColumns；派生指标可以引用其他 metricKey。"
             "如果字段疑似手机号、邮箱、身份证、地址等敏感信息，请补充 visibilityPolicy 和 maskingPolicy；"
             "如果表有明确租户过滤列，请补充 rowAccessPolicy。"
+            "聚合指标结果、时间或其他维度能否返回必须通过 resultAccessPolicies 按语义角色显式声明；"
+            "它只约束结果角色，不能替代原始字段访问策略，未声明时保持不可见。"
             "同时生成 tableUsageProfile，说明该表是否允许 Agent 查询、业务分层、权威度、"
             "支持的分析意图/指标/维度，以及适合和不适合回答的问题。"
             "不得根据表名或字段名约定猜测业务分层、租户列、时间列、粒度或可查询性；"
@@ -3946,6 +4040,7 @@ class TopicBuilderWorkflow:
             "timeColumn": str(existing.get("timeColumn") or profile.get("timeColumn") or ""),
             "merchantFilterColumn": str(existing.get("merchantFilterColumn") or ""),
             "rowAccessPolicy": normalize_row_access_policy(existing.get("rowAccessPolicy") or {}),
+            "resultAccessPolicies": normalize_result_access_policies(existing.get("resultAccessPolicies") or {}),
             "semanticColumns": semantic_columns,
             "metrics": metrics,
             "terms": terms,
@@ -4262,6 +4357,18 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
         },
         "additionalProperties": False,
     }
+    result_access_policy_schema = {
+        "type": "object",
+        "properties": {
+            "visibilityPolicy": visibility_policy_schema,
+            "maskingPolicy": masking_policy_schema,
+            "defaultVisible": {"type": "boolean"},
+            "displayPriority": {"type": "integer"},
+            "displayScenarios": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["visibilityPolicy", "maskingPolicy"],
+        "additionalProperties": False,
+    }
     semantic_column_schema = {
         "type": "object",
         "properties": {
@@ -4314,6 +4421,10 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "clarificationQuestion": {"type": "string"},
             "description": {"type": "string"},
             "sourceColumns": {"type": "array", "items": {"type": "string"}},
+            "metricDependencies": {"type": "array", "items": {"type": "string"}},
+            "requiresMetrics": {"type": "array", "items": {"type": "string"}},
+            "requiresTables": {"type": "array", "items": {"type": "string"}},
+            "externalMetricRefs": {"type": "array", "items": {"type": "string"}},
             "aliases": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
             "evidence": {"type": "string"},
@@ -4375,6 +4486,10 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
                 "timeColumn": {"type": "string"},
                 "merchantFilterColumn": {"type": "string"},
                 "rowAccessPolicy": row_access_policy_schema,
+                "resultAccessPolicies": {
+                    "type": "object",
+                    "additionalProperties": result_access_policy_schema,
+                },
                 "tableUsageProfile": table_usage_profile_schema,
                 "semanticColumns": {"type": "array", "items": semantic_column_schema},
                 "metrics": {"type": "array", "items": metric_schema},
@@ -4422,6 +4537,24 @@ def normalize_masking_policy(policy: Any) -> Dict[str, Any]:
         "strategy": normalize_masking_strategy(str(policy.get("strategy") or "")),
         "reason": str(policy.get("reason") or ""),
     }
+
+
+def normalize_result_access_policies(policies: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize explicitly governed result policies without inventing roles."""
+
+    if not isinstance(policies, dict):
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for raw_role, raw_policy in policies.items():
+        role = str(raw_role or "").strip().upper()
+        if not role or not isinstance(raw_policy, dict):
+            continue
+        normalized[role] = {
+            "visibilityPolicy": normalize_visibility_policy(raw_policy.get("visibilityPolicy") or {}),
+            "maskingPolicy": normalize_masking_policy(raw_policy.get("maskingPolicy") or {}),
+            **normalize_column_display_policy(raw_policy),
+        }
+    return normalized
 
 
 def normalize_column_display_policy(semantic: Any) -> Dict[str, Any]:
@@ -4801,8 +4934,22 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
     row_access_policy = normalize_row_access_policy(asset.get("rowAccessPolicy") or {})
+    result_access_policies = normalize_result_access_policies(asset.get("resultAccessPolicies") or {})
+    table_usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
     if row_access_policy and str(row_access_policy.get("filterColumn") or "") not in columns:
         errors.append({"code": "ROW_ACCESS_FILTER_COLUMN_MISSING", "column": row_access_policy.get("filterColumn")})
+    if bool(table_usage.get("queryableByAgent")):
+        if metrics and "METRIC" not in result_access_policies:
+            errors.append({"code": "METRIC_RESULT_ACCESS_POLICY_UNDECLARED"})
+        if str(asset.get("timeColumn") or "") and "TIME" not in result_access_policies:
+            errors.append({"code": "TIME_RESULT_ACCESS_POLICY_UNDECLARED", "column": asset.get("timeColumn")})
+    for role, policy in result_access_policies.items():
+        visibility = normalize_visibility_policy(policy.get("visibilityPolicy") or {})
+        masking = normalize_masking_policy(policy.get("maskingPolicy") or {})
+        if visibility.get("level") == "restricted" and not visibility.get("allowedRoles"):
+            errors.append({"code": "RESULT_POLICY_RESTRICTED_WITHOUT_ROLES", "semanticRole": role})
+        if visibility.get("level") == "restricted" and masking.get("strategy") == "none":
+            warnings.append({"code": "RESULT_POLICY_RESTRICTED_WITHOUT_MASKING", "semanticRole": role})
     seen_metrics: set[str] = set()
     metric_keys: set[str] = {
         str(metric.get("metricKey") or metric.get("key") or "").strip()
@@ -4813,8 +4960,18 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         if not isinstance(field, dict):
             continue
         column_name = str(field.get("columnName") or "").strip()
+        semantic_role = str(field.get("role") or field.get("semanticRole") or "").strip().upper()
+        metric_formula = str(field.get("metricFormula") or "").strip()
         if column_name and column_name not in columns:
             warnings.append({"code": "SEMANTIC_COLUMN_NOT_IN_SCHEMA", "column": column_name})
+        if metric_formula and semantic_role not in {"METRIC", "MEASURE"}:
+            errors.append(
+                {
+                    "code": "NON_METRIC_COLUMN_HAS_METRIC_FORMULA",
+                    "column": column_name,
+                    "semanticRole": semantic_role or "UNDECLARED",
+                }
+            )
         visibility = normalize_visibility_policy(field.get("visibilityPolicy") or {})
         masking = normalize_masking_policy(field.get("maskingPolicy") or {})
         if visibility.get("level") == "restricted" and not visibility.get("allowedRoles"):
@@ -4825,6 +4982,19 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         enum_metadata = field.get("enumMetadata") if isinstance(field.get("enumMetadata"), dict) else {}
         if enum_values and str(enum_metadata.get("reviewStatus") or "UNREVIEWED").upper() != "APPROVED":
             warnings.append({"code": "ENUM_VALUES_NOT_BUSINESS_APPROVED", "column": column_name})
+        field_aggregation_policy = str(field.get("aggregationPolicy") or "").strip().lower()
+        if field_aggregation_policy == "daily_value_only":
+            field_time_grain = str(field.get("applicableTimeGrain") or "").strip().lower()
+            if not field_time_grain:
+                errors.append({"code": "DAILY_VALUE_TIME_GRAIN_UNDECLARED", "column": column_name})
+            if re.search(r"\b(?:SUM|AVG)\s*\(", metric_formula, flags=re.IGNORECASE):
+                errors.append(
+                    {
+                        "code": "DAILY_VALUE_CROSS_DAY_AGGREGATION_FORBIDDEN",
+                        "column": column_name,
+                        "formula": metric_formula,
+                    }
+                )
     for metric in metrics:
         if not isinstance(metric, dict):
             continue
@@ -4852,6 +5022,24 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         time_column = str(metric.get("timeColumn") or "").strip()
         if time_column and time_column not in columns:
             errors.append({"code": "METRIC_TIME_COLUMN_MISSING", "metricKey": metric_key, "column": time_column})
+        aggregation_policy = str(metric.get("aggregationPolicy") or "").strip().lower()
+        formula = str(metric.get("formula") or metric.get("metricFormula") or "").strip()
+        metric_type = str(metric.get("metricType") or "").strip().upper()
+        ratio_metric = metric_type == "RATIO" or "/" in formula
+        if ratio_metric and aggregation_policy not in {"ratio_of_sums", "daily_value_only", "period_rollup"}:
+            errors.append({"code": "RATIO_AGGREGATION_POLICY_UNDECLARED", "metricKey": metric_key})
+        if aggregation_policy == "daily_value_only":
+            applicable_time_grain = str(metric.get("applicableTimeGrain") or "").strip().lower()
+            if not applicable_time_grain:
+                errors.append({"code": "DAILY_VALUE_TIME_GRAIN_UNDECLARED", "metricKey": metric_key})
+            if re.search(r"\b(?:SUM|AVG)\s*\(", formula, flags=re.IGNORECASE):
+                errors.append(
+                    {
+                        "code": "DAILY_VALUE_CROSS_DAY_AGGREGATION_FORBIDDEN",
+                        "metricKey": metric_key,
+                        "formula": formula,
+                    }
+                )
     for relationship in relationships:
         if not isinstance(relationship, dict):
             continue
@@ -5648,7 +5836,7 @@ def external_metric_dependency(metric: Dict[str, Any], ref: str) -> bool:
     if not wanted:
         return False
     declared: List[str] = []
-    for key in ("metricDependencies", "externalMetricRefs"):
+    for key in ("metricDependencies", "requiresMetrics", "externalMetricRefs"):
         for item in metric.get(key) or []:
             if isinstance(item, dict):
                 declared.append(str(item.get("metricRef") or item.get("metricKey") or "").strip())

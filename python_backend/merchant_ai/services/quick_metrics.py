@@ -18,6 +18,7 @@ from merchant_ai.services.time_semantics import (
     latest_partition_window_predicate,
     partition_date_matches,
     resolve_time_range,
+    resolve_time_window_contract,
     time_window_contract_payload,
 )
 
@@ -58,12 +59,21 @@ def quick_metric_response(
         return quick_metric_definition_response(question, merchant_id, matched_metrics)
     if any(term in question for term in ANALYSIS_TERMS):
         return None
-    metric = matched_metrics[0]
     if any(term in question for term in COMPLEX_TERMS):
         return None
-    if not any(term in question.lower() for term in ["多少", "总", "趋势", "走势", "变化", "最近", "近", "为什么", "原因"]):
+    if not any(
+        term in question.lower() for term in ["多少", "总", "趋势", "走势", "变化", "最近", "近", "为什么", "原因"]
+    ):
         return None
     time_range = resolve_time_range(question, timezone_name)
+    temporal_contract = resolve_time_window_contract(question, timezone_name)
+    temporal_mode = quick_metric_temporal_mode(time_range, temporal_contract)
+    if temporal_mode == "unsupported":
+        return None
+    original_metric = matched_metrics[0]
+    metric = resolve_quick_metric_temporal_variant(original_metric, semantic_metrics, temporal_mode)
+    if metric is None:
+        return None
     days = time_range.days
     cache_key = semantic_request_cache_key(
         "quick_metric",
@@ -73,7 +83,7 @@ def quick_metric_response(
         filters=[],
         time_range=time_range,
         asset_version={"semanticContract": semantic_metric_identity(metric)},
-        scope={"merchantId": merchant_id},
+        scope={"merchantId": merchant_id, "temporalMode": temporal_mode},
     )
     cached = QUICK_RESPONSE_CACHE.get(cache_key)
     if isinstance(cached, dict):
@@ -104,25 +114,9 @@ def quick_metric_response(
     latest_partition = row_time_dimension(rows[-1], time_column)
     if time_range.kind == "exact_date" and not partition_date_matches(latest_partition, time_range.end_date):
         return None
-    total_rows = repository.query(
-        "SELECT %s AS value FROM `%s` "
-        "WHERE `%s`=%%s AND %s"
-        % (
-            formula,
-            table,
-            tenant_column,
-            time_filter,
-        ),
-        [merchant_id] + time_params,
-    )
-    if not total_rows or total_rows[0].get("value") is None:
-        return None
     values = [float(row.get("value") or 0) for row in rows]
     # Never roll up daily aggregates in application code: SUM of daily
     # COUNT(DISTINCT), AVG, or ratios can change the governed metric meaning.
-    # The range total is therefore evaluated independently by Doris using the
-    # exact same published semantic formula.
-    total = float(total_rows[0]["value"])
     normalized_rows = [
         {
             "metric_name": metric["label"],
@@ -131,6 +125,29 @@ def quick_metric_response(
         }
         for row in rows
     ]
+    daily_series_value_only = (
+        temporal_mode == "daily_series" and metric_aggregation_policy(metric) == "daily_value_only"
+    )
+    if daily_series_value_only:
+        # A daily precomputed value has no governed multi-day scalar.  The
+        # grouped series is authoritative and its final point is disclosed as
+        # a latest-day value; never execute an interval MAX/AVG as a summary.
+        total = values[-1]
+    else:
+        total_rows = repository.query(
+            "SELECT %s AS value FROM `%s` "
+            "WHERE `%s`=%%s AND %s"
+            % (
+                formula,
+                table,
+                tenant_column,
+                time_filter,
+            ),
+            [merchant_id] + time_params,
+        )
+        if not total_rows or total_rows[0].get("value") is None:
+            return None
+        total = float(total_rows[0]["value"])
     first, last = values[0], values[-1]
     direction = "上升" if last > first else "下降" if last < first else "持平"
     delta = abs(last - first)
@@ -152,14 +169,12 @@ def quick_metric_response(
             f"峰值日期为 {peak[TIME_DIMENSION_KEY]}，峰值为 {format_value(peak['value'], metric)}。"
         )
     )
-    answer = (
-        f"{time_label}，店铺{metric['label']}{summary_predicate(metric)} {total_text}。\n\n"
-        f"{freshness_sentence}"
-        f"{trend_sentence}\n\n"
-        "建议：\n"
-        f"- {advice[0]}\n"
-        f"- {advice[1]}"
+    summary_sentence = (
+        f"{time_label}，店铺{metric['label']}最新日值为 {total_text}。"
+        if daily_series_value_only
+        else f"{time_label}，店铺{metric['label']}{summary_predicate(metric)} {total_text}。"
     )
+    answer = f"{summary_sentence}\n\n{freshness_sentence}{trend_sentence}\n\n建议：\n- {advice[0]}\n- {advice[1]}"
     suggestions = metric_suggestions(metric["label"], days)
     traceability = {
         "sourceSummary": "Doris 快速指标查询",
@@ -170,6 +185,7 @@ def quick_metric_response(
         "rowCount": len(normalized_rows),
         "sourceTables": [table],
         "evidenceStatus": "verified",
+        "summarySemantics": "latest_day_value" if daily_series_value_only else "period_aggregate",
     }
     response = ChatResponse(
         id="quick_" + uuid.uuid4().hex,
@@ -181,8 +197,28 @@ def quick_metric_response(
         thinking_steps=["识别简单指标问题", "读取指标口径", "查询 Doris 数据", "校验结果", "生成经营建议"],
         data_rows=normalized_rows,
         data_sections=[
-            ChatDataSection(title=f"{metric['label']}趋势", result_role="trend_context", doris_tables=[table], data_rows=normalized_rows),
-            ChatDataSection(title=metric["label"], result_role="summary", doris_tables=[table], data_rows=[{"metric_name": metric["label"], "value": total}]),
+            ChatDataSection(
+                title=f"{metric['label']}趋势",
+                result_role="trend_context",
+                doris_tables=[table],
+                data_rows=normalized_rows,
+            ),
+            ChatDataSection(
+                title=(f"{metric['label']}最新日值" if daily_series_value_only else metric["label"]),
+                result_role="summary",
+                doris_tables=[table],
+                data_rows=[
+                    {
+                        "metric_name": metric["label"],
+                        "value": total,
+                        **(
+                            {TIME_DIMENSION_KEY: normalized_rows[-1][TIME_DIMENSION_KEY]}
+                            if daily_series_value_only
+                            else {}
+                        ),
+                    }
+                ],
+            ),
         ],
         merchant_experience={
             "version": "v1",
@@ -202,14 +238,174 @@ def quick_metric_response(
             "metric": metric["label"],
             "metricTerms": metric.get("terms") or [],
             "semanticMetric": semantic_metric_identity(metric),
+            "temporalMode": temporal_mode,
+            "temporalMetricRedirected": semantic_metric_ref_id(metric) != semantic_metric_ref_id(original_metric),
+            "requestedSemanticMetric": semantic_metric_identity(original_metric),
+            "summarySemantics": "latest_day_value" if daily_series_value_only else "period_aggregate",
         },
     )
-    verification = verify_quick_metric_answer(question, metric, normalized_rows, total, answer)
+    verification = verify_quick_metric_answer(
+        question,
+        metric,
+        normalized_rows,
+        total,
+        answer,
+        summary_semantics="latest_day_value" if daily_series_value_only else "period_aggregate",
+    )
     if not verification.passed:
         return None
     response.debug_trace["answerClaimVerification"] = verification.model_dump(by_alias=True)
     QUICK_RESPONSE_CACHE.set(cache_key, response.model_dump(by_alias=True))
     return response
+
+
+def quick_metric_temporal_mode(time_range: Any, temporal_contract: Dict[str, Any]) -> str:
+    """Return the governed shape a quick metric query must produce.
+
+    Time interpretation comes from the shared time-window tool.  The fast path
+    has no comparison executor, so a second window is always returned to the
+    Planner rather than silently answering only the primary window.
+    """
+
+    if bool((temporal_contract or {}).get("requiresComparison")):
+        return "unsupported"
+    if str(getattr(time_range, "kind", "") or "") == "exact_date":
+        return "exact_day"
+    return "daily_series" if str((temporal_contract or {}).get("grain") or "").lower() == "day" else "period_summary"
+
+
+def resolve_quick_metric_temporal_variant(
+    selected: Dict[str, Any],
+    semantic_metrics: list[Dict[str, Any]],
+    temporal_mode: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a time-compatible member of a published metric family.
+
+    Family membership is established only by ``temporalVariants`` and
+    ``linkedVariantOf`` references.  Labels, metric names, table names, and
+    formula text never infer a relationship.
+    """
+
+    family = temporal_metric_family(selected, semantic_metrics)
+    compatible = [metric for metric in family if quick_metric_supports_temporal_mode(metric, temporal_mode)]
+    if not compatible:
+        return None
+    scores = [(quick_metric_temporal_preference(metric, temporal_mode), metric) for metric in compatible]
+    highest = max(score for score, _metric in scores)
+    winners = [metric for score, metric in scores if score == highest]
+    identities = {semantic_metric_ref_id(metric) for metric in winners}
+    if len(identities) != 1:
+        return None
+    return winners[0]
+
+
+def temporal_metric_family(
+    selected: Dict[str, Any],
+    semantic_metrics: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    by_ref = {semantic_metric_ref_id(metric): metric for metric in semantic_metrics}
+    selected_ref = semantic_metric_ref_id(selected)
+    if selected_ref not in by_ref:
+        by_ref[selected_ref] = selected
+    family_refs: set[str] = {selected_ref}
+    pending = [selected_ref]
+    while pending:
+        current_ref = pending.pop()
+        current = by_ref[current_ref]
+        for candidate_ref, candidate in by_ref.items():
+            if candidate_ref in family_refs:
+                continue
+            if metric_temporal_reference_targets(current, candidate) or metric_temporal_reference_targets(
+                candidate, current
+            ):
+                family_refs.add(candidate_ref)
+                pending.append(candidate_ref)
+    return [by_ref[reference] for reference in family_refs]
+
+
+def metric_temporal_reference_targets(source: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    return any(
+        temporal_reference_matches_metric(reference, source, target) for reference in metric_temporal_references(source)
+    )
+
+
+def metric_temporal_references(metric: Dict[str, Any]) -> list[str]:
+    references: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                references.append(text)
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for child in value:
+                visit(child)
+
+    visit(metric.get("temporal_variants") or metric.get("temporalVariants") or {})
+    visit(metric.get("linked_variant_of") or metric.get("linkedVariantOf") or "")
+    return dedupe_texts(references)
+
+
+def temporal_reference_matches_metric(
+    reference: str,
+    source: Dict[str, Any],
+    target: Dict[str, Any],
+) -> bool:
+    value = str(reference or "").strip()
+    if not value:
+        return False
+    target_ref = semantic_metric_ref_id(target)
+    if value == target_ref:
+        return True
+    # A short metric key is scoped to its publishing topic/table.  This avoids
+    # linking equal keys that happen to exist in unrelated semantic assets.
+    target_key = str(target.get("key") or "").strip()
+    if value != target_key:
+        return False
+    return str(source.get("topic") or "") == str(target.get("topic") or "") and str(source.get("table") or "") == str(
+        target.get("table") or ""
+    )
+
+
+def quick_metric_supports_temporal_mode(metric: Dict[str, Any], temporal_mode: str) -> bool:
+    policy = metric_aggregation_policy(metric)
+    grains = metric_applicable_time_grains(metric)
+    if policy == "daily_value_only":
+        return temporal_mode in {"exact_day", "daily_series"} and "day" in grains
+    if temporal_mode in {"exact_day", "daily_series"}:
+        return not grains or "day" in grains
+    if temporal_mode == "period_summary":
+        return not grains or "period" in grains
+    return False
+
+
+def quick_metric_temporal_preference(metric: Dict[str, Any], temporal_mode: str) -> int:
+    policy = metric_aggregation_policy(metric)
+    grains = metric_applicable_time_grains(metric)
+    if temporal_mode in {"exact_day", "daily_series"}:
+        if policy == "daily_value_only":
+            return 300
+        return 200 if "day" in grains else 100
+    if policy in {"ratio_of_sums", "period_rollup"}:
+        return 300
+    return 200 if "period" in grains else 100
+
+
+def metric_aggregation_policy(metric: Dict[str, Any]) -> str:
+    return str(metric.get("aggregation_policy") or metric.get("aggregationPolicy") or "").strip().lower()
+
+
+def metric_applicable_time_grains(metric: Dict[str, Any]) -> set[str]:
+    raw = metric.get("applicable_time_grain")
+    if raw in (None, ""):
+        raw = metric.get("applicableTimeGrain")
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    return {str(item or "").strip().lower() for item in values if str(item or "").strip()}
 
 
 def quick_metric_time_filter(
@@ -252,9 +448,15 @@ def verify_quick_metric_answer(
     trend_rows: list[Dict[str, Any]],
     total: float,
     answer: str,
+    summary_semantics: str = "period_aggregate",
 ) -> AnswerClaimVerification:
+    coverage_claim = (
+        "quick_metric_latest_day_coverage"
+        if summary_semantics == "latest_day_value"
+        else "quick_metric_period_total_coverage"
+    )
     supported_claim = AnswerClaim(
-        text="quick_metric_total_coverage",
+        text=coverage_claim,
         numeric_values=[format_value(total, metric)],
         supported=True,
     )
@@ -262,10 +464,10 @@ def verify_quick_metric_answer(
     if not answer_contains_number(answer, total):
         unsupported_claims.append(
             AnswerClaim(
-                text="quick_metric_total_coverage",
+                text=coverage_claim,
                 numeric_values=[format_value(total, metric)],
                 supported=False,
-                reasons=["missing_quick_metric_total"],
+                reasons=["missing_quick_metric_summary_value"],
             )
         )
     extra_numbers = unsupported_quick_answer_numbers(answer, question, trend_rows, total)
@@ -352,7 +554,9 @@ def numbers_close(left: float, right: float) -> bool:
     return abs(left - right) <= max(0.005, abs(right) * 0.000001)
 
 
-def quick_metric_definition_response(question: str, merchant_id: str, metrics: list[Dict[str, Any]]) -> Optional[ChatResponse]:
+def quick_metric_definition_response(
+    question: str, merchant_id: str, metrics: list[Dict[str, Any]]
+) -> Optional[ChatResponse]:
     if len(metrics) != 1:
         return None
     selected = metrics
@@ -392,7 +596,9 @@ def quick_metric_definition_response(question: str, merchant_id: str, metrics: l
                 "sourceTables": dedupe_texts([metric["table"] for metric in selected]),
                 "evidenceStatus": "semantic_definition",
             },
-            "drillDownActions": [{"label": "按该口径看趋势", "question": suggestions[0], "actionType": "follow_up_question"}],
+            "drillDownActions": [
+                {"label": "按该口径看趋势", "question": suggestions[0], "actionType": "follow_up_question"}
+            ],
         },
         debug_trace={
             "quickMetricPath": True,
@@ -434,7 +640,9 @@ def structured_keywords_require_planner(keywords: Any, matched_metrics: Optional
     analysis_intent = str(getattr(keywords, "analysis_intent", "") or "")
     if analysis_intent in {"attribution", "ranking", "detail", "advice"}:
         return True
-    if analysis_intent == "ratio" and not (matched_metrics is not None and len(matched_metrics) == 1 and len(structured_metrics) <= 1):
+    if analysis_intent == "ratio" and not (
+        matched_metrics is not None and len(matched_metrics) == 1 and len(structured_metrics) <= 1
+    ):
         return True
     if matched_metrics is not None and len(structured_metrics) > len(matched_metrics):
         return True
@@ -463,7 +671,9 @@ def structured_keywords_require_planner(keywords: Any, matched_metrics: Optional
     )
 
 
-def published_semantic_quick_metrics(topic_assets: Any, preferred_topics: Optional[Iterable[str]] = None) -> list[Dict[str, Any]]:
+def published_semantic_quick_metrics(
+    topic_assets: Any, preferred_topics: Optional[Iterable[str]] = None
+) -> list[Dict[str, Any]]:
     """Compile safe fast-path contracts exclusively from published topic assets."""
     preferred = [str(item) for item in (preferred_topics or []) if str(item or "").strip()]
     all_topics = list(topic_assets.all_topic_names())
@@ -531,16 +741,24 @@ def compile_semantic_quick_metric(
         "metric_grain": str(metric.get("metricGrain") or "").strip(),
         "metric_intent": str(metric.get("metricIntent") or "").strip(),
         "selection_guidance": str(metric.get("selectionGuidance") or "").strip(),
+        "aggregation_policy": str(metric.get("aggregationPolicy") or "").strip(),
+        "applicable_time_grain": metric.get("applicableTimeGrain"),
+        "temporal_variants": metric.get("temporalVariants") or {},
+        "linked_variant_of": str(metric.get("linkedVariantOf") or "").strip(),
     }
 
 
-def semantic_metric_identity(metric: Dict[str, Any]) -> Dict[str, str]:
+def semantic_metric_identity(metric: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "topic": str(metric.get("topic") or ""),
         "category": metric_topic_category(metric),
         "table": str(metric.get("table") or ""),
         "metricKey": str(metric.get("key") or ""),
         "formula": str(metric.get("formula") or ""),
+        "aggregationPolicy": metric_aggregation_policy(metric),
+        "applicableTimeGrain": sorted(metric_applicable_time_grains(metric)),
+        "temporalVariants": metric.get("temporal_variants") or metric.get("temporalVariants") or {},
+        "linkedVariantOf": str(metric.get("linked_variant_of") or metric.get("linkedVariantOf") or ""),
         "semanticRefId": semantic_metric_ref_id(metric),
         "governanceStatus": "published",
     }
@@ -557,6 +775,8 @@ def semantic_metric_disclosure(metric: Dict[str, Any]) -> Dict[str, Any]:
         "formula": metric["formula"],
         "description": metric.get("description") or "来自已发布语义资产",
         "semanticRef": semantic_metric_ref_id(metric),
+        "aggregationPolicy": metric_aggregation_policy(metric),
+        "applicableTimeGrain": sorted(metric_applicable_time_grains(metric)),
         "governanceStatus": "published",
     }
 
@@ -583,12 +803,13 @@ def resolve_metrics(
     phrases = [str(item or "").strip() for item in (metric_phrases or []) if str(item or "").strip()]
     if not phrases:
         matched_terms = {
-            term
-            for metric in semantic_metrics
-            for term in metric.get("terms") or []
-            if term and term.lower() in text
+            term for metric in semantic_metrics for term in metric.get("terms") or [] if term and term.lower() in text
         }
-        phrases = [term for term in matched_terms if not any(term != other and term.lower() in other.lower() for other in matched_terms)]
+        phrases = [
+            term
+            for term in matched_terms
+            if not any(term != other and term.lower() in other.lower() for other in matched_terms)
+        ]
     identities: set[tuple[str, str]] = set()
     result: list[Dict[str, Any]] = []
     for phrase in phrases:

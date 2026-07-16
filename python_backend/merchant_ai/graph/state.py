@@ -20,6 +20,7 @@ from merchant_ai.models import (
     ContextCompressionEvent,
     ContextManifest,
     ContextSnapshot,
+    ExecutionAttemptArtifact,
     FreshnessCheckResult,
     FastUnderstandingResult,
     GraphValidationGap,
@@ -134,10 +135,15 @@ class AgentState(TypedDict, total=False):
     agent_run_result: AgentRunResult
     query_bundle: QueryBundle
     query_bundles: List[QueryBundle]
+    execution_attempt_artifacts: List[ExecutionAttemptArtifact]
     available_actions: List[AgentAction]
     lead_decisions: List[AgentDecision]
     action_history: List[AgentActionTrace]
     action_outcomes: List[Dict[str, Any]]
+    action_catalog_contract_blocks: List[Dict[str, Any]]
+    contract_block_observation: Dict[str, Any]
+    contract_block_observed: bool
+    contract_block_generation: int
     _pending_action_contract: Dict[str, Any]
     last_action_result: ActionResult
     planner_reflection: PlannerReflectionResult
@@ -252,6 +258,7 @@ class AgentState(TypedDict, total=False):
     query_graph_supplemental_retrieve_count: int
     query_graph_plan_attempts: int
     query_graph_repair_attempts: int
+    query_graph_repair_attempted: bool
     execution_generation: int
     result_generation: int
     evidence_generation: int

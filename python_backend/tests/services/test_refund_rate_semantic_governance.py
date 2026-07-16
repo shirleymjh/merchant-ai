@@ -26,6 +26,7 @@ def test_published_refund_rate_contracts_have_one_bare_alias_owner():
     assert not any("samples=[" in str(item.get("evidence") or "") for item in profile["metrics"])
     assert period["formula"] == "SUM(return_cnt_1d) / NULLIF(SUM(order_cnt_1d), 0)"
     assert period["sourceColumns"] == ["return_cnt_1d", "order_cnt_1d"]
+    assert period["aggregationPolicy"] == "ratio_of_sums"
     assert period["temporalVariants"]["dailySeriesMetricKey"] == "refund_rate_1d"
     assert {"退款率", "退货率"} <= set(period["aliases"])
 

@@ -141,6 +141,7 @@ def daily_value_metric_pack() -> tuple[PlanningAssetPack, str]:
                     key="profile",
                     table="profile",
                     columns=["merchant_id", "pt", "refund_rate_1d"],
+                    metadata={"timeColumn": "pt", "dataGrain": "merchant_day_summary"},
                 )
             ],
             metrics=[
@@ -193,11 +194,17 @@ def test_daily_value_only_metric_rejects_multi_day_single_value_compilation():
     assert "planner.semantic_asset_selection.requires_full_planner" in plan.agent_trace
 
 
-def test_daily_value_only_metric_allows_explicit_daily_series_and_forces_pt():
+def test_daily_value_only_metric_uses_structured_time_series_contract_and_forces_pt():
     pack, ref = daily_value_metric_pack()
+    payload = daily_value_selection_payload(ref)
+    payload["planningContract"] = {
+        "analysisIntent": "trend",
+        "timeGrain": "day",
+        "timeWindowDays": 30,
+    }
     plan = QueryGraphPlanner(UnconfiguredLlm())._compile_semantic_asset_selection_payload(
-        "最近30天每天退款率走势",
-        daily_value_selection_payload(ref),
+        "opaque wording without time-series keywords",
+        payload,
         pack,
     )
 

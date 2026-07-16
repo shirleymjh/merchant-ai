@@ -7,6 +7,7 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextvars import copy_context
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -26,6 +27,7 @@ from merchant_ai.models import (
     EvidenceCheckResult,
     EvidenceGap,
     FreshnessCheckResult,
+    GraphValidationResult,
     IntentType,
     NodeAgentContext,
     NodeExecutionBatch,
@@ -47,6 +49,7 @@ from merchant_ai.models import (
     ToolCachePolicy,
     ToolCallExecutionResult,
 )
+from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.assets import (
@@ -62,7 +65,12 @@ from merchant_ai.services.formulas import (
     formula_columns as reconciled_formula_columns,
 )
 from merchant_ai.services.llm import LlmClient
-from merchant_ai.services.planning import EvidenceContractBuilder
+from merchant_ai.services.planning import (
+    EvidenceContractBuilder,
+    QueryGraphValidator,
+    query_plan_question_coverage_gaps,
+)
+from merchant_ai.services.planning_layers import GraphContractValidator
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.query_contracts import (
     collect_degraded_reasons,
@@ -92,6 +100,7 @@ from merchant_ai.services.query_security import (
     DEFAULT_ACCESS_ROLE,
     apply_column_masks,
     configured_contract_detail_columns,
+    declared_result_access_policy,
     configured_default_detail_columns,
     role_allowed_for_column,
     table_asset_metadata,
@@ -114,6 +123,61 @@ from merchant_ai.services.tools import artifact_file_tool_definitions, canonical
 
 
 SQL_BUILTIN_IDENTIFIERS = {"current_date", "current_timestamp", "current_time", "curdate", "now"}
+
+
+class ExecutionGraphPreparationError(RuntimeError):
+    """Raised before SQL dispatch when the execution graph contract is not ready."""
+
+
+class ExecutionGraphPreparationRequired(ExecutionGraphPreparationError):
+    """The caller supplied a graph that still changes under execution normalization."""
+
+
+class ExecutionGraphValidationError(ExecutionGraphPreparationError):
+    """The normalized execution graph did not pass the graph contract validator."""
+
+
+@dataclass(frozen=True)
+class ExecutionGraphPreparation:
+    """Immutable hand-off contract between graph normalization and NodeWorker.
+
+    ``plan`` is a deep copy of the caller's QueryGraph.  The remaining hashes bind
+    the validation result to the exact question, semantic asset pack and normalized
+    graph that may be dispatched to SQL workers.
+    """
+
+    plan: QueryPlan
+    validation: GraphValidationResult
+    source_plan_fingerprint: str
+    execution_plan_fingerprint: str
+    question_fingerprint: str
+    asset_pack_fingerprint: str
+    changed: bool
+    optimization_notes: Tuple[str, ...] = ()
+    validator_name: str = ""
+
+    @property
+    def executable(self) -> bool:
+        return bool(self.validation.valid)
+
+    def require_executable(self) -> QueryPlan:
+        if self.validation.valid:
+            return self.plan
+        gap_codes = [str(gap.code or "") for gap in self.validation.gaps if str(gap.code or "")]
+        raise ExecutionGraphValidationError(
+            "normalized execution graph is invalid; gaps=%s"
+            % (",".join(gap_codes[:8]) or "QUERY_GRAPH_VALIDATION_FAILED")
+        )
+
+
+def execution_question_fingerprint(question: str) -> str:
+    return hashlib.sha256(str(question or "").encode("utf-8")).hexdigest()
+
+
+def execution_asset_pack_fingerprint(asset_pack: PlanningAssetPack) -> str:
+    payload = asset_pack.model_dump(by_alias=True, mode="json")
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def sql_references_filter_column(sql: str, column: str) -> bool:
@@ -358,6 +422,9 @@ class NodePlanCritic:
                     ",".join(evidence_gaps),
                 )
             )
+        computation_columns = set(formula_columns(contract.metric_formula, allowed))
+        for spec in contract.metric_specs:
+            computation_columns.update(metric_spec_source_columns(spec, allowed))
         denied_evidence = [
             column
             for column in contract.required_evidence
@@ -365,6 +432,7 @@ class NodePlanCritic:
             and column in allowed
             and column not in visible
             and column not in {contract.metric_column, contract.merchant_filter_column}
+            and column not in computation_columns
         ]
         if denied_evidence:
             issues.append(
@@ -453,8 +521,14 @@ class NodeWorkerExecutor:
         access_role: str = DEFAULT_ACCESS_ROLE,
         user_scope: Optional[Dict[str, Any]] = None,
         execution_mode: str = "auto",
+        execution_preparation: Optional[ExecutionGraphPreparation] = None,
     ) -> AgentRunResult:
-        optimize_query_plan_for_execution(plan, asset_pack)
+        plan = require_normalized_execution_plan(
+            plan,
+            asset_pack,
+            question,
+            execution_preparation=execution_preparation,
+        )
         result = AgentRunResult()
         execution_run_id = run_id or "inline_%s" % uuid.uuid4().hex[:16]
         executable = [intent for intent in plan.intents if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE]
@@ -3401,6 +3475,23 @@ class NodeWorkerExecutor:
                 allowed_columns.append(column)
         access_role = str(context.access_role or DEFAULT_ACCESS_ROLE)
         field_semantics = table_field_semantics(asset_pack, table)
+        aggregate_result_aliases = {
+            str(spec.get("metricName") or spec.get("metric_name") or "")
+            for spec in effective_metric_specs
+            if str(spec.get("metricName") or spec.get("metric_name") or "")
+        }
+        aggregate_result_aliases.update(
+            str(value)
+            for value in [
+                metric_contract.get("metricKey"),
+                intent.metric_name,
+                (metric_contract.get("resolution") or {}).get("metricKey"),
+            ]
+            if str(value or "")
+        )
+        aggregate_output_columns = set(contract_output_keys)
+        if intent.group_by_column:
+            aggregate_output_columns.add(intent.group_by_column)
         visible_columns: List[str] = []
         internal_only_columns: List[str] = []
         column_access_policy: Dict[str, Dict[str, Any]] = {}
@@ -3409,15 +3500,34 @@ class NodeWorkerExecutor:
         protected_internal = {merchant_filter_column, str(row_scope_policy.get("filterColumn") or "")} - {""}
         for column in allowed_columns:
             semantic = field_semantics.get(column, {})
-            visibility_policy = normalize_visibility_policy(semantic.get("visibilityPolicy") or {})
-            masking_policy = normalize_masking_policy(semantic.get("maskingPolicy") or {})
+            result_role = ""
+            if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
+                if column in aggregate_result_aliases:
+                    result_role = "METRIC"
+                elif column in aggregate_output_columns:
+                    result_role = (
+                        "TIME"
+                        if column == time_column
+                        else str(semantic.get("semanticRole") or semantic.get("role") or "").upper()
+                    )
+            result_policy = declared_result_access_policy(table_metadata, result_role)
+            visibility_policy = normalize_visibility_policy(
+                (result_policy.get("visibilityPolicy") if result_policy else None)
+                or semantic.get("visibilityPolicy")
+                or {}
+            )
+            masking_policy = normalize_masking_policy(
+                (result_policy.get("maskingPolicy") if result_policy else None)
+                or semantic.get("maskingPolicy")
+                or {}
+            )
             policy = {
                 **visibility_policy,
                 "maskingStrategy": masking_policy.get("strategy") or "none",
                 "maskingReason": masking_policy.get("reason") or "",
             }
             column_access_policy[column] = policy
-            column_display_policy[column] = normalize_column_display_policy(semantic)
+            column_display_policy[column] = normalize_column_display_policy(result_policy or semantic)
             permitted = role_allowed_for_column(visibility_policy, access_role)
             if permitted:
                 visible_columns.append(column)
@@ -3551,7 +3661,6 @@ class NodeWorkerExecutor:
         semantic_defaults = [
             str(metadata.get("merchantFilterColumn") or ""),
             str(metadata.get("timeColumn") or ""),
-            *[entry.key for entry in asset_pack.entity_keys if entry.table == table],
         ]
         for item in semantic_defaults:
             if item in columns and item not in requested:
@@ -3920,10 +4029,18 @@ def first_bundle_error(bundles: List[QueryBundle]) -> str:
     return ""
 
 
-def optimize_query_plan_for_execution(plan: QueryPlan, asset_pack: PlanningAssetPack) -> None:
-    """Merge structurally equivalent metric nodes before NodeWorker execution."""
+def optimize_query_plan_for_execution(plan: QueryPlan, asset_pack: PlanningAssetPack) -> QueryPlan:
+    """Return a normalized execution graph without mutating the planned graph."""
 
-    if not plan or len(plan.intents) < 2:
+    optimized = (plan or QueryPlan()).model_copy(deep=True)
+    _optimize_query_plan_for_execution_in_place(optimized, asset_pack)
+    return optimized
+
+
+def _optimize_query_plan_for_execution_in_place(plan: QueryPlan, asset_pack: PlanningAssetPack) -> None:
+    """Merge structurally equivalent metric nodes on an isolated graph copy."""
+
+    if len(plan.intents) < 2:
         return
     intents_by_id = {intent.plan_task_id: intent for intent in plan.intents if intent.plan_task_id}
     groups: Dict[Tuple[Any, ...], List[QuestionIntent]] = {}
@@ -3995,6 +4112,114 @@ def optimize_query_plan_for_execution(plan: QueryPlan, asset_pack: PlanningAsset
     optimizer_notes = plan.compiler_trace if isinstance(plan.compiler_trace, list) else []
     optimizer_notes.extend(merge_notes)
     plan.compiler_trace = optimizer_notes
+
+
+def prepare_execution_graph(
+    question: str,
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+    graph_validator: Any = None,
+    memory_constraints: Optional[List[Dict[str, Any]]] = None,
+) -> ExecutionGraphPreparation:
+    """Normalize a copy and validate the exact graph that NodeWorker may execute."""
+
+    source_fingerprint = query_graph_fingerprint(plan)
+    normalized = optimize_query_plan_for_execution(plan, asset_pack)
+    execution_fingerprint = query_graph_fingerprint(normalized)
+    validator = graph_validator or QueryGraphValidator()
+    facade = validator if isinstance(validator, GraphContractValidator) else GraphContractValidator(validator)
+    validation = facade.validate(
+        question,
+        normalized,
+        asset_pack,
+        memory_constraints or [],
+    )
+    validation = execution_graph_validation_with_question_coverage(
+        question,
+        normalized,
+        asset_pack,
+        validation,
+    )
+    optimization_notes = tuple(
+        str(item)
+        for item in normalized.compiler_trace
+        if str(item).startswith("execution_optimizer.")
+    )
+    wrapped_validator = getattr(facade, "validator", validator)
+    return ExecutionGraphPreparation(
+        plan=normalized,
+        validation=validation,
+        source_plan_fingerprint=source_fingerprint,
+        execution_plan_fingerprint=execution_fingerprint,
+        question_fingerprint=execution_question_fingerprint(question),
+        asset_pack_fingerprint=execution_asset_pack_fingerprint(asset_pack),
+        changed=source_fingerprint != execution_fingerprint,
+        optimization_notes=optimization_notes,
+        validator_name=type(wrapped_validator).__name__,
+    )
+
+
+def execution_graph_validation_with_question_coverage(
+    question: str,
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+    validation: GraphValidationResult,
+) -> GraphValidationResult:
+    """Apply the same question-coverage gate used by the workflow validator."""
+
+    coverage_gaps = query_plan_question_coverage_gaps(question, plan, asset_pack)
+    if not coverage_gaps:
+        return validation
+    gaps = list(validation.gaps or [])
+    seen = {(gap.code, gap.task_id, gap.evidence) for gap in gaps}
+    for gap in coverage_gaps:
+        identity = (gap.code, gap.task_id, gap.evidence)
+        if identity in seen:
+            continue
+        gaps.append(gap)
+        seen.add(identity)
+    return validation.model_copy(
+        update={
+            "valid": False,
+            "gaps": gaps,
+            "repairable": False,
+        }
+    )
+
+
+def require_normalized_execution_plan(
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+    question: str,
+    *,
+    execution_preparation: Optional[ExecutionGraphPreparation] = None,
+) -> QueryPlan:
+    """Fail before worker dispatch if normalization or preparation is stale.
+
+    The optional typed preparation is the strict production hand-off: it proves
+    that the normalized graph passed validation.  The raw-plan path remains for
+    low-level worker tests, but it may only receive an already-normalized graph and
+    never performs the former in-place optimization.
+    """
+
+    candidate = plan
+    if execution_preparation is not None:
+        if execution_preparation.question_fingerprint != execution_question_fingerprint(question):
+            raise ExecutionGraphPreparationRequired("execution preparation belongs to a different question")
+        if execution_preparation.asset_pack_fingerprint != execution_asset_pack_fingerprint(asset_pack):
+            raise ExecutionGraphPreparationRequired("execution preparation belongs to a different semantic asset pack")
+        candidate = execution_preparation.require_executable()
+        if query_graph_fingerprint(plan) != execution_preparation.execution_plan_fingerprint:
+            raise ExecutionGraphPreparationRequired("supplied plan does not match the prepared execution graph")
+        if query_graph_fingerprint(candidate) != execution_preparation.execution_plan_fingerprint:
+            raise ExecutionGraphPreparationRequired("prepared execution graph changed after validation")
+
+    normalized_again = optimize_query_plan_for_execution(candidate, asset_pack)
+    if query_graph_fingerprint(normalized_again) != query_graph_fingerprint(candidate):
+        raise ExecutionGraphPreparationRequired(
+            "QueryGraph must be normalized and validated before NodeWorker.execute_plan"
+        )
+    return candidate
 
 
 def node_execution_contract_hash(
@@ -4410,13 +4635,41 @@ def normalize_metric_spec(spec: Dict[str, Any], intent: QuestionIntent, table: s
         or []
         if item
     ]
-    return {
+    normalized = {
         "metricName": metric_name,
         "metricColumn": metric_column,
         "metricFormula": metric_formula,
         "sourceColumns": dedupe_strings(source_columns),
         "sourceTaskId": str(spec.get("sourceTaskId") or spec.get("source_task_id") or intent.plan_task_id or ""),
     }
+    resolution = intent.metric_resolution or {}
+    presentation_fields = {
+        "displayName": ("displayName", "display_name"),
+        "naturalName": ("naturalName", "natural_name"),
+        "description": ("description",),
+        "unit": ("unit",),
+        "valueFormat": ("valueFormat", "value_format"),
+        "decimalPlaces": ("decimalPlaces", "decimal_places"),
+        "metricType": ("metricType", "metric_type"),
+        "aggregationPolicy": ("aggregationPolicy", "aggregation_policy"),
+        "semanticRefId": ("semanticRefId", "semantic_ref_id"),
+        "ownerTable": ("ownerTable", "owner_table"),
+    }
+    for target, aliases in presentation_fields.items():
+        value = next(
+            (
+                source.get(alias)
+                for source in [spec, resolution]
+                for alias in aliases
+                if source.get(alias) not in (None, "", [], {})
+            ),
+            None,
+        )
+        if value not in (None, "", [], {}):
+            normalized[target] = value
+    if table and not normalized.get("ownerTable"):
+        normalized["ownerTable"] = table
+    return normalized
 
 
 def dedupe_metric_specs(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
