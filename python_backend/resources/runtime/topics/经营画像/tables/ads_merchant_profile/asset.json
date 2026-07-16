@@ -3261,6 +3261,7 @@
       "metricIntent": "store_summary",
       "aggregationPolicy": "period_rollup",
       "ambiguousAliases": [],
+      "detailMetricRef": "semantic:客服工单:dwm_cs_ticket_detail_di:metric:ticket_cnt",
       "naturalName": "咨询工单量",
       "originalBusinessName": "咨询工单量",
       "sourceColumnAliases": [
@@ -3381,6 +3382,7 @@
       "metricIntent": "store_summary",
       "aggregationPolicy": "period_rollup",
       "ambiguousAliases": [],
+      "detailMetricRef": "semantic:客服理赔:dwm_cs_repay_detail_df:metric:repay_amt",
       "naturalName": "卖家赔付金额元",
       "originalBusinessName": "卖家赔付金额元",
       "sourceColumnAliases": [
@@ -4357,6 +4359,7 @@
       "metricIntent": "store_summary",
       "aggregationPolicy": "period_rollup",
       "ambiguousAliases": [],
+      "detailMetricRef": "semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt",
       "naturalName": "退款金额元",
       "originalBusinessName": "退款金额元",
       "sourceColumnAliases": [
@@ -4528,37 +4531,94 @@
       }
     },
     {
+      "metricKey": "refund_rate_by_pay_order",
+      "canonicalMetricKey": "refund_rate_by_pay_order",
+      "businessName": "周期汇总退款率",
+      "displayName": "周期汇总退款率",
+      "disambiguationName": "周期汇总退款率（退货量/支付订单量）",
+      "naturalName": "退款率",
+      "originalBusinessName": "退款率",
+      "formula": "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+      "metricFormula": "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+      "unit": "%",
+      "valueFormat": "percent",
+      "description": "跨天或指定周期的商家退款率，按周期退货量合计占周期支付订单量合计统计。",
+      "sourceColumns": [
+        "return_cnt_1d",
+        "pay_order_cnt_1d"
+      ],
+      "sourceColumnAliases": [
+        "return_cnt_1d",
+        "pay_order_cnt_1d"
+      ],
+      "aliases": [
+        "退款率（退货量/支付订单量）",
+        "refund_rate_by_pay_order",
+        "退款率",
+        "周期退款率",
+        "汇总退款率",
+        "商家退款率",
+        "店铺退款率",
+        "整体退款率"
+      ],
+      "confidence": 0.86,
+      "evidence": "由字段口径“退货量占支付订单量比例-最近1天”提升为周期 ratio_of_sums 口径",
+      "tableKind": "aggregate_profile",
+      "metricGrain": "merchant_day_summary",
+      "metricIntent": "store_summary",
+      "metricLevel": "business",
+      "metricType": "RATIO",
+      "aliasConflictScope": "GLOBAL",
+      "aggregationPolicy": "ratio_of_sums",
+      "selectionGuidance": "用于多日总值和周期对比，必须按 SUM(return_cnt_1d) / SUM(pay_order_cnt_1d) 重算；逐日走势使用 refund_rate_1d。",
+      "preferredUseCases": [
+        "period_refund_rate_total",
+        "period_over_period_refund_rate"
+      ],
+      "notPreferredUseCases": [
+        "daily_refund_rate_series"
+      ],
+      "temporalVariants": {
+        "dailySeriesMetricKey": "refund_rate_1d"
+      },
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
+    },
+    {
       "metricKey": "refund_rate_1d",
-      "businessName": "每日退货率",
+      "businessName": "每日退款率",
       "formula": "MAX(refund_rate_1d)",
       "unit": "%",
-      "description": "每日退货率，按单日退货量占支付订单量统计，适合查看退货率走势。",
+      "description": "每日退款率，按单日退货量占支付订单量统计，适合查看退款率走势。",
       "sourceColumns": [
         "refund_rate_1d"
       ],
       "aliases": [
-        "每日退货率",
         "每日退款率",
-        "每天退货率",
         "每天退款率",
         "按日退款率",
         "refund_rate_1d",
-        "退货率日值",
-        "退货率单日值",
-        "单日退货率",
-        "按日退货率",
+        "退款率日值",
+        "退款率单日值",
+        "单日退款率",
         "退货量占支付订单量比例-最近1天"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=退货量占支付订单量比例-最近1天; sample evidence is STALE and excluded",
-      "displayName": "每日退货率",
-      "disambiguationName": "每日退货率（单日字段）",
+      "displayName": "每日退款率",
+      "disambiguationName": "每日退款率（退货量/支付订单量单日字段）",
       "tableKind": "aggregate_profile",
       "metricGrain": "merchant_day_summary",
       "metricIntent": "store_summary",
       "ambiguousAliases": [],
-      "naturalName": "每日退货率",
-      "originalBusinessName": "每日退货率",
+      "naturalName": "每日退款率",
+      "originalBusinessName": "每日退款率",
       "sourceColumnAliases": [
         "refund_rate_1d"
       ],
@@ -4569,17 +4629,17 @@
       "aliasConflictScope": "SCOPED",
       "aggregationPolicy": "daily_value_only",
       "applicableTimeGrain": "day",
-      "selectionGuidance": "仅用于单日或按 pt 分组的逐日走势；禁止对多日 refund_rate_1d 直接 AVG 作为周期退货率。",
+      "selectionGuidance": "仅用于单日或按 pt 分组的逐日走势；禁止对多日 refund_rate_1d 直接 AVG 作为周期退款率。",
       "preferredUseCases": [
-        "single_day_return_rate",
-        "daily_return_rate_series"
+        "single_day_refund_rate",
+        "daily_refund_rate_series"
       ],
       "notPreferredUseCases": [
-        "period_return_rate_total",
-        "period_over_period_return_rate"
+        "period_refund_rate_total",
+        "period_over_period_refund_rate"
       ],
       "temporalVariants": {
-        "periodSummaryMetricKey": "return_rate_by_order"
+        "periodSummaryMetricKey": "refund_rate_by_pay_order"
       },
       "timeColumn": "pt",
       "timeSemantics": {
@@ -4880,18 +4940,12 @@
       "aliases": [
         "退货率（退货量/订单量）",
         "return_rate_by_order",
-        "退款率",
         "退货率",
         "周期退货率",
-        "周期退款率",
         "汇总退货率",
-        "汇总退款率",
         "商家退货率",
-        "商家退款率",
         "店铺退货率",
-        "店铺退款率",
-        "整体退货率",
-        "整体退款率"
+        "整体退货率"
       ],
       "confidence": 0.82,
       "evidence": "权威业务口径：SUM(return_cnt_1d) / SUM(order_cnt_1d)",
@@ -4913,7 +4967,7 @@
       "aliasConflictScope": "GLOBAL",
       "metricType": "RATIO",
       "aggregationPolicy": "ratio_of_sums",
-      "selectionGuidance": "用于多日总值和周期对比，必须按 SUM(return_cnt_1d) / SUM(order_cnt_1d) 重算；逐日走势改用 refund_rate_1d。",
+      "selectionGuidance": "用于多日总值和周期对比，必须按 SUM(return_cnt_1d) / SUM(order_cnt_1d) 重算；不得复用分母为支付订单量的 refund_rate_1d。",
       "preferredUseCases": [
         "period_return_rate_total",
         "period_over_period_return_rate"
@@ -4921,9 +4975,7 @@
       "notPreferredUseCases": [
         "daily_return_rate_series"
       ],
-      "temporalVariants": {
-        "dailySeriesMetricKey": "refund_rate_1d"
-      },
+      "temporalVariants": {},
       "applicableTimeGrain": "period",
       "timeColumn": "pt",
       "timeSemantics": {
@@ -5982,9 +6034,7 @@
       "description": "商家周期退货率口径：周期退货量合计占周期订单量合计。该口径不等于单日已算好的 refund_rate_1d，也不等于直接退款率。",
       "aliases": [
         "商家周期退货率",
-        "退款率",
         "退货率",
-        "周期退款率",
         "周期退货率",
         "整体退货率",
         "店铺退货率"
@@ -5995,6 +6045,24 @@
       ],
       "evidence": "权威业务口径：SUM(return_cnt_1d) / SUM(order_cnt_1d)",
       "canonicalMetricKey": "return_rate_by_order",
+      "aliasConflictScope": "GLOBAL"
+    },
+    {
+      "term": "商家周期退款率",
+      "description": "商家周期退款率口径：周期退货量合计占周期支付订单量合计。单日走势使用 refund_rate_1d，周期汇总不得直接 AVG/MAX 单日比率。",
+      "aliases": [
+        "商家周期退款率",
+        "退款率",
+        "周期退款率",
+        "整体退款率",
+        "店铺退款率"
+      ],
+      "relatedColumns": [
+        "return_cnt_1d",
+        "pay_order_cnt_1d"
+      ],
+      "evidence": "由字段口径“退货量占支付订单量比例-最近1天”提升为周期 ratio_of_sums 口径",
+      "canonicalMetricKey": "refund_rate_by_pay_order",
       "aliasConflictScope": "GLOBAL"
     },
     {

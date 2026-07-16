@@ -9,6 +9,7 @@ from langgraph.graph import START as LANGGRAPH_START
 from langgraph.graph import StateGraph
 
 import merchant_ai.graph.workflow as workflow_module
+from merchant_ai.config import Settings
 from merchant_ai.graph.policy import AgentActionRegistry, V2AgentPolicy
 from merchant_ai.graph.state import AgentState
 from merchant_ai.graph.workflow import MerchantQaWorkflow
@@ -17,6 +18,7 @@ from merchant_ai.models import (
     AgentDecision,
     GraphValidationGap,
     PlannerRepairInput,
+    QueryPlan,
     QueryGraphRepairDelta,
     QuestionCategory,
 )
@@ -70,6 +72,26 @@ def test_action_registry_has_unique_nodes_and_closed_contracts() -> None:
         registry.get("unregistered_action")
 
 
+def test_lead_action_retry_default_is_one_bounded_retry() -> None:
+    assert Settings.model_fields["agent_lead_action_retries"].default == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ("empty_response: provider returned no tool call", ("LEAD_LLM_EMPTY_RESPONSE", True)),
+        ("provider_error: connection reset by peer", ("LEAD_LLM_PROVIDER_ERROR", True)),
+        ("provider_error: HTTP 503 service unavailable", ("LEAD_LLM_PROVIDER_ERROR", True)),
+        ("provider_error: HTTP 403 forbidden", ("LEAD_LLM_PROVIDER_ERROR", False)),
+    ],
+)
+def test_lead_failure_retryability_is_transport_contract_driven(
+    error: str,
+    expected: tuple[str, bool],
+) -> None:
+    assert workflow_module.classify_lead_llm_failure(error) == expected
+
+
 def test_graph_repair_attempt_flag_has_a_persisted_state_channel() -> None:
     assert "query_graph_repair_attempted" in AgentState.__annotations__
     assert "query_graph_repair_progressed" in AgentState.__annotations__
@@ -82,6 +104,7 @@ def test_cross_node_control_channels_round_trip_through_langgraph_state_schema()
         "_clarification_tool_intercepted": True,
         "_emitted_tool_runtime_event_ids": ["event_1"],
         "_lead_llm_decision_fingerprint": "lead_fingerprint",
+        "_pending_lead_action_failure_observations": [{"errorCode": "LEAD_LLM_TIMEOUT"}],
         "_lead_previous_gap_counts": {"graphGaps": 2},
         "_lead_seen_recall_refs": ["semantic:domain:table:metric:measure"],
         "_memory_middleware_retry_attempted": True,
@@ -501,6 +524,237 @@ def test_lead_timeout_is_explicit_and_preserves_governed_policy_action() -> None
     assert spans[-1]["status"] == "failed"
     assert spans[-1]["error_code"] == "LEAD_LLM_TIMEOUT"
     assert not state.get("human_clarification_required")
+
+
+def test_lead_timeout_retries_once_and_preserves_first_failure_observation() -> None:
+    class RecoveringLeadLlm:
+        configured = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_error = ""
+
+        def tool_json_chat(self, *_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                self.last_error = "timeout: provider call exceeded 12 seconds"
+                return {}
+            self.last_error = ""
+            return {"actionId": "plan_graph", "reason": "continue with the governed Planner"}
+
+    llm = RecoveringLeadLlm()
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.settings = SimpleNamespace(
+        lead_action_llm_mode="always",
+        agent_lead_action_retries=1,
+        llm_lead_timeout_seconds=12,
+        llm_request_timeout_seconds=20,
+        llm_answer_timeout_seconds=10,
+        run_budget_max_duration_seconds=90,
+        openai_model="test-model",
+        openai_base_url="test-provider",
+    )
+    workflow.policy = V2AgentPolicy()
+    workflow.planner = SimpleNamespace(llm=llm)
+    workflow.record_span = lambda *_args, **_kwargs: None
+    decision = AgentDecision(
+        selected_action="lead_arbitrate",
+        selected_node=workflow.policy.registry.node_for("lead_arbitrate"),
+        available_actions=["retrieve_knowledge", "plan_graph"],
+        reason="multiple governed actions require Lead arbitration",
+        source="lead_arbitration_pending",
+    )
+    state = {
+        "question": "governed multi-metric request",
+        "main_agent_observations": [{"summary": "assets=true; planNodes=0"}],
+        "action_history": [],
+        "pending_knowledge_requests": [],
+        "planner_repair_requests": [],
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "plan": QueryPlan(),
+        "run_started_at_ms": workflow_module.now_ms(),
+    }
+
+    selected = workflow.arbitrate_lead_action_if_needed(state, decision)
+
+    assert llm.calls == 2
+    assert selected.selected_action == "plan_graph"
+    assert selected.source == "lead_llm_tool"
+    trace = state["bounded_lead_llm_trace"]
+    assert trace["recoveredAfterRetry"] is True
+    assert trace["attempts"][0]["errorCode"] == "LEAD_LLM_TIMEOUT"
+    pending = state["_pending_lead_action_failure_observations"]
+    assert pending[0]["priorObservation"]["summary"] == "assets=true; planNodes=0"
+
+
+def test_repeated_lead_timeout_uses_safe_progress_action_instead_of_answering_without_graph() -> None:
+    class TimedOutLeadLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 12 seconds"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def tool_json_chat(self, *_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            self.calls += 1
+            return {}
+
+    llm = TimedOutLeadLlm()
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.settings = SimpleNamespace(
+        lead_action_llm_mode="always",
+        agent_lead_action_retries=1,
+        llm_lead_timeout_seconds=12,
+        llm_request_timeout_seconds=20,
+        llm_answer_timeout_seconds=10,
+        run_budget_max_duration_seconds=90,
+        openai_model="test-model",
+        openai_base_url="test-provider",
+    )
+    workflow.policy = V2AgentPolicy()
+    workflow.planner = SimpleNamespace(llm=llm)
+    workflow.record_span = lambda *_args, **_kwargs: None
+    decision = AgentDecision(
+        selected_action="lead_arbitrate",
+        selected_node=workflow.policy.registry.node_for("lead_arbitrate"),
+        available_actions=["retrieve_knowledge", "plan_graph"],
+        reason="multiple governed actions require Lead arbitration",
+        source="lead_arbitration_pending",
+    )
+    state = {
+        "question": "governed multi-metric request",
+        "main_agent_observations": [{"summary": "assets=true; planNodes=0"}],
+        "action_history": [],
+        "pending_knowledge_requests": [],
+        "planner_repair_requests": [],
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "plan": QueryPlan(),
+        "run_started_at_ms": workflow_module.now_ms(),
+    }
+
+    selected = workflow.arbitrate_lead_action_if_needed(state, decision)
+
+    assert llm.calls == 2
+    assert selected.selected_action == "plan_graph"
+    assert selected.selected_action in selected.available_actions
+    assert selected.source == "runtime_safe_fallback"
+    assert "answer_data" not in selected.available_actions
+    assert state["bounded_lead_llm_trace"]["errorCode"] == "LEAD_LLM_TIMEOUT"
+    next_observation = workflow.main_agent_observation(state)
+    assert [item["errorCode"] for item in next_observation["leadActionFailures"]] == [
+        "LEAD_LLM_TIMEOUT",
+        "LEAD_LLM_TIMEOUT",
+    ]
+    assert next_observation["leadActionFailures"][0]["priorObservation"]["summary"] == "assets=true; planNodes=0"
+
+
+def test_lead_timeout_skips_retry_when_run_budget_cannot_cover_lead_and_answer_reserve() -> None:
+    class TimedOutLeadLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 12 seconds"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def tool_json_chat(self, *_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            self.calls += 1
+            return {}
+
+    llm = TimedOutLeadLlm()
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.settings = SimpleNamespace(
+        lead_action_llm_mode="always",
+        agent_lead_action_retries=1,
+        llm_lead_timeout_seconds=12,
+        llm_request_timeout_seconds=20,
+        llm_answer_timeout_seconds=10,
+        run_budget_max_duration_seconds=90,
+        openai_model="test-model",
+        openai_base_url="test-provider",
+    )
+    workflow.policy = V2AgentPolicy()
+    workflow.planner = SimpleNamespace(llm=llm)
+    workflow.record_span = lambda *_args, **_kwargs: None
+    decision = AgentDecision(
+        selected_action="lead_arbitrate",
+        selected_node=workflow.policy.registry.node_for("lead_arbitrate"),
+        available_actions=["retrieve_knowledge", "plan_graph"],
+        reason="multiple governed actions require Lead arbitration",
+    )
+    state = {
+        "question": "governed request",
+        "main_agent_observations": [{"summary": "assets=true; planNodes=0"}],
+        "action_history": [],
+        "pending_knowledge_requests": [],
+        "planner_repair_requests": [],
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "plan": QueryPlan(),
+        "run_started_at_ms": workflow_module.now_ms() - 70_000,
+    }
+
+    selected = workflow.arbitrate_lead_action_if_needed(state, decision)
+
+    assert llm.calls == 1
+    assert selected.selected_action == "plan_graph"
+    assert state["bounded_lead_llm_trace"]["retrySkippedReason"] == "insufficient_run_budget"
+
+
+def test_non_retryable_lead_provider_error_does_not_repeat_request() -> None:
+    class ForbiddenLeadLlm:
+        configured = True
+        last_error = "provider_error: HTTP 403 forbidden"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def tool_json_chat(self, *_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            self.calls += 1
+            return {}
+
+    llm = ForbiddenLeadLlm()
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.settings = SimpleNamespace(
+        lead_action_llm_mode="always",
+        agent_lead_action_retries=1,
+        llm_lead_timeout_seconds=12,
+        llm_request_timeout_seconds=20,
+        llm_answer_timeout_seconds=10,
+        run_budget_max_duration_seconds=90,
+        openai_model="test-model",
+        openai_base_url="test-provider",
+    )
+    workflow.policy = V2AgentPolicy()
+    workflow.planner = SimpleNamespace(llm=llm)
+    workflow.record_span = lambda *_args, **_kwargs: None
+    decision = AgentDecision(
+        selected_action="lead_arbitrate",
+        selected_node=workflow.policy.registry.node_for("lead_arbitrate"),
+        available_actions=["retrieve_knowledge", "plan_graph"],
+        reason="multiple governed actions require Lead arbitration",
+    )
+    state = {
+        "question": "governed request",
+        "main_agent_observations": [{"summary": "assets=true; planNodes=0"}],
+        "action_history": [],
+        "pending_knowledge_requests": [],
+        "planner_repair_requests": [],
+        "topic_routed": True,
+        "data_discovered": True,
+        "planning_assets_compacted": True,
+        "plan": QueryPlan(),
+        "run_started_at_ms": workflow_module.now_ms(),
+    }
+
+    selected = workflow.arbitrate_lead_action_if_needed(state, decision)
+
+    assert llm.calls == 1
+    assert selected.selected_action == "plan_graph"
+    assert state["bounded_lead_llm_trace"]["errorCode"] == "LEAD_LLM_PROVIDER_ERROR"
+    assert state["_pending_lead_action_failure_observations"][0]["retryable"] is False
 
 
 def test_lead_catalog_preserves_safe_answer_action_without_business_preference() -> None:

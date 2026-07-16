@@ -18,6 +18,7 @@ from threading import Thread
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings, get_settings
+from merchant_ai.graph.action_contract import action_state_flag_ready, state_path_ready
 from merchant_ai.graph.policy import REPAIRABLE_QUERY_GRAPH_GAP_CODES, V2AgentPolicy
 from merchant_ai.graph.query_graph_contract import (
     graph_validation_attempted,
@@ -142,6 +143,11 @@ from merchant_ai.services.context_filesystem import add_context_uri, context_lin
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.latency import LatencyOptimizer
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.llm_recovery import (
+    bounded_single_retry_count,
+    classify_llm_failure,
+    retry_timeout_with_answer_reserve,
+)
 from merchant_ai.services.knowledge_requests import (
     canonical_knowledge_request_payload,
     dedupe_knowledge_requests,
@@ -168,7 +174,7 @@ from merchant_ai.services.planning import (
     query_plan_question_coverage_gaps,
     semantic_workspace_manifest_from_asset_pack,
 )
-from merchant_ai.services.planning_tooling import planner_llm_terminal_error
+from merchant_ai.services.planning_tooling import planner_failure_gap_code, planner_llm_terminal_error
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
 from merchant_ai.services.query import (
@@ -197,6 +203,7 @@ from merchant_ai.services.routing import (
     RouteSlotExtractor,
     SemanticPreflightRouteClassifier,
     TopicRouterService,
+    planning_hints_from_extracted_keywords,
     route_primary_topic,
 )
 from merchant_ai.services.skill_drafts import SkillDraftService
@@ -374,6 +381,7 @@ class MerchantQaWorkflow:
             clarification_root_question=(question or "").strip(),
             bounded_route_llm_trace={},
             bounded_lead_llm_trace={},
+            _pending_lead_action_failure_observations=[],
             fast_gate_decision_trace={},
             main_agent_observations=[],
             fast_understanding=FastUnderstandingResult(),
@@ -1585,7 +1593,6 @@ class MerchantQaWorkflow:
             "decisionContext": state.get("lead_decision_context", {}),
             "instruction": self.lead_agent_tool_instruction(is_fast_gate),
         }
-        lead_llm_started = now_ms()
         lead_timeout_seconds = max(
             1,
             int(
@@ -1597,50 +1604,68 @@ class MerchantQaWorkflow:
                 or 1
             ),
         )
-        try:
-            if hasattr(llm, "tool_json_chat"):
-                tool = lead_action_selection_tool(allowed)
-                llm_payload = llm.tool_json_chat(
-                    "你是主 Agent 的 ReAct 决策器。先读 observation，再只能调用 select_agent_action 选择下一步。",
-                    json.dumps(payload, ensure_ascii=False, default=str),
-                    tool.openai_schema(),
-                    {},
-                    timeout_seconds=lead_timeout_seconds,
+        prompt_text = json.dumps(payload, ensure_ascii=False, default=str)
+        tool = lead_action_selection_tool(allowed) if hasattr(llm, "tool_json_chat") else None
+        if tool is not None:
+            trace["tool"] = tool.trace_schema()
+        max_retries = bounded_single_retry_count(
+            int(getattr(self.settings, "agent_lead_action_retries", 1) or 0)
+        )
+        trace["maxRetries"] = max_retries
+        trace["attempts"] = []
+        llm_payload: Dict[str, Any] = {}
+        attempt = 0
+        attempt_timeout_seconds = lead_timeout_seconds
+        while True:
+            lead_llm_started = now_ms()
+            raised_error = ""
+            try:
+                if tool is not None:
+                    llm_payload = llm.tool_json_chat(
+                        "你是主 Agent 的 ReAct 决策器。先读 observation，再只能调用 select_agent_action 选择下一步。",
+                        prompt_text,
+                        tool.openai_schema(),
+                        {},
+                        timeout_seconds=attempt_timeout_seconds,
+                    )
+                else:
+                    llm_payload = llm.json_chat(
+                        "你是 BI Agent 的受限 LeadAction 选择器，只能在给定 action registry 候选中改选下一步。",
+                        prompt_text,
+                        fallback={},
+                        timeout_seconds=attempt_timeout_seconds,
+                    )
+            except Exception as exc:
+                raised_error = "%s: %s" % (type(exc).__name__, str(exc))
+                llm_payload = {}
+
+            if llm_payload:
+                self.record_span(
+                    state,
+                    "llm",
+                    "lead_action.select",
+                    lead_llm_started,
+                    model=self.settings.openai_model,
+                    provider=self.settings.openai_base_url,
+                    estimated_prompt_chars=len(prompt_text),
+                    estimated_completion_chars=len(json.dumps(llm_payload, ensure_ascii=False, default=str)),
+                    metadata={"attempt": attempt + 1, "retried": attempt > 0},
                 )
-                trace["tool"] = tool.trace_schema()
-            else:
-                llm_payload = llm.json_chat(
-                    "你是 BI Agent 的受限 LeadAction 选择器，只能在给定 action registry 候选中改选下一步。",
-                    json.dumps(payload, ensure_ascii=False, default=str),
-                    fallback={},
-                    timeout_seconds=lead_timeout_seconds,
-                )
-        except Exception as exc:
-            self.record_span(
-                state,
-                "llm",
-                "lead_action.select",
-                lead_llm_started,
-                status="failed",
-                error_code="LEAD_LLM_FAILED",
-                error_message=str(exc)[:300],
-                model=self.settings.openai_model,
-                provider=self.settings.openai_base_url,
-            )
-            trace.update({"status": "failed", "errorCode": "LEAD_LLM_FAILED", "errorMessage": str(exc)[:300]})
-            return self.lead_decision_unavailable(
-                state,
-                decision,
-                allowed,
-                trace,
-                "lead_action_llm_failed",
-                error_code="LEAD_LLM_FAILED",
-                error_message=str(exc)[:300],
-            )
-        llm_error = str(getattr(llm, "last_error", "") or "")
-        if not llm_payload:
-            error_code = "LEAD_LLM_TIMEOUT" if "timeout" in llm_error.lower() else "LEAD_LLM_EMPTY_RESPONSE"
+                state["lead_provider_error"] = ""
+                break
+
+            llm_error = raised_error or str(getattr(llm, "last_error", "") or "")
+            error_code, retryable = classify_lead_llm_failure(llm_error)
             error_message = llm_error or "provider returned no Lead action tool payload"
+            failure_observation = self.preserve_lead_action_failure_observation(
+                state,
+                trace,
+                attempt=attempt + 1,
+                error_code=error_code,
+                error_message=error_message,
+                retryable=retryable,
+            )
+            trace["attempts"].append(failure_observation)
             self.record_span(
                 state,
                 "llm",
@@ -1651,37 +1676,55 @@ class MerchantQaWorkflow:
                 error_message=error_message[:300],
                 model=self.settings.openai_model,
                 provider=self.settings.openai_base_url,
-                estimated_prompt_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
+                estimated_prompt_chars=len(prompt_text),
                 estimated_completion_chars=0,
+                metadata={"attempt": attempt + 1, "retryable": retryable},
             )
+            retry_timeout_seconds = 0
+            if retryable and attempt < max_retries:
+                retry_timeout_seconds = self.lead_action_retry_timeout_seconds(state, lead_timeout_seconds)
+            if retry_timeout_seconds > 0:
+                failure_observation["retryScheduled"] = True
+                # The sync LLM timeout worker cannot be force-cancelled. Lead
+                # selection is read-only/idempotent, so permit at most one
+                # overlapping retry and only while the global budget can cover it.
+                attempt += 1
+                attempt_timeout_seconds = retry_timeout_seconds
+                trace.update(
+                    {
+                        "status": "retrying",
+                        "reason": "lead_action_llm_retryable_failure",
+                        "errorCode": error_code,
+                        "errorMessage": error_message[:300],
+                        "retryAttempt": attempt,
+                        "retryTimeoutSeconds": retry_timeout_seconds,
+                    }
+                )
+                continue
+
+            failure_observation["retryScheduled"] = False
+            failure_reason = lead_llm_failure_reason(error_code)
             trace.update(
                 {
                     "status": "failed",
-                    "reason": "lead_action_llm_timeout" if error_code == "LEAD_LLM_TIMEOUT" else "lead_action_llm_empty_response",
+                    "reason": failure_reason,
                     "errorCode": error_code,
                     "errorMessage": error_message[:300],
                     "payload": {},
                 }
             )
+            if retryable and attempt < max_retries:
+                trace["retrySkippedReason"] = "insufficient_run_budget"
             return self.lead_decision_unavailable(
                 state,
                 decision,
                 allowed,
                 trace,
-                str(trace["reason"]),
+                failure_reason,
                 error_code=error_code,
                 error_message=error_message,
             )
-        self.record_span(
-            state,
-            "llm",
-            "lead_action.select",
-            lead_llm_started,
-            model=self.settings.openai_model,
-            provider=self.settings.openai_base_url,
-            estimated_prompt_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
-            estimated_completion_chars=len(json.dumps(llm_payload or {}, ensure_ascii=False, default=str)),
-        )
+        trace["recoveredAfterRetry"] = attempt > 0
         selected_action = str(
             (llm_payload or {}).get("actionId")
             or (llm_payload or {}).get("action_id")
@@ -1731,6 +1774,84 @@ class MerchantQaWorkflow:
             source="lead_llm_tool",
         )
 
+    def lead_action_retry_timeout_seconds(self, state: AgentState, lead_timeout_seconds: int) -> int:
+        """Return one full retry timeout only when the run can still answer safely."""
+
+        return retry_timeout_with_answer_reserve(
+            remaining_run_budget_seconds(state, self.settings),
+            lead_timeout_seconds,
+            int(getattr(self.settings, "llm_answer_timeout_seconds", 10) or 10),
+        )
+
+    def preserve_lead_action_failure_observation(
+        self,
+        state: AgentState,
+        trace: Dict[str, Any],
+        *,
+        attempt: int,
+        error_code: str,
+        error_message: str,
+        retryable: bool,
+    ) -> Dict[str, Any]:
+        """Persist an operational Lead failure for the next ReAct observation."""
+
+        prior_observation = deepcopy(trace.get("observation") or {})
+        prior_observation.pop("leadActionFailures", None)
+        failure = {
+            "stage": "lead_action.select",
+            "status": "retryable_failure" if retryable else "failed",
+            "attempt": max(1, int(attempt)),
+            "errorCode": str(error_code or "LEAD_LLM_FAILED"),
+            "errorMessage": str(error_message or "")[:300],
+            "retryable": bool(retryable),
+            "deterministicAction": str(trace.get("deterministicAction") or ""),
+            "allowedActions": [str(item) for item in trace.get("allowedActions", []) if str(item)],
+            "priorObservation": prior_observation,
+        }
+        pending = list(state.get("_pending_lead_action_failure_observations") or [])
+        pending.append(failure)
+        state["_pending_lead_action_failure_observations"] = pending[-4:]
+        return failure
+
+    def runtime_safe_lead_recovery_action(
+        self,
+        state: AgentState,
+        decision: AgentDecision,
+        allowed: List[str],
+    ) -> tuple[str, str, List[Dict[str, object]]]:
+        """Select a contract-safe progress action when model arbitration is unavailable."""
+
+        catalog = list(dict.fromkeys(str(item) for item in allowed if str(item)))
+        deterministic_action = str(decision.selected_action or "")
+        if deterministic_action in catalog:
+            return deterministic_action, "preserve_governed_policy_action", []
+
+        safe, blocked = self.policy.contract_safe_action_ids(state, catalog)
+
+        if state.get("pending_knowledge_requests") and "retrieve_knowledge" in safe:
+            return "retrieve_knowledge", "pending_knowledge_contract", blocked
+
+        final_actions = {"answer_data", "ask_human", "cache_answer", "terminal_end"}
+        progress_actions = [action_id for action_id in safe if action_id not in final_actions]
+        if progress_actions:
+            selected_action = progress_actions[0]
+            selected_score = -1
+            for action_id in progress_actions:
+                action = self.policy.registry.get(action_id)
+                unmet_postconditions = sum(
+                    1 for path in action.expected_state_keys if not state_path_ready(state, path)
+                ) + sum(
+                    1 for flag in action.expected_state_flags if not action_state_flag_ready(state, flag)
+                )
+                if unmet_postconditions > selected_score:
+                    selected_action = action_id
+                    selected_score = unmet_postconditions
+            return selected_action, "unmet_postcondition_progress", blocked
+
+        if safe:
+            return safe[0], "only_contract_safe_terminal_action", blocked
+        return "lead_arbitrate", "no_contract_safe_recovery_action", blocked
+
     def lead_decision_unavailable(
         self,
         state: AgentState,
@@ -1749,13 +1870,13 @@ class MerchantQaWorkflow:
         invents a business action outside the filtered catalog.
         """
 
-        deterministic_action = str(decision.selected_action or "")
-        if deterministic_action in allowed:
-            selected_action = deterministic_action
-            policy_source = "runtime_safe_fallback"
-        else:
-            selected_action = "answer_data"
-            policy_source = "runtime_explicit_failure"
+        selected_action, recovery_strategy, blocked = self.runtime_safe_lead_recovery_action(
+            state,
+            decision,
+            allowed,
+        )
+        policy_source = "runtime_safe_fallback" if selected_action in allowed else "runtime_explicit_failure"
+        if error_message or error_code.startswith("LEAD_LLM"):
             state["lead_provider_error"] = error_message or reason
         action = self.policy.registry.get(selected_action)
         available = list(dict.fromkeys([*allowed, selected_action]))
@@ -1767,6 +1888,11 @@ class MerchantQaWorkflow:
                 "errorMessage": str(error_message or "")[:300],
                 "selectedAction": selected_action,
                 "policySource": policy_source,
+                "recoverySelection": {
+                    "strategy": recovery_strategy,
+                    "selectedAction": selected_action,
+                    "blockedCandidates": blocked,
+                },
             }
         )
         return AgentDecision(
@@ -1775,7 +1901,7 @@ class MerchantQaWorkflow:
             available_actions=available,
             reason="%s; Lead arbitration failed and Runtime applied its explicit safety contract" % reason,
             budget_exhausted=decision.budget_exhausted,
-            observation=decision.observation,
+            observation=str((trace.get("observation") or {}).get("summary") or decision.observation),
             source=policy_source,
         )
 
@@ -1838,6 +1964,11 @@ class MerchantQaWorkflow:
         validation = state.get("query_graph_validation_result") or GraphValidationResult()
         run_result = state.get("agent_run_result") or AgentRunResult()
         plan = state.get("plan") or QueryPlan()
+        planner_operational_observations = list(
+            (plan.planner_prompt_stats or {}).get("operationalAttempts") or []
+        )
+        lead_action_failures = list(state.get("_pending_lead_action_failure_observations") or [])
+        state["_pending_lead_action_failure_observations"] = []
         pending_requests = state.get("pending_knowledge_requests") or []
         graph_gaps = getattr(validation, "gaps", []) or []
         evidence_gaps = getattr(run_result, "evidence_gaps", []) or []
@@ -1858,6 +1989,38 @@ class MerchantQaWorkflow:
             summary_parts.append("graphGaps=%d" % len(graph_gaps))
         if evidence_gaps:
             summary_parts.append("evidenceGaps=%d" % len(evidence_gaps))
+        if lead_action_failures:
+            summary_parts.append(
+                "leadActionFailures=%s"
+                % ",".join(str(item.get("errorCode") or "LEAD_LLM_FAILED") for item in lead_action_failures)
+            )
+        if planner_operational_observations:
+            recovered_planner_observations = [
+                item
+                for item in planner_operational_observations
+                if isinstance(item, dict) and item.get("recovered") is True
+            ]
+            terminal_planner_observations = [
+                item
+                for item in planner_operational_observations
+                if isinstance(item, dict) and item.get("recovered") is not True
+            ]
+            if recovered_planner_observations:
+                summary_parts.append(
+                    "plannerOperationalRetriesRecovered=%s"
+                    % ",".join(
+                        str(item.get("errorCode") or "PLANNER_LLM_FAILED")
+                        for item in recovered_planner_observations
+                    )
+                )
+            if terminal_planner_observations:
+                summary_parts.append(
+                    "plannerOperationalFailures=%s"
+                    % ",".join(
+                        str(item.get("errorCode") or "PLANNER_LLM_FAILED")
+                        for item in terminal_planner_observations
+                    )
+                )
         if state.get("human_clarification_required"):
             summary_parts.append("needsHuman=true")
         contract_block = state.get("contract_block_observation") or {}
@@ -1885,6 +2048,8 @@ class MerchantQaWorkflow:
             "graphGaps": [gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap for gap in graph_gaps[:6]],
             "evidenceGaps": [gap.model_dump(by_alias=True) if hasattr(gap, "model_dump") else gap for gap in evidence_gaps[:6]],
             "toolRuntimeFailures": state.get("tool_failures", [])[-4:],
+            "leadActionFailures": lead_action_failures,
+            "plannerOperationalObservations": planner_operational_observations,
             "contractBlockObservation": contract_block,
             "catalogContractBlocks": state.get("action_catalog_contract_blocks", []),
             "plannerReflection": (
@@ -3803,11 +3968,16 @@ class MerchantQaWorkflow:
         emit(state, "node.started", "COMPACT_ASSETS", {})
         resume_repair_after_compaction = self.awaiting_query_graph_repair_input(state) is not None
         self.invalidate_execution_outputs(state, "PlanningAssetPack 重新生成")
+        planning_hints = planning_hints_from_extracted_keywords(
+            state["question"],
+            state.get("extracted_keywords") or ExtractedKeywords(),
+        )
         pack = self.asset_builder.compact(
             state["question"],
             state["recall_bundle"],
             self._effective_topic_categories(state),
             self.open_diagnostic_debug(state),
+            planning_hints,
         )
         slots = state.get("route_slots") or RouteSlots()
         pack.metric_compaction["routeSlots"] = {
@@ -3822,7 +3992,10 @@ class MerchantQaWorkflow:
         pack.metric_compaction["requestLineage"] = state.get("knowledge_request_lineage") or {}
         retrieval_health = knowledge_retrieval_health_payload(state)
         pack.metric_compaction["retrievalHealth"] = retrieval_health
-        planning_gaps = list(state.get("knowledge_request_gaps") or [])
+        planning_gaps = [
+            *list(pack.metric_compaction.get("knowledgeRequestGaps") or []),
+            *list(state.get("knowledge_request_gaps") or []),
+        ]
         known_gap_ids = {
             (str(item.get("code") or ""), str(item.get("requestKey") or ""), str(item.get("backend") or ""), str(item.get("lane") or ""))
             for item in planning_gaps
@@ -4064,8 +4237,16 @@ class MerchantQaWorkflow:
         state["query_metric_completed"] = False
         self.invalidate_execution_outputs(state, "query_metric 重新生成受控 QueryGraph")
         pack = state.get("planning_asset_pack") or PlanningAssetPack()
+        time_window_contract: Dict[str, Any] = {}
+        if self.settings.calendar_time_semantics_enabled:
+            time_window_contract = dict(
+                state.get("time_window_contract")
+                or resolve_time_window_contract(state["question"], self.settings.business_timezone)
+            )
+            state["time_window_contract"] = time_window_contract
         planner_context = {
             "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
+            "timeWindowContract": time_window_contract,
             "memoryConstraints": state.get("memory_constraints", []),
             "memoryRecall": memory_recall_health_payload(state),
         }
@@ -4218,9 +4399,7 @@ class MerchantQaWorkflow:
             )
             emit(state, "node.completed", "QUERY_METRIC", {"supported": False, "fallback": "plan_query_graph"})
             return state
-        if self.settings.calendar_time_semantics_enabled:
-            time_window_contract = resolve_time_window_contract(state["question"], self.settings.business_timezone)
-            state["time_window_contract"] = time_window_contract
+        if time_window_contract:
             plan = apply_time_window_contract_to_plan(plan, time_window_contract)
         state["plan"] = plan
         state["query_graph_reflected"] = True
@@ -4344,6 +4523,13 @@ class MerchantQaWorkflow:
         emit(state, "node.started", "PLAN_QUERY_GRAPH", {})
         self.configure_artifact_roots(state)
         self.invalidate_execution_outputs(state, "QueryGraph 重新规划")
+        time_window_contract: Dict[str, Any] = {}
+        if self.settings.calendar_time_semantics_enabled:
+            time_window_contract = dict(
+                state.get("time_window_contract")
+                or resolve_time_window_contract(state["question"], self.settings.business_timezone)
+            )
+            state["time_window_contract"] = time_window_contract
         planner_package = self.prepare_scoped_context_package(
             state,
             "plan_query_graph",
@@ -4356,6 +4542,7 @@ class MerchantQaWorkflow:
             "openDiagnostic": self.open_diagnostic_debug(state),
             "previousUnderstanding": (state.get("plan") or QueryPlan()).question_understanding,
             "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
+            "timeWindowContract": time_window_contract,
             "threadContext": state.get("thread_context", {}),
             "conversationContext": planner_conversation_context(state),
             "runtimeInjection": state.get("runtime_injection", {}),
@@ -4370,6 +4557,12 @@ class MerchantQaWorkflow:
             planner_context,
             budget_chars=int(self.settings.context_planner_budget_chars or 12000),
         )
+        planner_remaining_seconds = remaining_run_budget_seconds(state, self.settings)
+        planner_context["runtimeBudget"] = {
+            "deadlineEpochMs": datetime.now(timezone.utc).timestamp() * 1000
+            + int(planner_remaining_seconds * 1000),
+            "remainingSecondsAtDispatch": planner_remaining_seconds,
+        }
         # Planner follows Diana-style progressive semantic reads: start from
         # workspace refs/catalog only, then semantic_read details on demand.
         planner_knowledge_context = ""
@@ -4383,9 +4576,7 @@ class MerchantQaWorkflow:
             state.get("thinking_steps", []),
             planner_context,
         )
-        if self.settings.calendar_time_semantics_enabled:
-            time_window_contract = resolve_time_window_contract(state["question"], self.settings.business_timezone)
-            state["time_window_contract"] = time_window_contract
+        if time_window_contract:
             plan = apply_time_window_contract_to_plan(plan, time_window_contract)
         state["plan"] = plan
         self.materialize_plan_clarification(state)
@@ -9521,6 +9712,11 @@ def planner_degraded_state(error: str, plan: QueryPlan, reason: str = "") -> Dic
         or "validated_after_llm_failure" in str(item)
         or "failure_fallback" in str(item)
     ]
+    failure_code = planner_failure_gap_code(plan)
+    if not provider_error and failure_code and failure_trace:
+        # Exceptions caught around the provider call may not mutate the
+        # adapter's last_error. Preserve the structured Planner observation.
+        provider_error = failure_trace[0]
     if not provider_error or (plan.intents and not failure_trace):
         return {}
     understanding = plan.question_understanding or {}
@@ -9528,7 +9724,9 @@ def planner_degraded_state(error: str, plan: QueryPlan, reason: str = "") -> Dic
         understanding.get("allowDegradedHypothesisExploration")
         or understanding.get("allow_degraded_hypothesis_exploration")
     )
-    if "timeout:" in provider_error:
+    if failure_code:
+        code = failure_code
+    elif "timeout:" in provider_error:
         code = "PLANNER_LLM_TIMEOUT"
     elif "provider_error:" in provider_error:
         code = "PLANNER_PROVIDER_ERROR"
@@ -10449,6 +10647,26 @@ def remaining_run_budget_seconds(state: AgentState, settings: Settings) -> float
     if latency.get("eligible") and str(latency.get("mode") or "").startswith("fast_path"):
         limit_seconds = int(getattr(settings, "run_budget_fast_duration_seconds", 25) or 25)
     return max(0.0, float(limit_seconds) - elapsed_seconds)
+
+
+def classify_lead_llm_failure(error: str) -> tuple[str, bool]:
+    """Map the shared transport classification onto Lead's typed error codes."""
+
+    classified = classify_llm_failure(error)
+    code = {
+        "TIMEOUT": "LEAD_LLM_TIMEOUT",
+        "EMPTY_RESPONSE": "LEAD_LLM_EMPTY_RESPONSE",
+        "PROVIDER_ERROR": "LEAD_LLM_PROVIDER_ERROR",
+    }.get(classified.kind, "LEAD_LLM_FAILED")
+    return code, classified.retryable
+
+
+def lead_llm_failure_reason(error_code: str) -> str:
+    return {
+        "LEAD_LLM_TIMEOUT": "lead_action_llm_timeout",
+        "LEAD_LLM_EMPTY_RESPONSE": "lead_action_llm_empty_response",
+        "LEAD_LLM_PROVIDER_ERROR": "lead_action_llm_provider_error",
+    }.get(str(error_code or ""), "lead_action_llm_failed")
 
 
 def lead_decision_fingerprint(state: AgentState, allowed: List[str]) -> str:

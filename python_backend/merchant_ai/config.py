@@ -259,6 +259,8 @@ class Settings(BaseSettings):
     agent_retrieve_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_RETRIEVE_ROUNDS")
     agent_plan_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_PLAN_ROUNDS")
     agent_graph_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_GRAPH_REPAIR_ROUNDS")
+    agent_lead_action_retries: int = Field(1, validation_alias="YSHOPPING_AGENT_LEAD_ACTION_RETRIES")
+    agent_planner_transient_retries: int = Field(1, validation_alias="YSHOPPING_AGENT_PLANNER_TRANSIENT_RETRIES")
     agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
     agent_planner_invalid_output_retries: int = Field(
         1,
@@ -276,7 +278,7 @@ class Settings(BaseSettings):
     agent_planner_seed_table_limit: int = Field(4, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_TABLE_LIMIT")
     agent_planner_seed_metric_limit: int = Field(14, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_METRIC_LIMIT")
     agent_asset_field_entry_limit: int = Field(240, validation_alias="YSHOPPING_AGENT_ASSET_FIELD_ENTRY_LIMIT")
-    agent_planner_prompt_budget_chars: int = Field(20000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
+    agent_planner_prompt_budget_chars: int = Field(30000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
     agent_node_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_NODE_FILE_TOOL_ROUNDS")
     answer_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_ANSWER_FILE_TOOL_ROUNDS")
     route_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_ROUTE_LLM_MODE")

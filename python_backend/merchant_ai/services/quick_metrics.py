@@ -1001,15 +1001,6 @@ def semantic_phrase_score(metric: Dict[str, Any], phrase: str) -> int:
     return best
 
 
-def extract_days(question: str) -> int:
-    if "昨天" in question or "昨日" in question:
-        return 1
-    if "今天" in question or "今日" in question:
-        return 1
-    match = re.search(r"(?:最近|近)?\s*(\d{1,3})\s*天", question)
-    return max(1, min(int(match.group(1)), 180)) if match else 7
-
-
 def time_range_label(question: str, days: int) -> str:
     if "昨天" in question or "昨日" in question:
         return "昨天"

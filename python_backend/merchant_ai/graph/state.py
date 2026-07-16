@@ -339,6 +339,7 @@ class AgentState(TypedDict, total=False):
     _clarification_tool_intercepted: bool
     _emitted_tool_runtime_event_ids: List[str]
     _lead_llm_decision_fingerprint: str
+    _pending_lead_action_failure_observations: List[Dict[str, Any]]
     _lead_previous_gap_counts: Dict[str, int]
     _lead_seen_recall_refs: List[str]
     _memory_middleware_retry_attempted: bool

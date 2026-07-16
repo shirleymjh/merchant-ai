@@ -6,7 +6,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
@@ -30,6 +30,7 @@ from merchant_ai.services.context_filesystem import add_context_uri, merchant_ur
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.repositories import DorisRepository, write_json
 from merchant_ai.services.semantic_request import semantic_request_cache_key
+from merchant_ai.services.semantic_joins import plan_governed_joins
 from merchant_ai.services.time_semantics import resolve_time_range
 from merchant_ai.services.tools import AgentToolDefinition
 
@@ -1874,8 +1875,10 @@ class PlanningAssetPackBuilder:
         recall_bundle: RecallBundle,
         topic_categories: List[QuestionCategory],
         diagnostic_context: Optional[Dict[str, Any]] = None,
+        planning_hints: Optional[Dict[str, Any]] = None,
     ) -> PlanningAssetPack:
         pack = PlanningAssetPack()
+        planning_hints = normalize_planning_hints(planning_hints)
         allow_profile = isinstance(diagnostic_context, dict) and diagnostic_context.get("scope") == "OPEN_DIAGNOSTIC"
         topics = self.topic_assets.topic_names_for_categories(topic_categories)
         if not topics:
@@ -1896,6 +1899,8 @@ class PlanningAssetPackBuilder:
             table_topic,
             allow_profile=allow_profile,
             explicit_tables=set(),
+            planning_hints=planning_hints,
+            all_relationships=all_relationships,
         )
         if allow_profile:
             profile_tables = self._diagnostic_profile_seed_tables(table_topic, limit=1)
@@ -1908,7 +1913,11 @@ class PlanningAssetPackBuilder:
             all_relationships,
             table_topic,
             allow_profile=allow_profile,
-            max_extra=2,
+            max_extra=(
+                0
+                if any(str(item) == "targeted_seed_source=dimension_relationship_closure" for item in targeted_traces)
+                else 2
+            ),
         )
         seed_tables.update(bridge_tables)
         pack_tables = {table for table in seed_tables if table}
@@ -1925,8 +1934,11 @@ class PlanningAssetPackBuilder:
             "asset_pack",
             topics=[category.value if isinstance(category, QuestionCategory) else str(category) for category in topic_categories],
             metrics=recalled_metrics,
-            dimensions=[],
-            filters=[diagnostic_context or {}] if diagnostic_context else [],
+            dimensions=list(planning_hints.get("dimensions") or []),
+            filters=[
+                *([diagnostic_context or {}] if diagnostic_context else []),
+                *([{"ranking": planning_hints.get("ranking")}] if planning_hints.get("ranking") else []),
+            ],
             time_range=resolve_time_range(question, self.topic_assets.settings.business_timezone),
             asset_version={
                 "semanticSourceHash": semantic_source_hash,
@@ -1941,6 +1953,7 @@ class PlanningAssetPackBuilder:
             pack.metric_compaction.setdefault("cache", {})["hit"] = True
             pack.metric_compaction.setdefault("cache", {})["semanticSourceHash"] = semantic_source_hash
             pack.metric_compaction.setdefault("cache", {})["liveSchemaHash"] = live_schema_hash
+            pack.metric_compaction["questionStructure"] = planning_hints
             return pack
         source_refs: Dict[str, RecallItem] = {}
         for item in recall_bundle.items:
@@ -1964,6 +1977,10 @@ class PlanningAssetPackBuilder:
         recalled_metric_evidence = recalled_metric_evidence_from_bundle(recall_bundle)
         if recalled_metric_evidence:
             pack.metric_compaction["recalledMetricEvidence"] = recalled_metric_evidence
+        pack.metric_compaction["questionStructure"] = planning_hints
+        recalled_relationship_evidence = recalled_relationship_evidence_from_bundle(recall_bundle)
+        if recalled_relationship_evidence:
+            pack.metric_compaction["recalledRelationshipEvidence"] = recalled_relationship_evidence
         if not pack.metrics and not recalled_metric_evidence and self._deferred_structured_understanding(targeted_traces):
             metric_candidates, metric_candidate_traces = self._topic_metric_candidates_for_deferred_understanding(question, topics)
             if metric_candidates:
@@ -1984,15 +2001,54 @@ class PlanningAssetPackBuilder:
         relationship_topics.update(table_topic.get(table, "") for table in pack_tables)
         relationship_topics.discard("")
         selected_relationships = []
-        for topic, rel in all_relationships:
+        required_relationship_edges = relationship_edges_from_targeted_traces(targeted_traces)
+        required_relationship_refs = {
+            str(item).split(":", 1)[1]
+            for item in targeted_traces
+            if str(item).startswith("dimension_relationship_ref:")
+        }
+        recalled_relationship_refs = {
+            str(item.get("semanticRefId") or "")
+            for item in recalled_relationship_evidence_from_bundle(recall_bundle)
+        }
+        ordered_relationships = sorted(
+            all_relationships,
+            key=lambda item: (
+                0
+                if "semantic:%s:relationship:%s" % (item[0], item[1].get("name") or "")
+                in recalled_relationship_refs
+                else 1,
+                str(item[0]),
+                str(item[1].get("name") or ""),
+            ),
+        )
+        for topic, rel in ordered_relationships:
             left = str(rel.get("leftTable") or "")
             right = str(rel.get("rightTable") or "")
+            relationship_ref = "semantic:%s:relationship:%s" % (topic, rel.get("name") or "")
+            if required_relationship_refs and relationship_ref not in required_relationship_refs:
+                continue
+            if not required_relationship_refs and required_relationship_edges and frozenset({left, right}) not in required_relationship_edges:
+                continue
             if left in pack_tables and right in pack_tables and topic in relationship_topics:
                 selected_relationships.append((topic, rel))
         for topic, rel in selected_relationships:
             entry = relationship_entry(topic, rel)
             if entry.relationship_id and entry.relationship_id not in {item.relationship_id for item in pack.relationships}:
                 pack.relationships.append(entry)
+        relationship_contracts, relationship_gaps = relationship_contract_assessment(
+            pack,
+            selected_relationships,
+            planning_hints,
+            targeted_traces,
+        )
+        if relationship_contracts:
+            pack.metric_compaction["relationshipContracts"] = relationship_contracts
+        trace_gaps = planning_gaps_from_asset_traces(targeted_traces)
+        if trace_gaps or relationship_gaps:
+            pack.metric_compaction["knowledgeRequestGaps"] = dedupe_planning_gaps(
+                [*trace_gaps, *relationship_gaps]
+            )
         pack.relationship_closure = targeted_traces + bridge_traces + metric_dependency_closure
         pack.metric_compaction.setdefault("targetedSeed", {})["tables"] = sorted(pack_tables)
         pack.metric_compaction.setdefault("targetedSeed", {})["trace"] = targeted_traces + bridge_traces
@@ -2406,9 +2462,16 @@ class PlanningAssetPackBuilder:
         table_topic: Dict[str, str],
         allow_profile: bool = False,
         explicit_tables: Set[str] | None = None,
+        planning_hints: Dict[str, Any] | None = None,
+        all_relationships: List[Tuple[str, Dict[str, Any]]] | None = None,
     ) -> Tuple[Set[str], List[str]]:
         explicit_tables = explicit_tables or set()
+        planning_hints = normalize_planning_hints(planning_hints)
+        dimension_obligations = planning_dimension_obligations(planning_hints)
+        all_relationships = list(all_relationships or [])
         precise_recalled_tables: Set[str] = set()
+        recalled_relationship_seed_tables: Set[str] = set()
+        recalled_relationship_refs: Set[str] = set()
         recalled_tables = {
             item.table
             for item in recall_bundle.items
@@ -2435,9 +2498,13 @@ class PlanningAssetPackBuilder:
         for item in recall_bundle.items:
             if str(item.source_type or "").upper() != "SEMANTIC_RELATIONSHIP":
                 continue
+            relationship_ref = str((item.metadata or {}).get("semanticRefId") or item.doc_id or "")
+            if relationship_ref:
+                recalled_relationship_refs.add(relationship_ref)
             for table in recalled_relationship_tables(item):
                 if self._table_allowed_for_recalled_item(question, item, table, allow_profile=allow_profile):
                     recalled_tables.add(table)
+                    recalled_relationship_seed_tables.add(table)
                     if self._recall_item_has_precise_table_evidence(item):
                         precise_recalled_tables.add(table)
         precise_metric_seed_tables, precise_metric_seed_traces = self._precise_metric_seed_tables(
@@ -2448,6 +2515,20 @@ class PlanningAssetPackBuilder:
         )
         precise_seed_tables = explicit_tables | precise_recalled_tables | precise_metric_seed_tables
         if precise_seed_tables:
+            if dimension_obligations:
+                dimension_seed_tables, dimension_traces = self._dimension_aware_seed_tables(
+                    question=question,
+                    planning_hints=planning_hints,
+                    precise_seed_tables=precise_seed_tables,
+                    precise_metric_seed_traces=precise_metric_seed_traces,
+                    recalled_relationship_tables=recalled_relationship_seed_tables,
+                    recalled_relationship_refs=recalled_relationship_refs,
+                    table_topic=table_topic,
+                    all_relationships=all_relationships,
+                    allow_profile=allow_profile,
+                )
+                if dimension_seed_tables:
+                    return dimension_seed_tables, dimension_traces
             source_parts: List[str] = []
             if explicit_tables:
                 source_parts.append("explicit_tables")
@@ -2558,8 +2639,448 @@ class PlanningAssetPackBuilder:
                         continue
                     seed_tables.add(table)
                     traces.append("precise_metric_seed:%s:%s:%s" % (table, metric_key, matched))
-                    break
         return seed_tables, traces
+
+    def _dimension_aware_seed_tables(
+        self,
+        *,
+        question: str,
+        planning_hints: Dict[str, Any],
+        precise_seed_tables: Set[str],
+        precise_metric_seed_traces: List[str],
+        recalled_relationship_tables: Set[str],
+        recalled_relationship_refs: Set[str],
+        table_topic: Dict[str, str],
+        all_relationships: List[Tuple[str, Dict[str, Any]]],
+        allow_profile: bool,
+    ) -> Tuple[Set[str], List[str]]:
+        """Replace dimension-incompatible summary seeds with executable facts.
+
+        Selection is driven by governed metric/field metadata and the published
+        relationship graph.  A relationship makes two owners reachable; it is
+        not treated as proof that a raw multi-fact aggregation is fanout-safe.
+        """
+
+        obligations = planning_dimension_obligations(planning_hints)
+        if not obligations:
+            return set(), []
+        graph = relationship_table_graph(all_relationships)
+        metric_phrases = [str(item) for item in planning_hints.get("metricPhrases") or [] if str(item or "").strip()]
+        preferred_dimension_owner = self._preferred_dimension_owner(
+            obligations,
+            table_topic,
+            graph,
+            candidate_metric_tables=set(),
+            require_dimension_layer=True,
+        )
+        incompatible_tables = {
+            table
+            for table in precise_seed_tables
+            if not self._table_satisfies_dimension_obligations(table, obligations, table_topic)
+            or (
+                preferred_dimension_owner
+                and preferred_dimension_owner != table
+                and self._table_business_layer(table, table_topic) in {"ADS", "SUMMARY"}
+            )
+        }
+        if not incompatible_tables:
+            # A governed owner already satisfies the requested grain.  Preserve
+            # the compact single-owner behavior unless a relationship is needed.
+            return set(precise_seed_tables), [
+                "targeted_seed_tables:%s"
+                % ",".join("%s=dimension_compatible_metric_owner" % table for table in sorted(precise_seed_tables)),
+                *precise_metric_seed_traces,
+                "targeted_seed_source=dimension_compatible_metric_owner",
+            ]
+
+        base_tables = set(precise_seed_tables) | set(recalled_relationship_tables)
+        preferred_detail_targets = self._detail_metric_targets(
+            precise_metric_seed_traces,
+            table_topic,
+        )
+        selected_metrics: List[Dict[str, Any]] = []
+        unresolved_phrases: List[str] = []
+        for phrase in metric_phrases:
+            candidates = self._dimension_metric_candidates(
+                phrase,
+                obligations,
+                table_topic,
+                graph,
+                base_tables,
+                incompatible_tables,
+                preferred_detail_targets.get(phrase, set()),
+            )
+            if not candidates:
+                unresolved_phrases.append(phrase)
+                continue
+            selected_metrics.append(candidates[0])
+
+        if not selected_metrics:
+            traces = downgrade_incompatible_metric_seed_traces(
+                precise_metric_seed_traces,
+                incompatible_tables,
+            )
+            for phrase in unresolved_phrases or metric_phrases:
+                traces.append(
+                    planning_gap_trace(
+                        {
+                            "code": "METRIC_DIMENSION_GRAIN_MISMATCH",
+                            "type": "METRIC",
+                            "query": "%s metric definition at requested dimension grain" % phrase,
+                            "reason": "exact metric owner does not support the requested dimension and no compatible metric owner is published",
+                            "metricRefs": metric_refs_for_phrase(planning_hints, phrase),
+                            "dimensionRefs": dimension_refs_for_obligations(obligations),
+                            "dimensionPhrase": dimension_phrase_for_obligations(obligations),
+                            "sourceOwners": sorted(incompatible_tables),
+                        }
+                    )
+                )
+            return set(precise_seed_tables), traces + ["targeted_seed_source=dimension_incompatible_fail_closed"]
+
+        metric_tables = {str(item.get("table") or "") for item in selected_metrics if item.get("table")}
+        dimension_owner = self._preferred_dimension_owner(
+            obligations,
+            table_topic,
+            graph,
+            candidate_metric_tables=metric_tables,
+            require_dimension_layer=False,
+        )
+        selected_tables: Set[str] = set(metric_tables)
+        traces = downgrade_incompatible_metric_seed_traces(
+            precise_metric_seed_traces,
+            incompatible_tables,
+        )
+        for item in selected_metrics:
+            traces.append(
+                "precise_metric_seed:%s:%s:%s"
+                % (item.get("table") or "", item.get("metricKey") or "", item.get("phrase") or "")
+            )
+            traces.append(
+                "dimension_compatible_metric_seed:%s:%s:score=%s"
+                % (item.get("table") or "", item.get("metricKey") or "", item.get("score") or 0)
+            )
+        if dimension_owner:
+            selected_tables.add(dimension_owner)
+            traces.append("dimension_authority_seed:%s" % dimension_owner)
+
+        if not dimension_owner:
+            traces.append(
+                planning_gap_trace(
+                    {
+                        "code": "RELATIONSHIP_DIMENSION_OWNER_REQUIRED",
+                        "type": "RELATIONSHIP",
+                        "query": "published dimension owner and relationship path for %s"
+                        % dimension_phrase_for_obligations(obligations),
+                        "reason": "no governed table can own the requested dimension",
+                        "metricRefs": [str(item.get("metricKey") or "") for item in selected_metrics],
+                        "dimensionRefs": dimension_refs_for_obligations(obligations),
+                        "dimensionPhrase": dimension_phrase_for_obligations(obligations),
+                        "sourceOwners": sorted(metric_tables),
+                        "targetOwner": "",
+                        "requiredSemantics": ["join_path", "canonical_entity", "cardinality", "fanout_policy"],
+                    }
+                )
+            )
+        else:
+            for metric in selected_metrics:
+                source_owner = str(metric.get("table") or "")
+                if not source_owner or source_owner == dimension_owner:
+                    continue
+                path = governed_dimension_path(
+                    all_relationships,
+                    source_owner,
+                    dimension_owner,
+                    obligations,
+                    max_hops=3,
+                )
+                if not path:
+                    traces.append(
+                        planning_gap_trace(
+                            {
+                                "code": "RELATIONSHIP_PATH_REQUIRED",
+                                "type": "RELATIONSHIP",
+                                "query": "relationship path from %s to %s for metric %s by dimension %s"
+                                % (
+                                    source_owner,
+                                    dimension_owner,
+                                    metric.get("metricKey") or metric.get("phrase") or "",
+                                    dimension_phrase_for_obligations(obligations),
+                                ),
+                                "reason": "metric owner lacks a published path to the requested dimension owner",
+                                "metricRefs": [str(metric.get("metricKey") or "")],
+                                "dimensionRefs": dimension_refs_for_obligations(obligations),
+                                "dimensionPhrase": dimension_phrase_for_obligations(obligations),
+                                "sourceOwner": source_owner,
+                                "targetOwner": dimension_owner,
+                                "requiredSemantics": ["join_path", "canonical_entity", "cardinality", "fanout_policy"],
+                            }
+                        )
+                    )
+                    continue
+                selected_tables.update(path)
+                if len(path) > 1:
+                    traces.append("dimension_relationship_path:%s" % "->".join(path))
+                    for left, right in zip(path, path[1:]):
+                        relationship_ref = governed_relationship_ref_for_edge(
+                            all_relationships,
+                            left,
+                            right,
+                            dimension_owner,
+                            obligations,
+                            recalled_relationship_refs,
+                        )
+                        if relationship_ref:
+                            traces.append("dimension_relationship_ref:%s" % relationship_ref)
+
+        if unresolved_phrases:
+            for phrase in unresolved_phrases:
+                traces.append(
+                    planning_gap_trace(
+                        {
+                            "code": "METRIC_DIMENSION_GRAIN_MISMATCH",
+                            "type": "METRIC",
+                            "query": "%s metric definition at requested dimension grain" % phrase,
+                            "reason": "no governed dimension-compatible metric candidate was found",
+                            "metricRefs": metric_refs_for_phrase(planning_hints, phrase),
+                            "dimensionRefs": dimension_refs_for_obligations(obligations),
+                            "dimensionPhrase": dimension_phrase_for_obligations(obligations),
+                            "sourceOwners": sorted(incompatible_tables),
+                        }
+                    )
+                )
+
+        selected_tables = {
+            table
+            for table in selected_tables
+            if table in table_topic
+            and self._table_allowed_for_topic_question(
+                table_topic.get(table, ""),
+                question,
+                table,
+                allow_profile=allow_profile,
+            )
+        }
+        traces.extend(
+            [
+                "targeted_seed_tables:%s"
+                % ",".join("%s=dimension_relationship_closure" % table for table in sorted(selected_tables)),
+                "table_selection_explanations:%s"
+                % json.dumps(
+                    [
+                        {
+                            "strategy": "dimension_relationship_closure",
+                            "reason": "metric owners connected to requested dimension through published relationships",
+                            "ownerTables": sorted(selected_tables),
+                            "excludedSummaryOwners": sorted(incompatible_tables - selected_tables),
+                        }
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "targeted_seed_source=dimension_relationship_closure",
+            ]
+        )
+        return selected_tables, traces
+
+    def _dimension_metric_candidates(
+        self,
+        phrase: str,
+        obligations: List[Dict[str, Any]],
+        table_topic: Dict[str, str],
+        graph: Dict[str, Set[str]],
+        base_tables: Set[str],
+        incompatible_tables: Set[str],
+        preferred_targets: Set[Tuple[str, str]],
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for topic in self.topic_assets.all_topic_names():
+            for manifest_item in self.topic_assets.load_manifest(topic):
+                table = str(manifest_item.get("tableName") or "")
+                if not table or table in incompatible_tables or table_topic.get(table) != topic:
+                    continue
+                if not self._table_queryable_for_topic(topic, table):
+                    continue
+                distance = shortest_distance_from_tables(graph, base_tables, table, max_hops=3)
+                if base_tables and distance is None:
+                    continue
+                for metric in self.topic_assets.load_table_metrics(topic, table):
+                    metric_key = str(metric.get("metricKey") or "")
+                    is_preferred_target = (table, metric_key) in preferred_targets
+                    similarity = semantic_exact_phrase_similarity(
+                        phrase,
+                        [
+                            str(metric.get("businessName") or ""),
+                            str(metric.get("displayName") or ""),
+                            metric_key,
+                            *[str(alias) for alias in metric.get("aliases") or []],
+                        ],
+                    )
+                    if not is_preferred_target and similarity <= 0:
+                        continue
+                    if is_preferred_target:
+                        similarity = max(similarity, 160)
+                    metric_kind = str(metric.get("tableKind") or "").lower()
+                    metric_intent = str(metric.get("metricIntent") or "").lower()
+                    dimension_score = self._table_dimension_score(table, obligations, table_topic)
+                    score = similarity + dimension_score
+                    if "detail" in metric_kind or "detail" in metric_intent:
+                        score += 24
+                    formula = str(metric.get("formula") or "")
+                    if re.search(r"\b(case|when|filter)\b", formula, re.I):
+                        # Conditional variants remain eligible when the user's
+                        # phrase names the condition, but do not outrank the
+                        # unconditioned base measure merely because their label
+                        # contains more words.
+                        score -= 28
+                    if distance is not None:
+                        score += max(0, 12 - distance * 3)
+                    candidates.append(
+                        {
+                            "table": table,
+                            "topic": topic,
+                            "metricKey": metric_key,
+                            "phrase": phrase,
+                            "score": score,
+                            "distance": distance,
+                        }
+                    )
+        return sorted(
+            candidates,
+            key=lambda item: (
+                -int(item.get("score") or 0),
+                int(item.get("distance")) if item.get("distance") is not None else 99,
+                str(item.get("table") or ""),
+                str(item.get("metricKey") or ""),
+            ),
+        )
+
+    def _detail_metric_targets(
+        self,
+        precise_metric_seed_traces: List[str],
+        table_topic: Dict[str, str],
+    ) -> Dict[str, Set[Tuple[str, str]]]:
+        targets: Dict[str, Set[Tuple[str, str]]] = {}
+        for trace in precise_metric_seed_traces:
+            text = str(trace or "")
+            if not text.startswith("precise_metric_seed:"):
+                continue
+            parts = text.split(":", 3)
+            if len(parts) < 4:
+                continue
+            _prefix, owner_table, metric_key, phrase = parts
+            topic = table_topic.get(owner_table, "")
+            if not topic:
+                continue
+            metric = next(
+                (
+                    item
+                    for item in self.topic_assets.load_table_metrics(topic, owner_table)
+                    if str(item.get("metricKey") or "") == metric_key
+                ),
+                {},
+            )
+            detail_ref = str(
+                metric.get("detailMetricRef")
+                or metric.get("drilldownMetricRef")
+                or metric.get("detail_metric_ref")
+                or ""
+            )
+            detail_identity = semantic_metric_ref_identity(detail_ref)
+            if detail_identity:
+                targets.setdefault(phrase, set()).add(detail_identity)
+        return targets
+
+    def _preferred_dimension_owner(
+        self,
+        obligations: List[Dict[str, Any]],
+        table_topic: Dict[str, str],
+        graph: Dict[str, Set[str]],
+        candidate_metric_tables: Set[str],
+        require_dimension_layer: bool,
+    ) -> str:
+        del graph, candidate_metric_tables, require_dimension_layer
+        candidates: List[Tuple[int, str]] = []
+        requested_topics = {str(item.get("topic") or "") for item in obligations if item.get("topic")}
+        declared_owners = {
+            str(item.get("ownerTable") or "")
+            for item in obligations
+            if str(item.get("ownerTable") or "")
+        }
+        # Field existence is not an authority contract. Only owners carried by
+        # governed dimension mentions are eligible; otherwise the caller emits
+        # RELATIONSHIP_DIMENSION_OWNER_REQUIRED instead of guessing from graph
+        # centrality or a same-named fact column.
+        for table in sorted(declared_owners):
+            topic = table_topic.get(table, "")
+            if not topic:
+                continue
+            score = self._table_dimension_score(table, obligations, table_topic)
+            if score <= 0:
+                continue
+            layer = self._table_business_layer(table, table_topic)
+            if layer == "DIM":
+                score += 80
+            if topic in requested_topics or str(self.topic_assets.resolve_topic_category(topic)) in requested_topics:
+                score += 24
+            asset = self.topic_assets.load_table_asset(topic, table)
+            usage = asset.get("tableUsageProfile") if isinstance(asset, dict) else {}
+            score += min(int((usage or {}).get("authorityLevel") or 0), 100)
+            candidates.append((score, table))
+        return max(candidates, default=(0, ""), key=lambda item: (item[0], item[1]))[1]
+
+    def _table_satisfies_dimension_obligations(
+        self,
+        table: str,
+        obligations: List[Dict[str, Any]],
+        table_topic: Dict[str, str],
+    ) -> bool:
+        groups = dimension_obligation_groups(obligations)
+        if not groups:
+            return True
+        topic = table_topic.get(table, "")
+        fields = self.topic_assets.load_table_semantic_columns(topic, table) if topic else []
+        columns = {
+            str(item.get("columnName") or "")
+            for item in fields
+            if isinstance(item, dict) and str(item.get("columnName") or "")
+        }
+        return all(columns.intersection(columns_for_group) for columns_for_group in groups.values())
+
+    def _table_dimension_score(
+        self,
+        table: str,
+        obligations: List[Dict[str, Any]],
+        table_topic: Dict[str, str],
+    ) -> int:
+        topic = table_topic.get(table, "")
+        if not topic:
+            return 0
+        fields = self.topic_assets.load_table_semantic_columns(topic, table)
+        by_column = {
+            str(item.get("columnName") or ""): item
+            for item in fields
+            if isinstance(item, dict) and str(item.get("columnName") or "")
+        }
+        score = 0
+        for columns in dimension_obligation_groups(obligations).values():
+            matches = [by_column[column] for column in columns if column in by_column]
+            if not matches:
+                return 0
+            match_score = max(
+                20
+                + (16 if str(item.get("role") or "").upper() == "KEY" else 4)
+                for item in matches
+            )
+            score += match_score
+        return score
+
+    def _table_business_layer(self, table: str, table_topic: Dict[str, str]) -> str:
+        topic = table_topic.get(table, "")
+        if not topic:
+            return ""
+        asset = self.topic_assets.load_table_asset(topic, table)
+        usage = asset.get("tableUsageProfile") if isinstance(asset, dict) else {}
+        return str((usage or {}).get("businessLayer") or "").upper()
 
     def _recall_item_has_precise_table_evidence(self, item: RecallItem) -> bool:
         source_type = str(item.source_type or "").upper()
@@ -3118,6 +3639,490 @@ def recalled_relationship_tables(item: RecallItem) -> List[str]:
     if item.table and item.table not in tables:
         tables.append(item.table)
     return tables
+
+
+def normalize_planning_hints(value: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    metric_phrases = dedupe_strings([str(item) for item in value.get("metricPhrases") or value.get("metric_phrases") or []])
+    dimension_keywords = dedupe_strings(
+        [str(item) for item in value.get("dimensionKeywords") or value.get("dimension_keywords") or []]
+    )
+    dimensions = [dict(item) for item in value.get("dimensions") or [] if isinstance(item, dict)]
+    ranking = value.get("ranking") if isinstance(value.get("ranking"), dict) else {}
+    return {
+        key: item
+        for key, item in {
+            "metricPhrases": metric_phrases,
+            "dimensionKeywords": dimension_keywords,
+            "dimensions": dimensions,
+            "ranking": dict(ranking),
+            "analysisIntent": str(value.get("analysisIntent") or value.get("analysis_intent") or ""),
+        }.items()
+        if item not in (None, "", [], {})
+    }
+
+
+def planning_dimension_obligations(planning_hints: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    hints = normalize_planning_hints(planning_hints)
+    obligations: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+    for item in hints.get("dimensions") or []:
+        phrase = str(item.get("phrase") or "")
+        column = str(item.get("column") or item.get("canonicalKey") or "")
+        topic = str(item.get("topic") or "")
+        owner = str(item.get("ownerTable") or "")
+        identity = (phrase, column, topic, owner)
+        if not column or identity in seen:
+            continue
+        seen.add(identity)
+        obligations.append(
+            {
+                "phrase": phrase or column,
+                "column": column,
+                "topic": topic,
+                "ownerTable": owner,
+                "role": str(item.get("role") or ""),
+                "source": str(item.get("source") or ""),
+            }
+        )
+    return obligations
+
+
+def dimension_obligation_groups(obligations: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+    groups: Dict[str, Set[str]] = {}
+    for item in obligations:
+        phrase = str(item.get("phrase") or item.get("column") or "")
+        column = str(item.get("column") or "")
+        if phrase and column:
+            groups.setdefault(phrase, set()).add(column)
+    return groups
+
+
+def dimension_refs_for_obligations(obligations: List[Dict[str, Any]]) -> List[str]:
+    return dedupe_strings([str(item.get("column") or "") for item in obligations])
+
+
+def dimension_phrase_for_obligations(obligations: List[Dict[str, Any]]) -> str:
+    return " / ".join(dedupe_strings([str(item.get("phrase") or "") for item in obligations]))
+
+
+def metric_refs_for_phrase(planning_hints: Dict[str, Any], phrase: str) -> List[str]:
+    ranking = planning_hints.get("ranking") if isinstance(planning_hints.get("ranking"), dict) else {}
+    if str(ranking.get("anchorMetricPhrase") or "") == str(phrase or ""):
+        return dedupe_strings([str(item) for item in ranking.get("anchorMetricCandidates") or []])
+    return []
+
+
+def relationship_table_graph(
+    relationships: List[Tuple[str, Dict[str, Any]]],
+) -> Dict[str, Set[str]]:
+    graph: Dict[str, Set[str]] = {}
+    for _topic, rel in relationships:
+        left = str(rel.get("leftTable") or "")
+        right = str(rel.get("rightTable") or "")
+        if not left or not right:
+            continue
+        graph.setdefault(left, set()).add(right)
+        graph.setdefault(right, set()).add(left)
+    return graph
+
+
+def relationship_edges_from_targeted_traces(traces: List[str]) -> Set[FrozenSet[str]]:
+    edges: Set[FrozenSet[str]] = set()
+    for trace in traces:
+        text = str(trace or "")
+        if not text.startswith("dimension_relationship_path:"):
+            continue
+        path = [item for item in text.split(":", 1)[1].split("->") if item]
+        for left, right in zip(path, path[1:]):
+            edges.add(frozenset({left, right}))
+    return edges
+
+
+def shortest_distance_from_tables(
+    graph: Dict[str, Set[str]],
+    starts: Set[str],
+    target: str,
+    max_hops: int = 3,
+) -> int | None:
+    if target in starts:
+        return 0
+    distances = [
+        len(path) - 1
+        for start in starts
+        for path in [shortest_table_path(graph, start, target, max_hops=max_hops)]
+        if path
+    ]
+    return min(distances) if distances else None
+
+
+def governed_dimension_path(
+    relationships: List[Tuple[str, Dict[str, Any]]],
+    source: str,
+    target: str,
+    obligations: List[Dict[str, Any]],
+    max_hops: int = 3,
+) -> List[str]:
+    """Choose a published path whose final edge reaches the governed key.
+
+    A shorter name-based edge must not outrank a slightly longer path that lands
+    on the KEY declared by the dimension obligation.  The function only ranks
+    published edges; it never synthesizes a join.
+    """
+
+    graph = relationship_table_graph(relationships)
+    if source == target:
+        return [source]
+    paths: List[List[str]] = []
+
+    def visit(path: List[str]) -> None:
+        if len(path) - 1 >= max_hops:
+            return
+        for neighbor in sorted(graph.get(path[-1], set())):
+            if neighbor in path:
+                continue
+            candidate = [*path, neighbor]
+            if neighbor == target:
+                paths.append(candidate)
+            else:
+                visit(candidate)
+
+    visit([source])
+    if not paths:
+        return []
+    target_obligations = [
+        item
+        for item in obligations
+        if not str(item.get("ownerTable") or "") or str(item.get("ownerTable") or "") == target
+    ] or obligations
+    preferred_columns = {
+        str(item.get("column") or "")
+        for item in target_obligations
+        if str(item.get("role") or "").upper() == "KEY" and str(item.get("column") or "")
+    }
+    all_columns = {
+        str(item.get("column") or "")
+        for item in target_obligations
+        if str(item.get("column") or "")
+    }
+
+    def path_score(path: List[str]) -> Tuple[int, int, str]:
+        previous = path[-2]
+        landing_columns: Set[str] = set()
+        explicit_authority = 0
+        for _topic, rel in relationships:
+            left = str(rel.get("leftTable") or "")
+            right = str(rel.get("rightTable") or "")
+            if {left, right} != {previous, target}:
+                continue
+            for pair in rel.get("keys") or []:
+                if not isinstance(pair, list) or len(pair) < 2:
+                    continue
+                landing_columns.add(str(pair[1] if right == target else pair[0]))
+            if rel.get("canonicalEntityRef") or rel.get("entityMapping") or rel.get("fieldAuthority"):
+                explicit_authority = 40
+        authority_score = explicit_authority
+        if preferred_columns.intersection(landing_columns):
+            authority_score += 120
+        elif all_columns.intersection(landing_columns):
+            authority_score += 35
+        return (authority_score, -(len(path) - 1), "->".join(path))
+
+    return max(paths, key=path_score)
+
+
+def governed_relationship_ref_for_edge(
+    relationships: List[Tuple[str, Dict[str, Any]]],
+    left_table: str,
+    right_table: str,
+    dimension_owner: str,
+    obligations: List[Dict[str, Any]],
+    recalled_refs: Set[str] | None = None,
+) -> str:
+    recalled_refs = recalled_refs or set()
+    preferred_columns = {
+        str(item.get("column") or "")
+        for item in obligations
+        if str(item.get("ownerTable") or "") == dimension_owner
+        and str(item.get("role") or "").upper() == "KEY"
+        and str(item.get("column") or "")
+    }
+    candidates: List[Tuple[int, str]] = []
+    for topic, rel in relationships:
+        rel_left = str(rel.get("leftTable") or "")
+        rel_right = str(rel.get("rightTable") or "")
+        if {rel_left, rel_right} != {left_table, right_table}:
+            continue
+        ref = "semantic:%s:relationship:%s" % (topic, rel.get("name") or "")
+        score = 1000 if ref in recalled_refs else 0
+        if dimension_owner in {rel_left, rel_right}:
+            landing_columns = {
+                str(pair[0] if rel_left == dimension_owner else pair[1])
+                for pair in rel.get("keys") or []
+                if isinstance(pair, list) and len(pair) >= 2
+            }
+            if preferred_columns.intersection(landing_columns):
+                score += 120
+        if rel.get("canonicalEntityRef") or rel.get("entityMapping") or rel.get("fieldAuthority"):
+            score += 50
+        candidates.append((score, ref))
+    return max(candidates, default=(0, ""), key=lambda item: (item[0], item[1]))[1]
+
+
+def semantic_phrase_similarity(phrase: str, labels: List[str]) -> int:
+    target = normalize_for_match(phrase)
+    if not target:
+        return 0
+    best = 0
+    target_bigrams = semantic_bigrams(target)
+    for raw_label in labels:
+        label = normalize_for_match(raw_label)
+        if not label:
+            continue
+        if target == label:
+            best = max(best, 120)
+            continue
+        if target in label or label in target:
+            best = max(best, 105)
+        if semantic_subsequence(target, label):
+            best = max(best, 88)
+        label_bigrams = semantic_bigrams(label)
+        if target_bigrams:
+            overlap = len(target_bigrams.intersection(label_bigrams)) / len(target_bigrams)
+            best = max(best, int(overlap * 72))
+    return best
+
+
+def semantic_exact_phrase_similarity(phrase: str, labels: List[str]) -> int:
+    target = normalize_for_match(phrase)
+    if not target:
+        return 0
+    return 120 if any(normalize_for_match(label) == target for label in labels if str(label or "").strip()) else 0
+
+
+def semantic_metric_ref_identity(ref_id: str) -> Tuple[str, str] | None:
+    parts = [part for part in str(ref_id or "").split(":") if part]
+    if len(parts) < 5 or parts[-2] != "metric":
+        return None
+    table = parts[-3]
+    metric_key = parts[-1]
+    return (table, metric_key) if table and metric_key else None
+
+
+def semantic_subsequence(needle: str, haystack: str) -> bool:
+    if len(needle) < 2 or not haystack:
+        return False
+    index = 0
+    for character in haystack:
+        if index < len(needle) and needle[index] == character:
+            index += 1
+    return index == len(needle)
+
+
+def semantic_bigrams(value: str) -> Set[str]:
+    return {value[index : index + 2] for index in range(max(0, len(value) - 1))}
+
+
+def downgrade_incompatible_metric_seed_traces(
+    traces: List[str],
+    incompatible_tables: Set[str],
+) -> List[str]:
+    downgraded: List[str] = []
+    for trace in traces:
+        text = str(trace or "")
+        if not text.startswith("precise_metric_seed:"):
+            downgraded.append(text)
+            continue
+        parts = text.split(":", 3)
+        if len(parts) >= 2 and parts[1] in incompatible_tables:
+            downgraded.append("dimension_incompatible_metric_seed:%s" % text[len("precise_metric_seed:") :])
+        else:
+            downgraded.append(text)
+    return downgraded
+
+
+def planning_gap_trace(gap: Dict[str, Any]) -> str:
+    return "planning_gap:%s" % json.dumps(gap, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def planning_gaps_from_asset_traces(traces: List[str]) -> List[Dict[str, Any]]:
+    gaps: List[Dict[str, Any]] = []
+    for trace in traces:
+        text = str(trace or "")
+        if not text.startswith("planning_gap:"):
+            continue
+        try:
+            payload = json.loads(text[len("planning_gap:") :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            gaps.append(payload)
+    return gaps
+
+
+def recalled_relationship_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Dict[str, Any]]:
+    evidence: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for item in recall_bundle.items:
+        if str(item.source_type or "").upper() != "SEMANTIC_RELATIONSHIP":
+            continue
+        metadata = item.metadata or {}
+        ref = str(metadata.get("semanticRefId") or item.doc_id or "")
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        evidence.append(
+            {
+                "semanticRefId": ref,
+                "relationshipId": str(metadata.get("relationshipId") or metadata.get("name") or ""),
+                "leftTable": str(metadata.get("leftTable") or ""),
+                "rightTable": str(metadata.get("rightTable") or ""),
+            }
+        )
+    return evidence
+
+
+def relationship_contract_assessment(
+    asset_pack: PlanningAssetPack,
+    relationships: List[Tuple[str, Dict[str, Any]]],
+    planning_hints: Dict[str, Any],
+    targeted_traces: List[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    dimensions = planning_dimension_obligations(planning_hints)
+    metric_seed_count = len(
+        {
+            tuple(str(trace).split(":", 3)[1:3])
+            for trace in targeted_traces
+            if str(trace).startswith("precise_metric_seed:") and len(str(trace).split(":", 3)) >= 3
+        }
+    )
+    metric_refs = dedupe_strings(
+        [
+            str(trace).split(":", 3)[2]
+            for trace in targeted_traces
+            if str(trace).startswith("precise_metric_seed:") and len(str(trace).split(":", 3)) >= 3
+        ]
+    )
+    requires_cross_owner_aggregation = bool(dimensions and metric_seed_count > 0)
+    contracts: List[Dict[str, Any]] = []
+    gaps: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    canonical_refs: List[str] = []
+    for topic, rel in relationships:
+        identity = (
+            str(rel.get("name") or ""),
+            str(rel.get("leftTable") or ""),
+            str(rel.get("rightTable") or ""),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        ref = "semantic:%s:relationship:%s" % (topic, rel.get("name") or "")
+        cardinality = rel.get("cardinality") or rel.get("relationshipCardinality")
+        fanout_policy = rel.get("fanoutPolicy") or rel.get("aggregationJoinPolicy") or rel.get("preAggregate")
+        canonical_entity = rel.get("canonicalEntityRef") or rel.get("entityMapping")
+        if canonical_entity:
+            canonical_refs.append(ref)
+        contracts.append(
+            {
+                "sourceRefId": ref,
+                "relationshipId": identity[0],
+                "leftTable": identity[1],
+                "rightTable": identity[2],
+                "joinKeysDeclared": bool(rel.get("keys")),
+                "grainDeclared": bool(rel.get("grain")),
+                "cardinality": cardinality or "undeclared",
+                "fanoutPolicy": fanout_policy or "undeclared",
+                "canonicalEntity": canonical_entity or "undeclared",
+                "cautions": [str(item) for item in rel.get("cautions") or []],
+            }
+        )
+    if requires_cross_owner_aggregation:
+        dimension_owner = next(
+            (
+                str(trace).split(":", 1)[1]
+                for trace in targeted_traces
+                if str(trace).startswith("dimension_authority_seed:")
+            ),
+            "",
+        )
+        metric_owners = {
+            str(trace).split(":", 3)[1]
+            for trace in targeted_traces
+            if str(trace).startswith("precise_metric_seed:") and len(str(trace).split(":", 3)) >= 3
+        }
+        if dimension_owner and metric_owners:
+            # Validate each measure branch in its real direction: fact owner ->
+            # authoritative dimension, then pre-aggregate.  A single connector
+            # tree rooted at the dimension would model a raw multi-fact join and
+            # could reverse many-to-one safety.
+            for metric_owner in sorted(metric_owners - {dimension_owner}):
+                join_result = plan_governed_joins(
+                    asset_pack,
+                    base_table=metric_owner,
+                    required_tables=[dimension_owner],
+                    usage="aggregate",
+                )
+                branch_gaps = list(join_result.gaps)
+                if any(gap.code != "JOIN_PATH_NOT_FOUND" for gap in branch_gaps):
+                    branch_gaps = [gap for gap in branch_gaps if gap.code != "JOIN_PATH_NOT_FOUND"]
+                for gap in branch_gaps:
+                    gaps.append(
+                        {
+                            "code": gap.code,
+                            "type": "RELATIONSHIP",
+                            "query": "governed aggregate projection from %s to %s"
+                            % (metric_owner, dimension_owner),
+                            "reason": gap.reason,
+                            "metricRefs": metric_refs,
+                            "dimensionRefs": dimension_refs_for_obligations(dimensions),
+                            "dimensionPhrase": dimension_phrase_for_obligations(dimensions),
+                            "relationshipRefs": [gap.relationship_ref_id] if gap.relationship_ref_id else [],
+                            "sourceOwner": metric_owner,
+                            "targetOwner": dimension_owner,
+                            "requiredSemantics": [
+                                "directional_cardinality",
+                                "pre_aggregate_grain",
+                                "dedup_key",
+                                "fanout_policy",
+                            ],
+                            "evidence": gap.evidence,
+                        }
+                    )
+    if requires_cross_owner_aggregation and relationships and not canonical_refs:
+        gaps.append(
+            {
+                "code": "RELATIONSHIP_CANONICAL_ENTITY_UNDECLARED",
+                "type": "RELATIONSHIP",
+                "query": "canonical entity mapping for dimension %s" % dimension_phrase_for_obligations(dimensions),
+                "reason": "published join paths do not declare which cross-table field is authoritative for the requested entity",
+                "metricRefs": metric_refs,
+                "dimensionRefs": dimension_refs_for_obligations(dimensions),
+                "dimensionPhrase": dimension_phrase_for_obligations(dimensions),
+                "relationshipRefs": [item["sourceRefId"] for item in contracts],
+                "requiredSemantics": ["canonical_entity", "field_authority", "equivalence_policy"],
+            }
+        )
+    return contracts, gaps
+
+
+def dedupe_planning_gaps(gaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        identity = (
+            str(gap.get("code") or ""),
+            str(gap.get("query") or ""),
+            str(gap.get("sourceOwner") or gap.get("sourceOwners") or ""),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(gap)
+    return selected
 
 
 def dedupe_entries_by_identity(entries: List[PlanningAssetEntry]) -> List[PlanningAssetEntry]:

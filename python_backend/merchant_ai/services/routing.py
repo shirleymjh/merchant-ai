@@ -14,12 +14,15 @@ from merchant_ai.models import (
     QuestionRoute,
     RecallBundle,
     RouteObjectRef,
+    RouteLexicalSpan,
+    RouteSpanType,
     RouteSlots,
     RouteTimeWindow,
     RouteTopicCandidate,
     RoutingDecision,
     TopicRoutingDecision,
 )
+from merchant_ai.services.time_semantics import extract_temporal_lexical_spans, resolve_time_range
 
 
 ACTION_KEYWORDS = [
@@ -57,16 +60,177 @@ ACTION_KEYWORDS = [
     "最多",
     "最少",
 ]
-RANKING_PATTERNS = [
-    re.compile(r"前\s*\d+"),
-    re.compile(r"top\s*\d+", re.I),
-    re.compile(r"最高|最低|最多|最少|排名|排行"),
+RANKING_SPAN_PATTERNS = [
+    ("ordinal_prefix", re.compile(r"前\s*\d+")),
+    ("top_n", re.compile(r"top\s*\d+", re.I)),
+    ("ranking_operator", re.compile(r"最高|最低|最多|最少|排名|排行")),
 ]
-TIME_PATTERNS = [
-    re.compile(r"(最近|近|过去|前)?\s*\d{1,3}\s*[天日]"),
-    re.compile(r"(最近|近|过去|前)?\s*\d{1,2}\s*(周|星期|礼拜)"),
-    re.compile(r"(最近|近|过去|前)?\s*\d{1,2}\s*(个月|月)"),
-]
+
+
+def route_span_overlaps(left: RouteLexicalSpan, right: RouteLexicalSpan) -> bool:
+    return int(left.start) < int(right.end) and int(right.start) < int(left.end)
+
+
+def extract_pattern_spans(
+    text: str,
+    span_type: RouteSpanType,
+    patterns: List[tuple[str, re.Pattern[str]]],
+) -> List[RouteLexicalSpan]:
+    candidates: List[RouteLexicalSpan] = []
+    for source, pattern in patterns:
+        for match in pattern.finditer(str(text or "")):
+            candidates.append(
+                RouteLexicalSpan(
+                    span_type=span_type,
+                    start=match.start(),
+                    end=match.end(),
+                    text=match.group(0).strip(),
+                    source=source,
+                )
+            )
+    candidates.sort(key=lambda item: (item.start, -(item.end - item.start), item.source))
+    accepted: List[RouteLexicalSpan] = []
+    for candidate in candidates:
+        if any(route_span_overlaps(candidate, current) for current in accepted):
+            continue
+        accepted.append(candidate)
+    return accepted
+
+
+def extract_route_lexical_spans(text: str) -> List[RouteLexicalSpan]:
+    """Resolve temporal/ranking ambiguity through typed span precedence.
+
+    Temporal syntax owns an overlapping interval before ranking syntax is
+    considered. A numeric prefix with a time unit is therefore temporal,
+    while the same prefix before a non-time entity remains Top-N syntax.
+    """
+
+    temporal = extract_temporal_lexical_spans(text)
+    ranking_candidates = extract_pattern_spans(text, RouteSpanType.RANKING, RANKING_SPAN_PATTERNS)
+    ranking = [
+        candidate
+        for candidate in ranking_candidates
+        if not any(route_span_overlaps(candidate, occupied) for occupied in temporal)
+    ]
+    return sorted([*temporal, *ranking], key=lambda item: (item.start, item.end, item.span_type))
+
+
+def planning_hints_from_extracted_keywords(
+    question: str,
+    keywords: ExtractedKeywords | None,
+) -> Dict[str, Any]:
+    """Project routing evidence into the typed obligations used by planning.
+
+    The projection deliberately consumes governed keyword mentions and typed
+    lexical spans.  Asset compaction can therefore reason about a requested
+    dimension or Top-N contract without re-interpreting business words from the
+    raw question.
+    """
+
+    keywords = keywords or ExtractedKeywords()
+    normalized = str(keywords.normalized_question or normalize_keyword_text(question or ""))
+    metric_mentions = [item for item in keywords.mentions if item.kind == "metric" and item.phrase]
+    dimension_mentions = [item for item in keywords.mentions if item.kind == "dimension" and item.phrase]
+    metric_phrases = dedupe_ordered(
+        [*[item.phrase for item in metric_mentions], *list(keywords.metric_keywords or [])]
+    )
+    dimensions: List[Dict[str, Any]] = []
+    dimension_seen: Set[tuple[str, str, str, str]] = set()
+    for mention in dimension_mentions:
+        identity = (
+            str(mention.phrase or ""),
+            str(mention.canonical_key or ""),
+            str(getattr(mention.topic, "value", mention.topic) or ""),
+            str(mention.owner_table or ""),
+        )
+        if not identity[0] or not identity[1] or identity in dimension_seen:
+            continue
+        dimension_seen.add(identity)
+        dimensions.append(
+            {
+                "phrase": identity[0],
+                "column": identity[1],
+                "topic": identity[2],
+                "ownerTable": identity[3],
+                "role": str(mention.semantic_role or ""),
+                "source": str(mention.source or ""),
+            }
+        )
+
+    ranking_spans = [
+        span
+        for span in keywords.lexical_spans
+        if span.span_type == RouteSpanType.RANKING
+    ]
+    ranking: Dict[str, Any] = {}
+    if ranking_spans:
+        limit = 0
+        order = ""
+        operator = ""
+        for span in ranking_spans:
+            if span.source in {"ordinal_prefix", "top_n"} and not limit:
+                match = re.search(r"\d+", span.text)
+                limit = int(match.group(0)) if match else 0
+            if span.source == "ranking_operator":
+                operator = span.text
+                if span.text in {"最低", "最少"}:
+                    order = "asc"
+                elif span.text in {"最高", "最多", "排名", "排行"}:
+                    order = "desc"
+        if limit and not order:
+            order = "desc"
+        anchor_phrase = nearest_metric_phrase_to_ranking(normalized, metric_phrases, ranking_spans)
+        anchor_candidates = dedupe_ordered(
+            [item.canonical_key for item in metric_mentions if item.phrase == anchor_phrase and item.canonical_key]
+        )
+        ranking = {
+            "requested": True,
+            "limit": limit,
+            "order": order,
+            "operator": operator,
+            "anchorMetricPhrase": anchor_phrase,
+            "anchorMetricCandidates": anchor_candidates,
+            "spans": [span.model_dump(by_alias=True) for span in ranking_spans],
+        }
+        ranking = {key: value for key, value in ranking.items() if value not in (None, "", [], {})}
+
+    return {
+        key: value
+        for key, value in {
+            "metricPhrases": metric_phrases,
+            "dimensionKeywords": dedupe_ordered(list(keywords.dimension_keywords or [])),
+            "dimensions": dimensions,
+            "ranking": ranking,
+            "analysisIntent": str(keywords.analysis_intent or ""),
+        }.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def nearest_metric_phrase_to_ranking(
+    normalized_question: str,
+    metric_phrases: List[str],
+    ranking_spans: List[RouteLexicalSpan],
+) -> str:
+    """Bind a ranking clause to the closest governed metric mention."""
+
+    if not metric_phrases or not ranking_spans:
+        return ""
+    rank_start = min(int(span.start) for span in ranking_spans)
+    candidates: List[tuple[int, int, str]] = []
+    for phrase in metric_phrases:
+        normalized_phrase = normalize_keyword_text(phrase)
+        if not normalized_phrase:
+            continue
+        start = normalized_question.find(normalized_phrase)
+        while start >= 0:
+            end = start + len(normalized_phrase)
+            distance = rank_start - end if end <= rank_start else start - rank_start
+            candidates.append((0 if end <= rank_start else 1, abs(distance), phrase))
+            start = normalized_question.find(normalized_phrase, start + 1)
+    if not candidates:
+        return metric_phrases[0]
+    return min(candidates, key=lambda item: (item[0], item[1], metric_phrases.index(item[2])))[2]
 
 
 def default_topic_assets() -> Any:
@@ -169,14 +333,13 @@ class KeywordExtractService:
         metric_mentions = self._metric_mentions(normalized)
         dimension_mentions = self._dimension_mentions(normalized)
         action = longest_distinct_matches(normalized, ACTION_KEYWORDS)
-        time_words: List[str] = []
-        for pattern in TIME_PATTERNS:
-            time_words.extend(match.group(0).strip() for match in pattern.finditer(text))
-        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]:
-            if word in text and word not in time_words:
-                time_words.append(word)
-        ranking = [match.group(0).strip() for pattern in RANKING_PATTERNS for match in pattern.finditer(normalized)]
-        ranking = dedupe_ordered(ranking)
+        lexical_spans = extract_route_lexical_spans(normalized)
+        time_words = dedupe_ordered(
+            [span.text for span in lexical_spans if span.span_type == RouteSpanType.TEMPORAL]
+        )
+        ranking = dedupe_ordered(
+            [span.text for span in lexical_spans if span.span_type == RouteSpanType.RANKING]
+        )
         ambiguous_metrics = ambiguous_metric_phrases(metric_mentions)
         all_mentions = dedupe_mentions([*metric_mentions, *dimension_mentions, *topic_mentions])
         negated_segments = extract_negated_segments(normalized)
@@ -217,6 +380,7 @@ class KeywordExtractService:
             time_keywords=time_words,
             action_keywords=action,
             ranking_keywords=ranking,
+            lexical_spans=lexical_spans,
             mentions=mentions,
             topic_scores={key: round(value, 3) for key, value in topic_scores.items()},
             analysis_intent=analysis_intent,
@@ -269,6 +433,8 @@ class KeywordExtractService:
                             display_name=str(entry.get("businessName") or phrase),
                             kind="metric",
                             topic=topic or QuestionCategory.UNKNOWN,
+                            owner_table=str(entry.get("table") or ""),
+                            semantic_role="METRIC",
                             score=float(entry.get("score") or 3.0),
                             source="semantic_metric",
                         )
@@ -293,6 +459,8 @@ class KeywordExtractService:
                             display_name=phrase,
                             kind="dimension",
                             topic=topic or QuestionCategory.UNKNOWN,
+                            owner_table=str(entry.get("table") or ""),
+                            semantic_role=str(entry.get("role") or ""),
                             score=float(entry.get("score") or 2.0),
                             source="semantic_column",
                         )
@@ -443,6 +611,7 @@ class KeywordExtractService:
                                 "topicCandidates": topic_candidates or [category],
                                 "table": table,
                                 "column": column,
+                                "role": role,
                                 "score": score,
                             },
                         )
@@ -716,12 +885,10 @@ class QuestionRoutingService:
         return True
 
     def _has_multiple_time_ranges(self, question: str) -> bool:
-        return sum(1 for pattern in TIME_PATTERNS for _ in pattern.finditer(question)) >= 2
+        return len(extract_temporal_lexical_spans(question)) >= 2
 
     def _has_any_time_range(self, question: str) -> bool:
-        return self._has_multiple_time_ranges(question) or any(pattern.search(question) for pattern in TIME_PATTERNS) or any(
-            word in question for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]
-        )
+        return bool(extract_temporal_lexical_spans(question))
 
     def _is_simple_detail_lookup(self, question: str, keywords: ExtractedKeywords, recall_bundle: RecallBundle) -> bool:
         if not any(word in question for word in ["明细", "详情", "列表", "记录", "单号", "流水"]):
@@ -1047,9 +1214,7 @@ class PreflightUnderstandingService:
         text = str(question or "").strip()
         lowered = text.lower()
         business_surface = self.keyword_service.business_surface_signal(text)
-        has_time = bool(any(pattern.search(text) for pattern in TIME_PATTERNS)) or any(
-            word in text for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]
-        )
+        has_time = bool(extract_temporal_lexical_spans(text))
         has_object_ref = self.slot_extractor.has_object_ref(text)
         raw_analysis_intent = bool(any(term in text for term in ACTION_KEYWORDS))
         write_operation = bool(any(term.lower() in lowered for term in RouteSlotExtractor.WRITE_TERMS))
@@ -1268,14 +1433,8 @@ class RouteSlotExtractor:
         return RouteTimeWindow(days=days, raw=raw, needs_freshness_check=days > 0 and days <= 2)
 
     def _first_time_expression(self, text: str) -> str:
-        for pattern in TIME_PATTERNS:
-            match = pattern.search(text)
-            if match:
-                return match.group(0).strip()
-        for word in ["昨天", "昨日", "今天", "今日", "上周", "本周", "这周", "上个月", "本月"]:
-            if word in text:
-                return word
-        return ""
+        spans = extract_temporal_lexical_spans(text)
+        return spans[0].text if spans else ""
 
     def _analysis_signals(self, keywords: ExtractedKeywords) -> List[str]:
         analysis_actions = {
@@ -1472,17 +1631,5 @@ def route_primary_topic(candidates: List[QuestionCategory]) -> QuestionCategory:
 
 
 def extract_days(question: str, default: int = 7) -> int:
-    text = question or ""
-    for pattern, multiplier in [
-        (re.compile(r"(最近|近|过去|前)\s*(\d{1,3})\s*[天日]"), 1),
-        (re.compile(r"(最近|近|过去|前)\s*(\d{1,2})\s*(周|星期|礼拜)"), 7),
-        (re.compile(r"(最近|近|过去|前)\s*(\d{1,2})\s*个月"), 30),
-    ]:
-        match = pattern.search(text)
-        if match:
-            return max(1, min(int(match.group(2)) * multiplier, 365))
-    if "昨天" in text or "昨日" in text:
-        return 1
-    if "今天" in text or "今日" in text:
-        return 1
-    return default
+    resolved = resolve_time_range(question, default_days=default)
+    return max(1, int(resolved.days or default or 1))

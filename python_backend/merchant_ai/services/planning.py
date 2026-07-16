@@ -6,7 +6,8 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Set, Tuple
+import time
+from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.query_graph_contract import semantic_query_execution_contract
@@ -60,6 +61,12 @@ from merchant_ai.services.formulas import (
 )
 from merchant_ai.services.entity_contracts import canonical_entity_values, entity_comparison_policy
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.llm_recovery import (
+    LlmFailureClassification,
+    bounded_single_retry_count,
+    classify_llm_failure,
+    retry_timeout_with_answer_reserve,
+)
 from merchant_ai.services.memory_constraints import memory_constraint_validation_gaps
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.planning_tooling import (
@@ -1117,6 +1124,27 @@ class QueryGraphPlanner:
         trace: List[str],
         planner_context: Dict[str, Any] | None = None,
     ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
+        relationship_requests = preplan_relationship_knowledge_requests(asset_pack)
+        if relationship_requests:
+            reason = str(
+                next(
+                    (
+                        item.get("code")
+                        for item in (asset_pack.metric_compaction or {}).get("knowledgeRequestGaps") or []
+                        if isinstance(item, dict)
+                        and str(item.get("type") or "").upper() == KnowledgeRequestType.RELATIONSHIP.value
+                    ),
+                    "RELATIONSHIP_KNOWLEDGE_REQUIRED",
+                )
+            )
+            plan = QueryPlan(
+                knowledge_requests=relationship_requests,
+                agent_trace=[
+                    "planner.preplan_relationship_obligation=%s" % reason,
+                    "planner.preplan_relationship_request_count=%d" % len(relationship_requests),
+                ],
+            )
+            return plan, relationship_requests, reason
         prior_understanding = self.understanding_extractor.prior_understanding(planner_context)
         selection_handoff: Dict[str, Any] = {}
         selection_recovery_understanding: Dict[str, Any] = {}
@@ -1313,13 +1341,31 @@ class QueryGraphPlanner:
                 semantic_metric_plan = compile_semantic_metric_fallback_graph(question, asset_pack, payload)
                 if semantic_metric_plan.intents:
                     return semantic_metric_plan, semantic_metric_plan.knowledge_requests, payload.get("reason", "")
-        trace_reason = planner_failure_trace_reason(self.llm.configured, self.llm.last_error)
+        operational_attempts = list(payload.get("_plannerOperationalAttempts") or [])
+        operational_terminal_failure = bool(
+            operational_attempts
+            and payload.get("_plannerFailFast")
+            and not payload.get("_plannerRecoveredAfterRetry")
+        )
+        operational_recovered = bool(
+            operational_attempts and payload.get("_plannerRecoveredAfterRetry")
+        )
+        trace_reason = (
+            planner_operational_trace_reason(operational_attempts)
+            if operational_terminal_failure
+            else planner_failure_trace_reason(
+                self.llm.configured,
+                "" if operational_recovered else self.llm.last_error,
+            )
+        )
         invalid_output = payload.get("_plannerInvalidOutput") or {}
         if isinstance(invalid_output, dict) and invalid_output:
             trace_reason = "PLANNER_INVALID_STRUCTURED_OUTPUT: %s" % str(
                 invalid_output.get("reason") or payload.get("reason") or "output contract validation failed"
             )[:240]
-        provider_failure = planner_llm_terminal_error(self.llm.last_error)
+        provider_failure = operational_terminal_failure or bool(
+            planner_llm_terminal_error(self.llm.last_error) and not operational_recovered
+        )
         selection_recovery_allowed = bool(
             selection_handoff.get("verified")
             and selection_recovery_understanding
@@ -1361,6 +1407,9 @@ class QueryGraphPlanner:
                     append_prompt_trace(candidate, payload)
                     attach_planner_tool_trace(candidate, payload)
                 return candidate, requests, "TYPED_SEMANTIC_RECOVERY_CANDIDATE"
+            if payload:
+                append_prompt_trace(candidate, payload)
+                attach_planner_tool_trace(candidate, payload)
             candidate.agent_trace.append("planner.recovery_candidate.validation=failed_closed")
             return candidate, requests, trace_reason
         return (
@@ -1886,6 +1935,8 @@ class QueryGraphPlanner:
                 budget_level=budget_level,
                 fast_understanding=(planner_context or {}).get("fastUnderstanding")
                 or (planner_context or {}).get("fast_understanding"),
+                time_window_contract=(planner_context or {}).get("timeWindowContract")
+                or (planner_context or {}).get("time_window_contract"),
             ),
             "retrievedCandidates": candidates,
             "candidateGroups": self._semantic_selection_candidate_groups(metric_phrases, candidates),
@@ -2155,6 +2206,9 @@ class QueryGraphPlanner:
         time_semantics = merged.get("timeSemantics") or merged.get("time_semantics") or {}
         if not isinstance(time_semantics, dict):
             time_semantics = {}
+        temporal_variants = merged.get("temporalVariants") or merged.get("temporal_variants") or {}
+        if not isinstance(temporal_variants, dict):
+            temporal_variants = {}
         return {
             "id": candidate_id,
             "ref": ref,
@@ -2164,6 +2218,8 @@ class QueryGraphPlanner:
             "matched": matched[:80],
             "matchType": match_type[:40],
             "retrievalMatchType": retrieval_match_type[:40],
+            "metricResolutionAmbiguous": bool(merged.get("metricResolutionAmbiguous")),
+            "metricResolutionReason": trim_text(merged.get("metricResolutionReason") or "", 180),
             "confidence": confidence_value,
             "topic": str(item.topic or merged.get("topic") or "")[:50],
             "table": table[:100],
@@ -2174,6 +2230,7 @@ class QueryGraphPlanner:
                 merged.get("applicableTimeGrain") or merged.get("applicable_time_grain") or ""
             )[:80],
             "timeSemantics": dict(time_semantics),
+            "temporalVariants": dict(temporal_variants),
             "kind": self._semantic_selection_metric_kind(merged),
             "metricIntent": str(merged.get("metricIntent") or "")[:60],
             "tableKind": str(merged.get("tableKind") or "")[:60],
@@ -2253,10 +2310,15 @@ class QueryGraphPlanner:
             ids = []
             for card in candidates:
                 match_type = str(card.get("matchType") or "")
+                matched_phrase = normalize_semantic_text(card.get("matched"))
                 if (
-                    match_type == "exact_label"
+                    (
+                        match_type == "exact_label"
+                        or bool(card.get("metricResolutionAmbiguous"))
+                        or str(card.get("retrievalMatchType") or "") == "linked_variant"
+                    )
                     and normalized
-                    and normalize_semantic_text(card.get("matched")) == normalized
+                    and matched_phrase == normalized
                 ):
                     ids.append(card.get("id"))
                     continue
@@ -3173,6 +3235,89 @@ class QueryGraphPlanner:
         }
         return any(gap.code in repairable_codes for gap in gaps)
 
+    def _planner_remaining_budget_seconds(self, planner_context: Dict[str, Any] | None) -> float:
+        runtime_budget = (planner_context or {}).get("runtimeBudget") or (planner_context or {}).get("runtime_budget") or {}
+        if isinstance(runtime_budget, dict):
+            try:
+                deadline_ms = float(
+                    runtime_budget.get("deadlineEpochMs")
+                    or runtime_budget.get("deadline_epoch_ms")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                deadline_ms = 0.0
+            if deadline_ms > 0:
+                return max(0.0, (deadline_ms - time.time() * 1000.0) / 1000.0)
+        return float(max(0, int(getattr(self.settings, "run_budget_max_duration_seconds", 90) or 90)))
+
+    def _planner_transient_retry_limit(self) -> int:
+        return bounded_single_retry_count(
+            int(getattr(self.settings, "agent_planner_transient_retries", 1) or 0)
+        )
+
+    def _invoke_planner_llm_with_transient_retry(
+        self,
+        invoke: Callable[[int], Any],
+        has_output: Callable[[Any], bool],
+        planner_context: Dict[str, Any] | None,
+        *,
+        retry_limit: int,
+        observation_context: Dict[str, Any] | None = None,
+    ) -> Tuple[Any, List[Dict[str, Any]], int]:
+        """Retry the same read-only Planner call once without restarting its tool loop."""
+
+        request_timeout = max(1, int(getattr(self.settings, "llm_planner_timeout_seconds", 20) or 20))
+        observations: List[Dict[str, Any]] = []
+        retry_budget = bounded_single_retry_count(retry_limit)
+        retry_count = 0
+        timeout_seconds = request_timeout
+        result: Any = {}
+        while True:
+            raised_error = ""
+            try:
+                result = invoke(timeout_seconds)
+            except Exception as exc:
+                raised_error = "%s: %s" % (type(exc).__name__, str(exc))
+                result = {}
+            if has_output(result):
+                if observations and retry_count:
+                    observations[-1].update(
+                        {
+                            "status": "recovered",
+                            "recovered": True,
+                            "recoveredOnAttempt": retry_count + 1,
+                        }
+                    )
+                return result, observations, retry_count
+
+            error_message = raised_error or str(getattr(self.llm, "last_error", "") or "")
+            classified = classify_llm_failure(error_message)
+            observation = planner_llm_failure_observation(
+                classified,
+                error_message or "provider returned no Planner question-understanding payload",
+                attempt=retry_count + 1,
+                context=observation_context,
+            )
+            observations.append(observation)
+            if classified.retryable and retry_count < retry_budget:
+                retry_timeout = retry_timeout_with_answer_reserve(
+                    self._planner_remaining_budget_seconds(planner_context),
+                    request_timeout,
+                    int(getattr(self.settings, "llm_answer_timeout_seconds", 10) or 10),
+                )
+                if retry_timeout > 0:
+                    observation["retryScheduled"] = True
+                    retry_count += 1
+                    timeout_seconds = retry_timeout
+                    continue
+                observation["retrySkippedReason"] = "insufficient_run_budget"
+            elif classified.retryable:
+                observation["retrySkippedReason"] = "retry_budget_exhausted"
+            else:
+                observation["retrySkippedReason"] = "non_retryable_failure"
+            observation["retryScheduled"] = False
+            return result, observations, retry_count
+
     def _llm_understand(
         self,
         question: str,
@@ -3265,6 +3410,7 @@ class QueryGraphPlanner:
                 force_catalog,
                 require_semantic_read_before_emit=filesystem_entry in {"initial", "adaptive"},
                 prompt_budget=budget,
+                planner_context=planner_context,
             )
             if use_tool_loop
             else {}
@@ -3274,29 +3420,48 @@ class QueryGraphPlanner:
             and str(getattr(self.llm, "last_error", "") or "").startswith(("timeout:", "provider_error:"))
         )
         if not payload and not provider_failed_in_tool_loop and not use_tool_loop:
+            transient_retry_limit = self._planner_transient_retry_limit()
             if hasattr(self.llm, "tool_json_chat"):
-                try:
-                    payload = self.llm.tool_json_chat(
-                        prompt.system_prompt,
-                        user,
-                        output_tool_schema,
-                        {},
-                        timeout_seconds=self.settings.llm_planner_timeout_seconds,
-                    )
-                except TypeError:
-                    payload = self.llm.tool_json_chat(prompt.system_prompt, user, output_tool_schema, {})
+                def invoke_understanding(timeout_seconds: int) -> Any:
+                    try:
+                        return self.llm.tool_json_chat(
+                            prompt.system_prompt,
+                            user,
+                            output_tool_schema,
+                            {},
+                            timeout_seconds=timeout_seconds,
+                        )
+                    except TypeError:
+                        return self.llm.tool_json_chat(prompt.system_prompt, user, output_tool_schema, {})
             else:
-                try:
-                    payload = self.llm.json_chat(
-                        prompt.system_prompt,
-                        user,
-                        {},
-                        timeout_seconds=self.settings.llm_planner_timeout_seconds,
-                    )
-                except TypeError as exc:
-                    if "timeout_seconds" not in str(exc):
-                        raise
-                    payload = self.llm.json_chat(prompt.system_prompt, user, {})
+                def invoke_understanding(timeout_seconds: int) -> Any:
+                    try:
+                        return self.llm.json_chat(
+                            prompt.system_prompt,
+                            user,
+                            {},
+                            timeout_seconds=timeout_seconds,
+                        )
+                    except TypeError as exc:
+                        if "timeout_seconds" not in str(exc):
+                            raise
+                        return self.llm.json_chat(prompt.system_prompt, user, {})
+
+            raw_payload, operational_attempts, transient_retry_used = self._invoke_planner_llm_with_transient_retry(
+                invoke_understanding,
+                lambda value: bool(isinstance(value, dict) and value),
+                planner_context,
+                retry_limit=transient_retry_limit,
+                observation_context={
+                    "phase": "direct_understanding",
+                    "forceCatalog": bool(force_catalog),
+                    "compactRetry": bool(compact_retry),
+                    "filesystemEntry": filesystem_entry,
+                },
+            )
+            transient_retry_remaining = max(0, transient_retry_limit - transient_retry_used)
+            transient_call_failed = bool(operational_attempts) and not bool(raw_payload)
+            payload = raw_payload
             payload = normalize_question_understanding_payload(payload if isinstance(payload, dict) else {})
             validation_errors = planner_structured_output_validation_errors(payload, tool.parameters)
             retry_attempts: List[Dict[str, Any]] = []
@@ -3305,7 +3470,10 @@ class QueryGraphPlanner:
                 int(getattr(self.settings, "agent_planner_invalid_output_retries", 1) or 0),
             )
             for retry_index in range(retry_budget):
-                if not validation_errors or planner_llm_terminal_error(str(getattr(self.llm, "last_error", "") or "")):
+                if (
+                    not validation_errors
+                    or transient_call_failed
+                ):
                     break
                 retry_attempts.append(
                     {
@@ -3321,31 +3489,52 @@ class QueryGraphPlanner:
                 }
                 retry_user = json.dumps(retry_user_payload, ensure_ascii=False)
                 if hasattr(self.llm, "tool_json_chat"):
-                    try:
-                        retry_payload = self.llm.tool_json_chat(
-                            prompt.system_prompt,
-                            retry_user,
-                            output_tool_schema,
-                            {},
-                            timeout_seconds=self.settings.llm_planner_timeout_seconds,
-                        )
-                    except TypeError:
-                        retry_payload = self.llm.tool_json_chat(prompt.system_prompt, retry_user, output_tool_schema, {})
+                    def invoke_invalid_retry(timeout_seconds: int) -> Any:
+                        try:
+                            return self.llm.tool_json_chat(
+                                prompt.system_prompt,
+                                retry_user,
+                                output_tool_schema,
+                                {},
+                                timeout_seconds=timeout_seconds,
+                            )
+                        except TypeError:
+                            return self.llm.tool_json_chat(prompt.system_prompt, retry_user, output_tool_schema, {})
                 else:
-                    try:
-                        retry_payload = self.llm.json_chat(
-                            prompt.system_prompt,
-                            retry_user,
-                            {},
-                            timeout_seconds=self.settings.llm_planner_timeout_seconds,
-                        )
-                    except TypeError:
-                        retry_payload = self.llm.json_chat(prompt.system_prompt, retry_user, {})
+                    def invoke_invalid_retry(timeout_seconds: int) -> Any:
+                        try:
+                            return self.llm.json_chat(
+                                prompt.system_prompt,
+                                retry_user,
+                                {},
+                                timeout_seconds=timeout_seconds,
+                            )
+                        except TypeError:
+                            return self.llm.json_chat(prompt.system_prompt, retry_user, {})
+
+                retry_payload, retry_failures, retry_used = self._invoke_planner_llm_with_transient_retry(
+                    invoke_invalid_retry,
+                    lambda value: bool(isinstance(value, dict) and value),
+                    planner_context,
+                    retry_limit=transient_retry_remaining,
+                    observation_context={
+                        "phase": "invalid_output_retry",
+                        "structuredOutputAttempt": retry_index + 1,
+                        "filesystemEntry": filesystem_entry,
+                    },
+                )
+                transient_retry_remaining = max(0, transient_retry_remaining - retry_used)
+                operational_attempts.extend(retry_failures)
+                if retry_failures and not retry_payload:
+                    transient_call_failed = True
                 payload = normalize_question_understanding_payload(
                     retry_payload if isinstance(retry_payload, dict) else {}
                 )
                 validation_errors = planner_structured_output_validation_errors(payload, tool.parameters)
-            if validation_errors and not planner_llm_terminal_error(str(getattr(self.llm, "last_error", "") or "")):
+            if (
+                validation_errors
+                and not transient_call_failed
+            ):
                 payload = {
                     "status": "INVALID",
                     "reason": "PLANNER_INVALID_STRUCTURED_OUTPUT",
@@ -3358,6 +3547,11 @@ class QueryGraphPlanner:
                 }
             elif retry_attempts:
                 payload["_plannerInvalidOutputAttempts"] = retry_attempts
+            if operational_attempts:
+                payload["_plannerOperationalAttempts"] = operational_attempts
+                payload["_plannerRecoveredAfterRetry"] = not transient_call_failed
+                if transient_call_failed:
+                    payload["_plannerFailFast"] = True
             payload["_promptStats"] = stats
         elif payload:
             payload["_usedSemanticToolLoop"] = True
@@ -3372,6 +3566,14 @@ class QueryGraphPlanner:
         payload["_promptTrace"] = prompt.trace()
         payload["_toolSchema"] = tool.trace_schema()
         payload["_plannerBudgetTrace"] = budget_trace
+        operational_attempts = list(payload.get("_plannerOperationalAttempts") or [])
+        if operational_attempts:
+            prompt_stats = payload.get("_promptStats") or {}
+            prompt_stats["operationalAttempts"] = operational_attempts
+            prompt_stats["recoveredAfterTransientFailure"] = bool(
+                payload.get("_plannerRecoveredAfterRetry")
+            )
+            payload["_promptStats"] = prompt_stats
         semantic_selection_contract = (
             (planner_context or {}).get("semanticSelectionContract")
             or (planner_context or {}).get("semantic_selection_contract")
@@ -3575,7 +3777,12 @@ class QueryGraphPlanner:
             "trace": compact_planner_trace(trace, gaps, compact_retry)[: max(1, 3 - budget_level)],
             "plannerToolResults": [],
             "plannerBudgetLevel": budget_level,
-            "planningContract": compact_asset_planning_contract(asset_pack, budget_level=budget_level),
+            "planningContract": compact_asset_planning_contract(
+                asset_pack,
+                budget_level=budget_level,
+                time_window_contract=(planner_context or {}).get("timeWindowContract")
+                or (planner_context or {}).get("time_window_contract"),
+            ),
             "outputContract": {
                 "tool": "emit_question_understanding",
                 "status": "UNDERSTOOD | INVALID" if force_catalog else "UNDERSTOOD | NEED_MORE_KNOWLEDGE | INVALID",
@@ -3703,6 +3910,7 @@ class QueryGraphPlanner:
         force_catalog: bool,
         require_semantic_read_before_emit: bool = False,
         prompt_budget: int = 0,
+        planner_context: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         if not self.semantic_catalog or not hasattr(self.llm, "tool_chat") or self.settings.agent_planner_tool_rounds <= 0:
             return {}
@@ -3722,6 +3930,8 @@ class QueryGraphPlanner:
         final_payload: Dict[str, Any] = {}
         round_prompt_stats: List[Dict[str, Any]] = []
         invalid_output_attempts: List[Dict[str, Any]] = []
+        operational_attempts: List[Dict[str, Any]] = []
+        transient_retry_remaining = self._planner_transient_retry_limit()
         base_rounds = max(1, self.settings.agent_planner_tool_rounds)
         invalid_retry_budget = max(
             0,
@@ -3830,14 +4040,34 @@ class QueryGraphPlanner:
                     "_plannerRoundPromptStats": round_prompt_stats,
                 }
             prompt_artifact = self.artifact_store.write_json("planner", "planner_round_%d_prompt.json" % (round_index + 1), round_payload, preview_chars=0)
-            result = self.llm.tool_chat(
-                system_prompt,
-                json.dumps(round_payload, ensure_ascii=False),
-                tools,
-                {"content": "", "toolCalls": []},
-                timeout_seconds=self.settings.llm_planner_timeout_seconds,
-                tool_choice=output_tool.name if force_structured_output else None,
+            round_user = json.dumps(round_payload, ensure_ascii=False)
+            result, round_failures, retry_used = self._invoke_planner_llm_with_transient_retry(
+                lambda timeout_seconds: self.llm.tool_chat(
+                    system_prompt,
+                    round_user,
+                    tools,
+                    {"content": "", "toolCalls": []},
+                    timeout_seconds=timeout_seconds,
+                    tool_choice=output_tool.name if force_structured_output else None,
+                ),
+                lambda value: bool(
+                    isinstance(value, dict)
+                    and (value.get("content") or value.get("toolCalls"))
+                ),
+                planner_context,
+                retry_limit=transient_retry_remaining,
+                observation_context={
+                    "phase": "semantic_tool_loop",
+                    "round": round_index + 1,
+                    "forcedTool": output_tool.name if force_structured_output else "",
+                    "loadedRefs": sorted(set(loaded_refs)),
+                    "loadedToolNames": list(loaded_tool_names),
+                    "priorToolResultCount": len(planner_tool_results),
+                },
             )
+            transient_retry_remaining = max(0, transient_retry_remaining - retry_used)
+            operational_attempts.extend(round_failures)
+            result = result if isinstance(result, dict) else {"content": "", "toolCalls": []}
             self.artifact_store.write_json(
                 "planner",
                 "planner_round_%d_response.json" % (round_index + 1),
@@ -3846,11 +4076,24 @@ class QueryGraphPlanner:
                     "toolCalls": list(result.get("toolCalls") or []),
                     "forcedTool": output_tool.name if force_structured_output else "",
                     "lastError": str(getattr(self.llm, "last_error", "") or ""),
+                    "operationalAttempts": round_failures,
                 },
                 preview_chars=0,
             )
-            if not result.get("content") and not result.get("toolCalls") and planner_llm_terminal_error(self.llm.last_error):
-                return {}
+            if (
+                not result.get("content")
+                and not result.get("toolCalls")
+                and (planner_llm_terminal_error(self.llm.last_error) or bool(round_failures))
+            ):
+                return {
+                    "_plannerFailFast": True,
+                    "_plannerOperationalAttempts": operational_attempts,
+                    "_plannerToolCalls": planner_tool_calls,
+                    "_plannerToolResults": planner_tool_results,
+                    "_plannerLoadedRefs": sorted(set(loaded_refs)),
+                    "_plannerContextFiles": self.artifact_store.ls("planner", limit=50),
+                    "_plannerRoundPromptStats": round_prompt_stats,
+                }
             calls = normalize_llm_tool_calls(result.get("toolCalls") or [], round_index)
             planner_tool_calls.extend([call.model_dump(by_alias=True) for call in calls])
             emit_call = next((call for call in calls if call.name == output_tool.name), None)
@@ -3984,6 +4227,11 @@ class QueryGraphPlanner:
         final_payload["_plannerLoadedRefs"] = sorted(set(loaded_refs))
         final_payload["_plannerContextFiles"] = self.artifact_store.ls("planner", limit=50)
         final_payload["_plannerRoundPromptStats"] = round_prompt_stats
+        if operational_attempts:
+            final_payload["_plannerOperationalAttempts"] = operational_attempts
+            # Reaching a validated final payload means the transport retry
+            # recovered, even when a provider adapter leaves stale last_error.
+            final_payload["_plannerRecoveredAfterRetry"] = bool(final_payload)
         return final_payload
 
     def _fit_planner_tool_round_prompt(
@@ -4513,6 +4761,43 @@ def append_prompt_trace(plan: QueryPlan, payload: Dict[str, Any]) -> None:
             "planner.semantic_selection_handoff=%s"
             % ",".join(str(item) for item in selection_contract.get("selectedRefs") or [])
         )
+
+
+def planner_llm_failure_observation(
+    classified: LlmFailureClassification,
+    error_message: str,
+    *,
+    attempt: int,
+    context: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    code = {
+        "TIMEOUT": "PLANNER_LLM_TIMEOUT",
+        "EMPTY_RESPONSE": "PLANNER_EMPTY_RESPONSE",
+        "PROVIDER_ERROR": "PLANNER_PROVIDER_ERROR",
+    }.get(classified.kind, "PLANNER_LLM_FAILED")
+    observation = {
+        "stage": "planner.question_understanding",
+        "status": "retryable_failure" if classified.retryable else "failed",
+        "attempt": max(1, int(attempt)),
+        "errorCode": code,
+        "errorMessage": str(error_message or "")[:300],
+        "retryable": bool(classified.retryable),
+    }
+    observation.update(
+        {
+            str(key): value
+            for key, value in (context or {}).items()
+            if value not in (None, "", [], {})
+        }
+    )
+    return observation
+
+
+def planner_operational_trace_reason(attempts: List[Dict[str, Any]]) -> str:
+    first = next((item for item in attempts if isinstance(item, dict) and item.get("errorCode")), {})
+    code = str(first.get("errorCode") or "PLANNER_LLM_FAILED")
+    message = str(first.get("errorMessage") or "Planner question-understanding call failed")[:300]
+    return "%s: %s" % (code, message)
 
 
 def attach_planner_tool_trace(plan: QueryPlan, payload: Dict[str, Any]) -> None:
@@ -5641,7 +5926,10 @@ class QueryGraphValidator:
                     return True
             if wanted_tokens and all(token in relationship_tokens for token in wanted_tokens):
                 return True
-        return not asset_pack.relationships
+        # Cross-table dependencies are fail-closed. An empty relationship pack
+        # means the join is ungoverned, not that any matching column name is a
+        # valid relationship.
+        return False
 
 
 class GraphSanityCheck:
@@ -6093,6 +6381,55 @@ def compact_knowledge_request_gaps(asset_pack: PlanningAssetPack, budget_level: 
     return compacted
 
 
+def preplan_relationship_knowledge_requests(asset_pack: PlanningAssetPack) -> List[KnowledgeRequest]:
+    """Turn asset-level join obligations into retrieval before QueryGraph exists."""
+
+    requests: List[KnowledgeRequest] = []
+    seen: set[str] = set()
+    for gap in (asset_pack.metric_compaction or {}).get("knowledgeRequestGaps") or []:
+        if not isinstance(gap, dict):
+            continue
+        code = str(gap.get("code") or "")
+        gap_type = str(gap.get("type") or "").upper()
+        if gap_type != KnowledgeRequestType.RELATIONSHIP.value:
+            continue
+        if not (code.startswith("RELATIONSHIP_") or code.startswith("JOIN_")):
+            continue
+        payload = {
+            "code": code,
+            "metricRefs": [str(item) for item in gap.get("metricRefs") or [] if str(item or "")],
+            "dimensionRefs": [str(item) for item in gap.get("dimensionRefs") or [] if str(item or "")],
+            "dimensionPhrase": str(gap.get("dimensionPhrase") or ""),
+            "sourceOwner": str(gap.get("sourceOwner") or ""),
+            "sourceOwners": [str(item) for item in gap.get("sourceOwners") or [] if str(item or "")],
+            "targetOwner": str(gap.get("targetOwner") or ""),
+            "requiredSemantics": [str(item) for item in gap.get("requiredSemantics") or [] if str(item or "")],
+        }
+        query = str(gap.get("query") or "").strip()
+        if not query:
+            query = "relationship contract %s" % json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        request_key = "asset_relationship:%s" % hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:20]
+        if request_key in seen:
+            continue
+        seen.add(request_key)
+        expected_refs = dedupe_strings(
+            [str(item) for item in gap.get("relationshipRefs") or [] if str(item or "")]
+        )
+        requests.append(
+            KnowledgeRequest(
+                type=KnowledgeRequestType.RELATIONSHIP,
+                query=query,
+                reason=str(gap.get("reason") or code),
+                source_phrase=str(gap.get("dimensionPhrase") or ""),
+                expected_refs=expected_refs,
+                request_key=request_key,
+            )
+        )
+    return requests
+
+
 def compact_retrieval_health(asset_pack: PlanningAssetPack, budget_level: int = 0) -> Dict[str, Any]:
     raw = (asset_pack.metric_compaction or {}).get("retrievalHealth") or {}
     if not isinstance(raw, dict):
@@ -6272,13 +6609,21 @@ def compact_asset_planning_contract(
     asset_pack: PlanningAssetPack,
     budget_level: int = 0,
     fast_understanding: Dict[str, Any] | None = None,
+    time_window_contract: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     stored_fast = (asset_pack.metric_compaction or {}).get("fastUnderstanding") or {}
     stored_fast = stored_fast if isinstance(stored_fast, dict) else {}
+    question_structure = (asset_pack.metric_compaction or {}).get("questionStructure") or {}
+    question_structure = question_structure if isinstance(question_structure, dict) else {}
     runtime_fast = fast_understanding if isinstance(fast_understanding, dict) else {}
     fast = {**stored_fast, **runtime_fast}
     phrase_limit = 4 if budget_level >= 2 else 8 if budget_level >= 1 else 16
-    raw_phrases = fast.get("metricPhrases") or fast.get("metric_phrases") or []
+    raw_phrases = (
+        fast.get("metricPhrases")
+        or fast.get("metric_phrases")
+        or question_structure.get("metricPhrases")
+        or []
+    )
     if isinstance(raw_phrases, str):
         raw_phrases = [raw_phrases]
     raw_time_range = fast.get("timeRange") or fast.get("time_range") or {}
@@ -6300,18 +6645,92 @@ def compact_asset_planning_contract(
         ]
         if raw_time_range.get(key) not in (None, "", [], {})
     }
+    canonical_time = time_window_contract if isinstance(time_window_contract, dict) else {}
+    primary_time = canonical_time.get("primary") or {}
+    primary_time = primary_time if isinstance(primary_time, dict) else {}
+    comparison_time = canonical_time.get("comparison") or {}
+    comparison_time = comparison_time if isinstance(comparison_time, dict) else {}
+    if primary_time:
+        time_range = {
+            key: primary_time.get(key)
+            for key in [
+                "kind",
+                "startDate",
+                "endDate",
+                "days",
+                "timezone",
+                "anchorPolicy",
+                "explicit",
+                "source",
+                "windowRole",
+                "offsetDays",
+                "comparisonType",
+            ]
+            if primary_time.get(key) not in (None, "", [], {})
+        }
+    compact_comparison = {
+        key: comparison_time.get(key)
+        for key in [
+            "kind",
+            "startDate",
+            "endDate",
+            "days",
+            "timezone",
+            "anchorPolicy",
+            "explicit",
+            "source",
+            "windowRole",
+            "offsetDays",
+            "comparisonType",
+        ]
+        if comparison_time.get(key) not in (None, "", [], {})
+    }
     return {
         key: value
         for key, value in {
             "intentKind": fast.get("intentKind") or fast.get("intent_kind"),
             "analysisIntent": fast.get("analysisIntent") or fast.get("analysis_intent"),
             "analysisGrain": fast.get("analysisGrain") or fast.get("analysis_grain"),
-            "timeGrain": fast.get("timeGrain") or fast.get("time_grain"),
+            "timeGrain": canonical_time.get("grain") or fast.get("timeGrain") or fast.get("time_grain"),
             "timeSeries": fast.get("timeSeries") if "timeSeries" in fast else fast.get("time_series"),
             "complexity": fast.get("complexity"),
             "metricPhrases": [str(item) for item in raw_phrases[:phrase_limit] if str(item or "").strip()],
+            "dimensionKeywords": [
+                str(item)
+                for item in (question_structure.get("dimensionKeywords") or [])[:phrase_limit]
+                if str(item or "").strip()
+            ],
+            "dimensions": [
+                {
+                    key: item.get(key)
+                    for key in ["phrase", "column", "topic", "ownerTable", "role", "source"]
+                    if item.get(key) not in (None, "", [], {})
+                }
+                for item in (question_structure.get("dimensions") or [])[:phrase_limit]
+                if isinstance(item, dict)
+            ],
+            "ranking": (
+                {
+                    key: question_structure.get("ranking", {}).get(key)
+                    for key in [
+                        "requested",
+                        "limit",
+                        "order",
+                        "operator",
+                        "anchorMetricPhrase",
+                        "anchorMetricCandidates",
+                        "spans",
+                    ]
+                    if question_structure.get("ranking", {}).get(key) not in (None, "", [], {})
+                }
+                if isinstance(question_structure.get("ranking"), dict)
+                else {}
+            ),
             "timeWindowDays": fast.get("timeWindowDays") or fast.get("time_window_days"),
             "timeRange": time_range,
+            "comparisonTimeRange": compact_comparison,
+            "requiresComparison": canonical_time.get("requiresComparison"),
+            "comparisonType": canonical_time.get("comparisonType"),
             "objectRefs": fast.get("objectRefs") or fast.get("object_refs"),
         }.items()
         if value not in (None, "", [], {})

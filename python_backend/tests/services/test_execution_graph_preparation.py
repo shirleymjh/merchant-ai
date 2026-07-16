@@ -1,3 +1,6 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from merchant_ai.config import get_settings
@@ -14,6 +17,8 @@ from merchant_ai.models import (
     QueryPlan,
     QuestionIntent,
 )
+from merchant_ai.services.assets import PlanningAssetPackBuilder, TopicAssetService
+from merchant_ai.services.planning import QueryGraphPlanner
 from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
 from merchant_ai.services.query import (
     ExecutionGraphPreparationRequired,
@@ -22,7 +27,12 @@ from merchant_ai.services.query import (
     SqlValidationService,
     prepare_execution_graph,
 )
+from merchant_ai.services.retrieval import EsKnowledgeRetrievalService
 from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution
+from merchant_ai.services.time_semantics import (
+    apply_time_window_contract_to_plan,
+    resolve_time_window_contract,
+)
 
 
 class UnconfiguredLlm:
@@ -131,6 +141,106 @@ def test_prepare_execution_graph_is_pure_and_validates_the_merged_graph() -> Non
         "metric_b",
     }
     assert any("same_table_metric_merge" in note for note in prepared.optimization_notes)
+
+
+def test_published_three_metric_question_preserves_asset_formulas_and_one_time_range() -> None:
+    question = "最近30天订单量、退款金额和退货量分别是多少？"
+    expected_metric_keys = {"order_cnt_1d", "refund_amt_1d", "return_cnt_1d"}
+    settings = get_settings()
+    topic_assets = TopicAssetService(settings)
+    retrieval = EsKnowledgeRetrievalService(settings, topic_assets)
+
+    candidates = retrieval._resolve_metric_candidates(question, [])
+    candidates_by_key = {str(item.get("metricKey") or ""): item for item in candidates}
+
+    assert len(candidates) == len(expected_metric_keys)
+    assert set(candidates_by_key) == expected_metric_keys
+    assert len({str(item.get("tableName") or "") for item in candidates}) == 1
+    assert len({str(item.get("topic") or "") for item in candidates}) == 1
+
+    owner_table = str(candidates[0]["tableName"])
+    owner_topic = str(candidates[0]["topic"])
+    published_asset = topic_assets.load_table_asset(owner_topic, owner_table)
+    published_metrics = {
+        str(item.get("metricKey") or ""): item
+        for item in published_asset.get("metrics") or []
+        if str(item.get("metricKey") or "") in expected_metric_keys
+    }
+    assert set(published_metrics) == expected_metric_keys
+    for metric_key in expected_metric_keys:
+        candidate = candidates_by_key[metric_key]
+        published = published_metrics[metric_key]
+        assert candidate["formula"] == published["formula"]
+        assert candidate["sourceColumns"] == published["sourceColumns"]
+        assert candidate["aggregationPolicy"] == published["aggregationPolicy"]
+
+    asset_pack = PlanningAssetPack()
+    PlanningAssetPackBuilder(topic_assets).expand_for_metric_catalog_resolution(
+        asset_pack,
+        question,
+    )
+    selected_assets = [
+        {
+            "semanticRefId": candidate["semanticRefId"],
+            "metricRef": candidate["metricKey"],
+            "ownerTable": candidate["tableName"],
+            "sourcePhrase": candidate["matchedMetricLabel"],
+        }
+        for candidate in candidates
+    ]
+    plan = QueryGraphPlanner(UnconfiguredLlm())._compile_semantic_asset_selection_payload(
+        question,
+        {
+            "status": "SELECTED",
+            "queryContract": {
+                "contractType": "independent_metrics",
+                "timeWindowDays": 30,
+            },
+            "selectedRefs": [item["semanticRefId"] for item in selected_assets],
+            "selectedAssets": selected_assets,
+        },
+        asset_pack,
+    )
+
+    intents_by_metric = {intent.metric_name: intent for intent in plan.intents}
+    assert len(plan.intents) == len(expected_metric_keys)
+    assert set(intents_by_metric) == expected_metric_keys
+    for metric_key in expected_metric_keys:
+        intent = intents_by_metric[metric_key]
+        published = published_metrics[metric_key]
+        assert intent.preferred_table == owner_table
+        assert intent.metric_formula.replace("`", "") == published["formula"].replace("`", "")
+        assert intent.metric_resolution["sourceColumns"] == published["sourceColumns"]
+        assert intent.metric_resolution["aggregationPolicy"] == published["aggregationPolicy"]
+
+    time_contract = resolve_time_window_contract(
+        question,
+        now=datetime(2026, 7, 16, 12, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    plan = apply_time_window_contract_to_plan(plan, time_contract)
+    logical_time_ranges = [
+        intent.time_range.model_dump(by_alias=True, mode="json") for intent in plan.intents
+    ]
+    assert logical_time_ranges
+    assert all(time_range == logical_time_ranges[0] for time_range in logical_time_ranges)
+    assert logical_time_ranges[0]["days"] == 30
+    assert all(intent.days == 30 for intent in plan.intents)
+
+    prepared = prepare_execution_graph(question, plan, asset_pack)
+
+    assert prepared.executable is True
+    assert len(prepared.plan.intents) == 1
+    merged = prepared.plan.intents[0]
+    specs_by_metric = {str(spec.get("metricName") or ""): spec for spec in merged.metric_specs}
+    assert len(merged.metric_specs) == len(expected_metric_keys)
+    assert set(specs_by_metric) == expected_metric_keys
+    assert merged.days == 30
+    assert merged.time_range == plan.intents[0].time_range
+    for metric_key in expected_metric_keys:
+        spec = specs_by_metric[metric_key]
+        published = published_metrics[metric_key]
+        assert str(spec["metricFormula"]).replace("`", "") == str(published["formula"]).replace("`", "")
+        assert spec["sourceColumns"] == published["sourceColumns"]
 
 
 def test_node_worker_refuses_to_normalize_the_callers_graph_in_place() -> None:

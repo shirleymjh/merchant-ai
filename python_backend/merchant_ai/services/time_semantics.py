@@ -1,23 +1,98 @@
 from __future__ import annotations
 
 import re
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from merchant_ai.models import AnswerMode, QueryPlan, ResolvedTimeRange
+from merchant_ai.models import AnswerMode, QueryPlan, ResolvedTimeRange, RouteLexicalSpan, RouteSpanType
 
 
 CALENDAR_ANCHOR_POLICY = "calendar"
 LATEST_PARTITION_ANCHOR_POLICY = "latest_available_partition"
 EXPLICIT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:日)?(?!\d)")
-ROLLING_DAYS_PATTERN = re.compile(r"(?:最近|近)\s*(\d{1,3})\s*天")
-ROLLING_WEEK_PATTERN = re.compile(r"(?:最近|近)\s*(?:一|1)\s*(?:周|星期)")
-ROLLING_MONTH_PATTERN = re.compile(r"(?:最近|近)\s*(?:一|1)\s*个?月")
-PREVIOUS_DAYS_PATTERN = re.compile(r"(?:前|上一个|上一|上期|上一期)\s*(\d{1,3})?\s*天")
 COMPARISON_MARKER_PATTERN = re.compile(r"相比|对比|比较|变化|环比|较|比|上升|下降|增长|减少|升高|降低")
 DAILY_GRAIN_PATTERN = re.compile(r"每天|每日|按天|逐日|日趋势|每天的|按日|走势|趋势")
 TIME_SERIES_ANALYSIS_PATTERN = re.compile(r"波动|同步上升|同步下降|持续上升|持续下降|上升|下降|增长|减少|变化|异常|走势|趋势")
+TEMPORAL_QUANTITY_SPAN_PATTERN = re.compile(
+    r"(?:(?P<prefix>最近|近|过去|前)\s*)?(?P<value>\d+)\s*(?P<unit>个月|星期|礼拜|天|日|周|月)"
+)
+TEMPORAL_NAMED_SPAN_PATTERN = re.compile(
+    r"(?P<day>昨天|昨日|今天|今日)|(?P<week>上周|本周|这周)|(?P<month>上个月|本月)"
+)
+TEMPORAL_UNIT_ALIASES = {
+    "天": "day",
+    "日": "day",
+    "周": "week",
+    "星期": "week",
+    "礼拜": "week",
+    "月": "month",
+    "个月": "month",
+}
+
+
+def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
+    """Return canonical typed time spans without interpreting business text.
+
+    Numeric windows are parsed as ``value + unit`` for any value.  Their
+    prefix contributes a temporal role, while named calendar expressions use
+    the same output contract.  Offsets always refer to the supplied text.
+    """
+
+    value = str(text or "")
+    spans: list[RouteLexicalSpan] = []
+    for match in TEMPORAL_QUANTITY_SPAN_PATTERN.finditer(value):
+        prefix = str(match.group("prefix") or "")
+        spans.append(
+            RouteLexicalSpan(
+                span_type=RouteSpanType.TEMPORAL,
+                start=match.start(),
+                end=match.end(),
+                text=match.group(0),
+                source="quantity_window",
+                value=int(match.group("value")),
+                unit=TEMPORAL_UNIT_ALIASES.get(str(match.group("unit") or ""), ""),
+                role="previous_period" if prefix == "前" else "primary",
+            )
+        )
+    for match in TEMPORAL_NAMED_SPAN_PATTERN.finditer(value):
+        unit = next((name for name in ("day", "week", "month") if match.group(name)), "")
+        spans.append(
+            RouteLexicalSpan(
+                span_type=RouteSpanType.TEMPORAL,
+                start=match.start(),
+                end=match.end(),
+                text=match.group(0),
+                source="named_calendar_window",
+                value=1,
+                unit=unit,
+                role="primary",
+            )
+        )
+    spans.sort(key=lambda item: (item.start, -(item.end - item.start), item.source))
+    accepted: list[RouteLexicalSpan] = []
+    for candidate in spans:
+        if any(candidate.start < current.end and current.start < candidate.end for current in accepted):
+            continue
+        accepted.append(candidate)
+    return accepted
+
+
+def rolling_span_start(anchor: date, span: RouteLexicalSpan) -> date:
+    """Resolve a typed rolling quantity without duration-specific branches."""
+
+    amount = max(1, int(span.value or 0))
+    unit = str(span.unit or "")
+    if unit == "day":
+        return anchor - timedelta(days=amount - 1)
+    if unit == "week":
+        return anchor - timedelta(weeks=amount) + timedelta(days=1)
+    if unit == "month":
+        # A rolling month follows calendar arithmetic.  It is deliberately not
+        # approximated as 30 days because month lengths vary.
+        return shift_month(anchor, -amount) + timedelta(days=1)
+    raise ValueError("unsupported temporal quantity unit: %s" % unit)
 
 
 def resolve_time_range(
@@ -55,22 +130,22 @@ def resolve_time_range(
         end = today - timedelta(days=today.weekday() + 1)
         start = end - timedelta(days=6)
         return resolved_range("calendar_week", start, end, timezone_name, "上周", "calendar_previous_week")
-    match = ROLLING_DAYS_PATTERN.search(text)
-    if match:
-        days = max(1, min(int(match.group(1)), 180))
-        source = "relative_days"
-    elif ROLLING_WEEK_PATTERN.search(text):
-        days = 7
-        source = "relative_week_phrase"
-    elif ROLLING_MONTH_PATTERN.search(text):
-        days = 30
-        source = "relative_month_phrase"
-    else:
-        days = max(1, int(default_days or 7))
-        source = "default_days"
+    quantity_span = next(
+        (
+            span
+            for span in extract_temporal_lexical_spans(text)
+            if span.source == "quantity_window" and span.role == "primary"
+        ),
+        None,
+    )
+    if quantity_span:
+        start = rolling_span_start(today, quantity_span)
+        label = str(quantity_span.text or "").strip()
+        source = "relative_%s_quantity" % str(quantity_span.unit or "")
+        return resolved_range("rolling", start, today, timezone_name, label, source)
+    days = max(1, int(default_days or 7))
     start = today - timedelta(days=days - 1)
-    label = "最近%d天" % days
-    return resolved_range("rolling", start, today, timezone_name, label, source)
+    return resolved_range("rolling", start, today, timezone_name, "最近%d天" % days, "default_days")
 
 
 def resolve_time_window_contract(
@@ -104,8 +179,8 @@ def resolve_time_window_contract(
         contract["ambiguities"] = [
             {
                 "code": "RECENT_MONTH_AMBIGUOUS",
-                "message": "最近一个月可按最近30天或自然月理解；当前按最近30天处理。",
-                "default": "rolling_30_days",
+                "message": "最近N个月可按滚动日历月或完整自然月理解；当前按以锚点结束的滚动日历月处理。",
+                "default": "rolling_calendar_months",
             }
         ]
     return contract
@@ -126,9 +201,14 @@ def resolve_comparison_time_range(
     if not comparison_requested(text):
         return None
     today = local_today(timezone_name, now)
-    previous_days = PREVIOUS_DAYS_PATTERN.search(text)
-    days = max(1, min(int(previous_days.group(1)), 180)) if previous_days and previous_days.group(1) else int(primary.days or 0)
-    days = max(1, days or 1)
+    previous_span = next(
+        (
+            span
+            for span in extract_temporal_lexical_spans(text)
+            if span.source == "quantity_window" and span.role == "previous_period"
+        ),
+        None,
+    )
     if "同比" in text or "去年同期" in text:
         start = parse_iso_date(primary.start_date)
         end = parse_iso_date(primary.end_date)
@@ -163,16 +243,26 @@ def resolve_comparison_time_range(
             "previous_day",
             offset_days=1,
         )
-    offset = max(int(primary.days or days or 1), days)
     end = (parse_iso_date(primary.start_date) or today) - timedelta(days=1)
-    start = end - timedelta(days=days - 1)
+    if previous_span:
+        start = rolling_span_start(end, previous_span)
+        label = str(previous_span.text or "").strip()
+        source = "previous_%s_quantity" % str(previous_span.unit or "")
+    else:
+        days = max(1, int(primary.days or 1))
+        start = end - timedelta(days=days - 1)
+        label = "前%d天" % days
+        source = "previous_period"
+    # offsetDays shifts the comparison anchor away from the primary anchor;
+    # it is independent of the comparison window's own duration.
+    offset = max(1, int(primary.days or 1))
     return resolved_comparison_range(
         "previous_period",
         start,
         end,
         timezone_name,
-        "前%d天" % days,
-        "previous_period",
+        label,
+        source,
         offset_days=offset,
     )
 
@@ -183,7 +273,7 @@ def comparison_requested(text: str) -> bool:
         return False
     if "去年同期" in value or "同比" in value or "环比" in value:
         return True
-    if PREVIOUS_DAYS_PATTERN.search(value) and COMPARISON_MARKER_PATTERN.search(value):
+    if any(span.role == "previous_period" for span in extract_temporal_lexical_spans(value)) and COMPARISON_MARKER_PATTERN.search(value):
         return True
     if any(marker in value for marker in ["上月", "上个月", "上周", "上星期", "前天"]) and COMPARISON_MARKER_PATTERN.search(value):
         return True
@@ -193,7 +283,16 @@ def comparison_requested(text: str) -> bool:
 
 
 def ambiguous_recent_month(text: str) -> bool:
-    return bool(ROLLING_MONTH_PATTERN.search(str(text or "")) and "自然月" not in str(text or ""))
+    value = str(text or "")
+    if "自然月" in value:
+        return False
+    return any(
+        span.source == "quantity_window"
+        and span.role == "primary"
+        and span.unit == "month"
+        and str(span.text or "").strip().startswith(("最近", "近", "过去"))
+        for span in extract_temporal_lexical_spans(value)
+    )
 
 
 def resolve_time_grain(text: str, comparison: Optional[ResolvedTimeRange]) -> str:
@@ -244,7 +343,7 @@ def time_window_contract_trace(
             % (comparison.kind, comparison.label, int(comparison.offset_days or 0))
         )
     if ambiguous_recent_month(text):
-        trace.append("ambiguous_recent_month=rolling_30_days")
+        trace.append("ambiguous_recent_month=rolling_calendar_months")
     return trace
 
 
@@ -937,6 +1036,16 @@ def shift_year(value: date, years: int) -> date:
         return value.replace(year=value.year + years)
     except ValueError:
         return value.replace(year=value.year + years, day=28)
+
+
+def shift_month(value: date, months: int) -> date:
+    """Shift by calendar months while preserving a valid day-of-month."""
+
+    month_index = value.year * 12 + (value.month - 1) + int(months)
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(value.day, monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
 
 
 def safe_date(year: str, month: str, day: str) -> Optional[date]:

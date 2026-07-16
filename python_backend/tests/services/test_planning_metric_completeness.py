@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from merchant_ai.models import (
     AgentRunResult,
     AgentTaskResult,
@@ -20,17 +22,40 @@ from merchant_ai.services.planning import (
     QueryGraphPlanner,
     QuestionUnderstandingCompiler,
     SemanticMetricResolution,
+    compact_asset_planning_contract,
     detail_evidence_requests_from_understanding,
     freeze_metric_obligation_ledger,
     more_specific_requested_measure_than_ranking,
     query_plan_question_coverage_gaps,
 )
+from merchant_ai.services.time_semantics import resolve_time_window_contract
 
 
 class UnconfiguredLlm:
     configured = False
     last_error = ""
     error_events = []
+
+
+def test_planning_contract_contains_the_canonical_primary_and_comparison_windows_before_planning() -> None:
+    time_contract = resolve_time_window_contract(
+        "最近30天目标指标趋势，与前30天相比有什么变化",
+        now=datetime(2026, 7, 16, 12, 0, 0),
+    )
+
+    contract = compact_asset_planning_contract(
+        PlanningAssetPack(),
+        fast_understanding={"analysisIntent": "comparison"},
+        time_window_contract=time_contract,
+    )
+
+    assert contract["timeRange"]["days"] == 30
+    assert contract["timeRange"]["windowRole"] == "primary"
+    assert contract["comparisonTimeRange"]["days"] == 30
+    assert contract["comparisonTimeRange"]["windowRole"] == "comparison"
+    assert contract["comparisonTimeRange"]["offsetDays"] == 30
+    assert contract["requiresComparison"] is True
+    assert contract["comparisonType"] == "previous_period"
 
 
 def test_detail_branch_is_controlled_by_typed_result_mode() -> None:
@@ -814,6 +839,38 @@ def test_candidate_group_requires_exact_metric_phrase_match():
     groups = planner._semantic_selection_candidate_groups(["订单量"], candidates)
 
     assert groups == [{"phrase": "订单量", "candidateIds": ["M0"]}]
+
+
+def test_candidate_group_preserves_retrieval_reported_temporal_variant_ambiguity():
+    planner = QueryGraphPlanner(UnconfiguredLlm())
+    candidates = [
+        {
+            "id": "M0",
+            "metricKey": "period_ratio",
+            "name": "周期比率",
+            "aliases": ["目标比率"],
+            "matched": "目标比率",
+            "matchType": "exact_label",
+            "retrievalMatchType": "exact_alias",
+            "metricResolutionAmbiguous": True,
+            "temporalVariants": {"dailySeriesMetricKey": "daily_ratio"},
+        },
+        {
+            "id": "M1",
+            "metricKey": "daily_ratio",
+            "name": "每日目标比率",
+            "aliases": ["每日目标比率"],
+            "matched": "目标比率",
+            "matchType": "partial_label",
+            "retrievalMatchType": "linked_variant",
+            "metricResolutionAmbiguous": True,
+            "temporalVariants": {"periodSummaryMetricKey": "period_ratio"},
+        },
+    ]
+
+    groups = planner._semantic_selection_candidate_groups(["目标比率"], candidates)
+
+    assert groups == [{"phrase": "目标比率", "candidateIds": ["M0", "M1"]}]
 
 
 def test_candidate_group_binds_context_wrapped_phrase_to_longest_complete_asset_label():

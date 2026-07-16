@@ -688,6 +688,8 @@ def planner_failure_gap_code(plan: QueryPlan) -> str:
         return "PLANNER_JSON_PARSE_ERROR"
     if "planner_empty_response" in trace_lower or "empty_response:" in trace_lower:
         return "PLANNER_EMPTY_RESPONSE"
+    if "planner_llm_failed" in trace_lower:
+        return "PLANNER_LLM_FAILED"
     return ""
 
 
@@ -705,4 +707,6 @@ def planner_failure_reason(plan: QueryPlan, code: str) -> str:
         return "Planner LLM 返回内容无法解析为 questionUnderstanding。%s" % trace
     if code == "PLANNER_EMPTY_RESPONSE":
         return "Planner LLM 返回空内容，questionUnderstanding 未生成。%s" % trace
+    if code == "PLANNER_LLM_FAILED":
+        return "Planner LLM 调用失败，questionUnderstanding 未生成。%s" % trace
     return trace or "Planner 未能生成 QueryGraph。"

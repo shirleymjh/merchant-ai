@@ -15,29 +15,40 @@ def metric_by_key(asset: dict, metric_key: str) -> dict:
     return next(metric for metric in asset.get("metrics") or [] if metric.get("metricKey") == metric_key)
 
 
-def test_published_refund_rate_contracts_have_one_bare_alias_owner():
+def test_published_refund_and_return_rate_contracts_are_distinct_temporal_families():
     assets = TopicAssetService(get_settings())
     profile = assets.load_table_asset("经营画像", "ads_merchant_profile")
     refund_detail = assets.load_table_asset("电商退货", "dwm_trade_refund_detail_di")
 
-    period = metric_by_key(profile, "return_rate_by_order")
+    refund_period = metric_by_key(profile, "refund_rate_by_pay_order")
     assert profile["sampleEvidenceGovernance"]["enforcedAtLoad"] is True
     assert profile["profiles"] == []
     assert not any("samples=[" in str(item.get("evidence") or "") for item in profile["metrics"])
-    assert period["formula"] == "SUM(return_cnt_1d) / NULLIF(SUM(order_cnt_1d), 0)"
-    assert period["sourceColumns"] == ["return_cnt_1d", "order_cnt_1d"]
-    assert period["aggregationPolicy"] == "ratio_of_sums"
-    assert period["temporalVariants"]["dailySeriesMetricKey"] == "refund_rate_1d"
-    assert {"退款率", "退货率"} <= set(period["aliases"])
+    assert refund_period["formula"] == "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)"
+    assert refund_period["sourceColumns"] == ["return_cnt_1d", "pay_order_cnt_1d"]
+    assert refund_period["aggregationPolicy"] == "ratio_of_sums"
+    assert refund_period["temporalVariants"]["dailySeriesMetricKey"] == "refund_rate_1d"
+    assert "退款率" in refund_period["aliases"]
+    assert "退货率" not in refund_period["aliases"]
 
     daily = metric_by_key(profile, "refund_rate_1d")
     assert daily["formula"] == "MAX(refund_rate_1d)"
     assert daily["aggregation"] == "MAX"
     assert daily["aggregationPolicy"] == "daily_value_only"
-    assert daily["temporalVariants"]["periodSummaryMetricKey"] == "return_rate_by_order"
+    assert daily["temporalVariants"]["periodSummaryMetricKey"] == "refund_rate_by_pay_order"
     assert "canonicalMetricKey" not in daily
     assert "aliasOf" not in daily
     assert "禁止" in daily["selectionGuidance"]
+    assert "每日退款率" in daily["aliases"]
+    assert "每日退货率" not in daily["aliases"]
+
+    return_period = metric_by_key(profile, "return_rate_by_order")
+    assert return_period["formula"] == "SUM(return_cnt_1d) / NULLIF(SUM(order_cnt_1d), 0)"
+    assert return_period["sourceColumns"] == ["return_cnt_1d", "order_cnt_1d"]
+    assert return_period["aggregationPolicy"] == "ratio_of_sums"
+    assert return_period["temporalVariants"] == {}
+    assert "退货率" in return_period["aliases"]
+    assert "退款率" not in return_period["aliases"]
 
     direct = metric_by_key(profile, "direct_refund_rate_by_pay_order")
     assert "直接退款率" in direct["aliases"]
@@ -57,7 +68,7 @@ def test_published_refund_rate_contracts_have_one_bare_alias_owner():
             for metric in assets.load_table_metrics(topic, table):
                 if "退款率" in (metric.get("aliases") or []):
                     bare_alias_owners.append((topic, table, metric.get("metricKey")))
-    assert bare_alias_owners == [("经营画像", "ads_merchant_profile", "return_rate_by_order")]
+    assert bare_alias_owners == [("经营画像", "ads_merchant_profile", "refund_rate_by_pay_order")]
 
 
 def test_catalog_blocks_cross_topic_ratio_alias_with_different_families(tmp_path):
@@ -144,10 +155,14 @@ def test_refund_rate_retrieval_exposes_governed_temporal_candidates_without_sele
         return [str(item.get("metricKey") or "") for item in retrieval._resolve_metric_candidates(question, [])]
 
     period_keys = metric_keys("最近30天退款率")
-    assert {"return_rate_by_order", "refund_rate_1d"} <= set(period_keys)
+    assert {"refund_rate_by_pay_order", "refund_rate_1d"} <= set(period_keys)
+    assert "return_rate_by_order" not in period_keys[:2]
 
     daily_keys = metric_keys("最近7天每天退款率走势")
-    assert {"return_rate_by_order", "refund_rate_1d"} <= set(daily_keys)
+    assert {"refund_rate_by_pay_order", "refund_rate_1d"} <= set(daily_keys)
+
+    return_keys = metric_keys("最近30天退货率")
+    assert return_keys[0] == "return_rate_by_order"
 
     direct_keys = metric_keys("最近30天直接退款率")
     assert direct_keys[0] == "direct_refund_rate_by_pay_order"
@@ -194,6 +209,28 @@ def test_store_summary_owns_bare_order_and_gmv_aliases_while_detail_aliases_rema
     assert top_metric("最近30天订单量是多少") == "order_cnt_1d"
     assert top_metric("最近30天按商品 GMV") == "pay_amt"
     assert top_metric("最近30天按商品订单量") == "order_detail_cnt"
+
+
+def test_store_summary_metrics_publish_exact_detail_drilldown_refs():
+    assets = TopicAssetService(get_settings())
+    profile = assets.load_table_asset("经营画像", "ads_merchant_profile")
+    expected = {
+        "order_cnt_1d": "semantic:电商交易:dwm_trade_order_detail_di:metric:order_detail_cnt",
+        "refund_amt_1d": "semantic:电商退货:dwm_trade_refund_detail_di:metric:pay_amt",
+        "cs_ticket_cnt_1d": "semantic:客服工单:dwm_cs_ticket_detail_di:metric:ticket_cnt",
+        "seller_repay_amt_1d": "semantic:客服理赔:dwm_cs_repay_detail_df:metric:repay_amt",
+    }
+
+    assert {
+        metric_key: metric_by_key(profile, metric_key).get("detailMetricRef")
+        for metric_key in expected
+    } == expected
+
+    for detail_ref in expected.values():
+        _, topic, table, _, metric_key = detail_ref.split(":", 4)
+        detail_metric = metric_by_key(assets.load_table_asset(topic, table), metric_key)
+        assert detail_metric["metricIntent"] == "detail_drilldown"
+        assert detail_metric["aggregationPolicy"] == "period_rollup"
 
 
 def test_store_summary_owns_bare_compensation_and_ticket_rate_aliases():

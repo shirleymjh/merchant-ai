@@ -512,8 +512,28 @@ class KeywordMention(APIModel):
     display_name: str = ""
     kind: str = ""
     topic: QuestionCategory = QuestionCategory.UNKNOWN
+    owner_table: str = ""
+    semantic_role: str = ""
     score: float = 0.0
     source: str = ""
+
+
+class RouteSpanType(str, Enum):
+    TEMPORAL = "temporal"
+    RANKING = "ranking"
+
+
+class RouteLexicalSpan(APIModel):
+    """Typed lexical evidence with offsets into ``normalized_question``."""
+
+    span_type: RouteSpanType
+    start: int
+    end: int
+    text: str
+    source: str = ""
+    value: int = 0
+    unit: str = ""
+    role: str = ""
 
 
 class ExtractedKeywords(APIModel):
@@ -526,6 +546,7 @@ class ExtractedKeywords(APIModel):
     time_keywords: List[str] = Field(default_factory=list)
     action_keywords: List[str] = Field(default_factory=list)
     ranking_keywords: List[str] = Field(default_factory=list)
+    lexical_spans: List[RouteLexicalSpan] = Field(default_factory=list)
     mentions: List[KeywordMention] = Field(default_factory=list)
     topic_scores: Dict[str, float] = Field(default_factory=dict)
     analysis_intent: str = "lookup"
