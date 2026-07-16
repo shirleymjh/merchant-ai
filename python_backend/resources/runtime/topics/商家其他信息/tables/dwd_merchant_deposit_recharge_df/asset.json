@@ -6,12 +6,44 @@
   "dataGrain": "保证金充值流水粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "merchant_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWD", "queryableByAgent": true, "authorityLevel": 85, "topicRole": "DETAIL"},
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DWD",
+    "queryableByAgent": true,
+    "authorityLevel": 85,
+    "topicRole": "DETAIL"
+  },
   "status": "PUBLISHED",
   "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:17:35",
@@ -444,7 +476,8 @@
       "naturalAlias": "保证金充值金额",
       "sourceColumnAliases": [
         "deposit_recharge_amt"
-      ]
+      ],
+      "timeColumn": "pt"
     },
     {
       "metricKey": "deposit_recharge_cnt",
@@ -483,7 +516,8 @@
       "naturalAlias": "保证金充值流水数",
       "sourceColumnAliases": [
         "deposit_recharge_id"
-      ]
+      ],
+      "timeColumn": "pt"
     }
   ],
   "terms": [
@@ -670,5 +704,9 @@
       ],
       "evidence": "保证金充值表字段语义"
     }
-  ]
+  ],
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
+  }
 }

@@ -6,12 +6,44 @@
   "dataGrain": "商家主体/资质快照粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "merchant_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DIM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "PROFILE"},
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DIM",
+    "queryableByAgent": true,
+    "authorityLevel": 90,
+    "topicRole": "PROFILE"
+  },
   "runtimeBindings": [
     {
       "role": "principal_profile",
@@ -2173,7 +2205,8 @@
       "originalBusinessName": "商户入驻初始保证金元",
       "sourceColumnAliases": [
         "init_deposit_amt"
-      ]
+      ],
+      "timeColumn": "pt"
     },
     {
       "metricKey": "deposit_amt",
@@ -2208,7 +2241,8 @@
       "originalBusinessName": "保证金余额",
       "sourceColumnAliases": [
         "deposit_amt"
-      ]
+      ],
+      "timeColumn": "pt"
     },
     {
       "metricKey": "merchant_cnt",
@@ -2236,7 +2270,15 @@
       "originalBusinessName": "商家数",
       "sourceColumnAliases": [
         "merchant_id"
-      ]
+      ],
+      "applicableTimeGrain": "day",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "latest_as_of",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "merchant_deposit_freeze_amt",
@@ -2273,7 +2315,8 @@
       "originalBusinessName": "冻结保证金",
       "sourceColumnAliases": [
         "deposit_freeze"
-      ]
+      ],
+      "timeColumn": "pt"
     }
   ],
   "terms": [
@@ -3141,5 +3184,9 @@
       ],
       "evidence": "商家维表字段语义"
     }
-  ]
+  ],
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
+  }
 }

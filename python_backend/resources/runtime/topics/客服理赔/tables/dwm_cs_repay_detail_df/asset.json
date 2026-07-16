@@ -6,12 +6,44 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "seller_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DWM",
+    "queryableByAgent": true,
+    "authorityLevel": 90,
+    "topicRole": "DETAIL"
+  },
   "status": "PUBLISHED",
   "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:08:37",
@@ -1314,7 +1346,15 @@
       "naturalAlias": "赔付明细金额",
       "sourceColumnAliases": [
         "repay_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "repay_bill_cnt",
@@ -1347,12 +1387,20 @@
       "naturalAlias": "赔付明细单量",
       "sourceColumnAliases": [
         "bill_id"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "compensation_rate",
       "businessName": "商品维度赔付率",
-      "formula": "repay_bill_cnt / NULLIF(order_detail_cnt, 0)",
+      "formula": "SUM(repay_bill_cnt) / NULLIF(SUM(order_detail_cnt), 0)",
       "unit": "%",
       "description": "同一商品、订单集合或日期粒度下，赔付明细单量占订单明细去重下单数的比例；分子来自赔付明细单量，分母来自订单明细去重下单数。",
       "sourceColumns": [
@@ -1377,7 +1425,10 @@
       "metricType": "RATIO",
       "aggregationPolicy": "ratio_of_sums",
       "aliasConflictScope": "SCOPED",
-      "metricDependencies": ["repay_bill_cnt", "order_detail_cnt"],
+      "metricDependencies": [
+        "repay_bill_cnt",
+        "order_detail_cnt"
+      ],
       "ambiguousAliases": [],
       "naturalName": "商品赔付率",
       "originalBusinessName": "商品赔付率",
@@ -1385,7 +1436,15 @@
       "sourceColumnAliases": [
         "order_detail_cnt",
         "repay_bill_cnt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "repay_success_amt",
@@ -1417,7 +1476,15 @@
       "sourceColumnAliases": [
         "pay_status_name",
         "repay_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     }
   ],
   "terms": [
@@ -1976,5 +2043,9 @@
       ],
       "evidence": "赔付表状态字段语义"
     }
-  ]
+  ],
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
+  }
 }

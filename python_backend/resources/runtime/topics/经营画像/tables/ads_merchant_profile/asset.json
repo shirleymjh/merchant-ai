@@ -6,16 +6,50 @@
   "dataGrain": "商家-日期粒度经营指标画像",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "merchant_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "ADS", "queryableByAgent": true, "authorityLevel": 95, "topicRole": "PROFILE"},
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "ADS",
+    "queryableByAgent": true,
+    "authorityLevel": 95,
+    "topicRole": "PROFILE"
+  },
   "sampleEvidenceGovernance": {
     "status": "STALE",
     "usableForSemanticDecisions": false,
-    "affectedColumns": ["*"],
+    "affectedColumns": [
+      "*"
+    ],
     "reason": "The checked-in builder sample snapshot is synthetic/stale and no longer matches current Doris rows; semantic formulas remain governed, but all sample values must be rebuilt before use."
   },
   "status": "PUBLISHED",
@@ -2766,7 +2800,15 @@
       "originalBusinessName": "保证金余额元",
       "sourceColumnAliases": [
         "deposit_amt"
-      ]
+      ],
+      "applicableTimeGrain": "day",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "latest_as_of",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "order_cnt_1d",
@@ -2804,7 +2846,15 @@
       "originalBusinessName": "总订单量",
       "sourceColumnAliases": [
         "order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "order_user_cnt_1d",
@@ -2834,7 +2884,15 @@
       "originalBusinessName": "下单用户量",
       "sourceColumnAliases": [
         "order_user_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "order_gmv_amt_1d",
@@ -2875,7 +2933,15 @@
       "originalBusinessName": "总gmv金额元",
       "sourceColumnAliases": [
         "order_gmv_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_order_cnt_1d",
@@ -2908,7 +2974,15 @@
       "originalBusinessName": "支付订单量",
       "sourceColumnAliases": [
         "pay_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_gmv_amt_1d",
@@ -2946,7 +3020,15 @@
       "originalBusinessName": "支付gmv金额元",
       "sourceColumnAliases": [
         "pay_gmv_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "trade_success_order_cnt_1d",
@@ -2976,7 +3058,15 @@
       "originalBusinessName": "交易成功订单量",
       "sourceColumnAliases": [
         "trade_success_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_success_discount_order_cnt_1d",
@@ -3010,7 +3100,15 @@
       "originalBusinessName": "支付成功优惠单量",
       "sourceColumnAliases": [
         "pay_success_discount_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_success_discount_amt_1d",
@@ -3045,7 +3143,15 @@
       "originalBusinessName": "支付成功优惠金额元",
       "sourceColumnAliases": [
         "pay_success_discount_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "trade_success_discount_order_cnt_1d",
@@ -3076,7 +3182,15 @@
       "originalBusinessName": "交易成功优惠单量",
       "sourceColumnAliases": [
         "trade_success_discount_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "trade_success_discount_amt_1d",
@@ -3108,7 +3222,15 @@
       "originalBusinessName": "交易成功优惠金额元",
       "sourceColumnAliases": [
         "trade_success_discount_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "cs_ticket_cnt_1d",
@@ -3143,7 +3265,15 @@
       "originalBusinessName": "咨询工单量",
       "sourceColumnAliases": [
         "cs_ticket_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "risk_complaint_order_cnt_1d",
@@ -3173,7 +3303,15 @@
       "originalBusinessName": "风控客诉订单量",
       "sourceColumnAliases": [
         "risk_complaint_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "seller_repay_order_cnt_1d",
@@ -3205,7 +3343,15 @@
       "originalBusinessName": "卖家赔付订单数",
       "sourceColumnAliases": [
         "seller_repay_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "seller_repay_amt_1d",
@@ -3239,7 +3385,15 @@
       "originalBusinessName": "卖家赔付金额元",
       "sourceColumnAliases": [
         "seller_repay_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "entry_audit_duration_hours_1d",
@@ -3270,7 +3424,14 @@
       ],
       "aggregationPolicy": "daily_value_only",
       "applicableTimeGrain": "day",
-      "selectionGuidance": "仅用于单日或按已声明时间列分组的逐日结果；缺少加权分子分母，禁止跨日 SUM/AVG。"
+      "selectionGuidance": "仅用于单日或按已声明时间列分组的逐日结果；缺少加权分子分母，禁止跨日 SUM/AVG。",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "per_time_grain",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "deposit_pay_cnt_1d",
@@ -3300,7 +3461,15 @@
       "originalBusinessName": "缴纳保证金次数",
       "sourceColumnAliases": [
         "deposit_pay_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "entry_success_duration_hours_1d",
@@ -3331,7 +3500,14 @@
       ],
       "aggregationPolicy": "daily_value_only",
       "applicableTimeGrain": "day",
-      "selectionGuidance": "仅用于单日或按已声明时间列分组的逐日结果；缺少加权分子分母，禁止跨日 SUM/AVG。"
+      "selectionGuidance": "仅用于单日或按已声明时间列分组的逐日结果；缺少加权分子分母，禁止跨日 SUM/AVG。",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "per_time_grain",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "punish_cnt_1d",
@@ -3361,7 +3537,15 @@
       "originalBusinessName": "处罚次数",
       "sourceColumnAliases": [
         "punish_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "appeal_cnt_1d",
@@ -3391,7 +3575,15 @@
       "originalBusinessName": "申诉次数",
       "sourceColumnAliases": [
         "appeal_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "appeal_success_cnt_1d",
@@ -3421,7 +3613,15 @@
       "originalBusinessName": "申诉成功次数",
       "sourceColumnAliases": [
         "appeal_success_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "scm_performance_cnt_1d",
@@ -3451,7 +3651,15 @@
       "originalBusinessName": "供应链履约量",
       "sourceColumnAliases": [
         "scm_performance_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "return_success_cnt_1d",
@@ -3481,7 +3689,15 @@
       "originalBusinessName": "退货成功量",
       "sourceColumnAliases": [
         "return_success_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "return_cnt_1d",
@@ -3513,7 +3729,15 @@
       "originalBusinessName": "退货量",
       "sourceColumnAliases": [
         "return_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "fake_identify_cnt_1d",
@@ -3545,7 +3769,15 @@
       "originalBusinessName": "鉴定为假货量",
       "sourceColumnAliases": [
         "fake_identify_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "check_unpass_cnt_1d",
@@ -3575,7 +3807,15 @@
       "originalBusinessName": "质检不通过量",
       "sourceColumnAliases": [
         "check_unpass_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "goods_audit_reject_cnt_1d",
@@ -3614,7 +3854,15 @@
       "originalBusinessName": "商品审核拒绝量",
       "sourceColumnAliases": [
         "goods_audit_reject_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "goods_online_cnt_1d",
@@ -3644,7 +3892,15 @@
       "originalBusinessName": "上架商品量",
       "sourceColumnAliases": [
         "goods_online_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "goods_apply_cnt_1d",
@@ -3674,7 +3930,15 @@
       "originalBusinessName": "商品申请量",
       "sourceColumnAliases": [
         "goods_apply_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "trade_success_gmv_amt_1d",
@@ -3711,7 +3975,15 @@
       "originalBusinessName": "交易成功gmv金额元",
       "sourceColumnAliases": [
         "trade_success_gmv_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "trade_success_user_cnt_1d",
@@ -3741,7 +4013,15 @@
       "originalBusinessName": "交易成功用户量",
       "sourceColumnAliases": [
         "trade_success_user_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "avg_pay_order_amt_1d",
@@ -3772,7 +4052,14 @@
       ],
       "aggregationPolicy": "daily_value_only",
       "applicableTimeGrain": "day",
-      "selectionGuidance": "仅用于单日或逐日走势；周期客单价必须使用支付GMV与支付订单量的周期比值。"
+      "selectionGuidance": "仅用于单日或逐日走势；周期客单价必须使用支付GMV与支付订单量的周期比值。",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "per_time_grain",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "order_close_cnt_1d",
@@ -3802,7 +4089,15 @@
       "originalBusinessName": "关闭订单量",
       "sourceColumnAliases": [
         "order_close_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "seller_subsidy_amt_1d",
@@ -3833,7 +4128,15 @@
       "originalBusinessName": "商家补贴金额元",
       "sourceColumnAliases": [
         "seller_subsidy_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "platform_subsidy_amt_1d",
@@ -3864,7 +4167,15 @@
       "originalBusinessName": "平台补贴金额元",
       "sourceColumnAliases": [
         "platform_subsidy_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "ship_timeout_order_cnt_1d",
@@ -3894,7 +4205,15 @@
       "originalBusinessName": "发货超时订单量",
       "sourceColumnAliases": [
         "ship_timeout_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "signed_order_cnt_1d",
@@ -3924,7 +4243,15 @@
       "originalBusinessName": "签收订单量",
       "sourceColumnAliases": [
         "signed_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "delivery_timeout_order_cnt_1d",
@@ -3956,7 +4283,15 @@
       "originalBusinessName": "签收超预计送达订单量",
       "sourceColumnAliases": [
         "delivery_timeout_order_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_discount_rate_1d",
@@ -3987,7 +4322,14 @@
       ],
       "aggregationPolicy": "daily_value_only",
       "applicableTimeGrain": "day",
-      "selectionGuidance": "仅用于单日或逐日走势；周期优惠占比必须使用优惠金额与支付GMV的周期比值。"
+      "selectionGuidance": "仅用于单日或逐日走势；周期优惠占比必须使用优惠金额与支付GMV的周期比值。",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "per_time_grain",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "refund_amt_1d",
@@ -4019,7 +4361,15 @@
       "originalBusinessName": "退款金额元",
       "sourceColumnAliases": [
         "refund_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "return_success_amt_1d",
@@ -4050,7 +4400,15 @@
       "originalBusinessName": "退货成功金额元",
       "sourceColumnAliases": [
         "return_success_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "seller_responsible_refund_cnt_1d",
@@ -4080,7 +4438,15 @@
       "originalBusinessName": "卖家责任退货量",
       "sourceColumnAliases": [
         "seller_responsible_refund_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "direct_refund_cnt_1d",
@@ -4111,7 +4477,15 @@
       "originalBusinessName": "直接退款量",
       "sourceColumnAliases": [
         "direct_refund_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "direct_refund_rate_by_pay_order",
@@ -4143,7 +4517,15 @@
       "canonicalMetricKey": "direct_refund_rate_by_pay_order",
       "metricType": "RATIO",
       "aggregationPolicy": "ratio_of_sums",
-      "selectionGuidance": "仅在用户明确说“直接退款率”时使用；不响应裸“退款率”或“退货率”。"
+      "selectionGuidance": "仅在用户明确说“直接退款率”时使用；不响应裸“退款率”或“退货率”。",
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "refund_rate_1d",
@@ -4198,6 +4580,13 @@
       ],
       "temporalVariants": {
         "periodSummaryMetricKey": "return_rate_by_order"
+      },
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "per_time_grain",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
       }
     },
     {
@@ -4228,7 +4617,15 @@
       "originalBusinessName": "工单二次开启量",
       "sourceColumnAliases": [
         "ticket_reopen_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "ticket_reminder_cnt_1d",
@@ -4258,7 +4655,15 @@
       "originalBusinessName": "催单工单量",
       "sourceColumnAliases": [
         "ticket_reminder_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "ticket_close_cnt_1d",
@@ -4288,7 +4693,15 @@
       "originalBusinessName": "关闭工单量",
       "sourceColumnAliases": [
         "ticket_close_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "avg_ticket_score_1d",
@@ -4319,7 +4732,14 @@
       ],
       "aggregationPolicy": "daily_value_only",
       "applicableTimeGrain": "day",
-      "selectionGuidance": "仅用于单日或逐日走势；缺少评价总分与评价数，禁止跨日 AVG 伪装成周期总体均分。"
+      "selectionGuidance": "仅用于单日或逐日走势；缺少评价总分与评价数，禁止跨日 AVG 伪装成周期总体均分。",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "per_time_grain",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "goods_audit_pass_cnt_1d",
@@ -4355,7 +4775,15 @@
       "originalBusinessName": "商品审核通过量",
       "sourceColumnAliases": [
         "goods_audit_pass_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "appeal_success_rate_1d",
@@ -4389,7 +4817,15 @@
       "sourceColumnAliases": [
         "appeal_cnt_1d",
         "appeal_success_cnt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "net_gmv_after_refund",
@@ -4421,7 +4857,15 @@
       "sourceColumnAliases": [
         "order_gmv_amt_1d",
         "refund_amt_1d"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "return_rate_by_order",
@@ -4479,6 +4923,14 @@
       ],
       "temporalVariants": {
         "dailySeriesMetricKey": "refund_rate_1d"
+      },
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
       }
     },
     {
@@ -4510,7 +4962,15 @@
         "dailyComputation": "group_by_time_column_then_ratio_of_sums",
         "periodComputation": "ratio_of_period_sums"
       },
-      "evidence": "语义层已发布分子 seller_repay_order_cnt_1d（卖家赔付订单数）与分母 order_cnt_1d（总订单量）。"
+      "evidence": "语义层已发布分子 seller_repay_order_cnt_1d（卖家赔付订单数）与分母 order_cnt_1d（总订单量）。",
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "merchant_ticket_rate_by_order",
@@ -4541,7 +5001,15 @@
         "dailyComputation": "group_by_time_column_then_ratio_of_sums",
         "periodComputation": "ratio_of_period_sums"
       },
-      "evidence": "语义层已发布分子 cs_ticket_cnt_1d（咨询工单量）与分母 order_cnt_1d（总订单量）。"
+      "evidence": "语义层已发布分子 cs_ticket_cnt_1d（咨询工单量）与分母 order_cnt_1d（总订单量）。",
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "avg_pay_order_amt_by_period",
@@ -4571,7 +5039,15 @@
         "dailySeriesMetricKey": "avg_pay_order_amt_1d",
         "periodComputation": "ratio_of_period_sums"
       },
-      "evidence": "语义层已发布支付GMV与支付订单量，可按周期比值重算。"
+      "evidence": "语义层已发布支付GMV与支付订单量，可按周期比值重算。",
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_discount_rate_by_gmv",
@@ -4601,7 +5077,15 @@
         "dailySeriesMetricKey": "pay_discount_rate_1d",
         "periodComputation": "ratio_of_period_sums"
       },
-      "evidence": "语义层已发布支付成功优惠金额与支付GMV，可按周期比值重算。"
+      "evidence": "语义层已发布支付成功优惠金额与支付GMV，可按周期比值重算。",
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     }
   ],
   "terms": [
@@ -5643,5 +6127,9 @@
       ],
       "evidence": "表名与字段后缀 _1d"
     }
-  ]
+  ],
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
+  }
 }

@@ -6,13 +6,48 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
-  "entityLookupPolicy": {"mode": "clarify", "timeColumn": "pt"},
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "seller_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
+  },
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DWM",
+    "queryableByAgent": true,
+    "authorityLevel": 90,
+    "topicRole": "DETAIL"
+  },
   "status": "PUBLISHED",
   "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:08:36",
@@ -3868,7 +3903,15 @@
       "naturalAlias": "订单明细去重下单数",
       "sourceColumnAliases": [
         "sub_order_id"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "discount_amt",
@@ -3899,7 +3942,15 @@
       "naturalAlias": "订单优惠金额",
       "sourceColumnAliases": [
         "discount_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "sku_cnt",
@@ -3931,7 +3982,15 @@
       "naturalAlias": "下单商品数量",
       "sourceColumnAliases": [
         "sku_cnt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "product_amt",
@@ -3962,7 +4021,15 @@
       "naturalAlias": "商品总额分",
       "sourceColumnAliases": [
         "product_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "freight_amt",
@@ -3993,7 +4060,15 @@
       "naturalAlias": "运费金额分",
       "sourceColumnAliases": [
         "freight_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "platform_subsidy_amt",
@@ -4024,7 +4099,15 @@
       "naturalAlias": "订单明细平台补贴金额",
       "sourceColumnAliases": [
         "platform_subsidy_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "seller_subsidy_amt",
@@ -4055,7 +4138,15 @@
       "naturalAlias": "订单明细商家补贴金额",
       "sourceColumnAliases": [
         "seller_subsidy_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_amt",
@@ -4094,7 +4185,15 @@
       "naturalAlias": "订单支付金额",
       "sourceColumnAliases": [
         "pay_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     }
   ],
   "terms": [

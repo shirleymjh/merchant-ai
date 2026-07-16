@@ -6,12 +6,44 @@
   "dataGrain": "优惠券/津贴明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "seller_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DWM",
+    "queryableByAgent": true,
+    "authorityLevel": 90,
+    "topicRole": "DETAIL"
+  },
   "status": "PUBLISHED",
   "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:17:34",
@@ -1459,6 +1491,14 @@
         "droppedNonSchemaSourceColumns": [
           "coupon_total_amt"
         ]
+      },
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
       }
     },
     {
@@ -1498,6 +1538,14 @@
         "droppedNonSchemaSourceColumns": [
           "allowance_total_amt"
         ]
+      },
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
       }
     },
     {
@@ -1532,7 +1580,15 @@
       "naturalAlias": "优惠券发放量",
       "sourceColumnAliases": [
         "coupon_id"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "coupon_receive_cnt",
@@ -1565,7 +1621,15 @@
       "naturalAlias": "优惠券领取量",
       "sourceColumnAliases": [
         "is_receive"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "coupon_refund_cnt",
@@ -1598,7 +1662,15 @@
       "naturalAlias": "优惠券退回量",
       "sourceColumnAliases": [
         "coupon_refund_id"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     }
   ],
   "terms": [
@@ -2231,5 +2303,9 @@
       ],
       "evidence": "优惠券表字段语义"
     }
-  ]
+  ],
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
+  }
 }

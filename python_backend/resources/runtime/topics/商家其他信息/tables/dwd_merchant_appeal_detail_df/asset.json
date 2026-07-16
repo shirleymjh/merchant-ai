@@ -6,12 +6,44 @@
   "dataGrain": "商家申诉明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "merchant_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWD", "queryableByAgent": true, "authorityLevel": 85, "topicRole": "DETAIL"},
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DWD",
+    "queryableByAgent": true,
+    "authorityLevel": 85,
+    "topicRole": "DETAIL"
+  },
   "status": "PUBLISHED",
   "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:17:35",
@@ -691,7 +723,15 @@
       "naturalAlias": "申诉明细次数",
       "sourceColumnAliases": [
         "appeal_id"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "appeal_pass_cnt",
@@ -722,7 +762,15 @@
       "sourceColumnAliases": [
         "appeal_status_code",
         "appeal_status_name"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "appeal_reject_cnt",
@@ -753,12 +801,20 @@
       "sourceColumnAliases": [
         "appeal_status_code",
         "appeal_status_name"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "appeal_success_rate",
       "businessName": "申诉明细成功率",
-      "formula": "appeal_pass_cnt / NULLIF(appeal_cnt, 0)",
+      "formula": "SUM(appeal_pass_cnt) / NULLIF(SUM(appeal_cnt), 0)",
       "unit": "%",
       "description": "申诉通过次数占申诉次数的比例",
       "sourceColumns": [],
@@ -790,6 +846,14 @@
           "appeal_pass_cnt",
           "appeal_cnt"
         ]
+      },
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
       }
     },
     {
@@ -822,7 +886,15 @@
       "sourceColumnAliases": [
         "apply_type_code",
         "apply_type_name"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     }
   ],
   "terms": [
@@ -1113,5 +1185,9 @@
       ],
       "evidence": "商家申诉表字段语义"
     }
-  ]
+  ],
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
+  }
 }

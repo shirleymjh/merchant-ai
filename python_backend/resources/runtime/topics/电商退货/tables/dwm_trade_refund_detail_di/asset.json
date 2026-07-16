@@ -6,13 +6,48 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
-  "entityLookupPolicy": {"mode": "clarify", "timeColumn": "pt"},
-  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
-  "resultAccessPolicies": {
-    "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
-    "TIME": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_TIME_DIMENSION"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_TIME_DIMENSION"}}
+  "entityLookupPolicy": {
+    "mode": "clarify",
+    "timeColumn": "pt"
   },
-  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
+  "rowAccessPolicy": {
+    "scopeType": "merchant",
+    "filterColumn": "seller_id",
+    "operator": "eq",
+    "valueSource": "merchant_id",
+    "required": true
+  },
+  "resultAccessPolicies": {
+    "METRIC": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_AGGREGATE_RESULT"
+      }
+    },
+    "TIME": {
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_TIME_DIMENSION"
+      }
+    }
+  },
+  "tableUsageProfile": {
+    "contractStatus": "APPROVED",
+    "businessLayer": "DWM",
+    "queryableByAgent": true,
+    "authorityLevel": 90,
+    "topicRole": "DETAIL"
+  },
   "status": "PUBLISHED",
   "version": "v20260716105335",
   "generatedAt": "2026-06-15T18:08:37",
@@ -3245,7 +3280,15 @@
       "naturalAlias": "退款商品数量",
       "sourceColumnAliases": [
         "sku_count"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "pay_amt",
@@ -3279,7 +3322,15 @@
       "naturalAlias": "退款明细金额",
       "sourceColumnAliases": [
         "pay_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "refund_discount_amt",
@@ -3309,7 +3360,15 @@
       "naturalAlias": "退款优惠金额",
       "sourceColumnAliases": [
         "refund_discount_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "logistic_amt",
@@ -3339,7 +3398,15 @@
       "naturalAlias": "物流金额",
       "sourceColumnAliases": [
         "logistic_amt"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "refund_bill_cnt",
@@ -3379,12 +3446,20 @@
       "naturalAlias": "退款单量",
       "sourceColumnAliases": [
         "refund_id"
-      ]
+      ],
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     },
     {
       "metricKey": "product_refund_order_share",
       "businessName": "商品退款订单占比",
-      "formula": "refund_bill_cnt / NULLIF(order_detail_cnt, 0)",
+      "formula": "SUM(refund_bill_cnt) / NULLIF(SUM(order_detail_cnt), 0)",
       "unit": "%",
       "description": "商品粒度的退款明细单量占订单明细去重下单数的比例；这是商品退款订单占比，不是商家退货率或直接退款率。",
       "sourceColumns": [
@@ -3436,7 +3511,15 @@
         "dwm_trade_refund_detail_di",
         "dwm_trade_order_detail_di"
       ],
-      "clarificationQuestion": "商品退款订单占比需要同时读取退款明细单量和订单明细下单数，是否按商品粒度做跨表计算？"
+      "clarificationQuestion": "商品退款订单占比需要同时读取退款明细单量和订单明细下单数，是否按商品粒度做跨表计算？",
+      "applicableTimeGrain": "period",
+      "timeColumn": "pt",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      }
     }
   ],
   "terms": [
