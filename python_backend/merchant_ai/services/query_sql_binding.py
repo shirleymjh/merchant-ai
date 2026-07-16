@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from merchant_ai.models import NodeExecutionContext, PlanningAssetPack, QuestionIntent
 
@@ -390,11 +391,70 @@ def add_bind_values(target: Dict[str, List[Any]], column: str, values: List[Any]
         return
     bucket = target.setdefault(key, [])
     for value in values:
+        if len(bucket) >= max_values:
+            break
         if blank_entity_value(value) or value in bucket:
             continue
         bucket.append(value)
-        if len(bucket) >= max_values:
-            break
+
+
+def mandatory_semantic_filter_nodes(intent: QuestionIntent) -> List[Any]:
+    """Return predicates that every row must satisfy in the semantic filter tree.
+
+    Only root predicates and descendants of AND groups are mandatory-positive.
+    A predicate below OR/NOT cannot safely drive global parameter binding because
+    replacing every predicate on the same column would change boolean semantics.
+    """
+
+    spec = getattr(intent, "semantic_query", None)
+    nodes = list(getattr(spec, "filter_nodes", None) or [])
+    root_id = str(getattr(spec, "root_filter_node_id", "") or "")
+    node_by_id = {str(getattr(node, "node_id", "") or ""): node for node in nodes}
+    if not root_id or root_id not in node_by_id:
+        return []
+
+    def visit(node_id: str, visiting: set[str]) -> List[Any]:
+        if node_id in visiting:
+            return []
+        node = node_by_id.get(node_id)
+        if node is None:
+            return []
+        node_type = str(getattr(node, "node_type", "") or "").lower()
+        if node_type == "predicate":
+            return [node]
+        if node_type != "group" or str(getattr(node, "logical_operator", "") or "").lower() != "and":
+            return []
+        result: List[Any] = []
+        next_visiting = {*visiting, node_id}
+        for child_id in getattr(node, "child_node_ids", None) or []:
+            result.extend(visit(str(child_id or ""), next_visiting))
+        return result
+
+    return visit(root_id, set())
+
+
+def semantic_bind_values_by_column(intent: QuestionIntent, columns: set, max_values: int = 200) -> Dict[str, List[Any]]:
+    """Bind only unambiguous mandatory EQ/IN predicates by physical column."""
+
+    candidates: Dict[str, List[Any]] = {}
+    counts: Dict[str, int] = {}
+    for node in mandatory_semantic_filter_nodes(intent):
+        if str(getattr(node, "member_kind", "") or "").lower() == "measure":
+            continue
+        if str(getattr(node, "resolution_status", "") or "").lower() != "resolved":
+            continue
+        if str(getattr(node, "operator", "") or "").lower() not in {"eq", "in"}:
+            continue
+        column = normalize_identifier(getattr(node, "bound_field", ""))
+        if not column or column not in columns:
+            continue
+        counts[column] = counts.get(column, 0) + 1
+        candidates.setdefault(column, []).extend(list(getattr(node, "resolved_values", None) or []))
+    return {
+        column: list(dict.fromkeys(values))[:max_values]
+        for column, values in candidates.items()
+        if counts.get(column) == 1 and values
+    }
 
 
 def node_bind_values_by_column(
@@ -416,6 +476,8 @@ def node_bind_values_by_column(
     store_column = normalize_identifier((context.context_package or {}).get("storeFilterColumn"))
     if context.authorized_store_ids and store_column in normalized_columns:
         add_bind_values(values_by_column, store_column, list(context.authorized_store_ids), max_values)
+    for column, values in semantic_bind_values_by_column(intent, normalized_columns, max_values).items():
+        add_bind_values(values_by_column, column, values, max_values)
     filter_column = normalize_identifier(intent.filter_column)
     if filter_column in normalized_columns:
         reference = getattr(intent, "entity_reference", None)
@@ -557,6 +619,222 @@ def parse_sql_for_binding(sql: str) -> Optional[exp.Expression]:
             return sqlglot.parse_one((sql or "").replace("%s", "?").strip(), read="mysql")
         except Exception:
             return None
+
+
+BOUND_PARAMETER_PREFIX = "__contract_param_"
+
+
+def parse_bound_sql_for_contract(sql: str) -> Optional[exp.Expression]:
+    """Parse DB-API ``%s`` SQL while preserving each parameter position in AST."""
+
+    index = 0
+    source = str(sql or "")
+    output: List[str] = []
+    position = 0
+    quote = ""
+    line_comment = False
+    block_comment = False
+    while position < len(source):
+        if line_comment:
+            output.append(source[position])
+            if source[position] in "\r\n":
+                line_comment = False
+            position += 1
+            continue
+        if block_comment:
+            if source.startswith("*/", position):
+                output.append("*/")
+                block_comment = False
+                position += 2
+            else:
+                output.append(source[position])
+                position += 1
+            continue
+        if quote:
+            character = source[position]
+            output.append(character)
+            if character == "\\" and position + 1 < len(source):
+                output.append(source[position + 1])
+                position += 2
+                continue
+            if character == quote:
+                if position + 1 < len(source) and source[position + 1] == quote:
+                    output.append(source[position + 1])
+                    position += 2
+                    continue
+                quote = ""
+            position += 1
+            continue
+        if source.startswith("--", position):
+            output.append("--")
+            line_comment = True
+            position += 2
+            continue
+        if source.startswith("/*", position):
+            output.append("/*")
+            block_comment = True
+            position += 2
+            continue
+        if source[position] in {"'", '"', "`"}:
+            quote = source[position]
+            output.append(source[position])
+            position += 1
+            continue
+        if source.startswith("%s", position):
+            output.append(":%s%d" % (BOUND_PARAMETER_PREFIX, index))
+            index += 1
+            position += 2
+            continue
+        output.append(source[position])
+        position += 1
+    normalized = "".join(output)
+    try:
+        return sqlglot.parse_one(normalized.strip(), read="doris")
+    except Exception:
+        try:
+            return sqlglot.parse_one(normalized.strip(), read="mysql")
+        except Exception:
+            return None
+
+
+def bound_parameter_index(expression: Any) -> Optional[int]:
+    if not isinstance(expression, exp.Placeholder):
+        return None
+    name = str(expression.this or "")
+    if not name.startswith(BOUND_PARAMETER_PREFIX):
+        return None
+    suffix = name[len(BOUND_PARAMETER_PREFIX) :]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def unwrap_boolean_parentheses(expression: exp.Expression) -> exp.Expression:
+    current = expression
+    while isinstance(current, exp.Paren):
+        current = current.this
+    return current
+
+
+def root_and_terms(expression: exp.Expression) -> List[exp.Expression]:
+    current = unwrap_boolean_parentheses(expression)
+    if isinstance(current, exp.And):
+        return root_and_terms(current.this) + root_and_terms(current.expression)
+    return [current]
+
+
+def direct_expression_columns(expression: exp.Expression) -> List[str]:
+    """Return columns in an expression without descending into nested SELECTs."""
+
+    columns: List[str] = []
+
+    def visit(node: Any, root: bool = False) -> None:
+        if not isinstance(node, exp.Expression):
+            return
+        if not root and isinstance(node, (exp.Select, exp.Subquery)):
+            return
+        if isinstance(node, exp.Column):
+            columns.append(normalize_identifier(node.name))
+            return
+        for child in node.iter_expressions():
+            visit(child)
+
+    visit(expression, root=True)
+    return columns
+
+
+def select_scopes_reading_table(parsed: exp.Expression, table: str = "") -> List[Any]:
+    target = normalize_identifier(table)
+    scopes = list(traverse_scope(parsed))
+    if target:
+        return [
+            scope
+            for scope in scopes
+            if any(
+                isinstance(pair[1], exp.Table) and normalize_identifier(pair[1].name) == target
+                for pair in (getattr(scope, "selected_sources", {}) or {}).values()
+            )
+        ]
+    if isinstance(parsed, exp.Select):
+        return [scope for scope in scopes if scope.expression is parsed]
+    outer = parsed.find(exp.Select)
+    return [scope for scope in scopes if scope.expression is outer] if outer is not None else []
+
+
+def mandatory_column_predicate(
+    select: exp.Expression,
+    column: str,
+    *,
+    require_placeholders: bool = False,
+) -> Tuple[Optional[exp.Expression], List[int]]:
+    """Find the single positive EQ/IN predicate on the root-AND path."""
+
+    target = normalize_identifier(column)
+    where = select.args.get("where") if isinstance(select, exp.Select) else None
+    condition = where.this if isinstance(where, exp.Where) else None
+    if not target or condition is None:
+        return None, []
+    references = [term for term in root_and_terms(condition) if target in direct_expression_columns(term)]
+    if len(references) != 1:
+        return None, []
+    predicate = unwrap_boolean_parentheses(references[0])
+    if not isinstance(predicate, (exp.EQ, exp.In)):
+        return None, []
+    if predicate_column_name(predicate.this) != target:
+        return None, []
+    if isinstance(predicate, exp.In):
+        if predicate.args.get("query") is not None or predicate.find(exp.Subquery) is not None:
+            return None, []
+        rhs = list(predicate.expressions or [])
+        if not rhs:
+            return None, []
+    else:
+        if predicate.expression.find(exp.Select) is not None or predicate.expression.find(exp.Subquery) is not None:
+            return None, []
+        rhs = [predicate.expression]
+    indexes = [bound_parameter_index(item) for item in rhs]
+    if require_placeholders and any(index is None for index in indexes):
+        return None, []
+    return predicate, [int(index) for index in indexes if index is not None]
+
+
+def sql_has_mandatory_column_filter(sql: str, column: str, preferred_table: str = "") -> bool:
+    parsed = parse_bound_sql_for_contract(sql)
+    if parsed is None:
+        return False
+    scopes = select_scopes_reading_table(parsed, preferred_table)
+    return bool(scopes) and all(
+        mandatory_column_predicate(scope.expression, column)[0] is not None
+        for scope in scopes
+    )
+
+
+def sql_has_bound_scope_column_values(
+    sql: str,
+    column: str,
+    params: List[Any],
+    expected_values: List[Any],
+    preferred_table: str = "",
+) -> bool:
+    """Verify exact bound values in every base-table SELECT scope."""
+
+    parsed = parse_bound_sql_for_contract(sql)
+    if parsed is None:
+        return False
+    scopes = select_scopes_reading_table(parsed, preferred_table)
+    if not scopes:
+        return False
+    expected = sorted(str(item) for item in expected_values)
+    for scope in scopes:
+        predicate, indexes = mandatory_column_predicate(
+            scope.expression,
+            column,
+            require_placeholders=True,
+        )
+        if predicate is None or not indexes or any(index >= len(params) for index in indexes):
+            return False
+        actual = sorted(str(params[index]) for index in indexes)
+        if actual != expected:
+            return False
+    return True
 
 
 def placeholder_expression() -> exp.Placeholder:
@@ -788,7 +1066,6 @@ def bind_node_sql_parameters(
     def replace(match: re.Match[str]) -> str:
         nonlocal merchant_bound
         column = normalize_identifier(match.group("column"))
-        op = str(match.group("op") or "=").upper()
         rhs = str(match.group("rhs") or "")
         values = list(values_by_column.get(column) or [])
         if not values:

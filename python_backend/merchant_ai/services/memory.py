@@ -32,6 +32,7 @@ from merchant_ai.models import (
     MemoryRetrievalCandidate,
     MetricDefinitionPreferenceRequest,
     PendingAnswer,
+    RetrievalIssue,
 )
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.llm import TaskModelRouter
@@ -65,6 +66,74 @@ EXPLICIT_HABIT_TERMS = {
     "不用",
     "不要只",
 }
+
+
+def normalize_memory_recall_issues(values: Any) -> List[RetrievalIssue]:
+    """Normalize and deduplicate operational memory-recall issues."""
+
+    issues: List[RetrievalIssue] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for raw in values or []:
+        try:
+            issue = raw if isinstance(raw, RetrievalIssue) else RetrievalIssue.model_validate(raw)
+        except Exception:
+            continue
+        identity = (issue.code, issue.stage, issue.backend, issue.lane)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        issues.append(issue)
+    return issues
+
+
+def memory_recall_status_for(injection: Dict[str, Any], issues: Any = None) -> tuple[str, bool]:
+    """Classify recall without treating an operational failure as a zero hit."""
+
+    normalized = normalize_memory_recall_issues(issues)
+    unresolved_blocking = any(
+        not issue.resolved and str(issue.severity or "").lower() == "blocking"
+        for issue in normalized
+    )
+    if unresolved_blocking:
+        return "failed", False
+    if normalized:
+        return "degraded", True
+    has_memory = bool(
+        memory_ids_from_selected(injection or {})
+        or has_renderable_memory_payload(injection or {})
+    )
+    return ("success", True) if has_memory else ("empty", True)
+
+
+def memory_recall_trace_for(
+    injection: Dict[str, Any],
+    issues: Any = None,
+    enrichment_status: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Return the canonical four-state trace embedded in every injection."""
+
+    trace = dict((injection or {}).get("memoryInjectionTrace") or {})
+    declared_status = str(trace.get("status") or "").strip().lower()
+    merged_issues = normalize_memory_recall_issues(
+        [*(trace.get("issues") or []), *(issues or [])]
+    )
+    status, usable = memory_recall_status_for(injection or {}, merged_issues)
+    if declared_status == "failed":
+        status, usable = "failed", False
+    elif declared_status == "degraded" and status != "failed":
+        status, usable = "degraded", True
+    trace.update(
+        {
+            "status": status,
+            "usableSnapshot": usable,
+            "issues": [issue.model_dump(by_alias=True) for issue in merged_issues],
+            "enrichmentStatus": {
+                **dict(trace.get("enrichmentStatus") or {}),
+                **dict(enrichment_status or {}),
+            },
+        }
+    )
+    return trace
 
 
 class MemoryStore:
@@ -463,31 +532,109 @@ class MemoryRetrievalService:
         selected["source"] = str(store.memory_path(merchant_id))
         selected["updatedAt"] = memory.get("updatedAt", "")
         selected["memoryInjectionTrace"] = trace.model_dump(by_alias=True)
+        issues: List[RetrievalIssue] = []
         if trace.selected_ids:
-            store.record_usage(merchant_id, trace.selected_ids)
+            try:
+                store.record_usage(merchant_id, trace.selected_ids)
+            except Exception as exc:
+                issues.append(
+                    RetrievalIssue(
+                        code="MEMORY_USAGE_RECORD_FAILED",
+                        message=str(exc)[:500],
+                        backend="file",
+                        lane="usage",
+                        stage="usage_record",
+                        severity="warning",
+                        resolved=True,
+                        details={"answerImpact": False},
+                    )
+                )
+        selected["memoryInjectionTrace"] = memory_recall_trace_for(selected, issues)
         return selected
 
     def _select_enterprise(self, store: "EnterpriseMemoryStore", merchant_id: str, context: Dict[str, Any], budget: int) -> Dict[str, Any]:
         query_hash = memory_query_hash(merchant_id, context)
         injection_key = "memory_injection:%s:%s" % (merchant_id, query_hash)
-        cached = store.hot_cache.get_json(injection_key)
+        issues: List[RetrievalIssue] = []
+        try:
+            cached = store.hot_cache.get_json(injection_key)
+        except Exception as exc:
+            cached = None
+            issues.append(
+                RetrievalIssue(
+                    code="MEMORY_CACHE_READ_FAILED",
+                    message=str(exc)[:500],
+                    backend=store.hot_cache.backend_name(),
+                    lane="cache",
+                    stage="cache_read",
+                    severity="warning",
+                    resolved=True,
+                    details={"answerImpact": False},
+                )
+            )
         if isinstance(cached, dict):
             cached = dict(cached)
             selected_ids = memory_ids_from_selected(cached)
             if selected_ids:
-                store.record_usage(merchant_id, selected_ids)
+                try:
+                    store.record_usage(merchant_id, selected_ids)
+                except Exception as exc:
+                    issues.append(
+                        RetrievalIssue(
+                            code="MEMORY_USAGE_RECORD_FAILED",
+                            message=str(exc)[:500],
+                            backend="enterprise",
+                            lane="usage",
+                            stage="usage_record",
+                            severity="warning",
+                            resolved=True,
+                            details={"answerImpact": False},
+                        )
+                    )
             trace = dict(cached.get("memoryInjectionTrace") or {})
             trace["cacheHit"] = True
             trace["cacheKey"] = injection_key
             trace["cacheBackend"] = store.hot_cache.backend_name()
             cached["memoryInjectionTrace"] = trace
+            cached["memoryInjectionTrace"] = memory_recall_trace_for(cached, issues)
             return cached
 
         memory = store.load(merchant_id)
-        vector_ids = store._vector_candidate_ids(merchant_id, context)
+        storage_error = str(memory.get("memoryStorageError") or "")
+        storage_backend = str(memory.get("storageBackend") or "")
+        if storage_error and storage_backend == "json_fallback":
+            issues.append(
+                RetrievalIssue(
+                    code="MEMORY_PRIMARY_BACKEND_FAILED",
+                    message=storage_error[:500],
+                    backend="es",
+                    lane="primary",
+                    stage="load",
+                    severity="warning",
+                    fallback_used=True,
+                    resolved=True,
+                )
+            )
+        elif storage_error:
+            issues.append(
+                RetrievalIssue(
+                    code="MEMORY_BACKEND_UNAVAILABLE",
+                    message=storage_error[:500],
+                    backend=storage_backend or "enterprise",
+                    lane="primary",
+                    stage="load",
+                    severity="blocking",
+                    resolved=False,
+                )
+            )
+        vector_ids, vector_issue = store._vector_candidate_outcome(merchant_id, context)
+        if vector_issue:
+            issues.append(vector_issue)
         vector_loaded_count = 0
         if vector_ids:
-            vector_memory = store._load_vector_memory_items(merchant_id, memory, vector_ids)
+            vector_memory, vector_load_issue = store._load_vector_memory_items_outcome(merchant_id, memory, vector_ids)
+            if vector_load_issue:
+                issues.append(vector_load_issue)
             vector_loaded_count = count_memory_items(vector_memory)
             if vector_loaded_count:
                 memory = merge_memory_payload(memory, vector_memory)
@@ -497,15 +644,29 @@ class MemoryRetrievalService:
             candidates = boost_vector_candidates(candidates, vector_ids)
             filtered_reasons["vector_candidates"] = len(vector_ids)
             filtered_reasons["vector_loaded"] = vector_loaded_count
-            store.hot_cache.set_json(
-                "memory_candidates:%s:%s" % (merchant_id, query_hash),
-                {
-                    "merchantId": merchant_id,
-                    "queryHash": query_hash,
-                    "vectorIds": vector_ids[:24],
-                    "vectorLoadedCount": vector_loaded_count,
-                },
-            )
+            try:
+                store.hot_cache.set_json(
+                    "memory_candidates:%s:%s" % (merchant_id, query_hash),
+                    {
+                        "merchantId": merchant_id,
+                        "queryHash": query_hash,
+                        "vectorIds": vector_ids[:24],
+                        "vectorLoadedCount": vector_loaded_count,
+                    },
+                )
+            except Exception as exc:
+                issues.append(
+                    RetrievalIssue(
+                        code="MEMORY_CACHE_WRITE_FAILED",
+                        message=str(exc)[:500],
+                        backend=store.hot_cache.backend_name(),
+                        lane="cache",
+                        stage="cache_write",
+                        severity="warning",
+                        resolved=True,
+                        details={"answerImpact": False},
+                    )
+                )
         source = memory_source_label(memory, self.settings)
         selected, trace = allocate_injection(visible_memory, candidates, filtered_reasons, merchant_id, budget, source)
         selected["source"] = source
@@ -518,8 +679,38 @@ class MemoryRetrievalService:
         trace_payload["vectorLoadedCount"] = vector_loaded_count
         selected["memoryInjectionTrace"] = trace_payload
         if trace.selected_ids:
-            store.record_usage(merchant_id, trace.selected_ids)
-        store.hot_cache.set_json(injection_key, selected)
+            try:
+                store.record_usage(merchant_id, trace.selected_ids)
+            except Exception as exc:
+                issues.append(
+                    RetrievalIssue(
+                        code="MEMORY_USAGE_RECORD_FAILED",
+                        message=str(exc)[:500],
+                        backend="enterprise",
+                        lane="usage",
+                        stage="usage_record",
+                        severity="warning",
+                        resolved=True,
+                        details={"answerImpact": False},
+                    )
+                )
+        selected["memoryInjectionTrace"] = memory_recall_trace_for(selected, issues)
+        try:
+            store.hot_cache.set_json(injection_key, selected)
+        except Exception as exc:
+            issues.append(
+                RetrievalIssue(
+                    code="MEMORY_CACHE_WRITE_FAILED",
+                    message=str(exc)[:500],
+                    backend=store.hot_cache.backend_name(),
+                    lane="cache",
+                    stage="cache_write",
+                    severity="warning",
+                    resolved=True,
+                    details={"answerImpact": False},
+                )
+            )
+            selected["memoryInjectionTrace"] = memory_recall_trace_for(selected, issues)
         return selected
 
 
@@ -824,26 +1015,68 @@ class EnterpriseMemoryStore(StructuredMemoryStore):
             return {"flushed": 0, "error": str(exc)[:240]}
 
     def _vector_candidate_ids(self, merchant_id: str, context: Dict[str, Any]) -> List[str]:
+        values, _ = self._vector_candidate_outcome(merchant_id, context)
+        return values
+
+    def _vector_candidate_outcome(
+        self,
+        merchant_id: str,
+        context: Dict[str, Any],
+    ) -> tuple[List[str], Optional[RetrievalIssue]]:
         query_text = memory_vector_query_text(context)
         if not query_text:
-            return []
+            return [], None
         try:
-            return self.vector_index.search(merchant_id, query_text)
-        except Exception:
-            return []
+            return self.vector_index.search(merchant_id, query_text), None
+        except Exception as exc:
+            return [], RetrievalIssue(
+                code="MEMORY_VECTOR_RETRIEVAL_FAILED",
+                message=str(exc)[:500],
+                backend="vector",
+                lane="vector",
+                stage="search",
+                severity="warning",
+                resolved=True,
+            )
 
     def _load_vector_memory_items(self, merchant_id: str, memory: Dict[str, Any], vector_ids: List[str]) -> Dict[str, Any]:
+        payload, _ = self._load_vector_memory_items_outcome(merchant_id, memory, vector_ids)
+        return payload
+
+    def _load_vector_memory_items_outcome(
+        self,
+        merchant_id: str,
+        memory: Dict[str, Any],
+        vector_ids: List[str],
+    ) -> tuple[Dict[str, Any], Optional[RetrievalIssue]]:
         existing_ids = memory_id_set(memory)
         missing_ids = [memory_id for memory_id in unique_strings(vector_ids) if memory_id not in existing_ids]
         if not missing_ids:
-            return empty_memory_payload(merchant_id)
+            return empty_memory_payload(merchant_id), None
         try:
-            return self.repository.load_memory_items(merchant_id, missing_ids)
-        except Exception:
+            return self.repository.load_memory_items(merchant_id, missing_ids), None
+        except Exception as exc:
             if self._fallback_enabled():
                 fallback_memory = self.fallback_store.load(merchant_id)
-                return scan_memory_items_by_ids(fallback_memory, missing_ids, merchant_id)
-            return empty_memory_payload(merchant_id)
+                return scan_memory_items_by_ids(fallback_memory, missing_ids, merchant_id), RetrievalIssue(
+                    code="MEMORY_VECTOR_ITEM_LOAD_FAILED",
+                    message=str(exc)[:500],
+                    backend="enterprise",
+                    lane="vector_item_load",
+                    stage="load",
+                    severity="warning",
+                    fallback_used=True,
+                    resolved=True,
+                )
+            return empty_memory_payload(merchant_id), RetrievalIssue(
+                code="MEMORY_VECTOR_ITEM_LOAD_FAILED",
+                message=str(exc)[:500],
+                backend="enterprise",
+                lane="vector_item_load",
+                stage="load",
+                severity="warning",
+                resolved=True,
+            )
 
     def _refresh_hot_cache(self, merchant_id: str, memory: Dict[str, Any]) -> None:
         self.hot_cache.invalidate_merchant(merchant_id)

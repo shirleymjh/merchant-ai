@@ -8,6 +8,7 @@ import json
 import os
 import re
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import copy_context
@@ -25,6 +26,7 @@ from merchant_ai.graph.query_graph_contract import (
     invalidate_graph_validation,
     mark_graph_validation_stale,
     query_graph_fingerprint,
+    query_graph_structure_fingerprint,
     record_graph_validation,
 )
 from merchant_ai.graph.message_history import (
@@ -140,7 +142,20 @@ from merchant_ai.services.context_filesystem import add_context_uri, context_lin
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.latency import LatencyOptimizer
 from merchant_ai.services.llm import LlmClient
-from merchant_ai.services.memory import create_memory_store, memory_query_hash, retrieval_context_from_state, truncate_memory_text_by_tokens
+from merchant_ai.services.knowledge_requests import (
+    canonical_knowledge_request_payload,
+    dedupe_knowledge_requests,
+    knowledge_request_identity,
+    normalize_knowledge_request_text as normalize_canonical_knowledge_request_text,
+)
+from merchant_ai.services.memory import (
+    create_memory_store,
+    memory_query_hash,
+    memory_recall_trace_for,
+    normalize_memory_recall_issues,
+    retrieval_context_from_state,
+    truncate_memory_text_by_tokens,
+)
 from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.merchant_profile import MerchantProfileStore, MerchantProfileSummaryService
 from merchant_ai.services.middleware import MiddlewareChain, default_harness_middlewares
@@ -454,7 +469,10 @@ class MerchantQaWorkflow:
             thread_context={},
             runtime_injection={},
             memory_injection={},
+            memory_injection_raw_snapshot={},
             memory_injection_trace={},
+            memory_recall_status="not_started",
+            memory_recall_issues=[],
             memory_ingestion_trace={},
             memory_constraints=[],
             memory_constraint_trace={},
@@ -1107,6 +1125,8 @@ class MerchantQaWorkflow:
             if not state.get("topic_routed"):
                 state["memory_injection"] = {}
                 state["memory_injection_trace"] = {"status": "skipped", "reason": "topic_not_routed", "route": enum_value(route)}
+                state["memory_recall_status"] = "skipped"
+                state["memory_recall_issues"] = []
                 state["memory_constraints"] = []
                 state["memory_constraint_trace"] = {"constraintCount": 0, "status": "skipped", "reason": "topic_not_routed"}
                 add_step(state, "Long-term Memory：Topic workspace 未就绪，暂不召回长期记忆")
@@ -1116,6 +1136,8 @@ class MerchantQaWorkflow:
                 return state
             state["memory_injection"] = {}
             state["memory_injection_trace"] = {"status": "skipped", "reason": "non_business_route", "route": enum_value(route)}
+            state["memory_recall_status"] = "skipped"
+            state["memory_recall_issues"] = []
             state["memory_constraints"] = []
             state["memory_constraint_trace"] = {"constraintCount": 0, "status": "skipped", "reason": "non_business_route"}
             state["memory_recalled"] = True
@@ -1125,90 +1147,251 @@ class MerchantQaWorkflow:
             self.finish_run_step(state, step, "skipped", output_summary="non_business_route")
             emit(state, "node.completed", "MEMORY_RECALL", {"selectedCount": 0, "constraintCount": 0, "skipped": True})
             return state
+        fingerprint = memory_query_hash(
+            str(state.get("requested_merchant_id") or ""),
+            retrieval_context_from_state(state),
+        )
+        state["memory_injection_raw_snapshot"] = {}
+        issues: List[RetrievalIssue] = []
         try:
             injection = self.memory_store.select_for_question(
                 state,
                 budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
             )
-            state["memory_injection"] = injection
-            state["memory_recalled"] = True
-            trace = dict(injection.get("memoryInjectionTrace") or {})
-            trace.update(
-                {
-                    "status": "success",
-                    "contextFingerprint": memory_query_hash(
-                        str(state.get("requested_merchant_id") or ""),
-                        retrieval_context_from_state(state),
-                    ),
-                }
-            )
-            state["memory_injection_trace"] = trace
-            state["_memory_snapshot_locked"] = True
-            state["memory_constraints"] = build_memory_constraints(injection)
-            state["memory_constraint_trace"] = {
-                "constraintCount": len(state["memory_constraints"]),
-                "requiredCount": sum(
-                    1 for item in state["memory_constraints"] if str(item.get("enforcement") or "") == "required"
-                ),
-                "clarifyCount": sum(
-                    1
-                    for item in state["memory_constraints"]
-                    if str(item.get("enforcement") or "") == "clarify_or_disclose"
-                ),
-                "source": injection.get("source", ""),
-            }
-            state["merchant_profile_summary"] = self.merchant_profile_summary_service.summarize(
-                merchant=state["merchant"],
-                memory_injection=injection,
-                memory_constraints=state["memory_constraints"],
-                route_slots=state.get("route_slots", RouteSlots()),
-                fast_understanding=state.get("fast_understanding", FastUnderstandingResult()),
-            )
-            renderer = getattr(self.memory_store, "render_injection", None)
-            rendered = renderer(injection) if callable(renderer) else ""
-            state["memory_context"] = (
-                truncate_memory_text_by_tokens(
-                    rendered,
-                    int(self.settings.context_memory_budget_tokens or 1200),
+        except Exception as exc:
+            injection = {}
+            issues = [
+                RetrievalIssue(
+                    code="MEMORY_RECALL_FAILED",
+                    message=str(exc)[:500],
+                    backend=type(self.memory_store).__name__,
+                    lane="primary",
+                    stage="acquire",
+                    severity="blocking",
+                    resolved=False,
                 )
-                if rendered
-                else ""
+            ]
+        else:
+            issues = normalize_memory_recall_issues(
+                (injection.get("memoryInjectionTrace") or {}).get("issues") or []
             )
+
+        trace = memory_recall_trace_for(
+            injection,
+            issues,
+            enrichment_status={"acquire": "failed" if not injection and issues else "success"},
+        )
+        if trace.get("status") == "failed" and not issues:
+            issues = [
+                RetrievalIssue(
+                    code="MEMORY_RECALL_FAILED",
+                    message="Memory recall returned an unusable snapshot without a structured issue",
+                    backend=type(self.memory_store).__name__,
+                    lane="primary",
+                    stage="acquire",
+                    severity="blocking",
+                    resolved=False,
+                )
+            ]
+            trace = memory_recall_trace_for(injection, issues, enrichment_status={"acquire": "failed"})
+
+        state["memory_injection"] = injection
+        state["memory_constraints"] = []
+        state["memory_constraint_trace"] = {
+            "constraintCount": 0,
+            "status": trace.get("status", "failed"),
+            "source": injection.get("source", "") if isinstance(injection, dict) else "",
+        }
+        if trace.get("status") != "failed":
+            try:
+                constraints = build_memory_constraints(injection)
+            except Exception as exc:
+                state["memory_injection_raw_snapshot"] = injection
+                state["memory_injection"] = {}
+                state["memory_constraints"] = []
+                issues = normalize_memory_recall_issues(
+                    [
+                        *issues,
+                        RetrievalIssue(
+                            code="MEMORY_CONSTRAINT_COMPILATION_FAILED",
+                            message=str(exc)[:500],
+                            backend="memory_contract",
+                            lane="constraints",
+                            stage="compile_constraints",
+                            severity="blocking",
+                            resolved=False,
+                        ),
+                    ]
+                )
+                trace = memory_recall_trace_for(
+                    {},
+                    issues,
+                    enrichment_status={"acquire": "success", "constraints": "failed"},
+                )
+                source_trace = dict(injection.get("memoryInjectionTrace") or {})
+                for key in ["selectedIds", "candidateIds", "candidateCount", "filteredReasons"]:
+                    if key in source_trace:
+                        trace[key] = source_trace[key]
+                state["memory_constraint_trace"] = {
+                    "constraintCount": 0,
+                    "status": "failed",
+                    "error": str(exc)[:500],
+                }
+            else:
+                state["memory_constraints"] = constraints
+                state["memory_constraint_trace"] = {
+                    "constraintCount": len(constraints),
+                    "requiredCount": sum(
+                        1 for item in constraints if str(item.get("enforcement") or "") == "required"
+                    ),
+                    "clarifyCount": sum(
+                        1
+                        for item in constraints
+                        if str(item.get("enforcement") or "") == "clarify_or_disclose"
+                    ),
+                    "source": injection.get("source", ""),
+                    "status": "success" if constraints else trace.get("status", "empty"),
+                }
+                trace["enrichmentStatus"] = {
+                    **dict(trace.get("enrichmentStatus") or {}),
+                    "constraints": "success",
+                }
+
+        if trace.get("status") != "failed":
+            try:
+                state["merchant_profile_summary"] = self.merchant_profile_summary_service.summarize(
+                    merchant=state["merchant"],
+                    memory_injection=state["memory_injection"],
+                    memory_constraints=state["memory_constraints"],
+                    route_slots=state.get("route_slots", RouteSlots()),
+                    fast_understanding=state.get("fast_understanding", FastUnderstandingResult()),
+                )
+            except Exception as exc:
+                issues = normalize_memory_recall_issues(
+                    [
+                        *issues,
+                        RetrievalIssue(
+                            code="MEMORY_PROFILE_SUMMARY_FAILED",
+                            message=str(exc)[:500],
+                            backend="profile_summary",
+                            lane="enrichment",
+                            stage="profile_summary",
+                            severity="warning",
+                            resolved=True,
+                            details={"answerImpact": False},
+                        ),
+                    ]
+                )
+                trace = memory_recall_trace_for(
+                    state["memory_injection"],
+                    issues,
+                    enrichment_status={
+                        **dict(trace.get("enrichmentStatus") or {}),
+                        "profileSummary": "failed",
+                    },
+                )
+            else:
+                trace["enrichmentStatus"] = {
+                    **dict(trace.get("enrichmentStatus") or {}),
+                    "profileSummary": "success",
+                }
+
+            try:
+                renderer = getattr(self.memory_store, "render_injection", None)
+                rendered = renderer(state["memory_injection"]) if callable(renderer) else ""
+                state["memory_context"] = (
+                    truncate_memory_text_by_tokens(
+                        rendered,
+                        int(self.settings.context_memory_budget_tokens or 1200),
+                    )
+                    if rendered
+                    else ""
+                )
+            except Exception as exc:
+                state["memory_context"] = ""
+                issues = normalize_memory_recall_issues(
+                    [
+                        *issues,
+                        RetrievalIssue(
+                            code="MEMORY_RENDER_FAILED",
+                            message=str(exc)[:500],
+                            backend=type(self.memory_store).__name__,
+                            lane="enrichment",
+                            stage="render",
+                            severity="warning",
+                            resolved=True,
+                            details={"answerImpact": False},
+                        ),
+                    ]
+                )
+                trace = memory_recall_trace_for(
+                    state["memory_injection"],
+                    issues,
+                    enrichment_status={
+                        **dict(trace.get("enrichmentStatus") or {}),
+                        "render": "failed",
+                    },
+                )
+            else:
+                trace["enrichmentStatus"] = {
+                    **dict(trace.get("enrichmentStatus") or {}),
+                    "render": "success",
+                }
+
+        trace["contextFingerprint"] = fingerprint
+        trace["issues"] = [issue.model_dump(by_alias=True) for issue in normalize_memory_recall_issues(issues)]
+        state["memory_injection_trace"] = trace
+        state["memory_recall_status"] = str(trace.get("status") or "failed")
+        state["memory_recall_issues"] = list(trace.get("issues") or [])
+        state["memory_recalled"] = True
+        state["_memory_snapshot_locked"] = True
+        if state.get("memory_injection"):
+            state["memory_injection"]["memoryInjectionTrace"] = dict(trace)
+
+        selected_count = len(trace.get("selectedIds") or [])
+        constraint_count = len(state.get("memory_constraints") or [])
+        status = str(trace.get("status") or "failed")
+        if status == "failed":
+            add_step(state, "Long-term Memory：回答前召回不可用，已保留结构化失败证据")
+        elif status == "degraded":
+            add_step(
+                state,
+                "Long-term Memory：回答前召回部分降级 selected=%d constraints=%d issues=%d"
+                % (selected_count, constraint_count, len(issues)),
+            )
+        elif status == "empty":
+            add_step(state, "Long-term Memory：召回成功，本轮没有匹配的受治理记忆")
+        else:
             add_step(
                 state,
                 "Long-term Memory：回答前召回完成 selected=%d constraints=%d"
-                % (
-                    len(state["memory_injection_trace"].get("selectedIds") or []),
-                    len(state["memory_constraints"]),
-                ),
+                % (selected_count, constraint_count),
             )
-            self.finish_run_step(
-                state,
-                step,
-                "success",
-                output_summary="selected=%d constraints=%d"
-                % (
-                    len(state["memory_injection_trace"].get("selectedIds") or []),
-                    len(state["memory_constraints"]),
-                ),
-            )
-        except Exception as exc:
-            state["memory_injection"] = {}
-            state["memory_recalled"] = True
-            state["_memory_snapshot_locked"] = True
-            state["memory_injection_trace"] = {
-                "status": "failed",
-                "error": str(exc)[:500],
-                "contextFingerprint": memory_query_hash(
-                    str(state.get("requested_merchant_id") or ""),
-                    retrieval_context_from_state(state),
-                ),
-            }
-            state["memory_constraints"] = []
-            state["memory_constraint_trace"] = {"constraintCount": 0, "error": str(exc)[:500]}
-            add_step(state, "Long-term Memory：回答前召回失败，已降级为空记忆")
-            self.finish_run_step(state, step, "failed", output_summary=str(exc)[:500])
-        self.record_span(state, "action", "recall_memory", started)
+        self.finish_run_step(
+            state,
+            step,
+            "failed" if status == "failed" else ("partial" if status == "degraded" else "success"),
+            output_summary="status=%s selected=%d constraints=%d issues=%d"
+            % (status, selected_count, constraint_count, len(issues)),
+            error_code=(
+                next((issue.code for issue in issues if not issue.resolved), "MEMORY_RECALL_FAILED")
+                if status == "failed"
+                else ""
+            ),
+        )
+        self.record_span(
+            state,
+            "action",
+            "recall_memory",
+            started,
+            status="failed" if status == "failed" else ("partial" if status == "degraded" else "success"),
+            error_code=(
+                next((issue.code for issue in issues if not issue.resolved), "")
+                if status == "failed"
+                else ""
+            ),
+            metadata={"status": status, "issueCount": len(issues), "usableSnapshot": bool(trace.get("usableSnapshot"))},
+        )
         emit(
             state,
             "node.completed",
@@ -1216,6 +1399,8 @@ class MerchantQaWorkflow:
             {
                 "selectedCount": len(state.get("memory_injection_trace", {}).get("selectedIds") or []),
                 "constraintCount": len(state.get("memory_constraints") or []),
+                "status": state.get("memory_recall_status", "failed"),
+                "issues": state.get("memory_recall_issues", []),
             },
         )
         return state
@@ -2374,13 +2559,30 @@ class MerchantQaWorkflow:
         state.setdefault("capability_decisions", {})["metricFastEntry"] = self.policy.fast_metric_decision(result).model_dump(by_alias=True)
         state["latency_optimization"] = self.latency_optimizer.initial_policy(result)
         if state.get("memory_recalled") and state.get("merchant") is not None:
-            state["merchant_profile_summary"] = self.merchant_profile_summary_service.summarize(
-                merchant=state["merchant"],
-                memory_injection=state.get("memory_injection") or {},
-                memory_constraints=state.get("memory_constraints") or [],
-                route_slots=state.get("route_slots", RouteSlots()),
-                fast_understanding=result,
-            )
+            try:
+                state["merchant_profile_summary"] = self.merchant_profile_summary_service.summarize(
+                    merchant=state["merchant"],
+                    memory_injection=state.get("memory_injection") or {},
+                    memory_constraints=state.get("memory_constraints") or [],
+                    route_slots=state.get("route_slots", RouteSlots()),
+                    fast_understanding=result,
+                )
+            except Exception as exc:
+                append_memory_recall_issue_to_state(
+                    state,
+                    RetrievalIssue(
+                        code="MEMORY_PROFILE_SUMMARY_FAILED",
+                        message=str(exc)[:500],
+                        backend="profile_summary",
+                        lane="enrichment",
+                        stage="fast_understand_profile_summary",
+                        severity="warning",
+                        resolved=True,
+                        details={"answerImpact": False},
+                    ),
+                    enrichment_key="profileSummaryRefresh",
+                )
+                add_step(state, "Long-term Memory：画像摘要刷新失败，继续使用已召回的记忆与约束")
             self.refresh_context_snapshot(state, "fast_understand")
         context = state.get("request_context")
         if getattr(context, "offloaded_files", None):
@@ -2442,6 +2644,32 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "TRY_FAST_METRIC", {})
         state["fast_metric_attempted"] = True
+        if str(state.get("memory_recall_status") or "") == "failed":
+            state["fast_metric_completed"] = False
+            self.escalate_fast_request(state, "governed memory recall is unavailable")
+            add_step(state, "Lead Agent Fast Tool：长期记忆召回不可用，拒绝直接快速回答并进入完整证据链")
+            emit(
+                state,
+                "node.completed",
+                "TRY_FAST_METRIC",
+                {"supported": False, "fallback": "retrieve_knowledge", "reason": "memory_recall_failed"},
+            )
+            self.record_span(
+                state,
+                "tool",
+                "try_fast_metric",
+                started,
+                status="gap",
+                error_code="MEMORY_RECALL_FAILED",
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="memory recall failed -> full evidence path",
+                error_code="MEMORY_RECALL_FAILED",
+            )
+            return state
         merchant = state.get("merchant")
         semantic_metrics = published_semantic_quick_metrics(
             self.recall_service.topic_assets,
@@ -2507,6 +2735,21 @@ class MerchantQaWorkflow:
         else:
             self.attach_fast_metric_evidence_state(state, response, semantic_identity)
             state["should_persist"] = True
+        append_memory_recall_outcomes_to_run_result(state, state["agent_run_result"])
+        memory_gaps = [
+            gap
+            for gap in state["agent_run_result"].evidence_gaps
+            if str(gap.source or "") == "memory_recall"
+        ]
+        if memory_gaps:
+            verified = state["agent_run_result"].verified_evidence
+            verified.gaps = list(state["agent_run_result"].evidence_gaps)
+            verified.blocking_gaps = [gap for gap in verified.gaps if gap.severity == "blocking"]
+            verified.warning_gaps = [gap for gap in verified.gaps if gap.severity == "warning"]
+            verified.answer_guard_required = True
+            guarded = self.answer_service._apply_answer_guard(response.answer, state["agent_run_result"])
+            response.answer = guarded
+            state["answer"] = guarded
         state["chat_bi_completed"] = True
         if debug_trace.get("definitionOnly"):
             add_step(state, "Lead Agent Fast Tool：唯一已发布语义指标覆盖口径问题，采用语义资产口径说明")
@@ -2862,6 +3105,10 @@ class MerchantQaWorkflow:
             )
         state["pending_knowledge_requests"] = active_pending_requests
         had_pending_requests = bool(active_pending_requests)
+        resume_repair_after_retrieval = bool(
+            had_pending_requests
+            and self.awaiting_query_graph_repair_input(state) is not None
+        )
         was_data_discovered = bool(state.get("data_discovered"))
         if was_data_discovered or had_pending_requests:
             state["query_graph_supplemental_retrieve_count"] = int(state.get("query_graph_supplemental_retrieve_count") or 0) + 1
@@ -3137,7 +3384,20 @@ class MerchantQaWorkflow:
         if was_data_discovered or had_pending_requests:
             self.invalidate_execution_outputs(state, "知识召回已更新")
         self.planner.artifact_store.write_json("recall", "recall_bundle.json", state["recall_bundle"].model_dump(by_alias=True), preview_chars=0)
-        if had_pending_requests:
+        if had_pending_requests and resume_repair_after_retrieval:
+            consumed_request_keys = {
+                knowledge_request_key(request)
+                for request in active_pending_requests
+            }
+            retained_plan = (state.get("plan") or QueryPlan()).model_copy(deep=True)
+            retained_plan.knowledge_requests = [
+                request
+                for request in retained_plan.knowledge_requests
+                if knowledge_request_key(request) not in consumed_request_keys
+            ]
+            state["plan"] = retained_plan
+            self.restore_query_graph_repair_after_knowledge(state)
+        elif had_pending_requests:
             state["plan"] = QueryPlan()
             state["query_graph_plan_attempts"] = 0
             state["planner_provider_error"] = ""
@@ -3300,6 +3560,70 @@ class MerchantQaWorkflow:
                 "KnowledgeAgent：%d 个补知识请求二次召回无新增证据，停止重试"
                 % len(unchanged_requests),
             )
+
+    def awaiting_query_graph_repair_input(
+        self,
+        state: AgentState,
+    ) -> Optional[PlannerRepairInput]:
+        """Return the suspended repair contract while knowledge is being acquired."""
+
+        delta = state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()
+        if isinstance(delta, dict):
+            try:
+                delta = QueryGraphRepairDelta.model_validate(delta)
+            except Exception:
+                return None
+        plan = state.get("plan") or QueryPlan()
+        if (
+            str(getattr(delta, "status", "") or "") != "awaiting_knowledge"
+            or bool(getattr(delta, "changed", False))
+            or bool(getattr(delta, "exhausted", False))
+            or not plan.intents
+        ):
+            return None
+        raw_repair_input = state.get("planner_repair_input")
+        if isinstance(raw_repair_input, PlannerRepairInput):
+            repair_input = raw_repair_input
+        elif isinstance(raw_repair_input, dict):
+            try:
+                repair_input = PlannerRepairInput.model_validate(raw_repair_input)
+            except Exception:
+                return None
+        else:
+            return None
+        if repair_input.reflection.passed:
+            return None
+        return repair_input
+
+    def restore_query_graph_repair_after_knowledge(self, state: AgentState) -> bool:
+        """Resume the same Critic contract after supplemental knowledge retrieval."""
+
+        repair_input = self.awaiting_query_graph_repair_input(state)
+        if repair_input is None:
+            return False
+        reflection = repair_input.reflection.model_copy(deep=True)
+        retained_gaps = dedupe_graph_validation_gaps(
+            retained_query_graph_repair_gaps(repair_input)
+        )
+        state["planner_reflection"] = reflection
+        state["planner_repair_reason"] = reflection.repair_reason
+        state["planner_repair_requests"] = [
+            item.model_copy(deep=True)
+            for item in repair_input.repair_requests
+        ]
+        state["query_graph_reflected"] = True
+        state["query_graph_repair_exhausted"] = False
+        if retained_gaps:
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=True,
+                    gaps=retained_gaps,
+                ),
+            )
+            state["last_query_graph_validation_gaps"] = retained_gaps
+        return True
 
     def route_recall_query(self, state: AgentState) -> str:
         slots = state.get("route_slots") or RouteSlots()
@@ -3477,6 +3801,7 @@ class MerchantQaWorkflow:
         increment_round(state)
         self.configure_artifact_roots(state)
         emit(state, "node.started", "COMPACT_ASSETS", {})
+        resume_repair_after_compaction = self.awaiting_query_graph_repair_input(state) is not None
         self.invalidate_execution_outputs(state, "PlanningAssetPack 重新生成")
         pack = self.asset_builder.compact(
             state["question"],
@@ -3532,8 +3857,11 @@ class MerchantQaWorkflow:
         state["planning_assets_compacted"] = True
         self.reconcile_fast_request_agent_gates(state)
         invalidate_graph_validation(state)
-        state["query_graph_reflected"] = False
-        state["planner_reflection"] = PlannerReflectionResult()
+        if resume_repair_after_compaction:
+            self.restore_query_graph_repair_after_knowledge(state)
+        else:
+            state["query_graph_reflected"] = False
+            state["planner_reflection"] = PlannerReflectionResult()
         self.planner.artifact_store.write_json("planner", "planning_asset_pack.json", pack.model_dump(by_alias=True), preview_chars=0)
         add_step(
             state,
@@ -3739,6 +4067,7 @@ class MerchantQaWorkflow:
         planner_context = {
             "fastUnderstanding": (state.get("fast_understanding") or FastUnderstandingResult()).model_dump(by_alias=True),
             "memoryConstraints": state.get("memory_constraints", []),
+            "memoryRecall": memory_recall_health_payload(state),
         }
         selection_payload: Dict[str, Any] = {}
         plan = QueryPlan(agent_trace=["query_metric.semantic_asset_selection.skipped"])
@@ -4032,6 +4361,7 @@ class MerchantQaWorkflow:
             "runtimeInjection": state.get("runtime_injection", {}),
             "memoryInjection": state.get("memory_injection", {}),
             "memoryConstraints": state.get("memory_constraints", []),
+            "memoryRecall": memory_recall_health_payload(state),
         }
         planner_context = self.context_assembler.assemble_payload(
             state,
@@ -4268,7 +4598,50 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "reflect_plan", "PlannerCriticAgent", "REFLECT_QUERY_GRAPH", input_summary="nodes=%d" % len(state["plan"].intents))
         increment_round(state)
         emit(state, "node.started", "REFLECT_QUERY_GRAPH", {})
-        reflection = self.planner_reflection_agent.reflect(state["question"], state["plan"], state["planning_asset_pack"])
+        try:
+            reflection = self.planner_reflection_agent.reflect(
+                state["question"],
+                state["plan"],
+                state["planning_asset_pack"],
+            )
+        except Exception as exc:
+            failure_reason = "PlannerCritic callback failed: %s: %s" % (
+                type(exc).__name__,
+                str(exc)[:300],
+            )
+            failure_gap = GraphValidationGap(
+                code="PLANNER_CRITIC_FAILED",
+                evidence=type(exc).__name__,
+                reason=failure_reason,
+            )
+            reflection = PlannerReflectionResult(
+                passed=False,
+                issues=[
+                    {
+                        "code": failure_gap.code,
+                        "severity": "error",
+                        "evidence": failure_gap.evidence,
+                        "reason": failure_gap.reason,
+                    }
+                ],
+                suggested_actions=["repair_graph"],
+                repair_reason=failure_gap.code,
+            )
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=True,
+                    gaps=[failure_gap],
+                ),
+            )
+            state["last_action_result"] = ActionResult(
+                action="reflect_plan",
+                node="reflect_query_graph",
+                status="failed",
+                message=failure_reason,
+                retryable=True,
+            )
         state["planner_reflection"] = reflection
         state["planner_repair_reason"] = reflection.repair_reason
         state["planner_repair_requests"] = reflection.repair_requests
@@ -4289,7 +4662,12 @@ class MerchantQaWorkflow:
                 GraphValidationResult(
                     valid=False,
                     repairable=False,
-                    gaps=[query_graph_repair_exhaustion_gap(repair_input, scope_attempt_count)],
+                    gaps=dedupe_graph_validation_gaps(
+                        [
+                            query_graph_repair_exhaustion_gap(repair_input, scope_attempt_count),
+                            *retained_query_graph_repair_gaps(repair_input),
+                        ]
+                    ),
                 ),
             )
         reflection_requests = list(reflection.suggested_knowledge_requests or [])
@@ -4422,11 +4800,7 @@ class MerchantQaWorkflow:
                     repairable=False,
                     gaps=[
                         gap,
-                        *[
-                            item
-                            for item in repair_input.validation_gaps
-                            if item.code != "QUERY_GRAPH_REPAIR_EXHAUSTED"
-                        ],
+                        *retained_query_graph_repair_gaps(repair_input),
                     ],
                 ),
             )
@@ -4461,15 +4835,97 @@ class MerchantQaWorkflow:
         state["query_graph_repair_scope_attempt_count"] = scope_attempt
         before_plan = (state.get("plan") or QueryPlan()).model_copy(deep=True)
         before_nodes = len(before_plan.intents)
-        repaired_plan = self.planner.repair(
-            state["question"],
-            before_plan.model_copy(deep=True),
-            state["planning_asset_pack"],
-            [item.model_copy(deep=True) for item in repair_input.repair_gaps],
-            state.get("history_rows", []),
-            knowledge_context(state),
-            state["recall_bundle"],
-        )
+        try:
+            repaired_plan = self.planner.repair(
+                state["question"],
+                before_plan.model_copy(deep=True),
+                state["planning_asset_pack"],
+                [item.model_copy(deep=True) for item in repair_input.repair_gaps],
+                state.get("history_rows", []),
+                knowledge_context(state),
+                state["recall_bundle"],
+            )
+        except Exception as exc:
+            failure_gap = query_graph_repair_failure_gap(repair_input, exc)
+            exhausted = scope_attempt >= max_scope_attempts
+            failure_gaps = [failure_gap]
+            if exhausted:
+                failure_gaps.append(query_graph_repair_exhaustion_gap(repair_input, scope_attempt))
+            failure_gaps.extend(retained_query_graph_repair_gaps(repair_input))
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=not exhausted,
+                    gaps=dedupe_graph_validation_gaps(failure_gaps),
+                ),
+            )
+            delta = QueryGraphRepairDelta(
+                attempt=total_attempt,
+                scope_attempt=scope_attempt,
+                scope_key=repair_input.scope_key,
+                status="failed",
+                changed=False,
+                exhausted=exhausted,
+                before_graph_fingerprint=repair_input.graph_fingerprint,
+                after_graph_fingerprint=repair_input.graph_fingerprint,
+                before_nodes=before_nodes,
+                after_nodes=before_nodes,
+                repair_reason=failure_gap.reason,
+                reflection=repair_input.reflection.model_copy(deep=True),
+                repair_requests=[item.model_copy(deep=True) for item in repair_input.repair_requests],
+                repair_gaps=[failure_gap, *[item.model_copy(deep=True) for item in repair_input.repair_gaps]],
+            )
+            state["plan"] = before_plan
+            state["last_query_graph_repair_delta"] = delta
+            state.setdefault("query_graph_repair_history", []).append(delta.model_copy(deep=True))
+            state["query_graph_repair_history"] = state["query_graph_repair_history"][-32:]
+            state["query_graph_repair_exhausted"] = exhausted
+            state["query_graph_reflected"] = True
+            state["last_action_result"] = ActionResult(
+                action="repair_graph",
+                node="repair_query_graph",
+                status="failed",
+                message=failure_gap.reason,
+                retryable=not exhausted,
+            )
+            add_step(state, "Main Agent Tool repair_query_graph：修复回调失败，已保留原图与 PlannerCritic 契约")
+            self.record_span(
+                state,
+                "planner_repair",
+                "repair_query_graph",
+                started,
+                status="failed",
+                error_code=failure_gap.code,
+                error_message=failure_gap.reason,
+                metadata={
+                    "repairInput": repair_input.model_dump(by_alias=True),
+                    "repairDelta": delta.model_dump(by_alias=True),
+                },
+            )
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="failed scopeAttempt=%d" % scope_attempt,
+                error_code=failure_gap.code,
+                error_message=failure_gap.reason,
+            )
+            emit(
+                state,
+                "node.completed",
+                "REPAIR_QUERY_GRAPH",
+                {
+                    "attempt": total_attempt,
+                    "scopeAttempt": scope_attempt,
+                    "scopeKey": repair_input.scope_key,
+                    "changed": False,
+                    "exhausted": exhausted,
+                    "errorCode": failure_gap.code,
+                    "repairDelta": delta.model_dump(by_alias=True),
+                },
+            )
+            return state
         if isinstance(repaired_plan, dict):
             try:
                 repaired_plan = QueryPlan.model_validate(repaired_plan)
@@ -4477,14 +4933,140 @@ class MerchantQaWorkflow:
                 repaired_plan = before_plan.model_copy(deep=True)
         if not isinstance(repaired_plan, QueryPlan):
             repaired_plan = before_plan.model_copy(deep=True)
+        # The independent raw-question condition ledger is an immutable input
+        # to Repair, not Planner-authored graph material.  A repair may change
+        # semanticQuery bindings/structure, but may not delete or rewrite the
+        # source obligations it is supposed to satisfy.
+        before_understanding = before_plan.question_understanding or {}
+        frozen_condition_ledger = (
+            before_understanding.get("sourceConditionLedger")
+            or before_understanding.get("source_condition_ledger")
+        )
+        if isinstance(frozen_condition_ledger, dict) and frozen_condition_ledger:
+            repaired_understanding = dict(repaired_plan.question_understanding or {})
+            repaired_understanding["sourceConditionLedger"] = deepcopy(frozen_condition_ledger)
+            repaired_understanding["sourceConditionAuditRequired"] = True
+            repaired_plan = repaired_plan.model_copy(
+                update={"question_understanding": repaired_understanding}
+            )
+        added_knowledge_requests = new_query_graph_repair_knowledge_requests(before_plan, repaired_plan)
+        handled_knowledge_request_keys = {
+            str(key)
+            for key in (state.get("knowledge_request_lineage") or {})
+            if str(key)
+        } | {
+            str(key)
+            for key in (state.get("blocked_knowledge_request_keys") or [])
+            if str(key)
+        }
+        if handled_knowledge_request_keys:
+            repaired_plan.knowledge_requests = [
+                request
+                for request in repaired_plan.knowledge_requests
+                if knowledge_request_key(request) not in handled_knowledge_request_keys
+            ]
+            added_knowledge_requests = [
+                request
+                for request in added_knowledge_requests
+                if knowledge_request_key(request) not in handled_knowledge_request_keys
+            ]
         after_fingerprint = query_graph_fingerprint(repaired_plan)
-        changed = after_fingerprint != repair_input.graph_fingerprint
-        exhausted = bool(not changed and scope_attempt >= max_scope_attempts)
+        before_structure_fingerprint = query_graph_structure_fingerprint(before_plan)
+        after_structure_fingerprint = query_graph_structure_fingerprint(repaired_plan)
+        structure_changed = after_structure_fingerprint != before_structure_fingerprint
+
+        # A different hash is only a candidate.  Re-run both deterministic
+        # graph validation and PlannerCritic, then require every original typed
+        # target to disappear before reporting Repair success.
+        verification_gaps: List[GraphValidationGap] = []
+        try:
+            candidate_validation = self.graph_validator.validate(
+                state["question"],
+                repaired_plan,
+                state["planning_asset_pack"],
+                state.get("memory_constraints", []),
+            )
+            candidate_validation = validation_with_question_coverage(
+                state["question"],
+                repaired_plan,
+                state["planning_asset_pack"],
+                candidate_validation,
+            )
+            verification_gaps.extend(candidate_validation.gaps or [])
+            candidate_reflection = self.planner_reflection_agent.reflect(
+                state["question"],
+                repaired_plan,
+                state["planning_asset_pack"],
+            )
+            for issue in candidate_reflection.issues or []:
+                if not isinstance(issue, dict) or str(issue.get("severity") or "error").lower() != "error":
+                    continue
+                code = str(issue.get("code") or "")
+                if not code:
+                    continue
+                verification_gaps.append(
+                    GraphValidationGap(
+                        code=code,
+                        task_id=str(issue.get("taskId") or issue.get("task_id") or ""),
+                        evidence=str(issue.get("evidence") or ""),
+                        reason=str(issue.get("reason") or ""),
+                    )
+                )
+        except Exception as exc:
+            verification_gaps.append(
+                GraphValidationGap(
+                    code="QUERY_GRAPH_REPAIR_REVALIDATION_FAILED",
+                    evidence=type(exc).__name__,
+                    reason="repair candidate revalidation failed: %s: %s"
+                    % (type(exc).__name__, str(exc)[:300]),
+                )
+            )
+        verification_gaps = dedupe_graph_validation_gaps(verification_gaps)
+        target_keys = {
+            (str(gap.code or ""), str(gap.task_id or ""))
+            for gap in retained_query_graph_repair_gaps(repair_input)
+            if str(gap.code or "") not in QUERY_GRAPH_REPAIR_OPERATIONAL_GAP_CODES
+        }
+        remaining_target_gaps = [
+            gap
+            for gap in verification_gaps
+            if any(
+                target_code == str(gap.code or "")
+                and (not target_task or target_task == str(gap.task_id or ""))
+                for target_code, target_task in target_keys
+            )
+        ]
+        targets_revalidated = bool(target_keys) and not remaining_target_gaps and not any(
+            gap.code == "QUERY_GRAPH_REPAIR_REVALIDATION_FAILED" for gap in verification_gaps
+        )
+        before_candidate_fingerprint = query_graph_fingerprint(
+            before_plan.model_copy(update={"knowledge_requests": []})
+        )
+        after_candidate_fingerprint = query_graph_fingerprint(
+            repaired_plan.model_copy(update={"knowledge_requests": []})
+        )
+        candidate_changed = bool(
+            structure_changed or after_candidate_fingerprint != before_candidate_fingerprint
+        )
+        changed = bool(targets_revalidated and candidate_changed)
+        awaiting_knowledge = bool(not candidate_changed and not changed and added_knowledge_requests)
+        if awaiting_knowledge:
+            # Asking for governed knowledge suspends this repair. It is an
+            # orchestration transition, not a failed executable-graph attempt,
+            # so the same Critic contract keeps its remaining repair budget.
+            if prior_scope_attempts:
+                scope_attempts[repair_input.scope_key] = prior_scope_attempts
+            else:
+                scope_attempts.pop(repair_input.scope_key, None)
+            state["query_graph_repair_scope_attempts"] = scope_attempts
+            state["query_graph_repair_scope_attempt_count"] = prior_scope_attempts
+        exhausted = bool(not changed and not awaiting_knowledge and scope_attempt >= max_scope_attempts)
+        repair_status = "success" if changed else ("awaiting_knowledge" if awaiting_knowledge else "no_progress")
         delta = QueryGraphRepairDelta(
             attempt=total_attempt,
             scope_attempt=scope_attempt,
             scope_key=repair_input.scope_key,
-            status="success" if changed else "no_progress",
+            status=repair_status,
             changed=changed,
             exhausted=exhausted,
             before_graph_fingerprint=repair_input.graph_fingerprint,
@@ -4505,6 +5087,15 @@ class MerchantQaWorkflow:
             state["plan"] = repaired_plan
             state["query_graph_repair_progressed"] = True
             self.materialize_plan_clarification(state)
+        elif awaiting_knowledge:
+            state["plan"] = repaired_plan
+            state["last_action_result"] = ActionResult(
+                action="repair_graph",
+                node="repair_query_graph",
+                status="awaiting_knowledge",
+                message="repair preserved the executable graph and requested supplemental governed knowledge",
+                retryable=True,
+            )
         else:
             # The repairer may append traces in place.  A trace-only mutation is
             # not an executable graph repair, so retain the exact input graph.
@@ -4513,11 +5104,11 @@ class MerchantQaWorkflow:
                 action="repair_graph",
                 node="repair_query_graph",
                 status="no_progress",
-                message="repair produced the same executable QueryGraph fingerprint",
+                message="repair candidate did not clear its original typed gaps under revalidation",
                 retryable=not exhausted,
             )
 
-        if changed and state["plan"].knowledge_requests:
+        if (changed or awaiting_knowledge) and state["plan"].knowledge_requests:
             state["pending_knowledge_requests"] = filter_blocked_knowledge_requests(
                 state,
                 dedupe_workflow_knowledge_requests(
@@ -4532,27 +5123,58 @@ class MerchantQaWorkflow:
             state["planner_repair_requests"] = []
             self.invalidate_execution_outputs(state, "QueryGraph 修复后需要重新执行")
             add_step(state, "Main Agent Tool repair_query_graph：QueryGraph 可执行结构已改变")
+        elif awaiting_knowledge:
+            state["query_graph_reflected"] = True
+            awaiting_gap = query_graph_repair_awaiting_knowledge_gap(
+                repair_input,
+                added_knowledge_requests,
+            )
+            projected_gaps = dedupe_graph_validation_gaps(
+                [awaiting_gap, *retained_query_graph_repair_gaps(repair_input)]
+            )
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=True,
+                    gaps=projected_gaps,
+                ),
+            )
+            state["last_query_graph_validation_gaps"] = projected_gaps
+            add_step(
+                state,
+                "Main Agent Tool repair_query_graph：仅新增补知识请求，保留原图和 PlannerCritic 契约，状态=awaiting_knowledge",
+            )
         else:
             state["query_graph_reflected"] = True
             add_step(
                 state,
-                "Main Agent Tool repair_query_graph：QueryGraph 指纹未变化，保留 PlannerCritic 问题与修复请求",
+                "Main Agent Tool repair_query_graph：候选修复未通过目标 gap 重验证，保留 PlannerCritic 问题与修复请求",
             )
-            if exhausted:
-                exhaustion_gap = query_graph_repair_exhaustion_gap(repair_input, scope_attempt)
-                retained_gaps = [
-                    item.model_copy(deep=True)
-                    for item in repair_input.validation_gaps
-                    if item.code != "QUERY_GRAPH_REPAIR_EXHAUSTED"
-                ]
-                record_graph_validation(
-                    state,
-                    GraphValidationResult(
-                        valid=False,
-                        repairable=False,
-                        gaps=[exhaustion_gap, *retained_gaps],
-                    ),
+            no_progress_gap = query_graph_repair_no_progress_gap(repair_input, scope_attempt)
+            projected_gaps = [no_progress_gap]
+            if structure_changed and remaining_target_gaps:
+                projected_gaps.append(
+                    GraphValidationGap(
+                        code="QUERY_GRAPH_REPAIR_TARGET_UNRESOLVED",
+                        evidence=",".join(sorted({gap.code for gap in remaining_target_gaps if gap.code})),
+                        reason="repair changed executable structure but original typed gap remained after Validator/PlannerCritic revalidation",
+                    )
                 )
+            if exhausted:
+                projected_gaps.insert(0, query_graph_repair_exhaustion_gap(repair_input, scope_attempt))
+            projected_gaps.extend(retained_query_graph_repair_gaps(repair_input))
+            projected_gaps.extend(verification_gaps)
+            projected_gaps = dedupe_graph_validation_gaps(projected_gaps)
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=not exhausted,
+                    gaps=projected_gaps,
+                ),
+            )
+            state["last_query_graph_validation_gaps"] = projected_gaps
         repair_artifact = Path(state["thread_data"].outputs_path) / "artifacts" / "planner" / ("repair_attempt_%d.json" % total_attempt)
         try:
             self.planner.artifact_store.write_json(
@@ -4567,13 +5189,22 @@ class MerchantQaWorkflow:
             )
         except Exception:
             pass
+        repair_error_code = (
+            ""
+            if changed
+            else (
+                "QUERY_GRAPH_REPAIR_AWAITING_KNOWLEDGE"
+                if awaiting_knowledge
+                else ("QUERY_GRAPH_REPAIR_EXHAUSTED" if exhausted else "QUERY_GRAPH_REPAIR_NO_PROGRESS")
+            )
+        )
         self.record_span(
             state,
             "planner_repair",
             "repair_query_graph",
             started,
-            status="success" if changed else "failed",
-            error_code="" if changed else ("QUERY_GRAPH_REPAIR_EXHAUSTED" if exhausted else "QUERY_GRAPH_REPAIR_NO_PROGRESS"),
+            status="success" if changed else ("pending" if awaiting_knowledge else "failed"),
+            error_code=repair_error_code,
             metadata={
                 "repairInput": repair_input.model_dump(by_alias=True),
                 "repairDelta": delta.model_dump(by_alias=True),
@@ -4583,14 +5214,15 @@ class MerchantQaWorkflow:
             state,
             step,
             "success" if changed else "gap",
-            output_summary="changed=%s scopeAttempt=%d before=%s after=%s"
+            output_summary="status=%s changed=%s scopeAttempt=%d before=%s after=%s"
             % (
+                repair_status,
                 changed,
                 scope_attempt,
                 repair_input.graph_fingerprint,
                 after_fingerprint,
             ),
-            error_code="" if changed else ("QUERY_GRAPH_REPAIR_EXHAUSTED" if exhausted else "QUERY_GRAPH_REPAIR_NO_PROGRESS"),
+            error_code=repair_error_code,
             artifact_paths=[str(repair_artifact)],
         )
         emit(
@@ -4601,7 +5233,9 @@ class MerchantQaWorkflow:
                 "attempt": total_attempt,
                 "scopeAttempt": scope_attempt,
                 "scopeKey": repair_input.scope_key,
+                "status": repair_status,
                 "changed": changed,
+                "awaitingKnowledge": awaiting_knowledge,
                 "exhausted": exhausted,
                 "beforeGraphFingerprint": repair_input.graph_fingerprint,
                 "afterGraphFingerprint": after_fingerprint,
@@ -4906,6 +5540,7 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "verify_evidence", "EvidenceVerifierAgent", "VERIFY_EVIDENCE_GRAPH", input_summary="tasks=%d" % len(state["agent_run_result"].task_results))
         increment_round(state)
         append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
+        append_memory_recall_outcomes_to_run_result(state, state["agent_run_result"])
         append_subagent_outcomes_to_run_result(state, state["agent_run_result"])
         verified = self.evidence_verifier.verify(
             state["question"],
@@ -4983,6 +5618,7 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "ANSWER_RULE", {})
         append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
+        append_memory_recall_outcomes_to_run_result(state, state["agent_run_result"])
         state["plan"] = self.build_rule_recall_plan(state)
         record_graph_validation(state, GraphValidationResult(valid=True, repairable=False))
         state["query_graph_reflected"] = True
@@ -5746,6 +6382,7 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "ANSWER_ANALYSIS", {})
         append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
+        append_memory_recall_outcomes_to_run_result(state, state["agent_run_result"])
         personalization_context = self.answer_personalization_context(state)
         route = state["routing_decision"].route
         allow_answer_llm = self.latency_optimizer.answer_allows_llm(state.get("latency_optimization") or {})
@@ -6610,6 +7247,7 @@ class MerchantQaWorkflow:
 
     def to_response(self, state: AgentState) -> ChatResponse:
         append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
+        append_memory_recall_outcomes_to_run_result(state, state["agent_run_result"])
         append_subagent_outcomes_to_run_result(state, state["agent_run_result"])
         execution_attempts = normalized_execution_attempt_artifacts(state)
         state["execution_attempt_artifacts"] = execution_attempts
@@ -7746,6 +8384,10 @@ class MerchantQaWorkflow:
         return {
             "ingestion": ingestion,
             "retrieval": {
+                "status": state.get("memory_recall_status") or trace.get("status", "not_started"),
+                "usableSnapshot": bool(trace.get("usableSnapshot")),
+                "issues": list(state.get("memory_recall_issues") or trace.get("issues") or []),
+                "enrichmentStatus": dict(trace.get("enrichmentStatus") or {}),
                 "candidateCount": trace.get("candidateCount", 0),
                 "selectedIds": trace.get("selectedIds", []),
                 "candidateIds": trace.get("candidateIds", []),
@@ -8526,6 +9168,16 @@ def normalized_planner_repair_requests(values: List[Any]) -> List[PlannerRepairR
     return requests
 
 
+QUERY_GRAPH_REPAIR_OPERATIONAL_GAP_CODES = frozenset(
+    {
+        "QUERY_GRAPH_REPAIR_AWAITING_KNOWLEDGE",
+        "QUERY_GRAPH_REPAIR_EXHAUSTED",
+        "QUERY_GRAPH_REPAIR_FAILED",
+        "QUERY_GRAPH_REPAIR_NO_PROGRESS",
+    }
+)
+
+
 def planner_repair_scope_key(state: AgentState, plan: QueryPlan | None = None) -> str:
     """Scope repair budgets to one executable graph and one critic issue set."""
 
@@ -8543,37 +9195,34 @@ def planner_repair_scope_key(state: AgentState, plan: QueryPlan | None = None) -
     validation_gaps = [
         item
         for item in list(getattr(validation, "gaps", []) or [])
-        if str(getattr(item, "code", "") or "") != "QUERY_GRAPH_REPAIR_EXHAUSTED"
+        if str(getattr(item, "code", "") or "") not in QUERY_GRAPH_REPAIR_OPERATIONAL_GAP_CODES
+        and not planner_repair_request_projection_gap(item)
     ]
-    reflection_issues = canonical_repair_payloads(reflection.issues)
-    validation_payloads = canonical_repair_payloads(validation_gaps)
-    fallback_request_issues: List[Dict[str, Any]] = []
-    if not reflection_issues and not validation_payloads:
-        fallback_request_issues = [
-            {
-                "reason": request.reason,
-                "action": request.action,
-                "stage": request.stage,
-                "taskId": request.task_id,
-                "query": request.query,
-                "evidence": request.evidence,
-            }
-            for request in normalized_planner_repair_requests(
-                state.get("planner_repair_requests") or reflection.repair_requests
-            )
-        ]
+    reflection_issues = [
+        issue
+        for issue in reflection.issues
+        if isinstance(issue, dict)
+        and str(issue.get("severity") or "error").strip().lower() == "error"
+    ]
+    repair_requests = normalized_planner_repair_requests(
+        state.get("planner_repair_requests") or reflection.repair_requests
+    )
     payload = {
-        "graphFingerprint": query_graph_fingerprint(plan or state.get("plan")),
-        "reflectionIssues": reflection_issues,
-        "validationGaps": validation_payloads,
-        "fallbackRequestIssues": canonical_repair_payloads(fallback_request_issues),
+        "graphStructureFingerprint": query_graph_structure_fingerprint(plan or state.get("plan")),
+        "issues": canonical_repair_issue_payloads([*reflection_issues, *validation_gaps]),
+        # A changed repair strategy deserves a fresh scoped attempt even when
+        # the underlying critic issue is unchanged.  Exclude prose-only hints
+        # and request reasons so harmless wording changes cannot reset budget.
+        "repairRequests": canonical_repair_payloads(
+            [planner_repair_request_scope_payload(request) for request in repair_requests]
+        ),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def canonical_repair_payloads(values: List[Any]) -> List[Any]:
-    payloads: List[Any] = []
+    payloads: Dict[str, Any] = {}
     for value in values or []:
         if hasattr(value, "model_dump"):
             payload = value.model_dump(by_alias=True, mode="json")
@@ -8581,10 +9230,70 @@ def canonical_repair_payloads(values: List[Any]) -> List[Any]:
             payload = dict(value)
         else:
             payload = {"value": str(value)}
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        payloads.setdefault(encoded, payload)
+    return [payloads[key] for key in sorted(payloads)]
+
+
+def canonical_repair_issue_payloads(values: List[Any]) -> List[Dict[str, str]]:
+    payloads: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values or []:
+        if hasattr(value, "model_dump"):
+            raw = value.model_dump(by_alias=True, mode="json")
+        elif isinstance(value, dict):
+            raw = value
+        else:
+            continue
+        payload = {
+            "code": normalize_knowledge_request_text(raw.get("code") or ""),
+            "taskId": normalize_knowledge_request_text(
+                raw.get("taskId") or raw.get("task_id") or ""
+            ),
+        }
+        identity = (payload["code"], payload["taskId"])
+        if not payload["code"] or identity in seen:
+            continue
+        seen.add(identity)
         payloads.append(payload)
     return sorted(
         payloads,
-        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str),
+        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def planner_repair_request_scope_payload(request: PlannerRepairRequest) -> Dict[str, Any]:
+    knowledge_requests = [
+        canonical_knowledge_request_payload(item)
+        for item in dedupe_knowledge_requests(request.knowledge_requests)
+    ]
+    return {
+        "action": normalize_knowledge_request_text(request.action),
+        "stage": normalize_knowledge_request_text(request.stage),
+        "taskId": normalize_knowledge_request_text(request.task_id),
+        "query": normalize_knowledge_request_text(request.query),
+        "knowledgeRequests": canonical_repair_payloads(knowledge_requests),
+    }
+
+
+def planner_repair_request_projection_gap(value: Any) -> bool:
+    evidence = str(getattr(value, "evidence", "") or "")
+    if not evidence.startswith("{"):
+        return False
+    try:
+        payload = json.loads(evidence)
+    except Exception:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and ("action" in payload or "repairHints" in payload or "repair_hints" in payload)
+        and ("stage" in payload or "knowledgeRequests" in payload or "knowledge_requests" in payload)
     )
 
 
@@ -8665,6 +9374,117 @@ def query_graph_repair_exhaustion_gap(
         ),
         evidence=json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str),
     )
+
+
+def dedupe_graph_validation_gaps(gaps: List[GraphValidationGap]) -> List[GraphValidationGap]:
+    deduped: List[GraphValidationGap] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for gap in gaps or []:
+        identity = (
+            str(gap.code or ""),
+            str(gap.task_id or ""),
+            str(gap.evidence or ""),
+            str(gap.reason or ""),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(gap.model_copy(deep=True))
+    return deduped
+
+
+def retained_query_graph_repair_gaps(repair_input: PlannerRepairInput) -> List[GraphValidationGap]:
+    """Preserve original typed Critic/validator gaps across repair outcomes."""
+
+    retained = [
+        item
+        for item in [*repair_input.validation_gaps, *repair_input.repair_gaps]
+        if str(item.code or "") not in QUERY_GRAPH_REPAIR_OPERATIONAL_GAP_CODES
+    ]
+    return dedupe_graph_validation_gaps(retained)
+
+
+def query_graph_repair_no_progress_gap(
+    repair_input: PlannerRepairInput,
+    scope_attempt: int,
+) -> GraphValidationGap:
+    return GraphValidationGap(
+        code="QUERY_GRAPH_REPAIR_NO_PROGRESS",
+        reason=(
+            "Planner repair completed without changing executable QueryGraph structure; "
+            "the original PlannerCritic gaps remain unresolved"
+        ),
+        evidence=json.dumps(
+            {
+                "scopeKey": repair_input.scope_key,
+                "graphFingerprint": repair_input.graph_fingerprint,
+                "scopeAttempt": int(scope_attempt),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def query_graph_repair_failure_gap(
+    repair_input: PlannerRepairInput,
+    error: Exception,
+) -> GraphValidationGap:
+    return GraphValidationGap(
+        code="QUERY_GRAPH_REPAIR_FAILED",
+        reason="Planner repair callback failed: %s: %s" % (
+            type(error).__name__,
+            str(error)[:300],
+        ),
+        evidence=json.dumps(
+            {
+                "scopeKey": repair_input.scope_key,
+                "graphFingerprint": repair_input.graph_fingerprint,
+                "errorType": type(error).__name__,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def query_graph_repair_awaiting_knowledge_gap(
+    repair_input: PlannerRepairInput,
+    requests: List[KnowledgeRequest],
+) -> GraphValidationGap:
+    task_ids = unique_workflow_strings([str(item.needed_for_task_id or "") for item in requests])
+    return GraphValidationGap(
+        code="QUERY_GRAPH_REPAIR_AWAITING_KNOWLEDGE",
+        task_id=task_ids[0] if len(task_ids) == 1 else "",
+        reason=(
+            "Repair preserved the executable QueryGraph and requested supplemental governed knowledge; "
+            "this is pending orchestration work, not a successful graph repair"
+        ),
+        evidence=json.dumps(
+            {
+                "scopeKey": repair_input.scope_key,
+                "requests": [item.model_dump(by_alias=True, mode="json") for item in requests],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+
+def new_query_graph_repair_knowledge_requests(
+    before: QueryPlan,
+    after: QueryPlan,
+) -> List[KnowledgeRequest]:
+    before_ids = {knowledge_request_identity(item) for item in before.knowledge_requests}
+    return [
+        item.model_copy(deep=True)
+        for item in dedupe_knowledge_requests(after.knowledge_requests)
+        if knowledge_request_identity(item) not in before_ids
+    ]
 
 
 def graph_gaps_from_node_failures(task_results: List[Any]) -> List[GraphValidationGap]:
@@ -8777,6 +9597,150 @@ def append_active_planner_degraded_reason(
     if not any(planner_degraded_reason_identity(item) == identity for item in reasons):
         reasons.append(payload)
     run_result.degraded_reasons = reasons
+
+
+def memory_recall_issues_from_state(state: AgentState) -> List[RetrievalIssue]:
+    raw_items = list(state.get("memory_recall_issues") or [])
+    if not raw_items:
+        raw_items = list((state.get("memory_injection_trace") or {}).get("issues") or [])
+    return normalize_memory_recall_issues(raw_items)
+
+
+def memory_recall_health_payload(state: AgentState) -> Dict[str, Any]:
+    trace = dict(state.get("memory_injection_trace") or {})
+    issues = memory_recall_issues_from_state(state)
+    return {
+        "status": str(state.get("memory_recall_status") or trace.get("status") or "not_started"),
+        "usableSnapshot": bool(trace.get("usableSnapshot")),
+        "selectedIds": list(trace.get("selectedIds") or []),
+        "issues": [issue.model_dump(by_alias=True) for issue in issues],
+        "enrichmentStatus": dict(trace.get("enrichmentStatus") or {}),
+        "contextFingerprint": str(trace.get("contextFingerprint") or ""),
+    }
+
+
+def append_memory_recall_issue_to_state(
+    state: AgentState,
+    issue: RetrievalIssue,
+    enrichment_key: str = "",
+) -> None:
+    issues = normalize_memory_recall_issues([*memory_recall_issues_from_state(state), issue])
+    previous = dict(state.get("memory_injection_trace") or {})
+    enrichment = dict(previous.get("enrichmentStatus") or {})
+    if enrichment_key:
+        enrichment[enrichment_key] = "failed"
+    trace = memory_recall_trace_for(
+        state.get("memory_injection") or {},
+        issues,
+        enrichment_status=enrichment,
+    )
+    for key in ["contextFingerprint", "selectedIds", "candidateIds", "candidateCount"]:
+        if key in previous and key not in trace:
+            trace[key] = previous[key]
+    state["memory_injection_trace"] = trace
+    state["memory_recall_status"] = str(trace.get("status") or "failed")
+    state["memory_recall_issues"] = list(trace.get("issues") or [])
+    if state.get("memory_injection"):
+        state["memory_injection"]["memoryInjectionTrace"] = dict(trace)
+
+
+def append_memory_recall_outcomes_to_run_result(
+    state: AgentState,
+    run_result: AgentRunResult,
+) -> None:
+    """Keep memory availability and degradation monotonic through answering."""
+
+    status = str(
+        state.get("memory_recall_status")
+        or (state.get("memory_injection_trace") or {}).get("status")
+        or "not_started"
+    )
+    issues = memory_recall_issues_from_state(state)
+    if status not in {"failed", "degraded"} and not issues:
+        return
+    if status == "failed" and not issues:
+        issues = [
+            RetrievalIssue(
+                code="MEMORY_RECALL_FAILED",
+                message="Memory recall failed without a structured operational issue",
+                backend="unknown",
+                lane="primary",
+                stage="acquire",
+                severity="blocking",
+                resolved=False,
+            )
+        ]
+    reasons = [dict(item) for item in run_result.degraded_reasons or [] if isinstance(item, dict)]
+    gaps = [item.model_copy(deep=True) for item in run_result.evidence_gaps or []]
+    reason_ids = {
+        (str(item.get("stage") or ""), str(item.get("code") or ""), str(item.get("lane") or ""))
+        for item in reasons
+    }
+    gap_ids = {
+        (str(item.code or item.gap_code), str(item.source_node_id or item.task_id))
+        for item in gaps
+    }
+    for issue in issues:
+        severity = (
+            "blocking"
+            if status == "failed" and not issue.resolved
+            else "warning"
+        )
+        details = {
+            **dict(issue.details or {}),
+            "memoryRecallStatus": status,
+            "backend": issue.backend,
+            "lane": issue.lane,
+            "stage": issue.stage,
+            "retryable": issue.retryable,
+            "fallbackUsed": issue.fallback_used,
+            "resolved": issue.resolved,
+        }
+        reason_identity = ("memory_recall", issue.code, issue.lane)
+        if reason_identity not in reason_ids:
+            reasons.append(
+                {
+                    "active": True,
+                    "stage": "memory_recall",
+                    "code": issue.code or "MEMORY_RECALL_FAILED",
+                    "reason": issue.message[:1000] or issue.code,
+                    "status": status,
+                    "severity": severity,
+                    "backend": issue.backend,
+                    "lane": issue.lane,
+                    "resolved": issue.resolved,
+                    "details": details,
+                }
+            )
+            reason_ids.add(reason_identity)
+        if details.get("answerImpact") is False:
+            continue
+        code = issue.code or "MEMORY_RECALL_FAILED"
+        source_node_id = "memory:%s:%s" % (issue.backend or "unknown", issue.lane or "unknown")
+        gap_identity = (code, source_node_id)
+        if gap_identity in gap_ids:
+            continue
+        gaps.append(
+            EvidenceGap(
+                code=code,
+                source_node_id=source_node_id,
+                evidence=issue.backend,
+                reason=issue.message[:1000] or code,
+                severity=severity,
+                disclosure_required=True,
+                source="memory_recall",
+                answer_instruction=(
+                    "本轮长期记忆不可用，不能声称已应用历史偏好或纠正规则；恢复召回后再完成受历史记忆约束的回答。"
+                    if severity == "blocking"
+                    else "说明长期记忆使用了降级来源，本轮结论以当前问题和已发布语义资产为准。"
+                ),
+                suggested_action="retry_memory_recall" if severity == "blocking" else "answer_with_memory_disclosure",
+                details=details,
+            )
+        )
+        gap_ids.add(gap_identity)
+    run_result.degraded_reasons = reasons
+    run_result.evidence_gaps = gaps
 
 
 def retrieval_issues_from_state(state: AgentState) -> List[RetrievalIssue]:
@@ -9264,27 +10228,11 @@ def merge_recall_item_queries(current: RecallItem, incoming: RecallItem) -> Reca
 
 
 def normalize_knowledge_request_text(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip().lower())
-
-
-def knowledge_request_reason_code(request: KnowledgeRequest) -> str:
-    reason = str(request.reason or "").strip()
-    if not reason:
-        return ""
-    match = re.search(r":\s*([a-zA-Z0-9_]+)", reason)
-    if match:
-        return match.group(1)
-    return normalize_knowledge_request_text(reason).split(" ")[0]
+    return normalize_canonical_knowledge_request_text(value)
 
 
 def knowledge_request_key(request: KnowledgeRequest) -> str:
-    parts = [
-        str(request.type or ""),
-        normalize_knowledge_request_text(request.query),
-        normalize_knowledge_request_text(request.needed_for_task_id),
-        knowledge_request_reason_code(request),
-    ]
-    return "|".join(parts)
+    return knowledge_request_identity(request)
 
 
 def recall_item_queries(item: RecallItem) -> List[str]:
@@ -9798,15 +10746,7 @@ def merge_agent_run_results(left: AgentRunResult, right: AgentRunResult) -> Agen
 
 
 def dedupe_workflow_knowledge_requests(items: List[KnowledgeRequest]) -> List[KnowledgeRequest]:
-    deduped: List[KnowledgeRequest] = []
-    seen: set[str] = set()
-    for item in items:
-        key = knowledge_request_key(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped
+    return dedupe_knowledge_requests(items)
 
 
 def write_rows_csv(path: Path, rows: List[Dict[str, Any]]) -> None:

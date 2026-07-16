@@ -382,10 +382,133 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
     )
     filter_schema = object_schema(
         {
-            "field": string_property("filter field from semanticCatalog/live schema"),
-            "value": string_property("entity or status value from the user question; use comma-separated values for OR/IN filters"),
+            "field": string_property("legacy equality-filter field from semanticCatalog/live schema"),
+            "value": string_property("legacy raw value; use semanticQuery for new multi-condition plans"),
         },
         required=["field", "value"],
+    )
+    semantic_filter_node_schema = object_schema(
+        {
+            "nodeId": string_property("unique id within semanticQuery.filterNodes"),
+            "nodeType": string_property("predicate or boolean group node", ["predicate", "group"]),
+            "semanticRefId": string_property(
+                "recalled semantic member ref for a predicate; empty for a group; never emit a physical column guess"
+            ),
+            "sourcePhrase": string_property("exact user phrase represented by this predicate or group"),
+            "operator": string_property(
+                "typed predicate operator; empty for a group",
+                [
+                    "",
+                    "eq",
+                    "neq",
+                    "in",
+                    "not_in",
+                    "gt",
+                    "gte",
+                    "lt",
+                    "lte",
+                    "between",
+                    "is_null",
+                    "is_not_null",
+                    "contains",
+                    "not_contains",
+                    "starts_with",
+                    "ends_with",
+                ],
+            ),
+            "rawValues": array_property(
+                "unmodified value phrases copied from the user; empty for groups and null checks",
+                string_property("one raw user value"),
+            ),
+            "logicalOperator": string_property("boolean operator for a group; empty for a predicate", ["", "and", "or", "not"]),
+            "childNodeIds": array_property(
+                "ids of child nodes for a group; empty for a predicate",
+                string_property("child node id"),
+            ),
+            "knowledgeRefIds": array_property(
+                "recalled knowledge refs supporting this semantic choice",
+                string_property("knowledge ref id"),
+            ),
+            "reason": string_property("brief reason for this semantic node"),
+        },
+        required=[
+            "nodeId",
+            "nodeType",
+            "semanticRefId",
+            "sourcePhrase",
+            "operator",
+            "rawValues",
+            "logicalOperator",
+            "childNodeIds",
+            "knowledgeRefIds",
+        ],
+    )
+    semantic_order_schema = object_schema(
+        {
+            "semanticRefId": string_property("recalled semantic member or metric ref used for ordering"),
+            "direction": string_property("sort direction", ["asc", "desc"]),
+            "nulls": string_property("null ordering policy", ["auto", "first", "last"]),
+        },
+        required=["semanticRefId", "direction"],
+    )
+    semantic_query_schema = object_schema(
+        {
+            "resultMode": string_property(
+                "semantic result shape",
+                ["metric", "detail", "topn", "group_agg", "derived"],
+            ),
+            "filterNodes": array_property(
+                "flat predicate/group node graph; express nesting only through childNodeIds",
+                semantic_filter_node_schema,
+            ),
+            "rootFilterNodeId": string_property("root filter node id; empty only when no user filter exists"),
+            "selectRefIds": array_property(
+                "reserved result projection contract; emit [] until the compiler advertises projection support",
+                string_property("semantic ref id"),
+            ),
+            "measureRefIds": array_property(
+                "reserved measure projection contract; emit [] and use anchor/support metrics today",
+                string_property("measure semantic ref id"),
+            ),
+            "dimensionRefIds": array_property(
+                "reserved dimension projection contract; emit [] until the compiler advertises support",
+                string_property("dimension semantic ref id"),
+            ),
+            "sourceRefIds": array_property(
+                "reserved explicit source contract; emit [] because sources are derived from bound semantic refs",
+                string_property("source semantic ref id"),
+            ),
+            "relationshipRefIds": array_property(
+                "reserved governed relationship refs; emit [] until governed JOIN execution is available",
+                string_property("relationship semantic ref id"),
+            ),
+            "joinStrategy": string_property(
+                "logical join strategy; physical join keys are resolved from relationship refs",
+                ["auto", "single_source"],
+            ),
+            "orderBy": array_property(
+                "reserved semantic ordering contract; emit [] and use rankingObjective today",
+                semantic_order_schema,
+            ),
+            "limit": integer_property("requested row limit; zero means no explicit limit", 0),
+            "bindingStatus": string_property(
+                "Planner must emit unresolved; governed binding stages update this field later",
+                ["unresolved"],
+            ),
+        },
+        required=[
+            "resultMode",
+            "filterNodes",
+            "rootFilterNodeId",
+            "selectRefIds",
+            "measureRefIds",
+            "dimensionRefIds",
+            "sourceRefIds",
+            "relationshipRefIds",
+            "joinStrategy",
+            "orderBy",
+            "limit",
+        ],
     )
     evidence_intent_schema = object_schema(
         {
@@ -443,6 +566,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
                 scope_schema,
             ),
             "filters": array_property("explicit entity filters", filter_schema),
+            "semanticQuery": semantic_query_schema,
             "timeWindowDays": integer_property("requested time window in days", 1),
         },
         required=[
@@ -455,7 +579,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "metricCandidateDecisions",
             "calculationIntents",
             "scopeConstraints",
-            "filters",
+            "semanticQuery",
             "timeWindowDays",
         ],
     )
@@ -478,6 +602,120 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
                 "reason": string_property("brief reasoning summary"),
             },
             required=["status", "questionUnderstanding", "reason"],
+        ),
+    )
+
+
+def source_condition_coverage_tool() -> AgentToolDefinition:
+    """Independent, semantic-free extraction contract for user predicates."""
+
+    condition_node = object_schema(
+        {
+            "nodeId": string_property("unique id within this independent condition AST"),
+            "nodeType": string_property("atomic predicate or boolean group", ["predicate", "group"]),
+            "sourcePhrase": string_property(
+                "exact verbatim question span for a predicate; empty for a synthetic boolean group"
+            ),
+            "startOffset": integer_property("zero-based inclusive sourcePhrase offset", 0),
+            "endOffset": integer_property("zero-based exclusive sourcePhrase offset", 0),
+            "operator": string_property(
+                "operator expressed by the user; empty for a group",
+                [
+                    "",
+                    "eq",
+                    "neq",
+                    "in",
+                    "not_in",
+                    "gt",
+                    "gte",
+                    "lt",
+                    "lte",
+                    "between",
+                    "is_null",
+                    "is_not_null",
+                    "contains",
+                    "not_contains",
+                    "starts_with",
+                    "ends_with",
+                ],
+            ),
+            "rawValues": array_property(
+                "unmodified value phrases copied from the same question span",
+                string_property("one raw user value"),
+            ),
+            "logicalOperator": string_property(
+                "boolean operator for a group; empty for a predicate",
+                ["", "and", "or", "not"],
+            ),
+            "childNodeIds": array_property(
+                "child node ids for a group; empty for a predicate",
+                string_property("child node id"),
+            ),
+        },
+        required=[
+            "nodeId",
+            "nodeType",
+            "sourcePhrase",
+            "startOffset",
+            "endOffset",
+            "operator",
+            "rawValues",
+            "logicalOperator",
+            "childNodeIds",
+        ],
+    )
+    excluded_constraint = object_schema(
+        {
+            "constraintType": string_property(
+                "constraint handled by another governed contract",
+                ["time_window", "result_limit", "result_order", "projection"],
+            ),
+            "sourcePhrase": string_property("exact verbatim question span"),
+            "startOffset": integer_property("zero-based inclusive sourcePhrase offset", 0),
+            "endOffset": integer_property("zero-based exclusive sourcePhrase offset", 0),
+            "reason": string_property("why this is not a row predicate"),
+        },
+        required=["constraintType", "sourcePhrase", "startOffset", "endOffset", "reason"],
+    )
+    return AgentToolDefinition(
+        name="emit_source_condition_coverage",
+        description=(
+            "Independently enumerate every explicit row/filter condition in the original BI question. "
+            "Do not use or infer semantic refs, tables, columns, SQL, or a prior Planner AST. "
+            "conditionNodes contains only row/population predicates. Exclude relative/absolute time windows, Top-N/limit, "
+            "ordering and requested output fields from that boolean AST and list them in excludedConstraints so their "
+            "separate time/result contracts can verify them. Return VERIFIED only when this classification is complete."
+        ),
+        parameters=object_schema(
+            {
+                "status": string_property(
+                    "independent extraction result",
+                    ["VERIFIED", "AMBIGUOUS", "INVALID"],
+                ),
+                "conditionNodes": array_property(
+                    "flat non-recursive predicate/group graph; empty when the question has no explicit filter",
+                    condition_node,
+                ),
+                "rootConditionNodeId": string_property(
+                    "root node id; empty only when conditionNodes is empty"
+                ),
+                "excludedConstraints": array_property(
+                    "time and result-shape constraints intentionally governed outside semanticQuery filters",
+                    excluded_constraint,
+                ),
+                "clarificationQuestion": string_property(
+                    "question for the user when condition boundaries or boolean meaning are ambiguous"
+                ),
+                "reason": string_property("brief coverage decision"),
+            },
+            required=[
+                "status",
+                "conditionNodes",
+                "rootConditionNodeId",
+                "excludedConstraints",
+                "clarificationQuestion",
+                "reason",
+            ],
         ),
     )
 

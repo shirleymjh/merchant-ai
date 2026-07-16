@@ -785,7 +785,11 @@ class V2AgentPolicy:
         return actions
 
     def graph_repair_attempt_count(self, state: AgentState) -> int:
-        """Return the attempt count for the active graph-and-issue scope."""
+        """Return committed attempts for the active graph-and-issue scope.
+
+        A repair that only suspends for supplemental knowledge remains visible
+        in repair history, but the workflow does not commit it to this budget.
+        """
 
         scope_key = str(state.get("query_graph_repair_scope_key") or "")
         scope_attempts = state.get("query_graph_repair_scope_attempts") or {}

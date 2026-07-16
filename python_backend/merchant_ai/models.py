@@ -1437,6 +1437,8 @@ class NodePlanContract(APIModel):
     filter_column: str = ""
     filter_values: List[Any] = Field(default_factory=list)
     filter_value_limit: int = 0
+    semantic_query: SemanticQuerySpec = Field(default_factory=lambda: SemanticQuerySpec())
+    semantic_filter_obligations: List[SemanticFilterObligation] = Field(default_factory=list)
     entity_filter_obligations: List[EntityFilterObligation] = Field(default_factory=list)
     output_keys: List[str] = Field(default_factory=list)
     required_evidence: List[str] = Field(default_factory=list)
@@ -1881,6 +1883,109 @@ class EntityFilterVerificationProof(APIModel):
     reason: str = ""
 
 
+class SemanticFilterNode(APIModel):
+    """One node in a non-recursive semantic filter graph.
+
+    The Planner owns the semantic reference, operator, raw values and source
+    phrase.  Resolution and physical binding fields are populated only by the
+    governed resolver/compiler stages and remain explicit for audit.
+    """
+
+    node_id: str = ""
+    node_type: str = "predicate"
+    semantic_ref_id: str = ""
+    source_phrase: str = ""
+    operator: str = ""
+    raw_values: List[Any] = Field(default_factory=list)
+    resolved_values: List[Any] = Field(default_factory=list)
+    bound_table: str = ""
+    bound_field: str = ""
+    member_kind: str = ""
+    data_type: str = ""
+    resolution_status: str = "unresolved"
+    candidate_values: List[Any] = Field(default_factory=list)
+    logical_operator: str = ""
+    child_node_ids: List[str] = Field(default_factory=list)
+    knowledge_ref_ids: List[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class SemanticQuerySpec(APIModel):
+    """Planner-authored semantic query IR before deterministic SQL binding."""
+
+    result_mode: str = ""
+    filter_nodes: List[SemanticFilterNode] = Field(default_factory=list)
+    root_filter_node_id: str = ""
+    select_ref_ids: List[str] = Field(default_factory=list)
+    measure_ref_ids: List[str] = Field(default_factory=list)
+    dimension_ref_ids: List[str] = Field(default_factory=list)
+    source_ref_ids: List[str] = Field(default_factory=list)
+    relationship_ref_ids: List[str] = Field(default_factory=list)
+    join_strategy: str = "auto"
+    order_by: List[Dict[str, Any]] = Field(default_factory=list)
+    limit: int = 0
+    binding_status: str = "unresolved"
+
+
+class SemanticFilterObligation(APIModel):
+    """Immutable user-filter requirement carried from planning to evidence."""
+
+    obligation_id: str = ""
+    task_id: str = ""
+    node_id: str = ""
+    predicate_id: str = ""
+    semantic_ref_id: str = ""
+    source_phrase: str = ""
+    operator: str = ""
+    raw_values: List[Any] = Field(default_factory=list)
+    resolved_values: List[Any] = Field(default_factory=list)
+    bound_table: str = ""
+    bound_field: str = ""
+    member_kind: str = ""
+    data_type: str = ""
+    required: bool = True
+    knowledge_ref_ids: List[str] = Field(default_factory=list)
+    status: str = "unresolved"
+    reason: str = ""
+
+
+class SemanticFilterPredicateProof(APIModel):
+    """Compiler proof for one semantic-filter obligation."""
+
+    task_id: str = ""
+    obligation_id: str = ""
+    node_id: str = ""
+    semantic_ref_id: str = ""
+    bound_table: str = ""
+    bound_field: str = ""
+    member_kind: str = ""
+    operator: str = ""
+    sql_lane: str = ""
+    sql_expression_hash: str = ""
+    resolved_value_hashes: List[str] = Field(default_factory=list)
+    parameter_names: List[str] = Field(default_factory=list)
+    verified: bool = False
+    status: str = "unverified"
+    code: str = ""
+    reason: str = ""
+
+
+class SemanticFilterVerificationProof(APIModel):
+    """Aggregate proof that every required user filter reached executable SQL."""
+
+    task_id: str = ""
+    contract_hash: str = ""
+    sql_hash: str = ""
+    predicate_proofs: List[SemanticFilterPredicateProof] = Field(default_factory=list)
+    required_count: int = 0
+    verified_count: int = 0
+    coverage_complete: bool = False
+    verified: bool = False
+    status: str = "not_required"
+    code: str = ""
+    reason: str = ""
+
+
 class QuestionIntent(APIModel):
     question: str = ""
     intent_type: IntentType = IntentType.INVALID
@@ -1897,6 +2002,7 @@ class QuestionIntent(APIModel):
     group_by_name: str = ""
     filter_column: str = ""
     filter_value: str = ""
+    semantic_query: SemanticQuerySpec = Field(default_factory=SemanticQuerySpec)
     entity_reference: EntityReference = Field(default_factory=EntityReference)
     days: int = 7
     limit: int = 20
@@ -1922,6 +2028,7 @@ class QueryPlan(APIModel):
     clarification_needs: List[str] = Field(default_factory=list)
     final_required_evidence: List[str] = Field(default_factory=list)
     final_evidence_column_hints: Dict[str, List[str]] = Field(default_factory=dict)
+    semantic_filter_obligations: List[SemanticFilterObligation] = Field(default_factory=list)
     entity_filter_obligations: List[EntityFilterObligation] = Field(default_factory=list)
     agent_trace: List[str] = Field(default_factory=list)
     question_understanding: Dict[str, Any] = Field(default_factory=dict)
@@ -2011,6 +2118,7 @@ class AgentTaskResult(APIModel):
     freshness_reports: List[FreshnessCheckResult] = Field(default_factory=list)
     node_plan_contract: NodePlanContract = Field(default_factory=NodePlanContract)
     entity_filter_verification: EntityFilterVerificationProof = Field(default_factory=EntityFilterVerificationProof)
+    semantic_filter_verification: SemanticFilterVerificationProof = Field(default_factory=SemanticFilterVerificationProof)
     node_plan_critique: NodePlanCritiqueResult = Field(default_factory=NodePlanCritiqueResult)
     sql_draft_decision: SqlDraftDecision = Field(default_factory=SqlDraftDecision)
     file_tool_results: List[Dict[str, Any]] = Field(default_factory=list)
@@ -2306,6 +2414,12 @@ class MemoryRetrievalCandidate(APIModel):
 
 
 class MemoryInjectionTrace(APIModel):
+    # `status` describes the operational outcome of recall.  In particular,
+    # an empty but successful lookup is different from an unavailable backend.
+    status: str = "not_started"
+    usable_snapshot: bool = False
+    issues: List[RetrievalIssue] = Field(default_factory=list)
+    enrichment_status: Dict[str, str] = Field(default_factory=dict)
     merchant_id: str = ""
     budget_tokens: int = 0
     budget_chars: int = 0

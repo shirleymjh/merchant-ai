@@ -9,6 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -25,7 +26,6 @@ from merchant_ai.models import (
     AgentTaskResult,
     AnswerMode,
     EntityFilterObligation,
-    EntityReference,
     EntityFilterVerificationProof,
     EntitySet,
     EvidenceCheckResult,
@@ -45,6 +45,10 @@ from merchant_ai.models import (
     QueryPlan,
     QuestionIntent,
     ReActStep,
+    SemanticFilterNode,
+    SemanticFilterObligation,
+    SemanticFilterPredicateProof,
+    SemanticFilterVerificationProof,
     SnapshotAlignmentContract,
     SnapshotSourceWindow,
     SqlDraftDecision,
@@ -107,9 +111,11 @@ from merchant_ai.services.query_sql_binding import (
     append_note,
     bind_node_sql_parameters,
     blank_entity_value,
+    bound_parameter_index,
     build_split_detail_sql_plan,
-    has_merchant_filter_predicate,
+    direct_expression_columns,
     normalize_inclusive_relative_window_sql,
+    parse_bound_sql_for_contract,
     parse_partition_date,
     partition_is_stale_for_near_realtime,
     predicate_column_name,
@@ -117,7 +123,9 @@ from merchant_ai.services.query_sql_binding import (
     realtime_fallback_for_table,
     split_window_coverage_contract,
     sql_has_bound_merchant_filter,
+    sql_has_mandatory_column_filter,
     sql_literal,
+    root_and_terms,
 )
 from merchant_ai.services.query_security import (
     DEFAULT_ACCESS_ROLE,
@@ -520,6 +528,23 @@ class ExecutionGraphPreparation:
         return bool(self.runtime_source_plan_fingerprint)
 
 
+@dataclass(frozen=True)
+class SemanticFilterSqlCompilation:
+    """Deterministic SQL fragments and audit metadata for one filter graph."""
+
+    where_sql: str = ""
+    having_sql: str = ""
+    predicate_sql: Dict[str, str] = field(default_factory=dict)
+    predicate_lanes: Dict[str, str] = field(default_factory=dict)
+    reachable_predicate_ids: Tuple[str, ...] = ()
+    code: str = ""
+    reason: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return not self.code
+
+
 def execution_question_fingerprint(question: str) -> str:
     return hashlib.sha256(str(question or "").encode("utf-8")).hexdigest()
 
@@ -597,6 +622,114 @@ def sql_uses_latest_as_of_partition(
     return False
 
 
+def sql_scalar_contract_value(expression: Any) -> Optional[str]:
+    if isinstance(expression, exp.Literal):
+        return str(expression.this)
+    return None
+
+
+def exact_period_window_terms(
+    terms: List[exp.Expression],
+    partition_column: str,
+    start: str,
+    end: str,
+) -> bool:
+    target = str(partition_column or "").lower()
+    normalized = [unwrap_semantic_filter_parentheses(term) for term in terms]
+    if len(normalized) == 1 and isinstance(normalized[0], exp.Between):
+        predicate = normalized[0]
+        return bool(
+            predicate_column_name(predicate.this).lower() == target
+            and sql_scalar_contract_value(predicate.args.get("low")) == start
+            and sql_scalar_contract_value(predicate.args.get("high")) == end
+        )
+    if len(normalized) == 1 and isinstance(normalized[0], exp.EQ) and start == end:
+        predicate = normalized[0]
+        return bool(
+            predicate_column_name(predicate.this).lower() == target
+            and sql_scalar_contract_value(predicate.expression) == start
+        )
+    if len(normalized) != 2:
+        return False
+    lower = next((item for item in normalized if isinstance(item, exp.GTE)), None)
+    upper = next((item for item in normalized if isinstance(item, exp.LTE)), None)
+    return bool(
+        lower is not None
+        and upper is not None
+        and predicate_column_name(lower.this).lower() == target
+        and predicate_column_name(upper.this).lower() == target
+        and sql_scalar_contract_value(lower.expression) == start
+        and sql_scalar_contract_value(upper.expression) == end
+    )
+
+
+def time_window_sql_contract_error(
+    sql: str,
+    contract: NodePlanContract,
+    params: Optional[List[Any]] = None,
+) -> Tuple[str, str]:
+    time_contract = dict(contract.time_window_contract or {})
+    partition_column = str(time_contract.get("partitionColumn") or "")
+    if not partition_column:
+        return "", ""
+    _parameterized, parsed, complete = parse_sql_for_contract_proof(sql, params)
+    if parsed is None:
+        return "MISSING_PARTITION_FILTER", "Node SQL cannot be parsed for time-window verification"
+    if not complete:
+        return "RUNTIME_TIME_ALIGNMENT_MISMATCH", "time-window SQL placeholders have no complete parameter vector"
+    branches = contract_output_lineage_branches(parsed, contract.preferred_table)
+    if not branches or any(not has_target for _path, has_target in branches):
+        return "MISSING_PARTITION_FILTER", "Node SQL has an output branch outside the governed time source"
+    start = str(time_contract.get("executionStartValue") or "")
+    end = str(time_contract.get("executionEndValue") or "")
+    selection = str(time_contract.get("timeSelectionPolicy") or "")
+    target = partition_column.lower()
+    for path, _has_target in branches:
+        condition = combine_lineage_lane(path, "where")
+        if condition is None:
+            return "MISSING_PARTITION_FILTER", "Node SQL must filter the partitionColumn declared by timeWindowContract"
+        references = [
+            term
+            for term in root_and_terms(condition)
+            if target in direct_expression_columns(term)
+        ]
+        if not references:
+            return "MISSING_PARTITION_FILTER", "Node SQL must filter the partitionColumn declared by timeWindowContract"
+        if selection == "latest_as_of":
+            if len(references) != 1 or not isinstance(unwrap_semantic_filter_parentheses(references[0]), exp.EQ):
+                return "METRIC_TIME_SEMANTICS_MISMATCH", "latest_as_of partition selector is not mandatory-positive"
+            synthetic = exp.select("*").where(references[0].copy())
+            if not sql_uses_latest_as_of_partition(
+                synthetic,
+                partition_column,
+                end,
+                str(time_contract.get("tenantColumn") or contract.merchant_filter_column or ""),
+            ):
+                return (
+                    "METRIC_TIME_SEMANTICS_MISMATCH",
+                    "latest_as_of metric SQL must select MAX(partitionColumn) within the governed bound",
+                )
+            continue
+        if start and end:
+            if not exact_period_window_terms(references, partition_column, start, end):
+                return (
+                    "RUNTIME_TIME_ALIGNMENT_MISMATCH",
+                    "Node SQL time predicate must exactly preserve executionStartValue/executionEndValue and inclusive directions",
+                )
+            continue
+        normalized = [unwrap_semantic_filter_parentheses(term) for term in references]
+        if not (
+            (len(normalized) == 1 and isinstance(normalized[0], (exp.Between, exp.EQ)))
+            or (
+                len(normalized) == 2
+                and any(isinstance(item, (exp.GT, exp.GTE)) for item in normalized)
+                and any(isinstance(item, (exp.LT, exp.LTE)) for item in normalized)
+            )
+        ):
+            return "MISSING_PARTITION_FILTER", "partition filter is not mandatory-positive on the output path"
+    return "", ""
+
+
 STRUCTURED_FALLBACK_ERROR_CODES = {
     "SQL_EMPTY",
     "PARSE_ERROR",
@@ -605,6 +738,8 @@ STRUCTURED_FALLBACK_ERROR_CODES = {
     "UNKNOWN_BASE_TABLE",
     "OUT_OF_NODE_TABLE_SCOPE",
     "MISSING_MERCHANT_FILTER",
+    "MISSING_REGION_FILTER",
+    "MISSING_STORE_FILTER",
     "MISSING_PARTITION_FILTER",
     "INVALID_PARTITION_FILTER",
     "RUNTIME_TIME_ALIGNMENT_MISMATCH",
@@ -614,6 +749,11 @@ STRUCTURED_FALLBACK_ERROR_CODES = {
     "MISSING_ENTITY_FILTER",
     "MISSING_ENTITY_FILTER_VALUE",
     "ENTITY_FILTER_CONTRACT_MISMATCH",
+    "SEMANTIC_FILTER_EXTRA_PREDICATE",
+    "SEMANTIC_FILTER_BOOLEAN_STRUCTURE_MISMATCH",
+    "SEMANTIC_FILTER_PREDICATE_MISSING",
+    "SEMANTIC_FILTER_PARAMETER_VALUE_MISMATCH",
+    "SEMANTIC_FILTER_PARAMETER_VALUES_MISSING",
     "MEM_ALLOC_FAILED",
     "TIMEOUT",
     "SQL_SYNTAX",
@@ -629,6 +769,13 @@ STRICT_STRUCTURED_FALLBACK_CODES = {
     "MISSING_ENTITY_FILTER",
     "MISSING_ENTITY_FILTER_VALUE",
     "ENTITY_FILTER_CONTRACT_MISMATCH",
+    "MISSING_REGION_FILTER",
+    "MISSING_STORE_FILTER",
+    "SEMANTIC_FILTER_EXTRA_PREDICATE",
+    "SEMANTIC_FILTER_BOOLEAN_STRUCTURE_MISMATCH",
+    "SEMANTIC_FILTER_PREDICATE_MISSING",
+    "SEMANTIC_FILTER_PARAMETER_VALUE_MISMATCH",
+    "SEMANTIC_FILTER_PARAMETER_VALUES_MISSING",
 }
 RESOURCE_CONSTRAINED_DORIS_ERRORS = {"MEM_ALLOC_FAILED", "TIMEOUT"}
 class SqlValidationService:
@@ -847,6 +994,7 @@ class NodePlanCritic:
                         obligation.obligation_id,
                     )
                 )
+        issues.extend(semantic_filter_contract_issues(contract))
         missing_output = [column for column in contract.output_keys if column and column not in allowed]
         if missing_output:
             issues.append(issue("MISSING_OUTPUT_KEY", "outputKeys are not available in node schema", ",".join(missing_output)))
@@ -1835,7 +1983,14 @@ class NodeWorkerExecutor:
             question=question or intent.question,
             upstream_entity_sets=entity_sets,
             upstream_rows=upstream_rows if intent.answer_mode == AnswerMode.DERIVED else upstream_rows[: self.settings.tool_result_preview_rows],
-            context_package={"userScope": dict(user_scope or {})},
+            context_package={
+                "userScope": dict(user_scope or {}),
+                "semanticFilterObligations": [
+                    item.model_dump(by_alias=True, mode="json")
+                    for item in plan.semantic_filter_obligations
+                    if item.task_id == intent.plan_task_id
+                ],
+            },
         )
 
     def _task_rows_for_context(self, task_result: AgentTaskResult, include_artifacts: bool = False) -> List[Dict[str, Any]]:
@@ -2664,6 +2819,13 @@ class NodeWorkerExecutor:
             tenant_binding_error = tenant_scope_binding_error(bound_sql, sql_params, contract, context)
             if tenant_binding_error:
                 binding_error = binding_error or tenant_binding_error
+            time_binding_code, time_binding_error = time_window_sql_contract_error(
+                bound_sql,
+                contract,
+                sql_params,
+            )
+            if time_binding_code:
+                binding_error = binding_error or "%s: %s" % (time_binding_code, time_binding_error)
             if binding_error:
                 record_tool(
                     tool_traces,
@@ -2749,6 +2911,50 @@ class NodeWorkerExecutor:
                     "CURDATE anchored to max_pt=%s" % anchor_date,
                     "PARTITION_DATE_ANCHOR",
                     round_index,
+                )
+            bound_semantic_filter_proof = build_semantic_filter_verification_proof(
+                contract,
+                bound_sql,
+                sql_params,
+            )
+            if (
+                bound_semantic_filter_proof.status != "not_required"
+                and not bound_semantic_filter_proof.verified
+            ):
+                message = "%s: %s" % (
+                    bound_semantic_filter_proof.code or "SEMANTIC_FILTER_SQL_MISMATCH",
+                    bound_semantic_filter_proof.reason or "bound SQL changed the semantic filter contract",
+                )
+                record_tool(
+                    tool_traces,
+                    intent,
+                    "verify_semantic_filter_sql",
+                    "failed",
+                    trim_sql(bound_sql),
+                    message,
+                    bound_semantic_filter_proof.code or "SEMANTIC_FILTER_SQL_MISMATCH",
+                    round_index,
+                )
+                return AgentTaskResult(
+                    success=False,
+                    summary=message,
+                    query_bundle=QueryBundle(
+                        sql=bound_sql,
+                        params=sql_params,
+                        tables=validation.base_tables,
+                        failed=True,
+                        error=message,
+                    ),
+                    react_trace=trace,
+                    sql_repairs=repair_attempts,
+                    validation_results=validation_results,
+                    node_tool_traces=tool_traces,
+                    node_task_profile=node_task_profile,
+                    freshness_reports=[freshness],
+                    node_plan_contract=contract,
+                    semantic_filter_verification=bound_semantic_filter_proof,
+                    node_plan_critique=critique,
+                    sql_draft_decision=draft_decision,
                 )
             record_tool(
                 tool_traces,
@@ -2861,6 +3067,11 @@ class NodeWorkerExecutor:
                         bound_sql,
                         coverage_complete=coverage_complete,
                     )
+                    semantic_filter_verification = build_semantic_filter_verification_proof(
+                        contract,
+                        bound_sql,
+                        sql_params,
+                    )
                     entity_contract_error = (
                         entity_verification.reason
                         if entity_verification.status == "failed"
@@ -2942,6 +3153,7 @@ class NodeWorkerExecutor:
                         freshness_reports=[freshness],
                         node_plan_contract=contract,
                         entity_filter_verification=entity_verification,
+                        semantic_filter_verification=semantic_filter_verification,
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
@@ -3118,6 +3330,11 @@ class NodeWorkerExecutor:
                 )
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris", action="query_doris", observation="rows=%s" % len(rows)))
                 entity_verification = build_entity_filter_verification_proof(contract, rows, bound_sql)
+                semantic_filter_verification = build_semantic_filter_verification_proof(
+                    contract,
+                    bound_sql,
+                    sql_params,
+                )
                 entity_contract_error = (
                     entity_verification.reason
                     if entity_verification.status == "failed"
@@ -3156,6 +3373,7 @@ class NodeWorkerExecutor:
                         freshness_reports=[freshness],
                         node_plan_contract=contract,
                         entity_filter_verification=entity_verification,
+                        semantic_filter_verification=semantic_filter_verification,
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
@@ -3196,6 +3414,7 @@ class NodeWorkerExecutor:
                     freshness_reports=[freshness],
                     node_plan_contract=contract,
                     entity_filter_verification=entity_verification,
+                    semantic_filter_verification=semantic_filter_verification,
                     node_plan_critique=critique,
                     sql_draft_decision=draft_decision,
                 )
@@ -3236,6 +3455,11 @@ class NodeWorkerExecutor:
                         rows,
                         bound_sql,
                         coverage_complete=coverage_complete,
+                    )
+                    semantic_filter_verification = build_semantic_filter_verification_proof(
+                        contract,
+                        bound_sql,
+                        sql_params,
                     )
                     entity_contract_error = (
                         entity_verification.reason
@@ -3318,6 +3542,7 @@ class NodeWorkerExecutor:
                         freshness_reports=[freshness],
                         node_plan_contract=contract,
                         entity_filter_verification=entity_verification,
+                        semantic_filter_verification=semantic_filter_verification,
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
@@ -3672,7 +3897,12 @@ class NodeWorkerExecutor:
         if intent.sql or intent.sql_strategy in {"structured_first", "llm_first_debug"}:
             return False
         if intent.answer_mode == AnswerMode.DETAIL:
-            return bool(intent.output_keys or intent.required_evidence or intent.filter_column)
+            return bool(
+                intent.output_keys
+                or intent.required_evidence
+                or intent.filter_column
+                or intent.semantic_query.filter_nodes
+            )
         if (
             intent.answer_mode == AnswerMode.METRIC
             and intent.task_role != TaskRole.DEPENDENT
@@ -4368,6 +4598,9 @@ class NodeWorkerExecutor:
         if not table or not columns:
             return ""
         contract = contract or self._node_plan_contract(intent, asset_pack, context)
+        semantic_filters = compile_semantic_filter_sql(contract)
+        if not semantic_filters.valid:
+            return ""
         where = self._structured_where(
             intent,
             table,
@@ -4375,10 +4608,21 @@ class NodeWorkerExecutor:
             context,
             contract,
             entity_value_limit=50 if resource_safe else 200,
+            semantic_where_sql=semantic_filters.where_sql,
         )
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
-            return self._draft_structured_aggregate_sql(intent, table, columns, where_sql, contract, resource_safe=resource_safe)
+            return self._draft_structured_aggregate_sql(
+                intent,
+                table,
+                columns,
+                where_sql,
+                contract,
+                resource_safe=resource_safe,
+                having_sql=semantic_filters.having_sql,
+            )
+        if semantic_filters.having_sql:
+            return ""
         select_columns = self._structured_detail_columns(intent, columns, contract, resource_safe=resource_safe)
         return "SELECT %s FROM `%s`%s LIMIT %d" % (
             ", ".join(quote_identifier(column) for column in select_columns),
@@ -4395,6 +4639,7 @@ class NodeWorkerExecutor:
         where_sql: str,
         contract: NodePlanContract,
         resource_safe: bool = False,
+        having_sql: str = "",
     ) -> str:
         group_columns = self._structured_group_columns(intent, columns, contract)
         select_parts = [quote_identifier(column) for column in group_columns]
@@ -4417,13 +4662,15 @@ class NodeWorkerExecutor:
         if not resource_safe:
             for column in self._structured_context_columns(intent, columns, group_columns, contract):
                 select_parts.append("MAX(`%s`) AS `%s`" % (column, column))
+        having_clause = " HAVING %s" % having_sql if having_sql else ""
         if not group_columns:
-            return "SELECT %s FROM `%s`%s" % (", ".join(select_parts), table, where_sql)
-        return "SELECT %s FROM `%s`%s GROUP BY %s ORDER BY %s LIMIT %d" % (
+            return "SELECT %s FROM `%s`%s%s" % (", ".join(select_parts), table, where_sql, having_clause)
+        return "SELECT %s FROM `%s`%s GROUP BY %s%s ORDER BY %s LIMIT %d" % (
             ", ".join(select_parts),
             table,
             where_sql,
             ", ".join(quote_identifier(column) for column in group_columns),
+            having_clause,
             order_expr,
             structured_limit(intent.limit, detail=False, resource_safe=resource_safe),
         )
@@ -4485,13 +4732,34 @@ class NodeWorkerExecutor:
         context: NodeExecutionContext,
         contract: NodePlanContract,
         entity_value_limit: int = 200,
+        semantic_where_sql: str = "",
     ) -> List[str]:
         where: List[str] = []
         merchant_column = str(contract.merchant_filter_column or "")
-        if merchant_column and merchant_column in columns:
+        merchant_value = str(context.merchant_id or contract.merchant_id or "")
+        merchant_covered_by_semantic = semantic_filter_has_mandatory_exact_predicate(
+            contract,
+            merchant_column,
+            [merchant_value] if merchant_value else [],
+        )
+        if merchant_column and merchant_column in columns and not merchant_covered_by_semantic:
             where.append("`%s` = %s" % (merchant_column, sql_literal(context.merchant_id)))
-        if intent.filter_column and intent.filter_column in columns and intent.filter_value:
+        legacy_filter_is_merchant_scope = bool(
+            intent.filter_column
+            and intent.filter_column == merchant_column
+            and canonical_contract_values(intent_entity_filter_values(intent))
+            == canonical_contract_values([merchant_value])
+        )
+        if (
+            intent.filter_column
+            and intent.filter_column in columns
+            and intent.filter_value
+            and not semantic_filter_covers_legacy_entity(contract)
+            and not legacy_filter_is_merchant_scope
+        ):
             where.append(filter_predicate(intent.filter_column, intent_entity_filter_values(intent)))
+        if semantic_where_sql:
+            where.append("(%s)" % semantic_where_sql)
         if aggregate_entity_key_requires_non_empty_filter(intent, columns):
             column = intent.group_by_column
             where.append("`%s` IS NOT NULL" % column)
@@ -4514,7 +4782,7 @@ class NodeWorkerExecutor:
         time_selection_policy = str(time_contract.get("timeSelectionPolicy") or "")
         if partition_column in columns and time_selection_policy == "latest_as_of":
             anchor_value = execution_end or str(intent.time_range.end_date or "")
-            if not any(sql_references_filter_column(predicate, partition_column) for predicate in where):
+            if not any(sql_filters_column(predicate, partition_column) for predicate in where):
                 where.append(
                     latest_as_of_partition_predicate(
                         table,
@@ -4533,7 +4801,7 @@ class NodeWorkerExecutor:
             and execution_start
             and execution_end
         ):
-            if not any(sql_references_filter_column(predicate, partition_column) for predicate in where):
+            if not any(sql_filters_column(predicate, partition_column) for predicate in where):
                 where.append(
                     "`%s` BETWEEN %s AND %s"
                     % (partition_column, sql_literal(execution_start), sql_literal(execution_end))
@@ -4544,13 +4812,13 @@ class NodeWorkerExecutor:
             and intent.time_range.end_date
             and intent.time_range.anchor_policy == CALENDAR_ANCHOR_POLICY
         ):
-            if not any(sql_references_filter_column(predicate, partition_column) for predicate in where):
+            if not any(sql_filters_column(predicate, partition_column) for predicate in where):
                 where.append(
                     "`%s` BETWEEN %s AND %s"
                     % (partition_column, sql_literal(intent.time_range.start_date), sql_literal(intent.time_range.end_date))
                 )
         elif partition_column in columns and days > 0:
-            if not any(sql_references_filter_column(predicate, partition_column) for predicate in where):
+            if not any(sql_filters_column(predicate, partition_column) for predicate in where):
                 where.append(
                     latest_partition_window_predicate(
                         table,
@@ -4685,12 +4953,40 @@ class NodeWorkerExecutor:
     ) -> SqlValidationResult:
         if not validation.valid:
             return validation
-        if contract.merchant_filter_column and not has_merchant_filter_predicate(sql, {contract.merchant_filter_column}):
+        if contract.merchant_filter_column and not sql_has_mandatory_column_filter(
+            sql,
+            contract.merchant_filter_column,
+            contract.preferred_table,
+        ):
             return validation.model_copy(
                 update={
                     "valid": False,
                     "error_code": "MISSING_MERCHANT_FILTER",
                     "message": "Node SQL must filter by nodePlanContract.merchantFilterColumn",
+                }
+            )
+        if contract.authorized_region and contract.region_filter_column and not sql_has_mandatory_column_filter(
+            sql,
+            contract.region_filter_column,
+            contract.preferred_table,
+        ):
+            return validation.model_copy(
+                update={
+                    "valid": False,
+                    "error_code": "MISSING_REGION_FILTER",
+                    "message": "Node SQL must apply authorized Region as a mandatory-positive root predicate",
+                }
+            )
+        if contract.authorized_store_ids and contract.store_filter_column and not sql_has_mandatory_column_filter(
+            sql,
+            contract.store_filter_column,
+            contract.preferred_table,
+        ):
+            return validation.model_copy(
+                update={
+                    "valid": False,
+                    "error_code": "MISSING_STORE_FILTER",
+                    "message": "Node SQL must apply authorized stores as a mandatory-positive root predicate",
                 }
             )
         if contract.filter_column and contract.filter_values and not sql_has_entity_filter_predicate(
@@ -4706,54 +5002,27 @@ class NodeWorkerExecutor:
                     "message": "Node SQL must apply the entity filter declared by nodePlanContract",
                 }
             )
-        time_contract = dict(contract.time_window_contract or {})
-        partition_column = str(time_contract.get("partitionColumn") or "")
-        if partition_column and not sql_filters_column(sql, partition_column):
+        time_error_code, time_error = time_window_sql_contract_error(sql, contract)
+        if time_error_code:
             return validation.model_copy(
                 update={
                     "valid": False,
-                    "error_code": "MISSING_PARTITION_FILTER",
-                    "message": "Node SQL must filter the partitionColumn declared by timeWindowContract",
-                }
-            )
-        execution_start = str(time_contract.get("executionStartValue") or "")
-        execution_end = str(time_contract.get("executionEndValue") or "")
-        time_selection_policy = str(time_contract.get("timeSelectionPolicy") or "")
-        required_execution_values = (
-            [execution_end]
-            if time_selection_policy == "latest_as_of"
-            else [execution_start, execution_end]
-        )
-        required_execution_values = [value for value in required_execution_values if value]
-        if required_execution_values and any(value not in str(sql or "") for value in required_execution_values):
-            return validation.model_copy(
-                update={
-                    "valid": False,
-                    "error_code": "RUNTIME_TIME_ALIGNMENT_MISMATCH",
-                    "message": (
-                        "Node SQL must use the runtime-bound executionStartValue/executionEndValue "
-                        "from timeWindowContract"
-                    ),
+                    "error_code": time_error_code,
+                    "message": time_error,
                 }
             )
         try:
             parsed = sqlglot.parse_one((sql or "").strip(), read="doris")
         except Exception:
             return validation
-        if time_selection_policy == "latest_as_of" and not sql_uses_latest_as_of_partition(
-            parsed,
-            partition_column,
-            execution_end,
-            str(time_contract.get("tenantColumn") or contract.merchant_filter_column or ""),
-        ):
+        semantic_filter_proof = build_semantic_filter_verification_proof(contract, sql)
+        if semantic_filter_proof.status != "not_required" and not semantic_filter_proof.verified:
             return validation.model_copy(
                 update={
                     "valid": False,
-                    "error_code": "METRIC_TIME_SEMANTICS_MISMATCH",
-                    "message": (
-                        "latest_as_of metric SQL must select MAX(partitionColumn) not after "
-                        "executionEndValue within the governed tenant scope"
-                    ),
+                    "error_code": semantic_filter_proof.code or "SEMANTIC_FILTER_SQL_MISMATCH",
+                    "message": semantic_filter_proof.reason
+                    or "Node SQL does not preserve the semantic filter contract",
                 }
             )
         allowed = set(contract.allowed_columns)
@@ -4937,6 +5206,8 @@ class NodeWorkerExecutor:
             filter_column=intent.filter_column,
             filter_values=intent_entity_filter_values(intent),
             filter_value_limit=max(1, int(self.settings.agent_max_entity_values or 1)),
+            semantic_query=intent.semantic_query.model_copy(deep=True),
+            semantic_filter_obligations=semantic_filter_obligations_from_context(context),
             entity_filter_obligations=entity_filter_obligations_for_intent(intent),
             output_keys=contract_output_keys,
             required_evidence=intent.required_evidence,
@@ -5053,7 +5324,12 @@ class NodeWorkerExecutor:
         table = intent.preferred_table
         columns = set(asset_pack.known_columns(table))
         requested: List[str] = []
-        for item in intent.required_evidence + intent.output_keys + [intent.filter_column, intent.group_by_column, intent.metric_column]:
+        for item in (
+            intent.required_evidence
+            + intent.output_keys
+            + [intent.filter_column, intent.group_by_column, intent.metric_column]
+            + semantic_filter_physical_fields(intent.semantic_query.filter_nodes, table)
+        ):
             if item and item in columns and item not in requested:
                 requested.append(item)
         for spec in metric_specs_for_intent(intent, table):
@@ -6819,6 +7095,15 @@ def canonical_sql_hash(sql: str) -> str:
     return hashlib.sha256(canonical_sql(sql).encode("utf-8")).hexdigest()
 
 
+def semantic_filter_execution_hash(sql: str, params: Optional[List[Any]] = None) -> str:
+    payload = {
+        "canonicalSql": canonical_sql(sql),
+        "params": list(params or []),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def sql_repair_contract_hash(contract: NodePlanContract) -> str:
     payload = contract.model_dump(by_alias=True, mode="json")
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
@@ -6940,6 +7225,1395 @@ def sql_repair_observation(attempt: SqlRepairAttempt) -> Dict[str, Any]:
         "stateFingerprint": attempt.state_fingerprint,
         "observation": attempt.observation,
     }
+
+
+SEMANTIC_FILTER_OPERATORS = {
+    "eq",
+    "neq",
+    "in",
+    "not_in",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "between",
+    "is_null",
+    "is_not_null",
+    "contains",
+    "not_contains",
+    "starts_with",
+    "ends_with",
+}
+SEMANTIC_FILTER_COMPARISON_OPERATORS = {"gt", "gte", "lt", "lte", "between"}
+SEMANTIC_FILTER_TEXT_OPERATORS = {"contains", "not_contains", "starts_with", "ends_with"}
+SEMANTIC_FILTER_NO_VALUE_OPERATORS = {"is_null", "is_not_null"}
+SEMANTIC_FILTER_MULTI_VALUE_OPERATORS = {"in", "not_in"}
+SEMANTIC_FILTER_GROUP_OPERATORS = {"and", "or", "not"}
+
+
+class SemanticFilterCompilationError(ValueError):
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+def semantic_filter_obligations_from_context(context: NodeExecutionContext) -> List[SemanticFilterObligation]:
+    payload = (context.context_package or {}).get("semanticFilterObligations") or []
+    obligations: List[SemanticFilterObligation] = []
+    for item in payload:
+        try:
+            obligation = item if isinstance(item, SemanticFilterObligation) else SemanticFilterObligation.model_validate(item)
+        except Exception:
+            continue
+        if obligation not in obligations:
+            obligations.append(obligation)
+    return obligations
+
+
+def semantic_filter_physical_fields(nodes: List[SemanticFilterNode], table: str) -> List[str]:
+    fields: List[str] = []
+    for node in nodes or []:
+        if str(node.node_type or "").lower() != "predicate":
+            continue
+        if str(node.member_kind or "").lower() == "measure":
+            continue
+        if node.bound_table != table or not node.bound_field or node.bound_field in fields:
+            continue
+        fields.append(node.bound_field)
+    return fields
+
+
+def semantic_filter_contract_hash(contract: NodePlanContract) -> str:
+    payload = {
+        "taskId": contract.task_id,
+        "preferredTable": contract.preferred_table,
+        "semanticQuery": contract.semantic_query.model_dump(by_alias=True, mode="json"),
+        "obligations": [
+            item.model_dump(by_alias=True, mode="json")
+            for item in contract.semantic_filter_obligations
+            if item.required
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def semantic_filter_contract_issues(contract: NodePlanContract) -> List[Dict[str, Any]]:
+    compilation = compile_semantic_filter_sql(contract)
+    if compilation.valid:
+        return []
+    return [
+        issue(
+            compilation.code or "SEMANTIC_FILTER_CONTRACT_INVALID",
+            compilation.reason or "semantic filter contract is not executable",
+            contract.semantic_query.root_filter_node_id,
+        )
+    ]
+
+
+def semantic_filter_mandatory_predicate_ids(
+    node_by_id: Dict[str, SemanticFilterNode],
+    root_id: str,
+) -> Set[str]:
+    """Predicates guaranteed true for every row under the filter root."""
+
+    def visit(node_id: str, visiting: Set[str]) -> Set[str]:
+        if node_id in visiting:
+            return set()
+        node = node_by_id.get(node_id)
+        if node is None:
+            return set()
+        if str(node.node_type or "").lower() == "predicate":
+            return {node_id}
+        if str(node.node_type or "").lower() != "group":
+            return set()
+        if str(node.logical_operator or "").lower() != "and":
+            return set()
+        result: Set[str] = set()
+        for child_id in node.child_node_ids:
+            result.update(visit(str(child_id or ""), {*visiting, node_id}))
+        return result
+
+    return visit(str(root_id or ""), set())
+
+
+def canonical_contract_values(values: List[Any]) -> List[str]:
+    return sorted(str(value) for value in values if value not in (None, ""))
+
+
+def semantic_filter_has_mandatory_exact_predicate(
+    contract: NodePlanContract,
+    column: str,
+    expected_values: List[Any],
+) -> bool:
+    nodes = list(contract.semantic_query.filter_nodes or [])
+    node_by_id = {str(node.node_id or ""): node for node in nodes}
+    mandatory_ids = semantic_filter_mandatory_predicate_ids(
+        node_by_id,
+        str(contract.semantic_query.root_filter_node_id or ""),
+    )
+    matches = [
+        node
+        for node in nodes
+        if node.node_id in mandatory_ids
+        and str(node.node_type or "").lower() == "predicate"
+        and str(node.member_kind or "").lower() != "measure"
+        and str(node.bound_field or "").lower() == str(column or "").lower()
+        and str(node.operator or "").lower() in {"eq", "in"}
+    ]
+    return bool(
+        column
+        and expected_values
+        and len(matches) == 1
+        and canonical_contract_values(list(matches[0].resolved_values or []))
+        == canonical_contract_values(expected_values)
+    )
+
+
+def semantic_system_scope_contract_issue(
+    contract: NodePlanContract,
+    node_by_id: Dict[str, SemanticFilterNode],
+    root_id: str,
+) -> Tuple[str, str]:
+    mandatory_ids = semantic_filter_mandatory_predicate_ids(node_by_id, root_id)
+    protected = [
+        (str(contract.merchant_filter_column or ""), [contract.merchant_id] if contract.merchant_id else []),
+        (str(contract.region_filter_column or ""), [contract.authorized_region] if contract.authorized_region else []),
+        (str(contract.store_filter_column or ""), list(contract.authorized_store_ids or [])),
+    ]
+    for column, expected_values in protected:
+        if not column or not expected_values:
+            continue
+        matching = [
+            node
+            for node in node_by_id.values()
+            if str(node.node_type or "").lower() == "predicate"
+            and str(node.member_kind or "").lower() != "measure"
+            and str(node.bound_field or "").lower() == column.lower()
+        ]
+        if not matching:
+            continue
+        if len(matching) != 1 or matching[0].node_id not in mandatory_ids:
+            return (
+                "SEMANTIC_SCOPE_FILTER_CONFLICT",
+                "a protected scope field may appear only once as a mandatory-positive semantic predicate",
+            )
+        node = matching[0]
+        if str(node.operator or "").lower() not in {"eq", "in"}:
+            return (
+                "SEMANTIC_SCOPE_FILTER_CONFLICT",
+                "protected scope field %s requires an exact EQ/IN semantic predicate" % column,
+            )
+        if canonical_contract_values(list(node.resolved_values or [])) != canonical_contract_values(expected_values):
+            return (
+                "SEMANTIC_SCOPE_FILTER_CONFLICT",
+                "semantic predicate on protected scope field %s conflicts with the authorized values" % column,
+            )
+    return "", ""
+
+
+def semantic_time_window_contract_issue(
+    contract: NodePlanContract,
+    node_by_id: Dict[str, SemanticFilterNode],
+    root_id: str,
+) -> Tuple[str, str]:
+    time_contract = dict(contract.time_window_contract or {})
+    column = str(time_contract.get("partitionColumn") or "")
+    if not column:
+        return "", ""
+    time_nodes = [
+        node
+        for node in node_by_id.values()
+        if str(node.node_type or "").lower() == "predicate"
+        and str(node.member_kind or "").lower() != "measure"
+        and str(node.bound_field or "").lower() == column.lower()
+    ]
+    if not time_nodes:
+        return "", ""
+    mandatory_ids = semantic_filter_mandatory_predicate_ids(node_by_id, root_id)
+    if any(node.node_id not in mandatory_ids for node in time_nodes):
+        return (
+            "SEMANTIC_TIME_WINDOW_CONFLICT",
+            "semantic time predicates must be mandatory-positive under the filter root",
+        )
+    start = str(time_contract.get("executionStartValue") or "")
+    end = str(time_contract.get("executionEndValue") or "")
+    selection = str(time_contract.get("timeSelectionPolicy") or "")
+    if not end or (selection != "latest_as_of" and not start):
+        return (
+            "SEMANTIC_TIME_WINDOW_CONFLICT",
+            "semantic time predicate cannot replace an unresolved runtime time window",
+        )
+    if selection == "latest_as_of":
+        return (
+            "SEMANTIC_TIME_WINDOW_CONFLICT",
+            "latest_as_of requires the governed MAX(partition) selector and cannot be replaced by a user predicate",
+        )
+    elif len(time_nodes) == 1:
+        node = time_nodes[0]
+        operator = str(node.operator or "").lower()
+        values = [str(value) for value in node.resolved_values or []]
+        valid = (operator == "between" and values == [start, end]) or (
+            operator == "eq" and start == end and values == [start]
+        )
+    elif len(time_nodes) == 2:
+        boundaries = {
+            str(node.operator or "").lower(): [str(value) for value in node.resolved_values or []]
+            for node in time_nodes
+        }
+        valid = boundaries == {"gte": [start], "lte": [end]}
+    else:
+        valid = False
+    if not valid:
+        return (
+            "SEMANTIC_TIME_WINDOW_CONFLICT",
+            "semantic time predicates do not exactly match the runtime execution window",
+        )
+    return "", ""
+
+
+def compile_semantic_filter_sql(contract: NodePlanContract) -> SemanticFilterSqlCompilation:
+    """Compile a single-table semantic filter graph without changing its logic."""
+
+    nodes = list(contract.semantic_query.filter_nodes or [])
+    required_obligations = [item for item in contract.semantic_filter_obligations if item.required]
+    if not nodes:
+        if required_obligations:
+            return SemanticFilterSqlCompilation(
+                code="SEMANTIC_FILTER_GRAPH_MISSING",
+                reason="required semantic filter obligations have no executable filter graph",
+            )
+        return SemanticFilterSqlCompilation()
+    try:
+        if str(contract.semantic_query.binding_status or "").lower() != "resolved":
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_BINDING_UNRESOLVED",
+                "semantic query filter graph has not completed governed binding",
+            )
+        node_by_id: Dict[str, SemanticFilterNode] = {}
+        for node in nodes:
+            node_id = str(node.node_id or "").strip()
+            if not node_id:
+                raise SemanticFilterCompilationError(
+                    "SEMANTIC_FILTER_GRAPH_INVALID",
+                    "semantic filter node has no nodeId",
+                )
+            if node_id in node_by_id:
+                raise SemanticFilterCompilationError(
+                    "SEMANTIC_FILTER_GRAPH_INVALID",
+                    "semantic filter graph contains duplicate nodeId=%s" % node_id,
+                )
+            node_by_id[node_id] = node
+        root_id = str(contract.semantic_query.root_filter_node_id or "").strip()
+        if not root_id or root_id not in node_by_id:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_GRAPH_INVALID",
+                "semantic filter graph has no valid rootFilterNodeId",
+            )
+
+        parent_counts = {node_id: 0 for node_id in node_by_id}
+        for node_id, node in node_by_id.items():
+            node_type = str(node.node_type or "").lower()
+            if node_type == "predicate":
+                if node.child_node_ids:
+                    raise SemanticFilterCompilationError(
+                        "SEMANTIC_FILTER_GRAPH_INVALID",
+                        "predicate node %s cannot have child nodes" % node_id,
+                    )
+                continue
+            if node_type != "group":
+                raise SemanticFilterCompilationError(
+                    "SEMANTIC_FILTER_GRAPH_INVALID",
+                    "semantic filter node %s has unsupported nodeType=%s" % (node_id, node.node_type),
+                )
+            children = [str(item or "").strip() for item in node.child_node_ids]
+            if not children or len(children) != len(set(children)):
+                raise SemanticFilterCompilationError(
+                    "SEMANTIC_FILTER_GRAPH_INVALID",
+                    "filter group %s must contain unique child node ids" % node_id,
+                )
+            for child_id in children:
+                if child_id not in node_by_id:
+                    raise SemanticFilterCompilationError(
+                        "SEMANTIC_FILTER_GRAPH_INVALID",
+                        "filter group %s references unknown child %s" % (node_id, child_id),
+                    )
+                parent_counts[child_id] += 1
+        if parent_counts[root_id]:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_GRAPH_INVALID",
+                "root filter node cannot be referenced as a child",
+            )
+        shared = [node_id for node_id, count in parent_counts.items() if node_id != root_id and count != 1]
+        if shared:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_GRAPH_INVALID",
+                "semantic filter graph must be a rooted tree; invalid nodes=%s" % sorted(shared),
+            )
+        for code, reason in [
+            semantic_system_scope_contract_issue(contract, node_by_id, root_id),
+            semantic_time_window_contract_issue(contract, node_by_id, root_id),
+        ]:
+            if code:
+                raise SemanticFilterCompilationError(code, reason)
+
+        predicate_sql: Dict[str, str] = {}
+        predicate_lanes: Dict[str, str] = {}
+        visiting: Set[str] = set()
+        reachable: Set[str] = set()
+
+        def compile_node(node_id: str) -> Dict[str, str]:
+            if node_id in visiting:
+                raise SemanticFilterCompilationError(
+                    "SEMANTIC_FILTER_GRAPH_CYCLE",
+                    "semantic filter graph contains a cycle at %s" % node_id,
+                )
+            visiting.add(node_id)
+            reachable.add(node_id)
+            node = node_by_id[node_id]
+            node_type = str(node.node_type or "").lower()
+            if node_type == "predicate":
+                lane, expression = compile_semantic_filter_predicate(contract, node)
+                predicate_sql[node_id] = expression
+                predicate_lanes[node_id] = lane
+                compiled = {lane: expression}
+            else:
+                logical = str(node.logical_operator or "").lower()
+                if logical not in SEMANTIC_FILTER_GROUP_OPERATORS:
+                    raise SemanticFilterCompilationError(
+                        "SEMANTIC_FILTER_GRAPH_INVALID",
+                        "filter group %s has unsupported logicalOperator=%s" % (node_id, node.logical_operator),
+                    )
+                child_results = [compile_node(str(child_id)) for child_id in node.child_node_ids]
+                if logical == "not":
+                    if len(child_results) != 1 or len(child_results[0]) != 1:
+                        raise SemanticFilterCompilationError(
+                            "SEMANTIC_FILTER_MIXED_BOOLEAN_SCOPE_UNSUPPORTED",
+                            "NOT must contain exactly one WHERE-only or HAVING-only child",
+                        )
+                    lane, expression = next(iter(child_results[0].items()))
+                    compiled = {lane: "NOT (%s)" % expression}
+                elif logical == "or":
+                    lanes = [set(result) for result in child_results]
+                    if any(len(item) != 1 for item in lanes) or len({next(iter(item)) for item in lanes}) != 1:
+                        raise SemanticFilterCompilationError(
+                            "SEMANTIC_FILTER_MIXED_BOOLEAN_SCOPE_UNSUPPORTED",
+                            "OR cannot span WHERE and HAVING because splitting it would change semantics",
+                        )
+                    lane = next(iter(lanes[0]))
+                    compiled = {
+                        lane: combine_semantic_filter_expressions(
+                            "OR",
+                            [result[lane] for result in child_results],
+                        )
+                    }
+                else:
+                    by_lane: Dict[str, List[str]] = {}
+                    for result in child_results:
+                        for lane, expression in result.items():
+                            by_lane.setdefault(lane, []).append(expression)
+                    compiled = {
+                        lane: combine_semantic_filter_expressions("AND", expressions)
+                        for lane, expressions in by_lane.items()
+                    }
+            visiting.remove(node_id)
+            return compiled
+
+        root = compile_node(root_id)
+        if reachable != set(node_by_id):
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_GRAPH_INVALID",
+                "semantic filter graph contains disconnected nodes",
+            )
+        validate_semantic_filter_obligations(contract, node_by_id, predicate_sql)
+        if root.get("having") and contract.answer_mode not in {
+            AnswerMode.TOPN.value,
+            AnswerMode.GROUP_AGG.value,
+            AnswerMode.METRIC.value,
+        }:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_HAVING_REQUIRES_AGGREGATE",
+                "measure filters require an aggregate node and cannot be applied to detail rows",
+            )
+        return SemanticFilterSqlCompilation(
+            where_sql=root.get("where", ""),
+            having_sql=root.get("having", ""),
+            predicate_sql=predicate_sql,
+            predicate_lanes=predicate_lanes,
+            reachable_predicate_ids=tuple(sorted(predicate_sql)),
+        )
+    except SemanticFilterCompilationError as exc:
+        return SemanticFilterSqlCompilation(code=exc.code, reason=exc.reason)
+
+
+def combine_semantic_filter_expressions(operator: str, expressions: List[str]) -> str:
+    if not expressions:
+        return ""
+    if len(expressions) == 1:
+        return expressions[0]
+    return "(%s)" % (" %s " % operator).join("(%s)" % expression for expression in expressions)
+
+
+def compile_semantic_filter_predicate(
+    contract: NodePlanContract,
+    node: SemanticFilterNode,
+) -> Tuple[str, str]:
+    node_id = str(node.node_id or "")
+    if str(node.resolution_status or "").lower() != "resolved":
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_PREDICATE_UNRESOLVED",
+            "semantic filter predicate %s is not resolved" % node_id,
+        )
+    if not node.semantic_ref_id or not node.source_phrase:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_PREDICATE_INVALID",
+            "semantic filter predicate %s lacks semanticRefId or sourcePhrase" % node_id,
+        )
+    if node.bound_table != contract.preferred_table:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_CROSS_TABLE_UNSUPPORTED",
+            "semantic filter predicate %s binds table %s outside node table %s"
+            % (node_id, node.bound_table, contract.preferred_table),
+        )
+    operator = str(node.operator or "").lower()
+    if operator not in SEMANTIC_FILTER_OPERATORS:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_OPERATOR_UNSUPPORTED",
+            "semantic filter predicate %s has unsupported operator=%s" % (node_id, operator),
+        )
+    data_type = normalize_semantic_filter_data_type(node.data_type)
+    if not semantic_filter_operator_compatible(operator, data_type):
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_OPERATOR_TYPE_MISMATCH",
+            "operator %s is incompatible with dataType=%s for predicate %s"
+            % (operator, data_type or "unknown", node_id),
+        )
+    values = list(node.resolved_values or [])
+    validate_semantic_filter_value_cardinality(contract, node_id, operator, values)
+    member_kind = str(node.member_kind or "").lower()
+    if member_kind == "measure":
+        left = governed_measure_filter_expression(contract, node)
+        if not left:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_MEASURE_BINDING_UNSAFE",
+                "measure predicate %s has no matching governed aggregation formula" % node_id,
+            )
+        lane = "having"
+    else:
+        if not node.bound_field or node.bound_field not in set(contract.allowed_columns):
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_FIELD_NOT_ALLOWED",
+                "predicate %s binds field %s outside node allowedColumns"
+                % (node_id, node.bound_field),
+            )
+        left = quote_identifier(node.bound_field)
+        lane = "where"
+    expression = semantic_filter_predicate_expression(left, operator, values, data_type)
+    return lane, expression
+
+
+def normalize_semantic_filter_data_type(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "int": "integer",
+        "bigint": "integer",
+        "smallint": "integer",
+        "tinyint": "integer",
+        "float": "number",
+        "double": "number",
+        "decimal": "number",
+        "numeric": "number",
+        "bool": "boolean",
+        "timestamp": "datetime",
+        "text": "string",
+        "varchar": "string",
+        "char": "string",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def semantic_filter_operator_compatible(operator: str, data_type: str) -> bool:
+    if operator in {"eq", "neq", "in", "not_in", "is_null", "is_not_null"}:
+        return bool(data_type)
+    if operator in SEMANTIC_FILTER_COMPARISON_OPERATORS:
+        return data_type in {"integer", "number", "date", "datetime", "time"}
+    if operator in SEMANTIC_FILTER_TEXT_OPERATORS:
+        return data_type == "string"
+    return False
+
+
+def validate_semantic_filter_value_cardinality(
+    contract: NodePlanContract,
+    node_id: str,
+    operator: str,
+    values: List[Any],
+) -> None:
+    if operator in SEMANTIC_FILTER_NO_VALUE_OPERATORS:
+        if values:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_VALUE_CARDINALITY_INVALID",
+                "%s does not accept values for predicate %s" % (operator, node_id),
+            )
+        return
+    if any(value is None for value in values):
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_VALUE_INVALID",
+            "predicate %s must use is_null/is_not_null for NULL" % node_id,
+        )
+    expected = 2 if operator == "between" else None
+    if expected is not None and len(values) != expected:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_VALUE_CARDINALITY_INVALID",
+            "%s requires exactly %s values for predicate %s" % (operator, expected, node_id),
+        )
+    if operator not in SEMANTIC_FILTER_NO_VALUE_OPERATORS | {"between"} and not values:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_VALUE_CARDINALITY_INVALID",
+            "%s requires at least one resolved value for predicate %s" % (operator, node_id),
+        )
+    if operator not in SEMANTIC_FILTER_MULTI_VALUE_OPERATORS | {"between"} and len(values) != 1:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_VALUE_CARDINALITY_INVALID",
+            "%s requires exactly one resolved value for predicate %s" % (operator, node_id),
+        )
+    value_limit = int(contract.filter_value_limit or 0)
+    if value_limit > 0 and len(values) > value_limit:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_VALUE_LIMIT_EXCEEDED",
+            "predicate %s has %s values, exceeding limit %s" % (node_id, len(values), value_limit),
+        )
+
+
+def semantic_filter_predicate_expression(
+    left: str,
+    operator: str,
+    values: List[Any],
+    data_type: str,
+) -> str:
+    if operator == "is_null":
+        return "%s IS NULL" % left
+    if operator == "is_not_null":
+        return "%s IS NOT NULL" % left
+    literals = [semantic_filter_sql_literal(value, data_type) for value in values]
+    if operator == "eq":
+        return "%s = %s" % (left, literals[0])
+    if operator == "neq":
+        return "%s <> %s" % (left, literals[0])
+    if operator == "in":
+        return "%s IN (%s)" % (left, ", ".join(literals))
+    if operator == "not_in":
+        return "%s NOT IN (%s)" % (left, ", ".join(literals))
+    if operator in {"gt", "gte", "lt", "lte"}:
+        sql_operator = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[operator]
+        return "%s %s %s" % (left, sql_operator, literals[0])
+    if operator == "between":
+        return "%s BETWEEN %s AND %s" % (left, literals[0], literals[1])
+    escaped = semantic_like_value(values[0])
+    value_sql = sql_literal(escaped)
+    if operator in {"contains", "not_contains"}:
+        pattern = "CONCAT('%%', %s, '%%')" % value_sql
+    elif operator == "starts_with":
+        pattern = "CONCAT(%s, '%%')" % value_sql
+    else:
+        pattern = "CONCAT('%%', %s)" % value_sql
+    like = "%s LIKE %s ESCAPE %s" % (left, pattern, sql_literal("\\\\"))
+    return "NOT (%s)" % like if operator == "not_contains" else like
+
+
+def semantic_filter_sql_literal(value: Any, data_type: str) -> str:
+    if data_type == "integer":
+        text = str(value).strip()
+        if isinstance(value, bool) or not re.fullmatch(r"[-+]?\d+", text):
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_VALUE_TYPE_MISMATCH",
+                "resolved value %r is not an integer" % value,
+            )
+        return str(int(text))
+    if data_type == "number":
+        try:
+            number = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError):
+            number = Decimal("NaN")
+        if isinstance(value, bool) or not number.is_finite():
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_VALUE_TYPE_MISMATCH",
+                "resolved value %r is not a finite number" % value,
+            )
+        normalized = format(number.normalize(), "f")
+        return "0" if normalized in {"-0", "+0"} else normalized
+    if data_type == "boolean":
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1"}:
+            return "TRUE"
+        if normalized in {"false", "0"}:
+            return "FALSE"
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_VALUE_TYPE_MISMATCH",
+            "resolved value %r is not boolean" % value,
+        )
+    return sql_literal(value)
+
+
+def semantic_like_value(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def governed_measure_filter_expression(
+    contract: NodePlanContract,
+    node: SemanticFilterNode,
+) -> str:
+    candidates: List[Tuple[str, str]] = []
+    for spec in contract.metric_specs:
+        semantic_ref_id = str(spec.get("semanticRefId") or spec.get("semantic_ref_id") or "")
+        metric_key = str(
+            spec.get("metricName")
+            or spec.get("metric_name")
+            or spec.get("metricKey")
+            or spec.get("metric_key")
+            or ""
+        )
+        if semantic_ref_id != node.semantic_ref_id or metric_key != node.bound_field:
+            continue
+        formula = str(spec.get("metricFormula") or spec.get("metric_formula") or spec.get("formula") or "")
+        if formula:
+            candidates.append((semantic_ref_id, formula))
+    resolution = dict(contract.metric_resolution or {})
+    if (
+        str(resolution.get("semanticRefId") or resolution.get("semantic_ref_id") or "") == node.semantic_ref_id
+        and str(resolution.get("metricKey") or resolution.get("metric_key") or contract.metric_name or "")
+        == node.bound_field
+    ):
+        formula = str(resolution.get("formula") or contract.metric_formula or "")
+        if formula:
+            candidates.append((node.semantic_ref_id, formula))
+    unique_formulas = list(dict.fromkeys(formula for _, formula in candidates if formula))
+    if len(unique_formulas) != 1:
+        return ""
+    return compile_metric_formula(unique_formulas[0], set(contract.allowed_columns))
+
+
+def validate_semantic_filter_obligations(
+    contract: NodePlanContract,
+    node_by_id: Dict[str, SemanticFilterNode],
+    predicate_sql: Dict[str, str],
+) -> None:
+    obligations = [item for item in contract.semantic_filter_obligations if item.required]
+    if not obligations:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_OBLIGATION_MISSING",
+            "semantic filter predicates have no immutable user-filter obligations",
+        )
+    obligation_ids: Set[str] = set()
+    by_node: Dict[str, List[SemanticFilterObligation]] = {}
+    for obligation in obligations:
+        if not obligation.obligation_id or obligation.obligation_id in obligation_ids:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_OBLIGATION_INVALID",
+                "semantic filter obligation ids must be non-empty and unique",
+            )
+        obligation_ids.add(obligation.obligation_id)
+        node_id = str(obligation.node_id or obligation.predicate_id or "")
+        if (
+            not node_id
+            or (obligation.node_id and obligation.predicate_id and obligation.node_id != obligation.predicate_id)
+            or node_id not in predicate_sql
+        ):
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_OBLIGATION_INVALID",
+                "obligation %s does not reference a reachable predicate" % obligation.obligation_id,
+            )
+        by_node.setdefault(node_id, []).append(obligation)
+    missing = sorted(set(predicate_sql) - set(by_node))
+    duplicated = sorted(node_id for node_id, items in by_node.items() if len(items) != 1)
+    if missing or duplicated:
+        raise SemanticFilterCompilationError(
+            "SEMANTIC_FILTER_OBLIGATION_COVERAGE_MISMATCH",
+            "each predicate requires exactly one obligation; missing=%s duplicate=%s" % (missing, duplicated),
+        )
+    for node_id, items in by_node.items():
+        obligation = items[0]
+        node = node_by_id[node_id]
+        if str(obligation.status or "").lower() != "bound":
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_OBLIGATION_UNRESOLVED",
+                "required obligation %s is not bound" % obligation.obligation_id,
+            )
+        mismatch_fields: List[str] = []
+        exact_pairs = {
+            "taskId": (obligation.task_id, contract.task_id),
+            "semanticRefId": (obligation.semantic_ref_id, node.semantic_ref_id),
+            "sourcePhrase": (obligation.source_phrase, node.source_phrase),
+            "operator": (str(obligation.operator or "").lower(), str(node.operator or "").lower()),
+            "boundTable": (obligation.bound_table, node.bound_table),
+            "boundField": (obligation.bound_field, node.bound_field),
+            "memberKind": (str(obligation.member_kind or "").lower(), str(node.member_kind or "").lower()),
+            "dataType": (
+                normalize_semantic_filter_data_type(obligation.data_type),
+                normalize_semantic_filter_data_type(node.data_type),
+            ),
+        }
+        mismatch_fields.extend(key for key, pair in exact_pairs.items() if pair[0] != pair[1])
+        if canonical_semantic_filter_values(obligation.operator, obligation.raw_values) != canonical_semantic_filter_values(
+            node.operator,
+            node.raw_values,
+        ):
+            mismatch_fields.append("rawValues")
+        if canonical_semantic_filter_values(
+            obligation.operator,
+            obligation.resolved_values,
+        ) != canonical_semantic_filter_values(node.operator, node.resolved_values):
+            mismatch_fields.append("resolvedValues")
+        if sorted(set(obligation.knowledge_ref_ids)) != sorted(set(node.knowledge_ref_ids)):
+            mismatch_fields.append("knowledgeRefIds")
+        if mismatch_fields:
+            raise SemanticFilterCompilationError(
+                "SEMANTIC_FILTER_CONTRACT_MISMATCH",
+                "obligation %s differs from predicate %s in %s"
+                % (obligation.obligation_id, node_id, sorted(set(mismatch_fields))),
+            )
+
+
+def canonical_semantic_filter_values(operator: str, values: List[Any]) -> List[str]:
+    encoded = [
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        for value in values or []
+    ]
+    if str(operator or "").lower() in SEMANTIC_FILTER_MULTI_VALUE_OPERATORS:
+        return sorted(set(encoded))
+    return encoded
+
+
+def semantic_filter_covers_legacy_entity(contract: NodePlanContract) -> bool:
+    if not contract.filter_column or not contract.filter_values:
+        return False
+    expected = canonical_semantic_filter_values("in", contract.filter_values)
+    for node in contract.semantic_query.filter_nodes:
+        if (
+            node.node_type != "predicate"
+            or node.member_kind == "measure"
+            or node.bound_field != contract.filter_column
+            or node.operator not in {"eq", "in"}
+        ):
+            continue
+        if canonical_semantic_filter_values("in", node.resolved_values) == expected:
+            return True
+    return False
+
+
+def hydrate_contract_parameters(
+    expression: exp.Expression,
+    params: Optional[List[Any]],
+) -> Tuple[exp.Expression, bool]:
+    """Replace named contract placeholders with their exact DB-API values."""
+
+    values = list(params or [])
+    valid = True
+
+    def transform(node: exp.Expression) -> exp.Expression:
+        nonlocal valid
+        if not isinstance(node, exp.Placeholder):
+            return node
+        index = bound_parameter_index(node)
+        if index is None or index >= len(values):
+            valid = False
+            return node
+        return exp.convert(values[index])
+
+    return expression.transform(transform, copy=True), valid
+
+
+def parse_sql_for_contract_proof(
+    sql: str,
+    params: Optional[List[Any]] = None,
+) -> Tuple[Optional[exp.Expression], Optional[exp.Expression], bool]:
+    parameterized = parse_bound_sql_for_contract(sql)
+    if parameterized is None:
+        return None, None, False
+    hydrated, complete = hydrate_contract_parameters(parameterized, params)
+    return parameterized, hydrated, complete
+
+
+def contract_proof_select(parsed: exp.Expression) -> Optional[exp.Select]:
+    if isinstance(parsed, exp.Select):
+        return parsed
+    return parsed.find(exp.Select)
+
+
+def contract_output_lineage_branches(
+    parsed: exp.Expression,
+    preferred_table: str,
+) -> List[Tuple[List[exp.Select], bool]]:
+    """Return every output-producing SELECT path, excluding scalar subqueries."""
+
+    scopes = list(traverse_scope(parsed))
+    roots = [scope for scope in scopes if getattr(scope, "parent", None) is None]
+    target = str(preferred_table or "").lower()
+
+    def direct_target(scope: Any) -> bool:
+        return any(
+            isinstance(pair[1], exp.Table) and str(pair[1].name or "").lower() == target
+            for pair in (getattr(scope, "selected_sources", {}) or {}).values()
+        )
+
+    def contains_target(scope: Any, visiting: Set[int]) -> bool:
+        if id(scope) in visiting:
+            return False
+        if direct_target(scope):
+            return True
+        children = list(getattr(scope, "union_scopes", None) or [])
+        children.extend(
+            pair[1]
+            for pair in (getattr(scope, "selected_sources", {}) or {}).values()
+            if not isinstance(pair[1], exp.Table)
+        )
+        return any(contains_target(child, {*visiting, id(scope)}) for child in children)
+
+    def branches(scope: Any, visiting: Set[int]) -> List[Tuple[List[exp.Select], bool]]:
+        if id(scope) in visiting:
+            return [([], False)]
+        expression = getattr(scope, "expression", None)
+        if isinstance(expression, exp.Union):
+            result: List[Tuple[List[exp.Select], bool]] = []
+            for child in getattr(scope, "union_scopes", None) or []:
+                result.extend(branches(child, {*visiting, id(scope)}))
+            return result or [([], False)]
+        if not isinstance(expression, exp.Select):
+            return [([], False)]
+        if direct_target(scope):
+            return [([expression], True)]
+        lineage_children = [
+            pair[1]
+            for pair in (getattr(scope, "selected_sources", {}) or {}).values()
+            if not isinstance(pair[1], exp.Table) and contains_target(pair[1], set())
+        ]
+        if not lineage_children:
+            return [([expression], False)]
+        result = []
+        for child in lineage_children:
+            for path, has_target in branches(child, {*visiting, id(scope)}):
+                result.append(([expression, *path], has_target))
+        return result
+
+    result: List[Tuple[List[exp.Select], bool]] = []
+    for root in roots:
+        result.extend(branches(root, set()))
+    return result
+
+
+def combine_lineage_lane(path: List[exp.Select], lane: str) -> Optional[exp.Expression]:
+    clauses = [sql_select_clause_expression(select, lane) for select in path]
+    expressions = [clause.copy() for clause in clauses if clause is not None]
+    if not expressions:
+        return None
+    combined = expressions[0]
+    for expression in expressions[1:]:
+        combined = exp.and_(combined, expression)
+    return combined
+
+
+def lineage_has_ungoverned_filter_surface(path: List[exp.Select]) -> bool:
+    """Current single-table compiler governs WHERE/HAVING only."""
+
+    return any(
+        select.args.get("joins")
+        or select.args.get("qualify") is not None
+        or select.args.get("connect") is not None
+        for select in path
+    )
+
+
+def expression_literal_values(expression: exp.Expression) -> Optional[List[Any]]:
+    current = unwrap_semantic_filter_parentheses(expression)
+    if isinstance(current, exp.EQ):
+        rhs = [current.expression]
+    elif isinstance(current, exp.In) and current.args.get("query") is None and current.find(exp.Subquery) is None:
+        rhs = list(current.expressions or [])
+    else:
+        return None
+    values: List[Any] = []
+    for item in rhs:
+        if not isinstance(item, exp.Literal):
+            return None
+        values.append(item.this)
+    return values
+
+
+def exact_column_filter_term(expression: exp.Expression, column: str, values: List[Any]) -> bool:
+    current = unwrap_semantic_filter_parentheses(expression)
+    if not isinstance(current, (exp.EQ, exp.In)):
+        return False
+    if predicate_column_name(current.this).lower() != str(column or "").lower():
+        return False
+    actual = expression_literal_values(current)
+    return actual is not None and canonical_contract_values(actual) == canonical_contract_values(values)
+
+
+def upstream_filter_contracts(contract: NodePlanContract) -> Dict[str, List[Any]]:
+    result: Dict[str, List[Any]] = {}
+    for payload in contract.upstream_entity_sets or []:
+        if not isinstance(payload, dict):
+            continue
+        join_key = str(payload.get("joinKey") or payload.get("join_key") or "")
+        values = list(payload.get("values") or [])
+        if join_key and values:
+            result.setdefault(join_key, []).extend(values)
+        column_values = payload.get("columnValues") or payload.get("column_values") or {}
+        if isinstance(column_values, dict):
+            for column, items in column_values.items():
+                if items:
+                    result.setdefault(str(column), []).extend(list(items))
+    return {column: list(dict.fromkeys(values)) for column, values in result.items()}
+
+
+def is_governed_non_empty_term(expression: exp.Expression, contract: NodePlanContract) -> bool:
+    if contract.answer_mode not in {AnswerMode.TOPN.value, AnswerMode.GROUP_AGG.value} or not contract.group_by_column:
+        return False
+    current = unwrap_semantic_filter_parentheses(expression)
+    column = str(contract.group_by_column or "").lower()
+    if isinstance(current, exp.Not) and isinstance(current.this, exp.Is):
+        predicate = current.this
+        return predicate_column_name(predicate.this).lower() == column and isinstance(predicate.expression, exp.Null)
+    if isinstance(current, exp.Is):
+        return False
+    if isinstance(current, exp.NEQ):
+        return (
+            predicate_column_name(current.this).lower() == column
+            and isinstance(current.expression, exp.Literal)
+            and str(current.expression.this or "") == ""
+        )
+    return False
+
+
+def is_allowed_contract_extra_term(
+    expression: exp.Expression,
+    contract: NodePlanContract,
+) -> bool:
+    system_filters = [
+        (contract.merchant_filter_column, [contract.merchant_id] if contract.merchant_id else []),
+        (contract.region_filter_column, [contract.authorized_region] if contract.authorized_region else []),
+        (contract.store_filter_column, list(contract.authorized_store_ids or [])),
+        (contract.filter_column, list(contract.filter_values or [])),
+    ]
+    system_filters.extend(upstream_filter_contracts(contract).items())
+    if any(column and values and exact_column_filter_term(expression, column, values) for column, values in system_filters):
+        return True
+    partition_column = str((contract.time_window_contract or {}).get("partitionColumn") or "")
+    if partition_column and partition_column.lower() in direct_expression_columns(expression):
+        return True
+    return is_governed_non_empty_term(expression, contract)
+
+
+def semantic_filter_extra_terms(
+    actual: Optional[exp.Expression],
+    expected_sql: str,
+    contract: NodePlanContract,
+    *,
+    allow_contract_extras: bool = True,
+) -> List[exp.Expression]:
+    if actual is None:
+        return []
+    expected_terms: List[str] = []
+    if expected_sql:
+        try:
+            parsed = sqlglot.parse_one(
+                "SELECT * FROM `__semantic_filter_scope` WHERE %s" % expected_sql,
+                read="doris",
+            )
+            expected = sql_select_clause_expression(parsed, "where")
+            if expected is not None:
+                expected_terms = [
+                    semantic_filter_expression_fingerprint(item)
+                    for item in semantic_filter_and_terms(expected)
+                ]
+        except Exception:
+            return [actual]
+    remaining = list(expected_terms)
+    extras: List[exp.Expression] = []
+    for term in semantic_filter_and_terms(actual):
+        fingerprint = semantic_filter_expression_fingerprint(term)
+        if fingerprint in remaining:
+            remaining.remove(fingerprint)
+            continue
+        if not allow_contract_extras or not is_allowed_contract_extra_term(term, contract):
+            extras.append(term)
+    return extras
+
+
+def semantic_predicate_parameter_binding(
+    parameterized_clause: Optional[exp.Expression],
+    expected_sql: str,
+    params: Optional[List[Any]],
+) -> Tuple[bool, List[int]]:
+    if parameterized_clause is None or not expected_sql:
+        return False, []
+    try:
+        parsed = sqlglot.parse_one(
+            "SELECT * FROM `__semantic_filter_scope` WHERE %s" % expected_sql,
+            read="doris",
+        )
+    except Exception:
+        return False, []
+    expected = sql_select_clause_expression(parsed, "where")
+    if expected is None:
+        return False, []
+    expected_fingerprint = semantic_filter_expression_fingerprint(expected)
+    for candidate in parameterized_clause.walk():
+        if not isinstance(candidate, exp.Expression):
+            continue
+        hydrated, complete = hydrate_contract_parameters(candidate, params)
+        if not complete:
+            continue
+        if semantic_filter_expression_fingerprint(hydrated) != expected_fingerprint:
+            continue
+        indexes = sorted(
+            {
+                index
+                for placeholder in candidate.find_all(exp.Placeholder)
+                if (index := bound_parameter_index(placeholder)) is not None
+            }
+        )
+        return True, indexes
+    return False, []
+
+
+def build_semantic_filter_verification_proof(
+    contract: NodePlanContract,
+    sql: str,
+    params: Optional[List[Any]] = None,
+) -> SemanticFilterVerificationProof:
+    obligations = [item for item in contract.semantic_filter_obligations if item.required]
+    if not obligations and not contract.semantic_query.filter_nodes:
+        return SemanticFilterVerificationProof(task_id=contract.task_id, status="not_required")
+    contract_hash = semantic_filter_contract_hash(contract)
+    sql_hash = semantic_filter_execution_hash(sql, params)
+    compilation = compile_semantic_filter_sql(contract)
+    base = {
+        "task_id": contract.task_id,
+        "contract_hash": contract_hash,
+        "sql_hash": sql_hash,
+        "required_count": len(obligations),
+    }
+    if not compilation.valid:
+        return SemanticFilterVerificationProof(
+            **base,
+            status="failed",
+            code=compilation.code or "SEMANTIC_FILTER_CONTRACT_INVALID",
+            reason=compilation.reason or "semantic filter contract is not executable",
+        )
+    time_error_code, time_error = time_window_sql_contract_error(sql, contract, params)
+    if time_error_code:
+        return SemanticFilterVerificationProof(
+            **base,
+            status="failed",
+            code=time_error_code,
+            reason=time_error,
+        )
+    parameterized, parsed, parameters_complete = parse_sql_for_contract_proof(sql, params)
+    if parsed is None or parameterized is None:
+        return SemanticFilterVerificationProof(
+            **base,
+            status="failed",
+            code="SEMANTIC_FILTER_SQL_UNPARSABLE",
+            reason="cannot parse SQL for semantic filter verification",
+        )
+    if not parameters_complete:
+        return SemanticFilterVerificationProof(
+            **base,
+            status="failed",
+            code="SEMANTIC_FILTER_PARAMETER_VALUES_MISSING",
+            reason="bound SQL placeholders do not have a complete ordered parameter vector",
+        )
+    branches = contract_output_lineage_branches(parsed, contract.preferred_table)
+    parameterized_branches = contract_output_lineage_branches(parameterized, contract.preferred_table)
+    if not branches or len(branches) != len(parameterized_branches):
+        return SemanticFilterVerificationProof(
+            **base,
+            status="failed",
+            code="SEMANTIC_FILTER_SQL_SCOPE_MISSING",
+            reason="semantic filter verification requires a SELECT execution scope",
+        )
+    lineage_complete = all(has_target for _path, has_target in branches)
+    ungoverned_filter_surface = any(
+        lineage_has_ungoverned_filter_surface(path)
+        for path, _has_target in branches
+    )
+    actual_branches = [
+        {
+            "where": combine_lineage_lane(path, "where"),
+            "having": combine_lineage_lane(path, "having"),
+        }
+        for path, _has_target in branches
+    ]
+    parameterized_actual_branches = [
+        {
+            "where": combine_lineage_lane(path, "where"),
+            "having": combine_lineage_lane(path, "having"),
+        }
+        for path, _has_target in parameterized_branches
+    ]
+    expected_by_lane = {
+        "where": compilation.where_sql,
+        "having": compilation.having_sql,
+    }
+    graph_lane_results = [
+        {
+            lane: sql_clause_covers_semantic_filter(actual_by_lane[lane], expected)
+            for lane, expected in expected_by_lane.items()
+            if expected
+        }
+        for actual_by_lane in actual_branches
+    ]
+    extra_by_lane = [
+        {
+            lane: semantic_filter_extra_terms(
+                actual_by_lane[lane],
+                expected,
+                contract,
+                allow_contract_extras=lane == "where",
+            )
+            for lane, expected in expected_by_lane.items()
+            if actual_by_lane.get(lane) is not None
+        }
+        for actual_by_lane in actual_branches
+    ]
+    node_by_id = {node.node_id: node for node in contract.semantic_query.filter_nodes}
+    predicate_proofs: List[SemanticFilterPredicateProof] = []
+    for obligation in obligations:
+        node_id = str(obligation.node_id or obligation.predicate_id or "")
+        node = node_by_id.get(node_id, SemanticFilterNode(node_id=node_id))
+        lane = compilation.predicate_lanes.get(node_id, "")
+        expected_expression = compilation.predicate_sql.get(node_id, "")
+        branch_bindings = [
+            semantic_predicate_parameter_binding(
+                actual_by_lane.get(lane),
+                expected_expression,
+                params,
+            )
+            for actual_by_lane in parameterized_actual_branches
+        ]
+        predicate_verified = bool(branch_bindings) and all(item[0] for item in branch_bindings)
+        parameter_indexes = sorted({index for _verified, indexes in branch_bindings for index in indexes})
+        actual_value_hashes = [
+            semantic_filter_value_hash((params or [])[index])
+            for index in parameter_indexes
+            if index < len(params or [])
+        ]
+        predicate_proofs.append(
+            SemanticFilterPredicateProof(
+                task_id=contract.task_id,
+                obligation_id=obligation.obligation_id,
+                node_id=node_id,
+                semantic_ref_id=node.semantic_ref_id,
+                bound_table=node.bound_table,
+                bound_field=node.bound_field,
+                member_kind=node.member_kind,
+                operator=node.operator,
+                sql_lane=lane,
+                sql_expression_hash=semantic_filter_expression_hash(expected_expression),
+                resolved_value_hashes=(
+                    actual_value_hashes
+                    if parameter_indexes
+                    else [semantic_filter_value_hash(value) for value in node.resolved_values]
+                ),
+                parameter_names=["p%d" % index for index in parameter_indexes],
+                verified=predicate_verified,
+                status="verified" if predicate_verified else "failed",
+                code="" if predicate_verified else "SEMANTIC_FILTER_PREDICATE_MISSING",
+                reason=(
+                    ""
+                    if predicate_verified
+                    else "SQL %s clause does not contain predicate %s from obligation %s"
+                    % (lane.upper() or "UNKNOWN", node_id, obligation.obligation_id)
+                ),
+            )
+        )
+    verified_count = sum(1 for item in predicate_proofs if item.verified)
+    graph_verified = bool(graph_lane_results) and lineage_complete and all(
+        branch_result and all(branch_result.values())
+        for branch_result in graph_lane_results
+    )
+    no_extra_predicates = not ungoverned_filter_surface and not any(
+        extras
+        for branch_extras in extra_by_lane
+        for extras in branch_extras.values()
+    )
+    coverage_complete = bool(
+        obligations
+        and len(predicate_proofs) == len(obligations)
+        and verified_count == len(obligations)
+        and graph_verified
+        and no_extra_predicates
+    )
+    if coverage_complete:
+        return SemanticFilterVerificationProof(
+            **base,
+            predicate_proofs=predicate_proofs,
+            verified_count=verified_count,
+            coverage_complete=True,
+            verified=True,
+            status="verified",
+        )
+    structure_mismatch = bool(graph_lane_results) and not graph_verified
+    parameterized_sql = bool(list(parameterized.find_all(exp.Placeholder)))
+    if not no_extra_predicates and graph_verified and verified_count == len(obligations):
+        failure_code = "SEMANTIC_FILTER_EXTRA_PREDICATE"
+        failure_reason = "SQL contains predicates outside the governed semantic and system filter contracts"
+    elif parameterized_sql and verified_count != len(obligations):
+        failure_code = "SEMANTIC_FILTER_PARAMETER_VALUE_MISMATCH"
+        failure_reason = "bound SQL parameter values differ from one or more semantic filter obligations"
+    elif structure_mismatch and verified_count == len(obligations):
+        failure_code = "SEMANTIC_FILTER_BOOLEAN_STRUCTURE_MISMATCH"
+        failure_reason = "SQL contains filter leaves but changes the governed AND/OR/NOT structure"
+    else:
+        failure_code = "SEMANTIC_FILTER_PREDICATE_MISSING"
+        failure_reason = "SQL does not contain every required semantic filter predicate"
+    return SemanticFilterVerificationProof(
+        **base,
+        predicate_proofs=predicate_proofs,
+        verified_count=verified_count,
+        coverage_complete=False,
+        status="failed",
+        code=failure_code,
+        reason=failure_reason,
+    )
+
+
+def sql_select_clause_expression(select: exp.Select, lane: str) -> Optional[exp.Expression]:
+    clause = select.args.get(lane)
+    if lane == "where" and isinstance(clause, exp.Where):
+        return clause.this
+    if lane == "having" and isinstance(clause, exp.Having):
+        return clause.this
+    return None
+
+
+def sql_clause_covers_semantic_filter(
+    actual: Optional[exp.Expression],
+    expected_sql: str,
+) -> bool:
+    if actual is None or not expected_sql:
+        return False
+    try:
+        parsed = sqlglot.parse_one(
+            "SELECT * FROM `__semantic_filter_scope` WHERE %s" % expected_sql,
+            read="doris",
+        )
+    except Exception:
+        return False
+    expected = sql_select_clause_expression(parsed, "where")
+    if expected is None:
+        return False
+    actual_terms = [semantic_filter_expression_fingerprint(item) for item in semantic_filter_and_terms(actual)]
+    expected_terms = [semantic_filter_expression_fingerprint(item) for item in semantic_filter_and_terms(expected)]
+    remaining = list(actual_terms)
+    for fingerprint in expected_terms:
+        if fingerprint not in remaining:
+            return False
+        remaining.remove(fingerprint)
+    return True
+
+
+def sql_clause_contains_semantic_predicate(
+    actual: Optional[exp.Expression],
+    expected_sql: str,
+) -> bool:
+    if actual is None or not expected_sql:
+        return False
+    try:
+        parsed = sqlglot.parse_one(
+            "SELECT * FROM `__semantic_filter_scope` WHERE %s" % expected_sql,
+            read="doris",
+        )
+    except Exception:
+        return False
+    expected = sql_select_clause_expression(parsed, "where")
+    if expected is None:
+        return False
+    expected_fingerprint = semantic_filter_expression_fingerprint(expected)
+    return any(
+        semantic_filter_expression_fingerprint(candidate) == expected_fingerprint
+        for candidate in actual.walk()
+        if isinstance(candidate, exp.Expression)
+    )
+
+
+def semantic_filter_and_terms(expression: exp.Expression) -> List[exp.Expression]:
+    current = unwrap_semantic_filter_parentheses(expression)
+    if isinstance(current, exp.And):
+        return semantic_filter_and_terms(current.this) + semantic_filter_and_terms(current.expression)
+    return [current]
+
+
+def semantic_filter_expression_fingerprint(expression: exp.Expression) -> str:
+    def normalize(value: Any) -> Any:
+        if isinstance(value, exp.Paren):
+            return normalize(unwrap_semantic_filter_parentheses(value))
+        if isinstance(value, exp.And):
+            return ["and", *sorted((normalize(item) for item in semantic_filter_and_terms(value)), key=str)]
+        if isinstance(value, exp.Or):
+            terms = semantic_filter_or_terms(value)
+            return ["or", *sorted((normalize(item) for item in terms), key=str)]
+        if isinstance(value, exp.Column):
+            return ["column", str(value.name or "").lower()]
+        if isinstance(value, exp.Identifier):
+            return ["identifier", str(value.this or "").lower()]
+        if isinstance(value, exp.Literal):
+            return ["literal", bool(value.is_string), str(value.this)]
+        if isinstance(value, exp.Expression):
+            args = []
+            for key in sorted(value.args):
+                if key in {"comments"}:
+                    continue
+                args.append([key, normalize(value.args.get(key))])
+            return [str(value.key or type(value).__name__).lower(), args]
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if isinstance(value, tuple):
+            return [normalize(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    payload = normalize(expression)
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def semantic_filter_or_terms(expression: exp.Expression) -> List[exp.Expression]:
+    current = unwrap_semantic_filter_parentheses(expression)
+    if isinstance(current, exp.Or):
+        return semantic_filter_or_terms(current.this) + semantic_filter_or_terms(current.expression)
+    return [current]
+
+
+def unwrap_semantic_filter_parentheses(expression: exp.Expression) -> exp.Expression:
+    current = expression
+    while isinstance(current, exp.Paren):
+        current = current.this
+    return current
+
+
+def semantic_filter_expression_hash(expression_sql: str) -> str:
+    if not expression_sql:
+        return ""
+    try:
+        parsed = sqlglot.parse_one(
+            "SELECT * FROM `__semantic_filter_scope` WHERE %s" % expression_sql,
+            read="doris",
+        )
+        expression = sql_select_clause_expression(parsed, "where")
+        return semantic_filter_expression_fingerprint(expression) if expression is not None else ""
+    except Exception:
+        return hashlib.sha256(expression_sql.encode("utf-8")).hexdigest()
+
+
+def semantic_filter_value_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def filter_predicate(column: str, value: Any) -> str:

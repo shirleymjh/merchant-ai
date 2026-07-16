@@ -8,7 +8,10 @@ from merchant_ai.models import (
     NodeExecutionContext,
     NodePlanContract,
 )
-from merchant_ai.services.query_sql_binding import normalize_identifier, sql_has_bound_column_filter, sql_has_bound_merchant_filter
+from merchant_ai.services.query_sql_binding import (
+    normalize_identifier,
+    sql_has_bound_scope_column_values,
+)
 
 
 def contract_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List[EvidenceGap]:
@@ -108,21 +111,33 @@ def tenant_scope_binding_error(
     merchant_id = str(context.merchant_id or "").strip()
     if not merchant_id:
         return "缺少当前请求 merchant_id，不能执行带商家域的数据查询"
-    if not sql_has_bound_merchant_filter(bound_sql, tenant_columns):
+    tenant_column = next(iter(tenant_columns))
+    if not sql_has_bound_scope_column_values(
+        bound_sql,
+        tenant_column,
+        params,
+        [merchant_id],
+        contract.preferred_table,
+    ):
         return "SQL 商家过滤没有被后端参数绑定到当前 merchant，禁止执行跨商家风险查询"
-    if merchant_id not in {str(item) for item in params}:
-        return "SQL 参数中缺少当前 merchant_id，禁止执行跨商家风险查询"
     if contract.authorized_region and contract.region_filter_column:
-        if not sql_has_bound_column_filter(bound_sql, contract.region_filter_column):
+        if not sql_has_bound_scope_column_values(
+            bound_sql,
+            contract.region_filter_column,
+            params,
+            [contract.authorized_region],
+            contract.preferred_table,
+        ):
             return "SQL Region 过滤没有被后端参数绑定，禁止执行跨 Region 查询"
-        if str(contract.authorized_region) not in {str(item) for item in params}:
-            return "SQL 参数中缺少当前用户 Region，禁止执行跨 Region 查询"
     if contract.authorized_store_ids and contract.store_filter_column:
-        if not sql_has_bound_column_filter(bound_sql, contract.store_filter_column):
+        if not sql_has_bound_scope_column_values(
+            bound_sql,
+            contract.store_filter_column,
+            params,
+            list(contract.authorized_store_ids),
+            contract.preferred_table,
+        ):
             return "SQL 门店过滤没有被后端参数绑定，禁止执行跨门店查询"
-        bound_values = {str(item) for item in params}
-        if not set(map(str, contract.authorized_store_ids)).issubset(bound_values):
-            return "SQL 参数未完整绑定当前用户授权门店范围"
     return ""
 
 

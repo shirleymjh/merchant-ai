@@ -27,6 +27,7 @@ from merchant_ai.models import (
     ContextCompressionEvent,
     GraphValidationGap,
     MiddlewareEvent,
+    RetrievalIssue,
     ToolCallExecutionResult,
     ToolCallLedgerEntry,
     ToolCallRecoveryEvent,
@@ -42,6 +43,8 @@ from merchant_ai.services.memory import (
     MemoryQueryUnderstandingService,
     create_memory_store,
     memory_query_hash,
+    memory_recall_trace_for,
+    normalize_memory_recall_issues,
     retrieval_context_from_state,
     truncate_memory_text_by_tokens,
 )
@@ -997,26 +1000,41 @@ class MemoryMiddleware(HarnessMiddleware):
             return state
         trace = dict(state.get("memory_injection_trace") or {})
         if state.get("_memory_snapshot_locked") and trace:
-            self._render_existing_snapshot(state)
-            state["_memory_middleware_snapshot_ready"] = True
+            status = str(state.get("memory_recall_status") or trace.get("status") or "not_started")
+            usable_flag = trace.get("usableSnapshot") if "usableSnapshot" in trace else status in {"success", "empty", "degraded"}
+            usable = bool(usable_flag) and status in {"success", "empty", "degraded"}
+            if usable and status != "empty":
+                self._render_existing_snapshot(state)
+                trace = dict(state.get("memory_injection_trace") or trace)
+                status = str(state.get("memory_recall_status") or trace.get("status") or status)
+                usable_flag = trace.get("usableSnapshot") if "usableSnapshot" in trace else status in {"success", "empty", "degraded"}
+                usable = bool(usable_flag) and status in {"success", "empty", "degraded"}
+            state["_memory_middleware_snapshot_ready"] = usable
             state["_memory_snapshot_locked"] = True
             append_middleware_event(
                 state,
                 self.name,
                 "before_policy",
-                status="reused",
-                code="MEMORY_REQUEST_SNAPSHOT_LOCKED",
-                message="recall_memory node already produced the governed request snapshot",
+                status="reused" if usable else "error",
+                code="MEMORY_REQUEST_SNAPSHOT_LOCKED" if usable else "MEMORY_REQUEST_SNAPSHOT_UNAVAILABLE",
+                message=(
+                    "recall_memory node already produced the governed request snapshot"
+                    if usable
+                    else "recall_memory completed without a usable governed snapshot"
+                ),
                 metadata={
                     "constraintCount": len(state.get("memory_constraints") or []),
                     "contextFingerprint": trace.get("contextFingerprint") or "",
                     "locked": True,
-                    "status": trace.get("status", ""),
+                    "status": status,
+                    "usableSnapshot": usable,
                 },
             )
             return state
         fingerprint = self._context_fingerprint(state)
-        snapshot_succeeded = bool(trace) and not trace.get("error") and str(trace.get("status") or "success") == "success"
+        trace_status = str(trace.get("status") or "not_started")
+        trace_usable = trace.get("usableSnapshot") if "usableSnapshot" in trace else trace_status in {"success", "empty", "degraded"}
+        snapshot_succeeded = bool(trace) and bool(trace_usable) and trace_status in {"success", "empty", "degraded"}
         semantic_refresh = bool(
             state.get("topic_routed")
             and not state.get("_memory_snapshot_locked")
@@ -1024,7 +1042,8 @@ class MemoryMiddleware(HarnessMiddleware):
             and not state.get("_memory_semantic_refresh_attempted")
         )
         if snapshot_succeeded and not semantic_refresh:
-            self._render_existing_snapshot(state)
+            if trace_status != "empty":
+                self._render_existing_snapshot(state)
             state["_memory_middleware_snapshot_ready"] = True
             if state.get("topic_routed"):
                 state["_memory_snapshot_locked"] = True
@@ -1042,7 +1061,7 @@ class MemoryMiddleware(HarnessMiddleware):
                 },
             )
             return state
-        if trace.get("error") and state.get("_memory_middleware_retry_attempted") and not semantic_refresh:
+        if trace_status == "failed" and state.get("_memory_middleware_retry_attempted") and not semantic_refresh:
             return state
         if semantic_refresh:
             state["_memory_semantic_refresh_attempted"] = True
@@ -1054,27 +1073,74 @@ class MemoryMiddleware(HarnessMiddleware):
                 budget_tokens=int(self.settings.context_memory_budget_tokens or 1200),
             )
         except Exception as exc:
-            state["memory_injection_trace"] = {
-                "status": "failed",
-                "error": str(exc)[:500],
-                "contextFingerprint": fingerprint,
-            }
+            issue = RetrievalIssue(
+                code="MEMORY_RECALL_RETRY_FAILED",
+                message=str(exc)[:500],
+                backend=type(self.memory_store).__name__,
+                lane="primary",
+                stage="acquire",
+                severity="blocking",
+                resolved=False,
+            )
+            failed_trace = memory_recall_trace_for({}, [issue], enrichment_status={"acquire": "failed"})
+            failed_trace["contextFingerprint"] = fingerprint
+            state["memory_injection_trace"] = failed_trace
+            state["memory_recall_status"] = "failed"
+            state["memory_recall_issues"] = list(failed_trace.get("issues") or [])
             state["_memory_middleware_snapshot_ready"] = False
             append_middleware_event(
                 state,
                 self.name,
                 "before_policy",
                 status="error",
-                code="MEMORY_RECALL_RETRY_FAILED",
-                message=str(exc)[:500],
+                code=issue.code,
+                message=issue.message,
                 metadata={"contextFingerprint": fingerprint},
             )
             return state
         state["memory_injection"] = injection
-        next_trace = dict(injection.get("memoryInjectionTrace") or {})
-        next_trace.update({"status": "success", "contextFingerprint": fingerprint})
+        next_trace = memory_recall_trace_for(injection)
+        next_trace["contextFingerprint"] = fingerprint
         state["memory_injection_trace"] = next_trace
-        constraints = build_memory_constraints(injection)
+        state["memory_recall_status"] = str(next_trace.get("status") or "failed")
+        state["memory_recall_issues"] = list(next_trace.get("issues") or [])
+        if next_trace.get("status") == "failed":
+            state["_memory_middleware_snapshot_ready"] = False
+            return state
+        try:
+            constraints = build_memory_constraints(injection)
+        except Exception as exc:
+            issue = RetrievalIssue(
+                code="MEMORY_CONSTRAINT_COMPILATION_FAILED",
+                message=str(exc)[:500],
+                backend="memory_contract",
+                lane="constraints",
+                stage="compile_constraints",
+                severity="blocking",
+                resolved=False,
+            )
+            state["memory_injection_raw_snapshot"] = injection
+            state["memory_injection"] = {}
+            failed_trace = memory_recall_trace_for({}, [*normalize_memory_recall_issues(next_trace.get("issues") or []), issue])
+            for key in ["selectedIds", "candidateIds", "candidateCount", "filteredReasons"]:
+                if key in next_trace:
+                    failed_trace[key] = next_trace[key]
+            failed_trace["contextFingerprint"] = fingerprint
+            state["memory_injection_trace"] = failed_trace
+            state["memory_recall_status"] = "failed"
+            state["memory_recall_issues"] = list(failed_trace.get("issues") or [])
+            state["memory_constraints"] = []
+            state["memory_constraint_trace"] = {"constraintCount": 0, "status": "failed", "error": str(exc)[:500]}
+            state["_memory_middleware_snapshot_ready"] = False
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="error",
+                code=issue.code,
+                message=issue.message,
+            )
+            return state
         state["memory_constraints"] = constraints
         state["memory_constraint_trace"] = {
             "constraintCount": len(constraints),
@@ -1082,13 +1148,9 @@ class MemoryMiddleware(HarnessMiddleware):
             "clarifyCount": sum(1 for item in constraints if str(item.get("enforcement") or "") == "clarify_or_disclose"),
             "source": injection.get("source", ""),
             "selectedIds": (injection.get("memoryInjectionTrace") or {}).get("selectedIds", []),
+            "status": "success" if constraints else str(next_trace.get("status") or "empty"),
         }
-        rendered = self.memory_store.render_injection(injection)
-        if rendered:
-            state["memory_context"] = truncate_memory_text_by_tokens(
-                rendered,
-                int(self.settings.context_memory_budget_tokens or 1200),
-            )
+        self._render_existing_snapshot(state)
         recent_focus = state.get("recent_focus")
         memory_context = str(state.get("memory_context") or "")
         append_middleware_event(
@@ -1126,7 +1188,46 @@ class MemoryMiddleware(HarnessMiddleware):
         renderer = getattr(self.memory_store, "render_injection", None)
         if not callable(renderer):
             return
-        rendered = renderer(state.get("memory_injection") or {})
+        try:
+            rendered = renderer(state.get("memory_injection") or {})
+        except Exception as exc:
+            issue = RetrievalIssue(
+                code="MEMORY_RENDER_FAILED",
+                message=str(exc)[:500],
+                backend=type(self.memory_store).__name__,
+                lane="enrichment",
+                stage="render",
+                severity="warning",
+                resolved=True,
+                details={"answerImpact": False},
+            )
+            previous = dict(state.get("memory_injection_trace") or {})
+            issues = normalize_memory_recall_issues([*(previous.get("issues") or []), issue])
+            trace = memory_recall_trace_for(
+                state.get("memory_injection") or {},
+                issues,
+                enrichment_status={
+                    **dict(previous.get("enrichmentStatus") or {}),
+                    "render": "failed",
+                },
+            )
+            if previous.get("contextFingerprint"):
+                trace["contextFingerprint"] = previous["contextFingerprint"]
+            state["memory_injection_trace"] = trace
+            state["memory_recall_status"] = str(trace.get("status") or "degraded")
+            state["memory_recall_issues"] = list(trace.get("issues") or [])
+            if state.get("memory_injection"):
+                state["memory_injection"]["memoryInjectionTrace"] = dict(trace)
+            append_middleware_event(
+                state,
+                self.name,
+                "before_policy",
+                status="warning",
+                code=issue.code,
+                message=issue.message,
+                metadata={"answerImpact": False},
+            )
+            return
         if rendered:
             state["memory_context"] = truncate_memory_text_by_tokens(
                 rendered,

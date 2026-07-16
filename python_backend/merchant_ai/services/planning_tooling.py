@@ -52,13 +52,63 @@ def compact_planner_trace(trace: List[str], gaps: List[GraphValidationGap], comp
 
 
 def planner_repair_feedback_for_understanding(gaps: List[GraphValidationGap], previous_understanding: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_gaps = [
+        {
+            "code": str(gap.code or "QUERY_GRAPH_GAP"),
+            "taskId": str(gap.task_id or ""),
+            "evidence": str(gap.evidence or ""),
+            "reason": str(gap.reason or ""),
+            "requiredOutcome": (
+                "Emit a changed semantic understanding that removes this exact gap, or return "
+                "NEED_MORE_KNOWLEDGE/INVALID with a typed request. Do not repeat the unchanged invalid contract."
+            ),
+        }
+        for gap in gaps
+        if str(gap.code or gap.reason or gap.evidence or "").strip()
+    ]
+    if not normalized_gaps:
+        return {}
+
+    def item_count(*keys: str) -> int:
+        for key in keys:
+            value = previous_understanding.get(key)
+            if isinstance(value, list):
+                return len(value)
+        return 0
+
+    preserved_counts = {
+        "anchorMetric": int(
+            isinstance(
+                previous_understanding.get("anchorMetric")
+                or previous_understanding.get("anchor_metric"),
+                dict,
+            )
+        ),
+        "supportMetrics": item_count("supportMetrics", "support_metrics", "requestedMeasures", "requested_measures"),
+        "filters": item_count("filters", "filter"),
+        "scopeConstraints": item_count("scopeConstraints", "scope_constraints"),
+        "requiredEvidenceIntents": item_count("requiredEvidenceIntents", "required_evidence_intents"),
+        "calculationIntents": item_count("calculationIntents", "calculation_intents"),
+    }
+    feedback: Dict[str, Any] = {
+        "queryGraph": normalized_gaps,
+        "preservedContractCounts": {
+            key: value for key, value in preserved_counts.items() if value > 0
+        },
+        "contractRules": [
+            "Preserve every previously requested metric, filter, scope and evidence obligation unless the user changed it.",
+            "A trace-only rewrite is not a repair; the emitted contract must be executable and structurally different where the gap requires it.",
+            "If the active semantic assets cannot satisfy a gap, request the missing typed knowledge or clarification instead of inventing a field, metric or relationship.",
+        ],
+        "mustFixBeforePlanning": True,
+    }
     calculation_gaps = [
         gap
         for gap in gaps
         if gap.code in {"CALCULATION_NUMERATOR_MISSING", "CALCULATION_NUMERATOR_SAME_AS_DENOMINATOR", "CALCULATION_NUMERATOR_NOT_EVENT_METRIC"}
     ]
     if not calculation_gaps:
-        return {}
+        return feedback
     previous_calculations = [
         item
         for item in previous_understanding.get("calculationIntents") or previous_understanding.get("calculation_intents") or []
@@ -100,10 +150,8 @@ def planner_repair_feedback_for_understanding(gaps: List[GraphValidationGap], pr
                 ),
             }
         )
-    return {
-        "calculation": feedback_items,
-        "mustFixBeforePlanning": True,
-    }
+    feedback["calculation"] = feedback_items
+    return feedback
 
 
 def payload_has_understanding(payload: Dict[str, Any]) -> bool:
@@ -256,7 +304,16 @@ def planner_structured_output_validation_errors(
     understanding = (payload or {}).get("questionUnderstanding") or {}
     anchor = understanding.get("anchorMetric") if isinstance(understanding, dict) else None
     filters = understanding.get("filters") if isinstance(understanding, dict) else None
-    if isinstance(anchor, dict) and not anchor and isinstance(filters, list) and filters:
+    semantic_query = understanding.get("semanticQuery") if isinstance(understanding, dict) else None
+    semantic_filter_nodes = semantic_query.get("filterNodes") if isinstance(semantic_query, dict) else None
+    has_detail_filters = bool(isinstance(filters, list) and filters) or bool(
+        isinstance(semantic_filter_nodes, list)
+        and any(
+            isinstance(item, dict) and str(item.get("nodeType") or "predicate") == "predicate"
+            for item in semantic_filter_nodes
+        )
+    )
+    if isinstance(anchor, dict) and not anchor and has_detail_filters:
         errors = [error for error in errors if not error.startswith("$.questionUnderstanding.anchorMetric.")]
     return errors
 

@@ -40,6 +40,7 @@ from merchant_ai.models import (
     ChatDataSection,
     ChatResponse,
     ChatRequest,
+    EntityReference,
     EntitySet,
     EvidenceGap,
     ExtractedKeywords,
@@ -69,6 +70,7 @@ from merchant_ai.models import (
     QuestionCategory,
     QuestionIntent,
     QuestionRoute,
+    ResolvedTimeRange,
     PendingAnswer,
     RunCreateRequest,
     RelationshipEntry,
@@ -9410,38 +9412,8 @@ def test_planner_passes_compact_diagnostic_context_to_llm():
 
 
 def test_llm_understanding_compiles_detail_lookup_without_ranking_objective():
-    question = "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。"
-    pack = PlanningAssetPack(
-        tables=[
-            PlanningAssetEntry(table="dwm_trade_order_detail_di", columns=["seller_id", "order_id", "sub_order_id", "spu_id", "spu_name", "pay_amt", "pt"]),
-            PlanningAssetEntry(table="dwm_trade_refund_detail_di", columns=["seller_id", "order_id", "sub_order_id", "refund_id", "spu_name", "pay_amt", "buyer_id", "refund_create_time", "pt"]),
-            PlanningAssetEntry(table="dwm_goods_detail_df", columns=["seller_id", "spu_id", "spu_name", "spu_apply_create_time", "pt"]),
-        ],
-        metrics=[
-            PlanningAssetEntry(key="pay_amt", table="dwm_trade_refund_detail_di", columns=["pay_amt"], title="退款关联支付金额"),
-            PlanningAssetEntry(
-                key="goods_publish_time",
-                table="dwm_goods_detail_df",
-                columns=["spu_apply_create_time"],
-                title="商品发布时间",
-                metadata={"sourceColumns": ["spu_apply_create_time"]},
-            ),
-        ],
-        relationships=[
-            RelationshipEntry(
-                relationship_id="order_refund_by_sub_order",
-                left_table="dwm_trade_order_detail_di",
-                right_table="dwm_trade_refund_detail_di",
-                join_keys=[{"leftColumn": "seller_id", "rightColumn": "seller_id"}, {"leftColumn": "sub_order_id", "rightColumn": "sub_order_id"}],
-            ),
-            RelationshipEntry(
-                relationship_id="order_goods_by_spu",
-                left_table="dwm_trade_order_detail_di",
-                right_table="dwm_goods_detail_df",
-                join_keys=[{"leftColumn": "seller_id", "rightColumn": "seller_id"}, {"leftColumn": "spu_id", "rightColumn": "spu_id"}],
-            ),
-        ],
-    )
+    question = "最近30天查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。"
+    pack = trade_refund_goods_pack(governed=True)
     plan, requests, _ = QueryGraphPlanner(FakeDetailPlannerLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
     assert not requests
     tables = {intent.preferred_table for intent in plan.intents}
@@ -9459,24 +9431,42 @@ def test_detail_goods_lookup_does_not_require_missing_status_code_metric():
         def json_chat(self, system_prompt, user_prompt, fallback=None):
             return {
                 "status": "UNDERSTOOD",
+                "reason": "typed entity detail lookup",
                 "questionUnderstanding": {
                         "analysisGrain": "order",
-                        "rankingObjective": {},
-                        "requestedMeasures": [
-                            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
+                        "analysisIntent": "none",
+                        "requiresExplanation": False,
+                        "requiredEvidenceIntents": [],
+                        "anchorMetric": {
+                            "metricRef": "",
+                            "ownerTable": "dwm_trade_order_detail_di",
+                            "sourcePhrase": "订单明细",
+                            "objectiveType": "detail_anchor",
+                        },
+                        "supportMetrics": [
+                            {
+                                "metricRef": "pay_amt",
+                                "ownerTable": "dwm_trade_refund_detail_di",
+                                "sourcePhrase": "退款金额",
+                                "resultMode": "metric",
+                            },
                             {
                                 "metricRef": "goods_publish_time",
                                 "ownerTable": "dwm_goods_detail_df",
                                 "sourcePhrase": "商品发布信息",
+                                "resultMode": "detail",
                             },
                         ],
+                        "metricCandidateDecisions": [],
+                        "calculationIntents": [],
+                        "scopeConstraints": [],
                         "filters": [{"field": "sub_order_id", "value": "sub_order_id_100"}],
                         "timeWindowDays": 7,
                     },
             }
 
     question = "最近 7 天查询子订单 sub_order_id_100 的订单、退款和商品发布信息。"
-    pack = trade_refund_goods_pack(include_missing_goods_metric=True)
+    pack = trade_refund_goods_pack(include_missing_goods_metric=True, governed=True)
     plan, requests, _ = QueryGraphPlanner(DetailSubOrderLlm()).plan(question, [], "", recall_bundle_empty(), pack, [], [])
     assert not requests
     goods = next(intent for intent in plan.intents if intent.preferred_table == "dwm_goods_detail_df")
@@ -15732,20 +15722,59 @@ def test_node_agent_accepts_window_sql_cte_alias_from_llm():
 
 
 def test_detail_node_uses_structured_fast_path_before_llm():
+    class DetailLookupDoris:
+        def query(self, sql, params=None):
+            if "MIN(`pt`)" in sql and "MAX(`pt`)" in sql:
+                return [{"min_pt": "2026-06-01", "max_pt": "2026-06-30"}]
+            return [
+                {
+                    "seller_id": "100",
+                    "sub_order_id": "sub_order_id_100",
+                    "order_id": "order_id_100",
+                    "spu_id": "spu_id_100",
+                    "spu_name": "商品甲",
+                    "pt": "2026-06-30",
+                }
+            ]
+
     settings = get_settings()
     llm = FakeLlm()
-    worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
-    pack = trade_refund_goods_pack()
+    worker = NodeWorkerExecutor(llm, DetailLookupDoris(), SqlValidationService(), settings)
+    pack = trade_refund_goods_pack(governed=True)
     plan = QueryPlan(
         intents=[
             QuestionIntent(
-                question="查询子订单明细",
+                question="最近7天查询子订单明细",
                 intent_type="VALID",
                 answer_mode="DETAIL",
                 plan_task_id="anchor_order",
                 preferred_table="dwm_trade_order_detail_di",
                 filter_column="sub_order_id",
                 filter_value="sub_order_id_100",
+                entity_reference=EntityReference(
+                    semantic_ref_id="semantic:test:dwm_trade_order_detail_di:entity:sub_order_id",
+                    field="sub_order_id",
+                    table="dwm_trade_order_detail_di",
+                    raw_label="子订单号",
+                    raw_value="sub_order_id_100",
+                    values=["sub_order_id_100"],
+                    value_type="string",
+                    comparison_policy="exact",
+                    source="test_fixture",
+                    confidence=1.0,
+                    status="resolved",
+                    time_scope_explicit=True,
+                ),
+                time_range=ResolvedTimeRange(
+                    kind="absolute",
+                    start_date="2026-06-24",
+                    end_date="2026-06-30",
+                    days=7,
+                    label="2026-06-24 至 2026-06-30",
+                    anchor_policy="calendar",
+                    explicit=True,
+                    source="test_fixture",
+                ),
                 output_keys=["seller_id", "sub_order_id", "order_id", "spu_id", "spu_name", "pt"],
                 required_evidence=["seller_id", "sub_order_id", "order_id", "spu_id", "spu_name", "pt"],
                 days=7,
@@ -15753,7 +15782,7 @@ def test_detail_node_uses_structured_fast_path_before_llm():
             )
         ]
     )
-    result = worker.execute_plan("100", plan, pack, "", "查询子订单明细")
+    result = worker.execute_plan("100", plan, pack, "", "最近7天查询子订单明细")
     assert result.task_results[0].success
     assert llm.calls == 0
     assert result.sql_draft_decisions[0].source == "structured_fast_path"
@@ -16194,13 +16223,42 @@ def test_node_agent_missing_entity_key_filter_uses_structured_fallback():
     settings = get_settings().model_copy(update={"agent_sql_repair_rounds": 1})
     llm = MissingEntityKeyFilterSqlLlm()
     worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
+    spu_entity = _governed_test_entity_key(
+        "dwm_cs_ticket_detail_di",
+        "spu_id",
+        "商品SPU ID",
+        "entity:spu",
+        aliases=["SPU", "商品ID"],
+    )
     pack = PlanningAssetPack(
         tables=[
             PlanningAssetEntry(
                 table="dwm_cs_ticket_detail_di",
                 columns=["seller_id", "pt", "spu_id", "spu_name", "ticket_id"],
+                metadata=_governed_test_table_metadata("cs_ticket", "MERCHANT_OTHER"),
             )
-        ]
+        ],
+        fields=[
+            _governed_test_field("dwm_cs_ticket_detail_di", "seller_id", "TENANT_CONTEXT"),
+            _governed_test_field("dwm_cs_ticket_detail_di", "pt", "TIME"),
+            spu_entity,
+            _governed_test_field("dwm_cs_ticket_detail_di", "spu_name", "ATTRIBUTE"),
+            _governed_test_field("dwm_cs_ticket_detail_di", "ticket_id", "ENTITY"),
+        ],
+        entity_keys=[spu_entity],
+        metrics=[
+            PlanningAssetEntry(
+                key="ticket_cnt",
+                table="dwm_cs_ticket_detail_di",
+                columns=["ticket_id"],
+                title="客服工单量",
+                source_ref_id="semantic:test:cs_ticket:metric:ticket_cnt",
+                metadata={
+                    "sourceColumns": ["ticket_id"],
+                    "formula": "COUNT(DISTINCT ticket_id)",
+                },
+            )
+        ],
     )
     plan = QueryPlan(
         intents=[
@@ -16216,6 +16274,13 @@ def test_node_agent_missing_entity_key_filter_uses_structured_fallback():
                 metric_column="ticket_id",
                 metric_name="ticket_cnt",
                 metric_formula="COUNT(DISTINCT `ticket_id`)",
+                metric_resolution={
+                    "metricKey": "ticket_cnt",
+                    "ownerTable": "dwm_cs_ticket_detail_di",
+                    "formula": "COUNT(DISTINCT `ticket_id`)",
+                    "sourceColumns": ["ticket_id"],
+                    "groupByNonEmptyRequired": True,
+                },
                 output_keys=["seller_id", "spu_id", "spu_name"],
                 required_evidence=["seller_id", "spu_id", "spu_name", "ticket_id"],
                 days=60,
@@ -20512,13 +20577,8 @@ def test_semantic_metric_resolver_keeps_exact_refs_for_broad_detail_phrase():
 
 
 def test_compiler_refund_detail_preserves_requested_metrics_and_valid_dependencies():
-    settings = get_settings()
-    question = "查询退款单 refund_id_100 的退款明细，并关联订单和商品信息。"
-    pack = PlanningAssetPackBuilder(TopicAssetService(settings), SkillLoader(settings)).compact(
-        question,
-        recall_bundle_empty(),
-        [QuestionCategory.REFUND, QuestionCategory.TRADE, QuestionCategory.GOODS],
-    )
+    question = "最近30天查询退款单 refund_id_100 的退款明细，并关联订单和商品信息。"
+    pack = trade_refund_goods_pack(governed=True)
     understanding = {
         "analysisGrain": "refund",
         "analysisIntent": "none",
@@ -20532,10 +20592,30 @@ def test_compiler_refund_detail_preserves_requested_metrics_and_valid_dependenci
             "limit": 100,
         },
         "requestedMeasures": [
-            {"metricRef": "order_detail_cnt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单信息"},
-            {"metricRef": "goods_cnt", "ownerTable": "dwm_goods_detail_df", "sourcePhrase": "商品信息"},
-            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
-            {"metricRef": "sku_count", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+            {
+                "metricRef": "order_detail_cnt",
+                "ownerTable": "dwm_trade_order_detail_di",
+                "sourcePhrase": "订单信息",
+                "resultMode": "detail",
+            },
+            {
+                "metricRef": "goods_cnt",
+                "ownerTable": "dwm_goods_detail_df",
+                "sourcePhrase": "商品信息",
+                "resultMode": "detail",
+            },
+            {
+                "metricRef": "pay_amt",
+                "ownerTable": "dwm_trade_refund_detail_di",
+                "sourcePhrase": "退款明细金额",
+                "resultMode": "metric",
+            },
+            {
+                "metricRef": "sku_count",
+                "ownerTable": "dwm_trade_refund_detail_di",
+                "sourcePhrase": "退款商品件数",
+                "resultMode": "metric",
+            },
         ],
         "filters": [{"field": "refund_id", "value": "refund_id_100"}],
         "timeWindowDays": 30,
@@ -20553,8 +20633,8 @@ def test_compiler_refund_detail_preserves_requested_metrics_and_valid_dependenci
 
 
 def test_compiler_detail_anchor_uses_explicit_order_filter_even_when_metric_points_to_refund():
-    question = "查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。"
-    pack = trade_refund_goods_pack()
+    question = "最近30天查询订单 order_id_100 的订单明细，并查看退货时间、退货用户、退款金额，再看下对应 SPU 什么时候发布的。"
+    pack = trade_refund_goods_pack(governed=True)
     understanding = {
         "analysisGrain": "order",
         "analysisIntent": "none",
@@ -20568,12 +20648,20 @@ def test_compiler_detail_anchor_uses_explicit_order_filter_even_when_metric_poin
             "limit": 1,
         },
         "requestedMeasures": [
-            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"}
+            {
+                "metricRef": "pay_amt",
+                "ownerTable": "dwm_trade_refund_detail_di",
+                "sourcePhrase": "退款金额",
+                "resultMode": "metric",
+            }
         ],
         "requiredEvidenceIntents": [
             {
                 "semanticLabel": "商品发布时间",
+                "sourcePhrase": "对应 SPU 什么时候发布",
+                "reason": "回答需要关联商品的发布时间明细",
                 "requiredLevel": "required",
+                "evidenceMode": "detail",
                 "suggestedTables": ["dwm_goods_detail_df"],
                 "suggestedFields": ["spu_apply_create_time"],
             }
@@ -20833,7 +20921,7 @@ def test_query_graph_validator_rejects_pending_knowledge_requests():
 
 def test_query_graph_validator_requires_explicit_object_ref_filter():
     question = "查询订单 order_id_100 的订单明细，并查看退款金额。"
-    pack = trade_refund_goods_pack()
+    pack = trade_refund_goods_pack(governed=True)
     plan = QueryPlan(
         intents=[
             QuestionIntent(
@@ -24268,20 +24356,172 @@ def merge_recall_items_for_test(*groups):
     return list(by_id.values())
 
 
-def trade_refund_goods_pack(include_missing_goods_metric=False):
+def _governed_test_visibility() -> dict:
+    return {
+        "visibilityPolicy": {"level": "public"},
+        "maskingPolicy": {"strategy": "none"},
+        "defaultVisible": True,
+        "displayScenarios": ["detail", "metric", "ranking"],
+    }
+
+
+def _governed_test_field(table: str, column: str, role: str = "ATTRIBUTE") -> PlanningAssetEntry:
+    semantic = {"semanticRole": role, "role": role, **_governed_test_visibility()}
+    return PlanningAssetEntry(
+        key=column,
+        table=table,
+        title=column,
+        source_ref_id="semantic:test:%s:field:%s" % (table, column),
+        metadata={"semanticRole": role, "semantic": semantic},
+    )
+
+
+def _governed_test_entity_key(
+    table: str,
+    column: str,
+    title: str,
+    canonical_ref: str,
+    *,
+    aliases=None,
+    anchor_priority: int = 0,
+) -> PlanningAssetEntry:
+    semantic = {
+        "semanticRole": "ENTITY",
+        "role": "ENTITY",
+        "canonicalEntityRef": canonical_ref,
+        "comparisonPolicy": "exact",
+        **_governed_test_visibility(),
+    }
+    return PlanningAssetEntry(
+        key=column,
+        table=table,
+        title=title,
+        aliases=list(aliases or []),
+        source_ref_id="semantic:test:%s:entity:%s" % (table, column),
+        metadata={
+            "semanticRole": "ENTITY",
+            "canonicalEntityRef": canonical_ref,
+            "comparisonPolicy": "exact",
+            "anchorPriority": anchor_priority,
+            "schema": {"dataType": "VARCHAR", "comparisonPolicy": "exact"},
+            "semantic": semantic,
+        },
+    )
+
+
+def _governed_test_table_metadata(domain: str, category: str) -> dict:
+    public_result = {
+        "visibilityPolicy": {"level": "public"},
+        "maskingPolicy": {"strategy": "none"},
+        "defaultVisible": True,
+    }
+    return {
+        "semanticDomain": domain,
+        "questionCategory": category,
+        "tableKind": "detail",
+        "merchantFilterColumn": "seller_id",
+        "timeColumn": "pt",
+        "rowAccessPolicy": {
+            "scopeType": "merchant",
+            "filterColumn": "seller_id",
+            "operator": "eq",
+            "valueSource": "merchant_id",
+            "required": True,
+        },
+        "resultAccessPolicies": {
+            role: dict(public_result)
+            for role in ["METRIC", "TIME", "ENTITY", "ATTRIBUTE", "MEASURE", "TENANT_CONTEXT"]
+        },
+    }
+
+
+def trade_refund_goods_pack(include_missing_goods_metric=False, governed=False):
+    entity_keys = [
+        _governed_test_entity_key(
+            "dwm_trade_order_detail_di",
+            "order_id",
+            "主订单号",
+            "entity:order",
+            aliases=["订单ID", "主订单ID"],
+            anchor_priority=100,
+        ),
+        _governed_test_entity_key(
+            "dwm_trade_refund_detail_di",
+            "order_id",
+            "主订单编号",
+            "entity:order",
+            aliases=["订单ID", "主订单ID"],
+            anchor_priority=50,
+        ),
+        _governed_test_entity_key(
+            "dwm_trade_order_detail_di",
+            "sub_order_id",
+            "子订单号",
+            "entity:sub_order",
+            aliases=["订单号", "子订单ID"],
+            anchor_priority=100,
+        ),
+        _governed_test_entity_key(
+            "dwm_trade_refund_detail_di",
+            "sub_order_id",
+            "退款关联子订单号",
+            "entity:sub_order",
+            aliases=["订单号", "子订单ID"],
+            anchor_priority=50,
+        ),
+        _governed_test_entity_key(
+            "dwm_trade_refund_detail_di",
+            "refund_id",
+            "退款单号",
+            "entity:refund",
+            aliases=["退货单号", "退款ID"],
+            anchor_priority=100,
+        ),
+        _governed_test_entity_key(
+            "dwm_trade_order_detail_di",
+            "spu_id",
+            "商品SPU ID",
+            "entity:spu",
+            aliases=["SPU", "商品ID"],
+        ),
+        _governed_test_entity_key(
+            "dwm_goods_detail_df",
+            "spu_id",
+            "商品SPU ID",
+            "entity:spu",
+            aliases=["SPU", "商品ID"],
+        ),
+        _governed_test_entity_key(
+            "dwm_trade_refund_detail_di",
+            "buyer_id",
+            "买家ID",
+            "entity:buyer",
+            aliases=["退货用户", "买家编号"],
+        ),
+    ]
     metrics = [
         PlanningAssetEntry(
             key="order_detail_cnt",
             table="dwm_trade_order_detail_di",
             columns=["sub_order_id"],
             title="下单数",
+            source_ref_id="semantic:test:trade:metric:order_detail_cnt",
             metadata={"sourceColumns": ["sub_order_id"], "formula": "COUNT(DISTINCT sub_order_id)"},
+        ),
+        PlanningAssetEntry(
+            key="pay_amt",
+            table="dwm_trade_order_detail_di",
+            columns=["pay_amt"],
+            title="订单支付金额",
+            source_ref_id="semantic:test:trade:metric:pay_amt",
+            metadata={"sourceColumns": ["pay_amt"], "formula": "SUM(pay_amt)"},
         ),
         PlanningAssetEntry(
             key="refund_bill_cnt",
             table="dwm_trade_refund_detail_di",
             columns=["refund_id"],
             title="退款量",
+            source_ref_id="semantic:test:refund:metric:refund_bill_cnt",
             metadata={"sourceColumns": ["refund_id"], "formula": "COUNT(DISTINCT refund_id)"},
         ),
         PlanningAssetEntry(
@@ -24289,16 +24529,42 @@ def trade_refund_goods_pack(include_missing_goods_metric=False):
             table="dwm_trade_refund_detail_di",
             columns=["pay_amt"],
             title="退款金额",
+            source_ref_id="semantic:test:refund:metric:pay_amt",
             metadata={"sourceColumns": ["pay_amt"], "formula": "SUM(pay_amt)"},
+        ),
+        PlanningAssetEntry(
+            key="sku_count",
+            table="dwm_trade_refund_detail_di",
+            columns=["sku_count"],
+            title="退款商品件数",
+            source_ref_id="semantic:test:refund:metric:sku_count",
+            metadata={"sourceColumns": ["sku_count"], "formula": "SUM(sku_count)"},
         ),
         PlanningAssetEntry(
             key="goods_publish_time",
             table="dwm_goods_detail_df",
             columns=["spu_apply_create_time"],
             title="商品发布时间",
+            source_ref_id="semantic:test:goods:metric:goods_publish_time",
             metadata={"sourceColumns": ["spu_apply_create_time"]},
         ),
+        PlanningAssetEntry(
+            key="goods_cnt",
+            table="dwm_goods_detail_df",
+            columns=["spu_id"],
+            title="商品数",
+            source_ref_id="semantic:test:goods:metric:goods_cnt",
+            metadata={"sourceColumns": ["spu_id"], "formula": "COUNT(DISTINCT spu_id)"},
+        ),
     ]
+    if not governed:
+        legacy_metric_identities = {
+            ("dwm_trade_order_detail_di", "order_detail_cnt"),
+            ("dwm_trade_refund_detail_di", "refund_bill_cnt"),
+            ("dwm_trade_refund_detail_di", "pay_amt"),
+            ("dwm_goods_detail_df", "goods_publish_time"),
+        }
+        metrics = [metric for metric in metrics if (metric.table, metric.key) in legacy_metric_identities]
     if include_missing_goods_metric:
         metrics.append(
             PlanningAssetEntry(
@@ -24319,7 +24585,11 @@ def trade_refund_goods_pack(include_missing_goods_metric=False):
                 columns=["seller_id", "pt", "spu_id", "spu_name", "sub_order_id", "order_id", "discount_rel_id", "pay_amt"],
                 title="订单明细表",
                 aliases=["订单/子订单明细表", "订单明细", "子订单明细"],
-                metadata={"merchantFilterColumn": "seller_id", "timeColumn": "pt"},
+                metadata=(
+                    _governed_test_table_metadata("trade", "TRADE")
+                    if governed
+                    else {"merchantFilterColumn": "seller_id", "timeColumn": "pt"}
+                ),
             ),
             PlanningAssetEntry(
                 table="dwm_trade_refund_detail_di",
@@ -24333,20 +24603,62 @@ def trade_refund_goods_pack(include_missing_goods_metric=False):
                     "pay_amt",
                     "refund_status_name",
                     "refund_create_time",
+                    *(["sku_count", "buyer_id"] if governed else []),
                 ],
                 title="退款明细表",
                 aliases=["退款/售后明细表", "退款明细", "售后明细"],
-                metadata={"merchantFilterColumn": "seller_id", "timeColumn": "pt"},
+                metadata=(
+                    _governed_test_table_metadata("refund", "REFUND")
+                    if governed
+                    else {"merchantFilterColumn": "seller_id", "timeColumn": "pt"}
+                ),
             ),
             PlanningAssetEntry(
                 table="dwm_goods_detail_df",
                 columns=["seller_id", "pt", "spu_id", "spu_name", "spu_apply_create_time", "spu_status_name"],
                 title="商品明细表",
                 aliases=["商品明细", "SPU 明细"],
-                metadata={"merchantFilterColumn": "seller_id", "timeColumn": "pt"},
+                metadata=(
+                    _governed_test_table_metadata("goods", "GOODS")
+                    if governed
+                    else {"merchantFilterColumn": "seller_id", "timeColumn": "pt"}
+                ),
             ),
         ],
+        fields=([
+            *entity_keys,
+            *[
+                _governed_test_field(table, column, role)
+                for table, columns in {
+                    "dwm_trade_order_detail_di": {
+                        "seller_id": "TENANT_CONTEXT",
+                        "pt": "TIME",
+                        "spu_name": "ATTRIBUTE",
+                        "discount_rel_id": "ATTRIBUTE",
+                        "pay_amt": "MEASURE",
+                    },
+                    "dwm_trade_refund_detail_di": {
+                        "seller_id": "TENANT_CONTEXT",
+                        "pt": "TIME",
+                        "spu_name": "ATTRIBUTE",
+                        "pay_amt": "MEASURE",
+                        "sku_count": "MEASURE",
+                        "refund_status_name": "ATTRIBUTE",
+                        "refund_create_time": "TIME",
+                    },
+                    "dwm_goods_detail_df": {
+                        "seller_id": "TENANT_CONTEXT",
+                        "pt": "TIME",
+                        "spu_name": "ATTRIBUTE",
+                        "spu_apply_create_time": "TIME",
+                        "spu_status_name": "ATTRIBUTE",
+                    },
+                }.items()
+                for column, role in columns.items()
+            ],
+        ] if governed else []),
         metrics=metrics,
+        entity_keys=entity_keys if governed else [],
         relationships=[
             RelationshipEntry(
                 relationship_id="order_refund_by_sub_order",
@@ -25454,15 +25766,36 @@ class FakeDetailPlannerLlm:
 
     def json_chat(self, system_prompt, user_prompt, fallback=None):
         return {
-            "status": "PLAN_READY",
+            "status": "UNDERSTOOD",
             "reason": "llm understood detail lookup",
             "questionUnderstanding": {
                 "analysisGrain": "order",
-                "rankingObjective": {},
-                "requestedMeasures": [
-                    {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款金额"},
-                    {"metricRef": "goods_publish_time", "ownerTable": "dwm_goods_detail_df", "sourcePhrase": "商品发布时间"},
+                "analysisIntent": "none",
+                "requiresExplanation": False,
+                "requiredEvidenceIntents": [],
+                "anchorMetric": {
+                    "metricRef": "",
+                    "ownerTable": "dwm_trade_order_detail_di",
+                    "sourcePhrase": "订单明细",
+                    "objectiveType": "detail_anchor",
+                },
+                "supportMetrics": [
+                    {
+                        "metricRef": "pay_amt",
+                        "ownerTable": "dwm_trade_refund_detail_di",
+                        "sourcePhrase": "退款金额",
+                        "resultMode": "detail",
+                    },
+                    {
+                        "metricRef": "goods_publish_time",
+                        "ownerTable": "dwm_goods_detail_df",
+                        "sourcePhrase": "商品发布时间",
+                        "resultMode": "detail",
+                    },
                 ],
+                "metricCandidateDecisions": [],
+                "calculationIntents": [],
+                "scopeConstraints": [],
                 "filters": [{"field": "order_id", "value": "order_id_100"}],
                 "timeWindowDays": 30,
             },

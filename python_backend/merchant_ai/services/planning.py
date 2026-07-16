@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, Iterable, List, Set, Tuple
 
 from merchant_ai.config import Settings, get_settings
+from merchant_ai.graph.query_graph_contract import semantic_query_execution_contract
 from merchant_ai.models import (
     AnswerMode,
     EntityFilterObligation,
@@ -33,6 +34,9 @@ from merchant_ai.models import (
     RecallBundle,
     RecallItem,
     ResolvedTimeRange,
+    SemanticFilterNode,
+    SemanticFilterObligation,
+    SemanticQuerySpec,
     TaskRole,
     ToolCachePolicy,
 )
@@ -77,6 +81,7 @@ from merchant_ai.services.planning_tooling import (
     planner_prompt_stats,
     planner_repair_feedback_for_understanding,
     planner_structured_output_validation_errors,
+    structured_output_validation_errors,
     planner_tool_results_for_prompt,
 )
 from merchant_ai.services.planning_layers import GraphContractValidator, PlanCompiler, PlanRepairer, UnderstandingExtractor
@@ -92,6 +97,7 @@ from merchant_ai.services.tools import (
     question_understanding_tool,
     select_tool_schemas,
     semantic_file_tool_definitions,
+    source_condition_coverage_tool,
     tool_schema_catalog,
 )
 
@@ -1052,11 +1058,40 @@ class QueryGraphPlanner:
             failure_registry=self.tool_failure_registry,
             tool_registry=canonical_tool_registry(),
         )
+        self._source_condition_ledger_cache: Dict[str, Dict[str, Any]] = {}
 
     def with_artifact_root(self, root: str) -> None:
         self.artifact_store.set_context_root(root)
 
     def plan(
+        self,
+        question: str,
+        history_rows: List[Dict[str, Any]],
+        knowledge_context: str,
+        recall_bundle: RecallBundle,
+        asset_pack: PlanningAssetPack,
+        gaps: List[GraphValidationGap],
+        trace: List[str],
+        planner_context: Dict[str, Any] | None = None,
+    ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
+        plan, requests, reason = self._plan_without_source_condition_audit(
+            question,
+            history_rows,
+            knowledge_context,
+            recall_bundle,
+            asset_pack,
+            gaps,
+            trace,
+            planner_context=planner_context,
+        )
+        if plan.intents:
+            understanding = deepcopy(plan.question_understanding or {})
+            understanding["sourceConditionLedger"] = self._independent_source_condition_ledger(question)
+            understanding["sourceConditionAuditRequired"] = True
+            plan = plan.model_copy(update={"question_understanding": understanding})
+        return plan, requests, reason
+
+    def _plan_without_source_condition_audit(
         self,
         question: str,
         history_rows: List[Dict[str, Any]],
@@ -1595,6 +1630,17 @@ class QueryGraphPlanner:
         if not isinstance(understanding, dict) or not understanding:
             compile_payload = {"questionUnderstanding": payload} if payload_has_understanding(payload) else payload
             understanding = compile_payload.get("questionUnderstanding") or compile_payload.get("question_understanding")
+        if isinstance(understanding, dict) and str(compile_payload.get("status") or "UNDERSTOOD").upper() == "UNDERSTOOD":
+            # This is a second model lane.  It receives only the raw question,
+            # never the Planner semanticQuery, so missing predicates cannot be
+            # certified by duplicating one self-consistent Planner payload.
+            audited = deepcopy(understanding)
+            audited["sourceConditionLedger"] = self._independent_source_condition_ledger(question)
+            audited["sourceConditionAuditRequired"] = True
+            compile_payload = deepcopy(compile_payload)
+            compile_payload["questionUnderstanding"] = audited
+            compile_payload.pop("question_understanding", None)
+            understanding = audited
         expansion_trace = self._expand_asset_pack_from_understanding(asset_pack, understanding) if isinstance(understanding, dict) else []
         plan = self.plan_compiler.compile(question, compile_payload, asset_pack)
         if expansion_trace:
@@ -1602,6 +1648,59 @@ class QueryGraphPlanner:
         append_prompt_trace(plan, payload)
         attach_planner_tool_trace(plan, payload)
         return plan
+
+    def _independent_source_condition_ledger(self, question: str) -> Dict[str, Any]:
+        question_hash = hashlib.sha256(str(question or "").encode("utf-8")).hexdigest()
+        cached = self._source_condition_ledger_cache.get(question_hash)
+        if isinstance(cached, dict):
+            return deepcopy(cached)
+        tool = source_condition_coverage_tool()
+        tool_schema = compact_openai_tool_schema(tool.openai_schema())
+        system = (
+            "You are an independent BI source-condition coverage critic. Read only the original question. "
+            "Extract every explicit row/population predicate and its exact boolean AND/OR/NOT structure. "
+            "Do not infer semantic refs, tables, columns or SQL and do not reconstruct any Planner output. "
+            "Relative/absolute time windows, Top-N/limit, ordering and requested projections are not row predicates; "
+            "classify them in excludedConstraints. Copy each predicate sourcePhrase and rawValues verbatim."
+        )
+        user = json.dumps({"question": question}, ensure_ascii=False)
+        payload: Dict[str, Any] = {}
+        try:
+            if hasattr(self.llm, "tool_json_chat"):
+                try:
+                    payload = self.llm.tool_json_chat(
+                        system,
+                        user,
+                        tool_schema,
+                        {},
+                        timeout_seconds=self.settings.llm_planner_timeout_seconds,
+                    )
+                except TypeError:
+                    payload = self.llm.tool_json_chat(system, user, tool_schema, {})
+            else:
+                try:
+                    payload = self.llm.json_chat(
+                        system,
+                        user,
+                        {},
+                        timeout_seconds=self.settings.llm_planner_timeout_seconds,
+                    )
+                except TypeError:
+                    payload = self.llm.json_chat(system, user, {})
+        except Exception as exc:
+            return freeze_source_condition_ledger(
+                question,
+                {},
+                ["condition auditor failed: %s: %s" % (type(exc).__name__, str(exc)[:240])],
+            )
+        payload = payload if isinstance(payload, dict) else {}
+        errors = structured_output_validation_errors(payload, tool.parameters)
+        ledger = freeze_source_condition_ledger(question, payload, errors)
+        if ledger.get("auditorStatus") in {"verified", "ambiguous"}:
+            self._source_condition_ledger_cache[question_hash] = deepcopy(ledger)
+            if len(self._source_condition_ledger_cache) > 256:
+                self._source_condition_ledger_cache.pop(next(iter(self._source_condition_ledger_cache)))
+        return ledger
 
     def _semantic_asset_selection_plan(
         self,
@@ -3474,6 +3573,19 @@ class QueryGraphPlanner:
                 "metricOnlyCatalogRule": "candidateMetrics may be present while tables is empty; select metricRef/ownerTable from candidateMetrics first, and rely on semantic_read/on-demand expansion only when table schema, formula detail, or relationships are needed",
                 "knowledgeGapRule": "knowledgeRequestGaps are authoritative failed supplemental recalls; do not repeat the same request, either plan with available semanticCatalog evidence or leave the unsupported part as a structured gap",
                 "scopeRule": "business population limits such as 'within a selected set' must be declared in scopeConstraints and compiled before ranking/measures",
+                "semanticFilterRule": (
+                    "every explicit user condition must be preserved in semanticQuery.filterNodes; predicate.semanticRefId "
+                    "must be an exact field or metric ref loaded from semantic_read/current PlanningAssetPack, and each "
+                    "predicate must retain sourcePhrase plus the user's unmodified rawValues"
+                ),
+                "semanticFilterSafetyRule": (
+                    "never emit or guess a physical table/column as a filter binding; if an explicit condition cannot be "
+                    "bound to one loaded semanticRefId, return NEED_MORE_KNOWLEDGE or a clarification instead of dropping it"
+                ),
+                "legacyFilterRule": (
+                    "filters[field,value] is read only for migration compatibility; new plans must use semanticQuery with "
+                    "predicate/group nodes and rootFilterNodeId"
+                ),
                 "calculationRule": "when the user asks for proportion/percentage/占比/占多少, declare calculationIntents as event population divided by base population",
                 "memoryRule": (
                     "memoryConstraints are validate-only hints: use them only by selecting semanticCatalog-supported "
@@ -3494,6 +3606,43 @@ class QueryGraphPlanner:
                 "skillWorkflowRule": "skill matching is owned by the Lead Agent from dynamically loaded skill headers, not by this Planner",
             },
         }
+        previous_calculations = (
+            (prior_understanding or {}).get("calculationIntents")
+            or (prior_understanding or {}).get("calculation_intents")
+            or []
+        )
+        population_examples: List[str] = []
+        for calculation in previous_calculations if isinstance(previous_calculations, list) else []:
+            if not isinstance(calculation, dict):
+                continue
+            base = str(
+                calculation.get("basePopulationPhrase")
+                or calculation.get("base_population_phrase")
+                or ""
+            ).strip()
+            event = str(
+                calculation.get("eventPopulationPhrase")
+                or calculation.get("event_population_phrase")
+                or ""
+            ).strip()
+            numerator = str(
+                calculation.get("numeratorMetricRef")
+                or calculation.get("numerator_metric_ref")
+                or ""
+            ).strip()
+            denominator = str(
+                calculation.get("denominatorMetricRef")
+                or calculation.get("denominator_metric_ref")
+                or ""
+            ).strip()
+            if not any([base, event, numerator, denominator]):
+                continue
+            population_examples.append(
+                "base=%s; event=%s; numeratorMetricRef=%s; denominatorMetricRef=%s"
+                % (base, event, numerator, denominator)
+            )
+        if population_examples:
+            payload["outputContract"]["populationRatioExamples"] = population_examples[:3]
         if compact_selection:
             payload["semanticSelectionContract"] = compact_selection
         if include_full_file_context:
@@ -4932,6 +5081,7 @@ class QueryGraphContractValidator:
         gaps: List[GraphValidationGap] = []
         gaps.extend(metric_obligation_validation_gaps(plan, asset_pack))
         gaps.extend(entity_filter_obligation_validation_gaps(plan, asset_pack))
+        gaps.extend(semantic_filter_validation_gaps(plan, asset_pack))
         gaps.extend(self._metric_obligation_gaps(contract, plan, asset_pack))
         gaps.extend(self._scope_obligation_gaps(contract, plan, asset_pack))
         gaps.extend(self._detail_evidence_gaps(plan, asset_pack))
@@ -9063,7 +9213,12 @@ def compile_entity_detail_graph_from_understanding(question: str, understanding:
         )
     filter_column = entity_reference.field
     filter_value = ",".join(str(item) for item in entity_reference.values)
-    anchor_table = best_detail_anchor_table(filter_column, question, asset_pack)
+    anchor_table = (
+        entity_reference.table
+        if entity_reference.table in set(asset_pack.known_tables())
+        and filter_column in set(asset_pack.known_columns(entity_reference.table))
+        else best_detail_anchor_table(filter_column, question, asset_pack)
+    )
     if not anchor_table:
         return QueryPlan(
             agent_trace=["planner.understanding_compile.detail_anchor_unavailable"],
@@ -9210,6 +9365,40 @@ def entity_reference_from_understanding(
     understanding: Dict[str, Any],
     asset_pack: PlanningAssetPack,
 ) -> EntityReference:
+    semantic_query = semantic_query_payload_from_understanding(understanding)
+    if semantic_query:
+        mandatory_predicate_ids = semantic_filter_mandatory_positive_predicate_ids_from_payload(semantic_query)
+        candidates: List[Tuple[Dict[str, Any], PlanningAssetEntry]] = []
+        for item in semantic_query_filter_node_payloads(semantic_query):
+            if semantic_filter_node_type(item) != "predicate":
+                continue
+            if semantic_filter_string(item, "nodeId", "node_id") not in mandatory_predicate_ids:
+                continue
+            operator = normalize_semantic_filter_operator(item.get("operator"))
+            if operator not in {"eq", "in"}:
+                continue
+            semantic_ref_id = semantic_filter_string(item, "semanticRefId", "semantic_ref_id")
+            entries = semantic_filter_entries_for_ref(asset_pack, semantic_ref_id)
+            if len(entries) != 1 or semantic_filter_member_kind(entries[0], asset_pack) != "entity":
+                continue
+            candidates.append((item, entries[0]))
+        if candidates:
+            item, entry = candidates[0]
+            raw_values = semantic_filter_raw_values(item)
+            return build_entity_reference(
+                question=question,
+                raw_label=str(entry.key or ""),
+                raw_value=",".join(str(value) for value in raw_values),
+                matching_entries=[entry],
+                source="question_understanding_semantic_query",
+            )
+        # Native semanticQuery is authoritative.  Never fall back to guessing
+        # a physical field when it has no uniquely governed entity predicate.
+        return EntityReference(
+            source="question_understanding_semantic_query",
+            status="unresolved",
+            time_scope_explicit=question_has_explicit_time_scope(question),
+        )
     filters = understanding.get("filters") or []
     if isinstance(filters, list):
         for item in filters:
@@ -12557,35 +12746,121 @@ def detail_filter_from_understanding(
 
 
 def apply_understanding_filters(plan: QueryPlan, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
-    filters = semantic_filters_from_understanding(understanding)
-    if not filters or not plan.intents:
-        return plan
-    updated: List[QuestionIntent] = []
+    semantic_query = bind_semantic_query_from_understanding(understanding, asset_pack)
+    if not semantic_query.filter_nodes:
+        if not semantic_query_payload_from_understanding(understanding):
+            return plan
+        executable_indices = [
+            index
+            for index, intent in enumerate(plan.intents)
+            if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE
+        ]
+        if len(executable_indices) != 1:
+            return plan
+        target_index = executable_indices[0]
+        target = plan.intents[target_index]
+        updates: Dict[str, Any] = {"semantic_query": semantic_query}
+        if semantic_query.limit > 0:
+            updates["limit"] = semantic_query.limit
+        intents = list(plan.intents)
+        intents[target_index] = target.model_copy(update=updates)
+        return plan.model_copy(update={"intents": intents})
+    predicate_nodes = [node for node in semantic_query.filter_nodes if node.node_type == "predicate"]
+    mandatory_predicate_ids = semantic_filter_mandatory_positive_predicate_ids(semantic_query)
+    predicate_tables = {node.bound_table for node in predicate_nodes if node.bound_table}
+    has_unbound_predicate = any(not node.bound_table for node in predicate_nodes)
+    cross_table = len(predicate_tables) > 1
+    applicable_task_ids = {
+        intent.plan_task_id
+        for intent in plan.intents
+        if not cross_table
+        and bool(predicate_tables)
+        and intent.preferred_table in predicate_tables
+        and intent.intent_type == IntentType.VALID
+        and intent.answer_mode != AnswerMode.RULE
+    }
     trace = list(plan.compiler_trace)
+    if cross_table:
+        trace.append("FILTER_SCOPE_UNSUPPORTED:%s" % ",".join(sorted(predicate_tables)))
+    elif has_unbound_predicate:
+        trace.append("FILTER_BINDING_INCOMPLETE")
+
+    updated: List[QuestionIntent] = []
+    obligations: List[SemanticFilterObligation] = list(plan.semantic_filter_obligations)
+    entity_obligations = list(plan.entity_filter_obligations)
     for intent in plan.intents:
-        if intent.filter_column:
-            updated.append(intent)
-            continue
-        columns = set(asset_pack.known_columns(intent.preferred_table))
-        selected = next((item for item in filters if item[0] in columns), None)
-        if not selected:
-            updated.append(intent)
-            continue
-        field, value = selected
-        required = dedupe_strings(list(intent.required_evidence) + [field])
-        output_keys = dedupe_strings(list(intent.output_keys) + [field])
-        updated.append(
-            intent.model_copy(
-                update={
-                    "filter_column": field,
-                    "filter_value": value,
-                    "required_evidence": required[:18],
-                    "output_keys": output_keys[:18],
-                }
-            )
+        applicable = (
+            not cross_table
+            and bool(predicate_tables)
+            and intent.preferred_table in predicate_tables
+            and intent.intent_type == IntentType.VALID
+            and intent.answer_mode != AnswerMode.RULE
         )
-        trace.append("FILTER_BOUND:%s:%s=%s" % (intent.plan_task_id, field, value))
-    return plan.model_copy(update={"intents": updated, "compiler_trace": trace})
+        if not applicable:
+            updated.append(intent)
+            continue
+        produced_fields = [
+            node.bound_field
+            for node in predicate_nodes
+            if node.bound_table == intent.preferred_table and node.bound_field and node.member_kind != "measure"
+        ]
+        required = dedupe_strings(list(intent.required_evidence) + produced_fields)
+        output_keys = dedupe_strings(list(intent.output_keys) + produced_fields)
+        legacy_column, legacy_value = semantic_query_legacy_projection(semantic_query)
+        update: Dict[str, Any] = {
+            "semantic_query": semantic_query,
+            "required_evidence": required[:24],
+            "output_keys": output_keys[:24],
+        }
+        if semantic_query.limit > 0 and len(applicable_task_ids) == 1:
+            update["limit"] = semantic_query.limit
+        entity_nodes = [
+            node
+            for node in predicate_nodes
+            if node.bound_table == intent.preferred_table
+            and node.node_id in mandatory_predicate_ids
+            and node.member_kind == "entity"
+            and node.operator in {"eq", "in"}
+            and node.resolution_status == "resolved"
+        ]
+        if len(entity_nodes) == 1:
+            reference = entity_reference_from_semantic_filter_node(entity_nodes[0], asset_pack, intent.question)
+            update["entity_reference"] = reference
+            entity_obligation = entity_filter_obligation(reference, task_id=intent.plan_task_id, status="bound")
+            if not any(item.obligation_id == entity_obligation.obligation_id for item in entity_obligations):
+                entity_obligations.append(entity_obligation)
+        if not intent.filter_column and legacy_column:
+            update["filter_column"] = legacy_column
+            update["filter_value"] = legacy_value
+        updated.append(
+            intent.model_copy(update=update)
+        )
+        for node in predicate_nodes:
+            if node.bound_table != intent.preferred_table:
+                continue
+            obligation = semantic_filter_obligation(node, task_id=intent.plan_task_id)
+            if not any(item.obligation_id == obligation.obligation_id for item in obligations):
+                obligations.append(obligation)
+            trace.append(
+                "SEMANTIC_FILTER_BOUND:%s:%s:%s:%s"
+                % (intent.plan_task_id, node.node_id, node.bound_field, node.operator)
+            )
+
+    fallback_status = "scope_unsupported" if cross_table else "unbound"
+    for node in predicate_nodes:
+        if any(item.node_id == node.node_id for item in obligations):
+            continue
+        obligation = semantic_filter_obligation(node, task_id="", status=fallback_status)
+        if not any(item.obligation_id == obligation.obligation_id for item in obligations):
+            obligations.append(obligation)
+    return plan.model_copy(
+        update={
+            "intents": updated,
+            "semantic_filter_obligations": obligations,
+            "entity_filter_obligations": entity_obligations,
+            "compiler_trace": dedupe_strings(trace),
+        }
+    )
 
 
 def apply_required_evidence_intents(
@@ -13182,7 +13457,724 @@ def required_evidence_target_intent_index(intents: List[QuestionIntent], table: 
     return candidates[0][0]
 
 
+SEMANTIC_FILTER_OPERATOR_ALIASES = {
+    "=": "eq",
+    "==": "eq",
+    "equal": "eq",
+    "equals": "eq",
+    "eq": "eq",
+    "!=": "neq",
+    "<>": "neq",
+    "not_equal": "neq",
+    "not_equals": "neq",
+    "neq": "neq",
+    "in": "in",
+    "not_in": "not_in",
+    "notin": "not_in",
+    ">": "gt",
+    "gt": "gt",
+    ">=": "gte",
+    "gte": "gte",
+    "<": "lt",
+    "lt": "lt",
+    "<=": "lte",
+    "lte": "lte",
+    "between": "between",
+    "is_null": "is_null",
+    "isnull": "is_null",
+    "is_not_null": "is_not_null",
+    "isnotnull": "is_not_null",
+    "contains": "contains",
+    "not_contains": "not_contains",
+    "notcontains": "not_contains",
+    "starts_with": "starts_with",
+    "startswith": "starts_with",
+    "ends_with": "ends_with",
+    "endswith": "ends_with",
+}
+
+SEMANTIC_FILTER_OPERATORS_BY_TYPE = {
+    "integer": {"eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "between", "is_null", "is_not_null"},
+    "number": {"eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "between", "is_null", "is_not_null"},
+    "date": {"eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "between", "is_null", "is_not_null"},
+    "datetime": {"eq", "neq", "in", "not_in", "gt", "gte", "lt", "lte", "between", "is_null", "is_not_null"},
+    "boolean": {"eq", "neq", "in", "not_in", "is_null", "is_not_null"},
+    "string": {
+        "eq",
+        "neq",
+        "in",
+        "not_in",
+        "contains",
+        "not_contains",
+        "starts_with",
+        "ends_with",
+        "is_null",
+        "is_not_null",
+    },
+}
+
+
+def semantic_filter_string(payload: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def semantic_query_payload_from_understanding(understanding: Dict[str, Any]) -> Dict[str, Any]:
+    raw = understanding.get("semanticQuery") or understanding.get("semantic_query") or {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def semantic_query_filter_node_payloads(semantic_query: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = semantic_query.get("filterNodes") or semantic_query.get("filter_nodes") or []
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, dict)]
+
+
+def semantic_filter_node_type(payload: Dict[str, Any]) -> str:
+    declared = semantic_filter_string(payload, "nodeType", "node_type").lower()
+    if declared:
+        return declared
+    if payload.get("childNodeIds") or payload.get("child_node_ids"):
+        return "group"
+    return "predicate"
+
+
+def semantic_filter_mandatory_positive_ids(
+    root_node_id: str,
+    node_by_id: Dict[str, Any],
+    node_type: Any,
+    logical_operator: Any,
+    child_ids: Any,
+) -> set[str]:
+    """Return predicates that must be true for the whole boolean expression.
+
+    This conservative projection is the only safe input to legacy single-ID
+    contracts.  An ID mentioned under OR/NOT is not a global row constraint.
+    """
+
+    visiting: set[str] = set()
+    memo: Dict[str, set[str]] = {}
+
+    def required(node_id: str) -> set[str]:
+        if node_id in memo:
+            return set(memo[node_id])
+        if node_id in visiting or node_id not in node_by_id:
+            return set()
+        visiting.add(node_id)
+        node = node_by_id[node_id]
+        kind = str(node_type(node) or "").strip().lower()
+        if kind == "predicate":
+            result = {node_id}
+        elif kind != "group":
+            result = set()
+        else:
+            logical = str(logical_operator(node) or "").strip().lower()
+            children = [str(value) for value in child_ids(node) if str(value or "").strip()]
+            child_sets = [required(child) for child in children]
+            if logical == "and" and children and len(child_sets) == len(children):
+                result = set().union(*child_sets)
+            elif logical == "or" and child_sets:
+                result = set(child_sets[0])
+                for values in child_sets[1:]:
+                    result.intersection_update(values)
+            else:
+                # NOT never yields a positive predicate obligation. Invalid or
+                # incomplete groups are also non-projectable and fail later in
+                # the typed topology validator.
+                result = set()
+        visiting.discard(node_id)
+        memo[node_id] = set(result)
+        return result
+
+    return required(root_node_id)
+
+
+def semantic_filter_mandatory_positive_predicate_ids_from_payload(
+    semantic_query: Dict[str, Any],
+) -> set[str]:
+    payloads = semantic_query_filter_node_payloads(semantic_query)
+    ids = [semantic_filter_string(item, "nodeId", "node_id") for item in payloads]
+    if any(not node_id for node_id in ids) or len(set(ids)) != len(ids):
+        return set()
+    node_by_id = dict(zip(ids, payloads))
+    root = semantic_filter_string(semantic_query, "rootFilterNodeId", "root_filter_node_id")
+    return semantic_filter_mandatory_positive_ids(
+        root,
+        node_by_id,
+        node_type=semantic_filter_node_type,
+        logical_operator=lambda node: semantic_filter_string(node, "logicalOperator", "logical_operator"),
+        child_ids=lambda node: node.get("childNodeIds") or node.get("child_node_ids") or [],
+    )
+
+
+def semantic_filter_mandatory_positive_predicate_ids(spec: SemanticQuerySpec) -> set[str]:
+    ids = [node.node_id for node in spec.filter_nodes]
+    if any(not node_id for node_id in ids) or len(set(ids)) != len(ids):
+        return set()
+    return semantic_filter_mandatory_positive_ids(
+        spec.root_filter_node_id,
+        {node.node_id: node for node in spec.filter_nodes},
+        node_type=lambda node: node.node_type,
+        logical_operator=lambda node: node.logical_operator,
+        child_ids=lambda node: node.child_node_ids,
+    )
+
+
+def semantic_filter_raw_values(payload: Dict[str, Any]) -> List[Any]:
+    sentinel = object()
+    value: Any = sentinel
+    for key in ["rawValues", "raw_values", "rawValue", "raw_value", "values", "value"]:
+        if key in payload:
+            value = payload.get(key)
+            break
+    if value is sentinel or value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return [value]
+
+
+def normalize_semantic_filter_operator(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return SEMANTIC_FILTER_OPERATOR_ALIASES.get(raw, raw)
+
+
+def semantic_filter_legacy_query(understanding: Dict[str, Any]) -> Dict[str, Any]:
+    raw_filters = understanding.get("filters") or understanding.get("filter") or []
+    if not isinstance(raw_filters, list):
+        return {}
+    nodes: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_filters, start=1):
+        if not isinstance(item, dict):
+            continue
+        field = semantic_filter_string(item, "field", "column")
+        semantic_ref_id = semantic_filter_string(item, "semanticRefId", "semantic_ref_id")
+        raw_values = semantic_filter_raw_values(item)
+        if not (semantic_ref_id or field):
+            continue
+        operator = normalize_semantic_filter_operator(item.get("operator") or "eq")
+        phrase = semantic_filter_string(item, "sourcePhrase", "source_phrase")
+        if not phrase:
+            phrase = "%s %s %s" % (field or semantic_ref_id, operator, ",".join(str(value) for value in raw_values))
+        nodes.append(
+            {
+                "nodeId": "legacy_filter_%d" % index,
+                "nodeType": "predicate",
+                "semanticRefId": semantic_ref_id,
+                "legacyField": field,
+                "ownerTable": semantic_filter_string(item, "ownerTable", "owner_table", "table"),
+                "operator": operator,
+                "rawValues": raw_values,
+                "sourcePhrase": phrase,
+                "knowledgeRefIds": item.get("knowledgeRefIds") or item.get("knowledge_ref_ids") or [],
+                "legacyCompatibility": True,
+            }
+        )
+    if not nodes:
+        return {}
+    root = str(nodes[0]["nodeId"])
+    if len(nodes) > 1:
+        root = "legacy_filter_root"
+        nodes.append(
+            {
+                "nodeId": root,
+                "nodeType": "group",
+                "logicalOperator": "and",
+                "childNodeIds": [str(item["nodeId"]) for item in nodes],
+            }
+        )
+    return {
+        "resultMode": str(understanding.get("resultMode") or understanding.get("result_mode") or ""),
+        "filterNodes": nodes,
+        "rootFilterNodeId": root,
+        "bindingSource": "legacy_filters",
+    }
+
+
+def semantic_filter_entries_for_ref(asset_pack: PlanningAssetPack, semantic_ref_id: str) -> List[PlanningAssetEntry]:
+    if not semantic_ref_id:
+        return []
+    return [
+        entry
+        for entry in [*asset_pack.fields, *asset_pack.metrics]
+        if str(entry.source_ref_id or "") == semantic_ref_id
+    ]
+
+
+def semantic_filter_legacy_entries(
+    asset_pack: PlanningAssetPack,
+    field: str,
+    owner_table: str = "",
+) -> List[PlanningAssetEntry]:
+    if not field:
+        return []
+    matches = [entry for entry in [*asset_pack.fields, *asset_pack.metrics] if str(entry.key or "") == field]
+    if owner_table:
+        matches = [entry for entry in matches if str(entry.table or "") == owner_table]
+    return matches
+
+
+def semantic_filter_entry_metadata(entry: PlanningAssetEntry) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    metadata = dict(entry.metadata or {})
+    semantic = dict(metadata.get("semantic") or {}) if isinstance(metadata.get("semantic"), dict) else {}
+    schema = dict(metadata.get("schema") or {}) if isinstance(metadata.get("schema"), dict) else {}
+    return metadata, semantic, schema
+
+
+def semantic_filter_member_kind(entry: PlanningAssetEntry, asset_pack: PlanningAssetPack) -> str:
+    if any(entry is candidate for candidate in asset_pack.metrics):
+        return "measure"
+    metadata, semantic, schema = semantic_filter_entry_metadata(entry)
+    role = str(
+        semantic.get("semanticRole")
+        or semantic.get("role")
+        or metadata.get("semanticRole")
+        or metadata.get("role")
+        or ""
+    ).strip().upper()
+    if bool(schema.get("isPrimaryKey")) or role in {
+        "KEY",
+        "ENTITY",
+        "ENTITY_KEY",
+        "JOIN_KEY",
+        "PRIMARY_KEY",
+        "IDENTIFIER",
+    }:
+        return "entity"
+    if bool(schema.get("isPartitionColumn")) or role in {"TIME", "PARTITION", "DATE", "DATETIME", "TIMESTAMP"}:
+        return "time"
+    return "dimension"
+
+
+def semantic_filter_data_type(entry: PlanningAssetEntry, member_kind: str) -> str:
+    metadata, semantic, schema = semantic_filter_entry_metadata(entry)
+    raw = str(
+        semantic.get("dataType")
+        or semantic.get("valueType")
+        or metadata.get("dataType")
+        or metadata.get("valueType")
+        or schema.get("dataType")
+        or schema.get("type")
+        or ""
+    ).strip().lower()
+    if re.match(r"^(?:tinyint|smallint|int|integer|bigint)\b", raw):
+        return "integer"
+    if re.match(r"^(?:decimal|numeric|float|double|real|number)\b", raw):
+        return "number"
+    if re.match(r"^(?:bool|boolean)\b", raw):
+        return "boolean"
+    if re.match(r"^(?:timestamp|datetime)\b", raw):
+        return "datetime"
+    if re.match(r"^date\b", raw):
+        return "date"
+    if re.match(r"^(?:char|varchar|string|text|binary)\b", raw):
+        return "string"
+    if member_kind == "measure" and (
+        metadata.get("formula")
+        or metadata.get("metricFormula")
+        or metadata.get("aggregation")
+        or metadata.get("agg")
+    ):
+        return "number"
+    return "string" if member_kind in {"entity", "dimension", "time"} and raw else "unknown"
+
+
+def semantic_filter_comparison_policy(entry: PlanningAssetEntry) -> str:
+    metadata, semantic, schema = semantic_filter_entry_metadata(entry)
+    return str(
+        semantic.get("comparisonPolicy")
+        or metadata.get("comparisonPolicy")
+        or schema.get("comparisonPolicy")
+        or ""
+    ).strip().lower()
+
+
+def semantic_filter_enum_contract(entry: PlanningAssetEntry) -> Tuple[bool, List[Tuple[Any, List[Any]]]]:
+    metadata, semantic, _ = semantic_filter_entry_metadata(entry)
+    source = semantic if semantic else metadata
+    enum_metadata = source.get("enumMetadata") if isinstance(source.get("enumMetadata"), dict) else {}
+    approved = str(enum_metadata.get("reviewStatus") or "UNREVIEWED").strip().upper() == "APPROVED"
+    if not approved:
+        return False, []
+    pairs: List[Tuple[Any, List[Any]]] = []
+    for value in source.get("enumValues") or []:
+        pairs.append((value, [value]))
+    for key in ["enumMappings", "enumMeanings", "valueLabels"]:
+        mapping = source.get(key)
+        if not isinstance(mapping, dict):
+            continue
+        for canonical, labels in mapping.items():
+            values = list(labels) if isinstance(labels, (list, tuple, set)) else [labels]
+            pairs.append((canonical, [canonical, *values]))
+    return True, pairs
+
+
+def normalize_semantic_filter_value(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value if value is not None else "").strip()).casefold()
+
+
+def coerce_semantic_filter_scalar(value: Any, data_type: str) -> Tuple[bool, Any]:
+    if data_type == "integer":
+        text = str(value if value is not None else "").strip()
+        if not re.fullmatch(r"[-+]?\d+", text):
+            return False, value
+        return True, int(text)
+    if data_type == "number":
+        try:
+            number = Decimal(str(value if value is not None else "").strip())
+        except (InvalidOperation, TypeError, ValueError):
+            return False, value
+        return (number.is_finite(), number if number.is_finite() else value)
+    if data_type == "boolean":
+        normalized = normalize_semantic_filter_value(value)
+        if normalized in {"true", "1"}:
+            return True, True
+        if normalized in {"false", "0"}:
+            return True, False
+        return False, value
+    if data_type == "date":
+        text = str(value or "").strip()
+        return (bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", text)), text)
+    if data_type == "datetime":
+        text = str(value or "").strip()
+        return (bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", text)), text)
+    if data_type == "string":
+        return (value is not None and str(value) != "", str(value))
+    return False, value
+
+
+def resolve_semantic_filter_values(
+    entry: PlanningAssetEntry,
+    member_kind: str,
+    data_type: str,
+    operator: str,
+    raw_values: List[Any],
+) -> Tuple[List[Any], List[Any], str, str]:
+    if operator in {"is_null", "is_not_null"}:
+        if raw_values:
+            return [], [], "invalid", "null-check operators do not accept values"
+        return [], [], "resolved", ""
+    expected_count_valid = bool(raw_values)
+    if operator == "between":
+        expected_count_valid = len(raw_values) == 2
+    elif operator not in {"in", "not_in"}:
+        expected_count_valid = len(raw_values) == 1
+    if not expected_count_valid:
+        return [], [], "invalid", "operator value cardinality is invalid"
+
+    enum_approved, enum_pairs = semantic_filter_enum_contract(entry)
+    if enum_approved and operator in {"eq", "neq", "in", "not_in"}:
+        resolved: List[Any] = []
+        candidates: List[Any] = []
+        for raw in raw_values:
+            normalized = normalize_semantic_filter_value(raw)
+            matches = dedupe_values(
+                canonical
+                for canonical, labels in enum_pairs
+                if any(normalize_semantic_filter_value(label) == normalized for label in labels)
+            )
+            if len(matches) != 1:
+                candidates.extend(matches)
+                return [], dedupe_values(candidates), "unresolved", (
+                    "approved enum value is ambiguous" if matches else "value is absent from the approved enum contract"
+                )
+            resolved.append(matches[0])
+        return resolved, [], "resolved", ""
+
+    if data_type == "string" and operator in {"eq", "neq", "in", "not_in"}:
+        comparison_policy = semantic_filter_comparison_policy(entry)
+        if member_kind != "entity" and comparison_policy not in {
+            "exact",
+            "case_sensitive",
+            "case_insensitive",
+            "string_exact",
+        }:
+            return [], [], "unresolved", "string equality requires an approved enum or governed exact comparisonPolicy"
+    resolved_values: List[Any] = []
+    for raw in raw_values:
+        valid, resolved = coerce_semantic_filter_scalar(raw, data_type)
+        if not valid:
+            return [], [], "unresolved", "raw value is incompatible with the governed member data type"
+        resolved_values.append(resolved)
+    return resolved_values, [], "resolved", ""
+
+
+def dedupe_values(values: Iterable[Any]) -> List[Any]:
+    result: List[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(value)
+    return result
+
+
+def bind_semantic_filter_predicate(
+    payload: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+    legacy_compatibility: bool,
+) -> SemanticFilterNode:
+    node_id = semantic_filter_string(payload, "nodeId", "node_id")
+    semantic_ref_id = semantic_filter_string(payload, "semanticRefId", "semantic_ref_id")
+    entries = semantic_filter_entries_for_ref(asset_pack, semantic_ref_id)
+    if not semantic_ref_id and legacy_compatibility:
+        entries = semantic_filter_legacy_entries(
+            asset_pack,
+            semantic_filter_string(payload, "legacyField", "field", "column"),
+            semantic_filter_string(payload, "ownerTable", "owner_table", "table"),
+        )
+        if len(entries) == 1:
+            semantic_ref_id = str(entries[0].source_ref_id or "")
+    operator = normalize_semantic_filter_operator(payload.get("operator"))
+    raw_values = semantic_filter_raw_values(payload)
+    source_phrase = semantic_filter_string(payload, "sourcePhrase", "source_phrase")
+    knowledge_ref_ids = dedupe_strings(
+        str(value)
+        for value in (payload.get("knowledgeRefIds") or payload.get("knowledge_ref_ids") or [])
+        if str(value or "").strip()
+    )
+    if len(entries) != 1:
+        return SemanticFilterNode(
+            node_id=node_id,
+            node_type="predicate",
+            semantic_ref_id=semantic_ref_id,
+            source_phrase=source_phrase,
+            operator=operator,
+            raw_values=raw_values,
+            resolution_status="ambiguous_ref" if len(entries) > 1 else "unknown_ref",
+            candidate_values=[str(entry.source_ref_id or "") for entry in entries],
+            knowledge_ref_ids=knowledge_ref_ids,
+            reason="semanticRefId must resolve to exactly one current PlanningAssetPack field or metric",
+        )
+    entry = entries[0]
+    member_kind = semantic_filter_member_kind(entry, asset_pack)
+    data_type = semantic_filter_data_type(entry, member_kind)
+    legacy_comparison_syntax = any(
+        isinstance(value, str) and re.match(r"^\s*(?:>=|<=|!=|<>|>|<)", value)
+        for value in raw_values
+    )
+    if legacy_compatibility and (operator != "eq" or legacy_comparison_syntax):
+        return SemanticFilterNode(
+            node_id=node_id,
+            node_type="predicate",
+            semantic_ref_id=semantic_ref_id,
+            source_phrase=source_phrase,
+            operator=operator,
+            raw_values=raw_values,
+            bound_table=str(entry.table or ""),
+            bound_field=str(entry.key or ""),
+            member_kind=member_kind,
+            data_type=data_type,
+            resolution_status="legacy_operator_lossy",
+            knowledge_ref_ids=knowledge_ref_ids,
+            reason=(
+                "legacy filters[field,value] can represent exact equality only; "
+                "use native semanticQuery for comparison, negation, range or boolean predicates"
+            ),
+        )
+    if operator not in SEMANTIC_FILTER_OPERATORS_BY_TYPE.get(data_type, set()):
+        return SemanticFilterNode(
+            node_id=node_id,
+            node_type="predicate",
+            semantic_ref_id=semantic_ref_id,
+            source_phrase=source_phrase,
+            operator=operator,
+            raw_values=raw_values,
+            bound_table=str(entry.table or ""),
+            bound_field=str(entry.key or ""),
+            member_kind=member_kind,
+            data_type=data_type,
+            resolution_status="invalid_operator",
+            knowledge_ref_ids=knowledge_ref_ids,
+            reason="operator is incompatible with the governed member data type",
+        )
+    resolved, candidates, status, reason = resolve_semantic_filter_values(
+        entry,
+        member_kind,
+        data_type,
+        operator,
+        raw_values,
+    )
+    return SemanticFilterNode(
+        node_id=node_id,
+        node_type="predicate",
+        semantic_ref_id=semantic_ref_id,
+        source_phrase=source_phrase,
+        operator=operator,
+        raw_values=raw_values,
+        resolved_values=resolved,
+        bound_table=str(entry.table or ""),
+        bound_field=str(entry.key or ""),
+        member_kind=member_kind,
+        data_type=data_type,
+        resolution_status=status,
+        candidate_values=candidates,
+        knowledge_ref_ids=knowledge_ref_ids,
+        reason=reason,
+    )
+
+
+def bind_semantic_query_from_understanding(
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> SemanticQuerySpec:
+    native = semantic_query_payload_from_understanding(understanding)
+    raw = native or semantic_filter_legacy_query(understanding)
+    if not raw:
+        return SemanticQuerySpec()
+    legacy_compatibility = not bool(native)
+    nodes: List[SemanticFilterNode] = []
+    for payload in semantic_query_filter_node_payloads(raw):
+        node_type = semantic_filter_node_type(payload)
+        if node_type == "predicate":
+            nodes.append(bind_semantic_filter_predicate(payload, asset_pack, legacy_compatibility))
+            continue
+        nodes.append(
+            SemanticFilterNode(
+                node_id=semantic_filter_string(payload, "nodeId", "node_id"),
+                node_type=node_type,
+                logical_operator=semantic_filter_string(payload, "logicalOperator", "logical_operator").lower(),
+                child_node_ids=dedupe_strings(
+                    str(value)
+                    for value in (payload.get("childNodeIds") or payload.get("child_node_ids") or [])
+                    if str(value or "").strip()
+                ),
+                resolution_status="resolved" if node_type == "group" else "invalid",
+                reason="" if node_type == "group" else "nodeType must be predicate or group",
+            )
+        )
+    predicates = [node for node in nodes if node.node_type == "predicate"]
+    binding_status = "resolved" if predicates and all(node.resolution_status == "resolved" for node in predicates) else "unresolved"
+    source_refs = dedupe_strings(
+        [
+            *[str(value) for value in (raw.get("sourceRefIds") or raw.get("source_ref_ids") or [])],
+            *[node.semantic_ref_id for node in predicates if node.semantic_ref_id],
+        ]
+    )
+    try:
+        limit = int(raw.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    order_by = raw.get("orderBy") or raw.get("order_by") or []
+    return SemanticQuerySpec(
+        result_mode=semantic_filter_string(raw, "resultMode", "result_mode"),
+        filter_nodes=nodes,
+        root_filter_node_id=semantic_filter_string(raw, "rootFilterNodeId", "root_filter_node_id"),
+        select_ref_ids=dedupe_strings(str(value) for value in (raw.get("selectRefIds") or raw.get("select_ref_ids") or [])),
+        measure_ref_ids=dedupe_strings(str(value) for value in (raw.get("measureRefIds") or raw.get("measure_ref_ids") or [])),
+        dimension_ref_ids=dedupe_strings(str(value) for value in (raw.get("dimensionRefIds") or raw.get("dimension_ref_ids") or [])),
+        source_ref_ids=source_refs,
+        relationship_ref_ids=dedupe_strings(
+            str(value) for value in (raw.get("relationshipRefIds") or raw.get("relationship_ref_ids") or [])
+        ),
+        join_strategy=semantic_filter_string(raw, "joinStrategy", "join_strategy") or "auto",
+        order_by=[dict(item) for item in order_by if isinstance(item, dict)] if isinstance(order_by, list) else [],
+        limit=max(0, limit),
+        binding_status=binding_status,
+    )
+
+
+def semantic_query_legacy_projection(semantic_query: SemanticQuerySpec) -> Tuple[str, str]:
+    predicates = [node for node in semantic_query.filter_nodes if node.node_type == "predicate"]
+    mandatory_predicate_ids = semantic_filter_mandatory_positive_predicate_ids(semantic_query)
+    entity_predicates = [
+        node
+        for node in predicates
+        if node.node_id in mandatory_predicate_ids
+        and node.member_kind == "entity"
+        and node.resolution_status == "resolved"
+        and node.operator in {"eq", "in"}
+    ]
+    mandatory_predicates = [node for node in predicates if node.node_id in mandatory_predicate_ids]
+    candidates = entity_predicates if len(entity_predicates) == 1 else mandatory_predicates
+    if len(candidates) != 1:
+        return "", ""
+    node = candidates[0]
+    if node.resolution_status != "resolved" or node.operator not in {"eq", "in"} or node.member_kind == "measure":
+        return "", ""
+    return node.bound_field, ",".join(str(value) for value in node.resolved_values)
+
+
+def entity_reference_from_semantic_filter_node(
+    node: SemanticFilterNode,
+    asset_pack: PlanningAssetPack,
+    question: str,
+) -> EntityReference:
+    entries = semantic_filter_entries_for_ref(asset_pack, node.semantic_ref_id)
+    if len(entries) != 1 or node.member_kind != "entity":
+        return EntityReference(
+            semantic_ref_id=node.semantic_ref_id,
+            raw_label=node.bound_field,
+            raw_value=",".join(str(value) for value in node.raw_values),
+            values=list(node.resolved_values),
+            source="semantic_filter_contract",
+            status="unresolved",
+            time_scope_explicit=question_has_explicit_time_scope(question),
+        )
+    reference = build_entity_reference(
+        question=question,
+        raw_label=node.bound_field,
+        raw_value=",".join(str(value) for value in node.raw_values),
+        matching_entries=entries,
+        source="semantic_filter_contract",
+    )
+    return reference.model_copy(
+        update={
+            "table": node.bound_table,
+            "lookup_time_policy": entity_lookup_time_policy(node.bound_table, asset_pack),
+        }
+    )
+
+
+def semantic_filter_obligation(
+    node: SemanticFilterNode,
+    task_id: str,
+    status: str = "",
+) -> SemanticFilterObligation:
+    seed = json.dumps(
+        {
+            "taskId": task_id,
+            "nodeId": node.node_id,
+            "semanticRefId": node.semantic_ref_id,
+            "sourcePhrase": node.source_phrase,
+            "operator": node.operator,
+            "rawValues": node.raw_values,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return SemanticFilterObligation(
+        obligation_id="semantic_filter_%s" % hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16],
+        task_id=task_id,
+        node_id=node.node_id,
+        predicate_id=node.node_id,
+        semantic_ref_id=node.semantic_ref_id,
+        source_phrase=node.source_phrase,
+        operator=node.operator,
+        raw_values=list(node.raw_values),
+        resolved_values=list(node.resolved_values),
+        bound_table=node.bound_table,
+        bound_field=node.bound_field,
+        member_kind=node.member_kind,
+        data_type=node.data_type,
+        knowledge_ref_ids=list(node.knowledge_ref_ids),
+        status=status or ("bound" if node.resolution_status == "resolved" and task_id else node.resolution_status),
+        reason=node.reason,
+    )
+
+
 def semantic_filters_from_understanding(understanding: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Legacy flat-filter view kept for callers outside the semantic IR."""
+
     raw = understanding.get("filters") or understanding.get("filter") or []
     if not isinstance(raw, list):
         return []
@@ -13191,10 +14183,724 @@ def semantic_filters_from_understanding(understanding: Dict[str, Any]) -> List[T
         if not isinstance(item, dict):
             continue
         field = str(item.get("field") or item.get("column") or "").strip()
-        value = str(item.get("value") or "").strip()
+        values = semantic_filter_raw_values(item)
+        value = ",".join(str(part) for part in values).strip()
         if field and value and (field, value) not in filters:
             filters.append((field, value))
     return filters
+
+
+def semantic_filter_gap(
+    code: str,
+    evidence: str,
+    reason: str,
+    task_id: str = "",
+) -> GraphValidationGap:
+    return GraphValidationGap(code=code, evidence=evidence, task_id=task_id, reason=reason)
+
+
+def freeze_source_condition_ledger(
+    question: str,
+    payload: Dict[str, Any],
+    validation_errors: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Freeze an independent condition audit and recompute every source span.
+
+    Model-provided Unicode offsets are declarations only.  Exact phrases are
+    located by code; a missing or repeated phrase is not silently disambiguated.
+    """
+
+    source = payload if isinstance(payload, dict) else {}
+    issues = [str(item) for item in validation_errors if str(item or "").strip()]
+    raw_nodes = source.get("conditionNodes") or source.get("condition_nodes") or []
+    nodes: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw in raw_nodes if isinstance(raw_nodes, list) else []:
+        if not isinstance(raw, dict):
+            issues.append("condition node is not an object")
+            continue
+        node_id = semantic_filter_string(raw, "nodeId", "node_id")
+        node_type = semantic_filter_node_type(raw)
+        if not node_id or node_id in seen_ids:
+            issues.append("condition nodeId is missing or duplicated")
+        seen_ids.add(node_id)
+        node = {
+            "nodeId": node_id,
+            "nodeType": node_type,
+            "sourcePhrase": semantic_filter_string(raw, "sourcePhrase", "source_phrase"),
+            "operator": normalize_semantic_filter_operator(raw.get("operator")),
+            "rawValues": semantic_filter_raw_values(raw),
+            "logicalOperator": semantic_filter_string(raw, "logicalOperator", "logical_operator").lower(),
+            "childNodeIds": [
+                str(value)
+                for value in (raw.get("childNodeIds") or raw.get("child_node_ids") or [])
+                if str(value or "")
+            ],
+        }
+        if node_type == "predicate":
+            locations = exact_source_phrase_locations(question, node["sourcePhrase"])
+            if len(locations) != 1:
+                issues.append(
+                    "%s sourcePhrase must occur exactly once in the original question" % (node_id or "predicate")
+                )
+                node["startOffset"] = -1
+                node["endOffset"] = -1
+            else:
+                node["startOffset"], node["endOffset"] = locations[0]
+            for value in node["rawValues"]:
+                if str(value) and str(value) not in node["sourcePhrase"]:
+                    issues.append("%s rawValue is not verbatim within sourcePhrase" % (node_id or "predicate"))
+        else:
+            node["startOffset"] = 0
+            node["endOffset"] = 0
+        nodes.append(node)
+
+    excluded: List[Dict[str, Any]] = []
+    raw_excluded = source.get("excludedConstraints") or source.get("excluded_constraints") or []
+    for raw in raw_excluded if isinstance(raw_excluded, list) else []:
+        if not isinstance(raw, dict):
+            issues.append("excluded constraint is not an object")
+            continue
+        phrase = semantic_filter_string(raw, "sourcePhrase", "source_phrase")
+        locations = exact_source_phrase_locations(question, phrase)
+        if len(locations) != 1:
+            issues.append("excluded constraint sourcePhrase must occur exactly once in the original question")
+            start, end = -1, -1
+        else:
+            start, end = locations[0]
+        excluded.append(
+            {
+                "constraintType": semantic_filter_string(raw, "constraintType", "constraint_type").lower(),
+                "sourcePhrase": phrase,
+                "startOffset": start,
+                "endOffset": end,
+            }
+        )
+
+    declared_status = str(source.get("status") or "").strip().upper()
+    root = semantic_filter_string(source, "rootConditionNodeId", "root_condition_node_id")
+    if nodes and not root:
+        issues.append("rootConditionNodeId is required when conditionNodes is non-empty")
+    if not nodes and root:
+        issues.append("rootConditionNodeId must be empty when conditionNodes is empty")
+    if declared_status != "VERIFIED":
+        issues.append("independent condition auditor did not return VERIFIED")
+    auditor_status = "verified" if not issues else (
+        "ambiguous" if declared_status == "AMBIGUOUS" else "unverified"
+    )
+    ledger = {
+        "auditRequired": True,
+        "auditorStatus": auditor_status,
+        "verificationSource": "independent_llm_condition_auditor",
+        "questionHash": hashlib.sha256(str(question or "").encode("utf-8")).hexdigest(),
+        "conditionNodes": nodes,
+        "rootConditionNodeId": root,
+        "excludedConstraints": excluded,
+        "clarificationQuestion": str(source.get("clarificationQuestion") or ""),
+        "issues": dedupe_strings(issues),
+    }
+    encoded = json.dumps(
+        {
+            "questionHash": ledger["questionHash"],
+            "conditionExpression": canonical_source_condition_expression(nodes, root),
+            "excludedTypes": sorted(item["constraintType"] for item in excluded),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    ledger["auditHash"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return ledger
+
+
+def exact_source_phrase_locations(question: str, source_phrase: str) -> List[Tuple[int, int]]:
+    if not source_phrase:
+        return []
+    locations: List[Tuple[int, int]] = []
+    start = 0
+    while True:
+        index = str(question or "").find(source_phrase, start)
+        if index < 0:
+            break
+        locations.append((index, index + len(source_phrase)))
+        start = index + 1
+    return locations
+
+
+def canonical_source_condition_expression(nodes: Any, root_node_id: str) -> Any:
+    raw_nodes = [item for item in nodes if isinstance(item, dict)] if isinstance(nodes, list) else []
+    node_by_id = {
+        semantic_filter_string(item, "nodeId", "node_id"): item
+        for item in raw_nodes
+        if semantic_filter_string(item, "nodeId", "node_id")
+    }
+    visiting: set[str] = set()
+
+    def visit(node_id: str) -> Any:
+        if node_id in visiting:
+            return {"invalid": "cycle"}
+        node = node_by_id.get(node_id)
+        if node is None:
+            return {"invalid": "unknown_child"}
+        node_type = semantic_filter_node_type(node)
+        if node_type == "predicate":
+            operator = normalize_semantic_filter_operator(node.get("operator"))
+            values = semantic_filter_raw_values(node)
+            if operator in {"in", "not_in"}:
+                values = sorted(
+                    dedupe_values(values),
+                    key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+                )
+            return {
+                "type": "predicate",
+                "sourcePhrase": semantic_filter_string(node, "sourcePhrase", "source_phrase"),
+                "operator": operator,
+                "rawValues": values,
+            }
+        if node_type != "group":
+            return {"invalid": "node_type"}
+        logical = semantic_filter_string(node, "logicalOperator", "logical_operator").lower()
+        children = node.get("childNodeIds") or node.get("child_node_ids") or []
+        visiting.add(node_id)
+        expressions = [visit(str(child)) for child in children if str(child or "")]
+        visiting.discard(node_id)
+        if logical in {"and", "or"}:
+            expressions = sorted(
+                expressions,
+                key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+            )
+        return {"type": "group", "logicalOperator": logical, "children": expressions}
+
+    if root_node_id:
+        return visit(root_node_id)
+    expressions = [visit(node_id) for node_id in sorted(node_by_id)]
+    return sorted(
+        expressions,
+        key=lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def semantic_spec_source_condition_expression(spec: SemanticQuerySpec) -> Any:
+    nodes = [
+        {
+            "nodeId": node.node_id,
+            "nodeType": node.node_type,
+            "sourcePhrase": node.source_phrase,
+            "operator": node.operator,
+            "rawValues": list(node.raw_values),
+            "logicalOperator": node.logical_operator,
+            "childNodeIds": list(node.child_node_ids),
+        }
+        for node in spec.filter_nodes
+    ]
+    return canonical_source_condition_expression(nodes, spec.root_filter_node_id)
+
+
+def semantic_filter_spec_fingerprint(spec: SemanticQuerySpec) -> str:
+    payload = semantic_query_execution_contract(spec.model_dump(by_alias=True, mode="json"))
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def semantic_filter_topology_gaps(
+    spec: SemanticQuerySpec,
+    native_contract: bool,
+) -> List[GraphValidationGap]:
+    if not spec.filter_nodes:
+        return []
+    gaps: List[GraphValidationGap] = []
+    ids = [node.node_id for node in spec.filter_nodes]
+    for node in spec.filter_nodes:
+        if not node.node_id:
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_NODE_ID_MISSING",
+                    node.source_phrase or node.semantic_ref_id,
+                    "every semantic filter node requires a stable nodeId",
+                )
+            )
+    duplicates = sorted({node_id for node_id in ids if node_id and ids.count(node_id) > 1})
+    for node_id in duplicates:
+        gaps.append(
+            semantic_filter_gap(
+                "FILTER_NODE_DUPLICATE",
+                node_id,
+                "semantic filter nodeId must be unique",
+            )
+        )
+    node_by_id: Dict[str, SemanticFilterNode] = {}
+    for node in spec.filter_nodes:
+        if node.node_id and node.node_id not in node_by_id:
+            node_by_id[node.node_id] = node
+    root = spec.root_filter_node_id
+    if not root:
+        gaps.append(
+            semantic_filter_gap(
+                "FILTER_ROOT_MISSING",
+                "semanticQuery.rootFilterNodeId",
+                "semantic filter graph has predicates but no rootFilterNodeId",
+            )
+        )
+        return gaps
+    if root not in node_by_id:
+        gaps.append(
+            semantic_filter_gap(
+                "FILTER_ROOT_UNKNOWN",
+                root,
+                "rootFilterNodeId does not reference a declared filter node",
+            )
+        )
+        return gaps
+
+    for node in spec.filter_nodes:
+        if node.node_type == "predicate":
+            if native_contract and not node.source_phrase:
+                gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_SOURCE_PHRASE_MISSING",
+                        node.node_id,
+                        "native semantic filter predicates must preserve the user's sourcePhrase",
+                    )
+                )
+            continue
+        if node.node_type != "group":
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_NODE_TYPE_INVALID",
+                    node.node_id,
+                    "filter nodeType must be predicate or group",
+                )
+            )
+            continue
+        logical = node.logical_operator.lower()
+        if logical not in {"and", "or", "not"}:
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_LOGICAL_OPERATOR_INVALID",
+                    "%s:%s" % (node.node_id, logical),
+                    "group logicalOperator must be AND, OR, or NOT",
+                )
+            )
+        if not node.child_node_ids or (logical == "not" and len(node.child_node_ids) != 1):
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_GROUP_ARITY_INVALID",
+                    node.node_id,
+                    "AND/OR groups require children and NOT requires exactly one child",
+                )
+            )
+        for child in node.child_node_ids:
+            if child not in node_by_id:
+                gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_CHILD_UNKNOWN",
+                        "%s->%s" % (node.node_id, child),
+                        "filter group references an undeclared child node",
+                    )
+                )
+
+    reachable: set[str] = set()
+    visiting: set[str] = set()
+    cycles: set[Tuple[str, str]] = set()
+
+    def visit(node_id: str) -> None:
+        if node_id in visiting:
+            cycles.add((node_id, node_id))
+            return
+        if node_id in reachable:
+            return
+        visiting.add(node_id)
+        node = node_by_id.get(node_id)
+        if node and node.node_type == "group":
+            for child in node.child_node_ids:
+                if child in visiting:
+                    cycles.add((node_id, child))
+                    continue
+                if child in node_by_id:
+                    visit(child)
+        visiting.discard(node_id)
+        reachable.add(node_id)
+
+    visit(root)
+    for parent, child in sorted(cycles):
+        gaps.append(
+            semantic_filter_gap(
+                "FILTER_CYCLE",
+                "%s->%s" % (parent, child),
+                "semantic filter graph must be acyclic",
+            )
+        )
+    for node_id in sorted(set(node_by_id) - reachable):
+        gaps.append(
+            semantic_filter_gap(
+                "FILTER_NODE_UNREACHABLE",
+                node_id,
+                "declared filter node is not reachable from rootFilterNodeId",
+            )
+        )
+    return gaps
+
+
+def semantic_filter_binding_gaps(spec: SemanticQuerySpec) -> List[GraphValidationGap]:
+    gaps: List[GraphValidationGap] = []
+    for node in spec.filter_nodes:
+        if node.node_type != "predicate":
+            continue
+        if node.resolution_status == "unknown_ref":
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_SEMANTIC_REF_UNKNOWN",
+                    node.semantic_ref_id or node.node_id,
+                    "predicate semanticRefId is not present in the current PlanningAssetPack",
+                )
+            )
+        elif node.resolution_status == "ambiguous_ref":
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_SEMANTIC_REF_AMBIGUOUS",
+                    node.semantic_ref_id or node.node_id,
+                    "predicate semanticRefId resolves to multiple current semantic members",
+                )
+            )
+        elif node.resolution_status == "invalid_operator":
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_OPERATOR_UNSUPPORTED",
+                    "%s:%s:%s" % (node.semantic_ref_id, node.data_type, node.operator),
+                    node.reason or "operator is incompatible with the governed member type",
+                )
+            )
+        elif node.resolution_status == "legacy_operator_lossy":
+            gaps.append(
+                semantic_filter_gap(
+                    "LEGACY_FILTER_OPERATOR_LOSSY",
+                    "%s:%s" % (node.bound_field or node.semantic_ref_id, node.raw_values),
+                    node.reason or "legacy filter cannot preserve the requested operator",
+                )
+            )
+        elif node.resolution_status == "invalid":
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_VALUE_INVALID",
+                    node.node_id,
+                    node.reason or "predicate value cardinality is invalid",
+                )
+            )
+        elif node.resolution_status != "resolved":
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_VALUE_UNRESOLVED",
+                    "%s:%s" % (node.semantic_ref_id, node.raw_values),
+                    node.reason or "predicate raw value could not be resolved without guessing",
+                )
+            )
+    return gaps
+
+
+def source_condition_coverage_gaps(
+    plan: QueryPlan,
+    spec: SemanticQuerySpec,
+) -> List[GraphValidationGap]:
+    understanding = plan.question_understanding or {}
+    native = semantic_query_payload_from_understanding(understanding)
+    native_predicates = [
+        item
+        for item in semantic_query_filter_node_payloads(native)
+        if semantic_filter_node_type(item) == "predicate"
+    ]
+    ledger = understanding.get("sourceConditionLedger") or understanding.get("source_condition_ledger") or {}
+    contract_requires_audit = bool(
+        understanding.get("sourceConditionAuditRequired")
+        or understanding.get("source_condition_audit_required")
+        or any(str(item) == "SOURCE_CONDITION_AUDIT_REQUIRED" for item in plan.compiler_trace)
+    )
+    if not isinstance(ledger, dict) or not ledger:
+        if native_predicates or contract_requires_audit:
+            return [
+                semantic_filter_gap(
+                    "FILTER_COVERAGE_AUDIT_MISSING",
+                    "sourceConditionLedger",
+                    "native semanticQuery predicates require an independent raw-question condition audit",
+                )
+            ]
+        return []
+
+    ledger_nodes = ledger.get("conditionNodes") or ledger.get("condition_nodes") or []
+    ledger_nodes = [item for item in ledger_nodes if isinstance(item, dict)] if isinstance(ledger_nodes, list) else []
+    audit_required = bool(ledger.get("auditRequired", ledger.get("audit_required", False)))
+    auditor_status = str(ledger.get("auditorStatus") or ledger.get("auditor_status") or "").lower()
+    if auditor_status != "verified":
+        if not audit_required and not native_predicates and not ledger_nodes:
+            return []
+        reason = "; ".join(str(item) for item in (ledger.get("issues") or []) if str(item or ""))
+        return [
+            semantic_filter_gap(
+                "FILTER_COVERAGE_UNVERIFIED",
+                str(ledger.get("clarificationQuestion") or ledger.get("clarification_question") or "sourceConditionLedger"),
+                reason or "independent source-condition coverage could not be verified",
+            )
+        ]
+
+    question = next((intent.question for intent in plan.intents if intent.question), "") or str(
+        understanding.get("originalQuestion") or understanding.get("original_question") or ""
+    )
+    if audit_required and not question:
+        return [
+            semantic_filter_gap(
+                "FILTER_COVERAGE_QUESTION_MISSING",
+                "sourceConditionLedger.questionHash",
+                "independent condition coverage cannot be replay-verified without the original question",
+            )
+        ]
+    expected_hash = str(ledger.get("questionHash") or ledger.get("question_hash") or "")
+    if question and expected_hash != hashlib.sha256(question.encode("utf-8")).hexdigest():
+        return [
+            semantic_filter_gap(
+                "FILTER_COVERAGE_QUESTION_MISMATCH",
+                expected_hash,
+                "sourceConditionLedger belongs to a different raw question",
+            )
+        ]
+    span_gaps: List[GraphValidationGap] = []
+    if question:
+        for node in ledger_nodes:
+            if semantic_filter_node_type(node) != "predicate":
+                continue
+            phrase = semantic_filter_string(node, "sourcePhrase", "source_phrase")
+            locations = exact_source_phrase_locations(question, phrase)
+            if len(locations) != 1:
+                span_gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_SOURCE_SPAN_UNVERIFIED",
+                        phrase,
+                        "audited predicate sourcePhrase is missing or non-unique in the raw question",
+                    )
+                )
+    if span_gaps:
+        return span_gaps
+
+    ledger_root = semantic_filter_string(ledger, "rootConditionNodeId", "root_condition_node_id")
+    expected_expression = canonical_source_condition_expression(ledger_nodes, ledger_root)
+    planned_expression = semantic_spec_source_condition_expression(spec)
+    if expected_expression != planned_expression:
+        return [
+            semantic_filter_gap(
+                "FILTER_SOURCE_CONDITION_MISMATCH",
+                str(ledger.get("auditHash") or ledger.get("audit_hash") or ledger_root),
+                "semanticQuery does not preserve the independent condition AST's predicates, values, operators and boolean structure",
+            )
+        ]
+    return []
+
+
+def semantic_query_execution_gaps(
+    plan: QueryPlan,
+    spec: SemanticQuerySpec,
+) -> List[GraphValidationGap]:
+    """Reject Planner-authored SemanticQuery fields not consumed by runtime."""
+
+    understanding = plan.question_understanding or {}
+    raw = semantic_query_payload_from_understanding(understanding)
+    if not raw:
+        return []
+    gaps: List[GraphValidationGap] = []
+    unsupported_lists = {
+        "SEMANTIC_QUERY_SELECT_UNSUPPORTED": raw.get("selectRefIds") or raw.get("select_ref_ids") or [],
+        "SEMANTIC_QUERY_MEASURES_UNSUPPORTED": raw.get("measureRefIds") or raw.get("measure_ref_ids") or [],
+        "SEMANTIC_QUERY_DIMENSIONS_UNSUPPORTED": raw.get("dimensionRefIds") or raw.get("dimension_ref_ids") or [],
+        "SEMANTIC_QUERY_SOURCE_SCOPE_UNSUPPORTED": raw.get("sourceRefIds") or raw.get("source_ref_ids") or [],
+        "SEMANTIC_QUERY_RELATIONSHIPS_UNSUPPORTED": raw.get("relationshipRefIds") or raw.get("relationship_ref_ids") or [],
+        "SEMANTIC_QUERY_ORDER_UNSUPPORTED": raw.get("orderBy") or raw.get("order_by") or [],
+    }
+    for code, values in unsupported_lists.items():
+        if isinstance(values, list) and values:
+            gaps.append(
+                semantic_filter_gap(
+                    code,
+                    json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)[:500],
+                    "declared SemanticQuery field is not wired to the current executable SQL contract",
+                )
+            )
+    join_strategy = semantic_filter_string(raw, "joinStrategy", "join_strategy").lower() or "auto"
+    if join_strategy not in {"auto", "single_source"}:
+        gaps.append(
+            semantic_filter_gap(
+                "SEMANTIC_QUERY_JOIN_STRATEGY_UNSUPPORTED",
+                join_strategy,
+                "governed relationship planning has not produced an executable JOIN contract for this SemanticQuery",
+            )
+        )
+
+    executable = [
+        intent
+        for intent in plan.intents
+        if intent.intent_type == IntentType.VALID and intent.answer_mode != AnswerMode.RULE
+    ]
+    predicate_tables = {
+        node.bound_table
+        for node in spec.filter_nodes
+        if node.node_type == "predicate" and node.bound_table
+    }
+    applicable = [intent for intent in executable if intent.preferred_table in predicate_tables] if predicate_tables else executable
+    result_mode = semantic_filter_string(raw, "resultMode", "result_mode").lower()
+    expected_answer_mode = {
+        "detail": AnswerMode.DETAIL,
+        "metric": AnswerMode.METRIC,
+        "topn": AnswerMode.TOPN,
+        "group_agg": AnswerMode.GROUP_AGG,
+        "derived": AnswerMode.DERIVED,
+    }.get(result_mode)
+    if result_mode and expected_answer_mode is None:
+        gaps.append(
+            semantic_filter_gap(
+                "SEMANTIC_QUERY_RESULT_MODE_UNSUPPORTED",
+                result_mode,
+                "SemanticQuery resultMode is not mapped to an executable answer mode",
+            )
+        )
+    elif expected_answer_mode is not None and (
+        not applicable or any(intent.answer_mode != expected_answer_mode for intent in applicable)
+    ):
+        gaps.append(
+            semantic_filter_gap(
+                "SEMANTIC_QUERY_RESULT_MODE_MISMATCH",
+                result_mode,
+                "SemanticQuery resultMode does not match the compiled QueryGraph intent mode",
+            )
+        )
+    if spec.limit > 0:
+        if len(applicable) != 1:
+            gaps.append(
+                semantic_filter_gap(
+                    "SEMANTIC_QUERY_LIMIT_TARGET_AMBIGUOUS",
+                    str(spec.limit),
+                    "SemanticQuery limit requires exactly one executable target intent",
+                )
+            )
+        elif int(applicable[0].limit or 0) != spec.limit:
+            gaps.append(
+                semantic_filter_gap(
+                    "SEMANTIC_QUERY_LIMIT_NOT_BOUND",
+                    str(spec.limit),
+                    "SemanticQuery limit was not bound to the executable QueryGraph intent",
+                    task_id=applicable[0].plan_task_id,
+                )
+            )
+    return gaps
+
+
+def semantic_filter_plan_coverage_gaps(
+    plan: QueryPlan,
+    spec: SemanticQuerySpec,
+) -> List[GraphValidationGap]:
+    predicates = [node for node in spec.filter_nodes if node.node_type == "predicate"]
+    tables = {node.bound_table for node in predicates if node.bound_table}
+    if len(tables) > 1:
+        return [
+            semantic_filter_gap(
+                "FILTER_SCOPE_UNSUPPORTED",
+                ",".join(sorted(tables)),
+                "one boolean filter expression spans multiple tables and no governed cross-table predicate plan is available",
+            )
+        ]
+    if not tables:
+        return []
+    table = next(iter(tables))
+    applicable = [
+        intent
+        for intent in plan.intents
+        if intent.intent_type == IntentType.VALID
+        and intent.answer_mode != AnswerMode.RULE
+        and intent.preferred_table == table
+    ]
+    if not applicable:
+        return [
+            semantic_filter_gap(
+                "FILTER_NOT_PLANNED",
+                table,
+                "no executable QueryGraph intent owns the table required by the semantic filter expression",
+            )
+        ]
+    gaps: List[GraphValidationGap] = []
+    expected_fingerprint = semantic_filter_spec_fingerprint(spec)
+    for intent in applicable:
+        if not intent.semantic_query.filter_nodes:
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_NOT_PLANNED",
+                    spec.root_filter_node_id,
+                    "applicable QueryGraph intent does not carry the complete semantic filter expression",
+                    task_id=intent.plan_task_id,
+                )
+            )
+            continue
+        if semantic_filter_spec_fingerprint(intent.semantic_query) != expected_fingerprint:
+            gaps.append(
+                semantic_filter_gap(
+                    "FILTER_EXPRESSION_MISMATCH",
+                    spec.root_filter_node_id,
+                    "compiled intent semantic filter expression differs from questionUnderstanding",
+                    task_id=intent.plan_task_id,
+                )
+            )
+        obligations = [item for item in plan.semantic_filter_obligations if item.task_id == intent.plan_task_id]
+        for node in predicates:
+            if node.bound_table != table:
+                continue
+            matched = next((item for item in obligations if item.node_id == node.node_id), None)
+            if not matched:
+                gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_OBLIGATION_MISSING",
+                        node.node_id,
+                        "compiled semantic predicate has no immutable per-task filter obligation",
+                        task_id=intent.plan_task_id,
+                    )
+                )
+                continue
+            if matched.source_phrase != node.source_phrase or list(matched.raw_values) != list(node.raw_values):
+                gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_SOURCE_COVERAGE_MISMATCH",
+                        node.node_id,
+                        "filter obligation did not preserve the predicate sourcePhrase/rawValues",
+                        task_id=intent.plan_task_id,
+                    )
+                )
+    return gaps
+
+
+def semantic_filter_validation_gaps(
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+) -> List[GraphValidationGap]:
+    understanding = plan.question_understanding or {}
+    native = semantic_query_payload_from_understanding(understanding)
+    raw = native or semantic_filter_legacy_query(understanding)
+    spec = bind_semantic_query_from_understanding(understanding, asset_pack)
+    gaps = source_condition_coverage_gaps(plan, spec)
+    gaps.extend(semantic_query_execution_gaps(plan, spec))
+    if raw and semantic_query_filter_node_payloads(raw):
+        gaps.extend(semantic_filter_topology_gaps(spec, native_contract=bool(native)))
+        gaps.extend(semantic_filter_binding_gaps(spec))
+        gaps.extend(semantic_filter_plan_coverage_gaps(plan, spec))
+    unique: List[GraphValidationGap] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for gap in gaps:
+        marker = (gap.code, gap.task_id, gap.evidence)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(gap)
+    return unique
 
 
 def attach_metric_resolutions_from_understanding(
@@ -17024,6 +18730,12 @@ def knowledge_request_type_for_gap(gap: GraphValidationGap) -> KnowledgeRequestT
         "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
     }:
         return KnowledgeRequestType.METRIC
+    if gap.code in {
+        "FILTER_SEMANTIC_REF_UNKNOWN",
+        "FILTER_SEMANTIC_REF_AMBIGUOUS",
+        "FILTER_VALUE_UNRESOLVED",
+    } and ":metric:" in str(gap.evidence or ""):
+        return KnowledgeRequestType.METRIC
     return KnowledgeRequestType.FIELD
 
 
@@ -17044,6 +18756,9 @@ def validation_gap_should_request_knowledge(gap: GraphValidationGap) -> bool:
         "MEMORY_CONSTRAINT_ASSET_MISSING",
         "CALCULATION_NUMERATOR_MISSING",
         "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
+        "FILTER_SEMANTIC_REF_UNKNOWN",
+        "FILTER_SEMANTIC_REF_AMBIGUOUS",
+        "FILTER_VALUE_UNRESOLVED",
     }
 
 

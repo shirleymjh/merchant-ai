@@ -9,6 +9,11 @@ from merchant_ai.services.entity_contracts import (
     entity_filter_sql_hash,
 )
 from merchant_ai.services.memory_constraints import memory_constraint_evidence_gaps
+from merchant_ai.services.query import (
+    semantic_filter_contract_hash,
+    semantic_filter_execution_hash,
+    semantic_filter_value_hash,
+)
 
 
 class EvidenceVerifier:
@@ -31,6 +36,7 @@ class EvidenceVerifier:
         ]
         gaps.extend(execution_operational_evidence_gaps(run_result))
         gaps.extend(entity_filter_evidence_gaps(run_result))
+        gaps.extend(semantic_filter_evidence_gaps(run_result))
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
         gaps.extend(self._metric_spec_gaps(plan, derived_evidence))
@@ -1022,6 +1028,131 @@ def entity_filter_evidence_gaps(run_result: AgentRunResult) -> List[EvidenceGap]
                     source="entity_filter",
                     answer_instruction="逐项说明哪些请求 ID 未返回记录，不要把其他 ID 的结果替代它们。",
                     details={"missingValues": missing[:20]},
+                )
+            )
+    return gaps
+
+
+def semantic_filter_evidence_gaps(run_result: AgentRunResult) -> List[EvidenceGap]:
+    """Require an SQL-bound proof for every immutable user-filter obligation."""
+
+    gaps: List[EvidenceGap] = []
+    for task in run_result.task_results:
+        if task.query_bundle.failed:
+            continue
+        contract = task.node_plan_contract
+        nodes = {
+            item.node_id: item
+            for item in contract.semantic_query.filter_nodes
+            if item.node_id and item.node_type == "predicate"
+        }
+        obligations = [item for item in contract.semantic_filter_obligations if item.required]
+        if nodes and not obligations:
+            gaps.append(
+                EvidenceGap(
+                    code="SEMANTIC_FILTER_OBLIGATION_MISSING",
+                    task_id=task.task_id,
+                    evidence=contract.semantic_query.root_filter_node_id,
+                    reason="执行结果包含语义过滤图，但缺少规划阶段冻结的用户条件义务",
+                    severity="blocking",
+                    source="semantic_filter",
+                    answer_instruction="不能使用缺少用户条件义务账本的查询结果回答问题。",
+                )
+            )
+            continue
+        if not obligations:
+            continue
+        proof = task.semantic_filter_verification
+        expected_contract_hash = semantic_filter_contract_hash(contract)
+        expected_sql_hash = semantic_filter_execution_hash(
+            task.query_bundle.sql,
+            task.query_bundle.params,
+        )
+        if (
+            proof.status == "not_required"
+            or proof.contract_hash != expected_contract_hash
+            or proof.sql_hash != expected_sql_hash
+        ):
+            gaps.append(
+                EvidenceGap(
+                    code="SEMANTIC_FILTER_VERIFICATION_MISSING",
+                    task_id=task.task_id,
+                    evidence=contract.semantic_query.root_filter_node_id,
+                    reason="语义过滤执行结果缺少与当前 SQL 和条件契约绑定的验证证明",
+                    severity="blocking",
+                    source="semantic_filter",
+                    answer_instruction="不能声称结果满足了用户给出的全部过滤条件。",
+                    details={
+                        "requiredCount": len(obligations),
+                        "proofStatus": proof.status,
+                    },
+                )
+            )
+            continue
+        obligation_by_id = {item.obligation_id: item for item in obligations}
+        proof_by_id = {
+            item.obligation_id: item
+            for item in proof.predicate_proofs
+            if item.obligation_id
+        }
+        ledger_mismatches: List[str] = []
+        if len(obligation_by_id) != len(obligations) or len(proof_by_id) != len(proof.predicate_proofs):
+            ledger_mismatches.append("duplicate_obligation_or_proof_id")
+        for obligation_id, obligation in obligation_by_id.items():
+            item = proof_by_id.get(obligation_id)
+            node_id = str(obligation.node_id or obligation.predicate_id or "")
+            node = nodes.get(node_id)
+            if item is None or node is None:
+                ledger_mismatches.append(obligation_id)
+                continue
+            if (
+                item.node_id != node_id
+                or item.semantic_ref_id != obligation.semantic_ref_id
+                or item.bound_table != obligation.bound_table
+                or item.bound_field != obligation.bound_field
+                or str(item.member_kind or "").lower() != str(obligation.member_kind or "").lower()
+                or str(item.operator or "").lower() != str(obligation.operator or "").lower()
+                or sorted(item.resolved_value_hashes)
+                != sorted(semantic_filter_value_hash(value) for value in obligation.resolved_values)
+                or not item.verified
+            ):
+                ledger_mismatches.append(obligation_id)
+        if set(proof_by_id) != set(obligation_by_id):
+            ledger_mismatches.append("proof_obligation_set_mismatch")
+        if ledger_mismatches:
+            gaps.append(
+                EvidenceGap(
+                    code="SEMANTIC_FILTER_PROOF_LEDGER_MISMATCH",
+                    task_id=task.task_id,
+                    evidence=contract.semantic_query.root_filter_node_id,
+                    reason="语义过滤证明与规划义务账本不一致",
+                    severity="blocking",
+                    source="semantic_filter",
+                    answer_instruction="不能使用条件证明被替换、遗漏或重复的查询结果。",
+                    details={"mismatchIds": sorted(set(ledger_mismatches))[:20]},
+                )
+            )
+            continue
+        if (
+            not proof.verified
+            or not proof.coverage_complete
+            or proof.required_count != len(obligations)
+            or proof.verified_count != len(obligations)
+        ):
+            gaps.append(
+                EvidenceGap(
+                    code=proof.code or "SEMANTIC_FILTER_VERIFICATION_FAILED",
+                    task_id=task.task_id,
+                    evidence=contract.semantic_query.root_filter_node_id,
+                    reason=proof.reason or "部分用户过滤条件没有进入最终 SQL，或布尔结构发生变化",
+                    severity="blocking",
+                    source="semantic_filter",
+                    answer_instruction="不能声称结果满足了用户给出的全部过滤条件。",
+                    details={
+                        "requiredCount": len(obligations),
+                        "verifiedCount": proof.verified_count,
+                        "coverageComplete": proof.coverage_complete,
+                    },
                 )
             )
     return gaps

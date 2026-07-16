@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
+from merchant_ai.graph.query_graph_contract import query_graph_structure_fingerprint
 from merchant_ai.models import GraphValidationGap, KnowledgeRequest, PlanningAssetPack, QueryPlan, RecallBundle
+from merchant_ai.services.knowledge_requests import dedupe_knowledge_requests
 
 
 PlanFromPayload = Callable[[str, Dict[str, Any], PlanningAssetPack], QueryPlan]
@@ -217,19 +219,41 @@ class PlanRepairer:
         recall_bundle: RecallBundle,
     ) -> QueryPlan:
         if not plan.intents and self.llm.last_error.startswith("provider_error"):
-            plan.agent_trace.append("planner.repair.skipped_provider_error")
-            return plan
-        root_repaired = self.root_metric_repair(question, plan, asset_pack, self.compiler)
-        if root_repaired.compiler_trace != plan.compiler_trace or root_repaired.question_understanding != plan.question_understanding:
-            root_repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=promote_more_specific_root_metric"])
+            skipped = plan.model_copy(deep=True)
+            skipped.agent_trace.append("planner.repair.skipped_provider_error")
+            return skipped
+        original_structure = query_graph_structure_fingerprint(plan)
+        root_repaired = self.root_metric_repair(
+            question,
+            plan.model_copy(deep=True),
+            asset_pack,
+            self.compiler,
+        )
+        if query_graph_structure_fingerprint(root_repaired) != original_structure:
+            marker = "planner.repair=promote_more_specific_root_metric"
+            if marker not in root_repaired.agent_trace:
+                root_repaired.agent_trace.append(marker)
             return root_repaired
-        semantic_repaired = self.dependency_key_repair(question, plan, asset_pack, gaps)
-        if semantic_repaired.compiler_trace != plan.compiler_trace or len(semantic_repaired.dependencies) != len(plan.dependencies):
-            semantic_repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=semantic_relationship_graph_bridge"])
+        semantic_repaired = self.dependency_key_repair(
+            question,
+            plan.model_copy(deep=True),
+            asset_pack,
+            gaps,
+        )
+        if query_graph_structure_fingerprint(semantic_repaired) != original_structure:
+            marker = "planner.repair=semantic_relationship_graph_bridge"
+            if marker not in semantic_repaired.agent_trace:
+                semantic_repaired.agent_trace.append(marker)
             return semantic_repaired
-        semantic_repaired = self.missing_domain_repair(question, plan, asset_pack)
-        if len(semantic_repaired.intents) > len(plan.intents):
-            semantic_repaired.agent_trace.extend(plan.agent_trace + ["planner.repair=semantic_missing_domains"])
+        semantic_repaired = self.missing_domain_repair(
+            question,
+            plan.model_copy(deep=True),
+            asset_pack,
+        )
+        if query_graph_structure_fingerprint(semantic_repaired) != original_structure:
+            marker = "planner.repair=semantic_missing_domains"
+            if marker not in semantic_repaired.agent_trace:
+                semantic_repaired.agent_trace.append(marker)
             return semantic_repaired
         if self.llm.configured and gaps:
             payload = self.llm_repair(question, plan, asset_pack, gaps)
@@ -242,12 +266,21 @@ class PlanRepairer:
                     return repaired
             repair_requests = repair_payload_knowledge_requests(payload)
             if repair_requests:
-                return QueryPlan(
-                    knowledge_requests=repair_requests,
-                    agent_trace=plan.agent_trace + ["planner.repair=llm_requested_knowledge"],
+                # A supplemental knowledge request is not a replacement graph.
+                # Keep every executable/evidence-bearing contract monotonic so
+                # the workflow cannot mistake destructive graph loss for repair
+                # progress merely because the fingerprint changed.
+                repaired = plan.model_copy(deep=True)
+                repaired.knowledge_requests = dedupe_knowledge_requests(
+                    [*repaired.knowledge_requests, *repair_requests]
                 )
-        plan.agent_trace.append("planner.repair.unavailable")
-        return plan
+                marker = "planner.repair=llm_requested_knowledge"
+                if marker not in repaired.agent_trace:
+                    repaired.agent_trace.append(marker)
+                return repaired
+        unavailable = plan.model_copy(deep=True)
+        unavailable.agent_trace.append("planner.repair.unavailable")
+        return unavailable
 
 
 @dataclass

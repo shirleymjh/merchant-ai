@@ -219,7 +219,10 @@ class AgentState(TypedDict, total=False):
     thread_context: Dict[str, Any]
     runtime_injection: Dict[str, Any]
     memory_injection: Dict[str, Any]
+    memory_injection_raw_snapshot: Dict[str, Any]
     memory_injection_trace: Dict[str, Any]
+    memory_recall_status: str
+    memory_recall_issues: List[Dict[str, Any]]
     memory_ingestion_trace: Dict[str, Any]
     memory_constraints: List[Dict[str, Any]]
     memory_constraint_trace: Dict[str, Any]
