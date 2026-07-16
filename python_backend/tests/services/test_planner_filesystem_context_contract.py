@@ -9,6 +9,23 @@ from merchant_ai.services.planning import QueryGraphPlanner
 from merchant_ai.services.planning_tooling import compact_tool_result_for_prompt
 
 
+def empty_semantic_query(result_mode: str = "metric") -> dict[str, Any]:
+    return {
+        "resultMode": result_mode,
+        "filterNodes": [],
+        "rootFilterNodeId": "",
+        "selectRefIds": [],
+        "measureRefIds": [],
+        "dimensionRefIds": [],
+        "sourceRefIds": [],
+        "relationshipRefIds": [],
+        "joinStrategy": "auto",
+        "orderBy": [],
+        "limit": 0,
+        "bindingStatus": "unresolved",
+    }
+
+
 def planner_pack(metric_count: int = 36) -> PlanningAssetPack:
     tables = [
         PlanningAssetEntry(
@@ -290,9 +307,10 @@ def test_adaptive_planner_reads_exact_ref_before_emitting_understanding() -> Non
                                     "sourcePhrase": "Requested zero",
                                     "groupByColumn": "event_day",
                                 },
-                                "requestedMeasures": [],
-                                "filters": [],
-                                "timeWindowDays": 11,
+                                    "requestedMeasures": [],
+                                    "filters": [],
+                                    "semanticQuery": empty_semantic_query(),
+                                    "timeWindowDays": 11,
                             },
                         },
                     }
@@ -438,8 +456,9 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
                                     }
                                     for index in range(1, 5)
                                 ],
-                                "filters": [],
-                                "timeWindowDays": 11,
+                                    "filters": [],
+                                    "semanticQuery": empty_semantic_query(),
+                                    "timeWindowDays": 11,
                             },
                         },
                     }
@@ -566,8 +585,9 @@ def test_terminal_planner_round_forces_validated_emit_and_retries_invalid_struct
                                     "sourcePhrase": "Requested zero",
                                     "groupByColumn": "event_day",
                                 },
-                                "supportMetrics": [],
-                                "timeWindowDays": 11,
+                                    "supportMetrics": [],
+                                    "semanticQuery": empty_semantic_query(),
+                                    "timeWindowDays": 11,
                             },
                         },
                     }

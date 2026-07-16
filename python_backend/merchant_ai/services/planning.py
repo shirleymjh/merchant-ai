@@ -1084,12 +1084,27 @@ class QueryGraphPlanner:
             trace,
             planner_context=planner_context,
         )
-        if plan.intents:
-            understanding = deepcopy(plan.question_understanding or {})
-            understanding["sourceConditionLedger"] = self._independent_source_condition_ledger(question)
-            understanding["sourceConditionAuditRequired"] = True
-            plan = plan.model_copy(update={"question_understanding": understanding})
+        plan = self._attach_source_condition_audit(question, plan)
         return plan, requests, reason
+
+    def _attach_source_condition_audit(self, question: str, plan: QueryPlan) -> QueryPlan:
+        """Seal every executable Planner result with one independent audit."""
+
+        if not plan.intents:
+            return plan
+        understanding = deepcopy(plan.question_understanding or {})
+        understanding["sourceConditionLedger"] = self._independent_source_condition_ledger(question)
+        understanding["sourceConditionAuditRequired"] = True
+        understanding.setdefault("originalQuestion", question)
+        trace = list(plan.compiler_trace or [])
+        if "SOURCE_CONDITION_AUDIT_REQUIRED" not in trace:
+            trace.append("SOURCE_CONDITION_AUDIT_REQUIRED")
+        return plan.model_copy(
+            update={
+                "question_understanding": understanding,
+                "compiler_trace": trace,
+            }
+        )
 
     def _plan_without_source_condition_audit(
         self,
@@ -1509,12 +1524,13 @@ class QueryGraphPlanner:
         asset_pack: PlanningAssetPack,
         planner_context: Dict[str, Any] | None = None,
     ) -> Tuple[QueryPlan, Dict[str, Any]]:
-        return self._semantic_asset_selection_plan(
+        plan, payload = self._semantic_asset_selection_plan(
             question,
             recall_bundle,
             asset_pack,
             planner_context=planner_context,
         )
+        return self._attach_source_condition_audit(question, plan), payload
 
     def _multi_metric_trend_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         return compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
@@ -1643,6 +1659,7 @@ class QueryGraphPlanner:
             understanding = audited
         expansion_trace = self._expand_asset_pack_from_understanding(asset_pack, understanding) if isinstance(understanding, dict) else []
         plan = self.plan_compiler.compile(question, compile_payload, asset_pack)
+        plan = self._attach_source_condition_audit(question, plan)
         if expansion_trace:
             plan.compiler_trace.extend(expansion_trace)
         append_prompt_trace(plan, payload)
@@ -1688,18 +1705,17 @@ class QueryGraphPlanner:
                 except TypeError:
                     payload = self.llm.json_chat(system, user, {})
         except Exception as exc:
-            return freeze_source_condition_ledger(
-                question,
-                {},
-                ["condition auditor failed: %s: %s" % (type(exc).__name__, str(exc)[:240])],
-            )
-        payload = payload if isinstance(payload, dict) else {}
-        errors = structured_output_validation_errors(payload, tool.parameters)
+            payload = {}
+            errors = ["condition auditor failed: %s: %s" % (type(exc).__name__, str(exc)[:240])]
+        else:
+            payload = payload if isinstance(payload, dict) else {}
+            errors = structured_output_validation_errors(payload, tool.parameters)
         ledger = freeze_source_condition_ledger(question, payload, errors)
-        if ledger.get("auditorStatus") in {"verified", "ambiguous"}:
-            self._source_condition_ledger_cache[question_hash] = deepcopy(ledger)
-            if len(self._source_condition_ledger_cache) > 256:
-                self._source_condition_ledger_cache.pop(next(iter(self._source_condition_ledger_cache)))
+        # The ledger is an immutable per-question observation. Cache failures as
+        # well as successes so retries cannot silently replace the critic input.
+        self._source_condition_ledger_cache[question_hash] = deepcopy(ledger)
+        if len(self._source_condition_ledger_cache) > 256:
+            self._source_condition_ledger_cache.pop(next(iter(self._source_condition_ledger_cache)))
         return ledger
 
     def _semantic_asset_selection_plan(
@@ -1717,6 +1733,7 @@ class QueryGraphPlanner:
         plan = self._compile_semantic_asset_selection_payload(question, payload, asset_pack)
         if not plan.intents:
             return plan, payload
+        plan = self._attach_source_condition_audit(question, plan)
         validation = QueryGraphValidator().validate(
             question,
             plan,
@@ -5515,6 +5532,7 @@ class QueryGraphValidator:
             )
         gaps.extend(metric_candidate_decision_gaps(plan, asset_pack))
         gaps.extend(metric_obligation_validation_gaps(plan, asset_pack))
+        gaps.extend(semantic_filter_validation_gaps(plan, asset_pack))
         gaps.extend(explicit_object_ref_filter_gaps(question, plan, asset_pack))
         gaps.extend(calculation_contract_gaps(plan))
         gaps.extend(group_by_semantic_contract_gaps(plan, asset_pack))
@@ -14212,6 +14230,8 @@ def freeze_source_condition_ledger(
 
     source = payload if isinstance(payload, dict) else {}
     issues = [str(item) for item in validation_errors if str(item or "").strip()]
+    if not str(question or ""):
+        issues.append("original question is required for source-condition verification")
     raw_nodes = source.get("conditionNodes") or source.get("condition_nodes") or []
     nodes: List[Dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -14221,6 +14241,8 @@ def freeze_source_condition_ledger(
             continue
         node_id = semantic_filter_string(raw, "nodeId", "node_id")
         node_type = semantic_filter_node_type(raw)
+        if node_type not in {"predicate", "group"}:
+            issues.append("%s has an unsupported nodeType" % (node_id or "condition node"))
         if not node_id or node_id in seen_ids:
             issues.append("condition nodeId is missing or duplicated")
         seen_ids.add(node_id)
@@ -14253,6 +14275,13 @@ def freeze_source_condition_ledger(
         else:
             node["startOffset"] = 0
             node["endOffset"] = 0
+            if node["logicalOperator"] not in {"and", "or", "not"}:
+                issues.append("%s group logicalOperator is invalid" % (node_id or "group"))
+            child_count = len(node["childNodeIds"])
+            if (node["logicalOperator"] == "not" and child_count != 1) or (
+                node["logicalOperator"] in {"and", "or"} and child_count < 2
+            ):
+                issues.append("%s group child cardinality is invalid" % (node_id or "group"))
         nodes.append(node)
 
     excluded: List[Dict[str, Any]] = []
@@ -14268,12 +14297,16 @@ def freeze_source_condition_ledger(
             start, end = -1, -1
         else:
             start, end = locations[0]
+        constraint_type = semantic_filter_string(raw, "constraintType", "constraint_type").lower()
+        if constraint_type not in {"time_window", "result_limit", "result_order", "projection"}:
+            issues.append("excluded constraint has an unsupported constraintType")
         excluded.append(
             {
-                "constraintType": semantic_filter_string(raw, "constraintType", "constraint_type").lower(),
+                "constraintType": constraint_type,
                 "sourcePhrase": phrase,
                 "startOffset": start,
                 "endOffset": end,
+                "reason": semantic_filter_string(raw, "reason"),
             }
         )
 
@@ -14283,6 +14316,29 @@ def freeze_source_condition_ledger(
         issues.append("rootConditionNodeId is required when conditionNodes is non-empty")
     if not nodes and root:
         issues.append("rootConditionNodeId must be empty when conditionNodes is empty")
+    node_by_id = {item["nodeId"]: item for item in nodes if item["nodeId"]}
+    if root and root not in node_by_id:
+        issues.append("rootConditionNodeId references an unknown node")
+    for node in nodes:
+        for child in node["childNodeIds"]:
+            if child not in node_by_id:
+                issues.append("%s references an unknown child node" % (node["nodeId"] or "group"))
+    expression = canonical_source_condition_expression(nodes, root)
+    if "invalid" in json.dumps(expression, ensure_ascii=False, sort_keys=True):
+        issues.append("condition graph is cyclic or structurally invalid")
+    predicate_spans = [
+        (item["startOffset"], item["endOffset"])
+        for item in nodes
+        if item["nodeType"] == "predicate" and item["startOffset"] >= 0
+    ]
+    for item in excluded:
+        if item["startOffset"] < 0:
+            continue
+        if any(
+            max(item["startOffset"], start) < min(item["endOffset"], end)
+            for start, end in predicate_spans
+        ):
+            issues.append("excluded constraint overlaps a row predicate source span")
     if declared_status != "VERIFIED":
         issues.append("independent condition auditor did not return VERIFIED")
     auditor_status = "verified" if not issues else (
@@ -14302,7 +14358,7 @@ def freeze_source_condition_ledger(
     encoded = json.dumps(
         {
             "questionHash": ledger["questionHash"],
-            "conditionExpression": canonical_source_condition_expression(nodes, root),
+            "conditionExpression": expression,
             "excludedTypes": sorted(item["constraintType"] for item in excluded),
         },
         ensure_ascii=False,
@@ -14649,9 +14705,9 @@ def source_condition_coverage_gaps(
             )
         ]
 
-    question = next((intent.question for intent in plan.intents if intent.question), "") or str(
+    question = str(
         understanding.get("originalQuestion") or understanding.get("original_question") or ""
-    )
+    ) or next((intent.question for intent in plan.intents if intent.question), "")
     if audit_required and not question:
         return [
             semantic_filter_gap(
@@ -14684,6 +14740,43 @@ def source_condition_coverage_gaps(
                         "audited predicate sourcePhrase is missing or non-unique in the raw question",
                     )
                 )
+                continue
+            expected_start, expected_end = locations[0]
+            try:
+                stored_start = int(node.get("startOffset", node.get("start_offset", -1)))
+                stored_end = int(node.get("endOffset", node.get("end_offset", -1)))
+            except (TypeError, ValueError):
+                stored_start, stored_end = -1, -1
+            if stored_start != expected_start or stored_end != expected_end:
+                span_gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_SOURCE_SPAN_UNVERIFIED",
+                        phrase,
+                        "audited predicate offsets do not match the independently replayed question span",
+                    )
+                )
+            if any(str(value) not in phrase for value in semantic_filter_raw_values(node) if str(value)):
+                span_gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_SOURCE_VALUE_UNVERIFIED",
+                        phrase,
+                        "audited rawValues are not verbatim within their sourcePhrase",
+                    )
+                )
+        for item in ledger.get("excludedConstraints") or ledger.get("excluded_constraints") or []:
+            if not isinstance(item, dict):
+                continue
+            constraint_type = semantic_filter_string(item, "constraintType", "constraint_type").lower()
+            phrase = semantic_filter_string(item, "sourcePhrase", "source_phrase")
+            locations = exact_source_phrase_locations(question, phrase)
+            if constraint_type not in {"time_window", "result_limit", "result_order", "projection"} or len(locations) != 1:
+                span_gaps.append(
+                    semantic_filter_gap(
+                        "FILTER_EXCLUDED_CONSTRAINT_UNVERIFIED",
+                        "%s:%s" % (constraint_type, phrase),
+                        "time/result-shape classification is unknown, missing or non-unique in the raw question",
+                    )
+                )
     if span_gaps:
         return span_gaps
 
@@ -14712,6 +14805,21 @@ def semantic_query_execution_gaps(
     if not raw:
         return []
     gaps: List[GraphValidationGap] = []
+    aliases = {
+        "resultMode", "result_mode", "filterNodes", "filter_nodes", "rootFilterNodeId", "root_filter_node_id",
+        "selectRefIds", "select_ref_ids", "measureRefIds", "measure_ref_ids", "dimensionRefIds", "dimension_ref_ids",
+        "sourceRefIds", "source_ref_ids", "relationshipRefIds", "relationship_ref_ids", "joinStrategy", "join_strategy",
+        "orderBy", "order_by", "limit", "bindingStatus", "binding_status",
+    }
+    unknown_fields = sorted(str(key) for key in raw if str(key) not in aliases)
+    if unknown_fields:
+        gaps.append(
+            semantic_filter_gap(
+                "SEMANTIC_QUERY_FIELD_UNSUPPORTED",
+                ",".join(unknown_fields),
+                "SemanticQuery contains fields outside the governed executable contract",
+            )
+        )
     unsupported_lists = {
         "SEMANTIC_QUERY_SELECT_UNSUPPORTED": raw.get("selectRefIds") or raw.get("select_ref_ids") or [],
         "SEMANTIC_QUERY_MEASURES_UNSUPPORTED": raw.get("measureRefIds") or raw.get("measure_ref_ids") or [],
@@ -14721,12 +14829,30 @@ def semantic_query_execution_gaps(
         "SEMANTIC_QUERY_ORDER_UNSUPPORTED": raw.get("orderBy") or raw.get("order_by") or [],
     }
     for code, values in unsupported_lists.items():
-        if isinstance(values, list) and values:
+        if values:
             gaps.append(
                 semantic_filter_gap(
                     code,
                     json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)[:500],
                     "declared SemanticQuery field is not wired to the current executable SQL contract",
+                )
+            )
+    allowed_node_fields = {
+        "nodeId", "node_id", "nodeType", "node_type", "semanticRefId", "semantic_ref_id",
+        "sourcePhrase", "source_phrase", "operator", "rawValues", "raw_values", "logicalOperator",
+        "logical_operator", "childNodeIds", "child_node_ids", "knowledgeRefIds", "knowledge_ref_ids", "reason",
+    }
+    for node in semantic_query_filter_node_payloads(raw):
+        unknown_node_fields = sorted(str(key) for key in node if str(key) not in allowed_node_fields)
+        if unknown_node_fields:
+            gaps.append(
+                semantic_filter_gap(
+                    "SEMANTIC_FILTER_NODE_FIELD_UNSUPPORTED",
+                    "%s:%s" % (
+                        semantic_filter_string(node, "nodeId", "node_id"),
+                        ",".join(unknown_node_fields),
+                    ),
+                    "Planner filter nodes cannot provide physical bindings or fields outside the governed semantic contract",
                 )
             )
     join_strategy = semantic_filter_string(raw, "joinStrategy", "join_strategy").lower() or "auto"
@@ -14736,6 +14862,15 @@ def semantic_query_execution_gaps(
                 "SEMANTIC_QUERY_JOIN_STRATEGY_UNSUPPORTED",
                 join_strategy,
                 "governed relationship planning has not produced an executable JOIN contract for this SemanticQuery",
+            )
+        )
+    binding_status = semantic_filter_string(raw, "bindingStatus", "binding_status").lower() or "unresolved"
+    if binding_status != "unresolved":
+        gaps.append(
+            semantic_filter_gap(
+                "SEMANTIC_QUERY_BINDING_STATUS_INVALID",
+                binding_status,
+                "Planner SemanticQuery must remain unresolved until governed binding runs",
             )
         )
 

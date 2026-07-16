@@ -121,6 +121,7 @@ from merchant_ai.services.query_sql_binding import (
     predicate_column_name,
     quote_identifier,
     realtime_fallback_for_table,
+    split_detail_sql_chunk_contract_error,
     split_window_coverage_contract,
     sql_has_bound_merchant_filter,
     sql_has_mandatory_column_filter,
@@ -4399,8 +4400,16 @@ class NodeWorkerExecutor:
             split_sql = split_chunk.sql
             split_validation = self.validator.validate(split_sql, asset_pack)
             split_validation = self._node_scope_validation(split_validation, intent, split_sql, asset_pack)
-            split_validation = self._contract_scope_validation(split_validation, intent, split_sql, contract)
             if not split_validation.valid:
+                return None
+            chunk_error_code, chunk_error = split_detail_sql_chunk_contract_error(
+                safe_sql,
+                split_plan,
+                split_chunk,
+                time_column,
+                limit,
+            )
+            if chunk_error_code:
                 return None
             safe_bound_sql, safe_params, binding_error = bind_node_sql_parameters(
                 split_sql,

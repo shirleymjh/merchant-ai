@@ -4,11 +4,11 @@ from merchant_ai.graph.query_graph_contract import query_graph_structure_fingerp
 from merchant_ai.models import (
     QueryPlan,
     QuestionIntent,
-    SemanticFilterNode,
     SemanticFilterObligation,
     SemanticQuerySpec,
 )
 from merchant_ai.services.planning_tooling import planner_structured_output_validation_errors
+from merchant_ai.services.planning import semantic_query_execution_gaps
 from merchant_ai.services.tools import question_understanding_tool
 
 
@@ -71,7 +71,7 @@ def test_question_understanding_tool_exposes_non_recursive_semantic_query_graph(
     understanding = tool.parameters["properties"]["questionUnderstanding"]
     semantic_query = understanding["properties"]["semanticQuery"]
 
-    assert "semanticQuery" not in understanding["required"]  # legacy Planner compatibility
+    assert "semanticQuery" in understanding["required"]
     assert semantic_query["properties"]["filterNodes"]["items"]["type"] == "object"
     assert "$ref" not in str(semantic_query)
     assert "oneOf" not in str(semantic_query)
@@ -149,3 +149,37 @@ def test_semantic_filter_changes_executable_graph_fingerprint_but_reason_does_no
     changed.intents[0].semantic_query.filter_nodes[0].raw_values = ["M-2"]
     changed.semantic_filter_obligations[0].raw_values = ["M-2"]
     assert query_graph_structure_fingerprint(changed) != original
+
+
+def test_every_unconsumed_semantic_query_field_is_rejected_with_typed_gaps():
+    raw = {
+        "resultMode": "detail",
+        "filterNodes": [{"nodeId": "p1", "nodeType": "predicate", "boundField": "physical_id"}],
+        "rootFilterNodeId": "p1",
+        "selectRefIds": ["select"],
+        "measureRefIds": ["measure"],
+        "dimensionRefIds": ["dimension"],
+        "sourceRefIds": ["source"],
+        "relationshipRefIds": ["relationship"],
+        "joinStrategy": "relationship",
+        "orderBy": [{"semanticRefId": "measure", "direction": "desc"}],
+        "limit": 0,
+        "bindingStatus": "resolved",
+        "futureField": "must not be ignored",
+    }
+    plan = QueryPlan(question_understanding={"semanticQuery": raw})
+
+    codes = {gap.code for gap in semantic_query_execution_gaps(plan, SemanticQuerySpec())}
+
+    assert codes >= {
+        "SEMANTIC_QUERY_FIELD_UNSUPPORTED",
+        "SEMANTIC_FILTER_NODE_FIELD_UNSUPPORTED",
+        "SEMANTIC_QUERY_SELECT_UNSUPPORTED",
+        "SEMANTIC_QUERY_MEASURES_UNSUPPORTED",
+        "SEMANTIC_QUERY_DIMENSIONS_UNSUPPORTED",
+        "SEMANTIC_QUERY_SOURCE_SCOPE_UNSUPPORTED",
+        "SEMANTIC_QUERY_RELATIONSHIPS_UNSUPPORTED",
+        "SEMANTIC_QUERY_ORDER_UNSUPPORTED",
+        "SEMANTIC_QUERY_JOIN_STRATEGY_UNSUPPORTED",
+        "SEMANTIC_QUERY_BINDING_STATUS_INVALID",
+    }

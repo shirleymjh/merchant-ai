@@ -4739,6 +4739,25 @@ class MerchantQaWorkflow:
             dedupe_workflow_knowledge_requests(list(state.get("pending_knowledge_requests") or []) + list(result.recommended_knowledge_requests or [])),
         )
         if result.valid:
+            repair_delta = state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()
+            reflection = state.get("planner_reflection") or PlannerReflectionResult()
+            repair_revalidated = bool(
+                repair_delta.status == "pending_revalidation"
+                and repair_delta.changed
+                and state.get("query_graph_reflected")
+                and reflection.passed
+                and repair_delta.after_graph_fingerprint == query_graph_fingerprint(state.get("plan"))
+            )
+            if repair_revalidated:
+                repair_delta = repair_delta.model_copy(update={"status": "success"})
+                state["last_query_graph_repair_delta"] = repair_delta
+                history = list(state.get("query_graph_repair_history") or [])
+                for index in range(len(history) - 1, -1, -1):
+                    item = history[index]
+                    if item.attempt == repair_delta.attempt and item.scope_key == repair_delta.scope_key:
+                        history[index] = repair_delta.model_copy(deep=True)
+                        break
+                state["query_graph_repair_history"] = history
             state["planner_reflection"] = PlannerReflectionResult()
             state["planner_repair_reason"] = ""
             state["planner_repair_requests"] = []
@@ -4975,81 +4994,11 @@ class MerchantQaWorkflow:
         after_structure_fingerprint = query_graph_structure_fingerprint(repaired_plan)
         structure_changed = after_structure_fingerprint != before_structure_fingerprint
 
-        # A different hash is only a candidate.  Re-run both deterministic
-        # graph validation and PlannerCritic, then require every original typed
-        # target to disappear before reporting Repair success.
-        verification_gaps: List[GraphValidationGap] = []
-        try:
-            candidate_validation = self.graph_validator.validate(
-                state["question"],
-                repaired_plan,
-                state["planning_asset_pack"],
-                state.get("memory_constraints", []),
-            )
-            candidate_validation = validation_with_question_coverage(
-                state["question"],
-                repaired_plan,
-                state["planning_asset_pack"],
-                candidate_validation,
-            )
-            verification_gaps.extend(candidate_validation.gaps or [])
-            candidate_reflection = self.planner_reflection_agent.reflect(
-                state["question"],
-                repaired_plan,
-                state["planning_asset_pack"],
-            )
-            for issue in candidate_reflection.issues or []:
-                if not isinstance(issue, dict) or str(issue.get("severity") or "error").lower() != "error":
-                    continue
-                code = str(issue.get("code") or "")
-                if not code:
-                    continue
-                verification_gaps.append(
-                    GraphValidationGap(
-                        code=code,
-                        task_id=str(issue.get("taskId") or issue.get("task_id") or ""),
-                        evidence=str(issue.get("evidence") or ""),
-                        reason=str(issue.get("reason") or ""),
-                    )
-                )
-        except Exception as exc:
-            verification_gaps.append(
-                GraphValidationGap(
-                    code="QUERY_GRAPH_REPAIR_REVALIDATION_FAILED",
-                    evidence=type(exc).__name__,
-                    reason="repair candidate revalidation failed: %s: %s"
-                    % (type(exc).__name__, str(exc)[:300]),
-                )
-            )
-        verification_gaps = dedupe_graph_validation_gaps(verification_gaps)
-        target_keys = {
-            (str(gap.code or ""), str(gap.task_id or ""))
-            for gap in retained_query_graph_repair_gaps(repair_input)
-            if str(gap.code or "") not in QUERY_GRAPH_REPAIR_OPERATIONAL_GAP_CODES
-        }
-        remaining_target_gaps = [
-            gap
-            for gap in verification_gaps
-            if any(
-                target_code == str(gap.code or "")
-                and (not target_task or target_task == str(gap.task_id or ""))
-                for target_code, target_task in target_keys
-            )
-        ]
-        targets_revalidated = bool(target_keys) and not remaining_target_gaps and not any(
-            gap.code == "QUERY_GRAPH_REPAIR_REVALIDATION_FAILED" for gap in verification_gaps
-        )
-        before_candidate_fingerprint = query_graph_fingerprint(
-            before_plan.model_copy(update={"knowledge_requests": []})
-        )
-        after_candidate_fingerprint = query_graph_fingerprint(
-            repaired_plan.model_copy(update={"knowledge_requests": []})
-        )
-        candidate_changed = bool(
-            structure_changed or after_candidate_fingerprint != before_candidate_fingerprint
-        )
-        changed = bool(targets_revalidated and candidate_changed)
-        awaiting_knowledge = bool(not candidate_changed and not changed and added_knowledge_requests)
+        # Repair only proposes a candidate.  It cannot act as its own Critic:
+        # structural change is committed as pending revalidation and the next
+        # workflow observation must run PlannerCritic/Validator independently.
+        changed = structure_changed
+        awaiting_knowledge = bool(not changed and added_knowledge_requests)
         if awaiting_knowledge:
             # Asking for governed knowledge suspends this repair. It is an
             # orchestration transition, not a failed executable-graph attempt,
@@ -5061,7 +5010,11 @@ class MerchantQaWorkflow:
             state["query_graph_repair_scope_attempts"] = scope_attempts
             state["query_graph_repair_scope_attempt_count"] = prior_scope_attempts
         exhausted = bool(not changed and not awaiting_knowledge and scope_attempt >= max_scope_attempts)
-        repair_status = "success" if changed else ("awaiting_knowledge" if awaiting_knowledge else "no_progress")
+        repair_status = (
+            "pending_revalidation"
+            if changed
+            else ("awaiting_knowledge" if awaiting_knowledge else "no_progress")
+        )
         delta = QueryGraphRepairDelta(
             attempt=total_attempt,
             scope_attempt=scope_attempt,
@@ -5087,6 +5040,13 @@ class MerchantQaWorkflow:
             state["plan"] = repaired_plan
             state["query_graph_repair_progressed"] = True
             self.materialize_plan_clarification(state)
+            state["last_action_result"] = ActionResult(
+                action="repair_graph",
+                node="repair_query_graph",
+                status="pending_revalidation",
+                message="repair produced a structural candidate; PlannerCritic and Validator must revalidate it",
+                retryable=True,
+            )
         elif awaiting_knowledge:
             state["plan"] = repaired_plan
             state["last_action_result"] = ActionResult(
@@ -5104,7 +5064,7 @@ class MerchantQaWorkflow:
                 action="repair_graph",
                 node="repair_query_graph",
                 status="no_progress",
-                message="repair candidate did not clear its original typed gaps under revalidation",
+                message="repair did not change the executable/evidence-bearing graph contract",
                 retryable=not exhausted,
             )
 
@@ -5116,13 +5076,25 @@ class MerchantQaWorkflow:
                 ),
             )
         if changed:
-            invalidate_graph_validation(state)
             state["query_graph_reflected"] = False
-            state["planner_reflection"] = PlannerReflectionResult()
-            state["planner_repair_reason"] = ""
-            state["planner_repair_requests"] = []
+            pending_gaps = dedupe_graph_validation_gaps(
+                [
+                    GraphValidationGap(
+                        code="QUERY_GRAPH_REPAIR_PENDING_REVALIDATION",
+                        evidence=after_structure_fingerprint,
+                        reason="repair changed the executable graph; original typed gaps remain blocking until independent PlannerCritic/Validator revalidation passes",
+                    ),
+                    *retained_query_graph_repair_gaps(repair_input),
+                ]
+            )
+            record_graph_validation(
+                state,
+                GraphValidationResult(valid=False, repairable=True, gaps=pending_gaps),
+            )
+            mark_graph_validation_stale(state)
+            state["last_query_graph_validation_gaps"] = pending_gaps
             self.invalidate_execution_outputs(state, "QueryGraph 修复后需要重新执行")
-            add_step(state, "Main Agent Tool repair_query_graph：QueryGraph 可执行结构已改变")
+            add_step(state, "Main Agent Tool repair_query_graph：候选图已改变，保留原 typed gaps，等待 PlannerCritic/Validator 重验")
         elif awaiting_knowledge:
             state["query_graph_reflected"] = True
             awaiting_gap = query_graph_repair_awaiting_knowledge_gap(
@@ -5153,18 +5125,9 @@ class MerchantQaWorkflow:
             )
             no_progress_gap = query_graph_repair_no_progress_gap(repair_input, scope_attempt)
             projected_gaps = [no_progress_gap]
-            if structure_changed and remaining_target_gaps:
-                projected_gaps.append(
-                    GraphValidationGap(
-                        code="QUERY_GRAPH_REPAIR_TARGET_UNRESOLVED",
-                        evidence=",".join(sorted({gap.code for gap in remaining_target_gaps if gap.code})),
-                        reason="repair changed executable structure but original typed gap remained after Validator/PlannerCritic revalidation",
-                    )
-                )
             if exhausted:
                 projected_gaps.insert(0, query_graph_repair_exhaustion_gap(repair_input, scope_attempt))
             projected_gaps.extend(retained_query_graph_repair_gaps(repair_input))
-            projected_gaps.extend(verification_gaps)
             projected_gaps = dedupe_graph_validation_gaps(projected_gaps)
             record_graph_validation(
                 state,
@@ -5190,7 +5153,7 @@ class MerchantQaWorkflow:
         except Exception:
             pass
         repair_error_code = (
-            ""
+            "QUERY_GRAPH_REPAIR_PENDING_REVALIDATION"
             if changed
             else (
                 "QUERY_GRAPH_REPAIR_AWAITING_KNOWLEDGE"
@@ -5203,7 +5166,7 @@ class MerchantQaWorkflow:
             "planner_repair",
             "repair_query_graph",
             started,
-            status="success" if changed else ("pending" if awaiting_knowledge else "failed"),
+            status="pending" if (changed or awaiting_knowledge) else "failed",
             error_code=repair_error_code,
             metadata={
                 "repairInput": repair_input.model_dump(by_alias=True),
@@ -5213,7 +5176,7 @@ class MerchantQaWorkflow:
         self.finish_run_step(
             state,
             step,
-            "success" if changed else "gap",
+            "gap",
             output_summary="status=%s changed=%s scopeAttempt=%d before=%s after=%s"
             % (
                 repair_status,
@@ -9174,6 +9137,7 @@ QUERY_GRAPH_REPAIR_OPERATIONAL_GAP_CODES = frozenset(
         "QUERY_GRAPH_REPAIR_EXHAUSTED",
         "QUERY_GRAPH_REPAIR_FAILED",
         "QUERY_GRAPH_REPAIR_NO_PROGRESS",
+        "QUERY_GRAPH_REPAIR_PENDING_REVALIDATION",
     }
 )
 
@@ -9209,7 +9173,12 @@ def planner_repair_scope_key(state: AgentState, plan: QueryPlan | None = None) -
     )
     payload = {
         "graphStructureFingerprint": query_graph_structure_fingerprint(plan or state.get("plan")),
-        "issues": canonical_repair_issue_payloads([*reflection_issues, *validation_gaps]),
+        # When PlannerCritic has typed errors it owns the repair-budget
+        # identity. Validator observations are still passed to Repair, but new
+        # validator prose/codes cannot reset the same Critic scope.
+        "issues": canonical_repair_issue_payloads(
+            reflection_issues if reflection_issues else validation_gaps
+        ),
         # A changed repair strategy deserves a fresh scoped attempt even when
         # the underlying critic issue is unchanged.  Exclude prose-only hints
         # and request reasons so harmless wording changes cannot reset budget.

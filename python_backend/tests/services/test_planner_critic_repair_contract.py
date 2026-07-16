@@ -192,7 +192,7 @@ def test_noop_repair_preserves_full_critic_input_and_projects_exhaustion(tmp_pat
     assert observation["queryGraphRepairDelta"]["exhausted"] is True
 
 
-def test_executable_graph_change_is_success_and_clears_consumed_requests(tmp_path, monkeypatch):
+def test_executable_graph_change_is_pending_and_preserves_critic_until_revalidation(tmp_path, monkeypatch):
     workflow, state = _repair_state(tmp_path)
     before = query_graph_fingerprint(state["plan"])
 
@@ -201,16 +201,67 @@ def test_executable_graph_change_is_success_and_clears_consumed_requests(tmp_pat
     workflow.repair_query_graph(state)
 
     delta = state["last_query_graph_repair_delta"]
-    assert delta.status == "success"
+    assert delta.status == "pending_revalidation"
     assert delta.changed is True
     assert delta.before_graph_fingerprint == before
     assert delta.after_graph_fingerprint == query_graph_fingerprint(state["plan"])
     assert delta.after_graph_fingerprint != before
     assert state["query_graph_repair_attempted"] is True
     assert state["query_graph_repair_progressed"] is True
-    assert state["planner_reflection"].passed is True
-    assert state["planner_repair_requests"] == []
+    assert state["planner_reflection"].passed is False
+    assert state["planner_repair_requests"] == _reflection().repair_requests
     assert state["query_graph_reflected"] is False
+    assert state["last_action_result"].status == "pending_revalidation"
+    assert {
+        gap.code for gap in state["query_graph_validation_result"].gaps
+    } >= {"QUERY_GRAPH_REPAIR_PENDING_REVALIDATION", "DETAIL_EVIDENCE_NOT_PLANNED"}
+    assert workflow.route_after_repair_query_graph(state) == workflow.policy.registry.node_for("reflect_plan")
+
+    monkeypatch.setattr(
+        workflow.planner_reflection_agent,
+        "reflect",
+        lambda *_args, **_kwargs: PlannerReflectionResult(passed=True),
+    )
+    monkeypatch.setattr(
+        workflow.graph_validator,
+        "validate",
+        lambda *_args, **_kwargs: GraphValidationResult(valid=True, repairable=False),
+    )
+    workflow.reflect_query_graph(state)
+    assert state["last_query_graph_repair_delta"].status == "pending_revalidation"
+
+    workflow.validate_query_graph(state)
+
+    assert state["last_query_graph_repair_delta"].status == "success"
+    assert state["query_graph_repair_history"][-1].status == "success"
+    assert state["query_graph_validation_result"].valid is True
+
+
+def test_repair_candidate_does_not_become_success_when_independent_validation_fails(tmp_path, monkeypatch):
+    workflow, state = _repair_state(tmp_path)
+    monkeypatch.setattr(workflow.planner, "repair", lambda *_args, **_kwargs: _plan("repaired_metric"))
+    monkeypatch.setattr(
+        workflow.planner_reflection_agent,
+        "reflect",
+        lambda *_args, **_kwargs: PlannerReflectionResult(passed=True),
+    )
+    monkeypatch.setattr(
+        workflow.graph_validator,
+        "validate",
+        lambda *_args, **_kwargs: GraphValidationResult(
+            valid=False,
+            repairable=True,
+            gaps=[GraphValidationGap(code="STILL_INVALID", reason="independent validator rejected candidate")],
+        ),
+    )
+
+    workflow.repair_query_graph(state)
+    workflow.reflect_query_graph(state)
+    workflow.validate_query_graph(state)
+
+    assert state["last_query_graph_repair_delta"].status == "pending_revalidation"
+    assert state["query_graph_repair_history"][-1].status == "pending_revalidation"
+    assert state["query_graph_validation_result"].gaps[0].code == "STILL_INVALID"
 
 
 def test_repair_budget_is_scoped_by_graph_and_critic_issue(tmp_path, monkeypatch):
@@ -494,9 +545,10 @@ def test_awaiting_knowledge_resumes_same_critic_and_repairs_with_one_attempt_bud
     workflow.repair_query_graph(state)
 
     assert len(repair_calls) == 2
-    assert state["last_query_graph_repair_delta"].status == "success"
+    assert state["last_query_graph_repair_delta"].status == "pending_revalidation"
     assert state["plan"].intents[0].metric_name == "repaired_metric"
     assert state["query_graph_repair_scope_attempt_count"] == 1
+    assert state["planner_reflection"].issues[0]["code"] == "DETAIL_EVIDENCE_NOT_PLANNED"
 
 
 def test_same_unmet_knowledge_request_cannot_suspend_repair_forever(tmp_path, monkeypatch):

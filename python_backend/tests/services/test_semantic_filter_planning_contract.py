@@ -9,12 +9,17 @@ from merchant_ai.models import (
     PlanningAssetPack,
     QueryPlan,
     QuestionIntent,
+    RecallBundle,
 )
 from merchant_ai.services.planning import (
     QueryGraphContractValidator,
+    QueryGraphPlanner,
+    QueryGraphValidator,
     QuestionUnderstandingCompiler,
     apply_understanding_filters,
     bind_semantic_query_from_understanding,
+    freeze_source_condition_ledger,
+    semantic_filter_validation_gaps,
 )
 
 
@@ -90,8 +95,62 @@ def test_all_same_table_predicates_are_bound_without_first_filter_loss() -> None
         },
         root="root",
     )
+    question = "merchant is M-7 and amount over 100.50 and status is refunded"
+    understanding.update(
+        {
+            "originalQuestion": question,
+            "sourceConditionAuditRequired": True,
+            "sourceConditionLedger": freeze_source_condition_ledger(
+                question,
+                {
+                    "status": "VERIFIED",
+                    "conditionNodes": [
+                        {
+                            "nodeId": "p1",
+                            "nodeType": "predicate",
+                            "sourcePhrase": "merchant is M-7",
+                            "operator": "eq",
+                            "rawValues": ["M-7"],
+                            "logicalOperator": "",
+                            "childNodeIds": [],
+                        },
+                        {
+                            "nodeId": "p2",
+                            "nodeType": "predicate",
+                            "sourcePhrase": "amount over 100.50",
+                            "operator": "gt",
+                            "rawValues": ["100.50"],
+                            "logicalOperator": "",
+                            "childNodeIds": [],
+                        },
+                        {
+                            "nodeId": "p3",
+                            "nodeType": "predicate",
+                            "sourcePhrase": "status is refunded",
+                            "operator": "eq",
+                            "rawValues": ["refunded"],
+                            "logicalOperator": "",
+                            "childNodeIds": [],
+                        },
+                        {
+                            "nodeId": "root",
+                            "nodeType": "group",
+                            "sourcePhrase": "",
+                            "operator": "",
+                            "rawValues": [],
+                            "logicalOperator": "and",
+                            "childNodeIds": ["p1", "p2", "p3"],
+                        },
+                    ],
+                    "rootConditionNodeId": "root",
+                    "excludedConstraints": [],
+                },
+            ),
+        }
+    )
 
     planned = apply_understanding_filters(QueryPlan(intents=[intent("orders")]), understanding, pack)
+    planned.intents[0].question = question
 
     bound = planned.intents[0].semantic_query
     assert [node.node_id for node in bound.filter_nodes] == ["p1", "p2", "p3", "root"]
@@ -305,3 +364,77 @@ def test_detail_anchor_uses_governed_semantic_key_predicate() -> None:
     assert plan.intents[0].filter_value == "M-11"
     assert plan.intents[0].semantic_query.filter_nodes[0].semantic_ref_id == merchant.source_ref_id
     assert plan.semantic_filter_obligations[0].node_id == "merchant"
+
+
+def test_independent_condition_audit_is_cached_and_recomputes_all_source_spans(monkeypatch) -> None:
+    question = "最近7天按金额降序取前5条，只看订单ID和状态"
+
+    class AuditModel:
+        configured = True
+        last_error = ""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def tool_json_chat(self, *_args, **_kwargs):
+            self.calls += 1
+            return {
+                "status": "VERIFIED",
+                "conditionNodes": [],
+                "rootConditionNodeId": "",
+                "excludedConstraints": [
+                    {"constraintType": "time_window", "sourcePhrase": "最近7天", "startOffset": 999, "endOffset": 999, "reason": "time"},
+                    {"constraintType": "result_order", "sourcePhrase": "按金额降序", "startOffset": 999, "endOffset": 999, "reason": "order"},
+                    {"constraintType": "result_limit", "sourcePhrase": "前5条", "startOffset": 999, "endOffset": 999, "reason": "limit"},
+                    {"constraintType": "projection", "sourcePhrase": "只看订单ID和状态", "startOffset": 999, "endOffset": 999, "reason": "projection"},
+                ],
+                "clarificationQuestion": "",
+                "reason": "complete",
+            }
+
+    model = AuditModel()
+    planner = QueryGraphPlanner(model)
+    monkeypatch.setattr(
+        planner,
+        "_semantic_asset_selection_plan",
+        lambda *_args, **_kwargs: (QueryPlan(intents=[intent("orders")]), {}),
+    )
+
+    first, _ = planner.semantic_asset_selection_plan(question, RecallBundle(), PlanningAssetPack())
+    second, _ = planner.semantic_asset_selection_plan(question, RecallBundle(), PlanningAssetPack())
+
+    assert model.calls == 1
+    ledger = first.question_understanding["sourceConditionLedger"]
+    assert ledger["auditorStatus"] == "verified"
+    assert [item["constraintType"] for item in ledger["excludedConstraints"]] == [
+        "time_window", "result_order", "result_limit", "projection"
+    ]
+    assert ledger["excludedConstraints"][0]["startOffset"] == question.index("最近7天")
+    assert first.compiler_trace[-1] == "SOURCE_CONDITION_AUDIT_REQUIRED"
+    assert second.question_understanding["sourceConditionLedger"] == ledger
+
+
+def test_missing_or_failed_independent_audit_is_a_typed_execution_gate() -> None:
+    question = "show orders"
+    base = {
+        "originalQuestion": question,
+        "sourceConditionAuditRequired": True,
+        "semanticQuery": {"filterNodes": [], "rootFilterNodeId": ""},
+    }
+    missing = QueryPlan(intents=[intent("orders")], question_understanding=base)
+    missing_codes = {gap.code for gap in semantic_filter_validation_gaps(missing, PlanningAssetPack())}
+    assert "FILTER_COVERAGE_AUDIT_MISSING" in missing_codes
+    assert "FILTER_COVERAGE_AUDIT_MISSING" in {
+        gap.code for gap in QueryGraphValidator().validate(question, missing, PlanningAssetPack()).gaps
+    }
+
+    failed_understanding = dict(base)
+    failed_understanding["sourceConditionLedger"] = freeze_source_condition_ledger(
+        question,
+        {},
+        ["condition auditor failed: provider unavailable"],
+    )
+    failed = QueryPlan(intents=[intent("orders")], question_understanding=failed_understanding)
+    assert "FILTER_COVERAGE_UNVERIFIED" in {
+        gap.code for gap in semantic_filter_validation_gaps(failed, PlanningAssetPack())
+    }

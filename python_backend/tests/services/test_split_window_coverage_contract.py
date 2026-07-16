@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from threading import Lock
 
 from merchant_ai.config import get_settings
@@ -21,6 +22,7 @@ from merchant_ai.services.query import (
 )
 from merchant_ai.services.query_sql_binding import (
     build_split_detail_sql_plan,
+    split_detail_sql_chunk_contract_error,
     split_window_coverage_contract,
 )
 
@@ -158,6 +160,66 @@ def test_split_plan_preserves_full_window_obligation_when_max_chunks_truncates()
     assert coverage["truncated"] is True
     assert coverage["complete"] is False
     assert coverage["code"] == "SPLIT_WINDOW_COVERAGE_INCOMPLETE"
+
+
+def test_split_chunk_contract_rejects_sql_not_derived_by_root_and_restriction():
+    base_sql = "SELECT `order_id`, `pt` FROM `orders` WHERE `seller_id` = %s LIMIT 10"
+    plan = build_split_detail_sql_plan(
+        base_sql,
+        days=21,
+        chunk_days=7,
+        max_chunks=3,
+        limit=10,
+        time_column="pt",
+        anchor_date="2026-06-20",
+    )
+
+    assert plan is not None
+    valid_code, _ = split_detail_sql_chunk_contract_error(base_sql, plan, plan.chunks[0], "pt", 10)
+    tampered_chunk = replace(
+        plan.chunks[0],
+        sql=plan.chunks[0].sql.replace(" LIMIT 10", " AND 1 = 0 LIMIT 10"),
+    )
+    tampered_plan = replace(plan, chunks=(tampered_chunk, *plan.chunks[1:]))
+    invalid_code, _ = split_detail_sql_chunk_contract_error(
+        base_sql,
+        tampered_plan,
+        tampered_chunk,
+        "pt",
+        10,
+    )
+
+    assert valid_code == ""
+    assert invalid_code == "SPLIT_WINDOW_CHUNK_DERIVATION_INVALID"
+
+
+def test_split_chunk_contract_rejects_window_metadata_not_matching_full_plan():
+    base_sql = "SELECT `order_id`, `pt` FROM `orders` WHERE `seller_id` = %s LIMIT 10"
+    plan = build_split_detail_sql_plan(
+        base_sql,
+        days=21,
+        chunk_days=7,
+        max_chunks=3,
+        limit=10,
+        time_column="pt",
+        anchor_date="2026-06-20",
+    )
+
+    assert plan is not None
+    tampered_chunk = replace(plan.chunks[1], start_date="2026-06-08")
+    tampered_plan = replace(
+        plan,
+        chunks=(plan.chunks[0], tampered_chunk, plan.chunks[2]),
+    )
+    invalid_code, _ = split_detail_sql_chunk_contract_error(
+        base_sql,
+        tampered_plan,
+        tampered_chunk,
+        "pt",
+        10,
+    )
+
+    assert invalid_code == "SPLIT_WINDOW_PLAN_INVALID"
 
 
 def test_max_chunks_truncation_retains_partial_rows_but_fails_closed():

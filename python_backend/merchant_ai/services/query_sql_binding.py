@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,6 +81,34 @@ class SplitDetailSqlPlan:
         return max(0, self.required_chunk_count - len(self.chunks))
 
 
+def split_detail_chunk_restriction_sql(
+    time_column: str,
+    anchor_expression: str,
+    offset_start_days: int,
+    offset_end_days: int,
+) -> str:
+    """Build the deterministic, half-open partition restriction for one chunk."""
+
+    quoted_column = quote_identifier(normalize_identifier(time_column))
+    lower_bound = "%s >= DATE_SUB(%s, INTERVAL %d DAY)" % (
+        quoted_column,
+        anchor_expression,
+        max(0, int(offset_end_days or 0)),
+    )
+    if int(offset_start_days or 0) <= 0:
+        upper_bound = "%s < DATE_ADD(%s, INTERVAL 1 DAY)" % (
+            quoted_column,
+            anchor_expression,
+        )
+    else:
+        upper_bound = "%s < DATE_SUB(%s, INTERVAL %d DAY)" % (
+            quoted_column,
+            anchor_expression,
+            max(0, int(offset_start_days or 0) - 1),
+        )
+    return "(%s AND %s)" % (lower_bound, upper_bound)
+
+
 def build_split_detail_sql_plan(
     sql: str,
     days: int,
@@ -124,24 +153,16 @@ def build_split_detail_sql_plan(
     )
     requested_end_date = parsed_anchor.isoformat() if parsed_anchor else str(anchor_date or "")
     chunks: List[SplitDetailSqlChunk] = []
-    quoted_column = quote_identifier(partition_column)
     for index in range(scheduled_chunk_count):
         offset = index * window_days
         upper = min(total_days, offset + window_days)
-        lower_bound = "%s >= DATE_SUB(%s, INTERVAL %d DAY)" % (
-            quoted_column,
+        restriction = split_detail_chunk_restriction_sql(
+            partition_column,
             anchor_expr,
-            inclusive_day_interval(upper),
+            offset,
+            upper - 1,
         )
-        if offset <= 0:
-            upper_bound = "%s < DATE_ADD(%s, INTERVAL 1 DAY)" % (quoted_column, anchor_expr)
-        else:
-            upper_bound = "%s < DATE_SUB(%s, INTERVAL %d DAY)" % (
-                quoted_column,
-                anchor_expr,
-                inclusive_day_interval(offset),
-            )
-        chunk_sql = add_sql_where_condition(text, "(%s AND %s)" % (lower_bound, upper_bound))
+        chunk_sql = add_sql_where_condition(text, restriction)
         chunk_sql = replace_sql_limit(chunk_sql, capped_limit)
         chunk_start = (
             (parsed_anchor - timedelta(days=upper - 1)).isoformat()
@@ -173,6 +194,127 @@ def build_split_detail_sql_plan(
         required_chunk_count=required_chunk_count,
         chunks=tuple(chunks),
     )
+
+
+def split_detail_sql_chunk_contract_error(
+    base_sql: str,
+    plan: SplitDetailSqlPlan,
+    chunk: SplitDetailSqlChunk,
+    time_column: str,
+    limit: int,
+) -> Tuple[str, str]:
+    """Verify a split chunk is only a governed restriction of validated base SQL.
+
+    This contract deliberately does not replace the ordinary time-window gate.
+    Callers must first validate ``base_sql`` against the full requested window.
+    A chunk is then accepted only when its plan metadata is internally complete
+    and its SQL is exactly the base query plus two mandatory root-AND bounds on
+    the declared partition column.
+    """
+
+    partition_column = normalize_identifier(time_column)
+    if not str(base_sql or "").strip() or not partition_column or int(limit or 0) <= 0:
+        return "SPLIT_WINDOW_PLAN_INVALID", "split validation requires base SQL, partitionColumn, and a positive limit"
+    if plan.requested_days <= 0 or plan.chunk_days <= 0 or plan.max_chunks <= 0:
+        return "SPLIT_WINDOW_PLAN_INVALID", "split window sizes and caps must be positive"
+    expected_required_count = (plan.requested_days + plan.chunk_days - 1) // plan.chunk_days
+    expected_planned_count = min(expected_required_count, plan.max_chunks)
+    if plan.required_chunk_count != expected_required_count or len(plan.chunks) != expected_planned_count:
+        return "SPLIT_WINDOW_PLAN_INVALID", "split plan does not preserve the full requested-window obligation"
+
+    parsed_anchor: Optional[date] = None
+    if plan.anchor_date:
+        try:
+            parsed_anchor = date.fromisoformat(plan.anchor_date)
+        except ValueError:
+            return "SPLIT_WINDOW_PLAN_INVALID", "split plan anchorDate is not an ISO date"
+        expected_requested_start = (parsed_anchor - timedelta(days=plan.requested_days - 1)).isoformat()
+        if (
+            plan.requested_start_date != expected_requested_start
+            or plan.requested_end_date != parsed_anchor.isoformat()
+        ):
+            return "SPLIT_WINDOW_PLAN_INVALID", "split plan requestedWindow does not match anchorDate and requestedDays"
+    elif plan.requested_start_date or plan.requested_end_date:
+        return "SPLIT_WINDOW_PLAN_INVALID", "split plan has requested dates without a valid anchorDate"
+
+    for position, planned_chunk in enumerate(plan.chunks, start=1):
+        expected_offset_start = (position - 1) * plan.chunk_days
+        expected_offset_end = min(plan.requested_days, expected_offset_start + plan.chunk_days) - 1
+        if (
+            planned_chunk.index != position
+            or planned_chunk.offset_start_days != expected_offset_start
+            or planned_chunk.offset_end_days != expected_offset_end
+        ):
+            return "SPLIT_WINDOW_PLAN_INVALID", "split chunk offsets are not a contiguous partition of the requested window"
+        if parsed_anchor:
+            expected_start_date = (parsed_anchor - timedelta(days=expected_offset_end)).isoformat()
+            expected_end_date = (parsed_anchor - timedelta(days=expected_offset_start)).isoformat()
+            if planned_chunk.start_date != expected_start_date or planned_chunk.end_date != expected_end_date:
+                return "SPLIT_WINDOW_PLAN_INVALID", "split chunk date metadata does not match its governed offsets"
+        elif planned_chunk.start_date or planned_chunk.end_date:
+            return "SPLIT_WINDOW_PLAN_INVALID", "split chunk dates require a valid plan anchorDate"
+
+    if chunk.index <= 0 or chunk.index > len(plan.chunks) or plan.chunks[chunk.index - 1] != chunk:
+        return "SPLIT_WINDOW_CHUNK_DERIVATION_INVALID", "split SQL chunk is not the corresponding member of the validated plan"
+
+    escaped_anchor = str(plan.anchor_date or "").replace("'", "''")
+    anchor_expression = "'%s'" % escaped_anchor if escaped_anchor else "CURDATE()"
+    restriction_sql = split_detail_chunk_restriction_sql(
+        partition_column,
+        anchor_expression,
+        chunk.offset_start_days,
+        chunk.offset_end_days,
+    )
+    expected_sql = replace_sql_limit(
+        add_sql_where_condition(base_sql, restriction_sql),
+        int(limit),
+    )
+    actual_ast = parse_sql_for_binding(chunk.sql)
+    expected_ast = parse_sql_for_binding(expected_sql)
+    base_ast = parse_sql_for_binding(replace_sql_limit(base_sql, int(limit)))
+    restriction_ast = parse_sql_for_binding("SELECT * FROM `__split_scope` WHERE %s" % restriction_sql)
+    if not all(isinstance(item, exp.Select) for item in (actual_ast, expected_ast, base_ast, restriction_ast)):
+        return "SPLIT_WINDOW_CHUNK_DERIVATION_INVALID", "split SQL cannot be parsed as a single SELECT"
+
+    def canonical(expression: exp.Expression) -> str:
+        return expression.sql(dialect="doris", identify=True, pretty=False)
+
+    if canonical(actual_ast) != canonical(expected_ast):
+        return (
+            "SPLIT_WINDOW_CHUNK_DERIVATION_INVALID",
+            "split SQL must be exactly the validated base SQL plus its governed partition restriction",
+        )
+
+    def where_terms(select: exp.Select) -> List[exp.Expression]:
+        where = select.args.get("where")
+        return root_and_terms(where.this) if isinstance(where, exp.Where) else []
+
+    base_terms = Counter(canonical(term) for term in where_terms(base_ast))
+    restriction_terms = where_terms(restriction_ast)
+    actual_terms = Counter(canonical(term) for term in where_terms(actual_ast))
+    expected_terms = base_terms + Counter(canonical(term) for term in restriction_terms)
+    if len(restriction_terms) != 2 or actual_terms != expected_terms:
+        return (
+            "SPLIT_WINDOW_CHUNK_DERIVATION_INVALID",
+            "split partition bounds must be mandatory-positive root-AND predicates",
+        )
+    normalized_bounds = [unwrap_boolean_parentheses(term) for term in restriction_terms]
+    if (
+        not any(
+            isinstance(term, exp.GTE) and predicate_column_name(term.this) == partition_column
+            for term in normalized_bounds
+        )
+        or not any(
+            isinstance(term, exp.LT) and predicate_column_name(term.this) == partition_column
+            for term in normalized_bounds
+        )
+        or any(direct_expression_columns(term) != [partition_column] for term in normalized_bounds)
+    ):
+        return (
+            "SPLIT_WINDOW_CHUNK_DERIVATION_INVALID",
+            "split SQL bounds must restrict only the governed partitionColumn",
+        )
+    return "", ""
 
 
 def split_window_coverage_contract(
