@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import re
@@ -10,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Set, Tuple
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.models import (
     AnswerMode,
+    EntityFilterObligation,
+    EntityReference,
     GraphValidationGap,
     GraphValidationResult,
     IntentType,
@@ -51,6 +54,7 @@ from merchant_ai.services.formulas import (
     formula_columns as schema_formula_columns,
     reconcile_metric_formula_for_schema,
 )
+from merchant_ai.services.entity_contracts import canonical_entity_values, entity_comparison_policy
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory_constraints import memory_constraint_validation_gaps
 from merchant_ai.services.prompts import PromptAssembler
@@ -78,6 +82,7 @@ from merchant_ai.services.planning_tooling import (
 from merchant_ai.services.planning_layers import GraphContractValidator, PlanCompiler, PlanRepairer, UnderstandingExtractor
 from merchant_ai.services.routing import extract_days
 from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution, semantic_metric_contract_issue
+from merchant_ai.services.time_semantics import has_explicit_time_expression
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
 from merchant_ai.services.tools import (
@@ -4926,6 +4931,7 @@ class QueryGraphContractValidator:
         contract = QuestionGraphContract.from_understanding(plan.question_understanding or {})
         gaps: List[GraphValidationGap] = []
         gaps.extend(metric_obligation_validation_gaps(plan, asset_pack))
+        gaps.extend(entity_filter_obligation_validation_gaps(plan, asset_pack))
         gaps.extend(self._metric_obligation_gaps(contract, plan, asset_pack))
         gaps.extend(self._scope_obligation_gaps(contract, plan, asset_pack))
         gaps.extend(self._detail_evidence_gaps(plan, asset_pack))
@@ -9045,19 +9051,40 @@ def compile_derived_metric_graph_from_understanding(
 
 
 def compile_entity_detail_graph_from_understanding(question: str, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
-    filter_column, filter_value = detail_filter_from_understanding(question, understanding, asset_pack)
-    if not filter_column or not filter_value:
+    entity_reference = entity_reference_from_understanding(question, understanding, asset_pack)
+    if entity_reference.status != "resolved":
+        clarification = entity_reference_clarification(entity_reference)
         return QueryPlan(
             agent_trace=["planner.understanding_compile.missing_detail_filter"],
-            compiler_trace=["MISSING_DETAIL_FILTER"],
+            compiler_trace=["ENTITY_REFERENCE_%s" % str(entity_reference.status or "unresolved").upper()],
             question_understanding=understanding,
+            clarification_needs=[clarification] if clarification else [],
+            entity_filter_obligations=[entity_filter_obligation(entity_reference)],
         )
+    filter_column = entity_reference.field
+    filter_value = ",".join(str(item) for item in entity_reference.values)
     anchor_table = best_detail_anchor_table(filter_column, question, asset_pack)
     if not anchor_table:
         return QueryPlan(
             agent_trace=["planner.understanding_compile.detail_anchor_unavailable"],
             compiler_trace=["DETAIL_ANCHOR_UNAVAILABLE:%s" % filter_column],
             question_understanding=understanding,
+            entity_filter_obligations=[entity_filter_obligation(entity_reference)],
+        )
+    entity_reference = entity_reference.model_copy(
+        update={
+            "table": anchor_table,
+            "lookup_time_policy": entity_lookup_time_policy(anchor_table, asset_pack),
+        }
+    )
+    time_clarification = entity_lookup_time_clarification(entity_reference, anchor_table, asset_pack)
+    if time_clarification:
+        return QueryPlan(
+            agent_trace=["planner.understanding_compile.entity_lookup_time_required"],
+            compiler_trace=["ENTITY_LOOKUP_TIME_REQUIRED:%s:%s" % (anchor_table, filter_column)],
+            question_understanding=understanding,
+            clarification_needs=[time_clarification],
+            entity_filter_obligations=[entity_filter_obligation(entity_reference, status="pending_time_scope")],
         )
     columns = set(asset_pack.known_columns(anchor_table))
     index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
@@ -9085,7 +9112,8 @@ def compile_entity_detail_graph_from_understanding(question: str, understanding:
         preferred_table=anchor_table,
         filter_column=filter_column,
         filter_value=filter_value,
-        days=extract_days(question, 30),
+        entity_reference=entity_reference,
+        days=entity_lookup_days(question, entity_reference),
         limit=20,
         required_evidence=required[:18],
         output_keys=output_keys[:18],
@@ -9103,6 +9131,9 @@ def compile_entity_detail_graph_from_understanding(question: str, understanding:
             "FILTER_BOUND:%s:%s=%s" % (anchor.plan_task_id, filter_column, filter_value),
         ],
         agent_trace=["planner=llm_detail_understanding_compiler"],
+        entity_filter_obligations=[
+            entity_filter_obligation(entity_reference, task_id=anchor.plan_task_id, status="bound")
+        ],
     )
     plan = repair_missing_domain_dependencies(question, plan, asset_pack)
     plan = attach_metric_resolutions_from_understanding(question, plan, understanding, asset_pack)
@@ -9114,9 +9145,17 @@ def compile_entity_detail_graph_from_understanding(question: str, understanding:
 
 
 def compile_entity_detail_graph_from_question_entity(question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
-    filter_column, filter_value = entity_filter_from_question(question, asset_pack)
-    if not filter_column or not filter_value:
-        return QueryPlan(agent_trace=["planner.entity_id_semantic_fallback.no_entity_filter"])
+    entity_reference = resolve_entity_reference(question, asset_pack)
+    if entity_reference.status != "resolved":
+        clarification = entity_reference_clarification(entity_reference)
+        return QueryPlan(
+            agent_trace=["planner.entity_id_semantic_fallback.no_entity_filter"],
+            compiler_trace=["ENTITY_REFERENCE_%s" % str(entity_reference.status or "unresolved").upper()],
+            clarification_needs=[clarification] if clarification else [],
+            entity_filter_obligations=[entity_filter_obligation(entity_reference)],
+        )
+    filter_column = entity_reference.field
+    filter_value = ",".join(str(item) for item in entity_reference.values)
     requested_measures = [
         {
             "metricRef": metric.key,
@@ -9136,7 +9175,13 @@ def compile_entity_detail_graph_from_question_entity(question: str, asset_pack: 
         "requiredEvidenceIntents": semantic_fast_path_required_evidence(question, asset_pack),
         "rankingObjective": {},
         "requestedMeasures": requested_measures,
-        "filters": [{"field": filter_column, "value": filter_value}],
+        "filters": [
+            {
+                "field": filter_column,
+                "value": filter_value,
+                "entityReference": entity_reference.model_dump(by_alias=True),
+            }
+        ],
         "timeWindowDays": extract_days(question, 30),
         "source": "entity_id_semantic_fallback",
     }
@@ -9154,19 +9199,436 @@ def compile_entity_detail_graph_from_question_entity(question: str, asset_pack: 
 
 
 def entity_filter_from_question(question: str, asset_pack: PlanningAssetPack) -> Tuple[str, str]:
-    text = question or ""
-    candidates = entity_filter_candidate_columns(asset_pack)
-    for column in candidates:
-        match = re.search(r"\b%s_[A-Za-z0-9_]+\b" % re.escape(column), text, re.I)
+    reference = resolve_entity_reference(question, asset_pack)
+    if reference.status != "resolved":
+        return "", ""
+    return reference.field, ",".join(str(item) for item in reference.values)
+
+
+def entity_reference_from_understanding(
+    question: str,
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> EntityReference:
+    filters = understanding.get("filters") or []
+    if isinstance(filters, list):
+        for item in filters:
+            if not isinstance(item, dict):
+                continue
+            embedded = item.get("entityReference") or item.get("entity_reference")
+            if isinstance(embedded, dict):
+                try:
+                    reference = EntityReference.model_validate(embedded)
+                    if reference.field and reference.values:
+                        # Embedded objects are still untrusted Planner output.
+                        # Re-resolve the field and type against the active
+                        # semantic pack instead of trusting a forged
+                        # status="resolved" or semanticRefId.
+                        return resolve_declared_entity_reference(
+                            question,
+                            reference.field,
+                            reference.values,
+                            asset_pack,
+                            source="question_understanding_embedded",
+                        )
+                except Exception:
+                    pass
+            field = str(item.get("field") or item.get("column") or "").strip()
+            value = item.get("value")
+            if field and value not in (None, ""):
+                return resolve_declared_entity_reference(question, field, value, asset_pack, source="question_understanding")
+    return resolve_entity_reference(question, asset_pack)
+
+
+def resolve_entity_reference(question: str, asset_pack: PlanningAssetPack) -> EntityReference:
+    text = str(question or "")
+    entries = entity_filter_candidate_entries(asset_pack)
+    for entry in entries:
+        column = str(entry.key or "")
+        if not column:
+            continue
+        match = re.search(
+            r"(?<![A-Za-z0-9_])(?P<value>%s(?:[_-][A-Za-z0-9][A-Za-z0-9_.-]*)+)(?![A-Za-z0-9_])"
+            % re.escape(column),
+            text,
+            flags=re.I,
+        )
         if match:
-            return column, match.group(0)
-    return "", ""
+            return build_entity_reference(
+                question=text,
+                raw_label=column,
+                raw_value=match.group("value"),
+                matching_entries=[item for item in entries if item.key == column],
+                source="explicit_prefixed_value",
+            )
+
+    for match in entity_assignment_matches(text):
+        raw_label = match.group("label").strip()
+        raw_value = match.group("value").strip()
+        matching_entries = entity_entries_for_label(raw_label, entries)
+        if matching_entries:
+            return build_entity_reference(text, raw_label, raw_value, matching_entries, "explicit_assignment")
+    return EntityReference(source="question", status="unresolved", time_scope_explicit=question_has_explicit_time_scope(text))
+
+
+def resolve_declared_entity_reference(
+    question: str,
+    field_label: str,
+    value: Any,
+    asset_pack: PlanningAssetPack,
+    source: str,
+) -> EntityReference:
+    entries = entity_filter_candidate_entries(asset_pack)
+    matching_entries = entity_entries_for_label(field_label, entries)
+    if not matching_entries:
+        return EntityReference(
+            raw_label=field_label,
+            raw_value=str(value or ""),
+            source=source,
+            status="unresolved",
+            time_scope_explicit=question_has_explicit_time_scope(question),
+        )
+    raw_value = ",".join(str(item) for item in value) if isinstance(value, (list, tuple, set)) else str(value)
+    return build_entity_reference(question, field_label, raw_value, matching_entries, source)
+
+
+def entity_filter_candidate_entries(asset_pack: PlanningAssetPack) -> List[PlanningAssetEntry]:
+    entries: List[PlanningAssetEntry] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    declared_entries: List[PlanningAssetEntry] = list(asset_pack.entity_keys)
+    declared_entity_columns = {
+        (str(entry.table or ""), str(entry.key or ""))
+        for entry in asset_pack.entity_keys
+        if entry.key
+    }
+    for entry in asset_pack.fields:
+        if (str(entry.table or ""), str(entry.key or "")) in declared_entity_columns:
+            continue
+        metadata = entry.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        schema = metadata.get("schema") if isinstance(metadata.get("schema"), dict) else {}
+        role = str(
+            semantic.get("role")
+            or semantic.get("semanticRole")
+            or metadata.get("semanticRole")
+            or ""
+        ).strip().upper()
+        if bool(schema.get("isPrimaryKey")) or role in {
+            "KEY",
+            "ENTITY",
+            "ENTITY_KEY",
+            "JOIN_KEY",
+            "PRIMARY_KEY",
+            "IDENTIFIER",
+        }:
+            declared_entries.append(entry)
+
+    for entry in declared_entries:
+        column = str(entry.key or "").strip()
+        if not column:
+            continue
+        metadata = entry.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        if boolish(metadata.get("contextOnly", semantic.get("contextOnly"))):
+            continue
+        role = str(semantic.get("role") or semantic.get("semanticRole") or metadata.get("semanticRole") or "").strip().upper()
+        if role in {"PARTITION", "TENANT_CONTEXT", "CONTEXT", "TIME"}:
+            continue
+        identity = (column, str(entry.table or ""), str(entry.source_ref_id or ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        entries.append(entry)
+    return sorted(entries, key=lambda item: (-len(str(item.key or "")), str(item.key or ""), str(item.table or "")))
+
+
+def entity_assignment_matches(text: str) -> Iterable[re.Match[str]]:
+    pattern = re.compile(
+        r"(?P<label>[A-Za-z_][A-Za-z0-9_\- ]{0,48}|[\u4e00-\u9fffA-Za-z0-9_]{1,32}?)"
+        r"\s*(?:=|:|：|为|等于)\s*"
+        r"(?P<value>[\"'][^\"'\r\n]+[\"']|[A-Za-z0-9_./:@+\-]+(?:\s*[,，]\s*[A-Za-z0-9_./:@+\-]+)*)",
+        flags=re.I,
+    )
+    return pattern.finditer(text)
+
+
+def entity_entries_for_label(label: str, entries: List[PlanningAssetEntry]) -> List[PlanningAssetEntry]:
+    normalized_label = normalize_entity_label(label)
+    if not normalized_label:
+        return []
+    if normalized_label == "id":
+        return list(entries)
+    scored: List[Tuple[int, PlanningAssetEntry]] = []
+    for entry in entries:
+        aliases = dedupe_strings([entry.key, entry.title, *entry.aliases])
+        best = 0
+        for alias in aliases:
+            normalized_alias = normalize_entity_label(alias)
+            if not normalized_alias:
+                continue
+            if normalized_label == normalized_alias:
+                best = max(best, 1000 + len(normalized_alias))
+            elif normalized_label.endswith(normalized_alias):
+                best = max(best, 500 + len(normalized_alias))
+        if best:
+            scored.append((best, entry))
+    if not scored:
+        return []
+    top = max(score for score, _ in scored)
+    return [entry for score, entry in scored if score == top]
+
+
+def normalize_entity_label(value: Any) -> str:
+    text = re.sub(r"[\s_`：:（）()\-]+", "", str(value or "").strip().casefold())
+    text = re.sub(r"(?:编号|号码|号|id)$", "id", text, flags=re.I)
+    return text
+
+
+def build_entity_reference(
+    question: str,
+    raw_label: str,
+    raw_value: str,
+    matching_entries: List[PlanningAssetEntry],
+    source: str,
+) -> EntityReference:
+    fields = dedupe_strings([str(entry.key or "") for entry in matching_entries if entry.key])
+    refs = dedupe_strings([str(entry.source_ref_id or "") for entry in matching_entries if entry.source_ref_id])
+    entity_identities = dedupe_strings(
+        [entity_candidate_identity(entry) for entry in matching_entries if entity_candidate_identity(entry)]
+    )
+    values, valid = parse_entity_reference_values(raw_value)
+    placeholder = any(entity_value_is_placeholder(item) for item in values)
+    value_type = entity_reference_value_type(matching_entries)
+    if valid and values:
+        valid = all(entity_reference_value_is_valid(item, value_type) for item in values)
+    status = "resolved"
+    if len(fields) != 1 or len(entity_identities) != 1:
+        status = "ambiguous"
+    elif not valid or not values:
+        status = "invalid"
+    elif placeholder:
+        status = "placeholder"
+    typed_values = [coerce_entity_reference_value(item, value_type) for item in values] if status == "resolved" else values
+    field = fields[0] if len(fields) == 1 else ""
+    representative = next((entry for entry in matching_entries if entry.key == field), None)
+    return EntityReference(
+        semantic_ref_id=str(getattr(representative, "source_ref_id", "") or ""),
+        field=field,
+        table=str(getattr(representative, "table", "") or "") if representative else "",
+        raw_label=raw_label,
+        raw_value=raw_value,
+        values=typed_values,
+        value_type=value_type,
+        comparison_policy=entity_reference_comparison_policy(matching_entries, value_type),
+        source=source,
+        confidence=0.98 if source == "question_understanding" else 0.95,
+        candidate_ref_ids=refs,
+        status=status,
+        placeholder=placeholder,
+        time_scope_explicit=question_has_explicit_time_scope(question),
+    )
+
+
+def entity_candidate_identity(entry: PlanningAssetEntry) -> str:
+    """Return an explicitly governed entity identity, with a legacy fallback.
+
+    Equal physical names in unrelated tables are not enough to prove semantic
+    equivalence. Cross-table identity is merged only when the published
+    semantic assets share a canonical entity reference/type.
+    """
+
+    metadata = entry.metadata or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    canonical = str(
+        semantic.get("canonicalEntityRef")
+        or semantic.get("canonicalEntityType")
+        or semantic.get("entityType")
+        or metadata.get("canonicalEntityRef")
+        or metadata.get("canonicalEntityType")
+        or metadata.get("entityType")
+        or ""
+    ).strip()
+    if canonical:
+        return "canonical:%s" % canonical
+    return str(entry.source_ref_id or "%s.%s" % (entry.table, entry.key)).strip()
+
+
+def parse_entity_reference_values(raw_value: Any) -> Tuple[List[str], bool]:
+    text = str(raw_value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    values = dedupe_strings(item.strip().strip("'\"") for item in re.split(r"[,，]", text) if item.strip())
+    valid = bool(values) and all(bool(re.fullmatch(r"[\w./:@+\-]+", item, flags=re.UNICODE)) for item in values)
+    return values, valid
+
+
+def entity_value_is_placeholder(value: Any) -> bool:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return True
+    compact = re.sub(r"[\s_.\-]+", "", text)
+    return bool(
+        re.fullmatch(r"x{2,}", compact)
+        or compact in {"id", "某某", "某个", "示例id", "exampleid", "yourid", "placeholder"}
+        or re.fullmatch(r"[<{\[][^>}\]]*(?:id|编号)[^>}\]]*[>}\]]", text, flags=re.I)
+    )
+
+
+def entity_reference_value_type(entries: List[PlanningAssetEntry]) -> str:
+    types = []
+    for entry in entries:
+        schema = (entry.metadata or {}).get("schema") if isinstance((entry.metadata or {}).get("schema"), dict) else {}
+        raw = str(schema.get("dataType") or schema.get("type") or "").strip().lower()
+        if raw:
+            types.append(raw)
+    if types and all(re.match(r"^(?:tinyint|smallint|int|integer|bigint)\b", item) for item in types):
+        return "integer"
+    if types and all(re.match(r"^(?:decimal|numeric|float|double|real)\b", item) for item in types):
+        return "number"
+    return "string"
+
+
+def entity_reference_comparison_policy(
+    entries: List[PlanningAssetEntry],
+    value_type: str,
+) -> str:
+    declared: List[str] = []
+    for entry in entries:
+        metadata = entry.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        schema = metadata.get("schema") if isinstance(metadata.get("schema"), dict) else {}
+        raw = str(
+            semantic.get("comparisonPolicy")
+            or metadata.get("comparisonPolicy")
+            or schema.get("comparisonPolicy")
+            or ""
+        ).strip().lower()
+        if raw:
+            declared.append(raw)
+    if len(set(declared)) == 1:
+        return declared[0]
+    if value_type == "integer":
+        return "integer"
+    if value_type == "number":
+        return "decimal"
+    return "exact"
+
+
+def entity_reference_value_is_valid(value: str, value_type: str) -> bool:
+    if value_type == "integer":
+        return bool(re.fullmatch(r"[-+]?\d+", str(value or "")))
+    if value_type == "number":
+        try:
+            number = Decimal(str(value or ""))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return number.is_finite()
+    return bool(str(value or ""))
+
+
+def coerce_entity_reference_value(value: str, value_type: str) -> Any:
+    if value_type == "integer" and re.fullmatch(r"[-+]?\d+", value):
+        return int(value)
+    if value_type == "number":
+        return Decimal(value)
+    return value
+
+
+def question_has_explicit_time_scope(question: str) -> bool:
+    return has_explicit_time_expression(question)
+
+
+def entity_filter_obligation(
+    reference: EntityReference,
+    task_id: str = "",
+    status: str = "",
+) -> EntityFilterObligation:
+    seed = json.dumps(
+        {
+            "field": reference.field,
+            "values": reference.values,
+            "rawLabel": reference.raw_label,
+            "rawValue": reference.raw_value,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return EntityFilterObligation(
+        obligation_id="entity_filter_%s" % hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16],
+        task_id=task_id,
+        required=True,
+        reference=reference,
+        status=status or reference.status,
+        reason=entity_reference_clarification(reference),
+    )
+
+
+def entity_reference_clarification(reference: EntityReference) -> str:
+    if reference.status == "ambiguous":
+        labels = [item for item in reference.candidate_ref_ids if item]
+        return "你提供的 ID 字段存在多个语义候选，请明确具体实体类型。候选：%s" % "、".join(labels[:6])
+    if reference.status == "placeholder":
+        return "请提供要查询的真实 ID；当前内容看起来是占位符。"
+    if reference.status == "invalid":
+        return "ID 值格式无法安全解析，请提供一个明确的 ID，多个 ID 可用逗号分隔。"
+    if reference.status == "unresolved":
+        return "请明确要查询的实体 ID 类型和值，例如选择 Topic 内已发布的实体字段。"
+    return ""
+
+
+def entity_lookup_time_policy(table: str, asset_pack: PlanningAssetPack) -> Dict[str, Any]:
+    table_entry = next((item for item in asset_pack.tables if (item.table or item.key) == table), None)
+    metadata = dict(getattr(table_entry, "metadata", {}) or {})
+    raw = metadata.get("entityLookupPolicy") or metadata.get("entity_lookup_policy") or {}
+    if isinstance(raw, dict) and raw:
+        return dict(raw)
+    time_column = str(metadata.get("timeColumn") or metadata.get("partitionColumn") or "").strip()
+    return {
+        "mode": "clarify" if time_column else "not_required",
+        "timeColumn": time_column,
+        "source": "safe_default",
+    }
+
+
+def entity_lookup_days(question: str, reference: EntityReference) -> int:
+    """Translate the governed lookup policy into an executable window.
+
+    A global/unbounded entity index must not be silently turned back into the
+    historical 30-day default by the generic intent model.  Conversely, a
+    bounded default is only executable when the semantic asset explicitly
+    publishes its window.
+    """
+
+    if reference.time_scope_explicit:
+        return extract_days(question, 30)
+    policy = dict(reference.lookup_time_policy or {})
+    mode = str(policy.get("mode") or "").strip().lower()
+    if mode in {"bounded_default", "default_window"}:
+        return max(0, int(policy.get("defaultDays") or 0))
+    if mode in {"not_required", "global", "unbounded", "all_partitions"}:
+        return 0
+    return 0
+
+
+def entity_lookup_time_clarification(
+    reference: EntityReference,
+    table: str,
+    asset_pack: PlanningAssetPack,
+) -> str:
+    policy = entity_lookup_time_policy(table, asset_pack)
+    mode = str(policy.get("mode") or "").strip().lower()
+    if reference.time_scope_explicit or mode in {"not_required", "global", "unbounded", "all_partitions"}:
+        return ""
+    if mode in {"bounded_default", "default_window"} and int(policy.get("defaultDays") or 0) > 0:
+        return ""
+    return "该明细表按时间分区，请补充 ID 所在的大致日期或查询时间范围，系统不会静默假设最近 30 天。"
 
 
 def entity_filter_candidate_columns(asset_pack: PlanningAssetPack) -> List[str]:
     scored: List[Tuple[int, int, str]] = []
     seen: set[str] = set()
-    for entry in asset_pack.entity_keys:
+    for entry in entity_filter_candidate_entries(asset_pack):
         column = str(entry.key or "")
         if not column or column in seen:
             continue
@@ -9242,6 +9704,68 @@ def explicit_object_ref_filter_gaps(question: str, plan: QueryPlan, asset_pack: 
                 reason="用户显式指定的实体 ID 必须成为 QueryGraph 节点 filter；groupBy/outputKeys 不能替代实体过滤",
             )
         )
+    return gaps
+
+
+def entity_filter_obligation_validation_gaps(
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+) -> List[GraphValidationGap]:
+    """Keep explicit entity references monotonic through graph rewrites."""
+
+    obligations = list(plan.entity_filter_obligations or [])
+    if not obligations:
+        question = next((intent.question for intent in plan.intents if intent.question), "")
+        if not question:
+            question = str((plan.question_understanding or {}).get("question") or "")
+        reference = entity_reference_from_understanding(
+            question,
+            plan.question_understanding or {},
+            asset_pack,
+        )
+        if reference.status in {"resolved", "ambiguous", "placeholder", "invalid"}:
+            obligations = [entity_filter_obligation(reference)]
+    gaps: List[GraphValidationGap] = []
+    for obligation in obligations:
+        if not obligation.required:
+            continue
+        reference = obligation.reference
+        if reference.status != "resolved" or not reference.field or not reference.values:
+            gaps.append(
+                GraphValidationGap(
+                    code="ENTITY_FILTER_OBLIGATION_UNRESOLVED",
+                    evidence=obligation.obligation_id,
+                    reason=obligation.reason or entity_reference_clarification(reference),
+                )
+            )
+            continue
+        comparison_policy = entity_comparison_policy(reference)
+        expected_values = canonical_entity_values(reference.values, comparison_policy)
+        candidate_intents = [
+            intent
+            for intent in plan.intents
+            if not obligation.task_id or intent.plan_task_id == obligation.task_id
+        ]
+        covered = any(
+            intent.filter_column == reference.field
+            and intent.entity_reference.status == "resolved"
+            and intent.entity_reference.field == reference.field
+            and (
+                not reference.semantic_ref_id
+                or intent.entity_reference.semantic_ref_id == reference.semantic_ref_id
+            )
+            and canonical_entity_values(intent.entity_reference.values, comparison_policy) == expected_values
+            for intent in candidate_intents
+        )
+        if not covered:
+            gaps.append(
+                GraphValidationGap(
+                    code="ENTITY_FILTER_OBLIGATION_NOT_PLANNED",
+                    task_id=obligation.task_id,
+                    evidence="%s=%s" % (reference.field, ",".join(str(item) for item in reference.values)),
+                    reason="用户显式实体引用没有完整绑定到 QueryGraph filterColumn/filterValue",
+                )
+            )
     return gaps
 
 

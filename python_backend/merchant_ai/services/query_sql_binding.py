@@ -316,7 +316,7 @@ def split_filter_values(value: Any, max_values: int = 200) -> List[Any]:
         raw = str(value or "").strip()
         if not raw:
             return []
-        raw_values = [item.strip() for item in raw.split(",")] if "," in raw else [raw]
+        raw_values = [item.strip() for item in re.split(r"[,，]", raw)] if re.search(r"[,，]", raw) else [raw]
     values: List[Any] = []
     for item in raw_values:
         if blank_entity_value(item):
@@ -418,7 +418,14 @@ def node_bind_values_by_column(
         add_bind_values(values_by_column, store_column, list(context.authorized_store_ids), max_values)
     filter_column = normalize_identifier(intent.filter_column)
     if filter_column in normalized_columns:
-        add_bind_values(values_by_column, filter_column, split_filter_values(intent.filter_value, max_values), max_values)
+        reference = getattr(intent, "entity_reference", None)
+        governed_values = (
+            list(getattr(reference, "values", None) or [])
+            if str(getattr(reference, "status", "") or "") == "resolved"
+            and normalize_identifier(getattr(reference, "field", "")) == filter_column
+            else split_filter_values(intent.filter_value, max_values)
+        )
+        add_bind_values(values_by_column, filter_column, governed_values, max_values)
     for entity_set in context.upstream_entity_sets or []:
         join_key = normalize_identifier(entity_set.join_key)
         if join_key in normalized_columns:
@@ -643,6 +650,7 @@ def bind_node_sql_parameters_ast(
     params: List[Any] = []
     merchant_bound = not merchant_columns
     bound_any = False
+    binding_error = ""
 
     def values_for(column: str, original_values: List[Any]) -> List[Any]:
         values = list(values_by_column.get(column) or original_values or [])
@@ -652,7 +660,7 @@ def bind_node_sql_parameters_ast(
         return values
 
     def transform(node: exp.Expression) -> exp.Expression:
-        nonlocal merchant_bound, bound_any
+        nonlocal merchant_bound, bound_any, binding_error
         if isinstance(node, exp.EQ):
             column = predicate_column_name(node.this)
             if column not in values_by_column and column not in merchant_columns:
@@ -661,6 +669,13 @@ def bind_node_sql_parameters_ast(
             values = values_for(column, original_values)
             if not values:
                 return node
+            if len(values) > 1:
+                placeholders = [placeholder_expression() for _ in values]
+                params.extend(values)
+                bound_any = True
+                if column in merchant_columns:
+                    merchant_bound = True
+                return exp.In(this=node.this.copy(), expressions=placeholders)
             node.set("expression", placeholder_expression())
             params.append(values[0])
             bound_any = True
@@ -670,6 +685,9 @@ def bind_node_sql_parameters_ast(
         if isinstance(node, exp.In):
             column = predicate_column_name(node.this)
             if column not in values_by_column and column not in merchant_columns:
+                return node
+            if node.args.get("query") is not None or node.find(exp.Subquery) is not None:
+                binding_error = "受控过滤字段不能使用 IN 子查询，必须使用可绑定的标量值列表"
                 return node
             original_values = parse_ast_literal_values(list(node.expressions or []))
             values = values_for(column, original_values)
@@ -686,6 +704,11 @@ def bind_node_sql_parameters_ast(
 
     bound = parsed.transform(transform, copy=True)
     bound_sql = normalize_ast_bound_sql_text(bound.sql(dialect="mysql", identify=True).replace("?", "%s"))
+    if binding_error:
+        return bound_sql, params, binding_error, True
+    placeholder_count = sum(1 for _ in bound.find_all(exp.Placeholder))
+    if placeholder_count != len(params):
+        return bound_sql, params, "SQL 占位符数量与受控绑定参数不一致", True
     if merchant_columns and not merchant_bound:
         return bound_sql, params, "SQL 缺少语义资产声明的租户过滤字段", True
     if not bound_any:
@@ -735,7 +758,21 @@ def bind_node_sql_parameters(
     intent: QuestionIntent,
     asset_pack: PlanningAssetPack,
     context: NodeExecutionContext,
+    max_filter_values: int = 0,
 ) -> Tuple[str, List[Any], str]:
+    reference = getattr(intent, "entity_reference", None)
+    if (
+        str(getattr(reference, "status", "") or "") == "resolved"
+        and normalize_identifier(getattr(reference, "field", "")) == normalize_identifier(intent.filter_column)
+    ):
+        governed_values = list(getattr(reference, "values", None) or [])
+        if max_filter_values > 0 and len(governed_values) > max_filter_values:
+            return (
+                sql,
+                [],
+                "ENTITY_FILTER_VALUE_LIMIT_EXCEEDED: entity filter contains %s values; limit=%s"
+                % (len(governed_values), max_filter_values),
+            )
     columns = {normalize_identifier(column) for column in asset_pack.known_columns(intent.preferred_table)}
     values_by_column = node_bind_values_by_column(intent, asset_pack, columns, context)
     pattern = bindable_predicate_pattern(list(values_by_column.keys()))
@@ -762,7 +799,7 @@ def bind_node_sql_parameters(
         if column in merchant_columns:
             values = [context.merchant_id]
             merchant_bound = True
-        if op == "IN" and len(values) > 1:
+        if len(values) > 1:
             params.extend(values)
             return "%sIN (%s)" % (match.group("prefix"), ", ".join(["%s"] * len(values)))
         params.append(values[0])

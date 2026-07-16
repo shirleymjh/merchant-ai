@@ -93,6 +93,32 @@ EXECUTABLE_METRIC_AS_OF_POLICIES_BY_SELECTION = {
 }
 EXECUTABLE_METRIC_MISSING_DATA_POLICIES = frozenset({"disclose_unknown", "fail_closed"})
 EXECUTABLE_METRIC_ZERO_VALUE_POLICIES = frozenset({"preserve_observed_zero"})
+SUPPORTED_ENTITY_LOOKUP_POLICY_MODES = frozenset(
+    {
+        "clarify",
+        "not_required",
+        "global",
+        "unbounded",
+        "all_partitions",
+        "bounded_default",
+        "default_window",
+    }
+)
+SUPPORTED_ENTITY_COMPARISON_POLICIES = frozenset(
+    {
+        "exact",
+        "case_insensitive",
+        "casefold",
+        "trimmed",
+        "trim",
+        "trimmed_case_insensitive",
+        "trim_casefold",
+        "integer",
+        "decimal",
+        "number",
+        "numeric",
+    }
+)
 
 # These are the table-level semantic files that are actually overlaid by every
 # active asset reader. Keep the runtime loader and activation identity derived
@@ -2744,8 +2770,11 @@ class PlanningAssetPackBuilder:
                         key=name,
                         table=table,
                         topic=topic,
-                        title=name,
+                        title=comment,
+                        aliases=dedupe_strings(aliases),
+                        description=json.dumps({"schema": col, "semantic": semantic}, ensure_ascii=False),
                         source_ref_id="semantic:%s:%s:key:%s" % (topic, table, name),
+                        metadata={"schema": col, "semantic": semantic},
                     )
                 )
         table_metrics = self.topic_assets.load_table_metrics(topic, table)[:120]
@@ -5211,6 +5240,67 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
     row_access_policy = normalize_row_access_policy(asset.get("rowAccessPolicy") or {})
     result_access_policies = normalize_result_access_policies(asset.get("resultAccessPolicies") or {})
     table_usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
+    entity_fields = [
+        field
+        for field in semantic_columns
+        if isinstance(field, dict)
+        and str(field.get("role") or field.get("semanticRole") or "").strip().upper()
+        in {"KEY", "ENTITY", "ENTITY_KEY", "PRIMARY_KEY", "IDENTIFIER"}
+    ]
+    table_time_column = str(asset.get("timeColumn") or "").strip()
+    raw_entity_lookup_policy = asset.get("entityLookupPolicy")
+    if entity_fields and table_time_column and raw_entity_lookup_policy is None:
+        errors.append({"code": "ENTITY_LOOKUP_POLICY_UNDECLARED", "column": table_time_column})
+    if raw_entity_lookup_policy is not None:
+        if not isinstance(raw_entity_lookup_policy, dict):
+            errors.append({"code": "ENTITY_LOOKUP_POLICY_INVALID"})
+        else:
+            lookup_mode = str(raw_entity_lookup_policy.get("mode") or "").strip().lower()
+            lookup_time_column = str(raw_entity_lookup_policy.get("timeColumn") or "").strip()
+            if lookup_mode not in SUPPORTED_ENTITY_LOOKUP_POLICY_MODES:
+                errors.append(
+                    {
+                        "code": "ENTITY_LOOKUP_POLICY_MODE_INVALID",
+                        "mode": lookup_mode or "UNDECLARED",
+                    }
+                )
+            if lookup_time_column and lookup_time_column not in columns:
+                errors.append(
+                    {
+                        "code": "ENTITY_LOOKUP_TIME_COLUMN_MISSING",
+                        "column": lookup_time_column,
+                    }
+                )
+            if lookup_mode in {"bounded_default", "default_window"}:
+                try:
+                    default_days = int(raw_entity_lookup_policy.get("defaultDays"))
+                except (TypeError, ValueError):
+                    default_days = 0
+                if default_days <= 0:
+                    errors.append({"code": "ENTITY_LOOKUP_DEFAULT_DAYS_INVALID"})
+                if not lookup_time_column:
+                    errors.append({"code": "ENTITY_LOOKUP_TIME_COLUMN_UNDECLARED"})
+    for entity_field in entity_fields:
+        entity_column = str(entity_field.get("columnName") or "").strip()
+        canonical_ref = str(
+            entity_field.get("canonicalEntityRef")
+            or entity_field.get("canonicalEntityType")
+            or entity_field.get("entityType")
+            or ""
+        ).strip()
+        comparison_policy = str(entity_field.get("comparisonPolicy") or "").strip().lower()
+        if not canonical_ref:
+            warnings.append({"code": "CANONICAL_ENTITY_REF_UNDECLARED", "column": entity_column})
+        if not comparison_policy:
+            warnings.append({"code": "ENTITY_COMPARISON_POLICY_UNDECLARED", "column": entity_column})
+        elif comparison_policy not in SUPPORTED_ENTITY_COMPARISON_POLICIES:
+            errors.append(
+                {
+                    "code": "ENTITY_COMPARISON_POLICY_INVALID",
+                    "column": entity_column,
+                    "comparisonPolicy": comparison_policy,
+                }
+            )
     if row_access_policy and str(row_access_policy.get("filterColumn") or "") not in columns:
         errors.append({"code": "ROW_ACCESS_FILTER_COLUMN_MISSING", "column": row_access_policy.get("filterColumn")})
     if bool(table_usage.get("queryableByAgent")):

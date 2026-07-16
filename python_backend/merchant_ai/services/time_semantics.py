@@ -111,6 +111,12 @@ def resolve_time_window_contract(
     return contract
 
 
+def has_explicit_time_expression(question: str) -> bool:
+    """Use the canonical resolver to distinguish user time from defaults."""
+
+    return resolve_time_range(str(question or "")).source != "default_days"
+
+
 def resolve_comparison_time_range(
     text: str,
     primary: ResolvedTimeRange,
@@ -245,6 +251,35 @@ def time_window_contract_trace(
 def apply_time_range_to_plan(plan: QueryPlan, time_range: ResolvedTimeRange) -> QueryPlan:
     if not plan.intents:
         return plan
+    lookup_policy = plan_entity_lookup_time_policy(plan)
+    lookup_mode = str(lookup_policy.get("mode") or "").strip().lower()
+    lookup_explicit = bool(lookup_policy.get("timeScopeExplicit"))
+    if lookup_policy and not lookup_explicit and lookup_mode in {
+        "not_required",
+        "global",
+        "unbounded",
+        "all_partitions",
+    }:
+        # The default calendar contract is not user evidence.  A published
+        # global lookup contract must survive the workflow unchanged.
+        return plan
+    if lookup_policy and not lookup_explicit and lookup_mode in {
+        "bounded_default",
+        "default_window",
+    }:
+        policy_days = safe_positive_int(lookup_policy.get("defaultDays"))
+        if policy_days:
+            end = parse_iso_date(time_range.end_date)
+            if end:
+                start = end - timedelta(days=policy_days - 1)
+                time_range = resolved_range(
+                    "rolling",
+                    start,
+                    end,
+                    time_range.timezone,
+                    "语义资产默认%d天" % policy_days,
+                    "entity_lookup_policy",
+                ).model_copy(update={"explicit": False})
     intents = []
     for intent in plan.intents:
         current = intent.time_range
@@ -255,12 +290,74 @@ def apply_time_range_to_plan(plan: QueryPlan, time_range: ResolvedTimeRange) -> 
     return plan.model_copy(update={"intents": intents, "question_understanding": understanding})
 
 
+def plan_entity_lookup_time_policy(plan: QueryPlan) -> Dict[str, Any]:
+    references = [
+        obligation.reference
+        for obligation in plan.entity_filter_obligations
+        if obligation.required and obligation.reference.status == "resolved"
+    ]
+    if not references:
+        references = [
+            intent.entity_reference
+            for intent in plan.intents
+            if intent.entity_reference.status == "resolved"
+        ]
+    if not references:
+        return {}
+    reference = references[0]
+    policy = dict(reference.lookup_time_policy or {})
+    if not policy:
+        return {}
+    policy["timeScopeExplicit"] = bool(reference.time_scope_explicit)
+    return policy
+
+
+def safe_positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
 def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]) -> QueryPlan:
     if not plan.intents or not isinstance(contract, dict):
+        return plan
+    lookup_policy = plan_entity_lookup_time_policy(plan)
+    lookup_mode = str(lookup_policy.get("mode") or "").strip().lower()
+    lookup_explicit = bool(lookup_policy.get("timeScopeExplicit"))
+    if lookup_policy and not lookup_explicit and lookup_mode in {
+        "not_required",
+        "global",
+        "unbounded",
+        "all_partitions",
+    }:
         return plan
     primary = time_range_from_contract(contract.get("primary") or {})
     if not primary:
         return plan
+    if lookup_policy and not lookup_explicit and lookup_mode in {
+        "bounded_default",
+        "default_window",
+    }:
+        policy_days = safe_positive_int(lookup_policy.get("defaultDays"))
+        end = parse_iso_date(primary.end_date)
+        if policy_days and end:
+            primary = resolved_range(
+                "rolling",
+                end - timedelta(days=policy_days - 1),
+                end,
+                primary.timezone,
+                "语义资产默认%d天" % policy_days,
+                "entity_lookup_policy",
+            ).model_copy(update={"explicit": False})
+            contract = dict(contract)
+            contract["primary"] = primary.model_dump(by_alias=True)
+            contract["source"] = "entity_lookup_policy"
+            contract["trace"] = [
+                *list(contract.get("trace") or []),
+                "entity_lookup_policy=bounded_default:%d" % policy_days,
+            ]
     primary.window_role = "primary"
     plan = apply_time_range_to_plan(plan, primary)
     understanding = dict(plan.question_understanding or {})

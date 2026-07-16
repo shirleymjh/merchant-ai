@@ -1434,6 +1434,10 @@ class NodePlanContract(APIModel):
     metric_formula: str = ""
     metric_specs: List[Dict[str, Any]] = Field(default_factory=list)
     group_by_column: str = ""
+    filter_column: str = ""
+    filter_values: List[Any] = Field(default_factory=list)
+    filter_value_limit: int = 0
+    entity_filter_obligations: List[EntityFilterObligation] = Field(default_factory=list)
     output_keys: List[str] = Field(default_factory=list)
     required_evidence: List[str] = Field(default_factory=list)
     days: int = 0
@@ -1819,6 +1823,64 @@ class PlanDependency(APIModel):
     relation_type: str = "LOOKUP"
 
 
+class EntityReference(APIModel):
+    """A governed entity mention resolved from the user's question.
+
+    The raw mention is retained for audit, while ``values`` are the exact
+    canonical values that execution is allowed to bind.  Candidate refs make
+    ambiguity explicit instead of letting an LLM silently choose an ``*_id``
+    field.
+    """
+
+    semantic_ref_id: str = ""
+    field: str = ""
+    table: str = ""
+    raw_label: str = ""
+    raw_value: str = ""
+    values: List[Any] = Field(default_factory=list)
+    value_type: str = "string"
+    comparison_policy: str = "exact"
+    source: str = ""
+    confidence: float = 0.0
+    candidate_ref_ids: List[str] = Field(default_factory=list)
+    status: str = "unresolved"
+    placeholder: bool = False
+    time_scope_explicit: bool = False
+    lookup_time_policy: Dict[str, Any] = Field(default_factory=dict)
+
+
+class EntityFilterObligation(APIModel):
+    """Immutable planning obligation for an explicitly requested entity."""
+
+    obligation_id: str = ""
+    task_id: str = ""
+    required: bool = True
+    reference: EntityReference = Field(default_factory=EntityReference)
+    status: str = "unresolved"
+    reason: str = ""
+
+
+class EntityFilterVerificationProof(APIModel):
+    """Internal identity proof produced before display masking/offloading."""
+
+    task_id: str = ""
+    obligation_id: str = ""
+    field: str = ""
+    comparison_policy: str = "exact"
+    contract_hash: str = ""
+    sql_hash: str = ""
+    requested_value_hashes: List[str] = Field(default_factory=list)
+    observed_value_hashes: List[str] = Field(default_factory=list)
+    missing_values: List[Any] = Field(default_factory=list)
+    unexpected_value_count: int = 0
+    row_count: int = 0
+    coverage_complete: bool = False
+    verified: bool = False
+    status: str = "not_required"
+    code: str = ""
+    reason: str = ""
+
+
 class QuestionIntent(APIModel):
     question: str = ""
     intent_type: IntentType = IntentType.INVALID
@@ -1835,6 +1897,7 @@ class QuestionIntent(APIModel):
     group_by_name: str = ""
     filter_column: str = ""
     filter_value: str = ""
+    entity_reference: EntityReference = Field(default_factory=EntityReference)
     days: int = 7
     limit: int = 20
     required_evidence: List[str] = Field(default_factory=list)
@@ -1859,6 +1922,7 @@ class QueryPlan(APIModel):
     clarification_needs: List[str] = Field(default_factory=list)
     final_required_evidence: List[str] = Field(default_factory=list)
     final_evidence_column_hints: Dict[str, List[str]] = Field(default_factory=dict)
+    entity_filter_obligations: List[EntityFilterObligation] = Field(default_factory=list)
     agent_trace: List[str] = Field(default_factory=list)
     question_understanding: Dict[str, Any] = Field(default_factory=dict)
     compiler_trace: List[str] = Field(default_factory=list)
@@ -1946,6 +2010,7 @@ class AgentTaskResult(APIModel):
     node_task_profile: NodeTaskProfile = Field(default_factory=NodeTaskProfile)
     freshness_reports: List[FreshnessCheckResult] = Field(default_factory=list)
     node_plan_contract: NodePlanContract = Field(default_factory=NodePlanContract)
+    entity_filter_verification: EntityFilterVerificationProof = Field(default_factory=EntityFilterVerificationProof)
     node_plan_critique: NodePlanCritiqueResult = Field(default_factory=NodePlanCritiqueResult)
     sql_draft_decision: SqlDraftDecision = Field(default_factory=SqlDraftDecision)
     file_tool_results: List[Dict[str, Any]] = Field(default_factory=list)

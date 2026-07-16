@@ -4,6 +4,10 @@ import re
 from typing import Any, Dict, List, Set
 
 from merchant_ai.models import AgentRunResult, AnswerMode, EvidenceGap, QueryPlan, VerifiedEvidence
+from merchant_ai.services.entity_contracts import (
+    entity_filter_contract_hash,
+    entity_filter_sql_hash,
+)
 from merchant_ai.services.memory_constraints import memory_constraint_evidence_gaps
 
 
@@ -26,6 +30,7 @@ class EvidenceVerifier:
             for gap in run_result.evidence_gaps or []
         ]
         gaps.extend(execution_operational_evidence_gaps(run_result))
+        gaps.extend(entity_filter_evidence_gaps(run_result))
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
         gaps.extend(self._metric_spec_gaps(plan, derived_evidence))
@@ -952,6 +957,76 @@ def snapshot_time_display(value: Any) -> str:
     return text[:40]
 
 
+def entity_filter_evidence_gaps(run_result: AgentRunResult) -> List[EvidenceGap]:
+    """Consume the pre-mask identity proof; never re-check display rows."""
+
+    gaps: List[EvidenceGap] = []
+    for task in run_result.task_results:
+        contract = task.node_plan_contract
+        obligations = [
+            item
+            for item in contract.entity_filter_obligations
+            if item.required and item.status == "bound"
+        ]
+        if not obligations or task.query_bundle.failed:
+            continue
+        column = str(contract.filter_column or "")
+        proof = task.entity_filter_verification
+        expected_contract_hash = entity_filter_contract_hash(contract)
+        expected_sql_hash = entity_filter_sql_hash(task.query_bundle.sql)
+        if (
+            proof.status == "not_required"
+            or proof.contract_hash != expected_contract_hash
+            or proof.sql_hash != expected_sql_hash
+        ):
+            gaps.append(
+                EvidenceGap(
+                    code="ENTITY_FILTER_VERIFICATION_MISSING",
+                    task_id=task.task_id,
+                    evidence=column,
+                    reason="实体过滤执行结果缺少与当前 SQL/契约绑定的内部验证证明",
+                    severity="blocking",
+                    source="entity_filter",
+                    answer_instruction="不能把这些结果表述为用户指定 ID 的明细。",
+                )
+            )
+            continue
+        if not proof.verified:
+            gaps.append(
+                EvidenceGap(
+                    code=proof.code or "ENTITY_FILTER_RESULT_UNVERIFIABLE",
+                    task_id=task.task_id,
+                    evidence=column,
+                    reason=proof.reason or "实体过滤内部验证未通过",
+                    severity="blocking",
+                    source="entity_filter",
+                    answer_instruction="不能使用对象身份与请求不一致的明细结果。",
+                    details={
+                        "proofStatus": proof.status,
+                        "unexpectedValueCount": proof.unexpected_value_count,
+                        "coverageComplete": proof.coverage_complete,
+                    },
+                )
+            )
+            continue
+        missing = list(proof.missing_values or [])
+        if missing:
+            gaps.append(
+                EvidenceGap(
+                    code="ENTITY_FILTER_VALUE_NOT_FOUND",
+                    task_id=task.task_id,
+                    evidence=column,
+                    reason="部分请求 ID 在已完成查询中没有匹配记录",
+                    severity="warning",
+                    disclosure_required=True,
+                    source="entity_filter",
+                    answer_instruction="逐项说明哪些请求 ID 未返回记录，不要把其他 ID 的结果替代它们。",
+                    details={"missingValues": missing[:20]},
+                )
+            )
+    return gaps
+
+
 def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
     warning_codes = {
         "FIELD_AMBIGUOUS",
@@ -959,6 +1034,7 @@ def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
         "OPTIONAL_EVIDENCE_MISSING",
         "RESOURCE_DEGRADED_QUERY",
         "MEMORY_METRIC_DISPUTE_REQUIRES_CLARIFICATION",
+        "ENTITY_FILTER_VALUE_NOT_FOUND",
     }
     info_codes: Set[str] = set()
     default_severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"
@@ -1036,6 +1112,8 @@ def evidence_gap_source(code: str) -> str:
         return "calculation"
     if code.startswith("MEMORY_"):
         return "memory"
+    if code.startswith("ENTITY_FILTER_"):
+        return "entity_filter"
     if code in {"FIELD_AMBIGUOUS"}:
         return "field_policy"
     return "task"

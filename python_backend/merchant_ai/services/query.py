@@ -24,6 +24,9 @@ from merchant_ai.models import (
     AgentTask,
     AgentTaskResult,
     AnswerMode,
+    EntityFilterObligation,
+    EntityReference,
+    EntityFilterVerificationProof,
     EntitySet,
     EvidenceCheckResult,
     EvidenceGap,
@@ -67,6 +70,14 @@ from merchant_ai.services.formulas import (
     equivalent_formula_text,
     formula_columns as reconciled_formula_columns,
 )
+from merchant_ai.services.entity_contracts import (
+    canonical_entity_values,
+    entity_comparison_policy,
+    entity_filter_contract_hash,
+    entity_filter_sql_hash,
+    entity_value_display_map,
+    entity_value_hash,
+)
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.planning import (
     EvidenceContractBuilder,
@@ -101,6 +112,7 @@ from merchant_ai.services.query_sql_binding import (
     normalize_inclusive_relative_window_sql,
     parse_partition_date,
     partition_is_stale_for_near_realtime,
+    predicate_column_name,
     quote_identifier,
     realtime_fallback_for_table,
     split_window_coverage_contract,
@@ -599,6 +611,9 @@ STRUCTURED_FALLBACK_ERROR_CODES = {
     "METRIC_TIME_SEMANTICS_MISMATCH",
     "MISSING_OUTPUT_KEY",
     "MISSING_ENTITY_KEY_FILTER",
+    "MISSING_ENTITY_FILTER",
+    "MISSING_ENTITY_FILTER_VALUE",
+    "ENTITY_FILTER_CONTRACT_MISMATCH",
     "MEM_ALLOC_FAILED",
     "TIMEOUT",
     "SQL_SYNTAX",
@@ -611,6 +626,9 @@ STRICT_STRUCTURED_FALLBACK_CODES = {
     "RUNTIME_TIME_ALIGNMENT_MISMATCH",
     "METRIC_TIME_SEMANTICS_MISMATCH",
     "MISSING_ENTITY_KEY_FILTER",
+    "MISSING_ENTITY_FILTER",
+    "MISSING_ENTITY_FILTER_VALUE",
+    "ENTITY_FILTER_CONTRACT_MISMATCH",
 }
 RESOURCE_CONSTRAINED_DORIS_ERRORS = {"MEM_ALLOC_FAILED", "TIMEOUT"}
 class SqlValidationService:
@@ -789,6 +807,46 @@ class NodePlanCritic:
             issues.append(issue("MISSING_GROUP_BY_COLUMN", "aggregate node has no groupByColumn or outputKeys"))
         if contract.group_by_column and contract.group_by_column not in allowed:
             issues.append(issue("MISSING_GROUP_BY_COLUMN", "groupByColumn is not available in node schema", contract.group_by_column))
+        required_entity_obligations = [item for item in contract.entity_filter_obligations if item.required]
+        if required_entity_obligations and not contract.filter_column:
+            issues.append(issue("MISSING_ENTITY_FILTER", "required entity filter obligation has no bound filterColumn"))
+        if contract.filter_column:
+            if contract.filter_column not in allowed:
+                issues.append(issue("MISSING_ENTITY_FILTER", "filterColumn is not available in node schema", contract.filter_column))
+            if not contract.filter_values:
+                issues.append(issue("MISSING_ENTITY_FILTER_VALUE", "filterColumn has no governed filter values", contract.filter_column))
+            if contract.filter_value_limit > 0 and len(contract.filter_values) > contract.filter_value_limit:
+                issues.append(
+                    issue(
+                        "ENTITY_FILTER_VALUE_LIMIT_EXCEEDED",
+                        "entity filter exceeds the declared execution value limit",
+                        "%s>%s" % (len(contract.filter_values), contract.filter_value_limit),
+                    )
+                )
+        for obligation in required_entity_obligations:
+            reference = obligation.reference
+            if obligation.status != "bound" or reference.status != "resolved":
+                issues.append(
+                    issue(
+                        "ENTITY_FILTER_OBLIGATION_UNRESOLVED",
+                        "required entity reference is not resolved and bound",
+                        obligation.obligation_id,
+                    )
+                )
+                continue
+            comparison_policy = entity_comparison_policy(reference)
+            if (
+                reference.field != contract.filter_column
+                or canonical_entity_values(reference.values, comparison_policy)
+                != canonical_entity_values(contract.filter_values, comparison_policy)
+            ):
+                issues.append(
+                    issue(
+                        "ENTITY_FILTER_CONTRACT_MISMATCH",
+                        "entity obligation field/values differ from the executable node filter",
+                        obligation.obligation_id,
+                    )
+                )
         missing_output = [column for column in contract.output_keys if column and column not in allowed]
         if missing_output:
             issues.append(issue("MISSING_OUTPUT_KEY", "outputKeys are not available in node schema", ",".join(missing_output)))
@@ -2596,7 +2654,13 @@ class NodeWorkerExecutor:
                     )
                 sql = repaired.repaired_sql
                 continue
-            bound_sql, sql_params, binding_error = bind_node_sql_parameters(sql, intent, asset_pack, context)
+            bound_sql, sql_params, binding_error = bind_node_sql_parameters(
+                sql,
+                intent,
+                asset_pack,
+                context,
+                max_filter_values=max(1, int(self.settings.agent_max_entity_values or 1)),
+            )
             tenant_binding_error = tenant_scope_binding_error(bound_sql, sql_params, contract, context)
             if tenant_binding_error:
                 binding_error = binding_error or tenant_binding_error
@@ -2791,6 +2855,21 @@ class NodeWorkerExecutor:
                     coverage_complete = bool(coverage.get("complete"))
                     coverage_code = str(coverage.get("code") or "SPLIT_WINDOW_COVERAGE_INCOMPLETE")
                     coverage_reason = str(coverage.get("reason") or "requested window was not completely executed")
+                    entity_verification = build_entity_filter_verification_proof(
+                        contract,
+                        rows,
+                        bound_sql,
+                        coverage_complete=coverage_complete,
+                    )
+                    entity_contract_error = (
+                        entity_verification.reason
+                        if entity_verification.status == "failed"
+                        else ""
+                    )
+                    if entity_contract_error:
+                        coverage_complete = False
+                        coverage_code = "ENTITY_FILTER_RESULT_MISMATCH"
+                        coverage_reason = entity_contract_error
                     split_error = "" if coverage_complete else "%s: %s" % (coverage_code, coverage_reason)
                     summary = (
                         "Doris 原查询失败后拆分查询返回 %s 行" % len(rows)
@@ -2862,6 +2941,7 @@ class NodeWorkerExecutor:
                         node_task_profile=node_task_profile,
                         freshness_reports=[freshness],
                         node_plan_contract=contract,
+                        entity_filter_verification=entity_verification,
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
@@ -3037,6 +3117,48 @@ class NodeWorkerExecutor:
                     duration_ms=query_duration_ms,
                 )
                 trace.append(ReActStep(round=3 + round_index * 3, reason="读取 Doris", action="query_doris", observation="rows=%s" % len(rows)))
+                entity_verification = build_entity_filter_verification_proof(contract, rows, bound_sql)
+                entity_contract_error = (
+                    entity_verification.reason
+                    if entity_verification.status == "failed"
+                    else ""
+                )
+                if entity_contract_error:
+                    message = "ENTITY_FILTER_RESULT_MISMATCH: %s" % entity_contract_error
+                    record_tool(
+                        tool_traces,
+                        intent,
+                        "verify_entity_filter_result",
+                        "failed",
+                        contract.filter_column,
+                        entity_contract_error,
+                        "ENTITY_FILTER_RESULT_MISMATCH",
+                        round_index,
+                    )
+                    self.access_control.record_query_audit(access_decision, row_count=len(rows), status="failed_entity_filter_mismatch")
+                    return AgentTaskResult(
+                        success=False,
+                        summary=message,
+                        query_bundle=QueryBundle(
+                            sql=bound_sql,
+                            params=sql_params,
+                            tables=validation.base_tables,
+                            failed=True,
+                            error=message,
+                            original_row_count=len(rows),
+                            duration_ms=query_duration_ms,
+                        ),
+                        react_trace=trace,
+                        sql_repairs=repair_attempts,
+                        validation_results=validation_results,
+                        node_tool_traces=tool_traces,
+                        node_task_profile=node_task_profile,
+                        freshness_reports=[freshness],
+                        node_plan_contract=contract,
+                        entity_filter_verification=entity_verification,
+                        node_plan_critique=critique,
+                        sql_draft_decision=draft_decision,
+                    )
                 entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
                 display_rows = annotate_time_window_result_rows(apply_column_masks(rows, contract), intent)
                 self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success")
@@ -3073,6 +3195,7 @@ class NodeWorkerExecutor:
                     node_task_profile=node_task_profile,
                     freshness_reports=[freshness],
                     node_plan_contract=contract,
+                    entity_filter_verification=entity_verification,
                     node_plan_critique=critique,
                     sql_draft_decision=draft_decision,
                 )
@@ -3108,6 +3231,21 @@ class NodeWorkerExecutor:
                     coverage_complete = bool(coverage.get("complete"))
                     coverage_code = str(coverage.get("code") or "SPLIT_WINDOW_COVERAGE_INCOMPLETE")
                     coverage_reason = str(coverage.get("reason") or "requested window was not completely executed")
+                    entity_verification = build_entity_filter_verification_proof(
+                        contract,
+                        rows,
+                        bound_sql,
+                        coverage_complete=coverage_complete,
+                    )
+                    entity_contract_error = (
+                        entity_verification.reason
+                        if entity_verification.status == "failed"
+                        else ""
+                    )
+                    if entity_contract_error:
+                        coverage_complete = False
+                        coverage_code = "ENTITY_FILTER_RESULT_MISMATCH"
+                        coverage_reason = entity_contract_error
                     split_error = "" if coverage_complete else "%s: %s" % (coverage_code, coverage_reason)
                     summary = (
                         "Doris 原查询失败后拆分查询返回 %s 行" % len(rows)
@@ -3179,6 +3317,7 @@ class NodeWorkerExecutor:
                         node_task_profile=node_task_profile,
                         freshness_reports=[freshness],
                         node_plan_contract=contract,
+                        entity_filter_verification=entity_verification,
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
@@ -4033,7 +4172,13 @@ class NodeWorkerExecutor:
             split_validation = self._contract_scope_validation(split_validation, intent, split_sql, contract)
             if not split_validation.valid:
                 return None
-            safe_bound_sql, safe_params, binding_error = bind_node_sql_parameters(split_sql, intent, asset_pack, context)
+            safe_bound_sql, safe_params, binding_error = bind_node_sql_parameters(
+                split_sql,
+                intent,
+                asset_pack,
+                context,
+                max_filter_values=max(1, int(self.settings.agent_max_entity_values or 1)),
+            )
             tenant_binding_error = tenant_scope_binding_error(safe_bound_sql, safe_params, contract, context)
             if tenant_binding_error:
                 binding_error = binding_error or tenant_binding_error
@@ -4346,7 +4491,7 @@ class NodeWorkerExecutor:
         if merchant_column and merchant_column in columns:
             where.append("`%s` = %s" % (merchant_column, sql_literal(context.merchant_id)))
         if intent.filter_column and intent.filter_column in columns and intent.filter_value:
-            where.append(filter_predicate(intent.filter_column, intent.filter_value))
+            where.append(filter_predicate(intent.filter_column, intent_entity_filter_values(intent)))
         if aggregate_entity_key_requires_non_empty_filter(intent, columns):
             column = intent.group_by_column
             where.append("`%s` IS NOT NULL" % column)
@@ -4546,6 +4691,19 @@ class NodeWorkerExecutor:
                     "valid": False,
                     "error_code": "MISSING_MERCHANT_FILTER",
                     "message": "Node SQL must filter by nodePlanContract.merchantFilterColumn",
+                }
+            )
+        if contract.filter_column and contract.filter_values and not sql_has_entity_filter_predicate(
+            sql,
+            contract.filter_column,
+            contract.filter_values,
+            contract.preferred_table,
+        ):
+            return validation.model_copy(
+                update={
+                    "valid": False,
+                    "error_code": "MISSING_ENTITY_FILTER",
+                    "message": "Node SQL must apply the entity filter declared by nodePlanContract",
                 }
             )
         time_contract = dict(contract.time_window_contract or {})
@@ -4776,6 +4934,10 @@ class NodeWorkerExecutor:
             metric_formula=str(metric_contract.get("formula") or intent.metric_formula),
             metric_specs=effective_metric_specs,
             group_by_column=intent.group_by_column,
+            filter_column=intent.filter_column,
+            filter_values=intent_entity_filter_values(intent),
+            filter_value_limit=max(1, int(self.settings.agent_max_entity_values or 1)),
+            entity_filter_obligations=entity_filter_obligations_for_intent(intent),
             output_keys=contract_output_keys,
             required_evidence=intent.required_evidence,
             days=int(intent.days or 0),
@@ -6781,11 +6943,225 @@ def sql_repair_observation(attempt: SqlRepairAttempt) -> Dict[str, Any]:
 
 
 def filter_predicate(column: str, value: Any) -> str:
-    raw = str(value or "")
-    if "," in raw:
-        values = [item.strip() for item in raw.split(",") if item.strip()]
+    values = split_intent_filter_values(value)
+    if len(values) > 1:
         return "`%s` IN (%s)" % (column, ", ".join(sql_literal(item) for item in values))
-    return "`%s` = %s" % (column, sql_literal(value))
+    scalar = values[0] if values else value
+    return "`%s` = %s" % (column, sql_literal(scalar))
+
+
+def split_intent_filter_values(value: Any) -> List[Any]:
+    if isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        raw_values = re.split(r"[,，]", str(value or ""))
+    values: List[Any] = []
+    for item in raw_values:
+        normalized = item.strip() if isinstance(item, str) else item
+        if normalized in (None, "") or normalized in values:
+            continue
+        values.append(normalized)
+    return values
+
+
+def intent_entity_filter_values(intent: QuestionIntent) -> List[Any]:
+    reference = intent.entity_reference
+    if reference.status == "resolved" and reference.field == intent.filter_column and reference.values:
+        return list(reference.values)
+    return split_intent_filter_values(intent.filter_value)
+
+
+def entity_filter_obligations_for_intent(intent: QuestionIntent) -> List[EntityFilterObligation]:
+    reference = intent.entity_reference
+    if reference.status != "resolved" or not reference.field or not reference.values:
+        return []
+    seed = json.dumps(
+        {"field": reference.field, "values": reference.values, "raw": reference.raw_value},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return [
+        EntityFilterObligation(
+            obligation_id="entity_filter_%s" % hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16],
+            task_id=intent.plan_task_id,
+            required=True,
+            reference=reference,
+            status="bound",
+        )
+    ]
+
+
+def sql_has_entity_filter_predicate(
+    sql: str,
+    column: str,
+    expected_values: Optional[List[Any]] = None,
+    preferred_table: str = "",
+) -> bool:
+    """Return true only when the predicate restricts every base-table row.
+
+    Merely mentioning the key in a projection, a negation, an OR branch, or an
+    IN subquery is not a filter contract.  For multi-value obligations the
+    draft must expose one bindable IN predicate so execution cannot silently
+    collapse the request to its first value.
+    """
+
+    target = str(column or "").strip().lower()
+    if not target:
+        return False
+    try:
+        parsed = sqlglot.parse_one(str(sql or "").strip(), read="doris")
+    except Exception:
+        return False
+    scopes = list(traverse_scope(parsed))
+    table = str(preferred_table or "").strip().lower()
+    if table:
+        scopes = [
+            scope
+            for scope in scopes
+            if any(str(item.name or "").strip().lower() == table for item in scope.tables)
+        ]
+    elif isinstance(parsed, exp.Select):
+        scopes = [scope for scope in scopes if scope.expression is parsed]
+    if not scopes:
+        return False
+    expected_count = len([item for item in expected_values or [] if str(item).strip()])
+    return all(
+        select_scope_has_safe_entity_predicate(scope.expression, target, expected_count)
+        for scope in scopes
+    )
+
+
+def select_scope_has_safe_entity_predicate(
+    expression: exp.Expression,
+    target_column: str,
+    expected_count: int = 0,
+) -> bool:
+    where = expression.args.get("where") if isinstance(expression, exp.Select) else None
+    condition = where.this if isinstance(where, exp.Where) else None
+    if condition is None:
+        return False
+    if isinstance(condition, (exp.Or, exp.Not)) or condition.find(exp.Or) is not None or condition.find(exp.Not) is not None:
+        return False
+
+    leaves: List[exp.Expression] = []
+
+    def collect(node: exp.Expression) -> None:
+        current = node.this if isinstance(node, exp.Paren) else node
+        if isinstance(current, exp.And):
+            collect(current.this)
+            collect(current.expression)
+            return
+        leaves.append(current)
+
+    collect(condition)
+    matches: List[exp.Expression] = []
+    for leaf in leaves:
+        if not isinstance(leaf, (exp.EQ, exp.In)):
+            continue
+        if predicate_column_name(leaf.this).lower() == target_column:
+            matches.append(leaf)
+    if len(matches) != 1:
+        return False
+    predicate = matches[0]
+    if isinstance(predicate, exp.EQ):
+        if expected_count > 1:
+            return False
+        return predicate.expression.find(exp.Select) is None and predicate.expression.find(exp.Subquery) is None
+    if predicate.args.get("query") is not None or predicate.find(exp.Subquery) is not None:
+        return False
+    return bool(predicate.expressions)
+
+
+def build_entity_filter_verification_proof(
+    contract: NodePlanContract,
+    rows: List[Dict[str, Any]],
+    sql: str,
+    *,
+    coverage_complete: bool = True,
+) -> EntityFilterVerificationProof:
+    obligations = [item for item in contract.entity_filter_obligations if item.required and item.status == "bound"]
+    if not obligations:
+        return EntityFilterVerificationProof(task_id=contract.task_id, status="not_required")
+    column = str(contract.filter_column or "")
+    reference = obligations[0].reference
+    comparison_policy = entity_comparison_policy(reference)
+    requested_map = entity_value_display_map(contract.filter_values, comparison_policy)
+    requested = set(requested_map)
+    contract_hash = entity_filter_contract_hash(contract)
+    requested_hashes = sorted(entity_value_hash(value, contract_hash) for value in requested)
+    base = {
+        "task_id": contract.task_id,
+        "obligation_id": obligations[0].obligation_id,
+        "field": column,
+        "comparison_policy": comparison_policy,
+        "contract_hash": contract_hash,
+        "sql_hash": entity_filter_sql_hash(sql),
+        "requested_value_hashes": requested_hashes,
+        "row_count": len(rows),
+        "coverage_complete": bool(coverage_complete),
+    }
+    if not column or not requested:
+        return EntityFilterVerificationProof(
+            **base,
+            status="failed",
+            code="ENTITY_FILTER_CONTRACT_INVALID",
+            reason="bound entity obligation has no executable field/value contract",
+        )
+    if any(column not in row for row in rows):
+        return EntityFilterVerificationProof(
+            **base,
+            status="failed",
+            code="ENTITY_FILTER_RESULT_UNVERIFIABLE",
+            reason="result rows do not expose the governed entity key %s" % column,
+        )
+    observed_map = entity_value_display_map([row.get(column) for row in rows], comparison_policy)
+    observed = set(observed_map)
+    observed_hashes = sorted(entity_value_hash(value, contract_hash) for value in observed)
+    unexpected = sorted(observed - requested)
+    if unexpected:
+        return EntityFilterVerificationProof(
+            **base,
+            observed_value_hashes=observed_hashes,
+            unexpected_value_count=len(unexpected),
+            status="failed",
+            code="ENTITY_FILTER_RESULT_MISMATCH",
+            reason="result contains entity values outside the requested set",
+        )
+    missing = sorted(requested - observed)
+    if missing and len(requested) > 1 and sql_has_global_row_limit(sql):
+        coverage_complete = False
+    if not coverage_complete:
+        return EntityFilterVerificationProof(
+            **base,
+            observed_value_hashes=observed_hashes,
+            missing_values=[requested_map[item] for item in missing],
+            status="partial",
+            code="ENTITY_FILTER_COVERAGE_INCOMPLETE",
+            reason="entity-filter query coverage is incomplete",
+        )
+    return EntityFilterVerificationProof(
+        **base,
+        observed_value_hashes=observed_hashes,
+        missing_values=[requested_map[item] for item in missing],
+        verified=True,
+        status="verified",
+    )
+
+
+def sql_has_global_row_limit(sql: str) -> bool:
+    try:
+        parsed = sqlglot.parse_one(str(sql or "").strip(), read="doris")
+    except Exception:
+        return bool(re.search(r"\blimit\s+\d+\s*$", str(sql or ""), flags=re.I))
+    return parsed.args.get("limit") is not None
+
+
+def entity_filter_result_contract_error(contract: NodePlanContract, rows: List[Dict[str, Any]]) -> str:
+    proof = build_entity_filter_verification_proof(contract, rows, "")
+    if proof.status == "not_required" or proof.verified:
+        return ""
+    return proof.reason
 
 
 FORMULA_ALLOWED_TOKENS = {

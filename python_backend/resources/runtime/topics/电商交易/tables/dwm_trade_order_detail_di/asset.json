@@ -6,6 +6,7 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
+  "entityLookupPolicy": {"mode": "clarify", "timeColumn": "pt"},
   "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
   "resultAccessPolicies": {
     "METRIC": {"visibilityPolicy": {"level": "public", "allowedRoles": [], "reason": "PUBLISHED_AGGREGATE_RESULT"}, "maskingPolicy": {"strategy": "none", "reason": "PUBLISHED_AGGREGATE_RESULT"}},
@@ -1940,6 +1941,8 @@
       "columnName": "order_id",
       "businessName": "主订单号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:order",
+      "comparisonPolicy": "exact",
       "description": "主订单号",
       "aliases": [
         "主订单号",
@@ -1954,6 +1957,8 @@
       "columnName": "sub_order_id",
       "businessName": "订单号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:sub_order",
+      "comparisonPolicy": "exact",
       "description": "订单号",
       "aliases": [
         "订单号",
