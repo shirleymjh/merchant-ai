@@ -40,7 +40,9 @@ def format_metric_value_for_answer(
     if value_format in {"percent", "percentage", "ratio"} or unit == "%":
         percent = numeric * 100 if abs(numeric) <= 1 else numeric
         return "%s%%" % _format_number(percent, decimal_places)
-    if value_format in {"integer", "int", "count"}:
+    if value_format in {"currency", "money", "fixed", "fixed_decimal"}:
+        rendered = ("%%.%df" % decimal_places) % numeric
+    elif value_format in {"integer", "int", "count"}:
         rendered = str(int(numeric)) if float(numeric).is_integer() else _format_number(numeric, decimal_places)
     else:
         rendered = _format_number(numeric, decimal_places)

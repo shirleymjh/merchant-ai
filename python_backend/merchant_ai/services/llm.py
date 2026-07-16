@@ -194,7 +194,10 @@ class LlmClient:
             }
             if payload.get("content") or payload.get("toolCalls"):
                 self.response_cache.set(cache_key, payload)
-            self._record_success()
+                self._record_success()
+            else:
+                self.record_error("empty_response: provider returned neither a tool call nor content")
+                self._record_failure(self.last_error)
             return payload
         except Exception as exc:
             self.record_error("provider_error: %s" % str(exc)[:300])
@@ -225,7 +228,9 @@ class LlmClient:
                     return args
         content = str(result.get("content") or "")
         if not content:
-            return fallback or {}
+            if self.configured and not self.last_error:
+                self.record_error("empty_response: provider returned neither a tool call nor content")
+            return fallback if fallback is not None else {}
         parsed = self._parse_json_text(content)
         return parsed if parsed else (fallback or {})
 

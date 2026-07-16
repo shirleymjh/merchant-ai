@@ -16,6 +16,7 @@ from merchant_ai.services.capabilities import (
     features_from_query_plan,
 )
 from merchant_ai.services.planning import semantic_fast_path_can_bypass_configured_llm
+from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution
 
 
 def test_capability_registry_loads_versioned_runtime_contracts():
@@ -64,7 +65,16 @@ def test_semantic_plan_fast_rejects_multi_node_or_explanation_plan():
                     preferred_table="dwm_trade_order_detail_di",
                     metric_name="order_detail_cnt",
                     metric_column="order_detail_cnt",
-                    metric_resolution={"metricKey": "order_detail_cnt", "semanticRefId": "semantic:trade:order_count"},
+                    metric_formula="SUM(order_detail_cnt)",
+                    metric_resolution=seal_semantic_metric_resolution(
+                        {
+                            "metricKey": "order_detail_cnt",
+                            "semanticRefId": "semantic:trade:order_count",
+                            "ownerTable": "dwm_trade_order_detail_di",
+                            "formula": "SUM(order_detail_cnt)",
+                            "sourceColumns": ["order_detail_cnt"],
+                        }
+                    ),
                 )
             ],
         question_understanding={"analysisIntent": "lookup", "requiresExplanation": False},
@@ -99,6 +109,7 @@ def test_semantic_plan_fast_rejects_multi_node_or_explanation_plan():
                 table="dwm_trade_order_detail_di",
                 columns=["order_detail_cnt"],
                 source_ref_id="semantic:trade:order_count",
+                metadata={"formula": "SUM(order_detail_cnt)", "sourceColumns": ["order_detail_cnt"]},
             ),
             PlanningAssetEntry(
                 key="refund_amt",

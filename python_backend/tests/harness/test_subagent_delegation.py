@@ -16,6 +16,8 @@ from merchant_ai.models import (
     QuestionCategory,
     QuestionIntent,
     RouteSlots,
+    SubAgentDelegationPlan,
+    SubAgentDelegationTask,
     VerifiedEvidence,
 )
 from merchant_ai.services.distributed_workers import normalize_subagent_result
@@ -115,9 +117,11 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
     assert result_state["subagent_delegation_completed"] is True
     assert result_state["subagent_delegation_plan"]["tasks"][0]["taskKind"] == "document_analysis"
     result = result_state["subagent_delegation_results"][0]
-    assert result["status"] == "completed"
-    assert result["recommendedNextAction"] == "return_to_lead_agent"
+    assert result["status"] == "partial"
+    assert result["recommendedNextAction"] == "return_partial_to_lead_agent"
     assert result["summary"]
+    assert result["payload"]["fallbackUsed"] is True
+    assert result["gaps"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
     assert set(
         [
             "status",
@@ -129,7 +133,69 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
             "retryable",
         ]
     ).issubset(result)
-    assert result_state["main_agent_observations"][-1]["stage"] == "delegate_subagent"
+    observation = result_state["main_agent_observations"][-1]
+    assert observation["stage"] == "delegate_subagent"
+    assert observation["summary"].startswith("0/1 Sub-Agent tasks completed; partial=1")
+    assert "[partial:DOCUMENT_LLM_UNAVAILABLE]" in result_state["analysis_summary"]
+    assert result_state["agent_run_result"].degraded_reasons[0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
+    assert result_state["agent_run_result"].evidence_gaps[0].code == "DOCUMENT_LLM_UNAVAILABLE"
+    assert result_state["agent_run_result"].verified_evidence.warning_gaps[0].code == "DOCUMENT_LLM_UNAVAILABLE"
+    response = workflow.to_response(result_state)
+    assert response.debug_trace["degradedReasons"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
+    assert response.debug_trace["evidenceGaps"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
+
+
+def test_parallel_delegation_counts_only_completed_outcomes_as_success(tmp_path: Path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "distributed_subagents_enabled": False,
+            "max_sub_agent_tasks": 2,
+            "max_concurrent_sub_agents": 2,
+        }
+    )
+    workflow = create_workflow(settings)
+    state = workflow._initial_state("并行分析", "100", ChatContext(), None, "thread_parallel", "run_parallel")
+    state["agent_run_result"].verified_evidence = VerifiedEvidence(passed=True)
+    state["evidence_graph_verified"] = True
+    plan = SubAgentDelegationPlan(
+        parallel=True,
+        failure_strategy="continue_partial",
+        tasks=[
+            SubAgentDelegationTask(task_kind="analysis_worker", objective="完整分析"),
+            SubAgentDelegationTask(task_kind="document_analysis", objective="文档分析"),
+        ],
+    )
+    workflow._allowed_delegation_kinds = lambda current: ["analysis_worker", "document_analysis"]
+    workflow._build_delegation_plan = lambda current, allowed: plan
+
+    def execute_task(current, task, failure_strategy, read_artifact_policy):
+        if task.task_kind == "analysis_worker":
+            return normalize_subagent_result(task.task_kind, "completed", {"answer": "完整结果"})
+        return normalize_subagent_result(
+            task.task_kind,
+            "partial",
+            {
+                "answer": "摘录结果",
+                "fallbackUsed": True,
+                "gaps": [{"code": "DOCUMENT_LLM_UNAVAILABLE", "message": "provider unavailable"}],
+            },
+        )
+
+    workflow._execute_delegation_task = execute_task
+
+    result_state = workflow.delegate_subagent(state)
+
+    statuses = sorted(item["status"] for item in result_state["subagent_delegation_results"])
+    assert statuses == ["completed", "partial"]
+    observation = result_state["main_agent_observations"][-1]
+    assert observation["summary"] == "1/2 Sub-Agent tasks completed; partial=1 failed=0"
+    assert "DOCUMENT_LLM_UNAVAILABLE" in {
+        item["code"] for item in result_state["agent_run_result"].degraded_reasons
+    }
+    assert result_state["agent_run_result"].verified_evidence.passed is True
+    assert result_state["agent_run_result"].verified_evidence.warning_gaps[0].code == "DOCUMENT_LLM_UNAVAILABLE"
+    assert result_state["run_steps"][-1].status == "partial"
 
 
 def test_workflow_delegates_generic_analysis_worker(tmp_path: Path):

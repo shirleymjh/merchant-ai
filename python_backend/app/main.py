@@ -120,13 +120,6 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     golden_evaluation_service = GoldenEvaluationService(settings)
     topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
     semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
-    memory_governance_service = MemoryGovernanceService(
-        settings,
-        workflow.memory_store,
-        topic_assets,
-        semantic_governance,
-        doris_repository,
-    )
     recall_index_manager = RecallIndexManager(
         settings,
         workflow.recall_service,
@@ -141,6 +134,14 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
         topic_assets,
         semantic_governance,
         recall_index_manager,
+    )
+    memory_governance_service = MemoryGovernanceService(
+        settings,
+        workflow.memory_store,
+        topic_assets,
+        semantic_governance,
+        doris_repository,
+        semantic_publish_coordinator,
     )
     attachment_store = AttachmentStore(settings)
 
@@ -741,10 +742,11 @@ def publish_operator_knowledge_suggestion(
         table_name=request.table_name,
     )
     if result.get("success") and request.auto_index:
-        indexed = recall_index_manager.rebuild(changed_only=True, topic=result.get("topic", ""), table_name=result.get("tableName", ""))
-        result["recallIndex"] = indexed
-        if indexed.get("success", True):
-            result["indexed"] = memory_governance_service.mark_suggestion_indexed(target, item_id, result.get("suggestion", {}).get("publishedRefId", ""))
+        result["indexed"] = memory_governance_service.mark_suggestion_indexed(
+            target,
+            item_id,
+            result.get("suggestion", {}).get("publishedRefId", ""),
+        )
     return result
 
 

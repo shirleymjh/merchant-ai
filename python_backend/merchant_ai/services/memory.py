@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from collections import Counter, defaultdict
@@ -1379,12 +1380,14 @@ class MemoryKnowledgeGovernanceService:
         topic_assets: Optional[Any] = None,
         governance_service: Optional[Any] = None,
         doris_repository: Optional[Any] = None,
+        semantic_publish_coordinator: Optional[Any] = None,
     ):
         self.settings = settings
         self.memory_store = memory_store or create_memory_store(settings)
         self._topic_assets = topic_assets
         self._governance_service = governance_service
         self._doris_repository = doris_repository
+        self._semantic_publish_coordinator = semantic_publish_coordinator
         self.conflict_service = KnowledgeConflictService(settings, topic_assets=topic_assets)
 
     def review_suggestion(self, merchant_id: str, suggestion_id: str, request: KnowledgeSuggestionReviewRequest) -> Dict[str, Any]:
@@ -1622,68 +1625,152 @@ class MemoryKnowledgeGovernanceService:
                 "topic": publish_topic,
                 "tableName": publish_table,
             }
-        topic_assets = self._topic_assets
-        governance_service = self._governance_service
-        if topic_assets is None or governance_service is None:
-            from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicAssetService
-            from merchant_ai.services.repositories import DorisRepository
-
-            topic_assets = topic_assets or TopicAssetService(self.settings)
-            governance_service = governance_service or SemanticAssetGovernanceService(
-                self.settings,
-                self._doris_repository or DorisRepository(self.settings),
-                topic_assets,
+        topic_assets, governance_service, publish_coordinator = self._semantic_publish_dependencies()
+        pending_dir = self.settings.resolved_topic_path / publish_topic / "pending" / publish_table
+        try:
+            pending_snapshot = snapshot_semantic_candidate_directory(pending_dir)
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "CANDIDATE_SNAPSHOT_FAILED",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "topic": publish_topic,
+                "tableName": publish_table,
+                "error": str(exc)[:500],
+            }
+        try:
+            patch_result = topic_assets.stage_knowledge_suggestion_patch(publish_topic, publish_table, suggestion)
+        except Exception as exc:
+            return self._semantic_publish_failure_with_pending_restore(
+                pending_dir,
+                pending_snapshot,
+                {
+                    "success": False,
+                    "status": "PATCH_FAILED",
+                    "merchantId": merchant_id,
+                    "suggestionId": suggestion_id,
+                    "topic": publish_topic,
+                    "tableName": publish_table,
+                    "error": str(exc)[:500],
+                },
             )
-        patch_result = topic_assets.stage_knowledge_suggestion_patch(publish_topic, publish_table, suggestion)
-        if not bool(patch_result.get("success")):
-            return {
-                "success": False,
-                "status": str(patch_result.get("status") or "PATCH_FAILED"),
-                "merchantId": merchant_id,
-                "suggestionId": suggestion_id,
-                "topic": publish_topic,
-                "tableName": publish_table,
-                "assetPatch": patch_result,
-            }
-        preflight = governance_service.preflight_publish(publish_topic, publish_table)
-        if not bool(preflight.get("publishable")):
-            return {
-                "success": False,
-                "status": "PREFLIGHT_FAILED",
-                "merchantId": merchant_id,
-                "suggestionId": suggestion_id,
-                "topic": publish_topic,
-                "tableName": publish_table,
-                "preflight": preflight,
-            }
-        published = topic_assets.publish(publish_topic, publish_table, True, reviewer, review_note)
-        if not bool(published.get("success")):
-            return {
-                "success": False,
-                "status": str(published.get("status") or "PUBLISH_FAILED"),
-                "merchantId": merchant_id,
-                "suggestionId": suggestion_id,
-                "topic": publish_topic,
-                "tableName": publish_table,
-                "preflight": preflight,
-                "published": published,
-            }
-        governed = governance_service.after_publish(publish_topic, publish_table, reviewer, review_note)
-        readback = topic_assets.verify_published_suggestion(publish_topic, publish_table, suggestion_id)
-        if not readback.get("success"):
-            return {
-                "success": False,
-                "status": "PUBLISHED_READBACK_FAILED",
-                "merchantId": merchant_id,
-                "suggestionId": suggestion_id,
-                "topic": publish_topic,
-                "tableName": publish_table,
-                "assetPatch": patch_result,
-                "preflight": preflight,
-                "published": published,
-                "governed": governed,
-                "readback": readback,
-            }
+        if not isinstance(patch_result, dict) or patch_result.get("success") is not True:
+            patch_result = patch_result if isinstance(patch_result, dict) else {}
+            return self._semantic_publish_failure_with_pending_restore(
+                pending_dir,
+                pending_snapshot,
+                {
+                    "success": False,
+                    "status": str(patch_result.get("status") or "PATCH_FAILED"),
+                    "merchantId": merchant_id,
+                    "suggestionId": suggestion_id,
+                    "topic": publish_topic,
+                    "tableName": publish_table,
+                    "assetPatch": patch_result,
+                },
+            )
+        try:
+            preflight = governance_service.preflight_publish(publish_topic, publish_table)
+        except Exception as exc:
+            return self._semantic_publish_failure_with_pending_restore(
+                pending_dir,
+                pending_snapshot,
+                {
+                    "success": False,
+                    "status": "PREFLIGHT_VALIDATION_FAILED",
+                    "merchantId": merchant_id,
+                    "suggestionId": suggestion_id,
+                    "topic": publish_topic,
+                    "tableName": publish_table,
+                    "assetPatch": patch_result,
+                    "error": str(exc)[:500],
+                },
+            )
+        if (
+            not isinstance(preflight, dict)
+            or preflight.get("success") is not True
+            or preflight.get("publishable") is not True
+        ):
+            preflight = preflight if isinstance(preflight, dict) else {}
+            return self._semantic_publish_failure_with_pending_restore(
+                pending_dir,
+                pending_snapshot,
+                {
+                    "success": False,
+                    "status": "PREFLIGHT_FAILED",
+                    "merchantId": merchant_id,
+                    "suggestionId": suggestion_id,
+                    "topic": publish_topic,
+                    "tableName": publish_table,
+                    "preflight": preflight,
+                    "assetPatch": patch_result,
+                },
+            )
+        activation_verifier = self._knowledge_suggestion_activation_verifier(
+            topic_assets,
+            publish_topic,
+            publish_table,
+            suggestion_id,
+            require_index_change=knowledge_suggestion_status(suggestion) not in {"published", "indexed"},
+        )
+        try:
+            published = publish_coordinator.publish_approved(
+                publish_topic,
+                publish_table,
+                reviewer,
+                review_note,
+                preflight,
+                activation_verifier=activation_verifier,
+            )
+        except Exception as exc:
+            return self._semantic_publish_failure_with_pending_restore(
+                pending_dir,
+                pending_snapshot,
+                {
+                    "success": False,
+                    "status": "PUBLISH_COORDINATOR_FAILED",
+                    "merchantId": merchant_id,
+                    "suggestionId": suggestion_id,
+                    "topic": publish_topic,
+                    "tableName": publish_table,
+                    "preflight": preflight,
+                    "assetPatch": patch_result,
+                    "error": str(exc)[:500],
+                },
+            )
+        if not isinstance(published, dict):
+            published = {}
+        if (
+            published.get("success") is not True
+            or str(published.get("status") or "") != "PUBLISHED"
+            or str(published.get("publishState") or "") != "ACTIVE"
+            or not isinstance(published.get("recallIndex"), dict)
+            or published.get("recallIndex", {}).get("activeManifestAdvanced") is not True
+        ):
+            return self._semantic_publish_failure_with_pending_restore(
+                pending_dir,
+                pending_snapshot,
+                {
+                    "success": False,
+                    "status": str(published.get("status") or "PUBLISH_FAILED"),
+                    "merchantId": merchant_id,
+                    "suggestionId": suggestion_id,
+                    "topic": publish_topic,
+                    "tableName": publish_table,
+                    "preflight": preflight,
+                    "published": published,
+                    "assetPatch": patch_result,
+                },
+            )
+        governed = published.get("semanticGovernance") if isinstance(published.get("semanticGovernance"), dict) else {}
+        activation = (
+            published.get("activationVerification")
+            if isinstance(published.get("activationVerification"), dict)
+            else {}
+        )
+        readback = activation.get("filesystemReadback") if isinstance(activation.get("filesystemReadback"), dict) else {}
+        recall_readback = activation.get("recallReadback") if isinstance(activation.get("recallReadback"), dict) else {}
         now = datetime.now().isoformat()
         suggestion["status"] = "published"
         effective_reviewer = reviewer or str(suggestion.get("publishRequestedBy") or suggestion.get("reviewer") or "")
@@ -1693,7 +1780,12 @@ class MemoryKnowledgeGovernanceService:
         suggestion["reviewedAt"] = str(suggestion.get("reviewedAt") or now)
         suggestion["publishRequestedAt"] = str(suggestion.get("publishRequestedAt") or now)
         suggestion["publishRequestedBy"] = str(suggestion.get("publishRequestedBy") or effective_reviewer or "")
-        suggestion["publishedRefId"] = build_published_ref_id(suggestion, publish_topic, publish_table)
+        verified_recall_refs = [str(item) for item in recall_readback.get("expectedRefs") or [] if str(item or "")]
+        suggestion["publishedRefId"] = (
+            verified_recall_refs[0]
+            if verified_recall_refs
+            else build_published_ref_id(suggestion, publish_topic, publish_table)
+        )
         suggestion["updatedAt"] = now
         payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
         payload["semanticPublish"] = {
@@ -1702,6 +1794,10 @@ class MemoryKnowledgeGovernanceService:
             "preflightStatus": preflight.get("status"),
             "publishStatus": published.get("status"),
             "governedStatus": governed.get("status"),
+            "publishState": published.get("publishState"),
+            "indexVersion": str((published.get("recallIndex") or {}).get("indexVersion") or ""),
+            "semanticSourceHash": str((published.get("recallIndex") or {}).get("semanticSourceHash") or ""),
+            "activationStatus": activation.get("status"),
         }
         suggestion["payload"] = payload
         memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
@@ -1718,7 +1814,164 @@ class MemoryKnowledgeGovernanceService:
             "published": published,
             "governed": governed,
             "readback": readback,
+            "recallReadback": recall_readback,
+            "recallIndex": published.get("recallIndex") or {},
             "suggestion": find_knowledge_suggestion(saved, suggestion_id),
+        }
+
+    def _semantic_publish_dependencies(self) -> Tuple[Any, Any, Any]:
+        topic_assets = self._topic_assets
+        governance_service = self._governance_service
+        if topic_assets is None or governance_service is None:
+            from merchant_ai.services.assets import SemanticAssetGovernanceService, TopicAssetService
+            from merchant_ai.services.repositories import DorisRepository
+
+            topic_assets = topic_assets or TopicAssetService(self.settings)
+            governance_service = governance_service or SemanticAssetGovernanceService(
+                self.settings,
+                self._doris_repository or DorisRepository(self.settings),
+                topic_assets,
+            )
+            self._topic_assets = topic_assets
+            self._governance_service = governance_service
+        publish_coordinator = self._semantic_publish_coordinator
+        if publish_coordinator is None:
+            from merchant_ai.services.assets import HybridRecallService
+            from merchant_ai.services.recall_index import RecallIndexManager
+            from merchant_ai.services.semantic_publish import SemanticPublishCoordinator
+
+            recall_provider = HybridRecallService(self.settings, topic_assets)
+            recall_index_manager = RecallIndexManager(self.settings, recall_provider)
+            publish_coordinator = SemanticPublishCoordinator(
+                self.settings,
+                topic_assets,
+                governance_service,
+                recall_index_manager,
+            )
+            self._semantic_publish_coordinator = publish_coordinator
+        return topic_assets, governance_service, publish_coordinator
+
+    @staticmethod
+    def _knowledge_suggestion_activation_verifier(
+        topic_assets: Any,
+        topic: str,
+        table_name: str,
+        suggestion_id: str,
+        require_index_change: bool,
+    ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+        def verify(context: Dict[str, Any]) -> Dict[str, Any]:
+            from merchant_ai.services.assets import semantic_metric_ref_id, semantic_table_ref_id
+            from merchant_ai.services.recall_index import manifest_ref_for_recall_item
+
+            filesystem_readback = topic_assets.verify_published_suggestion(topic, table_name, suggestion_id)
+            if not isinstance(filesystem_readback, dict) or filesystem_readback.get("success") is not True:
+                return {
+                    "success": False,
+                    "status": "PUBLISHED_READBACK_FAILED",
+                    "errorCode": "PUBLISHED_READBACK_FAILED",
+                    "filesystemReadback": filesystem_readback,
+                }
+            expected_refs: List[str] = []
+            for match in filesystem_readback.get("matches") or []:
+                if not isinstance(match, dict):
+                    continue
+                kind = str(match.get("kind") or "")
+                item = match.get("item") if isinstance(match.get("item"), dict) else {}
+                metric_key = str(item.get("metricKey") or "")
+                if kind == "metrics" and metric_key:
+                    expected_refs.append(semantic_metric_ref_id(topic, table_name, metric_key))
+                else:
+                    expected_refs.append(semantic_table_ref_id(topic, table_name))
+            expected_refs = list(dict.fromkeys(expected_refs))
+            candidate_refs: List[str] = []
+            candidate_manifest_refs: Dict[str, str] = {}
+            for document in context.get("candidateDocuments") or []:
+                metadata = getattr(document, "metadata", {}) or {}
+                ref_id = str(metadata.get("semanticRefId") or getattr(document, "doc_id", "") or "")
+                if ref_id:
+                    candidate_refs.append(ref_id)
+                    candidate_manifest_refs[ref_id] = manifest_ref_for_recall_item(document)
+            missing_refs = [ref_id for ref_id in expected_refs if ref_id not in candidate_refs]
+            if not expected_refs or missing_refs:
+                return {
+                    "success": False,
+                    "status": "RECALL_READBACK_FAILED",
+                    "errorCode": "RECALL_READBACK_FAILED",
+                    "filesystemReadback": filesystem_readback,
+                    "recallReadback": {
+                        "expectedRefs": expected_refs,
+                        "missingRefs": missing_refs,
+                    },
+                }
+            previous_manifest = context.get("previousRecallManifest")
+            previous_manifest = previous_manifest if isinstance(previous_manifest, dict) else {}
+            candidate_manifest = context.get("candidateRecallManifest")
+            candidate_manifest = candidate_manifest if isinstance(candidate_manifest, dict) else {}
+            updated_refs = [str(item) for item in candidate_manifest.get("updatedRefs") or [] if str(item or "")]
+            expected_updated_refs = [candidate_manifest_refs.get(ref_id, ref_id) for ref_id in expected_refs]
+            missing_updated_refs = [ref_id for ref_id in expected_updated_refs if ref_id not in updated_refs]
+            if require_index_change and missing_updated_refs:
+                return {
+                    "success": False,
+                    "status": "RECALL_READBACK_FAILED",
+                    "errorCode": "RECALL_READBACK_FAILED",
+                    "filesystemReadback": filesystem_readback,
+                    "recallReadback": {
+                        "expectedRefs": expected_refs,
+                        "missingRefs": [],
+                        "updatedRefs": updated_refs,
+                        "expectedUpdatedRefs": expected_updated_refs,
+                        "missingUpdatedRefs": missing_updated_refs,
+                    },
+                }
+            previous_version = str(previous_manifest.get("indexVersion") or "")
+            candidate_version = str(candidate_manifest.get("indexVersion") or "")
+            index_changed = bool(candidate_version and candidate_version != previous_version)
+            if require_index_change and not index_changed:
+                return {
+                    "success": False,
+                    "status": "RECALL_INDEX_UNCHANGED",
+                    "errorCode": "RECALL_INDEX_UNCHANGED",
+                    "filesystemReadback": filesystem_readback,
+                    "recallReadback": {
+                        "expectedRefs": expected_refs,
+                        "previousIndexVersion": previous_version,
+                        "candidateIndexVersion": candidate_version,
+                        "indexChanged": False,
+                    },
+                }
+            return {
+                "success": True,
+                "status": "ACTIVATION_VERIFIED",
+                "filesystemReadback": filesystem_readback,
+                "recallReadback": {
+                    "expectedRefs": expected_refs,
+                    "missingRefs": [],
+                    "previousIndexVersion": previous_version,
+                    "candidateIndexVersion": candidate_version,
+                    "indexChanged": index_changed,
+                    "updatedRefs": updated_refs,
+                    "expectedUpdatedRefs": expected_updated_refs,
+                },
+            }
+
+        return verify
+
+    @staticmethod
+    def _semantic_publish_failure_with_pending_restore(
+        pending_dir: Path,
+        pending_snapshot: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        compensation = restore_semantic_candidate_directory(pending_dir, pending_snapshot)
+        if compensation.get("success"):
+            return {**result, "pendingCompensation": compensation}
+        return {
+            **result,
+            "success": False,
+            "status": "PENDING_COMPENSATION_FAILED",
+            "originalStatus": result.get("status"),
+            "pendingCompensation": compensation,
         }
 
     def request_publish_suggestion(
@@ -1823,6 +2076,37 @@ class MemoryKnowledgeGovernanceService:
             "queuedCount": len(queued),
             "processedCount": len(results),
             "results": results,
+        }
+
+
+def snapshot_semantic_candidate_directory(directory: Path) -> Dict[str, Any]:
+    files: Dict[str, bytes] = {}
+    if directory.exists():
+        if not directory.is_dir():
+            raise ValueError("semantic candidate path is not a directory")
+        for path in sorted(directory.rglob("*")):
+            if path.is_file():
+                files[path.relative_to(directory).as_posix()] = path.read_bytes()
+    return {"existed": directory.exists(), "files": files}
+
+
+def restore_semantic_candidate_directory(directory: Path, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if directory.exists():
+            shutil.rmtree(directory)
+        if bool(snapshot.get("existed")):
+            directory.mkdir(parents=True, exist_ok=True)
+            files = snapshot.get("files") if isinstance(snapshot.get("files"), dict) else {}
+            for relative_path, content in files.items():
+                target = directory / str(relative_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(bytes(content))
+        return {"success": True, "status": "PENDING_CANDIDATE_RESTORED"}
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "PENDING_CANDIDATE_RESTORE_FAILED",
+            "error": str(exc)[:500],
         }
 
 
@@ -4882,7 +5166,21 @@ class MemoryQueryUnderstandingService:
         question = str(state.get("question") or "")
         route_slots = model_dump_or_dict(state.get("route_slots"))
         topic_decision = state.get("topic_routing_decision")
-        topics = topic_decision.recall_topics() if hasattr(topic_decision, "recall_topics") else []
+        if hasattr(topic_decision, "recall_topics"):
+            topics = list(topic_decision.recall_topics())
+        else:
+            topic_payload = model_dump_or_dict(topic_decision)
+            raw_topics = (
+                topic_payload.get("topicIds")
+                or topic_payload.get("topic_ids")
+                or topic_payload.get("candidateTopics")
+                or topic_payload.get("candidate_topics")
+                or topic_payload.get("topics")
+                or []
+            )
+            if isinstance(raw_topics, str):
+                raw_topics = [raw_topics]
+            topics = list(raw_topics) if isinstance(raw_topics, (list, tuple, set)) else []
         object_refs = route_slots.get("objectRefs") if isinstance(route_slots.get("objectRefs"), dict) else {}
         time_window = route_slots.get("timeWindow") if isinstance(route_slots.get("timeWindow"), dict) else {}
         time_windows = unique_ints([time_window.get("days"), *extract_time_windows(question)])
@@ -4892,6 +5190,8 @@ class MemoryQueryUnderstandingService:
         has_structured_scope = bool(topics or object_refs or time_windows)
         has_metric_or_object = bool(metric_terms or object_refs)
         if has_structured_scope and has_metric_or_object:
+            return False
+        if topics and time_windows:
             return False
         if topics and metric_terms:
             return False

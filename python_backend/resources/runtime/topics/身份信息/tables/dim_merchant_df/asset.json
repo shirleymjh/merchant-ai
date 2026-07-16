@@ -2161,6 +2161,13 @@
       "metricGrain": "merchant_dimension",
       "metricIntent": "dimension_summary",
       "aggregationPolicy": "latest_value_only",
+      "applicableTimeGrain": "day",
+      "timeSemantics": {
+        "selectionPolicy": "latest_as_of",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      },
       "ambiguousAliases": [],
       "naturalName": "商户入驻初始保证金元",
       "originalBusinessName": "商户入驻初始保证金元",
@@ -2189,6 +2196,13 @@
       "metricGrain": "merchant_dimension",
       "metricIntent": "dimension_summary",
       "aggregationPolicy": "latest_value_only",
+      "applicableTimeGrain": "day",
+      "timeSemantics": {
+        "selectionPolicy": "latest_as_of",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      },
       "ambiguousAliases": [],
       "naturalName": "保证金余额",
       "originalBusinessName": "保证金余额",
@@ -2247,6 +2261,13 @@
       "metricGrain": "merchant_dimension",
       "metricIntent": "dimension_summary",
       "aggregationPolicy": "latest_value_only",
+      "applicableTimeGrain": "day",
+      "timeSemantics": {
+        "selectionPolicy": "latest_as_of",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      },
       "ambiguousAliases": [],
       "naturalName": "冻结保证金",
       "originalBusinessName": "冻结保证金",

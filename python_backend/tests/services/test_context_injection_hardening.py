@@ -13,6 +13,7 @@ from merchant_ai.models import (
     ChatContext,
     ContextBudgetReport,
     MerchantInfo,
+    PlanningAssetEntry,
     PlanningAssetPack,
     RecallBundle,
     ThreadData,
@@ -256,13 +257,25 @@ def test_planner_prompt_consumes_sanitized_conversation_context():
     llm = CaptureLlm()
     planner = QueryGraphPlanner(llm)
     marker = "spu_1,spu_2"
+    pack = PlanningAssetPack(
+        tables=[PlanningAssetEntry(table="goods", columns=["spu_id", "order_cnt", "pt"])],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_cnt",
+                table="goods",
+                title="下单量",
+                columns=["order_cnt"],
+                metadata={"formula": "SUM(order_cnt)", "sourceColumns": ["order_cnt"]},
+            )
+        ],
+    )
 
     planner.plan(
         "这些商品的下单量是多少",
         [],
         "",
         RecallBundle(),
-        PlanningAssetPack(),
+        pack,
         [],
         [],
         {
@@ -552,7 +565,9 @@ def test_memory_recall_profile_expands_colloquial_question():
 
     assert context["expandedTerms"] == set()
     assert "这阵子哪个品退得最凶" in context["queryVariants"]
-    assert {"ranking", "risk_ranking"} <= set(context["analysisIntents"])
+    # Runtime does not infer business intent from colloquial keywords.  That
+    # semantic expansion belongs to the small-model understanding profile.
+    assert context["analysisIntents"] == set()
     assert context["timeWindows"] == set()
 
 

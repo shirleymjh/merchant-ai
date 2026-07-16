@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from merchant_ai.config import get_settings
 from merchant_ai.models import KnowledgeRetrievalRequest, RecallBundle, RecallItem
 from merchant_ai.services.context import ContextManager
+from merchant_ai.services.assets import recalled_metric_evidence_from_bundle
+from merchant_ai.services.planning import recalled_metric_entry_from_evidence
 from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     business_rerank_recall_items,
@@ -39,6 +41,16 @@ class LinkedVariantTopicAssets:
                 "metricGrain": "account_period",
                 "metricIntent": "summary",
                 "aggregationPolicy": "period_rollup",
+                "applicableTimeGrain": "period",
+                "timeColumn": "event_day",
+                "timeSemantics": {
+                    "selectionPolicy": "period_window",
+                    "asOfPolicy": "latest_available_partition",
+                    "missingDataPolicy": "disclose_unknown",
+                    "zeroValuePolicy": "preserve_observed_zero",
+                },
+                "missingValuePolicy": "disclose_unknown",
+                "zeroValueMeaning": "preserve_observed_zero",
                 "selectionGuidance": "Use for one value over a bounded period.",
                 "temporalVariants": {
                     "series": {"metricKey": "revenue_daily"},
@@ -111,6 +123,17 @@ def test_metric_resolver_exposes_all_asset_linked_variants_without_question_base
     daily_card = next(item for item in cards if item.metadata["metricKey"] == "revenue_daily")
     assert daily_card.metadata["linkedVariantPath"] == "series.metricKey"
     assert daily_card.metadata["aggregationPolicy"] == "daily_value_only"
+
+    period_card = next(item for item in cards if item.metadata["metricKey"] == "revenue_period")
+    assert period_card.metadata["timeColumn"] == "event_day"
+    evidence = recalled_metric_evidence_from_bundle(RecallBundle(items=[period_card]))
+    entry = recalled_metric_entry_from_evidence(evidence, ("account_metrics", "revenue_period"))
+    assert entry is not None
+    assert entry.metadata["timeColumn"] == "event_day"
+    assert entry.metadata["aggregationPolicy"] == "period_rollup"
+    assert entry.metadata["timeSemantics"]["selectionPolicy"] == "period_window"
+    assert entry.metadata["missingValuePolicy"] == "disclose_unknown"
+    assert entry.metadata["zeroValueMeaning"] == "preserve_observed_zero"
 
 
 def test_qualified_label_suppresses_embedded_bare_label_unless_both_are_requested():

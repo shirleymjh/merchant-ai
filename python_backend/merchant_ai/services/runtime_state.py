@@ -102,7 +102,7 @@ class FileRuntimeStateStore(RuntimeStateStore):
 
     def enqueue_node_task(self, state: NodeTaskState) -> NodeTaskState:
         existing = self.get_node_task(state.run_id, state.task_id)
-        if existing and existing.status in {"running", "completed", "failed", "timeout", "canceled"}:
+        if existing and existing.status in {"running", "completed", "partial", "failed", "timeout", "canceled"}:
             return existing
         state.status = state.status or "queued"
         if state.status == "pending":
@@ -237,7 +237,7 @@ class RedisRuntimeStateStore(RuntimeStateStore):
 
     def enqueue_node_task(self, state: NodeTaskState) -> NodeTaskState:
         existing = self.get_node_task(state.run_id, state.task_id)
-        if existing and existing.status in {"running", "completed", "failed", "timeout", "canceled"}:
+        if existing and existing.status in {"running", "completed", "partial", "failed", "timeout", "canceled"}:
             return existing
         state.status = "queued" if state.status in {"", "pending"} else state.status
         self.upsert_node_task(state)
@@ -446,7 +446,7 @@ class PostgresRuntimeStateStore(RuntimeStateStore):
 
     def enqueue_node_task(self, state: NodeTaskState) -> NodeTaskState:
         existing = self.get_node_task(state.run_id, state.task_id)
-        if existing and existing.status in {"running", "completed", "failed", "timeout", "canceled"}:
+        if existing and existing.status in {"running", "completed", "partial", "failed", "timeout", "canceled"}:
             return existing
         state.status = "queued" if state.status in {"", "pending"} else state.status
         return self.upsert_node_task(state)

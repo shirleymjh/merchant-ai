@@ -344,8 +344,12 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "metricRef": string_property("candidate metric key"),
             "sourcePhrase": string_property("exact source phrase from the user question"),
             "ownerTable": string_property("metric owner table from semanticCatalog"),
+            "resultMode": string_property(
+                "typed result contract: metric computes the governed metric; detail requests row-level evidence",
+                ["metric", "detail"],
+            ),
         },
-        required=["metricRef", "ownerTable"],
+        required=["metricRef", "sourcePhrase", "ownerTable", "resultMode"],
     )
     metric_candidate_decision_schema = object_schema(
         {
@@ -388,10 +392,14 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "semanticLabel": string_property("semantic evidence label, e.g. explanation_context, risk_driver, comparison_baseline"),
             "reason": string_property("why this evidence is needed for the user's requested analysis"),
             "requiredLevel": string_property("whether the answer needs this evidence", ["required", "optional"]),
+            "evidenceMode": string_property(
+                "typed evidence contract; detail is the only mode that permits a row-level DETAIL branch",
+                ["metric", "detail", "rule", "context"],
+            ),
             "suggestedMetricRefs": array_property("candidate semantic metric keys that could satisfy this evidence", string_property("metric key")),
             "suggestedDomains": array_property("candidate semantic domains needed for this evidence", string_property("domain name")),
         },
-        required=["semanticLabel", "reason", "requiredLevel"],
+        required=["semanticLabel", "reason", "requiredLevel", "evidenceMode"],
     )
     understanding_schema = object_schema(
         {

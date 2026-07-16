@@ -15,6 +15,8 @@ from merchant_ai.services.formulas import compile_metric_formula
 from merchant_ai.services.semantic_request import semantic_request_cache_key
 from merchant_ai.services.time_semantics import (
     CALENDAR_ANCHOR_POLICY,
+    latest_as_of_partition_predicate_sql,
+    latest_partition_anchor_sql,
     latest_partition_window_predicate,
     partition_date_matches,
     resolve_time_range,
@@ -92,7 +94,20 @@ def quick_metric_response(
     table = metric["table"]
     time_column = metric["time_column"]
     tenant_column = metric["tenant_column"]
-    time_filter, time_params = quick_metric_time_filter(time_range, table, time_column, tenant_column, merchant_id)
+    aggregation_policy = metric_aggregation_policy(metric)
+    latest_as_of_value_only = aggregation_policy == "latest_value_only"
+    as_of_policy = metric_as_of_policy(metric)
+    if latest_as_of_value_only and as_of_policy == "not_applicable":
+        return None
+    time_filter, time_params = quick_metric_time_filter(
+        time_range,
+        table,
+        time_column,
+        tenant_column,
+        merchant_id,
+        aggregation_policy=aggregation_policy,
+        as_of_policy=as_of_policy,
+    )
     rows = repository.query(
         "SELECT `%s` AS `%s`, %s AS value FROM `%s` "
         "WHERE `%s`=%%s AND %s "
@@ -114,25 +129,38 @@ def quick_metric_response(
     latest_partition = row_time_dimension(rows[-1], time_column)
     if time_range.kind == "exact_date" and not partition_date_matches(latest_partition, time_range.end_date):
         return None
-    values = [float(row.get("value") or 0) for row in rows]
+    values = [quick_metric_numeric_value(row.get("value")) for row in rows]
+    # SQL NULL/invalid numeric output is missing evidence, never a business
+    # zero.  The lightweight response cannot carry the full typed evidence-gap
+    # contract, so return control to QueryGraph where the published missing-data
+    # policy can be applied and disclosed.
+    if any(value is None for value in values):
+        return None
+    numeric_values = [value for value in values if value is not None]
     # Never roll up daily aggregates in application code: SUM of daily
     # COUNT(DISTINCT), AVG, or ratios can change the governed metric meaning.
     normalized_rows = [
         {
             "metric_name": metric["label"],
             TIME_DIMENSION_KEY: row_time_dimension(row, time_column),
-            "value": float(row.get("value") or 0),
+            "value": numeric_values[index],
         }
-        for row in rows
+        for index, row in enumerate(rows)
     ]
     daily_series_value_only = (
         temporal_mode == "daily_series" and metric_aggregation_policy(metric) == "daily_value_only"
     )
-    if daily_series_value_only:
+    if latest_as_of_value_only:
+        # A snapshot metric is aggregated only inside its selected as-of
+        # partition.  Its published formula may legitimately be SUM/COUNT over
+        # rows in that partition, but it must never be reapplied across several
+        # historical snapshots.
+        total = numeric_values[-1]
+    elif daily_series_value_only:
         # A daily precomputed value has no governed multi-day scalar.  The
         # grouped series is authoritative and its final point is disclosed as
         # a latest-day value; never execute an interval MAX/AVG as a summary.
-        total = values[-1]
+        total = numeric_values[-1]
     else:
         total_rows = repository.query(
             "SELECT %s AS value FROM `%s` "
@@ -148,44 +176,72 @@ def quick_metric_response(
         if not total_rows or total_rows[0].get("value") is None:
             return None
         total = float(total_rows[0]["value"])
-    first, last = values[0], values[-1]
+    first, last = numeric_values[0], numeric_values[-1]
     direction = "上升" if last > first else "下降" if last < first else "持平"
     delta = abs(last - first)
     direction_text = "整体持平" if delta == 0 else "整体%s" % direction
-    peak_index = max(range(len(values)), key=values.__getitem__)
+    peak_index = max(range(len(numeric_values)), key=numeric_values.__getitem__)
     peak = normalized_rows[peak_index]
     total_text = format_value(total, metric)
-    all_zero = bool(values) and all(value == 0 for value in values)
+    all_zero = bool(numeric_values) and all(value == 0 for value in numeric_values)
     advice = zero_metric_advice(metric["label"]) if all_zero else metric_advice(metric["label"])
     time_label = time_range.label or time_range_label(question, days)
     freshness_sentence = ""
-    if time_range.kind == "rolling" and not partition_date_matches(latest_partition, time_range.end_date):
+    if (
+        not latest_as_of_value_only
+        and time_range.kind == "rolling"
+        and not partition_date_matches(latest_partition, time_range.end_date)
+    ):
         freshness_sentence = "数据日期截至 %s。\n\n" % latest_partition
-    trend_sentence = (
-        f"从每日表现看，{metric['label']}各日均为 {format_value(0, metric)}。"
-        if all_zero
-        else (
-            f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，{direction_text}；"
-            f"峰值日期为 {peak[TIME_DIMENSION_KEY]}，峰值为 {format_value(peak['value'], metric)}。"
+    if latest_as_of_value_only:
+        trend_sentence = (
+            f"{metric['label']}采用最新快照口径，本次只使用 {latest_partition} 分区的值，未做跨日加总。"
         )
-    )
-    summary_sentence = (
-        f"{time_label}，店铺{metric['label']}最新日值为 {total_text}。"
-        if daily_series_value_only
-        else f"{time_label}，店铺{metric['label']}{summary_predicate(metric)} {total_text}。"
-    )
+        summary_sentence = f"{time_label}按快照口径，截至 {latest_partition}，店铺{metric['label']}为 {total_text}。"
+    else:
+        trend_sentence = (
+            f"从每日表现看，{metric['label']}各日均为 {format_value(0, metric)}。"
+            if all_zero
+            else (
+                f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，{direction_text}；"
+                f"峰值日期为 {peak[TIME_DIMENSION_KEY]}，峰值为 {format_value(peak['value'], metric)}。"
+            )
+        )
+        summary_sentence = (
+            f"{time_label}，店铺{metric['label']}最新日值为 {total_text}。"
+            if daily_series_value_only
+            else f"{time_label}，店铺{metric['label']}{summary_predicate(metric)} {total_text}。"
+        )
     answer = f"{summary_sentence}\n\n{freshness_sentence}{trend_sentence}\n\n建议：\n- {advice[0]}\n- {advice[1]}"
     suggestions = metric_suggestions(metric["label"], days)
+    summary_semantics = (
+        "latest_as_of_value"
+        if latest_as_of_value_only
+        else "latest_day_value"
+        if daily_series_value_only
+        else "period_aggregate"
+    )
+    response_time_contract = time_window_contract_payload(time_range, table, time_column, tenant_column)
+    if latest_as_of_value_only:
+        response_time_contract.update(
+            {
+                "selectionMode": "latest_as_of",
+                "executionStartValue": latest_partition,
+                "executionEndValue": latest_partition,
+                "executionAnchorPolicy": "resolved_as_of_partition",
+                "executionRule": "use only the resolved as-of partition",
+            }
+        )
     traceability = {
         "sourceSummary": "Doris 快速指标查询",
         "merchantId": merchant_id,
         "timeRange": time_label,
-        "timeWindowContract": time_window_contract_payload(time_range, table, time_column, tenant_column),
+        "timeWindowContract": response_time_contract,
         "dataUpdatedAt": normalized_rows[-1][TIME_DIMENSION_KEY],
         "rowCount": len(normalized_rows),
         "sourceTables": [table],
         "evidenceStatus": "verified",
-        "summarySemantics": "latest_day_value" if daily_series_value_only else "period_aggregate",
+        "summarySemantics": summary_semantics,
     }
     response = ChatResponse(
         id="quick_" + uuid.uuid4().hex,
@@ -204,7 +260,13 @@ def quick_metric_response(
                 data_rows=normalized_rows,
             ),
             ChatDataSection(
-                title=(f"{metric['label']}最新日值" if daily_series_value_only else metric["label"]),
+                title=(
+                    f"{metric['label']}截至日值"
+                    if latest_as_of_value_only
+                    else f"{metric['label']}最新日值"
+                    if daily_series_value_only
+                    else metric["label"]
+                ),
                 result_role="summary",
                 doris_tables=[table],
                 data_rows=[
@@ -213,7 +275,7 @@ def quick_metric_response(
                         "value": total,
                         **(
                             {TIME_DIMENSION_KEY: normalized_rows[-1][TIME_DIMENSION_KEY]}
-                            if daily_series_value_only
+                            if latest_as_of_value_only or daily_series_value_only
                             else {}
                         ),
                     }
@@ -233,7 +295,7 @@ def quick_metric_response(
             "quickMetricPath": True,
             "days": days,
             "timeRange": time_range.model_dump(by_alias=True),
-            "timeWindowContract": time_window_contract_payload(time_range, table, time_column, tenant_column),
+            "timeWindowContract": response_time_contract,
             "actualLatestPartition": latest_partition,
             "metric": metric["label"],
             "metricTerms": metric.get("terms") or [],
@@ -241,7 +303,7 @@ def quick_metric_response(
             "temporalMode": temporal_mode,
             "temporalMetricRedirected": semantic_metric_ref_id(metric) != semantic_metric_ref_id(original_metric),
             "requestedSemanticMetric": semantic_metric_identity(original_metric),
-            "summarySemantics": "latest_day_value" if daily_series_value_only else "period_aggregate",
+            "summarySemantics": summary_semantics,
         },
     )
     verification = verify_quick_metric_answer(
@@ -250,7 +312,7 @@ def quick_metric_response(
         normalized_rows,
         total,
         answer,
-        summary_semantics="latest_day_value" if daily_series_value_only else "period_aggregate",
+        summary_semantics=summary_semantics,
     )
     if not verification.passed:
         return None
@@ -375,6 +437,11 @@ def temporal_reference_matches_metric(
 def quick_metric_supports_temporal_mode(metric: Dict[str, Any], temporal_mode: str) -> bool:
     policy = metric_aggregation_policy(metric)
     grains = metric_applicable_time_grains(metric)
+    if policy == "latest_value_only":
+        # QuickMetric is a scalar executor for snapshot metrics.  A requested
+        # daily series needs the full QueryGraph path; exact-day and period
+        # lookups both resolve to one governed as-of partition.
+        return temporal_mode in {"exact_day", "period_summary"} and (not grains or "day" in grains)
     if policy == "daily_value_only":
         return temporal_mode in {"exact_day", "daily_series"} and "day" in grains
     if temporal_mode in {"exact_day", "daily_series"}:
@@ -387,6 +454,8 @@ def quick_metric_supports_temporal_mode(metric: Dict[str, Any], temporal_mode: s
 def quick_metric_temporal_preference(metric: Dict[str, Any], temporal_mode: str) -> int:
     policy = metric_aggregation_policy(metric)
     grains = metric_applicable_time_grains(metric)
+    if policy == "latest_value_only" and temporal_mode in {"exact_day", "period_summary"}:
+        return 300
     if temporal_mode in {"exact_day", "daily_series"}:
         if policy == "daily_value_only":
             return 300
@@ -398,6 +467,13 @@ def quick_metric_temporal_preference(metric: Dict[str, Any], temporal_mode: str)
 
 def metric_aggregation_policy(metric: Dict[str, Any]) -> str:
     return str(metric.get("aggregation_policy") or metric.get("aggregationPolicy") or "").strip().lower()
+
+
+def metric_as_of_policy(metric: Dict[str, Any]) -> str:
+    semantics = metric.get("time_semantics") or metric.get("timeSemantics") or {}
+    if not isinstance(semantics, dict):
+        return ""
+    return str(semantics.get("asOfPolicy") or semantics.get("as_of_policy") or "").strip().lower()
 
 
 def metric_applicable_time_grains(metric: Dict[str, Any]) -> set[str]:
@@ -414,7 +490,39 @@ def quick_metric_time_filter(
     time_column: str,
     tenant_column: str,
     merchant_id: str,
+    aggregation_policy: str = "",
+    as_of_policy: str = "",
 ) -> tuple[str, list[Any]]:
+    if str(aggregation_policy or "").strip().lower() == "latest_value_only":
+        resolved_as_of = str(
+            getattr(time_range, "execution_end_value", "")
+            or getattr(time_range, "execution_end_date", "")
+            or ""
+        ).strip()
+        if not resolved_as_of and getattr(time_range, "anchor_policy", "") == CALENDAR_ANCHOR_POLICY:
+            resolved_as_of = str(getattr(time_range, "end_date", "") or "").strip()
+        if resolved_as_of:
+            params: list[Any] = []
+            if tenant_column:
+                params.append(merchant_id)
+            params.append(resolved_as_of)
+            return (
+                latest_as_of_partition_predicate_sql(
+                    table,
+                    time_column,
+                    anchor_value_sql="%s",
+                    tenant_column=tenant_column,
+                    tenant_value_sql="%s" if tenant_column else "",
+                ),
+                params,
+            )
+        anchor_sql = latest_partition_anchor_sql(
+            table,
+            partition_column=time_column,
+            tenant_column=tenant_column,
+            tenant_value_sql="%s" if tenant_column else "",
+        )
+        return "`%s` = %s" % (time_column, anchor_sql), [merchant_id] if tenant_column else []
     if (
         getattr(time_range, "anchor_policy", "") == CALENDAR_ANCHOR_POLICY
         and getattr(time_range, "start_date", "")
@@ -452,7 +560,7 @@ def verify_quick_metric_answer(
 ) -> AnswerClaimVerification:
     coverage_claim = (
         "quick_metric_latest_day_coverage"
-        if summary_semantics == "latest_day_value"
+        if summary_semantics in {"latest_day_value", "latest_as_of_value"}
         else "quick_metric_period_total_coverage"
     )
     supported_claim = AnswerClaim(
@@ -495,7 +603,11 @@ def unsupported_quick_answer_numbers(
     total: float,
 ) -> list[str]:
     allowed = [float(total)]
-    allowed.extend(float(row.get("value") or 0) for row in trend_rows[:40])
+    allowed.extend(
+        value
+        for row in trend_rows[:40]
+        if (value := quick_metric_numeric_value(row.get("value"))) is not None
+    )
     allowed.extend(value for _, value in numeric_token_pairs(question))
     unsupported: list[str] = []
     for raw, value in numeric_token_pairs(answer):
@@ -505,6 +617,18 @@ def unsupported_quick_answer_numbers(
             continue
         unsupported.append(raw)
     return dedupe_strings(unsupported)
+
+
+def quick_metric_numeric_value(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def dedupe_strings(items: Iterable[str]) -> list[str]:
@@ -711,6 +835,12 @@ def compile_semantic_quick_metric(
     time_column: str,
     tenant_column: str,
 ) -> Optional[Dict[str, Any]]:
+    effective_time_column = str(metric.get("timeColumn") or time_column or "").strip()
+    if not SAFE_IDENTIFIER.fullmatch(effective_time_column):
+        return None
+    time_semantics = metric.get("timeSemantics") or {}
+    if not isinstance(time_semantics, dict):
+        return None
     formula = str(metric.get("formula") or metric.get("metricFormula") or "").strip()
     source_columns = [str(item or "").strip() for item in metric.get("sourceColumns") or [] if str(item or "").strip()]
     if not source_columns or not all(SAFE_IDENTIFIER.fullmatch(column) for column in source_columns):
@@ -735,7 +865,7 @@ def compile_semantic_quick_metric(
         "source_columns": source_columns,
         "terms": terms,
         "table": table,
-        "time_column": time_column,
+        "time_column": effective_time_column,
         "tenant_column": tenant_column,
         "topic": topic,
         "description": str(metric.get("description") or "").strip(),
@@ -746,6 +876,13 @@ def compile_semantic_quick_metric(
         "selection_guidance": str(metric.get("selectionGuidance") or "").strip(),
         "aggregation_policy": str(metric.get("aggregationPolicy") or "").strip(),
         "applicable_time_grain": metric.get("applicableTimeGrain"),
+        "time_semantics": time_semantics,
+        "missing_value_policy": str(
+            metric.get("missingValuePolicy") or time_semantics.get("missingDataPolicy") or ""
+        ).strip(),
+        "zero_value_meaning": str(
+            metric.get("zeroValueMeaning") or time_semantics.get("zeroValuePolicy") or ""
+        ).strip(),
         "temporal_variants": metric.get("temporalVariants") or {},
         "linked_variant_of": str(metric.get("linkedVariantOf") or "").strip(),
     }
@@ -760,6 +897,10 @@ def semantic_metric_identity(metric: Dict[str, Any]) -> Dict[str, Any]:
         "formula": str(metric.get("formula") or ""),
         "aggregationPolicy": metric_aggregation_policy(metric),
         "applicableTimeGrain": sorted(metric_applicable_time_grains(metric)),
+        "timeColumn": str(metric.get("time_column") or metric.get("timeColumn") or ""),
+        "timeSemantics": metric.get("time_semantics") or metric.get("timeSemantics") or {},
+        "missingValuePolicy": str(metric.get("missing_value_policy") or metric.get("missingValuePolicy") or ""),
+        "zeroValueMeaning": str(metric.get("zero_value_meaning") or metric.get("zeroValueMeaning") or ""),
         "temporalVariants": metric.get("temporal_variants") or metric.get("temporalVariants") or {},
         "linkedVariantOf": str(metric.get("linked_variant_of") or metric.get("linkedVariantOf") or ""),
         "semanticRefId": semantic_metric_ref_id(metric),

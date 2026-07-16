@@ -14,12 +14,22 @@ def test_node_compiles_typed_amount_as_sealed_local_contract():
 
     contract = compile_node_metric_contract(
         intent,
-        PlanningAssetPack(tables=[PlanningAssetEntry(table="coupons", columns=["seller_id", "coupon_amt", "pt"])]),
+        PlanningAssetPack(
+            tables=[PlanningAssetEntry(table="coupons", columns=["seller_id", "coupon_amt", "pt"])],
+            metrics=[
+                PlanningAssetEntry(
+                    key="coupon_amt",
+                    table="coupons",
+                    columns=["coupon_amt"],
+                    metadata={"formula": "SUM(coupon_amt)", "sourceColumns": ["coupon_amt"]},
+                )
+            ],
+        ),
         {"seller_id", "coupon_amt", "pt"},
     )
 
     assert contract["mode"] == "compiled_local"
-    assert contract["formula"] == "SUM(`coupon_amt`)"
+    assert contract["formula"] == "SUM(coupon_amt)"
     assert contract["resolution"]["semanticRefId"].startswith("semantic:compiled_local:")
     assert contract["resolution"]["contractProvenance"]["kind"] == "execution_contract"
     assert semantic_metric_contract_issue(contract["resolution"], "coupons") == ""
@@ -58,7 +68,7 @@ def test_node_preserves_planner_compiled_local_provenance():
             "formula": "COUNT(DISTINCT order_id)",
             "sourceColumns": ["order_id"],
             "metricGovernanceMode": "compiled_local",
-            "localCompilationPolicy": "count_metric_convention",
+            "localCompilationPolicy": "declared_formula",
             "contractProvenance": {
                 "kind": "planning_asset",
                 "ownerTable": "orders",

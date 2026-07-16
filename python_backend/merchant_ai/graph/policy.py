@@ -140,7 +140,7 @@ class AgentActionRegistry:
                 description="repair QueryGraph",
                 required_state_keys=["plan.intents"],
                 required_state_flags=["planning_assets_compacted"],
-                expected_state_flags=["query_graph_repair_attempted"],
+                expected_state_flags=["query_graph_repair_progressed"],
             ),
             AgentAction(
                 id="execute_graph",
@@ -507,6 +507,7 @@ class V2AgentPolicy:
             eligible.add("recall_memory")
         if (
             not state.get("fast_understood")
+            and not has_plan
             and not has_tasks
             and not state.get("planner_provider_error")
             and not self.graph_validation_attempted(state)
@@ -543,38 +544,45 @@ class V2AgentPolicy:
                         eligible.add("retrieve_knowledge")
             else:
                 repair_actions = self.repair_request_actions(reflection) if reflection and not reflection.passed else []
-                repair_budget = int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions
+                repair_budget = self.graph_repair_attempt_count(state) < self.max_graph_repair_actions
+                validation_attempted = self.graph_validation_attempted(state)
+                reflection_pending = bool(
+                    not state.get("query_graph_reflected")
+                    and not self.fast_path_bypasses_reflection(state)
+                )
 
-                if not state.get("query_graph_reflected") and not self.fast_path_bypasses_reflection(state):
-                    eligible.add("reflect_plan")
-                if not self.graph_validation_attempted(state):
-                    eligible.add("validate_graph")
-
-                if reflection and not reflection.passed:
-                    if "semantic_read" in repair_actions and knowledge_can_progress:
-                        eligible.add("retrieve_knowledge")
-                    if "re_understand" in repair_actions and self.can_reunderstand(state):
-                        eligible.add("plan_graph")
-                    if repair_budget and (
-                        "graph_repair" in repair_actions
-                        or self.has_structural_anchor_repair_issue(reflection)
-                        or bool(reflection.issues)
-                    ):
-                        eligible.add("repair_graph")
-                    if "answer_with_gap" in repair_actions and self.graph_validation_attempted(state):
-                        eligible.add("answer_data")
-
-                if validation and not validation.valid:
+                # QueryGraph lifecycle is tri-state and phase ordered.  A default
+                # GraphValidationResult(valid=False) means "not run", never
+                # "failed".  Reflection, validation and repair therefore cannot
+                # all become eligible from the same unvalidated state.
+                if not validation_attempted:
+                    if reflection_pending:
+                        eligible.add("reflect_plan")
+                    elif reflection and not reflection.passed:
+                        if "semantic_read" in repair_actions and knowledge_can_progress:
+                            eligible.add("retrieve_knowledge")
+                        elif "re_understand" in repair_actions and self.can_reunderstand(state):
+                            eligible.add("plan_graph")
+                        elif repair_budget and (
+                            "graph_repair" in repair_actions
+                            or self.has_structural_anchor_repair_issue(reflection)
+                            or bool(reflection.issues)
+                        ):
+                            eligible.add("repair_graph")
+                        if not eligible.intersection({"retrieve_knowledge", "plan_graph", "repair_graph"}):
+                            eligible.add("answer_data")
+                    else:
+                        eligible.add("validate_graph")
+                elif not graph_validation_passed(state):
                     if self.validation_requires_knowledge(validation) and knowledge_can_progress:
                         eligible.add("retrieve_knowledge")
-                    if self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
+                    elif self.validation_requires_reunderstand(validation) and self.can_reunderstand(state):
                         eligible.add("plan_graph")
-                    if validation.repairable and repair_budget:
+                    elif validation and validation.repairable and repair_budget:
                         eligible.add("repair_graph")
                     if not eligible.intersection({"retrieve_knowledge", "plan_graph", "repair_graph"}):
                         eligible.add("answer_data")
-
-                if self.has_blocking_reflection_issues(state):
+                elif self.has_blocking_reflection_issues(state):
                     eligible.add("answer_data")
                 elif self.has_validated_executable_plan(state) and not state.get("sql_generated"):
                     eligible.update(self.execution_action_ids(state))
@@ -585,7 +593,7 @@ class V2AgentPolicy:
             eligible.add("verify_evidence")
 
         if self.has_graph_repairable_execution_gap(state):
-            if int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
+            if self.graph_repair_attempt_count(state) < self.max_graph_repair_actions:
                 eligible.add("repair_graph")
             else:
                 eligible.add("answer_data")
@@ -738,7 +746,7 @@ class V2AgentPolicy:
             actions.append("compact_assets")
         if state.get("planning_assets_compacted") and (not plan or not getattr(plan, "intents", None)) and self.can_reunderstand(state):
             actions.append("plan_graph")
-        if plan and getattr(plan, "intents", None) and int(state.get("query_graph_repair_attempts") or 0) < self.max_graph_repair_actions:
+        if plan and getattr(plan, "intents", None) and self.graph_repair_attempt_count(state) < self.max_graph_repair_actions:
             actions.append("repair_graph")
         if plan and getattr(plan, "intents", None) and not self.graph_validation_attempted(state):
             actions.append("validate_graph")
@@ -775,6 +783,17 @@ class V2AgentPolicy:
             if action:
                 actions.add(action)
         return actions
+
+    def graph_repair_attempt_count(self, state: AgentState) -> int:
+        """Return the attempt count for the active graph-and-issue scope."""
+
+        scope_key = str(state.get("query_graph_repair_scope_key") or "")
+        scope_attempts = state.get("query_graph_repair_scope_attempts") or {}
+        if scope_key and isinstance(scope_attempts, dict):
+            return int(scope_attempts.get(scope_key, 0) or 0)
+        if "query_graph_repair_scope_attempt_count" in state:
+            return int(state.get("query_graph_repair_scope_attempt_count") or 0)
+        return int(state.get("query_graph_repair_attempts") or 0)
 
     def has_structural_anchor_repair_issue(self, reflection: PlannerReflectionResult) -> bool:
         issue_codes = {

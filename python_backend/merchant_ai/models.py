@@ -670,6 +670,14 @@ class ResolvedTimeRange(APIModel):
     window_role: str = "primary"
     offset_days: int = 0
     comparison_type: str = ""
+    # Runtime execution bounds are populated only after source freshness has
+    # been checked.  They keep the user's relative-time semantics intact while
+    # binding every SQL node to the exact snapshot that was validated.
+    execution_start_date: str = ""
+    execution_end_date: str = ""
+    execution_start_value: str = ""
+    execution_end_value: str = ""
+    execution_anchor_policy: str = ""
 
 
 class FastUnderstandingResult(APIModel):
@@ -686,6 +694,34 @@ class FastUnderstandingResult(APIModel):
     confidence: float = 0.0
     reasons: List[str] = Field(default_factory=list)
     time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
+
+
+class MetricObligationDecision(str, Enum):
+    """Resolution state for one metric phrase frozen from the user request."""
+
+    SELECTED = "selected"
+    AMBIGUOUS = "ambiguous"
+    UNRESOLVED = "unresolved"
+
+
+class MetricObligationBinding(APIModel):
+    metric_ref: str = ""
+    owner_table: str = ""
+    semantic_ref_id: str = ""
+
+
+class MetricObligation(APIModel):
+    """Append-only identity plus the current structured resolution decision."""
+
+    obligation_id: str = ""
+    source_phrase: str = ""
+    normalized_phrase: str = ""
+    source_index: int = 0
+    origin: str = "fastUnderstanding.metricPhrases"
+    decision: MetricObligationDecision = MetricObligationDecision.UNRESOLVED
+    selected_metrics: List[MetricObligationBinding] = Field(default_factory=list)
+    candidate_refs: List[str] = Field(default_factory=list)
+    reason: str = ""
 
 
 class KnowledgeRequest(APIModel):
@@ -1304,6 +1340,12 @@ class FreshnessCheckResult(APIModel):
         validation_alias=AliasChoices("maxTimeValue", "max_time_value", "maxPt", "max_pt"),
     )
     fallback_table: str = ""
+    effective_start_time_value: str = ""
+    effective_end_time_value: str = ""
+    execution_start_value: str = ""
+    execution_end_value: str = ""
+    alignment_status: str = ""
+    coverage_complete: bool = True
     reason: str = ""
 
     # Compatibility projections for callers and persisted traces created before
@@ -1322,6 +1364,36 @@ class FreshnessCheckResult(APIModel):
     @property
     def max_pt(self) -> str:
         return self.max_time_value
+
+
+class SnapshotSourceWindow(APIModel):
+    task_id: str = ""
+    table: str = ""
+    aggregation_policy: str = ""
+    time_selection_policy: str = ""
+    source_min_time_value: str = ""
+    source_max_time_value: str = ""
+    effective_start_time_value: str = ""
+    effective_end_time_value: str = ""
+    execution_start_value: str = ""
+    execution_end_value: str = ""
+    requested_days: int = 0
+    offset_days: int = 0
+    status: str = ""
+    compatible: bool = False
+    coverage_complete: bool = True
+    reason: str = ""
+
+
+class SnapshotAlignmentContract(APIModel):
+    status: str = "NOT_APPLICABLE"
+    strategy: str = ""
+    aligned: bool = False
+    complete: bool = False
+    common_anchor_time_value: str = ""
+    disclosure_required: bool = False
+    sources: List[SnapshotSourceWindow] = Field(default_factory=list)
+    reason: str = ""
 
 
 class NodePlanContract(APIModel):
@@ -1504,6 +1576,36 @@ class GraphValidationResult(APIModel):
     recommended_knowledge_requests: List[KnowledgeRequest] = Field(default_factory=list)
 
 
+class PlannerRepairInput(APIModel):
+    """Immutable critic output consumed by one QueryGraph repair attempt."""
+
+    scope_key: str = ""
+    graph_fingerprint: str = ""
+    reflection: PlannerReflectionResult = Field(default_factory=PlannerReflectionResult)
+    repair_requests: List[PlannerRepairRequest] = Field(default_factory=list)
+    validation_gaps: List[GraphValidationGap] = Field(default_factory=list)
+    repair_gaps: List[GraphValidationGap] = Field(default_factory=list)
+
+
+class QueryGraphRepairDelta(APIModel):
+    """Observable executable-graph delta produced by a repair invocation."""
+
+    attempt: int = 0
+    scope_attempt: int = 0
+    scope_key: str = ""
+    status: str = ""
+    changed: bool = False
+    exhausted: bool = False
+    before_graph_fingerprint: str = ""
+    after_graph_fingerprint: str = ""
+    before_nodes: int = 0
+    after_nodes: int = 0
+    repair_reason: str = ""
+    reflection: PlannerReflectionResult = Field(default_factory=PlannerReflectionResult)
+    repair_requests: List[PlannerRepairRequest] = Field(default_factory=list)
+    repair_gaps: List[GraphValidationGap] = Field(default_factory=list)
+
+
 class SqlValidationResult(APIModel):
     valid: bool = False
     error_code: str = ""
@@ -1652,6 +1754,7 @@ class VerifiedAnswerContext(APIModel):
     verified_passed: bool = False
     partial_answer_reason: str = ""
     verified_facts: List[VerifiedFact] = Field(default_factory=list)
+    freshness: Dict[str, Any] = Field(default_factory=dict)
 
     def prompt_payload(self) -> Dict[str, Any]:
         return {
@@ -1669,6 +1772,7 @@ class VerifiedAnswerContext(APIModel):
             "verifiedPassed": self.verified_passed,
             "partialAnswerReason": self.partial_answer_reason,
             "verifiedFacts": [item.model_dump(by_alias=True) for item in self.verified_facts],
+            "freshness": self.freshness,
         }
 
 
@@ -1914,6 +2018,7 @@ class AgentRunResult(APIModel):
     node_tool_traces: List[NodeToolCall] = Field(default_factory=list)
     node_task_profiles: List[NodeTaskProfile] = Field(default_factory=list)
     freshness_reports: List[FreshnessCheckResult] = Field(default_factory=list)
+    snapshot_alignment: SnapshotAlignmentContract = Field(default_factory=SnapshotAlignmentContract)
     node_plan_contracts: List[NodePlanContract] = Field(default_factory=list)
     node_plan_critiques: List[NodePlanCritiqueResult] = Field(default_factory=list)
     sql_draft_decisions: List[SqlDraftDecision] = Field(default_factory=list)

@@ -4,10 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from merchant_ai.models import ResolvedTimeRange
 from merchant_ai.services.quick_metrics import (
     compile_semantic_quick_metric,
     quick_metric_response,
     quick_metric_supports_temporal_mode,
+    quick_metric_time_filter,
     resolve_quick_metric_temporal_variant,
 )
 
@@ -59,6 +61,7 @@ def test_compiler_preserves_published_temporal_governance_metadata() -> None:
             "displayName": "快照脉冲率",
             "formula": "MAX(snapshot_rate)",
             "sourceColumns": ["snapshot_rate"],
+            "timeColumn": "metric_event_day",
             "aggregationPolicy": "daily_value_only",
             "applicableTimeGrain": "day",
             "temporalVariants": {"publishedPeriodContract": "runtime_period_ratio"},
@@ -71,6 +74,7 @@ def test_compiler_preserves_published_temporal_governance_metadata() -> None:
     )
 
     assert contract is not None
+    assert contract["time_column"] == "metric_event_day"
     assert contract["aggregation_policy"] == "daily_value_only"
     assert contract["applicable_time_grain"] == "day"
     assert contract["temporal_variants"] == {"publishedPeriodContract": "runtime_period_ratio"}
@@ -84,6 +88,9 @@ def test_compiler_preserves_published_temporal_governance_metadata() -> None:
         ("daily_value_only", "day", "daily_series", True),
         ("daily_value_only", "day", "period_summary", False),
         ("daily_value_only", "", "exact_day", False),
+        ("latest_value_only", "day", "exact_day", True),
+        ("latest_value_only", "day", "period_summary", True),
+        ("latest_value_only", "day", "daily_series", False),
         ("ratio_of_sums", "period", "period_summary", True),
         ("ratio_of_sums", "period", "daily_series", False),
         ("ratio_of_sums", "", "daily_series", True),
@@ -215,6 +222,216 @@ def test_period_daily_value_without_published_variant_returns_to_planner_before_
         UnexpectedRepository(),
         extracted_metric_phrase("孤立快照率"),
         [daily],
+    )
+
+    assert response is None
+
+
+def test_latest_value_only_uses_one_latest_as_of_partition_and_never_sums_the_window() -> None:
+    snapshot = semantic_metric(
+        "snapshot_balance",
+        "快照余额",
+        "SUM(event_count)",
+        "SUM(`event_count`)",
+        policy="latest_value_only",
+        grain="day",
+    )
+    snapshot["unit"] = "元"
+    calls: list[tuple[str, list[str]]] = []
+
+    class Repository:
+        def query(self, sql, params=None):
+            calls.append((sql, list(params or [])))
+            return [{"time_dimension": "2026-07-11", "value": 110.0}]
+
+    response = quick_metric_response(
+        "最近30天快照余额是多少？",
+        "tenant-latest-as-of",
+        Repository(),
+        extracted_metric_phrase("快照余额"),
+        [snapshot],
+    )
+
+    assert response is not None
+    assert len(calls) == 1
+    sql, params = calls[0]
+    assert "`event_day` = (SELECT MAX(`event_day`)" in sql
+    assert "BETWEEN" not in sql
+    assert params == ["tenant-latest-as-of", "tenant-latest-as-of"]
+    assert "截至 2026-07-11" in response.answer
+    assert "未做跨日加总" in response.answer
+    assert "合计" not in response.answer
+    assert response.debug_trace["summarySemantics"] == "latest_as_of_value"
+    assert response.debug_trace["timeWindowContract"]["executionStartValue"] == "2026-07-11"
+    assert response.debug_trace["timeWindowContract"]["executionEndValue"] == "2026-07-11"
+
+
+def test_latest_value_only_null_is_missing_evidence_not_business_zero() -> None:
+    snapshot = semantic_metric(
+        "null_snapshot_balance",
+        "空快照余额",
+        "SUM(event_count)",
+        "SUM(`event_count`)",
+        policy="latest_value_only",
+        grain="day",
+    )
+
+    class Repository:
+        def query(self, sql, params=None):
+            return [{"time_dimension": "2026-07-11", "value": None}]
+
+    response = quick_metric_response(
+        "最近30天空快照余额是多少？",
+        "tenant-null-latest",
+        Repository(),
+        extracted_metric_phrase("空快照余额"),
+        [snapshot],
+    )
+
+    assert response is None
+
+
+def test_daily_value_series_null_returns_to_query_graph_instead_of_inventing_zero() -> None:
+    daily = semantic_metric(
+        "null_daily_ratio",
+        "空序列率",
+        "MAX(snapshot_rate)",
+        "MAX(`snapshot_rate`)",
+        policy="daily_value_only",
+        grain="day",
+    )
+
+    class Repository:
+        def query(self, sql, params=None):
+            return [
+                {"time_dimension": "2026-07-14", "value": 0.2},
+                {"time_dimension": "2026-07-15", "value": None},
+            ]
+
+    response = quick_metric_response(
+        "最近2天空序列率趋势",
+        "tenant-null-series",
+        Repository(),
+        extracted_metric_phrase("空序列率", analysis_intent="trend"),
+        [daily],
+    )
+
+    assert response is None
+
+
+def test_latest_value_only_exact_date_uses_the_resolved_as_of_value() -> None:
+    snapshot = semantic_metric(
+        "dated_snapshot_balance",
+        "日期快照余额",
+        "SUM(event_count)",
+        "SUM(`event_count`)",
+        policy="latest_value_only",
+        grain="day",
+    )
+    calls: list[tuple[str, list[str]]] = []
+
+    class Repository:
+        def query(self, sql, params=None):
+            calls.append((sql, list(params or [])))
+            return [{"time_dimension": "2026-07-10", "value": 80.0}]
+
+    response = quick_metric_response(
+        "2026-07-10日期快照余额是多少？",
+        "tenant-exact-as-of",
+        Repository(),
+        extracted_metric_phrase("日期快照余额"),
+        [snapshot],
+    )
+
+    assert response is not None
+    assert len(calls) == 1
+    sql, params = calls[0]
+    assert "`event_day` = (SELECT MAX(`event_day`)" in sql
+    assert "`event_day` <= %s" in sql
+    assert "BETWEEN" not in sql
+    assert params == ["tenant-exact-as-of", "tenant-exact-as-of", "2026-07-10"]
+
+
+@pytest.mark.parametrize(
+    ("resolved_field", "resolved_anchor"),
+    [
+        ("execution_end_value", "20260712"),
+        ("execution_end_date", "2026-07-12"),
+    ],
+)
+def test_latest_value_only_prefers_the_resolved_execution_anchor(
+    resolved_field: str,
+    resolved_anchor: str,
+) -> None:
+    time_range = ResolvedTimeRange(
+        kind="rolling",
+        anchor_policy="latest_partition",
+        **{resolved_field: resolved_anchor},
+    )
+
+    predicate, params = quick_metric_time_filter(
+        time_range,
+        "arbitrary_snapshot_table",
+        "arbitrary_partition",
+        "arbitrary_tenant",
+        "tenant-resolved-anchor",
+        aggregation_policy="latest_value_only",
+    )
+
+    assert predicate == (
+        "`arbitrary_partition` = (SELECT MAX(`arbitrary_partition`) "
+        "FROM `arbitrary_snapshot_table` WHERE `arbitrary_tenant` = %s "
+        "AND `arbitrary_partition` <= %s)"
+    )
+    assert params == ["tenant-resolved-anchor", resolved_anchor]
+
+
+def test_latest_value_calendar_as_of_uses_the_same_max_not_after_operator_as_query_graph() -> None:
+    time_range = ResolvedTimeRange(
+        kind="exact_date",
+        anchor_policy="calendar",
+        end_date="2026-07-12",
+        execution_end_value="20260712",
+    )
+
+    predicate, params = quick_metric_time_filter(
+        time_range,
+        "arbitrary_snapshot_table",
+        "arbitrary_partition",
+        "arbitrary_tenant",
+        "tenant-calendar-anchor",
+        aggregation_policy="latest_value_only",
+        as_of_policy="calendar",
+    )
+
+    assert predicate == (
+        "`arbitrary_partition` = (SELECT MAX(`arbitrary_partition`) "
+        "FROM `arbitrary_snapshot_table` WHERE `arbitrary_tenant` = %s "
+        "AND `arbitrary_partition` <= %s)"
+    )
+    assert params == ["tenant-calendar-anchor", "20260712"]
+
+
+def test_latest_value_only_daily_trend_returns_to_query_graph() -> None:
+    snapshot = semantic_metric(
+        "trend_snapshot_balance",
+        "趋势快照余额",
+        "SUM(event_count)",
+        "SUM(`event_count`)",
+        policy="latest_value_only",
+        grain="day",
+    )
+
+    class UnexpectedRepository:
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("snapshot trend requires the QueryGraph time-series executor")
+
+    response = quick_metric_response(
+        "最近7天趋势快照余额走势",
+        "tenant-snapshot-trend",
+        UnexpectedRepository(),
+        extracted_metric_phrase("趋势快照余额", analysis_intent="trend"),
+        [snapshot],
     )
 
     assert response is None

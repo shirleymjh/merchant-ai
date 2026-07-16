@@ -8,6 +8,7 @@ from merchant_ai.services.assets import (
     TopicAssetService,
     TopicBuilderWorkflow,
     normalize_table_usage_profile,
+    semantic_asset_builder_tool,
     semantic_catalog_conflict_detection,
 )
 
@@ -46,6 +47,39 @@ DISTRIBUTED BY HASH(`tenant_key`) BUCKETS 4
 
     def sample_rows(self, table, merchant_id, limit=20):
         return [{"tenant_key": "t-1", "event_day": "2026-07-01", "entity_key": "e-1", "value_x": 3.0}]
+
+
+def test_topic_builder_metric_schema_requires_generic_execution_semantics() -> None:
+    parameters = semantic_asset_builder_tool().parameters
+    metric_schema = parameters["properties"]["metrics"]["items"]
+
+    assert metric_schema["additionalProperties"] is False
+    assert {
+        "aggregationPolicy",
+        "metricGrain",
+        "applicableTimeGrain",
+        "timeSemantics",
+    } <= set(metric_schema["required"])
+    assert set(metric_schema["properties"]["aggregationPolicy"]["enum"]) == {
+        "period_rollup",
+        "period_recompute",
+        "latest_value_only",
+        "daily_value_only",
+        "ratio_of_sums",
+    }
+
+    time_semantics = metric_schema["properties"]["timeSemantics"]
+    assert time_semantics["additionalProperties"] is False
+    assert set(time_semantics["required"]) == {
+        "selectionPolicy",
+        "asOfPolicy",
+        "missingDataPolicy",
+        "zeroValuePolicy",
+    }
+    assert "latest_as_of" in time_semantics["properties"]["selectionPolicy"]["enum"]
+    assert "latest_available_partition" in time_semantics["properties"]["asOfPolicy"]["enum"]
+    assert "disclose_unknown" in time_semantics["properties"]["missingDataPolicy"]["enum"]
+    assert "preserve_observed_zero" in time_semantics["properties"]["zeroValuePolicy"]["enum"]
 
 
 def test_builder_uses_physical_metadata_and_leaves_business_contracts_undeclared(tmp_path):

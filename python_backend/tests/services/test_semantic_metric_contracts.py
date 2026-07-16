@@ -1,4 +1,5 @@
 from merchant_ai.services.semantic_metrics import (
+    metric_time_selection_policy,
     seal_semantic_metric_resolution,
     semantic_metric_contract_issue,
 )
@@ -6,6 +7,7 @@ from merchant_ai.models import (
     AgentRunResult,
     AgentTaskResult,
     AnswerMode,
+    EntitySet,
     PlanningAssetEntry,
     PlanningAssetPack,
     QueryBundle,
@@ -76,10 +78,72 @@ def test_semantic_metric_contract_rejects_late_table_override():
     assert semantic_metric_contract_issue(resolution, "refunds") == "semantic metric contract drifted after resolution"
 
 
+def test_semantic_metric_contract_seals_temporal_execution_semantics():
+    resolution = seal_semantic_metric_resolution(
+        {
+            **governed_resolution(),
+            "aggregationPolicy": "latest_value_only",
+            "applicableTimeGrain": "day",
+            "metricGrain": "tenant_snapshot",
+            "timeColumn": "event_day",
+            "timeSemantics": {
+                "selectionPolicy": "latest_as_of",
+                "asOfPolicy": "latest_available_partition",
+                "missingDataPolicy": "disclose_unknown",
+                "zeroValuePolicy": "preserve_observed_zero",
+            },
+        }
+    )
+
+    assert resolution["semanticContract"]["aggregationPolicy"] == "latest_value_only"
+    assert resolution["semanticContract"]["timeColumn"] == "event_day"
+    assert metric_time_selection_policy(resolution) == "latest_as_of"
+    resolution["aggregationPolicy"] = "period_rollup"
+    assert semantic_metric_contract_issue(resolution, "orders") == "semantic metric contract drifted after resolution"
+
+
+def test_semantic_metric_contract_rejects_late_time_column_override():
+    resolution = seal_semantic_metric_resolution(
+        {
+            **governed_resolution(),
+            "aggregationPolicy": "period_rollup",
+            "metricGrain": "tenant_event",
+            "timeColumn": "event_day",
+        }
+    )
+    resolution["timeColumn"] = "ingest_day"
+
+    assert semantic_metric_contract_issue(resolution, "orders") == "semantic metric contract drifted after resolution"
+
+
+def test_semantic_metric_contract_rejects_late_missing_value_policy_override():
+    resolution = seal_semantic_metric_resolution(
+        {
+            **governed_resolution(),
+            "aggregationPolicy": "period_rollup",
+            "missingValuePolicy": "unknown",
+        }
+    )
+    resolution["missingValuePolicy"] = "zero"
+
+    assert semantic_metric_contract_issue(resolution, "orders") == "semantic metric contract drifted after resolution"
+
+
 def test_planner_seals_explicit_asset_as_compiled_local_metric_contract():
     pack = PlanningAssetPack(
         tables=[PlanningAssetEntry(table="orders", columns=["seller_id", "order_id", "pt"])],
-        metrics=[PlanningAssetEntry(key="order_cnt", table="orders", columns=["order_id"], title="订单量")],
+        metrics=[
+            PlanningAssetEntry(
+                key="order_cnt",
+                table="orders",
+                columns=["order_id"],
+                title="订单量",
+                metadata={
+                    "formula": "COUNT(DISTINCT order_id)",
+                    "sourceColumns": ["order_id"],
+                },
+            )
+        ],
     )
     understanding = {
         "analysisGrain": "merchant",
@@ -104,7 +168,7 @@ def test_planner_seals_explicit_asset_as_compiled_local_metric_contract():
     assert plan.intents
     assert all(intent.metric_formula == "COUNT(DISTINCT `order_id`)" for intent in plan.intents)
     assert all(intent.metric_resolution["metricGovernanceMode"] == "compiled_local" for intent in plan.intents)
-    assert all(intent.metric_resolution["localCompilationPolicy"] == "count_metric_convention" for intent in plan.intents)
+    assert all(intent.metric_resolution["localCompilationPolicy"] == "declared_formula" for intent in plan.intents)
     assert all(semantic_metric_contract_issue(intent.metric_resolution, "orders") == "" for intent in plan.intents)
     assert PlannerReflectionAgent().reflect("最近7天订单量是多少", plan, pack).passed
     assert not semantic_fast_path_can_bypass_configured_llm("最近7天订单量是多少", plan, pack)
@@ -157,8 +221,26 @@ def test_compiled_local_derived_metric_governs_each_component_contract():
                 title="退款率",
                 metadata={"formula": "refund_cnt / order_cnt", "sourceColumns": ["refund_cnt", "order_cnt"]},
             ),
-            PlanningAssetEntry(key="refund_cnt", table="refunds", columns=["refund_id"], title="退款量"),
-            PlanningAssetEntry(key="order_cnt", table="orders", columns=["order_id"], title="订单量"),
+            PlanningAssetEntry(
+                key="refund_cnt",
+                table="refunds",
+                columns=["refund_id"],
+                title="退款量",
+                metadata={
+                    "formula": "COUNT(DISTINCT refund_id)",
+                    "sourceColumns": ["refund_id"],
+                },
+            ),
+            PlanningAssetEntry(
+                key="order_cnt",
+                table="orders",
+                columns=["order_id"],
+                title="订单量",
+                metadata={
+                    "formula": "COUNT(DISTINCT order_id)",
+                    "sourceColumns": ["order_id"],
+                },
+            ),
         ],
     )
     understanding = {
@@ -294,11 +376,13 @@ def test_merged_rows_record_field_owner_conflicts_instead_of_hiding_them():
                 task_id="order_lookup",
                 success=True,
                 query_bundle=QueryBundle(rows=[{"order_id": "order_1", "pay_amt": 122}]),
+                entity_set=EntitySet(join_key="order_id", column_values={"order_id": ["order_1"]}),
             ),
             AgentTaskResult(
                 task_id="refund_lookup",
                 success=True,
                 query_bundle=QueryBundle(rows=[{"order_id": "order_1", "pay_amt": 121.5}]),
+                entity_set=EntitySet(join_key="order_id", column_values={"order_id": ["order_1"]}),
             ),
         ]
     )
@@ -339,7 +423,14 @@ def test_cross_task_detail_answer_keeps_each_tasks_owned_fields():
                 output_keys=["order_id", "buyer_name", "refund_create_time", "pay_amt"],
                 required_evidence=["buyer_name", "refund_create_time", "pay_amt"],
                 metric_name="pay_amt",
-                metric_resolution={"metricKey": "pay_amt", "displayName": "退款金额", "sourceColumns": ["pay_amt"]},
+                metric_resolution={
+                    "metricKey": "pay_amt",
+                    "displayName": "退款金额",
+                    "sourceColumns": ["pay_amt"],
+                    "unit": "元",
+                    "valueFormat": "currency",
+                    "decimalPlaces": 2,
+                },
             ),
         ]
     )

@@ -23,6 +23,7 @@ from merchant_ai.graph.workflow import (
     current_analysis_summary_for_state,
     graph_gaps_from_node_failures,
     graph_repair_validation_gaps,
+    planner_repair_gaps_from_state,
     knowledge_request_key,
     lead_decision_fingerprint,
     merchant_access_role,
@@ -2159,7 +2160,7 @@ def test_repair_graph_invalidates_stale_analysis_outputs(tmp_path, monkeypatch):
     state["skill_worker_completed"] = True
 
     repaired = state["plan"].model_copy(deep=True)
-    repaired.compiler_trace.append("REPAIRED")
+    repaired.intents[0].metric_name = "refund_rate_repaired"
     monkeypatch.setattr(workflow.planner, "repair", lambda *_args, **_kwargs: repaired)
 
     state = workflow.repair_query_graph(state)
@@ -2174,6 +2175,34 @@ def test_repair_graph_invalidates_stale_analysis_outputs(tmp_path, monkeypatch):
     assert state["analysis_worker_completed"] is False
     assert state["analysis_skill_trace"] == {}
     assert state["skill_worker_completed"] is False
+
+
+def test_planner_repair_receives_blocking_reflection_issues() -> None:
+    state = {
+        "query_graph_validation_result": GraphValidationResult(),
+        "planner_reflection": PlannerReflectionResult(
+            passed=False,
+            issues=[
+                {
+                    "code": "DETAIL_EVIDENCE_NOT_PLANNED",
+                    "severity": "error",
+                    "evidence": "runtime_fact:row evidence",
+                    "reason": "typed detail contract is not covered",
+                },
+                {
+                    "code": "SCHEMA_DRIFT",
+                    "severity": "warning",
+                    "evidence": "runtime_fact",
+                    "reason": "non-blocking drift",
+                },
+            ],
+        ),
+    }
+
+    gaps = planner_repair_gaps_from_state(state)
+
+    assert [gap.code for gap in gaps] == ["DETAIL_EVIDENCE_NOT_PLANNED"]
+    assert gaps[0].evidence == "runtime_fact:row evidence"
 
 
 def test_execution_invalidation_preserves_user_declined_skill(tmp_path):
@@ -2369,7 +2398,7 @@ def test_bounded_lead_llm_cannot_select_action_outside_registry_candidates():
     selected = workflow.apply_bounded_lead_llm_decision(state, decision)
 
     assert selected.selected_action == "retrieve_knowledge"
-    assert state["bounded_lead_llm_trace"]["status"] == "ignored"
+    assert state["bounded_lead_llm_trace"]["status"] == "failed_closed"
     assert state["bounded_lead_llm_trace"]["reason"] == "llm_selected_action_not_allowed"
 
 
@@ -11401,11 +11430,14 @@ def test_memory_knowledge_governance_reviews_publishes_and_indexes_suggestion(tm
         }
     ]
     store.save("seller_100", memory)
+    topic_assets = FakeSuggestionTopicAssets()
+    governance = FakeSuggestionGovernanceService()
     service = MemoryKnowledgeGovernanceService(
         settings,
         memory_store=store,
-        topic_assets=FakeSuggestionTopicAssets(),
-        governance_service=FakeSuggestionGovernanceService(),
+        topic_assets=topic_assets,
+        governance_service=governance,
+        semantic_publish_coordinator=FakeSuggestionPublishCoordinator(topic_assets, governance),
     )
 
     reviewed = service.review_suggestion(
@@ -11580,11 +11612,14 @@ def test_memory_knowledge_governance_request_publish_and_run_jobs(tmp_path):
         }
     ]
     store.save("seller_100", memory)
+    topic_assets = FakeSuggestionTopicAssets()
+    governance = FakeSuggestionGovernanceService()
     service = MemoryKnowledgeGovernanceService(
         settings,
         memory_store=store,
-        topic_assets=FakeSuggestionTopicAssets(),
-        governance_service=FakeSuggestionGovernanceService(),
+        topic_assets=topic_assets,
+        governance_service=governance,
+        semantic_publish_coordinator=FakeSuggestionPublishCoordinator(topic_assets, governance),
     )
 
     requested = service.request_publish_suggestion("seller_100", "ks_refund_rate", requested_by="ops_reviewer", review_note="ready")
@@ -11598,6 +11633,7 @@ def test_memory_knowledge_governance_request_publish_and_run_jobs(tmp_path):
     assert jobs["processedCount"] == 1
     assert jobs["results"][0]["status"] == "PUBLISHED"
     assert jobs["results"][0]["indexed"]["status"] == "INDEXED"
+    assert topic_assets.publish_calls == []
 
     saved = store.load("seller_100")
     suggestion = saved["knowledgeSuggestions"][0]
@@ -13066,6 +13102,46 @@ class FakeSuggestionGovernanceService:
             "publishMode": "scoped_incremental",
             "publishScope": {"topic": topic, "table": table},
             "semanticCatalogVersion": {"semanticVersion": "semantic-1"},
+        }
+
+
+class FakeSuggestionPublishCoordinator:
+    def __init__(self, topic_assets, governance_service):
+        self.topic_assets = topic_assets
+        self.governance_service = governance_service
+        self.calls = []
+
+    def publish_approved(self, topic, table_name, reviewer, review_note, preflight, activation_verifier=None):
+        self.calls.append((topic, table_name, reviewer, review_note, preflight, activation_verifier))
+        return {
+            "success": True,
+            "status": "PUBLISHED",
+            "publishState": "ACTIVE",
+            "topic": topic,
+            "tableName": table_name,
+            "semanticGovernance": self.governance_service.after_publish(topic, table_name, reviewer, review_note),
+            "activationVerification": {
+                "success": True,
+                "status": "ACTIVATION_VERIFIED",
+                "filesystemReadback": {
+                    "success": True,
+                    "status": "READBACK_VERIFIED",
+                    "suggestionId": "ks_refund_rate",
+                },
+                "recallReadback": {
+                    "expectedRefs": ["semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate"],
+                    "missingRefs": [],
+                    "previousIndexVersion": "old",
+                    "candidateIndexVersion": "new",
+                    "indexChanged": True,
+                },
+            },
+            "recallIndex": {
+                "success": True,
+                "activeManifestAdvanced": True,
+                "indexVersion": "new",
+                "semanticSourceHash": "new-source-hash",
+            },
         }
 
 
@@ -17200,6 +17276,9 @@ def test_lead_policy_registry_selects_reflection_before_validation():
         "planning_assets_compacted": True,
         "query_graph_reflected": False,
         "query_graph_validated": False,
+        "query_graph_validation_status": "not_run",
+        "query_graph_validation_attempted": False,
+        "query_graph_validation_result": GraphValidationResult(),
         "react_round": 4,
         "plan": QueryPlan(
             intents=[
@@ -17218,7 +17297,8 @@ def test_lead_policy_registry_selects_reflection_before_validation():
     decision = policy.decide(state)
     assert decision.selected_action == "reflect_plan"
     assert decision.selected_node == "reflect_query_graph"
-    assert "validate_graph" in decision.available_actions
+    assert "validate_graph" not in decision.available_actions
+    assert "repair_graph" not in decision.available_actions
 
 
 def test_lead_policy_treats_plan_clarification_as_terminal_even_without_projected_flag():
@@ -17276,6 +17356,9 @@ def test_lead_policy_fast_path_skips_reflection_before_validation():
         "planning_assets_compacted": True,
         "query_graph_reflected": False,
         "query_graph_validated": False,
+        "query_graph_validation_status": "not_run",
+        "query_graph_validation_attempted": False,
+        "query_graph_validation_result": GraphValidationResult(),
         "latency_optimization": {"eligible": True, "mode": "fast_path_verified_graph"},
         "react_round": 4,
         "plan": QueryPlan(
@@ -17441,6 +17524,7 @@ def test_lead_policy_reunderstands_contract_mismatch_from_validator():
             repairable=True,
         ),
     }
+    record_graph_validation(state, state["query_graph_validation_result"])
 
     decision = V2AgentPolicy(get_settings()).decide(state)
     assert decision.selected_action == "plan_graph"
@@ -20837,8 +20921,8 @@ def test_compiler_preserves_parallel_detail_branches_with_topn_metric():
             "limit": 3,
         },
         "requestedMeasures": [
-            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单明细"},
-            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单明细", "resultMode": "detail"},
+            {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细", "resultMode": "detail"},
         ],
         "requiredEvidenceIntents": [],
         "filters": [],
@@ -20866,8 +20950,8 @@ def test_validator_rejects_missing_parallel_detail_branch():
     plan = QueryPlan(
         question_understanding={
             "requestedMeasures": [
-                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单明细"},
-                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细"},
+                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_order_detail_di", "sourcePhrase": "订单明细", "resultMode": "detail"},
+                {"metricRef": "pay_amt", "ownerTable": "dwm_trade_refund_detail_di", "sourcePhrase": "退款明细", "resultMode": "detail"},
             ]
         },
         intents=[
@@ -20912,6 +20996,7 @@ def test_compiler_does_not_turn_metric_phrases_into_detail_branches():
                 "metricRef": "order_detail_cnt",
                 "ownerTable": "dwm_trade_order_detail_di",
                 "sourcePhrase": "交易成功订单量",
+                "resultMode": "metric",
                 "groupByColumn": "pt",
             }
         ],
@@ -21399,8 +21484,19 @@ def test_planner_reflection_flags_generic_root_when_recalled_measure_is_more_spe
             PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "ship_timeout_order_cnt_1d", "pt"]),
         ],
         metrics=[
-            PlanningAssetEntry(key="order_detail_cnt", table="dwm_trade_order_detail_di", columns=["sub_order_id"]),
-            PlanningAssetEntry(key="ship_timeout_order_cnt_1d", table="ads_merchant_profile", columns=["ship_timeout_order_cnt_1d"]),
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                source_ref_id="semantic:order:dwm_trade_order_detail_di:metric:order_detail_cnt",
+            ),
+            PlanningAssetEntry(
+                key="ship_timeout_order_cnt_1d",
+                table="ads_merchant_profile",
+                columns=["ship_timeout_order_cnt_1d"],
+                title="发货超时订单量",
+                metadata={"variantOf": "semantic:order:dwm_trade_order_detail_di:metric:order_detail_cnt"},
+            ),
         ],
     )
     plan = QueryPlan(
@@ -21460,14 +21556,22 @@ def test_repair_promotes_recalled_specific_metric_to_primary_root():
             PlanningAssetEntry(table="ads_merchant_profile", columns=["merchant_id", "ship_timeout_order_cnt_1d", "pt"]),
         ],
         metrics=[
-            PlanningAssetEntry(key="order_detail_cnt", table="dwm_trade_order_detail_di", columns=["sub_order_id"]),
+            PlanningAssetEntry(
+                key="order_detail_cnt",
+                table="dwm_trade_order_detail_di",
+                columns=["sub_order_id"],
+                source_ref_id="semantic:order:dwm_trade_order_detail_di:metric:order_detail_cnt",
+            ),
             PlanningAssetEntry(
                 key="ship_timeout_order_cnt_1d",
                 table="ads_merchant_profile",
                 columns=["ship_timeout_order_cnt_1d"],
+                title="发货超时订单量",
                 metadata={
+                    "formula": "SUM(ship_timeout_order_cnt_1d)",
                     "sourceColumns": ["ship_timeout_order_cnt_1d"],
                     "semanticRefId": "semantic:profile:ads_merchant_profile:metric:ship_timeout_order_cnt_1d",
+                    "variantOf": "semantic:order:dwm_trade_order_detail_di:metric:order_detail_cnt",
                 },
             ),
         ],

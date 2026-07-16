@@ -39,6 +39,12 @@ from merchant_ai.services.answer_formatting import (
     identifier_like_column,
 )
 from merchant_ai.services.answer_claims import AnswerClaimVerifier, build_verified_facts
+from merchant_ai.services.evidence import (
+    snapshot_alignment_applicable,
+    snapshot_alignment_disclosures,
+    snapshot_alignment_incomplete,
+    snapshot_time_display,
+)
 from merchant_ai.services.time_semantics import declared_time_column_for_intent
 
 
@@ -47,7 +53,9 @@ TIME_DIMENSION_KEY = "time_dimension"
 
 def answer_context_policy() -> str:
     return (
-        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、analysisDraft、mandatoryAnswerSkeleton；不要读取或推断 QueryGraph。"
+        "AnswerAgent 只读取 VerifiedAnswerContext 中的 question、businessContext、verifiedFacts、dataRows、dataSections、metricDisclosures、evidenceGaps、degradedReasons、freshness、analysisDraft、mandatoryAnswerSkeleton；不要读取或推断 QueryGraph。"
+        "freshness.commonAnchorTimeValue 是本轮可比数据截止日的唯一权威来源；有统一时间锚点时必须披露该截止日。"
+        "freshness.complete=false 或 freshness.aligned=false 时，未完整覆盖统一时间窗口的数据来源不可用，不得将缺失解释为 0。"
         "metricFacts 是本轮必须覆盖的指标事实清单，最终回答必须自然覆盖其中每个指标名称、数值和时间范围；不要遗漏，也不要机械照抄模板。"
         "metricComparisonFacts 是已验证的同指标跨时间窗口对比事实；用户问相比、变化、环比时必须覆盖当前值、对比窗口值和变化方向。"
         "verifiedFacts 是数字、日期、实体和排序结论的唯一事实来源；任何事实陈述都必须能直接绑定其中的 factId，不能补充未出现的数值或业务实体。"
@@ -612,6 +620,11 @@ class AnswerComposeService:
     ) -> str:
         if not skeleton:
             return answer
+        if snapshot_alignment_incomplete(run_result):
+            # An LLM draft may have interpreted an uncovered component as a
+            # business zero.  The deterministic skeleton is generated from the
+            # typed snapshot contract and is the only safe answer in this state.
+            return skeleton
         if not answer:
             return skeleton
         answer = self._ensure_multi_trend_answer_coverage(answer, question, plan, run_result)
@@ -1143,12 +1156,19 @@ class AnswerComposeService:
         run_result: AgentRunResult | None,
         fallback_answer: str = "",
     ) -> str:
+        alignment_incomplete = snapshot_alignment_incomplete(run_result)
+        if alignment_incomplete:
+            answer = incomplete_snapshot_alignment_answer(run_result)
+            fallback_answer = answer
         if run_result is not None:
             run_result.verified_facts = build_verified_facts(plan, run_result)
         guarded = self._apply_answer_guard(answer or fallback_answer, run_result)
-        verification = lightweight_answer_contract_verification(question, plan, run_result, guarded)
+        verification_text = answer_without_snapshot_alignment_disclosures(guarded, run_result)
+        verification = None
+        if not alignment_incomplete:
+            verification = lightweight_answer_contract_verification(question, plan, run_result, verification_text)
         if verification is None:
-            verification = AnswerClaimVerifier().verify(question, plan, run_result, guarded)
+            verification = AnswerClaimVerifier().verify(question, plan, run_result, verification_text)
         if verification is None or verification.passed:
             self._record_lightweight_answer_verification(run_result, verification)
             return guarded
@@ -1162,7 +1182,11 @@ class AnswerComposeService:
             fact_fallback = self._ensure_mandatory_answer_skeleton(
                 fact_fallback, fallback_answer, question, plan, run_result
             )
-        fallback_candidates = [fallback_answer, deterministic_fallback, fact_fallback]
+        fallback_candidates = (
+            [incomplete_snapshot_alignment_answer(run_result)]
+            if alignment_incomplete
+            else [fallback_answer, deterministic_fallback, fact_fallback]
+        )
         seen: set[str] = {guarded}
         last_verification: AnswerClaimVerification | None = None
         for candidate in fallback_candidates:
@@ -1170,9 +1194,12 @@ class AnswerComposeService:
             if not candidate or candidate in seen:
                 continue
             seen.add(candidate)
-            candidate_verification = lightweight_answer_contract_verification(question, plan, run_result, candidate)
+            candidate_text = answer_without_snapshot_alignment_disclosures(candidate, run_result)
+            candidate_verification = None
+            if not alignment_incomplete:
+                candidate_verification = lightweight_answer_contract_verification(question, plan, run_result, candidate_text)
             if candidate_verification is None:
-                candidate_verification = AnswerClaimVerifier().verify(question, plan, run_result, candidate)
+                candidate_verification = AnswerClaimVerifier().verify(question, plan, run_result, candidate_text)
             candidate_verification = candidate_verification.model_copy(
                 update={
                     "fallback_used": True,
@@ -1188,10 +1215,17 @@ class AnswerComposeService:
         # Never return a candidate that the same contract has just rejected.
         # When even the fact-only rendering cannot pass, suppress all numeric
         # claims and preserve the failed verification in the runtime trace.
-        safe_answer = "已拿到查询结果，但回答完整性校验未通过；为避免展示未经校验的数值，请稍后重试。"
-        safe_verification = lightweight_answer_contract_verification(question, plan, run_result, safe_answer)
+        safe_answer = (
+            incomplete_snapshot_alignment_answer(run_result)
+            if alignment_incomplete
+            else "已拿到查询结果，但回答完整性校验未通过；为避免展示未经校验的数值，请稍后重试。"
+        )
+        safe_text = answer_without_snapshot_alignment_disclosures(safe_answer, run_result)
+        safe_verification = None
+        if not alignment_incomplete:
+            safe_verification = lightweight_answer_contract_verification(question, plan, run_result, safe_text)
         if safe_verification is None:
-            safe_verification = AnswerClaimVerifier().verify(question, plan, run_result, safe_answer)
+            safe_verification = AnswerClaimVerifier().verify(question, plan, run_result, safe_text)
         final_verification = safe_verification or last_verification or verification
         final_verification = final_verification.model_copy(
             update={
@@ -2003,6 +2037,7 @@ def metric_display_contract(intent: QuestionIntent, spec: Dict[str, Any] | None 
         "description": ["description"],
         "unit": ["unit"],
         "valueFormat": ["valueFormat", "value_format"],
+        "decimalPlaces": ["decimalPlaces", "decimal_places"],
         "sourceColumnLabels": ["sourceColumnLabels", "source_column_labels"],
         "aggregationPolicy": ["aggregationPolicy", "aggregation_policy"],
         "applicableTimeGrain": ["applicableTimeGrain", "applicable_time_grain"],
@@ -3077,41 +3112,112 @@ def question_requests_diagnosis(question: str) -> bool:
     return bool(re.search(r"(为什么|原因|归因|怎么回事|分析|建议|怎么办|策略|优化|风险|异常)", str(question or "")))
 
 
+def append_snapshot_alignment_disclosures(answer: str, run_result: AgentRunResult | None) -> str:
+    if not answer:
+        return ""
+    disclosures = snapshot_alignment_disclosures(run_result)
+    additions = [item for item in disclosures if item and item not in str(answer or "")]
+    if not additions:
+        return str(answer or "")
+    note = "说明：\n" + "\n".join("- %s" % item for item in additions)
+    return str(answer).rstrip() + "\n\n" + note
+
+
+def incomplete_snapshot_alignment_answer(run_result: AgentRunResult | None) -> str:
+    if not snapshot_alignment_incomplete(run_result):
+        return ""
+    answer = "这题目前不能给出完整结论。未完整覆盖统一时间窗口的数据来源不可用于本轮结论。"
+    return append_snapshot_alignment_disclosures(answer, run_result)
+
+
+def answer_without_snapshot_alignment_disclosures(answer: str, run_result: AgentRunResult | None) -> str:
+    """Remove trusted runtime disclosures before ordinary fact verification.
+
+    The common anchor is an execution-contract fact rather than a value in a
+    query row.  It is generated here, never accepted from model prose, so the
+    row-level claim verifier should not reject that date as an unsupported
+    business claim.
+    """
+
+    disclosures = set(snapshot_alignment_disclosures(run_result))
+    if not disclosures:
+        return str(answer or "")
+    kept: List[str] = []
+    for line in str(answer or "").splitlines():
+        candidate = line.strip()
+        if candidate.startswith("-"):
+            candidate = candidate[1:].strip()
+        if candidate in disclosures:
+            continue
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    if kept and re.fullmatch(r"说明\s*[:：]", kept[-1].strip()):
+        kept.pop()
+    return "\n".join(kept).strip()
+
+
+def snapshot_alignment_prompt_context(run_result: AgentRunResult | None) -> Dict[str, Any]:
+    if not snapshot_alignment_applicable(run_result):
+        return {}
+    alignment = run_result.snapshot_alignment
+    unavailable_source_count = sum(
+        1
+        for source in alignment.sources
+        if not bool(source.compatible) or not bool(source.coverage_complete)
+    )
+    return {
+        "status": str(alignment.status or ""),
+        "strategy": str(alignment.strategy or ""),
+        "aligned": bool(alignment.aligned),
+        "complete": bool(alignment.complete),
+        "commonAnchorTimeValue": snapshot_time_display(alignment.common_anchor_time_value),
+        "disclosureRequired": bool(alignment.disclosure_required or snapshot_alignment_disclosures(run_result)),
+        "unavailableSourceCount": unavailable_source_count,
+    }
+
+
 def deterministic_structured_answer(
     question: str,
     plan: QueryPlan,
     run_result: AgentRunResult | None,
     fallback_rows: List[Dict[str, Any]] | None = None,
 ) -> str:
+    if snapshot_alignment_incomplete(run_result):
+        return incomplete_snapshot_alignment_answer(run_result)
+
+    def finish(value: str) -> str:
+        return append_snapshot_alignment_disclosures(value, run_result)
+
     if not run_result and not fallback_rows:
-        return ""
+        return finish("")
     detail = deterministic_cross_task_detail_answer(question, plan, run_result)
     if detail:
-        return detail
+        return finish(detail)
     if run_result and answer_metric_comparison_facts(question, plan, run_result):
         summary_sentence = summary_metric_sentence(question, plan, run_result)
         if summary_sentence:
-            return summary_sentence + chart_hint_sentence(plan, run_result)
+            return finish(summary_sentence + chart_hint_sentence(plan, run_result))
     ranking = deterministic_ranking_answer(question, plan, run_result)
     if ranking:
-        return ranking
+        return finish(ranking)
     if run_result:
         summary_sentence = summary_metric_sentence(question, plan, run_result)
         if summary_sentence:
-            return summary_sentence + chart_hint_sentence(plan, run_result)
+            return finish(summary_sentence + chart_hint_sentence(plan, run_result))
         trend_sentence = multi_trend_metric_sentence(question, plan, run_result)
         if question_requests_diagnosis(question):
             if trend_sentence:
-                return trend_sentence + chart_hint_sentence(plan, run_result)
-            return ""
+                return finish(trend_sentence + chart_hint_sentence(plan, run_result))
+            return finish("")
         if trend_sentence:
-            return trend_sentence + chart_hint_sentence(plan, run_result)
+            return finish(trend_sentence + chart_hint_sentence(plan, run_result))
         derived_sentence = derived_metric_sentence(question, plan, run_result)
         if derived_sentence:
-            return derived_sentence + chart_hint_sentence(plan, run_result)
+            return finish(derived_sentence + chart_hint_sentence(plan, run_result))
     rows = fallback_rows or (run_result.merged_query_bundle.rows if run_result else [])
     if not rows:
-        return ""
+        return finish("")
     if len(rows) == 1:
         row = rows[0]
         metric_column = primary_answer_metric_column(plan, row)
@@ -3126,19 +3232,22 @@ def deterministic_structured_answer(
             )
             if entity_column:
                 entity_label = friendly_column_label(plan, entity_column)
-                return "%s%s %s 的%s为 %s。" % (
-                    answer_time_prefix(question),
-                    entity_label,
-                    format_cell(row.get(entity_column)),
-                    metric_label,
-                    metric_value,
+                return finish(
+                    "%s%s %s 的%s为 %s。"
+                    % (
+                        answer_time_prefix(question),
+                        entity_label,
+                        format_cell(row.get(entity_column)),
+                        metric_label,
+                        metric_value,
+                    )
                 )
-            return "%s%s为 %s。" % (answer_time_prefix(question), metric_label, metric_value)
-        return single_row_detail_sentence(question, plan, row)
+            return finish("%s%s为 %s。" % (answer_time_prefix(question), metric_label, metric_value))
+        return finish(single_row_detail_sentence(question, plan, row))
     sample = row_sample_sentence(question, plan, rows)
     if sample:
-        return sample
-    return generic_result_overview_sentence(question, plan, rows, run_result)
+        return finish(sample)
+    return finish(generic_result_overview_sentence(question, plan, rows, run_result))
 
 
 def derived_metric_sentence(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
@@ -4513,6 +4622,7 @@ def verified_answer_context(
             question=question,
             business_context=answer_business_context(question, plan, run_result, merchant, personalization_context),
             rule_evidence=compact_rule_evidence(question, rule_context),
+            freshness=snapshot_alignment_prompt_context(run_result),
         )
     verified = run_result.verified_evidence
     facts = build_verified_facts(plan, run_result)
@@ -4532,6 +4642,7 @@ def verified_answer_context(
         verified_passed=bool(verified.passed),
         partial_answer_reason=run_result.partial_answer_reason or verified.partial_answer_reason,
         verified_facts=facts,
+        freshness=snapshot_alignment_prompt_context(run_result),
     )
 
 
@@ -5008,6 +5119,8 @@ def is_internal_answer_line(line: str) -> bool:
 def merchant_facing_gap_note(value: str) -> str:
     text = str(value or "").strip()
     text = re.sub(r"^[A-Z_]+[:：]\s*", "", text)
+    if "统一时间窗口" in text and ("不可用" in text or "未完整覆盖" in text or "未完成" in text):
+        return "部分数据来源未完整覆盖统一时间窗口，相关结果不可用，不能把缺失解释为 0。"
     if "SQL 成功但返回 0 行" in text or "执行成功但返回 0 行" in text:
         return "相关查询返回 0 行，不能直接解释为业务为 0。"
     if "派生指标缺少" in text or "分子/分母" in text:

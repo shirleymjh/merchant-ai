@@ -16,10 +16,21 @@ class EvidenceVerifier:
         memory_constraints: List[Dict[str, Any]] | None = None,
         allowed_knowledge_refs: Set[str] | None = None,
     ) -> VerifiedEvidence:
-        gaps: List[EvidenceGap] = []
+        # Evidence gaps are monotonic across the execution pipeline.  Runtime,
+        # graph validation and node workers may already have produced typed
+        # failures that this verifier cannot reconstruct from result rows.  A
+        # later verification pass may enrich those gaps, but must never erase
+        # them by starting from an empty list.
+        gaps: List[EvidenceGap] = [
+            gap.model_copy(deep=True)
+            for gap in run_result.evidence_gaps or []
+        ]
+        gaps.extend(execution_operational_evidence_gaps(run_result))
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
         gaps.extend(self._metric_spec_gaps(plan, derived_evidence))
+        gaps.extend(snapshot_alignment_evidence_gaps(run_result))
+        gaps.extend(planner_degraded_evidence_gaps(run_result))
         zero_filled_component_tasks, zero_filled_edges = self._zero_filled_derived_components(plan, run_result)
         table_names = set(run_result.merged_query_bundle.tables)
         if plan.evidence_contracts:
@@ -33,6 +44,12 @@ class EvidenceVerifier:
                     continue
                 gaps.append(EvidenceGap(code="MISSING_REQUIRED_EVIDENCE", evidence=evidence, reason="finalRequiredEvidence 未被结果字段或使用表覆盖"))
         required_disclosures = metric_resolution_disclosures(plan)
+        for disclosure in snapshot_alignment_disclosures(run_result):
+            if disclosure not in required_disclosures:
+                required_disclosures.append(disclosure)
+        for disclosure in planner_degraded_disclosures(run_result):
+            if disclosure not in required_disclosures:
+                required_disclosures.append(disclosure)
         gaps.extend(metric_resolution_warning_gaps(plan))
         gaps.extend(memory_constraint_evidence_gaps(question, plan, memory_constraints or []))
         for gap in run_result.evidence_check.gaps:
@@ -82,7 +99,7 @@ class EvidenceVerifier:
                         reason="上游实体超过本轮最大传递数量，dependent 结果可能只覆盖部分实体",
                     )
                 )
-        gaps = [classify_evidence_gap(gap) for gap in gaps]
+        gaps = dedupe_evidence_gaps([classify_evidence_gap(gap) for gap in gaps])
         blocking_gaps = [gap for gap in gaps if gap.severity == "blocking"]
         warning_gaps = [gap for gap in gaps if gap.severity == "warning"]
         partial_reason = "；".join(gap.reason for gap in blocking_gaps[:3])
@@ -642,6 +659,271 @@ def missing_gap_code(contract: Dict[str, Any]) -> str:
     return "MISSING_REQUIRED_COLUMNS"
 
 
+def snapshot_alignment_applicable(run_result: AgentRunResult | None) -> bool:
+    if not run_result:
+        return False
+    alignment = getattr(run_result, "snapshot_alignment", None)
+    if alignment is None:
+        return False
+    status = str(getattr(alignment, "status", "") or "").strip().upper()
+    return bool(
+        getattr(alignment, "sources", None)
+        or getattr(alignment, "strategy", "")
+        or getattr(alignment, "common_anchor_time_value", "")
+        or getattr(alignment, "disclosure_required", False)
+        or status not in {"", "NOT_APPLICABLE"}
+    )
+
+
+def planner_degraded_reasons(run_result: AgentRunResult | None) -> List[Dict[str, Any]]:
+    """Return active planner failures recorded by the runtime.
+
+    Planner availability is operational evidence, not business evidence.  Keep
+    the structured failure attached to the run so a validated deterministic
+    fallback can be disclosed and an unsafe/no fallback can fail closed.
+    """
+
+    if not run_result:
+        return []
+    reasons: List[Dict[str, Any]] = []
+    seen: Set[tuple[str, str]] = set()
+    for raw in run_result.degraded_reasons or []:
+        if not isinstance(raw, dict):
+            continue
+        stage = str(raw.get("stage") or "").strip().lower()
+        code = str(raw.get("code") or "").strip()
+        if stage != "planner" or raw.get("active") is False:
+            continue
+        identity = (code, str(raw.get("reason") or ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        reasons.append(dict(raw))
+    return reasons
+
+
+def execution_operational_evidence_gaps(run_result: AgentRunResult | None) -> List[EvidenceGap]:
+    """Fail closed when execution ended before a task-level result existed."""
+
+    if not run_result or not run_result.merged_query_bundle.failed:
+        return []
+    # Normal task failures are classified with their task id later in verify().
+    # This guard covers worker/bootstrap/fingerprint failures that have no task
+    # record from which the verifier could otherwise reconstruct a gap.
+    if any(item.query_bundle.failed for item in run_result.task_results or []):
+        return []
+    error = str(
+        run_result.merged_query_bundle.error
+        or run_result.merged_query_bundle.summary
+        or "query execution failed before producing task evidence"
+    )
+    return [
+        EvidenceGap(
+            code="EXECUTION_OPERATIONAL_FAILURE",
+            evidence=str(run_result.executed_query_graph_fingerprint or "execution"),
+            reason=error[:500],
+            severity="blocking",
+            disclosure_required=True,
+            source="execution",
+            answer_instruction="说明本轮执行链路失败且没有形成可验证任务结果，不能输出业务结论或把失败解释为 0。",
+            suggested_action="retry_execution_or_answer_with_operational_gap",
+        )
+    ]
+
+
+def planner_degraded_evidence_gaps(run_result: AgentRunResult | None) -> List[EvidenceGap]:
+    gaps: List[EvidenceGap] = []
+    for degraded in planner_degraded_reasons(run_result):
+        fallback_used = bool(degraded.get("fallbackUsed") or degraded.get("fallback_used"))
+        coverage_passed = bool(
+            degraded.get("fallbackCoveragePassed") or degraded.get("fallback_coverage_passed")
+        )
+        safe_fallback = fallback_used and coverage_passed
+        planner_code = str(degraded.get("code") or "PLANNER_OPERATIONAL_FAILURE")
+        reason = str(degraded.get("reason") or planner_code)
+        gaps.append(
+            EvidenceGap(
+                code="PLANNER_DEGRADED_FALLBACK" if safe_fallback else "PLANNER_OPERATIONAL_FAILURE",
+                evidence=planner_code,
+                reason=(
+                    "Planner 服务异常，本轮使用了通过问题覆盖校验的确定性降级规划；业务结果仍需披露该恢复来源"
+                    if safe_fallback
+                    else "Planner 服务异常且没有通过问题覆盖校验的安全规划，不能输出业务结论"
+                ),
+                severity="warning" if safe_fallback else "blocking",
+                disclosure_required=True,
+                source="planner",
+                answer_instruction=(
+                    "说明 Planner 服务异常，本轮由通过覆盖校验的确定性降级规划完成取数；不要表述为正常规划链路。"
+                    if safe_fallback
+                    else "说明 Planner 服务异常且未形成安全可执行规划，不能据此输出业务结论。"
+                ),
+                suggested_action=(
+                    "answer_with_planner_fallback_disclosure"
+                    if safe_fallback
+                    else "retry_planner_or_answer_with_operational_gap"
+                ),
+                details={
+                    "plannerCode": planner_code,
+                    "plannerReason": reason[:500],
+                    "fallbackUsed": fallback_used,
+                    "fallbackCoveragePassed": coverage_passed,
+                    "plannerTrace": list(degraded.get("trace") or [])[:12],
+                },
+            )
+        )
+    return gaps
+
+
+def planner_degraded_disclosures(run_result: AgentRunResult | None) -> List[str]:
+    disclosures: List[str] = []
+    for degraded in planner_degraded_reasons(run_result):
+        fallback_used = bool(degraded.get("fallbackUsed") or degraded.get("fallback_used"))
+        coverage_passed = bool(
+            degraded.get("fallbackCoveragePassed") or degraded.get("fallback_coverage_passed")
+        )
+        text = (
+            "本轮 Planner 服务异常，取数计划来自通过问题覆盖校验的确定性降级规划。"
+            if fallback_used and coverage_passed
+            else "本轮 Planner 服务异常，未形成通过问题覆盖校验的安全取数计划。"
+        )
+        if text not in disclosures:
+            disclosures.append(text)
+    return disclosures
+
+
+def snapshot_alignment_incomplete(run_result: AgentRunResult | None) -> bool:
+    if not snapshot_alignment_applicable(run_result):
+        return False
+    alignment = run_result.snapshot_alignment
+    return not bool(alignment.aligned and alignment.complete)
+
+
+def snapshot_alignment_evidence_gaps(run_result: AgentRunResult | None) -> List[EvidenceGap]:
+    """Turn runtime snapshot coverage into answer-blocking evidence contracts.
+
+    A missing component row is not evidence of a business zero.  The executor's
+    typed snapshot contract is the authority for whether sources cover the same
+    physical window; the verifier must therefore fail closed whenever that
+    contract is incomplete.
+    """
+
+    if not snapshot_alignment_incomplete(run_result):
+        return []
+    alignment = run_result.snapshot_alignment
+    gaps: List[EvidenceGap] = []
+    common_details = {
+        "snapshotStatus": str(alignment.status or ""),
+        "strategy": str(alignment.strategy or ""),
+        "commonAnchorTimeValue": str(alignment.common_anchor_time_value or ""),
+        "aligned": bool(alignment.aligned),
+        "complete": bool(alignment.complete),
+    }
+    uncovered_sources = [
+        source
+        for source in alignment.sources
+        if not bool(source.compatible) or not bool(source.coverage_complete)
+    ]
+    for source in uncovered_sources:
+        compatible = bool(source.compatible)
+        code = "SNAPSHOT_SOURCE_COVERAGE_INCOMPLETE" if compatible else "SNAPSHOT_SOURCE_UNAVAILABLE"
+        reason = (
+            "数据来源未完整覆盖本轮统一时间窗口，相关结果不可用于完整结论，且不能把缺失解释为 0"
+            if compatible
+            else "数据来源未能绑定到本轮统一时间窗口，相关结果不可用，且不能把缺失解释为 0"
+        )
+        expected_range = snapshot_source_expected_range(source)
+        details = {
+            **common_details,
+            "taskId": str(source.task_id or ""),
+            "table": str(source.table or ""),
+            "sourceStatus": str(source.status or ""),
+            "sourceMinTimeValue": str(source.source_min_time_value or ""),
+            "sourceMaxTimeValue": str(source.source_max_time_value or ""),
+            "effectiveStartTimeValue": str(source.effective_start_time_value or ""),
+            "effectiveEndTimeValue": str(source.effective_end_time_value or ""),
+            "executionStartValue": str(source.execution_start_value or ""),
+            "executionEndValue": str(source.execution_end_value or ""),
+            "compatible": compatible,
+            "coverageComplete": bool(source.coverage_complete),
+            "sourceReason": str(source.reason or ""),
+        }
+        gaps.append(
+            EvidenceGap(
+                code=code,
+                task_id=str(source.task_id or ""),
+                evidence=str(source.table or source.task_id or "snapshot_source"),
+                reason=reason,
+                severity="blocking",
+                disclosure_required=True,
+                source="freshness",
+                answer_instruction="说明该数据来源未完整覆盖统一时间窗口，相关结果不可用，不能把缺失解释为 0。",
+                suggested_action="align_source_windows_or_answer_with_gap",
+                missing_time_range=expected_range,
+                details={key: value for key, value in details.items() if value not in ("", None, [], {})},
+            )
+        )
+    if not alignment.aligned or not gaps:
+        gaps.insert(
+            0,
+            EvidenceGap(
+                code="SNAPSHOT_ALIGNMENT_INCOMPLETE",
+                evidence="snapshot_alignment",
+                reason="本轮所需数据来源未完成统一时间对齐，不能进行完整比较，且不能把未覆盖区间解释为 0",
+                severity="blocking",
+                disclosure_required=True,
+                source="freshness",
+                answer_instruction="说明本轮数据来源未完成统一时间对齐，未对齐结果不可用，不能把缺失解释为 0。",
+                suggested_action="align_source_windows_or_answer_with_gap",
+                missing_time_range=snapshot_time_display(alignment.common_anchor_time_value),
+                details={key: value for key, value in common_details.items() if value not in ("", None, [], {})},
+            ),
+        )
+    return gaps
+
+
+def snapshot_alignment_disclosures(run_result: AgentRunResult | None) -> List[str]:
+    if not snapshot_alignment_applicable(run_result):
+        return []
+    alignment = run_result.snapshot_alignment
+    anchor = snapshot_time_display(alignment.common_anchor_time_value)
+    disclosures: List[str] = []
+    if anchor:
+        disclosures.append("本轮可比数据已统一到同一时间口径，数据截至 %s。" % anchor)
+    if snapshot_alignment_incomplete(run_result):
+        unavailable_count = sum(
+            1
+            for source in alignment.sources
+            if not bool(source.compatible) or not bool(source.coverage_complete)
+        )
+        if unavailable_count:
+            disclosures.append(
+                "有 %d 个数据来源未完整覆盖统一时间窗口，相关结果不可用，不能把缺失解释为 0。"
+                % unavailable_count
+            )
+        else:
+            disclosures.append("本轮数据来源未完成统一时间对齐，未对齐结果不可用，不能把缺失解释为 0。")
+    return disclosures
+
+
+def snapshot_source_expected_range(source: Any) -> str:
+    start = str(source.effective_start_time_value or source.execution_start_value or "").strip()
+    end = str(source.effective_end_time_value or source.execution_end_value or "").strip()
+    if start and end:
+        return "%s..%s" % (start, end)
+    return start or end
+
+
+def snapshot_time_display(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        return "%s-%s-%s" % (text[:4], text[4:6], text[6:8])
+    match = re.match(r"(\d{4}-\d{1,2}-\d{1,2})", text)
+    if match:
+        return match.group(1)
+    return text[:40]
+
+
 def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
     warning_codes = {
         "FIELD_AMBIGUOUS",
@@ -651,7 +933,8 @@ def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
         "MEMORY_METRIC_DISPUTE_REQUIRES_CLARIFICATION",
     }
     info_codes: Set[str] = set()
-    severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"
+    default_severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"
+    severity = normalize_evidence_severity(gap.severity, default_severity)
     instruction = gap.answer_instruction or answer_instruction_for_gap(gap)
     details = dict(gap.details or {})
     details.setdefault("gapCode", gap.gap_code or gap.code)
@@ -661,7 +944,7 @@ def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
         update={
             "gap_code": gap.gap_code or gap.code,
             "source_node_id": gap.source_node_id or gap.task_id,
-            "severity": gap.severity or severity,
+            "severity": severity,
             "disclosure_required": gap.disclosure_required or severity in {"blocking", "warning"},
             "source": gap.source or evidence_gap_source(gap.code),
             "answer_instruction": instruction,
@@ -674,7 +957,49 @@ def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
     )
 
 
+def normalize_evidence_severity(value: Any, default: str = "blocking") -> str:
+    """Map producer vocabularies onto the verifier's closed severity set."""
+
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"fatal", "critical", "error", "block", "blocked", "blocking"}:
+        return "blocking"
+    if normalized in {"warn", "warning", "degraded", "partial"}:
+        return "warning"
+    if normalized in {"info", "informational"}:
+        return "info"
+    # An unknown producer severity must not create a new fail-open state.
+    return "blocking"
+
+
+def dedupe_evidence_gaps(gaps: List[EvidenceGap]) -> List[EvidenceGap]:
+    """Deduplicate retries without weakening the strongest gap contract."""
+
+    deduped: List[EvidenceGap] = []
+    positions: Dict[tuple[str, str, str, str], int] = {}
+    severity_rank = {"": 0, "info": 1, "warning": 2, "blocking": 3}
+    for gap in gaps:
+        identity = (
+            str(gap.gap_code or gap.code or ""),
+            str(gap.source_node_id or gap.task_id or ""),
+            str(gap.evidence or ""),
+            str(gap.reason or ""),
+        )
+        position = positions.get(identity)
+        if position is None:
+            positions[identity] = len(deduped)
+            deduped.append(gap)
+            continue
+        current = deduped[position]
+        if severity_rank.get(str(gap.severity or ""), 0) > severity_rank.get(str(current.severity or ""), 0):
+            deduped[position] = gap
+    return deduped
+
+
 def evidence_gap_source(code: str) -> str:
+    if code.startswith("SNAPSHOT_"):
+        return "freshness"
     if code.startswith("MISSING") or code in {"ZERO_ROWS"}:
         return "contract"
     if code.startswith("UPSTREAM") or code in {"JOIN_KEY_NOT_PRODUCED", "DEPENDENCY_GAP"}:
@@ -689,6 +1014,8 @@ def evidence_gap_source(code: str) -> str:
 
 
 def answer_instruction_for_gap(gap: EvidenceGap) -> str:
+    if gap.code.startswith("SNAPSHOT_"):
+        return "说明本轮数据来源未完整覆盖统一时间窗口，相关结果不可用，不能把缺失解释为 0。"
     if gap.code == "FIELD_AMBIGUOUS":
         return "说明该字段或指标口径未完全确认，不能把候选值表述为已确认事实。"
     if gap.code == "ZERO_ROWS":
@@ -709,6 +1036,8 @@ def answer_instruction_for_gap(gap: EvidenceGap) -> str:
 
 
 def suggested_action_for_gap(gap: EvidenceGap) -> str:
+    if gap.code.startswith("SNAPSHOT_"):
+        return "align_source_windows_or_answer_with_gap"
     if gap.code in {"ZERO_ROWS"}:
         return "answer_with_zero_rows_disclosure"
     if gap.code in {"SQL_EXECUTION_FAILED", "UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "TIMEOUT"}:

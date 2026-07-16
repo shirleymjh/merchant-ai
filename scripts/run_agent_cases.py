@@ -93,6 +93,7 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
                     "traceReplay": harness_debug.get("traceReplay", {}),
                 },
                 "plannerReflection": debug.get("plannerReflection", {}),
+                "questionUnderstanding": debug.get("questionUnderstanding", {}),
                 "queryGraph": {
                     "intents": debug.get("planIntents", []),
                     "dependencies": debug.get("dependencies", []),
@@ -103,8 +104,16 @@ def run_case_worker(python_backend_path: str, question: str, merchant_id: str, c
                 "executionAttemptArtifacts": execution_attempts,
                 "nodeToolTraces": debug.get("nodeToolTraces", []),
                 "freshnessReports": debug.get("freshnessReports", []),
+                "dataFreshness": (body.get("merchantExperience") or {}).get("dataFreshness", {}),
+                "snapshotAlignment": (
+                    ((body.get("merchantExperience") or {}).get("dataFreshness") or {}).get(
+                        "snapshotAlignment",
+                        {},
+                    )
+                ),
                 "evidenceGaps": debug.get("evidenceGaps", []),
                 "verifiedEvidence": debug.get("verifiedEvidence", {}),
+                "claimVerification": (debug.get("answerGuard") or {}).get("claimVerification", {}),
                 "partialAnswerReason": debug.get("partialAnswerReason", ""),
                 "performance": harness_debug.get("performance", {}),
                 "traceReplay": harness_debug.get("traceReplay", {}),

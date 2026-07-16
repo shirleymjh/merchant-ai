@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,6 +36,220 @@ def normalize_inclusive_relative_window_sql(sql: str, days: Any) -> str:
     return pattern.sub(lambda match: "DATE_SUB(%s, INTERVAL %d DAY)" % (match.group(1), inclusive_interval), text)
 
 
+@dataclass(frozen=True)
+class SplitDetailSqlChunk:
+    """One required slice of a split detail-query window."""
+
+    index: int
+    offset_start_days: int
+    offset_end_days: int
+    start_date: str
+    end_date: str
+    sql: str
+
+    def contract_payload(self) -> Dict[str, Any]:
+        return {
+            "chunkIndex": self.index,
+            "offsetStartDays": self.offset_start_days,
+            "offsetEndDays": self.offset_end_days,
+            "startDate": self.start_date,
+            "endDate": self.end_date,
+        }
+
+
+@dataclass(frozen=True)
+class SplitDetailSqlPlan:
+    """Bounded execution plan plus the full requested-window obligation."""
+
+    requested_days: int
+    requested_start_date: str
+    requested_end_date: str
+    anchor_date: str
+    chunk_days: int
+    max_chunks: int
+    required_chunk_count: int
+    chunks: Tuple[SplitDetailSqlChunk, ...]
+
+    @property
+    def truncated(self) -> bool:
+        return len(self.chunks) < self.required_chunk_count
+
+    @property
+    def omitted_chunk_count(self) -> int:
+        return max(0, self.required_chunk_count - len(self.chunks))
+
+
+def build_split_detail_sql_plan(
+    sql: str,
+    days: int,
+    chunk_days: int,
+    max_chunks: int,
+    limit: int,
+    time_column: str,
+    anchor_date: str = "",
+) -> Optional[SplitDetailSqlPlan]:
+    """Plan resource-safe SQL chunks without losing the original window size.
+
+    ``max_chunks`` limits scheduled work, not the semantic obligation.  The
+    returned plan therefore keeps ``required_chunk_count`` so callers can fail
+    closed when the cap omits any portion of the requested window.
+    """
+
+    text = str(sql or "").strip()
+    partition_column = normalize_identifier(time_column)
+    if not text or re.search(r"\b(group\s+by|union|join)\b", text, flags=re.I):
+        return None
+    if not partition_column or not sql_references_column(text, partition_column):
+        return None
+    total_days = max(1, int(days or 0))
+    window_days = max(1, int(chunk_days or 1))
+    chunk_cap = max(1, int(max_chunks or 1))
+    capped_limit = max(1, int(limit or 1))
+    required_chunk_count = (total_days + window_days - 1) // window_days
+    scheduled_chunk_count = min(required_chunk_count, chunk_cap)
+    anchor_expr = "CURDATE()"
+    parsed_anchor: Optional[date] = None
+    if anchor_date:
+        escaped_anchor = str(anchor_date).replace("'", "''")
+        anchor_expr = "'%s'" % escaped_anchor
+        try:
+            parsed_anchor = date.fromisoformat(str(anchor_date))
+        except ValueError:
+            parsed_anchor = None
+    requested_start_date = (
+        (parsed_anchor - timedelta(days=total_days - 1)).isoformat()
+        if parsed_anchor
+        else ""
+    )
+    requested_end_date = parsed_anchor.isoformat() if parsed_anchor else str(anchor_date or "")
+    chunks: List[SplitDetailSqlChunk] = []
+    quoted_column = quote_identifier(partition_column)
+    for index in range(scheduled_chunk_count):
+        offset = index * window_days
+        upper = min(total_days, offset + window_days)
+        lower_bound = "%s >= DATE_SUB(%s, INTERVAL %d DAY)" % (
+            quoted_column,
+            anchor_expr,
+            inclusive_day_interval(upper),
+        )
+        if offset <= 0:
+            upper_bound = "%s < DATE_ADD(%s, INTERVAL 1 DAY)" % (quoted_column, anchor_expr)
+        else:
+            upper_bound = "%s < DATE_SUB(%s, INTERVAL %d DAY)" % (
+                quoted_column,
+                anchor_expr,
+                inclusive_day_interval(offset),
+            )
+        chunk_sql = add_sql_where_condition(text, "(%s AND %s)" % (lower_bound, upper_bound))
+        chunk_sql = replace_sql_limit(chunk_sql, capped_limit)
+        chunk_start = (
+            (parsed_anchor - timedelta(days=upper - 1)).isoformat()
+            if parsed_anchor
+            else ""
+        )
+        chunk_end = (
+            (parsed_anchor - timedelta(days=offset)).isoformat()
+            if parsed_anchor
+            else ""
+        )
+        chunks.append(
+            SplitDetailSqlChunk(
+                index=index + 1,
+                offset_start_days=offset,
+                offset_end_days=upper - 1,
+                start_date=chunk_start,
+                end_date=chunk_end,
+                sql=chunk_sql,
+            )
+        )
+    return SplitDetailSqlPlan(
+        requested_days=total_days,
+        requested_start_date=requested_start_date,
+        requested_end_date=requested_end_date,
+        anchor_date=requested_end_date,
+        chunk_days=window_days,
+        max_chunks=chunk_cap,
+        required_chunk_count=required_chunk_count,
+        chunks=tuple(chunks),
+    )
+
+
+def split_window_coverage_contract(
+    plan: SplitDetailSqlPlan,
+    chunk_outcomes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Materialize a generic, auditable coverage contract for split execution."""
+
+    normalized_outcomes: List[Dict[str, Any]] = []
+    seen_indexes = set()
+    for raw in sorted(chunk_outcomes, key=lambda item: int(item.get("chunkIndex") or 0)):
+        index = int(raw.get("chunkIndex") or 0)
+        if index <= 0 or index in seen_indexes:
+            continue
+        seen_indexes.add(index)
+        normalized_outcomes.append(
+            {
+                key: value
+                for key, value in {
+                    "chunkIndex": index,
+                    "status": str(raw.get("status") or "failed"),
+                    "rows": int(raw.get("rows") or 0),
+                    "errorCode": str(raw.get("errorCode") or ""),
+                    "error": str(raw.get("error") or "")[:240],
+                }.items()
+                if value not in ("", None)
+            }
+        )
+    succeeded = [item for item in normalized_outcomes if item.get("status") == "succeeded"]
+    failed = [item for item in normalized_outcomes if item.get("status") != "succeeded"]
+    planned_indexes = {chunk.index for chunk in plan.chunks}
+    executed_indexes = {int(item["chunkIndex"]) for item in normalized_outcomes}
+    unexecuted_indexes = sorted(planned_indexes - executed_indexes)
+    complete = bool(
+        not plan.truncated
+        and not failed
+        and not unexecuted_indexes
+        and len(succeeded) == plan.required_chunk_count
+    )
+    reason_parts: List[str] = []
+    if plan.truncated:
+        reason_parts.append(
+            "maxChunks scheduled %d of %d required chunks"
+            % (len(plan.chunks), plan.required_chunk_count)
+        )
+    if failed:
+        reason_parts.append("%d executed chunks failed" % len(failed))
+    if unexecuted_indexes:
+        reason_parts.append("planned chunks not executed: %s" % ",".join(map(str, unexecuted_indexes)))
+    return {
+        "contractVersion": "split_window_coverage_v1",
+        "code": "" if complete else "SPLIT_WINDOW_COVERAGE_INCOMPLETE",
+        "requestedWindow": {
+            "startDate": plan.requested_start_date,
+            "endDate": plan.requested_end_date,
+            "days": plan.requested_days,
+            "anchorDate": plan.anchor_date,
+        },
+        "chunkDays": plan.chunk_days,
+        "maxChunks": plan.max_chunks,
+        "requiredChunkCount": plan.required_chunk_count,
+        "plannedChunkCount": len(plan.chunks),
+        "plannedChunks": [chunk.contract_payload() for chunk in plan.chunks],
+        "executedChunkCount": len(normalized_outcomes),
+        "executedChunks": normalized_outcomes,
+        "succeededChunkCount": len(succeeded),
+        "succeededChunks": succeeded,
+        "failedChunkCount": len(failed),
+        "failedChunks": failed,
+        "unexecutedChunkIndexes": unexecuted_indexes,
+        "omittedChunkCount": plan.omitted_chunk_count,
+        "truncated": plan.truncated,
+        "complete": complete,
+        "lineageComplete": complete,
+        "reason": "; ".join(reason_parts),
+    }
+
+
 def split_detail_sql_by_time_windows(
     sql: str,
     days: int,
@@ -44,39 +259,16 @@ def split_detail_sql_by_time_windows(
     time_column: str,
     anchor_date: str = "",
 ) -> List[str]:
-    text = str(sql or "").strip()
-    partition_column = normalize_identifier(time_column)
-    if not text or re.search(r"\b(group\s+by|union|join)\b", text, flags=re.I):
-        return []
-    if not partition_column or not sql_references_column(text, partition_column):
-        return []
-    total_days = max(1, int(days or 0))
-    window_days = max(1, int(chunk_days or 1))
-    chunks = max(1, int(max_chunks or 1))
-    capped_limit = max(1, int(limit or 1))
-    result: List[str] = []
-    anchor_expr = "CURDATE()"
-    if anchor_date:
-        anchor_expr = "'%s'" % str(anchor_date).replace("'", "''")
-    for offset in range(0, total_days, window_days):
-        if len(result) >= chunks:
-            break
-        upper = min(total_days, offset + window_days)
-        lower = offset
-        quoted_column = quote_identifier(partition_column)
-        lower_bound = "%s >= DATE_SUB(%s, INTERVAL %d DAY)" % (quoted_column, anchor_expr, inclusive_day_interval(upper))
-        if lower <= 0:
-            upper_bound = "%s < DATE_ADD(%s, INTERVAL 1 DAY)" % (quoted_column, anchor_expr)
-        else:
-            upper_bound = "%s < DATE_SUB(%s, INTERVAL %d DAY)" % (
-                quoted_column,
-                anchor_expr,
-                inclusive_day_interval(lower),
-            )
-        chunk_sql = add_sql_where_condition(text, "(%s AND %s)" % (lower_bound, upper_bound))
-        chunk_sql = replace_sql_limit(chunk_sql, capped_limit)
-        result.append(chunk_sql)
-    return result
+    plan = build_split_detail_sql_plan(
+        sql,
+        days,
+        chunk_days,
+        max_chunks,
+        limit,
+        time_column,
+        anchor_date=anchor_date,
+    )
+    return [chunk.sql for chunk in plan.chunks] if plan else []
 
 
 def add_sql_where_condition(sql: str, condition: str) -> str:

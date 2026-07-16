@@ -19,7 +19,9 @@ from typing import Any, Dict, List, Optional
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.policy import REPAIRABLE_QUERY_GRAPH_GAP_CODES, V2AgentPolicy
 from merchant_ai.graph.query_graph_contract import (
+    graph_validation_attempted,
     graph_validation_failure_reason,
+    graph_validation_passed,
     invalidate_graph_validation,
     mark_graph_validation_stale,
     query_graph_fingerprint,
@@ -74,8 +76,11 @@ from merchant_ai.models import (
     WorkspaceManifest,
     PendingAnswer,
     PlanningAssetPack,
+    PlannerRepairInput,
     PlannerReflectionResult,
+    PlannerRepairRequest,
     QueryBundle,
+    QueryGraphRepairDelta,
     QueryPlan,
     QuestionCategory,
     QuestionIntent,
@@ -178,6 +183,7 @@ from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.distributed_workers import (
     DistributedSubAgentClient,
     builtin_worker_handlers,
+    coerce_handler_outcome,
     normalize_subagent_result,
 )
 from merchant_ai.services.tools import (
@@ -380,6 +386,7 @@ class MerchantQaWorkflow:
             contract_block_observed=False,
             contract_block_generation=0,
             lead_arbitration_observed=False,
+            lead_provider_error="",
             last_action_result=ActionResult(),
             planner_reflection=PlannerReflectionResult(),
             node_tool_traces=[],
@@ -412,6 +419,7 @@ class MerchantQaWorkflow:
             run_steps=[],
             trace_spans=[],
             planner_repair_requests=[],
+            planner_repair_input=PlannerRepairInput(),
             tool_failures=[],
             circuit_breakers=[],
             tool_runtime_policies=[],
@@ -491,6 +499,13 @@ class MerchantQaWorkflow:
             query_graph_plan_attempts=0,
             query_graph_repair_attempts=0,
             query_graph_repair_attempted=False,
+            query_graph_repair_progressed=False,
+            query_graph_repair_scope_attempts={},
+            query_graph_repair_scope_key="",
+            query_graph_repair_scope_attempt_count=0,
+            query_graph_repair_exhausted=False,
+            query_graph_repair_history=[],
+            last_query_graph_repair_delta=QueryGraphRepairDelta(),
             execution_generation=0,
             result_generation=-1,
             evidence_generation=-1,
@@ -663,7 +678,7 @@ class MerchantQaWorkflow:
         return self.policy.can_retrieve_supplemental(state) and not self.policy.knowledge_recall_stalled(state)
 
     def can_repair_graph(self, state: AgentState) -> bool:
-        return int(state.get("query_graph_repair_attempts") or 0) < self.policy.max_graph_repair_actions
+        return self.policy.graph_repair_attempt_count(state) < self.policy.max_graph_repair_actions
 
     def invalidate_execution_outputs(self, state: AgentState, reason: str) -> None:
         state["execution_generation"] = int(state.get("execution_generation") or 0) + 1
@@ -792,6 +807,9 @@ class MerchantQaWorkflow:
         if terminal:
             return terminal
         if self.policy.has_pending_knowledge_requests(state) and self.can_retry_knowledge(state):
+            return "policy"
+        delta = state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()
+        if state.get("query_graph_repair_exhausted") or not getattr(delta, "changed", False):
             return "policy"
         plan = state.get("plan") or QueryPlan()
         if not plan.intents:
@@ -1339,8 +1357,10 @@ class MerchantQaWorkflow:
             and (
                 bool(state.get("pending_knowledge_requests"))
                 or bool(state.get("planner_repair_requests"))
-                or not bool(state.get("query_graph_validated"))
-                or bool(getattr(state.get("query_graph_validation_result"), "gaps", None))
+                or (
+                    graph_validation_attempted(state)
+                    and not graph_validation_passed(state)
+                )
             )
         )
         if mode == "adaptive":
@@ -1372,8 +1392,18 @@ class MerchantQaWorkflow:
             "decisionContext": state.get("lead_decision_context", {}),
             "instruction": self.lead_agent_tool_instruction(is_fast_gate),
         }
-        state["_lead_llm_decision_fingerprint"] = lead_decision_fingerprint(state, allowed)
         lead_llm_started = now_ms()
+        lead_timeout_seconds = max(
+            1,
+            int(
+                getattr(
+                    self.settings,
+                    "llm_lead_timeout_seconds",
+                    getattr(self.settings, "llm_request_timeout_seconds", 12),
+                )
+                or 1
+            ),
+        )
         try:
             if hasattr(llm, "tool_json_chat"):
                 tool = lead_action_selection_tool(allowed)
@@ -1382,7 +1412,7 @@ class MerchantQaWorkflow:
                     json.dumps(payload, ensure_ascii=False, default=str),
                     tool.openai_schema(),
                     {},
-                    timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
+                    timeout_seconds=lead_timeout_seconds,
                 )
                 trace["tool"] = tool.trace_schema()
             else:
@@ -1390,7 +1420,7 @@ class MerchantQaWorkflow:
                     "你是 BI Agent 的受限 LeadAction 选择器，只能在给定 action registry 候选中改选下一步。",
                     json.dumps(payload, ensure_ascii=False, default=str),
                     fallback={},
-                    timeout_seconds=min(8, int(getattr(self.settings, "llm_request_timeout_seconds", 20) or 20)),
+                    timeout_seconds=lead_timeout_seconds,
                 )
         except Exception as exc:
             self.record_span(
@@ -1405,7 +1435,50 @@ class MerchantQaWorkflow:
                 provider=self.settings.openai_base_url,
             )
             trace.update({"status": "failed", "errorCode": "LEAD_LLM_FAILED", "errorMessage": str(exc)[:300]})
-            return self.lead_decision_unavailable(state, decision, allowed, trace, "lead_action_llm_failed")
+            return self.lead_decision_unavailable(
+                state,
+                decision,
+                allowed,
+                trace,
+                "lead_action_llm_failed",
+                error_code="LEAD_LLM_FAILED",
+                error_message=str(exc)[:300],
+            )
+        llm_error = str(getattr(llm, "last_error", "") or "")
+        if not llm_payload:
+            error_code = "LEAD_LLM_TIMEOUT" if "timeout" in llm_error.lower() else "LEAD_LLM_EMPTY_RESPONSE"
+            error_message = llm_error or "provider returned no Lead action tool payload"
+            self.record_span(
+                state,
+                "llm",
+                "lead_action.select",
+                lead_llm_started,
+                status="failed",
+                error_code=error_code,
+                error_message=error_message[:300],
+                model=self.settings.openai_model,
+                provider=self.settings.openai_base_url,
+                estimated_prompt_chars=len(json.dumps(payload, ensure_ascii=False, default=str)),
+                estimated_completion_chars=0,
+            )
+            trace.update(
+                {
+                    "status": "failed",
+                    "reason": "lead_action_llm_timeout" if error_code == "LEAD_LLM_TIMEOUT" else "lead_action_llm_empty_response",
+                    "errorCode": error_code,
+                    "errorMessage": error_message[:300],
+                    "payload": {},
+                }
+            )
+            return self.lead_decision_unavailable(
+                state,
+                decision,
+                allowed,
+                trace,
+                str(trace["reason"]),
+                error_code=error_code,
+                error_message=error_message,
+            )
         self.record_span(
             state,
             "llm",
@@ -1425,7 +1498,16 @@ class MerchantQaWorkflow:
         )
         if selected_action not in allowed:
             trace.update({"status": "ignored", "reason": "llm_selected_action_not_allowed", "payload": llm_payload or {}})
-            return self.lead_decision_unavailable(state, decision, allowed, trace, "lead_action_selection_invalid")
+            return self.lead_decision_unavailable(
+                state,
+                decision,
+                allowed,
+                trace,
+                "llm_selected_action_not_allowed",
+                error_code="LEAD_ACTION_INVALID",
+                error_message="Lead model selected an action outside the governed catalog",
+            )
+        state["_lead_llm_decision_fingerprint"] = lead_decision_fingerprint(state, allowed)
         if selected_action == decision.selected_action:
             llm_reason = str((llm_payload or {}).get("reason") or "")[:300]
             reason = "bounded Lead LLM selected %s from registry. %s" % (selected_action, llm_reason)
@@ -1463,41 +1545,45 @@ class MerchantQaWorkflow:
         allowed: List[str],
         trace: Dict[str, Any],
         reason: str,
+        *,
+        error_code: str = "LEAD_DECISION_UNAVAILABLE",
+        error_message: str = "",
     ) -> AgentDecision:
-        """Fail closed when several business actions need a model decision.
+        """Preserve a safe policy choice or surface an explicit Lead failure.
 
-        Runtime safety gates may deterministically force a single action.  They
-        must not silently turn an ordered candidate list into a business
-        workflow when the Lead model cannot arbitrate it.
+        Provider failures are operational failures, not clarification needs.
+        Runtime may preserve an already-selected governed action, but it never
+        invents a business action outside the filtered catalog.
         """
 
-        selected_action = "answer_data" if "answer_data" in allowed or self.policy.has_task_results(state) else "ask_human"
-        if selected_action == "ask_human":
-            state["human_clarification_required"] = True
-            state["human_clarification_question"] = "主 Agent 暂时无法在多个安全工具之间完成可靠决策，请稍后重试。"
-            state["human_clarification_stage"] = "LEAD_DECISION"
-            state["human_clarification_type"] = "lead_decision_unavailable"
-            state["human_clarification_options"] = []
+        deterministic_action = str(decision.selected_action or "")
+        if deterministic_action in allowed:
+            selected_action = deterministic_action
+            policy_source = "runtime_safe_fallback"
+        else:
+            selected_action = "answer_data"
+            policy_source = "runtime_explicit_failure"
+            state["lead_provider_error"] = error_message or reason
         action = self.policy.registry.get(selected_action)
         available = list(dict.fromkeys([*allowed, selected_action]))
         trace.update(
             {
                 "status": "failed_closed",
                 "reason": reason,
-                "errorCode": "LEAD_DECISION_UNAVAILABLE",
+                "errorCode": error_code,
+                "errorMessage": str(error_message or "")[:300],
                 "selectedAction": selected_action,
-                "policySource": "runtime_fail_closed",
+                "policySource": policy_source,
             }
         )
-        state["planner_provider_error"] = state.get("planner_provider_error") or "LEAD_DECISION_UNAVAILABLE"
         return AgentDecision(
             selected_action=action.id,
             selected_node=action.node,
             available_actions=available,
-            reason="%s; multiple eligible business actions were not ordered by Runtime" % reason,
+            reason="%s; Lead arbitration failed and Runtime applied its explicit safety contract" % reason,
             budget_exhausted=decision.budget_exhausted,
             observation=decision.observation,
-            source="runtime_fail_closed",
+            source=policy_source,
         )
 
     def apply_bounded_lead_llm_decision(self, state: AgentState, decision: AgentDecision) -> AgentDecision:
@@ -1584,6 +1670,17 @@ class MerchantQaWorkflow:
         contract_block = state.get("contract_block_observation") or {}
         if contract_block:
             summary_parts.append("contractBlock=%s" % contract_block.get("blockedAction", "unknown"))
+        repair_delta = state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()
+        if getattr(repair_delta, "attempt", 0):
+            summary_parts.append(
+                "graphRepair=%s(scopeAttempt=%d,changed=%s,exhausted=%s)"
+                % (
+                    repair_delta.status,
+                    repair_delta.scope_attempt,
+                    repair_delta.changed,
+                    repair_delta.exhausted,
+                )
+            )
         last_action = {}
         if state.get("action_history"):
             item = state["action_history"][-1]
@@ -1597,6 +1694,16 @@ class MerchantQaWorkflow:
             "toolRuntimeFailures": state.get("tool_failures", [])[-4:],
             "contractBlockObservation": contract_block,
             "catalogContractBlocks": state.get("action_catalog_contract_blocks", []),
+            "plannerReflection": (
+                state.get("planner_reflection") or PlannerReflectionResult()
+            ).model_dump(by_alias=True),
+            "plannerRepairRequests": [
+                item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                for item in (state.get("planner_repair_requests") or [])
+            ],
+            "queryGraphRepairDelta": (
+                repair_delta.model_dump(by_alias=True) if getattr(repair_delta, "attempt", 0) else {}
+            ),
         }
 
     def build_lead_decision_context(self, state: AgentState, observation: Dict[str, Any]) -> Dict[str, Any]:
@@ -4024,6 +4131,25 @@ class MerchantQaWorkflow:
         state["planner_repair_reason"] = reflection.repair_reason
         state["planner_repair_requests"] = reflection.repair_requests
         state["query_graph_reflected"] = True
+        repair_input = planner_repair_input_from_state(state)
+        scope_attempts = dict(state.get("query_graph_repair_scope_attempts") or {})
+        scope_attempt_count = int(scope_attempts.get(repair_input.scope_key, 0) or 0)
+        state["planner_repair_input"] = repair_input
+        state["query_graph_repair_scope_key"] = repair_input.scope_key
+        state["query_graph_repair_scope_attempt_count"] = scope_attempt_count
+        state["query_graph_repair_exhausted"] = bool(
+            not reflection.passed
+            and scope_attempt_count >= max(0, int(self.policy.max_graph_repair_actions))
+        )
+        if state["query_graph_repair_exhausted"]:
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=False,
+                    gaps=[query_graph_repair_exhaustion_gap(repair_input, scope_attempt_count)],
+                ),
+            )
         reflection_requests = list(reflection.suggested_knowledge_requests or [])
         for repair_request in reflection.repair_requests or []:
             reflection_requests.extend(repair_request.knowledge_requests or [])
@@ -4123,47 +4249,176 @@ class MerchantQaWorkflow:
         started = now_ms()
         step = self.start_run_step(state, "repair_graph", "PlannerAgent", "REPAIR_QUERY_GRAPH", reason=state.get("planner_repair_reason", ""))
         increment_round(state)
-        state["query_graph_repair_attempts"] = int(state.get("query_graph_repair_attempts") or 0) + 1
+        repair_input = planner_repair_input_from_state(state)
+        state["planner_repair_input"] = repair_input
+        scope_attempts = dict(state.get("query_graph_repair_scope_attempts") or {})
+        prior_scope_attempts = int(scope_attempts.get(repair_input.scope_key, 0) or 0)
+        max_scope_attempts = max(0, int(self.policy.max_graph_repair_actions))
+        state["query_graph_repair_scope_key"] = repair_input.scope_key
+        state["query_graph_repair_scope_attempt_count"] = prior_scope_attempts
+        state["query_graph_repair_exhausted"] = prior_scope_attempts >= max_scope_attempts
+        state["query_graph_repair_attempted"] = False
+        state["query_graph_repair_progressed"] = False
+        emit(
+            state,
+            "node.started",
+            "REPAIR_QUERY_GRAPH",
+            {
+                "scopeKey": repair_input.scope_key,
+                "scopeAttempt": prior_scope_attempts + 1,
+                "beforeGraphFingerprint": repair_input.graph_fingerprint,
+                "reflection": repair_input.reflection.model_dump(by_alias=True),
+                "repairRequests": [item.model_dump(by_alias=True) for item in repair_input.repair_requests],
+            },
+        )
+        if prior_scope_attempts >= max_scope_attempts:
+            gap = query_graph_repair_exhaustion_gap(repair_input, prior_scope_attempts)
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    repairable=False,
+                    gaps=[
+                        gap,
+                        *[
+                            item
+                            for item in repair_input.validation_gaps
+                            if item.code != "QUERY_GRAPH_REPAIR_EXHAUSTED"
+                        ],
+                    ],
+                ),
+            )
+            add_step(state, "Main Agent Tool repair_query_graph：相同 QueryGraph 与问题集合的修复预算已耗尽")
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="scopeAttempt=%d exhausted=true" % prior_scope_attempts,
+                error_code="QUERY_GRAPH_REPAIR_EXHAUSTED",
+            )
+            emit(
+                state,
+                "node.completed",
+                "REPAIR_QUERY_GRAPH",
+                {
+                    "scopeKey": repair_input.scope_key,
+                    "scopeAttempt": prior_scope_attempts,
+                    "changed": False,
+                    "exhausted": True,
+                    "errorCode": "QUERY_GRAPH_REPAIR_EXHAUSTED",
+                },
+            )
+            return state
+
+        total_attempt = int(state.get("query_graph_repair_attempts") or 0) + 1
+        scope_attempt = prior_scope_attempts + 1
+        scope_attempts[repair_input.scope_key] = scope_attempt
+        state["query_graph_repair_attempts"] = total_attempt
         state["query_graph_repair_attempted"] = True
-        emit(state, "node.started", "REPAIR_QUERY_GRAPH", {})
-        before_nodes = len(state["plan"].intents)
-        repair_reason = state.get("planner_repair_reason", "")
-        repair_requests = list(state.get("planner_repair_requests", []))
-        state["plan"] = self.planner.repair(
+        state["query_graph_repair_scope_attempts"] = scope_attempts
+        state["query_graph_repair_scope_attempt_count"] = scope_attempt
+        before_plan = (state.get("plan") or QueryPlan()).model_copy(deep=True)
+        before_nodes = len(before_plan.intents)
+        repaired_plan = self.planner.repair(
             state["question"],
-            state["plan"],
+            before_plan.model_copy(deep=True),
             state["planning_asset_pack"],
-            state["query_graph_validation_result"].gaps,
+            [item.model_copy(deep=True) for item in repair_input.repair_gaps],
             state.get("history_rows", []),
             knowledge_context(state),
             state["recall_bundle"],
         )
-        self.materialize_plan_clarification(state)
-        if state["plan"].knowledge_requests:
+        if isinstance(repaired_plan, dict):
+            try:
+                repaired_plan = QueryPlan.model_validate(repaired_plan)
+            except Exception:
+                repaired_plan = before_plan.model_copy(deep=True)
+        if not isinstance(repaired_plan, QueryPlan):
+            repaired_plan = before_plan.model_copy(deep=True)
+        after_fingerprint = query_graph_fingerprint(repaired_plan)
+        changed = after_fingerprint != repair_input.graph_fingerprint
+        exhausted = bool(not changed and scope_attempt >= max_scope_attempts)
+        delta = QueryGraphRepairDelta(
+            attempt=total_attempt,
+            scope_attempt=scope_attempt,
+            scope_key=repair_input.scope_key,
+            status="success" if changed else "no_progress",
+            changed=changed,
+            exhausted=exhausted,
+            before_graph_fingerprint=repair_input.graph_fingerprint,
+            after_graph_fingerprint=after_fingerprint,
+            before_nodes=before_nodes,
+            after_nodes=len(repaired_plan.intents),
+            repair_reason=str(state.get("planner_repair_reason") or repair_input.reflection.repair_reason or ""),
+            reflection=repair_input.reflection.model_copy(deep=True),
+            repair_requests=[item.model_copy(deep=True) for item in repair_input.repair_requests],
+            repair_gaps=[item.model_copy(deep=True) for item in repair_input.repair_gaps],
+        )
+        state["last_query_graph_repair_delta"] = delta
+        state.setdefault("query_graph_repair_history", []).append(delta.model_copy(deep=True))
+        state["query_graph_repair_history"] = state["query_graph_repair_history"][-32:]
+        state["query_graph_repair_exhausted"] = exhausted
+
+        if changed:
+            state["plan"] = repaired_plan
+            state["query_graph_repair_progressed"] = True
+            self.materialize_plan_clarification(state)
+        else:
+            # The repairer may append traces in place.  A trace-only mutation is
+            # not an executable graph repair, so retain the exact input graph.
+            state["plan"] = before_plan
+            state["last_action_result"] = ActionResult(
+                action="repair_graph",
+                node="repair_query_graph",
+                status="no_progress",
+                message="repair produced the same executable QueryGraph fingerprint",
+                retryable=not exhausted,
+            )
+
+        if changed and state["plan"].knowledge_requests:
             state["pending_knowledge_requests"] = filter_blocked_knowledge_requests(
                 state,
                 dedupe_workflow_knowledge_requests(
                     list(state.get("pending_knowledge_requests") or []) + list(state["plan"].knowledge_requests or [])
                 ),
             )
-        invalidate_graph_validation(state)
-        state["query_graph_reflected"] = False
-        state["planner_reflection"] = PlannerReflectionResult()
-        state["planner_repair_reason"] = ""
-        state["planner_repair_requests"] = []
-        self.invalidate_execution_outputs(state, "QueryGraph 修复后需要重新执行")
-        add_step(state, "Main Agent Tool repair_query_graph：完成 QueryGraph 修复尝试")
-        repair_artifact = Path(state["thread_data"].outputs_path) / "artifacts" / "planner" / ("repair_attempt_%d.json" % state["query_graph_repair_attempts"])
+        if changed:
+            invalidate_graph_validation(state)
+            state["query_graph_reflected"] = False
+            state["planner_reflection"] = PlannerReflectionResult()
+            state["planner_repair_reason"] = ""
+            state["planner_repair_requests"] = []
+            self.invalidate_execution_outputs(state, "QueryGraph 修复后需要重新执行")
+            add_step(state, "Main Agent Tool repair_query_graph：QueryGraph 可执行结构已改变")
+        else:
+            state["query_graph_reflected"] = True
+            add_step(
+                state,
+                "Main Agent Tool repair_query_graph：QueryGraph 指纹未变化，保留 PlannerCritic 问题与修复请求",
+            )
+            if exhausted:
+                exhaustion_gap = query_graph_repair_exhaustion_gap(repair_input, scope_attempt)
+                retained_gaps = [
+                    item.model_copy(deep=True)
+                    for item in repair_input.validation_gaps
+                    if item.code != "QUERY_GRAPH_REPAIR_EXHAUSTED"
+                ]
+                record_graph_validation(
+                    state,
+                    GraphValidationResult(
+                        valid=False,
+                        repairable=False,
+                        gaps=[exhaustion_gap, *retained_gaps],
+                    ),
+                )
+        repair_artifact = Path(state["thread_data"].outputs_path) / "artifacts" / "planner" / ("repair_attempt_%d.json" % total_attempt)
         try:
             self.planner.artifact_store.write_json(
                 "planner",
-                "repair_attempt_%d.json" % state["query_graph_repair_attempts"],
+                "repair_attempt_%d.json" % total_attempt,
                 {
-                    "attempt": state["query_graph_repair_attempts"],
-                    "repairReason": repair_reason,
-                    "repairRequests": [item.model_dump(by_alias=True) for item in repair_requests],
-                    "beforeNodes": before_nodes,
-                    "afterNodes": len(state["plan"].intents),
+                    "repairInput": repair_input.model_dump(by_alias=True),
+                    "repairDelta": delta.model_dump(by_alias=True),
                     "plan": state["plan"].model_dump(by_alias=True),
                 },
                 preview_chars=0,
@@ -4175,22 +4430,44 @@ class MerchantQaWorkflow:
             "planner_repair",
             "repair_query_graph",
             started,
+            status="success" if changed else "failed",
+            error_code="" if changed else ("QUERY_GRAPH_REPAIR_EXHAUSTED" if exhausted else "QUERY_GRAPH_REPAIR_NO_PROGRESS"),
             metadata={
-                "repairReason": repair_reason,
-                "repairRequests": [item.model_dump(by_alias=True) for item in repair_requests],
-                "beforeNodes": before_nodes,
-                "afterNodes": len(state["plan"].intents),
-                "attempt": state["query_graph_repair_attempts"],
+                "repairInput": repair_input.model_dump(by_alias=True),
+                "repairDelta": delta.model_dump(by_alias=True),
             },
         )
         self.finish_run_step(
             state,
             step,
-            "success",
-            output_summary="beforeNodes=%d afterNodes=%d" % (before_nodes, len(state["plan"].intents)),
+            "success" if changed else "gap",
+            output_summary="changed=%s scopeAttempt=%d before=%s after=%s"
+            % (
+                changed,
+                scope_attempt,
+                repair_input.graph_fingerprint,
+                after_fingerprint,
+            ),
+            error_code="" if changed else ("QUERY_GRAPH_REPAIR_EXHAUSTED" if exhausted else "QUERY_GRAPH_REPAIR_NO_PROGRESS"),
             artifact_paths=[str(repair_artifact)],
         )
-        emit(state, "node.completed", "REPAIR_QUERY_GRAPH", {"attempt": state["query_graph_repair_attempts"]})
+        emit(
+            state,
+            "node.completed",
+            "REPAIR_QUERY_GRAPH",
+            {
+                "attempt": total_attempt,
+                "scopeAttempt": scope_attempt,
+                "scopeKey": repair_input.scope_key,
+                "changed": changed,
+                "exhausted": exhausted,
+                "beforeGraphFingerprint": repair_input.graph_fingerprint,
+                "afterGraphFingerprint": after_fingerprint,
+                "reflection": repair_input.reflection.model_dump(by_alias=True),
+                "repairRequests": [item.model_dump(by_alias=True) for item in repair_input.repair_requests],
+                "repairDelta": delta.model_dump(by_alias=True),
+            },
+        )
         return state
 
     def execute_query_graph_direct(self, state: AgentState) -> AgentState:
@@ -4275,6 +4552,7 @@ class MerchantQaWorkflow:
                 partial_answer_reason=validation_failure,
                 reflection_notes=["NodeAgent skipped because the current graph has no matching passed validation"],
             )
+            append_active_planner_degraded_reason(state, run_result)
             archive_execution_attempt(state, run_result, "query_graph_validation_rejection")
             state["agent_run_result"] = run_result
             state["query_bundle"] = run_result.merged_query_bundle
@@ -4360,6 +4638,7 @@ class MerchantQaWorkflow:
                 merged_query_bundle=QueryBundle(failed=True, error=str(exc), summary="NodeWorker 执行失败"),
                 reflection_notes=["NodeWorker 执行失败: %s" % str(exc)[:200]],
             )
+        append_active_planner_degraded_reason(state, run_result)
         archive_execution_attempt(state, run_result, "query_graph_execution")
         state["agent_run_result"] = run_result
         state["query_bundle"] = run_result.merged_query_bundle
@@ -4484,6 +4763,7 @@ class MerchantQaWorkflow:
         started = now_ms()
         step = self.start_run_step(state, "verify_evidence", "EvidenceVerifierAgent", "VERIFY_EVIDENCE_GRAPH", input_summary="tasks=%d" % len(state["agent_run_result"].task_results))
         increment_round(state)
+        append_subagent_outcomes_to_run_result(state, state["agent_run_result"])
         verified = self.evidence_verifier.verify(
             state["question"],
             state["plan"],
@@ -4673,23 +4953,35 @@ class MerchantQaWorkflow:
         state["subagent_delegation_results"] = results
         state["subagent_delegation_completed"] = True
         completed = [item for item in results if item.get("status") == "completed"]
+        partial = [item for item in results if item.get("status") == "partial"]
+        failed = [item for item in results if item.get("status") not in {"completed", "partial"}]
         analysis_summary_task_kinds = {"document_analysis", "analysis_worker", "analysis_skill", "hypothesis_review"}
-        summaries = [
-            str(item.get("summary") or "").strip()
-            for item in completed
-            if str(item.get("taskKind") or item.get("task_kind") or "") in analysis_summary_task_kinds
-            and str(item.get("summary") or "").strip()
-        ]
+        summaries: List[str] = []
+        for item in [*completed, *partial]:
+            task_kind = str(item.get("taskKind") or item.get("task_kind") or "")
+            summary = str(item.get("summary") or "").strip()
+            if task_kind not in analysis_summary_task_kinds or not summary:
+                continue
+            if item.get("status") == "partial":
+                codes = [
+                    str(gap.get("code") or "")
+                    for gap in item.get("gaps") or []
+                    if isinstance(gap, dict) and str(gap.get("code") or "")
+                ]
+                summary = "[partial%s] %s" % (":" + ",".join(codes[:3]) if codes else "", summary)
+            summaries.append(summary)
         if summaries:
             delegated_summary = "\n".join("- %s" % text for text in summaries)
             prior = str(state.get("analysis_summary") or "").strip()
             state["analysis_summary"] = "\n".join(item for item in (prior, "Sub-Agent 结果：\n%s" % delegated_summary) if item)
             state["analysis_generation"] = int(state.get("execution_generation") or 0)
+        append_subagent_outcomes_to_run_result(state, state.get("agent_run_result") or AgentRunResult())
         observations = list(state.get("main_agent_observations") or [])
         observations.append(
             {
                 "stage": "delegate_subagent",
-                "summary": "%d/%d Sub-Agent tasks completed" % (len(completed), len(results)),
+                "summary": "%d/%d Sub-Agent tasks completed; partial=%d failed=%d"
+                % (len(completed), len(results), len(partial), len(failed)),
                 "plan": plan.model_dump(by_alias=True),
                 "results": results,
             }
@@ -4715,7 +5007,15 @@ class MerchantQaWorkflow:
             state,
             "node.completed",
             "DELEGATE_SUBAGENT",
-            {"completed": True, "taskCount": len(results), "successCount": len(completed), "parallel": plan.parallel},
+            {
+                "completed": True,
+                "status": status,
+                "taskCount": len(results),
+                "successCount": len(completed),
+                "partialCount": len(partial),
+                "failedCount": len(failed),
+                "parallel": plan.parallel,
+            },
         )
         return state
 
@@ -4847,8 +5147,13 @@ class MerchantQaWorkflow:
                     contract = normalize_subagent_result(task.task_kind, "failed", {}, "unsupported task kind")
                 else:
                     try:
-                        payload = handler(request, lambda: bool(state.get("run_canceled")))
-                        contract = normalize_subagent_result(task.task_kind, "completed", payload)
+                        outcome = coerce_handler_outcome(handler(request, lambda: bool(state.get("run_canceled"))))
+                        contract = normalize_subagent_result(
+                            task.task_kind,
+                            outcome.status,
+                            outcome.payload,
+                            outcome.error,
+                        )
                     except Exception as exc:
                         contract = normalize_subagent_result(task.task_kind, "failed", {}, "%s: %s" % (type(exc).__name__, str(exc)))
             if contract.get("status") == "completed" or not contract.get("retryable") or attempt + 1 >= attempts:
@@ -6117,6 +6422,12 @@ class MerchantQaWorkflow:
                 "plannerReflection": state.get("planner_reflection", PlannerReflectionResult()).model_dump(by_alias=True),
                 "plannerRepairReason": state.get("planner_repair_reason", ""),
                 "plannerRepairRequests": [item.model_dump(by_alias=True) for item in state.get("planner_repair_requests", [])],
+                "plannerRepairInput": (state.get("planner_repair_input") or PlannerRepairInput()).model_dump(by_alias=True),
+                "queryGraphRepairDelta": (state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()).model_dump(by_alias=True),
+                "queryGraphRepairHistory": [
+                    item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                    for item in state.get("query_graph_repair_history", [])
+                ],
                 "questionUnderstanding": state["plan"].question_understanding,
                 "compilerTrace": state["plan"].compiler_trace,
                 "plannerToolCalls": state["plan"].planner_tool_calls,
@@ -6153,6 +6464,7 @@ class MerchantQaWorkflow:
             return
 
     def to_response(self, state: AgentState) -> ChatResponse:
+        append_subagent_outcomes_to_run_result(state, state["agent_run_result"])
         execution_attempts = normalized_execution_attempt_artifacts(state)
         state["execution_attempt_artifacts"] = execution_attempts
         state["agent_run_result"].execution_attempt_artifacts = [
@@ -6195,6 +6507,8 @@ class MerchantQaWorkflow:
                     for item in state.get("lead_decisions", [])
                 ],
                 "capabilityDecisions": state.get("capability_decisions", {}),
+                "degradedReasons": list(state["agent_run_result"].degraded_reasons or []),
+                "evidenceGaps": [item.model_dump(by_alias=True) for item in state["agent_run_result"].evidence_gaps],
             }
             return response
         sections = self.answer_service.build_sections(state["plan"], state["agent_run_result"])
@@ -6366,6 +6680,12 @@ class MerchantQaWorkflow:
                 "plannerReflection": state.get("planner_reflection", PlannerReflectionResult()).model_dump(by_alias=True),
                 "plannerRepairReason": state.get("planner_repair_reason", ""),
                 "plannerRepairRequests": [item.model_dump(by_alias=True) for item in state.get("planner_repair_requests", [])],
+                "plannerRepairInput": (state.get("planner_repair_input") or PlannerRepairInput()).model_dump(by_alias=True),
+                "queryGraphRepairDelta": (state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()).model_dump(by_alias=True),
+                "queryGraphRepairHistory": [
+                    item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+                    for item in state.get("query_graph_repair_history", [])
+                ],
                 "questionUnderstanding": state["plan"].question_understanding,
                 "compilerTrace": state["plan"].compiler_trace,
                 "plannerToolCalls": state["plan"].planner_tool_calls,
@@ -6404,6 +6724,7 @@ class MerchantQaWorkflow:
                 "taskResults": [item.model_dump(by_alias=True) for item in state["agent_run_result"].task_results],
                 "executionAttemptArtifacts": [item.model_dump(by_alias=True) for item in execution_attempts],
                 "evidenceGaps": [item.model_dump(by_alias=True) for item in state["agent_run_result"].evidence_gaps],
+                "degradedReasons": list(state["agent_run_result"].degraded_reasons or []),
                 "sqlRepairs": [item.model_dump(by_alias=True) for item in state["agent_run_result"].sql_repairs],
                 "verifiedEvidence": state["agent_run_result"].verified_evidence.model_dump(by_alias=True),
                 "partialAnswerReason": state["agent_run_result"].partial_answer_reason,
@@ -6499,12 +6820,23 @@ class MerchantQaWorkflow:
     def data_freshness_for_response(self, state: AgentState, sections: List[Any]) -> Dict[str, Any]:
         reports = state.get("freshness_reports") or []
         report_payloads = [item.model_dump(by_alias=True) for item in reports[:12]]
+        run_result = state.get("agent_run_result") or AgentRunResult()
+        alignment = run_result.snapshot_alignment
+        alignment_applicable = bool(
+            alignment.sources
+            or alignment.common_anchor_time_value
+            or alignment.disclosure_required
+            or str(alignment.status or "").upper() not in {"", "NOT_APPLICABLE"}
+        )
+        alignment_incomplete = bool(alignment_applicable and not (alignment.aligned and alignment.complete))
         report_statuses = {str(item.get("status") or "").upper() for item in report_payloads}
         gap_codes = {
             str(gap.gap_code or gap.code or "").upper()
-            for gap in (state.get("agent_run_result") or AgentRunResult()).evidence_gaps
+            for gap in run_result.evidence_gaps
         }
-        degraded = any(code in gap_codes for code in {"ZERO_ROWS", "PARTIAL_EVIDENCE", "RESOURCE_DEGRADED_QUERY"})
+        degraded = alignment_incomplete or any(
+            code in gap_codes for code in {"ZERO_ROWS", "PARTIAL_EVIDENCE", "RESOURCE_DEGRADED_QUERY"}
+        )
         fallback_reports = [item for item in report_payloads if item.get("fallbackTable")]
         realtime_fallback_used = "STALE_USE_REALTIME_FALLBACK" in report_statuses or bool(fallback_reports)
         offline_stale = realtime_fallback_used or any("STALE" in status for status in report_statuses)
@@ -6513,6 +6845,8 @@ class MerchantQaWorkflow:
             status = "realtime_fallback_used"
         elif offline_stale:
             status = "offline_stale"
+        elif alignment_incomplete:
+            status = "aligned_partial_coverage" if alignment.aligned else "alignment_incomplete"
         elif degraded:
             status = "partial_or_degraded"
         elif any(str(item.get("status") or "").lower() in {"stale", "fallback", "partial"} for item in report_payloads):
@@ -6537,15 +6871,36 @@ class MerchantQaWorkflow:
             notes.append("已识别离线表延迟并切换到实时/近实时 fallback 表")
         if degraded:
             notes.append("存在空结果、部分证据或降级查询，答案需要披露数据覆盖风险")
-        latest_data_at = ""
-        for item in report_payloads:
-            latest_data_at = max(latest_data_at, str(item.get("maxPt") or item.get("max_pt") or ""))
+        if alignment_incomplete:
+            notes.append("部分来源未覆盖统一时间窗口，相关缺失不可解释为业务为 0")
+        common_anchor = str(alignment.common_anchor_time_value or "") if alignment_applicable else ""
+        latest_data_at = common_anchor
+        if not latest_data_at:
+            for item in report_payloads:
+                latest_data_at = max(latest_data_at, str(item.get("maxPt") or item.get("max_pt") or ""))
+        source_cutoffs = [
+            {
+                "taskId": source.task_id,
+                "table": source.table,
+                "sourceLatestDataAt": source.source_max_time_value,
+                "effectiveStartTimeValue": source.effective_start_time_value,
+                "effectiveEndTimeValue": source.effective_end_time_value,
+                "aggregationPolicy": source.aggregation_policy,
+                "timeSelectionPolicy": source.time_selection_policy,
+                "coverageComplete": source.coverage_complete,
+                "compatible": source.compatible,
+            }
+            for source in alignment.sources[:12]
+        ]
         return {
             "status": status,
             "checked": bool(reports),
             "tables": tables[:12],
             "reports": report_payloads,
             "latestDataAt": latest_data_at,
+            "commonAnchorTimeValue": common_anchor,
+            "sourceCutoffs": source_cutoffs,
+            "snapshotAlignment": alignment.model_dump(by_alias=True) if alignment_applicable else {},
             "offlineDelayDetected": offline_stale,
             "realtimeFallbackUsed": realtime_fallback_used,
             "fallbackSuggested": degraded or offline_stale or any(item.get("fallbackTable") for item in report_payloads),
@@ -6645,7 +7000,8 @@ class MerchantQaWorkflow:
             "steps": {
                 "leadDecisions": len(lead_decisions),
                 "actions": len(action_history),
-                "plannerRepairs": len(repair_requests),
+                "plannerRepairs": len(state.get("query_graph_repair_history") or []),
+                "pendingPlannerRepairRequests": len(repair_requests),
                 "toolCalls": len(state.get("tool_call_ledger") or []),
                 "evidenceGaps": len(gaps),
             },
@@ -7952,6 +8308,216 @@ def graph_repair_validation_gaps(evidence_gaps: List[Any]) -> List[GraphValidati
     return gaps
 
 
+def planner_repair_gaps_from_state(state: AgentState) -> List[GraphValidationGap]:
+    """Merge validator and PlannerCritic failures into one typed repair input."""
+
+    validation = state.get("query_graph_validation_result") or GraphValidationResult()
+    gaps = list(getattr(validation, "gaps", []) or [])
+    reflection = state.get("planner_reflection") or PlannerReflectionResult()
+    issues = reflection.get("issues", []) if isinstance(reflection, dict) else reflection.issues
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        severity = str(issue.get("severity") or "error").strip().lower()
+        if severity != "error":
+            continue
+        gap = GraphValidationGap(
+            code=str(issue.get("code") or ""),
+            evidence=str(issue.get("evidence") or ""),
+            task_id=str(issue.get("taskId") or issue.get("task_id") or ""),
+            reason=str(issue.get("reason") or ""),
+        )
+        if not gap.code:
+            continue
+        if any(
+            current.code == gap.code
+            and current.task_id == gap.task_id
+            and current.evidence == gap.evidence
+            for current in gaps
+        ):
+            continue
+        gaps.append(gap)
+    for request in normalized_planner_repair_requests(state.get("planner_repair_requests") or []):
+        payload = request.model_dump(by_alias=True, mode="json")
+        gap = GraphValidationGap(
+            code=str(request.reason or "PLANNER_REPAIR_REQUEST"),
+            evidence=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            task_id=str(request.task_id or ""),
+            reason=(
+                "PlannerCritic requested %s at %s%s"
+                % (
+                    str(request.action or "graph_repair"),
+                    str(request.stage or "planner_reflection"),
+                    (" from " + str(request.source)) if request.source else "",
+                )
+            ),
+        )
+        if any(
+            current.code == gap.code
+            and current.task_id == gap.task_id
+            and current.evidence == gap.evidence
+            for current in gaps
+        ):
+            continue
+        gaps.append(gap)
+    return gaps
+
+
+def normalized_planner_repair_requests(values: List[Any]) -> List[PlannerRepairRequest]:
+    requests: List[PlannerRepairRequest] = []
+    for value in values or []:
+        if isinstance(value, PlannerRepairRequest):
+            requests.append(value.model_copy(deep=True))
+            continue
+        if isinstance(value, dict):
+            try:
+                requests.append(PlannerRepairRequest.model_validate(value))
+            except Exception:
+                continue
+    return requests
+
+
+def planner_repair_scope_key(state: AgentState, plan: QueryPlan | None = None) -> str:
+    """Scope repair budgets to one executable graph and one critic issue set."""
+
+    reflection_value = state.get("planner_reflection") or PlannerReflectionResult()
+    if isinstance(reflection_value, PlannerReflectionResult):
+        reflection = reflection_value
+    elif isinstance(reflection_value, dict):
+        try:
+            reflection = PlannerReflectionResult.model_validate(reflection_value)
+        except Exception:
+            reflection = PlannerReflectionResult()
+    else:
+        reflection = PlannerReflectionResult()
+    validation = state.get("query_graph_validation_result") or GraphValidationResult()
+    validation_gaps = [
+        item
+        for item in list(getattr(validation, "gaps", []) or [])
+        if str(getattr(item, "code", "") or "") != "QUERY_GRAPH_REPAIR_EXHAUSTED"
+    ]
+    reflection_issues = canonical_repair_payloads(reflection.issues)
+    validation_payloads = canonical_repair_payloads(validation_gaps)
+    fallback_request_issues: List[Dict[str, Any]] = []
+    if not reflection_issues and not validation_payloads:
+        fallback_request_issues = [
+            {
+                "reason": request.reason,
+                "action": request.action,
+                "stage": request.stage,
+                "taskId": request.task_id,
+                "query": request.query,
+                "evidence": request.evidence,
+            }
+            for request in normalized_planner_repair_requests(
+                state.get("planner_repair_requests") or reflection.repair_requests
+            )
+        ]
+    payload = {
+        "graphFingerprint": query_graph_fingerprint(plan or state.get("plan")),
+        "reflectionIssues": reflection_issues,
+        "validationGaps": validation_payloads,
+        "fallbackRequestIssues": canonical_repair_payloads(fallback_request_issues),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def canonical_repair_payloads(values: List[Any]) -> List[Any]:
+    payloads: List[Any] = []
+    for value in values or []:
+        if hasattr(value, "model_dump"):
+            payload = value.model_dump(by_alias=True, mode="json")
+        elif isinstance(value, dict):
+            payload = dict(value)
+        else:
+            payload = {"value": str(value)}
+        payloads.append(payload)
+    return sorted(
+        payloads,
+        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
+def planner_repair_input_from_state(state: AgentState) -> PlannerRepairInput:
+    reflection_value = state.get("planner_reflection") or PlannerReflectionResult()
+    if isinstance(reflection_value, PlannerReflectionResult):
+        reflection = reflection_value.model_copy(deep=True)
+    elif isinstance(reflection_value, dict):
+        try:
+            reflection = PlannerReflectionResult.model_validate(reflection_value)
+        except Exception:
+            reflection = PlannerReflectionResult()
+    else:
+        reflection = PlannerReflectionResult()
+    validation = state.get("query_graph_validation_result") or GraphValidationResult()
+    requests = normalized_planner_repair_requests(
+        state.get("planner_repair_requests") or reflection.repair_requests
+    )
+    return PlannerRepairInput(
+        scope_key=planner_repair_scope_key(state),
+        graph_fingerprint=query_graph_fingerprint(state.get("plan")),
+        reflection=reflection,
+        repair_requests=requests,
+        validation_gaps=[item.model_copy(deep=True) for item in list(getattr(validation, "gaps", []) or [])],
+        repair_gaps=[item.model_copy(deep=True) for item in planner_repair_gaps_from_state(state)],
+    )
+
+
+def query_graph_repair_exhaustion_gap(
+    repair_input: PlannerRepairInput,
+    scope_attempts: int,
+) -> GraphValidationGap:
+    issue_summaries: List[str] = []
+    for issue in repair_input.reflection.issues:
+        if not isinstance(issue, dict):
+            continue
+        code = str(issue.get("code") or "PLANNER_CRITIC_ISSUE")
+        detail = str(issue.get("reason") or issue.get("evidence") or "").strip()
+        summary = "%s%s" % (code, (": " + detail) if detail else "")
+        if summary not in issue_summaries:
+            issue_summaries.append(summary)
+    request_summaries: List[str] = []
+    for request in repair_input.repair_requests:
+        summary = "%s/%s%s" % (
+            str(request.reason or "PLANNER_REPAIR_REQUEST"),
+            str(request.action or "graph_repair"),
+            (" task=" + str(request.task_id)) if request.task_id else "",
+        )
+        if summary not in request_summaries:
+            request_summaries.append(summary)
+    details = []
+    if issue_summaries:
+        details.append("issues=" + " | ".join(issue_summaries))
+    if request_summaries:
+        details.append("requests=" + " | ".join(request_summaries))
+    if not details:
+        details.append("issues=" + " | ".join(gap.code for gap in repair_input.repair_gaps if gap.code))
+    task_ids = unique_workflow_strings(
+        [
+            *[str(issue.get("taskId") or issue.get("task_id") or "") for issue in repair_input.reflection.issues if isinstance(issue, dict)],
+            *[str(item.task_id or "") for item in repair_input.repair_requests],
+            *[str(item.task_id or "") for item in repair_input.repair_gaps],
+        ]
+    )
+    evidence = {
+        "scopeKey": repair_input.scope_key,
+        "graphFingerprint": repair_input.graph_fingerprint,
+        "scopeAttempts": int(scope_attempts),
+        "reflectionIssues": repair_input.reflection.issues,
+        "repairRequests": [item.model_dump(by_alias=True, mode="json") for item in repair_input.repair_requests],
+    }
+    return GraphValidationGap(
+        code="QUERY_GRAPH_REPAIR_EXHAUSTED",
+        task_id=task_ids[0] if len(task_ids) == 1 else "",
+        reason=(
+            "PlannerCritic repair made no executable QueryGraph progress after %d scoped attempts; %s"
+            % (int(scope_attempts), "; ".join(details))
+        ),
+        evidence=json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
+
 def graph_gaps_from_node_failures(task_results: List[Any]) -> List[GraphValidationGap]:
     gaps: List[GraphValidationGap] = []
     for task_result in task_results:
@@ -8044,6 +8610,189 @@ def planner_degraded_state(error: str, plan: QueryPlan, reason: str = "") -> Dic
         "plannerReason": reason,
         "trace": failure_trace[:12],
     }
+
+
+def append_active_planner_degraded_reason(
+    state: AgentState,
+    run_result: AgentRunResult,
+) -> None:
+    """Project the active Planner operational state into execution evidence."""
+
+    raw = state.get("planner_degraded") or {}
+    if not isinstance(raw, dict) or not raw.get("active"):
+        return
+    payload = json.loads(json.dumps(raw, ensure_ascii=False, default=str))
+    payload.setdefault("stage", "planner")
+    reasons = [dict(item) for item in run_result.degraded_reasons or [] if isinstance(item, dict)]
+    identity = planner_degraded_reason_identity(payload)
+    if not any(planner_degraded_reason_identity(item) == identity for item in reasons):
+        reasons.append(payload)
+    run_result.degraded_reasons = reasons
+
+
+def append_subagent_outcomes_to_run_result(
+    state: AgentState,
+    run_result: AgentRunResult,
+) -> None:
+    """Keep logical Sub-Agent degradation monotonic through later execution.
+
+    Delegation may happen before or after SQL execution, and SQL execution may
+    replace the current ``AgentRunResult``.  Re-projecting the stored contracts
+    at the evidence and response boundaries prevents a useful partial summary
+    from being mistaken for a completed analysis or silently disappearing.
+    The projection is task-kind agnostic: status and structured gaps are the
+    authority.
+    """
+
+    contracts = [
+        dict(item)
+        for item in state.get("subagent_delegation_results") or []
+        if isinstance(item, dict)
+    ]
+    if not contracts:
+        return
+    reasons = [dict(item) for item in run_result.degraded_reasons or [] if isinstance(item, dict)]
+    evidence_gaps = [item.model_copy(deep=True) for item in run_result.evidence_gaps or []]
+    projected_gaps: List[EvidenceGap] = []
+    for contract_index, contract in enumerate(contracts):
+        status = str(contract.get("status") or "failed").strip().lower()
+        raw_gaps = [
+            item.model_dump(by_alias=True) if hasattr(item, "model_dump") else dict(item)
+            for item in contract.get("gaps") or []
+            if isinstance(item, dict) or hasattr(item, "model_dump")
+        ]
+        if status == "completed" and not raw_gaps:
+            continue
+        if not raw_gaps:
+            raw_gaps = [
+                {
+                    "code": "SUBAGENT_PARTIAL" if status == "partial" else "SUBAGENT_FAILED",
+                    "message": str(contract.get("summary") or "Sub-Agent did not complete")[:1000],
+                }
+            ]
+        task_kind = str(contract.get("taskKind") or contract.get("task_kind") or "subagent")
+        objective = str(contract.get("objective") or "")
+        for gap_index, raw_gap in enumerate(raw_gaps):
+            code = str(raw_gap.get("code") or "SUBAGENT_DEGRADED").strip() or "SUBAGENT_DEGRADED"
+            reason = str(raw_gap.get("reason") or raw_gap.get("message") or contract.get("summary") or code).strip()
+            severity = str(raw_gap.get("severity") or "warning").strip().lower()
+            if severity not in {"blocking", "warning", "info"}:
+                severity = "warning"
+            source_node_id = "%s:%d" % (task_kind, contract_index)
+            details = {
+                **dict(raw_gap.get("details") or {}),
+                "taskKind": task_kind,
+                "outcomeStatus": status,
+                "objective": objective[:500],
+                "contractIndex": contract_index,
+                "gapIndex": gap_index,
+            }
+            degraded = {
+                "active": True,
+                "stage": "subagent",
+                "source": "subagent",
+                "taskKind": task_kind,
+                "status": status,
+                "code": code,
+                "reason": reason[:1000],
+                "fallbackUsed": bool((contract.get("payload") or {}).get("fallbackUsed")),
+                "summary": str(contract.get("summary") or "")[:1000],
+                "details": details,
+            }
+            degraded_identity = (
+                str(degraded["stage"]),
+                task_kind,
+                code,
+                str(degraded["reason"]),
+            )
+            if not any(
+                (
+                    str(item.get("stage") or ""),
+                    str(item.get("taskKind") or item.get("task_kind") or ""),
+                    str(item.get("code") or ""),
+                    str(item.get("reason") or ""),
+                )
+                == degraded_identity
+                for item in reasons
+            ):
+                reasons.append(degraded)
+            projected_gaps.append(
+                EvidenceGap(
+                    code=code,
+                    source_node_id=source_node_id,
+                    evidence=task_kind,
+                    reason=reason[:1000],
+                    severity=severity,
+                    disclosure_required=bool(raw_gap.get("disclosureRequired", True)),
+                    source="subagent",
+                    answer_instruction=str(
+                        raw_gap.get("answerInstruction")
+                        or raw_gap.get("answer_instruction")
+                        or "说明 Sub-Agent 未完整执行，降级或部分输出不能表述为已完成的分析。"
+                    ),
+                    suggested_action=str(raw_gap.get("suggestedAction") or "answer_with_subagent_gap"),
+                    details=details,
+                )
+            )
+    if not projected_gaps:
+        return
+    existing_gap_ids = {
+        (
+            str(item.gap_code or item.code),
+            str(item.source_node_id or item.task_id),
+            str(item.reason or ""),
+        )
+        for item in evidence_gaps
+    }
+    for gap in projected_gaps:
+        identity = (str(gap.gap_code or gap.code), str(gap.source_node_id or gap.task_id), str(gap.reason or ""))
+        if identity not in existing_gap_ids:
+            evidence_gaps.append(gap)
+            existing_gap_ids.add(identity)
+    run_result.degraded_reasons = reasons
+    run_result.evidence_gaps = evidence_gaps
+
+    verified = run_result.verified_evidence
+    verified_gap_ids = {
+        (
+            str(item.gap_code or item.code),
+            str(item.source_node_id or item.task_id),
+            str(item.reason or ""),
+        )
+        for item in verified.gaps or []
+    }
+    verified_gaps = [item.model_copy(deep=True) for item in verified.gaps or []]
+    for gap in projected_gaps:
+        identity = (str(gap.gap_code or gap.code), str(gap.source_node_id or gap.task_id), str(gap.reason or ""))
+        if identity not in verified_gap_ids:
+            verified_gaps.append(gap.model_copy(deep=True))
+            verified_gap_ids.add(identity)
+    blocking_gaps = [item for item in verified_gaps if item.severity == "blocking"]
+    warning_gaps = [item for item in verified_gaps if item.severity == "warning"]
+    verified.gaps = verified_gaps
+    verified.blocking_gaps = blocking_gaps
+    verified.warning_gaps = warning_gaps
+    verified.passed = bool(verified.passed and not blocking_gaps)
+    verified.answer_guard_required = bool(
+        verified.answer_guard_required
+        or blocking_gaps
+        or warning_gaps
+        or any(item.disclosure_required for item in projected_gaps)
+    )
+    if blocking_gaps and not verified.partial_answer_reason:
+        verified.partial_answer_reason = "；".join(item.reason for item in blocking_gaps[:3])
+    if blocking_gaps and not run_result.partial_answer_reason:
+        run_result.partial_answer_reason = verified.partial_answer_reason
+
+
+def planner_degraded_reason_identity(payload: Dict[str, Any]) -> tuple[str, str, str]:
+    stage = str(payload.get("stage") or "planner").strip().lower()
+    code = str(payload.get("code") or "").strip()
+    reason = str(payload.get("reason") or "").strip()
+    if code or reason:
+        return stage, code, reason
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return stage, "", canonical
 
 
 def planner_degraded_stops_expensive_work(state: AgentState) -> bool:
@@ -8367,6 +9116,7 @@ def observability_summary(state: AgentState) -> Dict[str, Any]:
     validation = state.get("query_graph_validation_result") or GraphValidationResult()
     run_result = state.get("agent_run_result") or AgentRunResult()
     active_manifest = state.get("active_context_manifest") or {}
+    repair_delta = state.get("last_query_graph_repair_delta") or QueryGraphRepairDelta()
     return {
         "selectedMemoryIds": context_memory_ids(state),
         "semanticRefIds": context_semantic_ref_ids(state)[:40],
@@ -8381,6 +9131,9 @@ def observability_summary(state: AgentState) -> Dict[str, Any]:
             for gap in getattr(run_result, "evidence_gaps", [])[:12]
         ],
         "repairCount": int(state.get("query_graph_repair_attempts") or 0),
+        "repairScopeAttemptCount": int(state.get("query_graph_repair_scope_attempt_count") or 0),
+        "repairExhausted": bool(state.get("query_graph_repair_exhausted")),
+        "lastRepairDelta": repair_delta.model_dump(by_alias=True) if getattr(repair_delta, "attempt", 0) else {},
     }
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 from typing import Any, Dict, Iterable, List, Set, Tuple
@@ -15,6 +16,9 @@ from merchant_ai.models import (
     KnowledgeRef,
     KnowledgeRequest,
     KnowledgeRequestType,
+    MetricObligation,
+    MetricObligationBinding,
+    MetricObligationDecision,
     PlanDependency,
     PlannerRepairRequest,
     PlanningAssetEntry,
@@ -59,6 +63,7 @@ from merchant_ai.services.planning_tooling import (
     compact_previous_understanding,
     compact_tool_result_for_prompt,
     normalize_llm_tool_calls,
+    normalize_question_understanding_payload,
     parse_json_object,
     payload_has_understanding,
     planner_failure_gap_code,
@@ -67,6 +72,7 @@ from merchant_ai.services.planning_tooling import (
     planner_llm_terminal_error,
     planner_prompt_stats,
     planner_repair_feedback_for_understanding,
+    planner_structured_output_validation_errors,
     planner_tool_results_for_prompt,
 )
 from merchant_ai.services.planning_layers import GraphContractValidator, PlanCompiler, PlanRepairer, UnderstandingExtractor
@@ -235,7 +241,7 @@ class UnderstandingCoverageCritic:
     def complete(self, question: str, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> UnderstandingCoverageResult:
         if not isinstance(understanding, dict):
             return UnderstandingCoverageResult({}, [], ["INVALID_UNDERSTANDING"], ["coverage_critic.skipped_invalid_understanding"])
-        updated = deepcopy(understanding)
+        updated = freeze_metric_obligation_ledger(understanding, asset_pack)
         trace: List[str] = []
         pruned = prune_unrequested_requested_measures(question, updated, asset_pack)
         if pruned:
@@ -358,6 +364,7 @@ class UnderstandingCoverageCritic:
                 trace.append("UNDERSTANDING_TABLE_EVIDENCE_COMPLETION:%s:%s:%s" % (table, matched_label, ",".join(fields[:6])))
         if not trace:
             trace.append("understanding_coverage_critic.no_missing_metrics")
+        updated = freeze_metric_obligation_ledger(updated, asset_pack)
         return UnderstandingCoverageResult(updated, added, issues, trace)
 
 
@@ -1056,6 +1063,9 @@ class QueryGraphPlanner:
         planner_context: Dict[str, Any] | None = None,
     ) -> Tuple[QueryPlan, List[KnowledgeRequest], str]:
         prior_understanding = self.understanding_extractor.prior_understanding(planner_context)
+        selection_handoff: Dict[str, Any] = {}
+        selection_recovery_understanding: Dict[str, Any] = {}
+        payload: Dict[str, Any] = {}
         if not self.llm.configured:
             fast_plan = self.understanding_extractor.semantic_fast_path(question, asset_pack)
             if fast_plan.intents and semantic_failure_candidate_valid(question, fast_plan, asset_pack):
@@ -1096,6 +1106,54 @@ class QueryGraphPlanner:
                     selection_plan.agent_trace.append("planner.legacy_question_planner=disabled")
                 reason = str(selection_payload.get("reason") or selection_status or "SEMANTIC_ASSET_SELECTION_NOT_EXECUTABLE")
                 return selection_plan, selection_plan.knowledge_requests, reason
+            selection_handoff = self._semantic_selection_handoff(question, selection_payload, asset_pack)
+            selection_recovery_understanding = dict(selection_handoff.get("recoveryUnderstanding") or {})
+            if (
+                bool(getattr(self.settings, "planner_semantic_contract_compile_enabled", True))
+                and selection_handoff.get("verified")
+                and selection_recovery_understanding
+            ):
+                contract_candidate = self._asset_driven_multi_metric_fallback(
+                    question,
+                    asset_pack,
+                    structured_understanding=selection_recovery_understanding,
+                )
+                if contract_candidate.intents and semantic_failure_candidate_valid(
+                    question,
+                    contract_candidate,
+                    asset_pack,
+                ):
+                    contract_candidate.agent_trace = [
+                        item
+                        for item in contract_candidate.agent_trace
+                        if item != "planner=asset_driven_multi_metric_failure_fallback"
+                    ]
+                    contract_candidate.agent_trace.extend(
+                        [
+                            "planner.semantic_selection_handoff=contract_compiled",
+                            "planner.semantic_selection_handoff.validation=passed",
+                            "planner.llm_call_budget=selector_only",
+                        ]
+                    )
+                    understanding = dict(contract_candidate.question_understanding or {})
+                    understanding["source"] = "semantic_selection_contract_compiler"
+                    understanding["planningCandidate"] = {
+                        "type": "semantic_contract",
+                        "provenance": "semantic_asset_selector",
+                        "validated": True,
+                        "selectedRefs": list(selection_handoff.get("selectedRefs") or []),
+                    }
+                    contract_candidate.question_understanding = understanding
+                    return (
+                        contract_candidate,
+                        contract_candidate.knowledge_requests,
+                        "SEMANTIC_SELECTION_CONTRACT_COMPILED",
+                    )
+            if selection_handoff:
+                planner_context = {
+                    **dict(planner_context or {}),
+                    "semanticSelectionContract": selection_handoff,
+                }
             payload, start_with_workspace, prior_understanding, initial_tool_entry = self.understanding_extractor.initial_payload(
                 question,
                 asset_pack,
@@ -1201,18 +1259,36 @@ class QueryGraphPlanner:
                 if semantic_metric_plan.intents:
                     return semantic_metric_plan, semantic_metric_plan.knowledge_requests, payload.get("reason", "")
         trace_reason = planner_failure_trace_reason(self.llm.configured, self.llm.last_error)
-        if planner_llm_terminal_error(self.llm.last_error):
+        invalid_output = payload.get("_plannerInvalidOutput") or {}
+        if isinstance(invalid_output, dict) and invalid_output:
+            trace_reason = "PLANNER_INVALID_STRUCTURED_OUTPUT: %s" % str(
+                invalid_output.get("reason") or payload.get("reason") or "output contract validation failed"
+            )[:240]
+        provider_failure = planner_llm_terminal_error(self.llm.last_error)
+        selection_recovery_allowed = bool(
+            selection_handoff.get("verified")
+            and selection_recovery_understanding
+            and not payload.get("_plannerContextOverBudget")
+        )
+        if provider_failure or selection_recovery_allowed:
+            recovery_trigger = (
+                "provider_failure"
+                if provider_failure
+                else "invalid_structured_output"
+                if invalid_output
+                else "non_provider_planner_failure"
+            )
             candidate, requests, _ = self.understanding_extractor.failure_fallback_plan(
                 question,
                 asset_pack,
                 trace_reason,
-                structured_understanding=prior_understanding,
+                structured_understanding=selection_recovery_understanding or prior_understanding,
             )
             if candidate.intents and semantic_failure_candidate_valid(question, candidate, asset_pack):
                 candidate.agent_trace.extend(
                     [
                         "planner.recovery_candidate.type=deterministic_semantic",
-                        "planner.recovery_candidate.trigger=provider_failure",
+                        "planner.recovery_candidate.trigger=%s" % recovery_trigger,
                         "planner.recovery_candidate.provenance=published_asset_contract",
                         "planner.recovery_candidate.validation=passed",
                     ]
@@ -1220,11 +1296,15 @@ class QueryGraphPlanner:
                 understanding = dict(candidate.question_understanding or {})
                 understanding["recoveryCandidate"] = {
                     "type": "deterministic_semantic",
-                    "trigger": "provider_failure",
+                    "trigger": recovery_trigger,
                     "provenance": "published_asset_contract",
                     "validated": True,
+                    "selectedRefs": list(selection_handoff.get("selectedRefs") or []),
                 }
                 candidate.question_understanding = understanding
+                if payload:
+                    append_prompt_trace(candidate, payload)
+                    attach_planner_tool_trace(candidate, payload)
                 return candidate, requests, "TYPED_SEMANTIC_RECOVERY_CANDIDATE"
             candidate.agent_trace.append("planner.recovery_candidate.validation=failed_closed")
             return candidate, requests, trace_reason
@@ -1254,6 +1334,98 @@ class QueryGraphPlanner:
         action = str(payload.get("action") or "").strip().lower()
         status = str(payload.get("status") or "").strip().upper()
         return action in {"unsupported", "invalid"} or status in {"UNSUPPORTED", "INVALID"}
+
+    def _semantic_selection_handoff(
+        self,
+        question: str,
+        payload: Dict[str, Any],
+        asset_pack: PlanningAssetPack,
+    ) -> Dict[str, Any]:
+        """Turn exact Selector decisions into a typed Planner input contract.
+
+        A requires_planner decision means the selected metrics are evidence for
+        the next stage, not discarded work. Only refs that resolve back to
+        published assets are marked verified and therefore eligible for
+        deterministic recovery.
+        """
+
+        selected_refs = dedupe_strings(
+            [str(item) for item in payload.get("selectedRefs") or payload.get("selected_refs") or [] if str(item or "")]
+        )
+        if not selected_refs:
+            return {}
+        selected = self._selected_semantic_metrics(question, payload, asset_pack)
+        selected_metrics = [
+            {
+                "metricRef": item["metric"].key,
+                "ownerTable": item["metric"].table,
+                "sourcePhrase": item["sourcePhrase"],
+                "semanticRefId": item["metric"].source_ref_id,
+                "confidence": item.get("confidence") or "1.0",
+            }
+            for item in selected
+        ]
+        resolved_refs = {str(item.get("semanticRefId") or "") for item in selected_metrics}
+        verified = bool(
+            selected_metrics
+            and set(selected_refs) == resolved_refs
+            and not payload.get("_uncoveredPhrases")
+            and not self._semantic_selection_clarification_needs(payload)
+            and all(
+                asset_fallback_metric_is_published(item["metric"], asset_pack)
+                for item in selected
+            )
+        )
+        planning_contract = dict(payload.get("planningContract") or payload.get("planning_contract") or {})
+        query_contract = dict(payload.get("queryContract") or payload.get("query_contract") or {})
+        recovery_understanding: Dict[str, Any] = {}
+        if verified:
+            analysis_intent = str(
+                planning_contract.get("analysisIntent")
+                or planning_contract.get("analysis_intent")
+                or ""
+            ).strip().lower()
+            time_range = planning_contract.get("timeRange") or planning_contract.get("time_range") or {}
+            try:
+                time_window_days = int(
+                    planning_contract.get("timeWindowDays")
+                    or planning_contract.get("time_window_days")
+                    or (time_range or {}).get("days")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                time_window_days = 0
+            recovery_understanding = {
+                "analysisGrain": str(
+                    planning_contract.get("timeGrain")
+                    or planning_contract.get("time_grain")
+                    or ("time" if analysis_intent in ASSET_FALLBACK_TIME_SERIES_INTENTS else "metric")
+                ),
+                "analysisIntent": analysis_intent,
+                "requiresExplanation": analysis_intent in ASSET_FALLBACK_EXPLANATION_INTENTS,
+                "requiredEvidenceIntents": [],
+                "rankingObjective": {},
+                "requestedMeasures": selected_metrics,
+                "metricPhrases": list(planning_contract.get("metricPhrases") or []),
+                "filters": [],
+                "scopeConstraints": [],
+                "calculationIntents": [],
+                "timeWindowDays": time_window_days,
+                "timeRange": dict(time_range) if isinstance(time_range, dict) else {},
+                "semanticSelectionRefs": selected_refs,
+                "source": "semantic_asset_selection_handoff",
+            }
+        return {
+            "status": str(payload.get("status") or ""),
+            "verified": verified,
+            "selectedRefs": selected_refs,
+            "selectedMetrics": selected_metrics,
+            "planningContract": planning_contract,
+            "queryContract": query_contract,
+            "reason": str(payload.get("reason") or "")[:500],
+            "recoveryUnderstanding": recovery_understanding,
+            "provenance": "semantic_asset_selector",
+        }
 
     def _failure_candidate_coverage_gaps(
         self,
@@ -1859,6 +2031,9 @@ class QueryGraphPlanner:
             or merged.get("metricLevel")
             or ""
         )[:80]
+        time_semantics = merged.get("timeSemantics") or merged.get("time_semantics") or {}
+        if not isinstance(time_semantics, dict):
+            time_semantics = {}
         return {
             "id": candidate_id,
             "ref": ref,
@@ -1872,6 +2047,12 @@ class QueryGraphPlanner:
             "topic": str(item.topic or merged.get("topic") or "")[:50],
             "table": table[:100],
             "grain": grain,
+            "metricGrain": str(merged.get("metricGrain") or merged.get("metric_grain") or grain)[:80],
+            "timeColumn": str(merged.get("timeColumn") or merged.get("time_column") or "")[:100],
+            "applicableTimeGrain": str(
+                merged.get("applicableTimeGrain") or merged.get("applicable_time_grain") or ""
+            )[:80],
+            "timeSemantics": dict(time_semantics),
             "kind": self._semantic_selection_metric_kind(merged),
             "metricIntent": str(merged.get("metricIntent") or "")[:60],
             "tableKind": str(merged.get("tableKind") or "")[:60],
@@ -2712,9 +2893,64 @@ class QueryGraphPlanner:
             phrase = str(gap.get("sourcePhrase") or gap.get("source_phrase") or "")
             rejected_by_phrase.setdefault(phrase, []).extend(str(item) for item in gap.get("candidateIds") or [] if str(item or ""))
         decisions: List[Dict[str, Any]] = []
+        selected_by_ref = {
+            str(item.get("semanticRefId") or getattr(item.get("metric"), "source_ref_id", "") or ""): item
+            for item in selected
+            if str(item.get("semanticRefId") or getattr(item.get("metric"), "source_ref_id", "") or "")
+        }
+        candidate_ref_by_id = {
+            str(item.get("id") or ""): str(item.get("ref") or "")
+            for item in payload.get("_retrievedCandidates") or []
+            if isinstance(item, dict) and item.get("id") and item.get("ref")
+        }
+        selected_refs = {
+            str(item)
+            for item in payload.get("selectedRefs") or payload.get("selected_refs") or []
+            if str(item or "")
+        }
+        decided_refs: set[str] = set()
+        for group in payload.get("_candidateGroups") or []:
+            if not isinstance(group, dict):
+                continue
+            phrase = str(group.get("phrase") or group.get("sourcePhrase") or "").strip()
+            candidate_ids = [str(item) for item in group.get("candidateIds") or [] if str(item or "")]
+            group_selected_refs = dedupe_strings(
+                [
+                    candidate_ref_by_id.get(candidate_id, candidate_id)
+                    for candidate_id in candidate_ids
+                    if candidate_ref_by_id.get(candidate_id, candidate_id) in selected_refs
+                ]
+            )
+            if len(group_selected_refs) != 1:
+                continue
+            selected_ref = group_selected_refs[0]
+            selected_item = selected_by_ref.get(selected_ref)
+            if not selected_item:
+                continue
+            metric = selected_item["metric"]
+            decisions.append(
+                {
+                    "phrase": phrase or selected_item["sourcePhrase"],
+                    "decision": "selected_one",
+                    "selectedCandidateId": selected_ref,
+                    "selectedMetricRef": metric.key,
+                    "selectedOwnerTable": metric.table,
+                    "rejectedCandidateIds": [
+                        candidate_ref_by_id.get(candidate_id, candidate_id)
+                        for candidate_id in candidate_ids
+                        if candidate_ref_by_id.get(candidate_id, candidate_id) != selected_ref
+                    ],
+                    "confidence": selected_item.get("confidence") or "1.0",
+                    "reason": selected_item.get("reason") or "selected by semantic asset selector",
+                }
+            )
+            decided_refs.add(selected_ref)
         for item in selected:
             metric = item["metric"]
             phrase = item["sourcePhrase"]
+            semantic_ref = str(item.get("semanticRefId") or metric.source_ref_id or "")
+            if semantic_ref in decided_refs:
+                continue
             decisions.append(
                 {
                     "phrase": phrase,
@@ -2940,6 +3176,67 @@ class QueryGraphPlanner:
                     if "timeout_seconds" not in str(exc):
                         raise
                     payload = self.llm.json_chat(prompt.system_prompt, user, {})
+            payload = normalize_question_understanding_payload(payload if isinstance(payload, dict) else {})
+            validation_errors = planner_structured_output_validation_errors(payload, tool.parameters)
+            retry_attempts: List[Dict[str, Any]] = []
+            retry_budget = max(
+                0,
+                int(getattr(self.settings, "agent_planner_invalid_output_retries", 1) or 0),
+            )
+            for retry_index in range(retry_budget):
+                if not validation_errors or planner_llm_terminal_error(str(getattr(self.llm, "last_error", "") or "")):
+                    break
+                retry_attempts.append(
+                    {
+                        "attempt": retry_index + 1,
+                        "validationErrors": list(validation_errors)[:12],
+                    }
+                )
+                retry_user_payload = dict(selected_user_payload)
+                retry_user_payload["structuredOutputFeedback"] = {
+                    "requiredTool": tool.name,
+                    "validationErrors": list(validation_errors)[:12],
+                    "instruction": "Return a complete payload matching the provided tool schema; do not return prose.",
+                }
+                retry_user = json.dumps(retry_user_payload, ensure_ascii=False)
+                if hasattr(self.llm, "tool_json_chat"):
+                    try:
+                        retry_payload = self.llm.tool_json_chat(
+                            prompt.system_prompt,
+                            retry_user,
+                            output_tool_schema,
+                            {},
+                            timeout_seconds=self.settings.llm_planner_timeout_seconds,
+                        )
+                    except TypeError:
+                        retry_payload = self.llm.tool_json_chat(prompt.system_prompt, retry_user, output_tool_schema, {})
+                else:
+                    try:
+                        retry_payload = self.llm.json_chat(
+                            prompt.system_prompt,
+                            retry_user,
+                            {},
+                            timeout_seconds=self.settings.llm_planner_timeout_seconds,
+                        )
+                    except TypeError:
+                        retry_payload = self.llm.json_chat(prompt.system_prompt, retry_user, {})
+                payload = normalize_question_understanding_payload(
+                    retry_payload if isinstance(retry_payload, dict) else {}
+                )
+                validation_errors = planner_structured_output_validation_errors(payload, tool.parameters)
+            if validation_errors and not planner_llm_terminal_error(str(getattr(self.llm, "last_error", "") or "")):
+                payload = {
+                    "status": "INVALID",
+                    "reason": "PLANNER_INVALID_STRUCTURED_OUTPUT",
+                    "_plannerInvalidOutput": {
+                        "reason": "questionUnderstanding failed schema validation",
+                        "validationErrors": list(validation_errors)[:12],
+                        "attempts": retry_attempts,
+                        "retryBudget": retry_budget,
+                    },
+                }
+            elif retry_attempts:
+                payload["_plannerInvalidOutputAttempts"] = retry_attempts
             payload["_promptStats"] = stats
         elif payload:
             payload["_usedSemanticToolLoop"] = True
@@ -2954,6 +3251,17 @@ class QueryGraphPlanner:
         payload["_promptTrace"] = prompt.trace()
         payload["_toolSchema"] = tool.trace_schema()
         payload["_plannerBudgetTrace"] = budget_trace
+        semantic_selection_contract = (
+            (planner_context or {}).get("semanticSelectionContract")
+            or (planner_context or {}).get("semantic_selection_contract")
+            or {}
+        )
+        if isinstance(semantic_selection_contract, dict) and semantic_selection_contract:
+            payload["_semanticSelectionContract"] = {
+                key: semantic_selection_contract.get(key)
+                for key in ["verified", "selectedRefs", "selectedMetrics", "provenance"]
+                if semantic_selection_contract.get(key) not in (None, "", [], {})
+            }
         if compact_retry:
             payload["_compactRetry"] = True
         if use_tool_loop:
@@ -3115,6 +3423,26 @@ class QueryGraphPlanner:
         prompt_tables = [str(item.get("table") or "") for item in catalog.get("tables") or [] if item.get("table")]
         table_limit = max(1, int(self.settings.agent_planner_seed_table_limit or 4))
         repair_feedback = planner_repair_feedback_for_understanding(gaps, prior_understanding or {})
+        semantic_selection = (
+            (planner_context or {}).get("semanticSelectionContract")
+            or (planner_context or {}).get("semantic_selection_contract")
+            or {}
+        )
+        semantic_selection = semantic_selection if isinstance(semantic_selection, dict) else {}
+        compact_selection = {
+            key: semantic_selection.get(key)
+            for key in [
+                "status",
+                "verified",
+                "selectedRefs",
+                "selectedMetrics",
+                "planningContract",
+                "queryContract",
+                "reason",
+                "provenance",
+            ]
+            if semantic_selection.get(key) not in (None, "", [], {})
+        }
         payload = {
             "question": question,
             "semanticCatalog": catalog,
@@ -3136,6 +3464,8 @@ class QueryGraphPlanner:
                     else "anchorMetric/supportMetrics.metricRef must come from semanticCatalog.candidateMetrics.key"
                 ),
                 "ownerTableRule": "ownerTable must equal the selected metric table",
+                "resultModeRule": "every supportMetrics item must declare resultMode; use metric for a governed aggregate and detail only when row-level records are explicitly requested",
+                "evidenceModeRule": "every requiredEvidenceIntents item must declare evidenceMode; only evidenceMode=detail may create a row-level DETAIL branch",
                 "metricOnlyCatalogRule": "candidateMetrics may be present while tables is empty; select metricRef/ownerTable from candidateMetrics first, and rely on semantic_read/on-demand expansion only when table schema, formula detail, or relationships are needed",
                 "knowledgeGapRule": "knowledgeRequestGaps are authoritative failed supplemental recalls; do not repeat the same request, either plan with available semanticCatalog evidence or leave the unsupported part as a structured gap",
                 "scopeRule": "business population limits such as 'within a selected set' must be declared in scopeConstraints and compiled before ranking/measures",
@@ -3150,10 +3480,17 @@ class QueryGraphPlanner:
                     "metric from a business keyword"
                 ),
                 "repairRule": "if repairFeedback is non-empty, fix questionUnderstanding according to it; do not repeat an invalid numerator/denominator pair",
+                "semanticSelectionRule": (
+                    "semanticSelectionContract contains verified metric identities selected by the previous stage; preserve every selected metric in anchorMetric/supportMetrics, read those exact refs when details are needed, and never replace them with a near-name candidate"
+                    if compact_selection.get("verified")
+                    else "semanticSelectionContract is advisory unless verified=true"
+                ),
                 "analysisRule": "analysisIntent none => requiresExplanation false and requiredEvidenceIntents []; otherwise include evidence intents",
                 "skillWorkflowRule": "skill matching is owned by the Lead Agent from dynamically loaded skill headers, not by this Planner",
             },
         }
+        if compact_selection:
+            payload["semanticSelectionContract"] = compact_selection
         if include_full_file_context:
             payload["semanticWorkspace"] = compact_semantic_workspace_for_prompt(
                 semantic_workspace_manifest_from_asset_pack(
@@ -3213,7 +3550,47 @@ class QueryGraphPlanner:
         loaded_refs: List[str] = []
         final_payload: Dict[str, Any] = {}
         round_prompt_stats: List[Dict[str, Any]] = []
-        for round_index in range(max(1, self.settings.agent_planner_tool_rounds)):
+        invalid_output_attempts: List[Dict[str, Any]] = []
+        base_rounds = max(1, self.settings.agent_planner_tool_rounds)
+        invalid_retry_budget = max(
+            0,
+            int(getattr(self.settings, "agent_planner_invalid_output_retries", 1) or 0),
+        )
+
+        def record_invalid_output(
+            round_number: int,
+            reason: str,
+            errors: List[str],
+            result: Dict[str, Any],
+        ) -> None:
+            attempt = {
+                "round": round_number,
+                "reason": reason,
+                "validationErrors": list(errors)[:12],
+                "toolNames": [
+                    str(item.get("name") or "")
+                    for item in result.get("toolCalls") or []
+                    if isinstance(item, dict) and item.get("name")
+                ],
+                "contentPreview": str(result.get("content") or "")[:800],
+            }
+            invalid_output_attempts.append(attempt)
+            planner_tool_results.append(
+                {
+                    "id": "planner_invalid_output_%d" % round_number,
+                    "name": "planner_structured_output_validator",
+                    "status": "error",
+                    "errorType": "INVALID_STRUCTURED_OUTPUT",
+                    "errorMessage": reason,
+                    "round": round_number,
+                    "result": attempt,
+                }
+            )
+
+        max_possible_rounds = base_rounds + invalid_retry_budget
+        for round_index in range(max_possible_rounds):
+            if round_index >= base_rounds + min(len(invalid_output_attempts), invalid_retry_budget):
+                break
             round_payload = dict(user_payload)
             filesystem_policy = round_payload.get("filesystemContextPolicy") or {}
             filesystem_entry = str(filesystem_policy.get("entry") or "")
@@ -3235,7 +3612,7 @@ class QueryGraphPlanner:
             round_payload["plannerToolResults"] = []
             round_payload["plannerToolPolicy"] = {
                 "round": round_index + 1,
-                "maxRounds": self.settings.agent_planner_tool_rounds,
+                "maxRounds": max_possible_rounds,
                 "instruction": planner_tool_instruction,
                 "forceCatalog": force_catalog,
             }
@@ -3253,6 +3630,12 @@ class QueryGraphPlanner:
                         for schema in select_tool_schemas(file_tool_defs, loaded_tool_names)
                     ],
                 ]
+            force_structured_output = bool(
+                round_index >= base_rounds - 1
+                or (invalid_output_attempts and loaded_refs)
+            )
+            if force_structured_output:
+                round_payload["plannerToolPolicy"]["requiredTerminalTool"] = output_tool.name
             round_payload, round_stats = self._fit_planner_tool_round_prompt(
                 system_prompt,
                 round_payload,
@@ -3282,6 +3665,18 @@ class QueryGraphPlanner:
                 tools,
                 {"content": "", "toolCalls": []},
                 timeout_seconds=self.settings.llm_planner_timeout_seconds,
+                tool_choice=output_tool.name if force_structured_output else None,
+            )
+            self.artifact_store.write_json(
+                "planner",
+                "planner_round_%d_response.json" % (round_index + 1),
+                {
+                    "content": str(result.get("content") or ""),
+                    "toolCalls": list(result.get("toolCalls") or []),
+                    "forcedTool": output_tool.name if force_structured_output else "",
+                    "lastError": str(getattr(self.llm, "last_error", "") or ""),
+                },
+                preview_chars=0,
             )
             if not result.get("content") and not result.get("toolCalls") and planner_llm_terminal_error(self.llm.last_error):
                 return {}
@@ -3301,7 +3696,20 @@ class QueryGraphPlanner:
                         }
                     )
                     continue
-                final_payload = dict(emit_call.args)
+                candidate_payload = normalize_question_understanding_payload(dict(emit_call.args))
+                validation_errors = planner_structured_output_validation_errors(
+                    candidate_payload,
+                    output_tool.parameters,
+                )
+                if validation_errors:
+                    record_invalid_output(
+                        round_index + 1,
+                        "emit_question_understanding arguments failed schema validation",
+                        validation_errors,
+                        result,
+                    )
+                    continue
+                final_payload = candidate_payload
                 break
             load_schema_calls = [call for call in calls if call.name == loader_tool.name]
             if load_schema_calls:
@@ -3357,22 +3765,49 @@ class QueryGraphPlanner:
                 continue
             parsed = parse_json_object(str(result.get("content") or ""))
             if parsed:
+                parsed = normalize_question_understanding_payload(parsed)
+                validation_errors = planner_structured_output_validation_errors(parsed, output_tool.parameters)
+                if validation_errors:
+                    record_invalid_output(
+                        round_index + 1,
+                        "JSON content failed emit_question_understanding schema validation",
+                        validation_errors,
+                        result,
+                    )
+                    continue
                 final_payload = parsed
                 break
-            if round_index == 0:
-                return {}
+            record_invalid_output(
+                round_index + 1,
+                "Planner returned neither a recognized terminal tool call nor valid JSON",
+                ["$: emit_question_understanding output is required"],
+                result,
+            )
         if not final_payload:
             policy_blocked = any(
                 str(item.get("errorType") or "") == "SEMANTIC_READ_REQUIRED"
                 for item in planner_tool_results
                 if isinstance(item, dict)
             )
-            if not policy_blocked:
+            if invalid_output_attempts:
+                final_payload = {
+                    "status": "INVALID",
+                    "reason": "PLANNER_INVALID_STRUCTURED_OUTPUT",
+                    "_plannerInvalidOutput": {
+                        "reason": str(invalid_output_attempts[-1].get("reason") or "output contract validation failed"),
+                        "attempts": invalid_output_attempts,
+                        "retryBudget": invalid_retry_budget,
+                    },
+                }
+            elif not policy_blocked:
                 return {}
-            final_payload = {
-                "status": "NEED_MORE_KNOWLEDGE",
-                "reason": "SEMANTIC_READ_REQUIRED: planner attempted to emit from the L0 index without reading selected semantic refs",
-            }
+            else:
+                final_payload = {
+                    "status": "NEED_MORE_KNOWLEDGE",
+                    "reason": "SEMANTIC_READ_REQUIRED: planner attempted to emit from the L0 index without reading selected semantic refs",
+                }
+        if invalid_output_attempts:
+            final_payload["_plannerInvalidOutputAttempts"] = invalid_output_attempts
         final_payload["_plannerToolCalls"] = planner_tool_calls
         final_payload["_plannerToolResults"] = planner_tool_results
         final_payload["_plannerLoadedRefs"] = sorted(set(loaded_refs))
@@ -3640,7 +4075,13 @@ class PlannerReflectionAgent:
         for gap in QueryGraphContractValidator().validate(plan, asset_pack):
             issues.append(critic_issue_from_gap(gap))
             suggested_actions.extend(critic_actions_for_gap(gap.code))
-            if gap.code in {"REQUESTED_MEASURE_NOT_PLANNED", "OBJECTIVE_NOT_COMPILED"}:
+            if gap.code in {
+                "REQUESTED_MEASURE_NOT_PLANNED",
+                "OBJECTIVE_NOT_COMPILED",
+                "METRIC_OBLIGATION_AMBIGUOUS",
+                "METRIC_OBLIGATION_UNRESOLVED",
+                "METRIC_OBLIGATION_NOT_PLANNED",
+            }:
                 suggested_requests.append(
                     KnowledgeRequest(
                         type=KnowledgeRequestType.METRIC,
@@ -3840,7 +4281,7 @@ class PlannerReflectionAgent:
             for gap in sanity_gaps:
                 suggested_actions.extend(critic_actions_for_gap(gap.code))
             repair_hints.append("repair QueryGraph graph roles/dependencies so business intent is naturally represented")
-        alignment_issues = business_graph_alignment_issues(plan, asset_pack)
+        alignment_issues = business_graph_alignment_issues(plan, asset_pack, question=question)
         if alignment_issues:
             issues.extend(alignment_issues)
             suggested_actions.extend(["repair_graph", "plan_graph"])
@@ -3890,6 +4331,17 @@ def append_prompt_trace(plan: QueryPlan, payload: Dict[str, Any]) -> None:
         plan.agent_trace.append("planner.semantic_tool_loop=enabled")
     if payload.get("_plannerLoadedRefs"):
         plan.agent_trace.append("planner.loaded_refs=%s" % ",".join(str(item) for item in payload.get("_plannerLoadedRefs") or []))
+    if payload.get("_plannerInvalidOutputAttempts"):
+        plan.agent_trace.append(
+            "planner.invalid_structured_output_attempts=%d"
+            % len(payload.get("_plannerInvalidOutputAttempts") or [])
+        )
+    selection_contract = payload.get("_semanticSelectionContract") or {}
+    if isinstance(selection_contract, dict) and selection_contract.get("verified"):
+        plan.agent_trace.append(
+            "planner.semantic_selection_handoff=%s"
+            % ",".join(str(item) for item in selection_contract.get("selectedRefs") or [])
+        )
 
 
 def attach_planner_tool_trace(plan: QueryPlan, payload: Dict[str, Any]) -> None:
@@ -4473,6 +4925,7 @@ class QueryGraphContractValidator:
     def validate(self, plan: QueryPlan, asset_pack: PlanningAssetPack) -> List[GraphValidationGap]:
         contract = QuestionGraphContract.from_understanding(plan.question_understanding or {})
         gaps: List[GraphValidationGap] = []
+        gaps.extend(metric_obligation_validation_gaps(plan, asset_pack))
         gaps.extend(self._metric_obligation_gaps(contract, plan, asset_pack))
         gaps.extend(self._scope_obligation_gaps(contract, plan, asset_pack))
         gaps.extend(self._detail_evidence_gaps(plan, asset_pack))
@@ -4697,7 +5150,12 @@ def critic_actions_for_gap(code: str) -> List[str]:
         return ["retrieve_knowledge", "plan_graph"]
     if code in {"MISSING_REQUIRED_FIELD_EVIDENCE"}:
         return ["repair_graph"]
-    if code in {"REQUESTED_MEASURE_NOT_PLANNED"}:
+    if code in {
+        "REQUESTED_MEASURE_NOT_PLANNED",
+        "METRIC_OBLIGATION_AMBIGUOUS",
+        "METRIC_OBLIGATION_UNRESOLVED",
+        "METRIC_OBLIGATION_NOT_PLANNED",
+    }:
         return ["retrieve_knowledge", "plan_graph"]
     if code in {"MEMORY_CONSTRAINT_UNAPPLIED"}:
         return ["plan_graph"]
@@ -4900,6 +5358,7 @@ class QueryGraphValidator:
                 )
             )
         gaps.extend(metric_candidate_decision_gaps(plan, asset_pack))
+        gaps.extend(metric_obligation_validation_gaps(plan, asset_pack))
         gaps.extend(explicit_object_ref_filter_gaps(question, plan, asset_pack))
         gaps.extend(calculation_contract_gaps(plan))
         gaps.extend(group_by_semantic_contract_gaps(plan, asset_pack))
@@ -5881,6 +6340,8 @@ def compact_active_planner_round_payload(payload: Dict[str, Any]) -> Dict[str, A
             "maxRounds": planner_policy.get("maxRounds"),
             "policy": "Use the exact semantic reads below, then emit or fail closed.",
         }
+        if planner_policy.get("requiredTerminalTool"):
+            compact["plannerToolPolicy"]["requiredTerminalTool"] = planner_policy.get("requiredTerminalTool")
     filesystem_policy = compact.get("filesystemContextPolicy")
     if isinstance(filesystem_policy, dict):
         compact["filesystemContextPolicy"] = {
@@ -6346,6 +6807,18 @@ def recalled_metric_entry_from_evidence(evidence_items: List[Dict[str, Any]], id
                 "formula": str(evidence.get("formula") or ""),
                 "canonicalMetricKey": str(evidence.get("canonicalMetricKey") or ""),
                 "metricLevel": str(evidence.get("metricLevel") or ""),
+                "metricGrain": str(evidence.get("metricGrain") or ""),
+                "metricIntent": str(evidence.get("metricIntent") or ""),
+                "aggregationPolicy": str(evidence.get("aggregationPolicy") or ""),
+                "applicableTimeGrain": str(evidence.get("applicableTimeGrain") or ""),
+                "timeColumn": str(evidence.get("timeColumn") or ""),
+                "timeSemantics": dict(evidence.get("timeSemantics") or {}),
+                "missingValuePolicy": str(evidence.get("missingValuePolicy") or ""),
+                "zeroValueMeaning": str(evidence.get("zeroValueMeaning") or ""),
+                "selectionGuidance": str(evidence.get("selectionGuidance") or ""),
+                "preferredUseCases": list(evidence.get("preferredUseCases") or []),
+                "notPreferredUseCases": list(evidence.get("notPreferredUseCases") or []),
+                "temporalVariants": dict(evidence.get("temporalVariants") or {}),
                 "fusionScore": float(evidence.get("fusionScore") or 0.0),
             },
         )
@@ -6416,11 +6889,20 @@ GRAPH_ROLE_SCOPE_POPULATION = "scope_population"
 GRAPH_ROLE_DERIVED_COMPUTE = "derived_compute"
 
 
-def promote_more_specific_ranking_understanding(understanding: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+def promote_more_specific_ranking_understanding(
+    understanding: Dict[str, Any],
+    question: str = "",
+    asset_pack: PlanningAssetPack | None = None,
+) -> Tuple[Dict[str, Any], List[str]]:
     ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
     if not isinstance(ranking, dict):
         return understanding, []
-    promoted = more_specific_requested_measure_than_ranking(ranking, understanding)
+    promoted = more_specific_requested_measure_than_ranking(
+        ranking,
+        understanding,
+        question=question,
+        asset_pack=asset_pack,
+    )
     if not promoted:
         return understanding, []
     updated = deepcopy(understanding)
@@ -6495,7 +6977,12 @@ def allow_phrase_override_for_understanding_metric(
 def compile_query_graph_from_understanding(question: str, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
     if not isinstance(understanding, dict):
         return QueryPlan(agent_trace=["planner.understanding_compile.invalid_payload"], compiler_trace=["INVALID_UNDERSTANDING"])
-    understanding, precompile_trace = promote_more_specific_ranking_understanding(understanding)
+    understanding = freeze_metric_obligation_ledger(understanding, asset_pack)
+    understanding, precompile_trace = promote_more_specific_ranking_understanding(
+        understanding,
+        question=question,
+        asset_pack=asset_pack,
+    )
     ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
     if not isinstance(ranking, dict):
         return QueryPlan(
@@ -6767,7 +7254,13 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
                 grain=semantic_fast_path_grain("", group_by, asset_pack, metric.table) or grain,
                 group_by=group_by,
                 depends_on=[],
-                limit=20,
+                limit=requested_measure_sibling_limit(
+                    understanding,
+                    anchor,
+                    graph_contract,
+                    metric,
+                    asset_pack,
+                ),
                 asset_pack=asset_pack,
                 metric_resolution=metric_resolution.payload(),
             )
@@ -7000,7 +7493,7 @@ def requested_measure_graph_contract(
         graph_role = GRAPH_ROLE_SIBLING_METRIC
     elif scope_context:
         graph_role = GRAPH_ROLE_DEPENDENT_METRIC
-    elif primary_metric_produces_filter_set(ranking, anchor, grain):
+    elif primary_metric_produces_filter_set(ranking, anchor, grain, asset_pack):
         graph_role = GRAPH_ROLE_DEPENDENT_METRIC
     else:
         graph_role = GRAPH_ROLE_SIBLING_METRIC
@@ -7027,8 +7520,16 @@ def requested_measure_is_independent_baseline(metric: Any, ranking: Dict[str, An
     return semantic_role in {"baseline", "comparison_baseline", "context"} or graph_role == "sibling_metric"
 
 
-def primary_metric_produces_filter_set(ranking: Dict[str, Any], anchor: QuestionIntent, grain: str) -> bool:
+def primary_metric_produces_filter_set(
+    ranking: Dict[str, Any],
+    anchor: QuestionIntent,
+    grain: str,
+    asset_pack: PlanningAssetPack | None = None,
+) -> bool:
     objective = str(ranking.get("objectiveType") or ranking.get("objective_type") or ranking.get("type") or "").lower()
+    group_by = anchor.group_by_column or str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "")
+    if group_by and asset_pack and semantic_role_for_column(asset_pack, anchor.preferred_table, group_by) in {"TIME", "PARTITION"}:
+        return False
     if objective in {"metric_total", "total", "metric", "trend_anchor", "trend", "time_series"}:
         return False
     if objective == "detail_anchor":
@@ -7041,7 +7542,6 @@ def primary_metric_produces_filter_set(ranking: Dict[str, Any], anchor: Question
     ranking_like = objective in {"ranking", "top", "topn", "rank", "highest", "lowest"} or order in {"asc", "desc"} or limit > 0
     if not ranking_like:
         return False
-    group_by = anchor.group_by_column or str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "")
     if not group_by:
         return False
     if "producesFilterSet" in ranking or "produces_filter_set" in ranking:
@@ -7051,6 +7551,32 @@ def primary_metric_produces_filter_set(ranking: Dict[str, Any], anchor: Question
         + anchor.required_evidence
         + [anchor.group_by_column, anchor.filter_column]
     )
+
+
+def requested_measure_sibling_limit(
+    understanding: Dict[str, Any],
+    anchor: QuestionIntent,
+    contract: GraphMetricContract,
+    metric: Any,
+    asset_pack: PlanningAssetPack,
+) -> int:
+    default_limit = 20
+    group_by = str(contract.group_by_column or "")
+    if not group_by or semantic_role_for_column(asset_pack, metric.table, group_by) not in {"TIME", "PARTITION"}:
+        return default_limit
+    raw_range = understanding.get("timeRange") or understanding.get("time_range") or {}
+    raw_range = raw_range if isinstance(raw_range, dict) else {}
+    try:
+        window_days = int(
+            understanding.get("timeWindowDays")
+            or understanding.get("time_window_days")
+            or raw_range.get("days")
+            or anchor.days
+            or 0
+        )
+    except (TypeError, ValueError):
+        window_days = 0
+    return max(default_limit, window_days)
 
 
 def requested_measure_group_by_for_contract(
@@ -7081,6 +7607,8 @@ def finalize_compiled_query_plan(
     understanding: Dict[str, Any],
     asset_pack: PlanningAssetPack,
 ) -> QueryPlan:
+    understanding = freeze_metric_obligation_ledger(understanding, asset_pack)
+    plan = plan.model_copy(update={"question_understanding": understanding})
     compiled = sync_intent_dependencies(plan)
     compiled = apply_understanding_filters(compiled, understanding, asset_pack)
     compiled = annotate_explicit_object_ref_contract(question, compiled, asset_pack)
@@ -9224,10 +9752,398 @@ def longest_shared_text_span(left: str, right: str, max_size: int = 8) -> int:
     return 0
 
 
+def freeze_metric_obligation_ledger(
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> Dict[str, Any]:
+    """Freeze user metric phrases before any selector/planner reduction.
+
+    The phrase identity is derived only from the original metric phrase stream;
+    later Planner or Repair payloads may refine a decision but cannot remove an
+    obligation.  Matching a decision back to an obligation is deliberately
+    exact after normalization: name containment is not semantic evidence.
+    """
+
+    if not isinstance(understanding, dict):
+        return {}
+    updated = deepcopy(understanding)
+    existing_raw = updated.get("metricObligations") or updated.get("metric_obligations") or []
+    existing = [item for item in existing_raw if isinstance(item, dict)] if isinstance(existing_raw, list) else []
+    phrases = frozen_metric_obligation_phrases(updated, asset_pack, existing)
+    if not phrases:
+        updated["metricObligations"] = []
+        return updated
+
+    existing_by_id = {
+        str(item.get("obligationId") or item.get("obligation_id") or ""): item
+        for item in existing
+        if str(item.get("obligationId") or item.get("obligation_id") or "")
+    }
+    occurrence_by_phrase: Dict[str, int] = {}
+    obligations: List[Dict[str, Any]] = []
+    for source_index, phrase in enumerate(phrases):
+        normalized = normalize_metric_phrase(phrase)
+        occurrence = occurrence_by_phrase.get(normalized, 0)
+        occurrence_by_phrase[normalized] = occurrence + 1
+        obligation_id = stable_metric_obligation_id(normalized, occurrence)
+        previous = existing_by_id.get(obligation_id) or existing_metric_obligation_for_phrase(
+            existing,
+            normalized,
+            occurrence,
+        )
+        obligation = resolve_metric_obligation_decision(
+            obligation_id=obligation_id,
+            source_phrase=phrase,
+            normalized_phrase=normalized,
+            source_index=source_index,
+            understanding=updated,
+            asset_pack=asset_pack,
+            previous=previous,
+        )
+        obligations.append(obligation.model_dump(by_alias=True))
+    updated["originalMetricPhrases"] = list(phrases)
+    updated["metricObligations"] = obligations
+    updated.pop("metric_obligations", None)
+    return updated
+
+
+def frozen_metric_obligation_phrases(
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+    existing: List[Dict[str, Any]],
+) -> List[str]:
+    fast = (
+        (asset_pack.metric_compaction or {}).get("fastUnderstanding")
+        or (asset_pack.metric_compaction or {}).get("fast_understanding")
+        or {}
+    )
+    def phrases_from(source: Dict[str, Any]) -> List[str]:
+        for key in ["originalMetricPhrases", "original_metric_phrases", "metricPhrases", "metric_phrases"]:
+            raw = source.get(key)
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, list) and raw:
+                return [str(item).strip() for item in raw if str(item or "").strip()]
+        return []
+
+    fast_phrases = phrases_from(fast if isinstance(fast, dict) else {})
+    if fast_phrases:
+        return fast_phrases
+    existing_phrases = [
+        str(item.get("sourcePhrase") or item.get("source_phrase") or "").strip()
+        for item in existing
+        if str(item.get("sourcePhrase") or item.get("source_phrase") or "").strip()
+    ]
+    if existing_phrases:
+        return existing_phrases
+    return phrases_from(understanding)
+
+
+def stable_metric_obligation_id(normalized_phrase: str, occurrence: int) -> str:
+    digest = hashlib.sha256(
+        ("metric-obligation:v1:%s:%s" % (normalized_phrase, occurrence)).encode("utf-8")
+    ).hexdigest()[:16]
+    return "metric-obligation-%s" % digest
+
+
+def existing_metric_obligation_for_phrase(
+    existing: List[Dict[str, Any]],
+    normalized_phrase: str,
+    occurrence: int,
+) -> Dict[str, Any] | None:
+    matches = [
+        item
+        for item in existing
+        if normalize_metric_phrase(
+            item.get("normalizedPhrase")
+            or item.get("normalized_phrase")
+            or item.get("sourcePhrase")
+            or item.get("source_phrase")
+            or ""
+        )
+        == normalized_phrase
+    ]
+    return matches[occurrence] if occurrence < len(matches) else None
+
+
+def resolve_metric_obligation_decision(
+    obligation_id: str,
+    source_phrase: str,
+    normalized_phrase: str,
+    source_index: int,
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+    previous: Dict[str, Any] | None = None,
+) -> MetricObligation:
+    selected: List[MetricObligationBinding] = []
+    for item in requested_metric_items_from_understanding(understanding, include_ranking=True):
+        if not metric_item_matches_obligation(item, obligation_id, normalized_phrase):
+            continue
+        binding = metric_obligation_binding(item)
+        if binding.metric_ref and binding not in selected:
+            selected.append(binding)
+
+    decisions = metric_candidate_decisions_for_obligation(
+        understanding,
+        obligation_id,
+        normalized_phrase,
+    )
+    for decision in decisions:
+        binding = metric_obligation_binding(decision)
+        if binding.metric_ref and binding not in selected:
+            selected.append(binding)
+
+    previous_bindings = (previous or {}).get("selectedMetrics") or (previous or {}).get("selected_metrics") or []
+    if not selected and isinstance(previous_bindings, list):
+        for item in previous_bindings:
+            if not isinstance(item, dict):
+                continue
+            try:
+                binding = MetricObligationBinding.model_validate(item)
+            except Exception:
+                continue
+            if binding.metric_ref and binding not in selected:
+                selected.append(binding)
+
+    candidate_refs, recall_ambiguous = recalled_metric_candidates_for_obligation(
+        source_phrase,
+        asset_pack,
+    )
+    for decision in decisions:
+        for key in [
+            "candidateRefs",
+            "candidate_refs",
+            "candidateIds",
+            "candidate_ids",
+            "rejectedCandidateIds",
+            "rejected_candidate_ids",
+        ]:
+            raw = decision.get(key) or []
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, list):
+                candidate_refs.extend(str(item) for item in raw if str(item or ""))
+        direct_ref = str(
+            decision.get("selectedCandidateId")
+            or decision.get("selected_candidate_id")
+            or decision.get("semanticRefId")
+            or decision.get("semantic_ref_id")
+            or ""
+        )
+        if direct_ref:
+            candidate_refs.append(direct_ref)
+    if previous:
+        candidate_refs.extend(
+            str(item)
+            for item in previous.get("candidateRefs") or previous.get("candidate_refs") or []
+            if str(item or "")
+        )
+    candidate_refs = dedupe_strings(candidate_refs)
+
+    explicit_decisions = {
+        str(item.get("decision") or item.get("status") or "").strip().lower()
+        for item in decisions
+    }
+    explicitly_ambiguous = bool(
+        explicit_decisions
+        & {"ambiguous", "ask_human", "need_clarification", "multiple_candidates"}
+    )
+    explicitly_unresolved = bool(
+        explicit_decisions
+        & {"unresolved", "unsupported", "missing", "not_selected"}
+    )
+    if explicitly_ambiguous:
+        decision = MetricObligationDecision.AMBIGUOUS
+        reason = "multiple semantic candidates require an explicit selection"
+    elif selected:
+        decision = MetricObligationDecision.SELECTED
+        reason = "metric obligation has an explicit structured selection"
+    elif recall_ambiguous or len(candidate_refs) > 1:
+        decision = MetricObligationDecision.AMBIGUOUS
+        reason = "multiple recalled semantic candidates remain"
+    elif explicitly_unresolved:
+        decision = MetricObligationDecision.UNRESOLVED
+        reason = "planner explicitly left this metric obligation unresolved"
+    else:
+        previous_decision = str((previous or {}).get("decision") or "").strip().lower()
+        if previous_decision == MetricObligationDecision.AMBIGUOUS.value:
+            decision = MetricObligationDecision.AMBIGUOUS
+            reason = str((previous or {}).get("reason") or "metric obligation remains ambiguous")
+        else:
+            decision = MetricObligationDecision.UNRESOLVED
+            reason = str((previous or {}).get("reason") or "no explicit metric selection covers this obligation")
+
+    return MetricObligation(
+        obligation_id=obligation_id,
+        source_phrase=source_phrase,
+        normalized_phrase=normalized_phrase,
+        source_index=source_index,
+        decision=decision,
+        selected_metrics=selected,
+        candidate_refs=candidate_refs,
+        reason=reason,
+    )
+
+
+def metric_item_matches_obligation(
+    item: Dict[str, Any],
+    obligation_id: str,
+    normalized_phrase: str,
+) -> bool:
+    declared_id = str(item.get("obligationId") or item.get("obligation_id") or "")
+    if declared_id:
+        return declared_id == obligation_id
+    source_phrase = normalize_metric_phrase(
+        item.get("sourcePhrase")
+        or item.get("source_phrase")
+        or item.get("phrase")
+        or ""
+    )
+    return bool(source_phrase and source_phrase == normalized_phrase)
+
+
+def metric_obligation_binding(item: Dict[str, Any]) -> MetricObligationBinding:
+    return MetricObligationBinding(
+        metric_ref=str(
+            item.get("resolvedMetricRef")
+            or item.get("resolved_metric_ref")
+            or item.get("selectedMetricRef")
+            or item.get("selected_metric_ref")
+            or item.get("metricRef")
+            or item.get("metric_ref")
+            or ""
+        ),
+        owner_table=str(
+            item.get("resolvedOwnerTable")
+            or item.get("resolved_owner_table")
+            or item.get("selectedOwnerTable")
+            or item.get("selected_owner_table")
+            or item.get("ownerTable")
+            or item.get("owner_table")
+            or ""
+        ),
+        semantic_ref_id=str(
+            item.get("semanticRefId")
+            or item.get("semantic_ref_id")
+            or item.get("selectedCandidateId")
+            or item.get("selected_candidate_id")
+            or ""
+        ),
+    )
+
+
+def metric_candidate_decisions_for_obligation(
+    understanding: Dict[str, Any],
+    obligation_id: str,
+    normalized_phrase: str,
+) -> List[Dict[str, Any]]:
+    raw = understanding.get("metricCandidateDecisions") or understanding.get("metric_candidate_decisions") or []
+    if not isinstance(raw, list):
+        return []
+    return [
+        item
+        for item in raw
+        if isinstance(item, dict)
+        and metric_item_matches_obligation(item, obligation_id, normalized_phrase)
+    ]
+
+
+def recalled_metric_candidates_for_obligation(
+    source_phrase: str,
+    asset_pack: PlanningAssetPack,
+) -> Tuple[List[str], bool]:
+    normalized = normalize_metric_phrase(source_phrase)
+    candidates: List[str] = []
+    ambiguous = False
+    identities: set[Tuple[str, str]] = set()
+    for evidence in (asset_pack.metric_compaction or {}).get("recalledMetricEvidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        labels = [
+            evidence.get("matchedMetricLabel"),
+            evidence.get("matchedExactMetricLabel"),
+            evidence.get("sourcePhrase"),
+        ]
+        if not any(normalize_metric_phrase(label) == normalized for label in labels if str(label or "").strip()):
+            continue
+        owner_table = str(evidence.get("ownerTable") or evidence.get("owner_table") or "")
+        metric_ref = str(evidence.get("metricKey") or evidence.get("metric_key") or "")
+        semantic_ref = str(evidence.get("semanticRefId") or evidence.get("semantic_ref_id") or "")
+        if metric_ref:
+            identities.add((owner_table, metric_ref))
+        candidate_ref = semantic_ref or ("%s.%s" % (owner_table, metric_ref) if metric_ref else "")
+        if candidate_ref:
+            candidates.append(candidate_ref)
+        ambiguous = ambiguous or bool(evidence.get("metricResolutionAmbiguous"))
+    return dedupe_strings(candidates), ambiguous or len(identities) > 1
+
+
+def metric_obligation_validation_gaps(
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+) -> List[GraphValidationGap]:
+    frozen = freeze_metric_obligation_ledger(plan.question_understanding or {}, asset_pack)
+    raw = frozen.get("metricObligations") or []
+    if not raw:
+        return []
+    planned_refs = planned_metric_refs(plan)
+    gaps: List[GraphValidationGap] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        phrase = str(item.get("sourcePhrase") or item.get("source_phrase") or "")
+        obligation_id = str(item.get("obligationId") or item.get("obligation_id") or "")
+        decision = str(item.get("decision") or "").strip().lower()
+        bindings = item.get("selectedMetrics") or item.get("selected_metrics") or []
+        if decision == MetricObligationDecision.AMBIGUOUS.value:
+            gaps.append(
+                GraphValidationGap(
+                    code="METRIC_OBLIGATION_AMBIGUOUS",
+                    evidence=phrase,
+                    reason="%s remains ambiguous; Planner must preserve the obligation and request a structured selection" % obligation_id,
+                )
+            )
+            continue
+        if decision != MetricObligationDecision.SELECTED.value:
+            gaps.append(
+                GraphValidationGap(
+                    code="METRIC_OBLIGATION_UNRESOLVED",
+                    evidence=phrase,
+                    reason="%s has no selected semantic metric; it cannot be silently removed from the plan" % obligation_id,
+                )
+            )
+            continue
+        covered = False
+        for binding in bindings if isinstance(bindings, list) else []:
+            if not isinstance(binding, dict):
+                continue
+            owner_table = str(binding.get("ownerTable") or binding.get("owner_table") or "")
+            metric_ref = str(binding.get("metricRef") or binding.get("metric_ref") or "")
+            semantic_ref = str(binding.get("semanticRefId") or binding.get("semantic_ref_id") or "")
+            if planned_metric_identity_covered(owner_table, metric_ref, planned_refs):
+                covered = True
+                break
+            if semantic_ref and (semantic_ref in planned_refs or (owner_table, semantic_ref) in planned_refs):
+                covered = True
+                break
+        if not covered:
+            gaps.append(
+                GraphValidationGap(
+                    code="METRIC_OBLIGATION_NOT_PLANNED",
+                    evidence=phrase,
+                    reason="%s is selected but no QueryGraph node or metricSpec executes its binding" % obligation_id,
+                )
+            )
+    return gaps
+
+
 def requested_metric_question_coverage_gaps(
     plan: QueryPlan,
     asset_pack: PlanningAssetPack,
 ) -> List[GraphValidationGap]:
+    obligation_gaps = metric_obligation_validation_gaps(plan, asset_pack)
+    if (freeze_metric_obligation_ledger(plan.question_understanding or {}, asset_pack).get("metricObligations") or []):
+        return obligation_gaps
     understanding = plan.question_understanding or {}
     phrases = original_requested_metric_phrases(understanding, asset_pack)
     structured_items = requested_metric_items_from_understanding(understanding, include_ranking=True)
@@ -11224,9 +12140,12 @@ def detail_evidence_requests_from_understanding(
             continue
         table = str(measure.get("ownerTable") or measure.get("owner_table") or "")
         source_phrase = str(measure.get("sourcePhrase") or measure.get("source_phrase") or "")
-        if table in table_names and table_detail_phrase_matches(table, source_phrase, asset_pack):
+        if table in table_names and requested_measure_is_detail_evidence(measure, asset_pack):
             requests.append((table, source_phrase))
     for item in required_evidence_intent_items(understanding):
+        evidence_mode = str(item.get("evidenceMode") or item.get("evidence_mode") or "").strip().lower()
+        if evidence_mode != "detail":
+            continue
         source_phrase = str(
             item.get("sourcePhrase")
             or item.get("source_phrase")
@@ -11236,7 +12155,7 @@ def detail_evidence_requests_from_understanding(
             or ""
         )
         for table in evidence_item_suggested_tables(item):
-            if table in table_names and table_detail_phrase_matches(table, source_phrase, asset_pack):
+            if table in table_names:
                 requests.append((table, source_phrase))
     return dedupe_detail_requests(requests)
 
@@ -11245,8 +12164,13 @@ def requested_measure_is_detail_evidence(measure: Dict[str, Any], asset_pack: Pl
     if not isinstance(measure, dict):
         return False
     table = str(measure.get("ownerTable") or measure.get("owner_table") or "")
-    source_phrase = str(measure.get("sourcePhrase") or measure.get("source_phrase") or "")
-    return bool(table and table_detail_phrase_matches(table, source_phrase, asset_pack))
+    result_mode = str(measure.get("resultMode") or measure.get("result_mode") or "").strip().lower()
+    if result_mode:
+        return bool(table and result_mode == "detail")
+    # Legacy persisted understandings did not carry resultMode.  A resolved
+    # ownerTable + metricRef is already a typed governed metric contract, so it
+    # must remain a metric instead of being reclassified from wording.
+    return False
 
 
 def detail_metric_contract_is_evidence(
@@ -11254,11 +12178,20 @@ def detail_metric_contract_is_evidence(
     understanding: Dict[str, Any],
     asset_pack: PlanningAssetPack,
 ) -> bool:
-    if not metric.owner_table or not metric.source_phrase:
-        return False
-    if not table_detail_phrase_matches(metric.owner_table, metric.source_phrase, asset_pack):
-        return False
-    return any(table == metric.owner_table for table, _ in detail_evidence_requests_from_understanding(understanding, asset_pack))
+    for measure in understanding.get("requestedMeasures") or understanding.get("requested_measures") or []:
+        if not isinstance(measure, dict) or not requested_measure_is_detail_evidence(measure, asset_pack):
+            continue
+        owner_table = str(measure.get("ownerTable") or measure.get("owner_table") or "")
+        metric_ref = str(
+            measure.get("resolvedMetricRef")
+            or measure.get("resolved_metric_ref")
+            or measure.get("metricRef")
+            or measure.get("metric_ref")
+            or ""
+        )
+        if owner_table == metric.owner_table and metric_ref == metric.metric_ref:
+            return True
+    return False
 
 
 def dedupe_detail_requests(requests: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
@@ -11271,44 +12204,6 @@ def dedupe_detail_requests(requests: List[Tuple[str, str]]) -> List[Tuple[str, s
         seen.add(key)
         deduped.append((table, source_phrase))
     return deduped
-
-
-def table_detail_phrase_matches(table: str, source_phrase: str, asset_pack: PlanningAssetPack) -> bool:
-    phrase = normalize_semantic_text(source_phrase)
-    if len(phrase) < 2:
-        return False
-    if not phrase_requests_detail_evidence(phrase):
-        return False
-    entry = next((item for item in asset_pack.tables if (item.table or item.key) == table), None)
-    if not entry or not table_is_detail_asset(entry):
-        return False
-    labels = table_semantic_labels(entry)
-    normalized_labels = [normalize_semantic_text(label) for label in labels if normalize_semantic_text(label)]
-    if any(phrase in label or label in phrase for label in normalized_labels):
-        return True
-    phrase_terms = semantic_phrase_terms(phrase)
-    if not phrase_terms:
-        return False
-    label_text = " ".join(normalized_labels)
-    matched = [term for term in phrase_terms if term in label_text]
-    return len(matched) >= min(2, len(phrase_terms))
-
-
-def phrase_requests_detail_evidence(normalized_phrase: str) -> bool:
-    if not normalized_phrase:
-        return False
-    detail_markers = [
-        "明细",
-        "流水",
-        "记录",
-        "列表",
-        "详情",
-        "信息",
-        "哪些",
-        "给我看",
-        "看一下",
-    ]
-    return any(marker in normalized_phrase for marker in detail_markers)
 
 
 def table_is_detail_asset(entry: PlanningAssetEntry) -> bool:
@@ -11961,9 +12856,26 @@ class SemanticMetricResolution:
                 "fieldWarning": self.field_warning,
                 "knowledgeRequests": [item.model_dump(by_alias=True) for item in self.knowledge_requests],
             }
-        metadata = getattr(metric, "metadata", {}) or {}
+        metadata = dict(getattr(metric, "metadata", {}) or {})
         source_columns = [str(item) for item in metadata.get("sourceColumns") or metadata.get("source_columns") or getattr(metric, "columns", []) or [] if item]
         formula = str(metadata.get("formula") or metadata.get("metricFormula") or metric_formula_for_entry(metric) or "")
+        time_semantics = metadata.get("timeSemantics") or metadata.get("time_semantics") or {}
+        if not isinstance(time_semantics, dict):
+            time_semantics = {}
+        missing_value_policy = str(
+            metadata.get("missingValuePolicy")
+            or metadata.get("missing_value_policy")
+            or time_semantics.get("missingDataPolicy")
+            or time_semantics.get("missing_data_policy")
+            or ""
+        )
+        zero_value_meaning = str(
+            metadata.get("zeroValueMeaning")
+            or metadata.get("zero_value_meaning")
+            or time_semantics.get("zeroValuePolicy")
+            or time_semantics.get("zero_value_policy")
+            or ""
+        )
         return seal_semantic_metric_resolution({
             "requestedMetricRef": self.requested_metric_ref,
             "sourcePhrase": self.source_phrase,
@@ -11978,8 +12890,12 @@ class SemanticMetricResolution:
             "naturalName": str(metadata.get("naturalName") or ""),
             "metricGrain": str(metadata.get("metricGrain") or ""),
             "metricIntent": str(metadata.get("metricIntent") or ""),
+            "timeColumn": str(metadata.get("timeColumn") or metadata.get("time_column") or ""),
             "aggregationPolicy": str(metadata.get("aggregationPolicy") or metadata.get("aggregation_policy") or ""),
             "applicableTimeGrain": str(metadata.get("applicableTimeGrain") or metadata.get("applicable_time_grain") or ""),
+            "timeSemantics": dict(time_semantics),
+            "missingValuePolicy": missing_value_policy,
+            "zeroValueMeaning": zero_value_meaning,
             "selectionGuidance": str(metadata.get("selectionGuidance") or ""),
             "confidence": self.confidence,
             "resolutionSource": self.resolution_source,
@@ -13767,7 +14683,11 @@ def anchor_mismatch_issue(plan: QueryPlan) -> Dict[str, Any]:
     return {}
 
 
-def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPack) -> List[Dict[str, Any]]:
+def business_graph_alignment_issues(
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+    question: str = "",
+) -> List[Dict[str, Any]]:
     if not plan or not plan.intents:
         return []
     issues: List[Dict[str, Any]] = []
@@ -13803,7 +14723,12 @@ def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPa
                     "reason": "rankingObjective metric is compiled only behind an unrelated dependency instead of root/scope-root",
                 }
             )
-        more_specific = more_specific_requested_measure_than_ranking(ranking, plan.question_understanding or {})
+        more_specific = more_specific_requested_measure_than_ranking(
+            ranking,
+            plan.question_understanding or {},
+            question=question,
+            asset_pack=asset_pack,
+        )
         if more_specific:
             issues.append(
                 {
@@ -13892,7 +14817,12 @@ def root_metric_task_is_aligned(intent: QuestionIntent, scope_tasks: set[str], d
     return bool(ancestors & scope_tasks)
 
 
-def more_specific_requested_measure_than_ranking(ranking: Dict[str, Any], understanding: Dict[str, Any]) -> Dict[str, Any]:
+def more_specific_requested_measure_than_ranking(
+    ranking: Dict[str, Any],
+    understanding: Dict[str, Any],
+    question: str = "",
+    asset_pack: PlanningAssetPack | None = None,
+) -> Dict[str, Any]:
     ranking_metric = str(ranking.get("metricRef") or ranking.get("metric_ref") or "")
     ranking_table = str(ranking.get("ownerTable") or ranking.get("owner_table") or "")
     ranking_phrase = normalize_metric_match_text(ranking.get("sourcePhrase") or ranking.get("source_phrase") or "")
@@ -13915,8 +14845,95 @@ def more_specific_requested_measure_than_ranking(ranking: Dict[str, Any], unders
             continue
         if not (measure.get("semanticRefId") or measure.get("semantic_ref_id") or measure.get("completionSource") or measure.get("completion_source")):
             continue
+        if not metric_root_promotion_is_governed(
+            ranking,
+            measure,
+            question=question,
+            asset_pack=asset_pack,
+        ):
+            continue
         return measure
     return {}
+
+
+def metric_root_promotion_is_governed(
+    ranking: Dict[str, Any],
+    measure: Dict[str, Any],
+    question: str,
+    asset_pack: PlanningAssetPack | None,
+) -> bool:
+    """Require both question evidence and a published variant/refinement edge."""
+
+    if not asset_pack or not str(question or "").strip():
+        return False
+    base_table, base_ref = requested_metric_identity(ranking)
+    variant_table, variant_ref = requested_metric_identity(measure)
+    base = metric_entry_by_identity(asset_pack, base_table, base_ref)
+    variant = metric_entry_by_identity(asset_pack, variant_table, variant_ref)
+    if not base or not variant:
+        return False
+    source_phrase = normalize_metric_match_text(
+        measure.get("sourcePhrase") or measure.get("source_phrase") or ""
+    )
+    normalized_question = normalize_metric_match_text(question)
+    if not source_phrase or not explicit_metric_label_text_match(source_phrase, normalized_question):
+        return False
+    if not metric_explicitly_mentioned_in_question(variant, question):
+        return False
+    variant_refs = explicit_metric_relation_refs(
+        variant,
+        [
+            "variantOf",
+            "variant_of",
+            "refines",
+            "refinesMetric",
+            "refines_metric",
+            "linkedVariantOf",
+            "linked_variant_of",
+            "baseMetric",
+            "base_metric",
+        ],
+    )
+    if metric_reference_targets(variant, base, variant_refs):
+        return True
+    base_refs = explicit_metric_relation_refs(
+        base,
+        [
+            "variants",
+            "metricVariants",
+            "metric_variants",
+            "refinedBy",
+            "refined_by",
+            "temporalVariants",
+            "temporal_variants",
+        ],
+    )
+    return metric_reference_targets(base, variant, base_refs)
+
+
+def explicit_metric_relation_refs(metric: Any, keys: List[str]) -> set[str]:
+    metadata = getattr(metric, "metadata", {}) or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    refs: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                refs.add(value.strip())
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for child in value:
+                visit(child)
+
+    for source in [metadata, semantic]:
+        for key in keys:
+            if key in source:
+                visit(source.get(key))
+    return refs
 
 
 def repair_more_specific_root_metric(
@@ -13929,7 +14946,12 @@ def repair_more_specific_root_metric(
     ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
     if not isinstance(ranking, dict):
         return plan
-    promoted = more_specific_requested_measure_than_ranking(ranking, understanding)
+    promoted = more_specific_requested_measure_than_ranking(
+        ranking,
+        understanding,
+        question=question,
+        asset_pack=asset_pack,
+    )
     if not promoted:
         return plan
     updated = deepcopy(understanding)
@@ -14899,7 +15921,15 @@ def reflection_repair_reason(issues: List[Dict[str, Any]]) -> str:
         return "ANCHOR_MISMATCH"
     if "METRIC_RESOLUTION_NEEDED" in codes:
         return "METRIC_RESOLUTION_NEEDED"
-    if "REQUESTED_MEASURE_NOT_PLANNED" in codes:
+    if any(
+        code in codes
+        for code in {
+            "REQUESTED_MEASURE_NOT_PLANNED",
+            "METRIC_OBLIGATION_AMBIGUOUS",
+            "METRIC_OBLIGATION_UNRESOLVED",
+            "METRIC_OBLIGATION_NOT_PLANNED",
+        }
+    ):
         return "METRIC_RESOLUTION_NEEDED"
     if "METRIC_RESOLUTION_AMBIGUOUS" in codes:
         return "METRIC_RESOLUTION_NEEDED"
@@ -14929,6 +15959,8 @@ def reflection_repair_reason(issues: List[Dict[str, Any]]) -> str:
     if "MISSING_ANALYSIS_EVIDENCE_CONTRACT" in codes:
         return "ANALYSIS_CONTRACT_MISSING"
     if "ANALYSIS_EVIDENCE_NOT_COVERED" in codes:
+        return "MISSING_REQUIRED_EVIDENCE"
+    if "DETAIL_EVIDENCE_NOT_PLANNED" in codes:
         return "MISSING_REQUIRED_EVIDENCE"
     return ""
 
@@ -15009,6 +16041,9 @@ def planner_repair_reason_for_issue(code: str) -> str:
     if code in {
         "METRIC_RESOLUTION_NEEDED",
         "REQUESTED_MEASURE_NOT_PLANNED",
+        "METRIC_OBLIGATION_AMBIGUOUS",
+        "METRIC_OBLIGATION_UNRESOLVED",
+        "METRIC_OBLIGATION_NOT_PLANNED",
         "METRIC_RESOLUTION_AMBIGUOUS",
         "METRIC_RESOLUTION_LOW_CONFIDENCE",
         "CALCULATION_NUMERATOR_MISSING",
@@ -15016,7 +16051,11 @@ def planner_repair_reason_for_issue(code: str) -> str:
         "CALCULATION_NUMERATOR_NOT_EVENT_METRIC",
     }:
         return "METRIC_RESOLUTION_NEEDED" if code != "METRIC_RESOLUTION_LOW_CONFIDENCE" else "METRIC_RESOLUTION_LOW_CONFIDENCE"
-    if code in {"MISSING_ANALYSIS_EVIDENCE_CONTRACT", "ANALYSIS_EVIDENCE_NOT_COVERED"}:
+    if code in {
+        "MISSING_ANALYSIS_EVIDENCE_CONTRACT",
+        "ANALYSIS_EVIDENCE_NOT_COVERED",
+        "DETAIL_EVIDENCE_NOT_PLANNED",
+    }:
         return "ANALYSIS_EVIDENCE_NOT_COVERED"
     if code == "FRESHNESS_RISK":
         return "FRESHNESS_GAP"
@@ -15410,7 +16449,12 @@ def missing_metric_dependencies(intent: QuestionIntent, asset_pack: PlanningAsse
 def knowledge_request_type_for_gap(gap: GraphValidationGap) -> KnowledgeRequestType:
     if gap.code == "PENDING_KNOWLEDGE_REQUEST" and str(gap.reason or "").startswith("CALCULATION_NUMERATOR_"):
         return KnowledgeRequestType.METRIC
-    if gap.code == "METRIC_RESOLUTION_LOW_CONFIDENCE":
+    if gap.code in {
+        "METRIC_RESOLUTION_LOW_CONFIDENCE",
+        "METRIC_OBLIGATION_AMBIGUOUS",
+        "METRIC_OBLIGATION_UNRESOLVED",
+        "METRIC_OBLIGATION_NOT_PLANNED",
+    }:
         return KnowledgeRequestType.METRIC
     if gap.code == "METRIC_RESOLUTION_AMBIGUOUS":
         return KnowledgeRequestType.METRIC
@@ -15435,6 +16479,9 @@ def validation_gap_should_request_knowledge(gap: GraphValidationGap) -> bool:
         "MISSING_RELATIONSHIP",
         "MISSING_METRIC_DEPENDENCY",
         "REQUESTED_MEASURE_NOT_PLANNED",
+        "METRIC_OBLIGATION_AMBIGUOUS",
+        "METRIC_OBLIGATION_UNRESOLVED",
+        "METRIC_OBLIGATION_NOT_PLANNED",
         "METRIC_RESOLUTION_NEEDED",
         "METRIC_RESOLUTION_LOW_CONFIDENCE",
         "METRIC_RESOLUTION_AMBIGUOUS",
@@ -16426,6 +17473,9 @@ def compact_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "dataType",
         "aggregationPolicy",
         "applicableTimeGrain",
+        "timeSemantics",
+        "missingValuePolicy",
+        "zeroValueMeaning",
         "selectionGuidance",
         "temporalVariants",
         "linkedVariantOf",

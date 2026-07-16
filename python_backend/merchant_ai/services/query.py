@@ -7,7 +7,8 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextvars import copy_context
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -41,6 +42,8 @@ from merchant_ai.models import (
     QueryPlan,
     QuestionIntent,
     ReActStep,
+    SnapshotAlignmentContract,
+    SnapshotSourceWindow,
     SqlDraftDecision,
     SqlRepairAttempt,
     SqlValidationResult,
@@ -78,7 +81,13 @@ from merchant_ai.services.query_contracts import (
     tenant_scope_binding_error,
 )
 from merchant_ai.services.repositories import DorisRepository
-from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution, semantic_metric_contract_issue
+from merchant_ai.services.semantic_metrics import (
+    metric_aggregation_policy,
+    metric_time_selection_policy,
+    seal_semantic_metric_resolution,
+    semantic_metric_contract_issue,
+    semantic_metric_temporal_contract_issue,
+)
 from merchant_ai.services.runtime_state import NodeTaskState, create_runtime_state_store, node_task_idempotency_key
 from merchant_ai.services.distributed_workers import DistributedSubAgentClient
 from merchant_ai.services.query_sql_binding import (
@@ -86,13 +95,14 @@ from merchant_ai.services.query_sql_binding import (
     append_note,
     bind_node_sql_parameters,
     blank_entity_value,
+    build_split_detail_sql_plan,
     has_merchant_filter_predicate,
     normalize_inclusive_relative_window_sql,
     parse_partition_date,
     partition_is_stale_for_near_realtime,
     quote_identifier,
     realtime_fallback_for_table,
-    split_detail_sql_by_time_windows,
+    split_window_coverage_contract,
     sql_has_bound_merchant_filter,
     sql_literal,
 )
@@ -109,6 +119,7 @@ from merchant_ai.services.query_security import (
 from merchant_ai.services.time_semantics import (
     CALENDAR_ANCHOR_POLICY,
     LATEST_PARTITION_ANCHOR_POLICY,
+    latest_as_of_partition_predicate_sql,
     latest_partition_window_predicate,
     time_window_contract_payload,
 )
@@ -123,6 +134,322 @@ from merchant_ai.services.tools import artifact_file_tool_definitions, canonical
 
 
 SQL_BUILTIN_IDENTIFIERS = {"current_date", "current_timestamp", "current_time", "curdate", "now"}
+
+
+def bind_runtime_snapshot_alignment(
+    plan: QueryPlan,
+    reports: List[FreshnessCheckResult],
+) -> SnapshotAlignmentContract:
+    """Bind every comparable node to one runtime snapshot.
+
+    Calendar/exact windows keep their resolved dates.  Relative windows that
+    use latest-partition semantics share the oldest latest partition across all
+    required sources, so no node can silently use a newer private window.
+    """
+
+    report_by_task = {report.task_id: report for report in reports if report.task_id}
+    candidates: List[Tuple[QuestionIntent, FreshnessCheckResult | None]] = []
+    latest_partition_dates: List[date] = []
+    for intent in plan.intents:
+        if intent.intent_type != IntentType.VALID or intent.answer_mode == AnswerMode.RULE:
+            continue
+        days = int(intent.days or getattr(intent.time_range, "days", 0) or 0)
+        has_resolved_window = bool(intent.time_range.start_date and intent.time_range.end_date)
+        if days <= 0 and not has_resolved_window:
+            continue
+        report = report_by_task.get(intent.plan_task_id)
+        candidates.append((intent, report))
+        if not runtime_window_uses_latest_partition(intent) or report is None:
+            continue
+        parsed = parse_partition_date(report.max_pt)
+        if parsed:
+            latest_partition_dates.append(parsed)
+
+    if not candidates:
+        return SnapshotAlignmentContract()
+
+    common_latest_anchor = min(latest_partition_dates) if latest_partition_dates else None
+    sources: List[SnapshotSourceWindow] = []
+    primary_anchors: Set[str] = set()
+    all_compatible = True
+    all_covered = True
+    any_relative = False
+    for intent, report in candidates:
+        days = max(1, int(intent.days or getattr(intent.time_range, "days", 0) or 1))
+        offset_days = max(0, int(getattr(intent.time_range, "offset_days", 0) or 0))
+        aggregation_policy = intent_metric_aggregation_policy(intent)
+        time_selection_policy = intent_metric_time_selection_policy(intent)
+        relative = runtime_window_uses_latest_partition(intent)
+        any_relative = any_relative or relative
+        requested_start = parse_partition_date(intent.time_range.start_date)
+        requested_end = parse_partition_date(intent.time_range.end_date)
+        if relative and common_latest_anchor:
+            effective_end = common_latest_anchor - timedelta(days=offset_days)
+            effective_start = (
+                effective_end
+                if time_selection_policy == "latest_as_of"
+                else effective_end - timedelta(days=days - 1)
+            )
+            execution_anchor_policy = "common_latest_partition"
+        elif requested_start and requested_end:
+            effective_start = requested_start
+            effective_end = requested_end
+            execution_anchor_policy = "resolved_calendar_window"
+        else:
+            effective_start = None
+            effective_end = None
+            execution_anchor_policy = ""
+
+        sample_value = str(getattr(report, "max_pt", "") or "")
+        execution_start = partition_execution_value(effective_start, sample_value) if effective_start else ""
+        execution_end = partition_execution_value(effective_end, sample_value) if effective_end else ""
+        compatible = bool(
+            effective_start
+            and effective_end
+            and report
+            and report.time_column
+            and report.table == intent.preferred_table
+        )
+        coverage_complete = (
+            source_covers_time_selection(
+                report,
+                effective_start,
+                effective_end,
+                time_selection_policy,
+            )
+            if compatible
+            else False
+        )
+        all_compatible = all_compatible and compatible
+        all_covered = all_covered and coverage_complete
+
+        if effective_start and effective_end:
+            intent.time_range = intent.time_range.model_copy(
+                update={
+                    "execution_start_date": effective_start.isoformat(),
+                    "execution_end_date": effective_end.isoformat(),
+                    "execution_start_value": execution_start,
+                    "execution_end_value": execution_end,
+                    "execution_anchor_policy": execution_anchor_policy,
+                }
+            )
+            if str(getattr(intent.time_range, "window_role", "") or "primary") == "primary":
+                primary_anchors.add(effective_end.isoformat())
+        if report is not None:
+            report.effective_start_time_value = effective_start.isoformat() if effective_start else ""
+            report.effective_end_time_value = effective_end.isoformat() if effective_end else ""
+            report.execution_start_value = execution_start
+            report.execution_end_value = execution_end
+            report.alignment_status = execution_anchor_policy.upper() if execution_anchor_policy else "UNBOUND"
+            report.coverage_complete = coverage_complete
+            if effective_start and effective_end:
+                report.reason = append_note(
+                    report.reason,
+                    "effective_window=%s..%s alignment=%s"
+                    % (effective_start.isoformat(), effective_end.isoformat(), execution_anchor_policy),
+                )
+
+        sources.append(
+            SnapshotSourceWindow(
+                task_id=intent.plan_task_id,
+                table=intent.preferred_table,
+                aggregation_policy=aggregation_policy,
+                time_selection_policy=time_selection_policy,
+                source_min_time_value=str(getattr(report, "min_pt", "") or ""),
+                source_max_time_value=sample_value,
+                effective_start_time_value=effective_start.isoformat() if effective_start else "",
+                effective_end_time_value=effective_end.isoformat() if effective_end else "",
+                execution_start_value=execution_start,
+                execution_end_value=execution_end,
+                requested_days=days,
+                offset_days=offset_days,
+                status=str(getattr(report, "status", "") or "NOT_CHECKED"),
+                compatible=compatible,
+                coverage_complete=coverage_complete,
+                reason=str(getattr(report, "reason", "") or ""),
+            )
+        )
+
+    aligned = bool(all_compatible and len(primary_anchors) <= 1)
+    complete = bool(aligned and all_covered)
+    if aligned and complete:
+        status = "ALIGNED_COMPLETE"
+    elif aligned:
+        status = "ALIGNED_PARTIAL_COVERAGE"
+    else:
+        status = "ALIGNMENT_INCOMPLETE"
+    common_anchor = next(iter(primary_anchors), "") if len(primary_anchors) == 1 else ""
+    strategy = "common_latest_partition" if any_relative else "resolved_calendar_window"
+    if aligned and complete:
+        reason = "all comparable nodes share the same runtime anchor and satisfy their metric coverage contracts"
+    elif aligned:
+        reason = "all comparable nodes share the same runtime anchor, but one or more sources lack required coverage"
+    else:
+        reason = "one or more required sources could not be bound to the shared runtime window"
+    understanding = dict(plan.question_understanding or {})
+    understanding["snapshotAlignment"] = {
+        "status": status,
+        "strategy": strategy,
+        "commonAnchorTimeValue": common_anchor,
+        "complete": complete,
+        "reason": reason,
+        "sources": [source.model_dump(by_alias=True) for source in sources],
+    }
+    plan.question_understanding = understanding
+    return SnapshotAlignmentContract(
+        status=status,
+        strategy=strategy,
+        aligned=aligned,
+        complete=complete,
+        common_anchor_time_value=common_anchor,
+        disclosure_required=True,
+        sources=sources,
+        reason=reason,
+    )
+
+
+def runtime_window_uses_latest_partition(intent: QuestionIntent) -> bool:
+    policy = str(getattr(intent.time_range, "anchor_policy", "") or "")
+    kind = str(getattr(intent.time_range, "kind", "") or "")
+    if policy == LATEST_PARTITION_ANCHOR_POLICY:
+        return True
+    return bool(kind == "rolling" and policy != CALENDAR_ANCHOR_POLICY)
+
+
+def intent_metric_aggregation_policy(intent: QuestionIntent) -> str:
+    policies = {
+        metric_aggregation_policy(spec)
+        for spec in intent.metric_specs or []
+        if isinstance(spec, dict) and metric_aggregation_policy(spec)
+    }
+    resolution_policy = metric_aggregation_policy(intent.metric_resolution or {})
+    if resolution_policy:
+        policies.add(resolution_policy)
+    return next(iter(policies), "") if len(policies) == 1 else ""
+
+
+def intent_metric_time_selection_policy(intent: QuestionIntent) -> str:
+    policies = {
+        metric_time_selection_policy(spec)
+        for spec in intent.metric_specs or []
+        if isinstance(spec, dict) and metric_time_selection_policy(spec)
+    }
+    resolution_policy = metric_time_selection_policy(intent.metric_resolution or {})
+    if resolution_policy:
+        policies.add(resolution_policy)
+    return next(iter(policies), "") if len(policies) == 1 else ""
+
+
+def intent_metric_execution_policy_signature(intent: QuestionIntent) -> Tuple[Tuple[str, str], ...]:
+    payloads = [spec for spec in intent.metric_specs or [] if isinstance(spec, dict)]
+    if not payloads:
+        payloads = [dict(intent.metric_resolution or {})]
+    return tuple(
+        sorted(
+            {
+                (metric_aggregation_policy(payload), metric_time_selection_policy(payload))
+                for payload in payloads
+            }
+        )
+    )
+
+
+def intent_declared_metric_time_columns(intent: QuestionIntent) -> Set[str]:
+    values = {
+        str(spec.get("timeColumn") or spec.get("time_column") or "").strip()
+        for spec in intent.metric_specs or []
+        if isinstance(spec, dict)
+    }
+    resolution = dict(intent.metric_resolution or {})
+    values.add(str(resolution.get("timeColumn") or resolution.get("time_column") or "").strip())
+    return {value for value in values if value}
+
+
+def intent_semantic_time_column(intent: QuestionIntent, table_metadata: Dict[str, Any]) -> str:
+    declared = intent_declared_metric_time_columns(intent)
+    if len(declared) == 1:
+        return next(iter(declared))
+    if len(declared) > 1:
+        return ""
+    return str((table_metadata or {}).get("timeColumn") or "")
+
+
+def metric_time_execution_contract(intent: QuestionIntent) -> Dict[str, Any]:
+    resolution = dict(intent.metric_resolution or {})
+    payload: Dict[str, Any] = {}
+    aggregation_policy = intent_metric_aggregation_policy(intent)
+    selection_policy = intent_metric_time_selection_policy(intent)
+    if aggregation_policy:
+        payload["metricAggregationPolicy"] = aggregation_policy
+    if selection_policy:
+        payload["timeSelectionPolicy"] = selection_policy
+    time_semantics = resolution.get("timeSemantics") or resolution.get("time_semantics")
+    if isinstance(time_semantics, dict) and time_semantics:
+        payload["metricTimeSemantics"] = dict(time_semantics)
+    for target, aliases in {
+        "missingValuePolicy": ("missingValuePolicy", "missing_value_policy"),
+        "zeroValueMeaning": ("zeroValueMeaning", "zero_value_meaning"),
+    }.items():
+        value = next((resolution.get(alias) for alias in aliases if resolution.get(alias) not in (None, "")), None)
+        if value not in (None, ""):
+            payload[target] = value
+    return payload
+
+
+def metric_time_execution_rule(contract: Dict[str, Any]) -> str:
+    if str(contract.get("timeSelectionPolicy") or "") == "latest_as_of":
+        return "select the latest partition not after the runtime-bound executionEndValue"
+    return "use runtime-bound executionStartValue/executionEndValue directly"
+
+
+def partition_execution_value(value: date, source_sample: str) -> str:
+    sample = str(source_sample or "").strip()
+    if re.fullmatch(r"\d{8}(?:\D.*)?", sample):
+        return value.strftime("%Y%m%d")
+    return value.isoformat()
+
+
+def latest_as_of_partition_predicate(
+    table: str,
+    partition_column: str,
+    *,
+    anchor_value: str = "",
+    tenant_column: str = "",
+    tenant_value_sql: str = "",
+) -> str:
+    """Build the generic point-in-time row selector for snapshot metrics."""
+    return latest_as_of_partition_predicate_sql(
+        table,
+        partition_column,
+        anchor_value_sql=sql_literal(anchor_value) if anchor_value else "",
+        tenant_column=tenant_column,
+        tenant_value_sql=tenant_value_sql,
+    )
+
+
+def source_covers_time_selection(
+    report: FreshnessCheckResult | None,
+    start: date | None,
+    end: date | None,
+    time_selection_policy: str = "period_window",
+) -> bool:
+    if report is None or not report.checked or not start or not end:
+        return False
+    source_min = parse_partition_date(report.min_pt)
+    source_max = parse_partition_date(report.max_pt)
+    if time_selection_policy == "latest_as_of":
+        return bool(source_min and source_min <= end)
+    return bool(source_min and source_max and source_min <= start and source_max >= end)
+
+
+def source_covers_window(
+    report: FreshnessCheckResult | None,
+    start: date | None,
+    end: date | None,
+) -> bool:
+    """Backward-compatible full-window coverage helper."""
+
+    return source_covers_time_selection(report, start, end, "period_window")
 
 
 class ExecutionGraphPreparationError(RuntimeError):
@@ -158,6 +485,7 @@ class ExecutionGraphPreparation:
     freshness_reports: Tuple[FreshnessCheckResult, ...] = ()
     runtime_fallback_task_ids: Tuple[str, ...] = ()
     runtime_source_plan_fingerprint: str = ""
+    snapshot_alignment: SnapshotAlignmentContract = field(default_factory=SnapshotAlignmentContract)
 
     @property
     def executable(self) -> bool:
@@ -200,6 +528,62 @@ def sql_filters_column(sql: str, column: str) -> bool:
         return False
     predicate = r"(?<![A-Za-z0-9_])`?%s`?\s*(?:=|!=|<>|<|>|<=|>=|BETWEEN\b|IN\s*\()" % re.escape(value)
     return bool(re.search(predicate, sql or "", flags=re.I))
+
+
+def sql_uses_latest_as_of_partition(
+    parsed: exp.Expression,
+    partition_column: str,
+    anchor_value: str = "",
+    tenant_column: str = "",
+) -> bool:
+    partition = str(partition_column or "").strip().strip("`")
+    tenant = str(tenant_column or "").strip().strip("`")
+    if not partition:
+        return False
+    for equality in parsed.find_all(exp.EQ):
+        left = equality.this
+        right = equality.expression
+        pairs = ((left, right), (right, left))
+        for column_side, selector_side in pairs:
+            if not isinstance(column_side, exp.Column) or column_side.name != partition:
+                continue
+            subquery = selector_side.find(exp.Select)
+            if subquery is None:
+                continue
+            max_matches = [
+                aggregate
+                for aggregate in subquery.find_all(exp.Max)
+                if any(column.name == partition for column in aggregate.find_all(exp.Column))
+            ]
+            if not max_matches:
+                continue
+            if anchor_value:
+                bounded = any(
+                    isinstance(comparison.this, exp.Column)
+                    and comparison.this.name == partition
+                    and str(anchor_value) in comparison.sql(dialect="doris")
+                    for comparison in subquery.find_all(exp.LTE)
+                )
+                if not bounded:
+                    continue
+            if tenant:
+                tenant_scoped = any(
+                    (
+                        isinstance(predicate.this, exp.Column)
+                        and predicate.this.name == tenant
+                    )
+                    or (
+                        isinstance(predicate.expression, exp.Column)
+                        and predicate.expression.name == tenant
+                    )
+                    for predicate in subquery.find_all(exp.EQ)
+                )
+                if not tenant_scoped:
+                    continue
+            return True
+    return False
+
+
 STRUCTURED_FALLBACK_ERROR_CODES = {
     "SQL_EMPTY",
     "PARSE_ERROR",
@@ -210,6 +594,8 @@ STRUCTURED_FALLBACK_ERROR_CODES = {
     "MISSING_MERCHANT_FILTER",
     "MISSING_PARTITION_FILTER",
     "INVALID_PARTITION_FILTER",
+    "RUNTIME_TIME_ALIGNMENT_MISMATCH",
+    "METRIC_TIME_SEMANTICS_MISMATCH",
     "MISSING_OUTPUT_KEY",
     "MISSING_ENTITY_KEY_FILTER",
     "MEM_ALLOC_FAILED",
@@ -221,6 +607,8 @@ STRICT_STRUCTURED_FALLBACK_CODES = {
     "MISSING_OUTPUT_KEY",
     "UNKNOWN_CONTRACT_COLUMN",
     "INVALID_PARTITION_FILTER",
+    "RUNTIME_TIME_ALIGNMENT_MISMATCH",
+    "METRIC_TIME_SEMANTICS_MISMATCH",
     "MISSING_ENTITY_KEY_FILTER",
 }
 RESOURCE_CONSTRAINED_DORIS_ERRORS = {"MEM_ALLOC_FAILED", "TIMEOUT"}
@@ -583,6 +971,13 @@ class NodeWorkerExecutor:
                 fallback_task_ids.append(intent.plan_task_id)
             reports.append(report)
 
+        snapshot_alignment = bind_runtime_snapshot_alignment(runtime_plan, reports)
+        bound_snapshot_task_ids = tuple(
+            source.task_id
+            for source in snapshot_alignment.sources
+            if source.compatible and source.execution_start_value and source.execution_end_value
+        )
+
         final = initial
         if fallback_task_ids:
             evidence_builder = EvidenceContractBuilder()
@@ -591,6 +986,12 @@ class NodeWorkerExecutor:
             runtime_plan.agent_trace.append(
                 "execution_runtime.realtime_fallback=%s" % ",".join(fallback_task_ids)
             )
+        if bound_snapshot_task_ids:
+            runtime_plan.agent_trace.append(
+                "execution_runtime.snapshot_bound=%s:%s"
+                % (snapshot_alignment.status, ",".join(bound_snapshot_task_ids))
+            )
+        if fallback_task_ids or bound_snapshot_task_ids:
             final = prepare_execution_graph(
                 question,
                 runtime_plan,
@@ -601,10 +1002,11 @@ class NodeWorkerExecutor:
 
         return replace(
             final,
-            changed=bool(final.changed or fallback_task_ids),
+            changed=bool(final.changed or fallback_task_ids or bound_snapshot_task_ids),
             freshness_reports=tuple(report.model_copy(deep=True) for report in reports),
             runtime_fallback_task_ids=tuple(fallback_task_ids),
             runtime_source_plan_fingerprint=runtime_source_fingerprint,
+            snapshot_alignment=snapshot_alignment.model_copy(deep=True),
         )
 
     def execute_plan(
@@ -627,7 +1029,14 @@ class NodeWorkerExecutor:
             question,
             execution_preparation=execution_preparation,
         )
-        result = AgentRunResult(executed_query_graph_fingerprint=query_graph_fingerprint(plan))
+        result = AgentRunResult(
+            executed_query_graph_fingerprint=query_graph_fingerprint(plan),
+            snapshot_alignment=(
+                execution_preparation.snapshot_alignment.model_copy(deep=True)
+                if execution_preparation
+                else SnapshotAlignmentContract()
+            ),
+        )
         prepared_freshness_by_task = {
             report.task_id: report.model_copy(deep=True)
             for report in (execution_preparation.freshness_reports if execution_preparation else ())
@@ -755,9 +1164,13 @@ class NodeWorkerExecutor:
                     suggested_action="restore_full_artifact_or_rerun_query",
                 )
             )
-        result.evidence_gaps = dag_evidence_gaps + lineage_gaps + contract_gaps_from_task_results(result.task_results) + [
-            EvidenceGap(code="DEPENDENCY_GAP", task_id=gap, reason=gap) for gap in dependency_check_gaps
-        ]
+        result.evidence_gaps = (
+            dag_evidence_gaps
+            + lineage_gaps
+            + split_window_coverage_gaps(result.task_results)
+            + contract_gaps_from_task_results(result.task_results)
+            + [EvidenceGap(code="DEPENDENCY_GAP", task_id=gap, reason=gap) for gap in dependency_check_gaps]
+        )
         result.degraded_reasons = collect_degraded_reasons(result.task_results)
         return result
 
@@ -2178,34 +2591,68 @@ class NodeWorkerExecutor:
                     cache_key = str(split_result.get("cacheKey") or "")
                     split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
                     split_events = list(split_result.get("runtimeEvents") or [])
-                    display_rows = apply_column_masks(rows, contract)
-                    self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success_split_fallback")
+                    coverage = dict(split_result.get("coverage") or {})
+                    coverage_complete = bool(coverage.get("complete"))
+                    coverage_code = str(coverage.get("code") or "SPLIT_WINDOW_COVERAGE_INCOMPLETE")
+                    coverage_reason = str(coverage.get("reason") or "requested window was not completely executed")
+                    split_error = "" if coverage_complete else "%s: %s" % (coverage_code, coverage_reason)
+                    summary = (
+                        "Doris 原查询失败后拆分查询返回 %s 行" % len(rows)
+                        if coverage_complete
+                        else "%s；仅保留 %s 行部分证据" % (split_error, len(rows))
+                    )
+                    display_rows = annotate_time_window_result_rows(apply_column_masks(rows, contract), intent)
+                    self.access_control.record_query_audit(
+                        access_decision,
+                        row_count=len(rows),
+                        status="success_split_fallback" if coverage_complete else "failed_split_coverage_incomplete",
+                    )
                     artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                     preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
-                    entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+                    entity_set = (
+                        entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+                        if coverage_complete
+                        else None
+                    )
                     record_tool(
                         tool_traces,
                         intent,
                         "execute_sql_split_fallback",
-                        "success",
+                        "success" if coverage_complete else "failed",
                         trim_sql(bound_sql),
-                        "rows=%s chunks=%s sourceError=%s cacheHit=%s" % (len(rows), len(split_events), error_type, cache_hit),
-                        error_type,
+                        "%s rows=%s chunks=%s sourceError=%s cacheHit=%s"
+                        % (coverage_reason, len(rows), len(split_events), error_type, cache_hit),
+                        error_type if coverage_complete else coverage_code,
                         round_index,
                         duration_ms=split_duration_ms,
                     )
-                    trace.append(ReActStep(round=4 + round_index * 3, reason="Doris 超时/资源错误后按时间窗口拆分明细查询", action="query_doris.split_fallback", observation="rows=%s chunks=%s" % (len(rows), len(split_events))))
+                    trace.append(
+                        ReActStep(
+                            round=4 + round_index * 3,
+                            reason="Doris 超时/资源错误后按时间窗口拆分明细查询",
+                            action=(
+                                "query_doris.split_fallback"
+                                if coverage_complete
+                                else "query_doris.split_fallback.incomplete"
+                            ),
+                            observation="rows=%s chunks=%s complete=%s"
+                            % (len(rows), len(split_events), coverage_complete),
+                        )
+                    )
                     return AgentTaskResult(
-                        success=True,
-                        summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                        success=coverage_complete,
+                        summary=summary,
                         query_bundle=QueryBundle(
                             sql=bound_sql,
                             params=sql_params,
                             tables=validation.base_tables,
                             rows=preview_rows,
+                            failed=not coverage_complete,
+                            error=split_error,
                             original_row_count=len(rows),
-                            summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                            summary=summary,
                             offloaded_files=artifact_paths,
+                            lineage_complete=coverage_complete,
                             duration_ms=split_duration_ms,
                             cache_hit=cache_hit,
                             cache_key=cache_key,
@@ -2349,6 +2796,7 @@ class NodeWorkerExecutor:
                     validation.base_tables,
                     contract,
                     query_duration_ms,
+                    freshness,
                 )
                 if split_result is not None:
                     rows = list(split_result["rows"])
@@ -2356,34 +2804,68 @@ class NodeWorkerExecutor:
                     cache_key = str(split_result.get("cacheKey") or "")
                     split_duration_ms = int(split_result.get("durationMs") or query_duration_ms)
                     split_events = list(split_result.get("runtimeEvents") or [])
+                    coverage = dict(split_result.get("coverage") or {})
+                    coverage_complete = bool(coverage.get("complete"))
+                    coverage_code = str(coverage.get("code") or "SPLIT_WINDOW_COVERAGE_INCOMPLETE")
+                    coverage_reason = str(coverage.get("reason") or "requested window was not completely executed")
+                    split_error = "" if coverage_complete else "%s: %s" % (coverage_code, coverage_reason)
+                    summary = (
+                        "Doris 原查询失败后拆分查询返回 %s 行" % len(rows)
+                        if coverage_complete
+                        else "%s；仅保留 %s 行部分证据" % (split_error, len(rows))
+                    )
                     display_rows = annotate_time_window_result_rows(apply_column_masks(rows, contract), intent)
-                    self.access_control.record_query_audit(access_decision, row_count=len(rows), status="success_split_fallback")
+                    self.access_control.record_query_audit(
+                        access_decision,
+                        row_count=len(rows),
+                        status="success_split_fallback" if coverage_complete else "failed_split_coverage_incomplete",
+                    )
                     artifact_paths = self._write_node_artifacts(intent.plan_task_id, bound_sql, display_rows, context.workspace_path)
                     preview_rows = display_rows[: max(0, self.settings.context_artifact_inline_max_rows)]
-                    entity_set = entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+                    entity_set = (
+                        entity_set_from_rows(intent.plan_task_id, intent, rows, self.settings.agent_max_entity_values)
+                        if coverage_complete
+                        else None
+                    )
                     record_tool(
                         tool_traces,
                         intent,
                         "execute_sql_split_fallback",
-                        "success",
+                        "success" if coverage_complete else "failed",
                         trim_sql(bound_sql),
-                        "rows=%s chunks=%s sourceError=%s cacheHit=%s" % (len(rows), len(split_events), doris_error_code, cache_hit),
-                        doris_error_code,
+                        "%s rows=%s chunks=%s sourceError=%s cacheHit=%s"
+                        % (coverage_reason, len(rows), len(split_events), doris_error_code, cache_hit),
+                        doris_error_code if coverage_complete else coverage_code,
                         round_index,
                         duration_ms=split_duration_ms,
                     )
-                    trace.append(ReActStep(round=4 + round_index * 3, reason="Doris 超时/资源错误后按时间窗口拆分明细查询", action="query_doris.split_fallback", observation="rows=%s chunks=%s" % (len(rows), len(split_events))))
+                    trace.append(
+                        ReActStep(
+                            round=4 + round_index * 3,
+                            reason="Doris 超时/资源错误后按时间窗口拆分明细查询",
+                            action=(
+                                "query_doris.split_fallback"
+                                if coverage_complete
+                                else "query_doris.split_fallback.incomplete"
+                            ),
+                            observation="rows=%s chunks=%s complete=%s"
+                            % (len(rows), len(split_events), coverage_complete),
+                        )
+                    )
                     return AgentTaskResult(
-                        success=True,
-                        summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                        success=coverage_complete,
+                        summary=summary,
                         query_bundle=QueryBundle(
                             sql=bound_sql,
                             params=sql_params,
                             tables=validation.base_tables,
                             rows=preview_rows,
+                            failed=not coverage_complete,
+                            error=split_error,
                             original_row_count=len(rows),
-                            summary="Doris 原查询失败后拆分查询返回 %s 行" % len(rows),
+                            summary=summary,
                             offloaded_files=artifact_paths,
+                            lineage_complete=coverage_complete,
                             duration_ms=split_duration_ms,
                             cache_hit=cache_hit,
                             cache_key=cache_key,
@@ -2766,7 +3248,8 @@ class NodeWorkerExecutor:
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
                     "GROUP_AGG/TOPN 必须按 contract 声明的 outputKeys 和 groupByColumn 分组并原样输出；"
                     "timeWindowContract 非空时，必须使用其中的 partitionColumn、tenantColumn、anchorPolicy 和 days 生成过滤。"
-                    "相对时间窗锚定 preferredTable 在授权主体过滤后的 MAX(partitionColumn)，不要用 CURDATE()/CURRENT_DATE；"
+                    "timeWindowContract 声明 executionStartValue/executionEndValue 时，必须直接使用这两个已绑定边界，禁止再按本表 MAX(partitionColumn) 改写；"
+                    "仅当没有 runtime execution 边界时，相对时间窗才锚定 preferredTable 在授权主体过滤后的 MAX(partitionColumn)，不要用 CURDATE()/CURRENT_DATE；"
                     "显式日期且 anchorPolicy=calendar 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
                     "没有倒排索引时不要假设索引存在；只选择 requiredColumns 中需要字段和过滤字段；明细 LIMIT <= 20。"
                     "不能修改 contract 里的指标、粒度、依赖或证据要求。"
@@ -2858,7 +3341,7 @@ class NodeWorkerExecutor:
         table = intent.preferred_table
         columns = set(asset_pack.known_columns(table))
         table_metadata = table_asset_metadata(asset_pack, table)
-        time_column = str(table_metadata.get("timeColumn") or "")
+        time_column = intent_semantic_time_column(intent, table_metadata)
         merchant_filter_column = str(table_metadata.get("merchantFilterColumn") or "")
         if not table:
             return FreshnessCheckResult(task_id=intent.plan_task_id, table=table, status="SKIPPED", reason="no preferred table")
@@ -2931,9 +3414,10 @@ class NodeWorkerExecutor:
             return sql, ""
         if intent.time_range.start_date and intent.time_range.end_date and intent.time_range.anchor_policy == "calendar":
             return sql, ""
-        if not freshness.checked or not freshness.max_pt:
+        anchor_value = freshness.effective_end_time_value or freshness.max_pt
+        if not freshness.checked or not anchor_value:
             return sql, ""
-        anchor = parse_partition_date(freshness.max_pt)
+        anchor = parse_partition_date(anchor_value)
         if not anchor:
             return sql, ""
         anchor_text = anchor.isoformat()
@@ -3067,7 +3551,11 @@ class NodeWorkerExecutor:
         table = intent.preferred_table
         columns = set(asset_pack.known_columns(table))
         table_metadata = table_asset_metadata(asset_pack, table)
-        time_column = str(table_metadata.get("timeColumn") or "")
+        time_column = str(
+            (contract.time_window_contract or {}).get("partitionColumn")
+            or intent_semantic_time_column(intent, table_metadata)
+            or ""
+        )
         if not time_column or time_column not in columns or int(intent.days or 0) <= 0:
             return None
         safe_sql = self._draft_structured_sql(intent, asset_pack, context, contract=contract, resource_safe=True)
@@ -3082,10 +3570,11 @@ class NodeWorkerExecutor:
         max_chunks = max(1, int(getattr(self.settings, "agent_doris_split_max_chunks", 6) or 6))
         max_concurrency = max(1, int(getattr(self.settings, "agent_doris_split_max_concurrency", 3) or 3))
         limit = structured_limit(intent.limit, detail=True, resource_safe=True)
-        anchor = parse_partition_date(freshness.max_pt) if freshness.max_pt else None
+        anchor_value = freshness.effective_end_time_value or freshness.max_pt
+        anchor = parse_partition_date(anchor_value) if anchor_value else None
         if not anchor:
             return None
-        split_sqls = split_detail_sql_by_time_windows(
+        split_plan = build_split_detail_sql_plan(
             safe_sql,
             int(intent.days or 0),
             chunk_days,
@@ -3094,11 +3583,12 @@ class NodeWorkerExecutor:
             time_column,
             anchor_date=anchor.isoformat() if anchor else "",
         )
-        if not split_sqls:
+        if not split_plan or not split_plan.chunks:
             return None
         anchor_date = ""
-        chunk_queries: List[Tuple[str, List[Any]]] = []
-        for split_sql in split_sqls:
+        chunk_queries: List[Tuple[int, str, List[Any]]] = []
+        for split_chunk in split_plan.chunks:
+            split_sql = split_chunk.sql
             split_validation = self.validator.validate(split_sql, asset_pack)
             split_validation = self._node_scope_validation(split_validation, intent, split_sql, asset_pack)
             split_validation = self._contract_scope_validation(split_validation, intent, split_sql, contract)
@@ -3114,7 +3604,7 @@ class NodeWorkerExecutor:
             access_decision = self.access_control.authorize_contract(contract, anchored_sql, run_id=context.sub_agent_run_id)
             if not access_decision.allowed:
                 return None
-            chunk_queries.append((anchored_sql, safe_params))
+            chunk_queries.append((split_chunk.index, anchored_sql, safe_params))
             anchor_date = anchor_date or split_anchor_date
         if not chunk_queries:
             return None
@@ -3127,6 +3617,13 @@ class NodeWorkerExecutor:
                 "chunkDays": chunk_days,
                 "maxChunks": max_chunks,
                 "chunkCount": len(chunk_queries),
+                "requiredChunkCount": split_plan.required_chunk_count,
+                "requestedWindow": {
+                    "startDate": split_plan.requested_start_date,
+                    "endDate": split_plan.requested_end_date,
+                    "days": split_plan.requested_days,
+                },
+                "truncated": split_plan.truncated,
                 "maxConcurrency": min(max_concurrency, len(chunk_queries)),
                 "executionMode": "parallel_chunks",
                 "limit": limit,
@@ -3137,6 +3634,7 @@ class NodeWorkerExecutor:
         cache_keys: List[str] = []
         started = time.perf_counter()
         chunk_results: Dict[int, List[Dict[str, Any]]] = {}
+        chunk_outcomes: Dict[int, Dict[str, Any]] = {}
         split_cancel_event = Event()
 
         def query_chunk(index: int, chunk_sql: str, chunk_params: List[Any]) -> Dict[str, Any]:
@@ -3161,7 +3659,7 @@ class NodeWorkerExecutor:
         try:
             futures = {
                 submit_with_current_context(executor, query_chunk, index, chunk_sql, chunk_params): (index, chunk_sql)
-                for index, (chunk_sql, chunk_params) in enumerate(chunk_queries, start=1)
+                for index, chunk_sql, chunk_params in chunk_queries
             }
             try:
                 for future in as_completed(
@@ -3172,18 +3670,29 @@ class NodeWorkerExecutor:
                     try:
                         payload = future.result()
                     except Exception as exc:
+                        outcome = {
+                            "chunkIndex": index,
+                            "status": "failed",
+                            "rows": 0,
+                            "errorCode": classify_doris_error(str(exc)),
+                            "error": str(exc)[:240],
+                        }
+                        chunk_outcomes[index] = outcome
                         events.append(
                             {
                                 "event": "split_query_chunk_failed",
-                                "chunkIndex": index,
-                                "errorCode": classify_doris_error(str(exc)),
-                                "error": str(exc)[:240],
+                                **outcome,
                                 "sql": trim_sql(chunk_sql, 600),
                             }
                         )
                         continue
                     chunk_rows = payload["rows"]
                     chunk_results[index] = chunk_rows
+                    chunk_outcomes[index] = {
+                        "chunkIndex": index,
+                        "status": "succeeded",
+                        "rows": len(chunk_rows),
+                    }
                     cache_hit = cache_hit or bool(payload["cacheHit"])
                     if payload["cacheKey"]:
                         cache_keys.append(payload["cacheKey"])
@@ -3212,21 +3721,43 @@ class NodeWorkerExecutor:
         finally:
             split_cancel_event.set()
             executor.shutdown(wait=False, cancel_futures=True)
+        for index, chunk_sql, _chunk_params in chunk_queries:
+            if index in chunk_outcomes:
+                continue
+            outcome = {
+                "chunkIndex": index,
+                "status": "failed",
+                "rows": 0,
+                "errorCode": "TIMEOUT",
+                "error": "split query chunk did not complete before the fallback deadline",
+            }
+            chunk_outcomes[index] = outcome
+            events.append(
+                {
+                    "event": "split_query_chunk_failed",
+                    **outcome,
+                    "sql": trim_sql(chunk_sql, 600),
+                }
+            )
         rows: List[Dict[str, Any]] = []
         for index in sorted(chunk_results):
             if len(rows) >= limit:
                 break
             remaining = max(0, limit - len(rows))
             rows.extend(chunk_results[index][:remaining])
-        if not rows:
-            return None
+        coverage = split_window_coverage_contract(split_plan, list(chunk_outcomes.values()))
         events.append(
             {
                 "event": "split_query_fallback_finished",
+                "code": coverage.get("code") or "SPLIT_WINDOW_COVERAGE_COMPLETE",
                 "rows": len(rows),
                 "chunksAttempted": len([item for item in events if str(item.get("event")) in {"split_query_chunk_succeeded", "split_query_chunk_failed"}]),
                 "chunksSucceeded": len([item for item in events if str(item.get("event")) == "split_query_chunk_succeeded"]),
                 "chunksFailed": len([item for item in events if str(item.get("event")) == "split_query_chunk_failed"]),
+                "truncated": bool(coverage.get("truncated")),
+                "complete": bool(coverage.get("complete")),
+                "lineageComplete": bool(coverage.get("lineageComplete")),
+                "coverage": coverage,
                 "executionMode": "parallel_chunks",
                 "tables": tables,
             }
@@ -3237,6 +3768,7 @@ class NodeWorkerExecutor:
             "cacheKey": ",".join(cache_keys[:3]),
             "durationMs": int((time.perf_counter() - started) * 1000),
             "runtimeEvents": events,
+            "coverage": coverage,
         }
 
     def _draft_structured_sql(
@@ -3393,7 +3925,36 @@ class NodeWorkerExecutor:
         time_contract = dict(contract.time_window_contract or {})
         partition_column = str(time_contract.get("partitionColumn") or "")
         days = int(time_contract.get("days") or intent.days or getattr(intent.time_range, "days", 0) or 0)
-        if (
+        execution_start = str(time_contract.get("executionStartValue") or "")
+        execution_end = str(time_contract.get("executionEndValue") or "")
+        time_selection_policy = str(time_contract.get("timeSelectionPolicy") or "")
+        if partition_column in columns and time_selection_policy == "latest_as_of":
+            anchor_value = execution_end or str(intent.time_range.end_date or "")
+            if not any(sql_references_filter_column(predicate, partition_column) for predicate in where):
+                where.append(
+                    latest_as_of_partition_predicate(
+                        table,
+                        partition_column,
+                        anchor_value=anchor_value,
+                        tenant_column=str(time_contract.get("tenantColumn") or merchant_column),
+                        tenant_value_sql=(
+                            sql_literal(context.merchant_id)
+                            if (time_contract.get("tenantColumn") or merchant_column)
+                            else ""
+                        ),
+                    )
+                )
+        elif (
+            partition_column in columns
+            and execution_start
+            and execution_end
+        ):
+            if not any(sql_references_filter_column(predicate, partition_column) for predicate in where):
+                where.append(
+                    "`%s` BETWEEN %s AND %s"
+                    % (partition_column, sql_literal(execution_start), sql_literal(execution_end))
+                )
+        elif (
             partition_column in columns
             and intent.time_range.start_date
             and intent.time_range.end_date
@@ -3533,10 +4094,46 @@ class NodeWorkerExecutor:
                     "message": "Node SQL must filter the partitionColumn declared by timeWindowContract",
                 }
             )
+        execution_start = str(time_contract.get("executionStartValue") or "")
+        execution_end = str(time_contract.get("executionEndValue") or "")
+        time_selection_policy = str(time_contract.get("timeSelectionPolicy") or "")
+        required_execution_values = (
+            [execution_end]
+            if time_selection_policy == "latest_as_of"
+            else [execution_start, execution_end]
+        )
+        required_execution_values = [value for value in required_execution_values if value]
+        if required_execution_values and any(value not in str(sql or "") for value in required_execution_values):
+            return validation.model_copy(
+                update={
+                    "valid": False,
+                    "error_code": "RUNTIME_TIME_ALIGNMENT_MISMATCH",
+                    "message": (
+                        "Node SQL must use the runtime-bound executionStartValue/executionEndValue "
+                        "from timeWindowContract"
+                    ),
+                }
+            )
         try:
             parsed = sqlglot.parse_one((sql or "").strip(), read="doris")
         except Exception:
             return validation
+        if time_selection_policy == "latest_as_of" and not sql_uses_latest_as_of_partition(
+            parsed,
+            partition_column,
+            execution_end,
+            str(time_contract.get("tenantColumn") or contract.merchant_filter_column or ""),
+        ):
+            return validation.model_copy(
+                update={
+                    "valid": False,
+                    "error_code": "METRIC_TIME_SEMANTICS_MISMATCH",
+                    "message": (
+                        "latest_as_of metric SQL must select MAX(partitionColumn) not after "
+                        "executionEndValue within the governed tenant scope"
+                    ),
+                }
+            )
         allowed = set(contract.allowed_columns)
         visible = set(contract.visible_columns)
         internal_only = set(contract.internal_only_columns)
@@ -3627,9 +4224,15 @@ class NodeWorkerExecutor:
         row_scope_policy = normalize_row_access_policy(table_metadata.get("rowAccessPolicy") or default_row_access_policy(merchant_filter_column))
         region_filter_column = str(table_metadata.get("regionFilterColumn") or "")
         store_filter_column = str(table_metadata.get("storeFilterColumn") or "")
-        time_column = str(table_metadata.get("timeColumn") or "")
+        time_column = intent_semantic_time_column(intent, table_metadata)
         execution_scope_columns = [merchant_filter_column, region_filter_column, store_filter_column]
-        if time_column in table_columns and (intent.days or intent.time_range.start_date or intent.time_range.end_date):
+        if time_column in table_columns and (
+            intent.days
+            or intent.time_range.start_date
+            or intent.time_range.end_date
+            or intent.time_range.execution_start_value
+            or intent.time_range.execution_end_value
+        ):
             execution_scope_columns.append(time_column)
         for column in execution_scope_columns:
             if column and column in table_columns and column not in allowed_columns:
@@ -3748,18 +4351,30 @@ class NodeWorkerExecutor:
         merchant_filter_column: str,
         time_column: str,
     ) -> Dict[str, Any]:
-        if time_column not in set(table_columns) or not (intent.days or intent.time_range.start_date or intent.time_range.end_date):
+        metric_time_contract = metric_time_execution_contract(intent)
+        has_execution_window = bool(
+            intent.time_range.execution_start_value and intent.time_range.execution_end_value
+        )
+        if time_column not in set(table_columns) or not (
+            intent.days
+            or intent.time_range.start_date
+            or intent.time_range.end_date
+            or has_execution_window
+        ):
             return {}
-        if intent.time_range.start_date or intent.time_range.end_date:
+        if intent.time_range.start_date or intent.time_range.end_date or has_execution_window:
             contract = time_window_contract_payload(intent.time_range, table, time_column, merchant_filter_column)
-            if contract.get("anchorPolicy") != CALENDAR_ANCHOR_POLICY:
+            contract.update(metric_time_contract)
+            if has_execution_window:
+                contract["executionRule"] = metric_time_execution_rule(contract)
+            elif contract.get("anchorPolicy") != CALENDAR_ANCHOR_POLICY:
                 contract["anchorPolicy"] = LATEST_PARTITION_ANCHOR_POLICY
                 contract["executionRule"] = "relative windows must anchor to MAX(partitionColumn) after tenant filter"
             if intent.days and not contract.get("days"):
                 contract["days"] = int(intent.days or 0)
             return contract
         days = int(intent.days or 0)
-        return {
+        contract = {
             "kind": "rolling",
             "label": "最近%d天" % days,
             "days": days,
@@ -3767,8 +4382,14 @@ class NodeWorkerExecutor:
             "partitionColumn": time_column,
             "table": table,
             "tenantColumn": merchant_filter_column,
-            "executionRule": "relative windows must anchor to MAX(partitionColumn) after tenant filter",
+            **metric_time_contract,
         }
+        contract["executionRule"] = (
+            "select the latest available partition after tenant filter"
+            if contract.get("timeSelectionPolicy") == "latest_as_of"
+            else "relative windows must anchor to MAX(partitionColumn) after tenant filter"
+        )
+        return contract
 
     def _enforce_identity_scope_sql(
         self,
@@ -3886,6 +4507,50 @@ class NodeWorkerExecutor:
         return EvidenceCheckResult(passed=not gaps, summary="证据图校验通过" if not gaps else "证据图存在缺口", gaps=gaps)
 
 
+def split_window_coverage_gaps(task_results: List[AgentTaskResult]) -> List[EvidenceGap]:
+    """Lift incomplete split-window execution into monotonic evidence gaps."""
+
+    gaps: List[EvidenceGap] = []
+    for task_result in task_results:
+        coverage: Dict[str, Any] = {}
+        for event in reversed(task_result.query_bundle.runtime_events or []):
+            candidate = event.get("coverage") if isinstance(event, dict) else None
+            if isinstance(candidate, dict) and candidate.get("contractVersion") == "split_window_coverage_v1":
+                coverage = dict(candidate)
+                break
+        if not coverage or bool(coverage.get("complete")):
+            continue
+        reason = str(coverage.get("reason") or "requested split-query window was not completely executed")
+        requested_window = dict(coverage.get("requestedWindow") or {})
+        evidence = "%s..%s" % (
+            requested_window.get("startDate") or "?",
+            requested_window.get("endDate") or "?",
+        )
+        gaps.append(
+            EvidenceGap(
+                code=str(coverage.get("code") or "SPLIT_WINDOW_COVERAGE_INCOMPLETE"),
+                task_id=task_result.task_id,
+                evidence=evidence,
+                reason=reason,
+                severity="blocking",
+                disclosure_required=True,
+                source="split_window_coverage",
+                answer_instruction=(
+                    "拆分 SQL 未完整覆盖用户请求时间窗；部分行只能作为故障诊断证据，"
+                    "禁止据此回答完整业务结果，也不能把未执行窗口解释为 0。"
+                ),
+                suggested_action="rerun_all_required_chunks_or_answer_with_blocking_gap",
+                missing_time_range=evidence,
+                details={
+                    "coverage": coverage,
+                    "partialRowCount": task_result.query_bundle.effective_row_count(),
+                    "lineageComplete": False,
+                },
+            )
+        )
+    return gaps
+
+
 def merge_query_bundles(
     bundles: List[QueryBundle],
     source_ids: Optional[List[str]] = None,
@@ -3899,6 +4564,7 @@ def merge_query_bundles(
     source_artifact_refs: Dict[str, List[str]] = {}
     offloaded_files: List[str] = []
     incomplete_sources: List[str] = []
+    lineage_incomplete_sources: List[str] = []
     for index, bundle in enumerate(bundles):
         source_id = source_ids[index] if index < len(source_ids) else "node_%s" % (index + 1)
         source_row_counts[source_id] = bundle.effective_row_count()
@@ -3907,6 +4573,8 @@ def merge_query_bundles(
         for table in bundle.tables:
             if table not in tables:
                 tables.append(table)
+        if not bundle.lineage_complete:
+            lineage_incomplete_sources.append(source_id)
         if bundle.failed and not first_error:
             first_error = bundle.error or bundle.summary
         if not bundle.failed:
@@ -3936,6 +4604,7 @@ def merge_query_bundles(
         source_row_counts=source_row_counts,
         source_artifact_refs=source_artifact_refs,
         failed=bool(bundles) and not any(not item.failed for item in bundles),
+        lineage_complete=not lineage_incomplete_sources,
         error=first_error,
         summary="合并 %s 个 NodeWorker 结果" % len(bundles),
         duration_ms=sum(int(bundle.duration_ms or 0) for bundle in bundles),
@@ -3978,6 +4647,7 @@ def merge_task_result_bundles(
     first_error = first_bundle_error(bundles)
     source_row_counts = {source_id: bundle.effective_row_count() for source_id, bundle in zip(source_ids, bundles)}
     source_artifact_refs = {source_id: list(bundle.offloaded_files or []) for source_id, bundle in zip(source_ids, bundles)}
+    lineage_incomplete_sources = [source_id for source_id, bundle in zip(source_ids, bundles) if not bundle.lineage_complete]
     offloaded_files = dedupe_strings(path for bundle in bundles for path in bundle.offloaded_files or [])
     complete_rows_by_task: Dict[str, List[Dict[str, Any]]] = {}
     incomplete_sources: List[str] = []
@@ -4042,6 +4712,7 @@ def merge_task_result_bundles(
         source_row_counts=source_row_counts,
         source_artifact_refs=source_artifact_refs,
         failed=bool(bundles) and not any(not item.failed for item in bundles),
+        lineage_complete=not lineage_incomplete_sources,
         error=first_error,
         summary="按实体键 %s 合并 %s 个 NodeWorker 结果" % ("+".join(merge_keys), len(bundles)),
         duration_ms=sum(int(bundle.duration_ms or 0) for bundle in bundles),
@@ -4491,6 +5162,7 @@ def same_table_metric_base_key(intent: QuestionIntent, asset_pack: PlanningAsset
         int(getattr(intent.time_range, "offset_days", 0) or 0),
         str(getattr(intent.time_range, "start_date", "") or ""),
         str(getattr(intent.time_range, "end_date", "") or ""),
+        intent_metric_execution_policy_signature(intent),
     )
 
 
@@ -4812,8 +5484,13 @@ def normalize_metric_spec(spec: Dict[str, Any], intent: QuestionIntent, table: s
         "valueFormat": ("valueFormat", "value_format"),
         "decimalPlaces": ("decimalPlaces", "decimal_places"),
         "metricType": ("metricType", "metric_type"),
+        "metricGrain": ("metricGrain", "metric_grain"),
+        "timeColumn": ("timeColumn", "time_column"),
         "aggregationPolicy": ("aggregationPolicy", "aggregation_policy"),
         "applicableTimeGrain": ("applicableTimeGrain", "applicable_time_grain"),
+        "timeSemantics": ("timeSemantics", "time_semantics"),
+        "missingValuePolicy": ("missingValuePolicy", "missing_value_policy"),
+        "zeroValueMeaning": ("zeroValueMeaning", "zero_value_meaning"),
         "semanticRefId": ("semanticRefId", "semantic_ref_id"),
         "ownerTable": ("ownerTable", "owner_table"),
     }
@@ -5082,7 +5759,38 @@ def governed_metric_contract_issue(resolution: Dict[str, Any], table: str = "") 
 def metric_execution_contract_issue(contract: NodePlanContract) -> str:
     mode = str(contract.metric_governance_mode or "legacy_unsealed")
     if mode == "published_semantic":
-        return governed_metric_contract_issue(contract.metric_resolution, contract.preferred_table)
+        governed_issue = governed_metric_contract_issue(contract.metric_resolution, contract.preferred_table)
+        if governed_issue:
+            return governed_issue
+        temporal_issue = semantic_metric_temporal_contract_issue(contract.metric_resolution)
+        if temporal_issue:
+            return temporal_issue
+        declared_time_columns = {
+            str(item.get("timeColumn") or item.get("time_column") or "").strip()
+            for item in [contract.metric_resolution, *(contract.metric_specs or [])]
+            if isinstance(item, dict)
+        }
+        declared_time_columns.discard("")
+        if len(declared_time_columns) > 1:
+            return "one SQL node cannot combine metrics with different semantic time columns"
+        if declared_time_columns:
+            declared_time_column = next(iter(declared_time_columns))
+            if declared_time_column not in set(contract.allowed_columns):
+                return "semantic metric timeColumn is outside the node schema"
+            bound_time_column = str((contract.time_window_contract or {}).get("partitionColumn") or "")
+            if bound_time_column and bound_time_column != declared_time_column:
+                return "timeWindowContract partitionColumn differs from the sealed semantic metric timeColumn"
+        if contract.time_window_contract and not metric_aggregation_policy(contract.metric_resolution):
+            return "published temporal metric has no aggregationPolicy execution contract"
+        policy_signatures = {
+            (metric_aggregation_policy(spec), metric_time_selection_policy(spec))
+            for spec in contract.metric_specs or []
+            if isinstance(spec, dict)
+        }
+        policy_signatures.discard(("", ""))
+        if len(policy_signatures) > 1:
+            return "one SQL node cannot combine metrics with different temporal execution policies"
+        return ""
     if mode == "compiled_local":
         resolution = contract.metric_resolution or {}
         if str(resolution.get("ownerTable") or "") != contract.preferred_table:

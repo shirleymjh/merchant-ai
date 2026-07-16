@@ -34,8 +34,10 @@ from merchant_ai.models import (
     MiddlewareEvent,
     NodeToolCall,
     PlannerRepairRequest,
+    PlannerRepairInput,
     PlanningAssetPack,
     PlannerReflectionResult,
+    QueryGraphRepairDelta,
     QueryBundle,
     QueryPlan,
     QuestionCategory,
@@ -150,6 +152,7 @@ class AgentState(TypedDict, total=False):
     contract_block_observed: bool
     contract_block_generation: int
     lead_arbitration_observed: bool
+    lead_provider_error: str
     _pending_action_contract: Dict[str, Any]
     last_action_result: ActionResult
     planner_reflection: PlannerReflectionResult
@@ -184,6 +187,7 @@ class AgentState(TypedDict, total=False):
     run_steps: List[RunStep]
     trace_spans: List[TraceSpan]
     planner_repair_requests: List[PlannerRepairRequest]
+    planner_repair_input: PlannerRepairInput
     tool_failures: List[ToolFailureRecord]
     circuit_breakers: List[CircuitBreakerState]
     tool_runtime_policies: List[ToolRuntimePolicy]
@@ -269,6 +273,13 @@ class AgentState(TypedDict, total=False):
     query_graph_plan_attempts: int
     query_graph_repair_attempts: int
     query_graph_repair_attempted: bool
+    query_graph_repair_progressed: bool
+    query_graph_repair_scope_attempts: Dict[str, int]
+    query_graph_repair_scope_key: str
+    query_graph_repair_scope_attempt_count: int
+    query_graph_repair_exhausted: bool
+    query_graph_repair_history: List[QueryGraphRepairDelta]
+    last_query_graph_repair_delta: QueryGraphRepairDelta
     execution_generation: int
     result_generation: int
     evidence_generation: int

@@ -31,6 +31,7 @@ class LlmSettings:
     model: str
     api_key: str
     request_timeout_seconds: int
+    lead_timeout_seconds: int
     planner_timeout_seconds: int
     answer_timeout_seconds: int
     analysis_timeout_seconds: int
@@ -107,6 +108,7 @@ class Settings(BaseSettings):
     llm_model: str = Field("gpt-5.2", validation_alias="YSHOPPING_LLM_MODEL")
     llm_api_key: str = Field("", validation_alias="YSHOPPING_LLM_API_KEY")
     llm_request_timeout_seconds: int = Field(12, validation_alias="YSHOPPING_LLM_REQUEST_TIMEOUT_SECONDS")
+    llm_lead_timeout_seconds: int = Field(12, validation_alias="YSHOPPING_LLM_LEAD_TIMEOUT_SECONDS")
     llm_planner_timeout_seconds: int = Field(20, validation_alias="YSHOPPING_LLM_PLANNER_TIMEOUT_SECONDS")
     llm_answer_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_LLM_ANSWER_TIMEOUT_SECONDS")
     llm_analysis_timeout_seconds: int = Field(12, validation_alias="YSHOPPING_LLM_ANALYSIS_TIMEOUT_SECONDS")
@@ -258,6 +260,14 @@ class Settings(BaseSettings):
     agent_plan_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_PLAN_ROUNDS")
     agent_graph_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_GRAPH_REPAIR_ROUNDS")
     agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
+    agent_planner_invalid_output_retries: int = Field(
+        1,
+        validation_alias="YSHOPPING_AGENT_PLANNER_INVALID_OUTPUT_RETRIES",
+    )
+    planner_semantic_contract_compile_enabled: bool = Field(
+        True,
+        validation_alias="YSHOPPING_PLANNER_SEMANTIC_CONTRACT_COMPILE_ENABLED",
+    )
     agent_deferred_tool_schema_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_DEFERRED_TOOL_SCHEMA_ENABLED")
     planner_filesystem_context_mode: str = Field("auto", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
     legacy_question_planner_enabled: bool = Field(False, validation_alias="YSHOPPING_LEGACY_QUESTION_PLANNER_ENABLED")
@@ -425,6 +435,7 @@ class Settings(BaseSettings):
             model=self.openai_model,
             api_key=self.openai_api_key,
             request_timeout_seconds=self.llm_request_timeout_seconds,
+            lead_timeout_seconds=self.llm_lead_timeout_seconds,
             planner_timeout_seconds=self.llm_planner_timeout_seconds,
             answer_timeout_seconds=self.llm_answer_timeout_seconds,
             analysis_timeout_seconds=self.llm_analysis_timeout_seconds,

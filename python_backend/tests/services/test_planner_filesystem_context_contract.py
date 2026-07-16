@@ -6,6 +6,7 @@ from typing import Any
 from merchant_ai.config import get_settings
 from merchant_ai.models import PlanningAssetEntry, PlanningAssetPack
 from merchant_ai.services.planning import QueryGraphPlanner
+from merchant_ai.services.planning_tooling import compact_tool_result_for_prompt
 
 
 def planner_pack(metric_count: int = 36) -> PlanningAssetPack:
@@ -170,6 +171,48 @@ def test_planner_prompt_budget_fails_closed_without_calling_model() -> None:
     assert payload["_plannerContextOverBudget"] is True
     assert payload["_promptStats"]["budgetPolicy"] == "fail_closed"
     assert payload["status"] == "NEED_MORE_KNOWLEDGE"
+
+
+def test_metric_tool_compaction_never_drops_the_execution_contract() -> None:
+    metric = {
+        "metricKey": "opaque_metric",
+        "businessName": "Opaque metric with a deliberately long display name",
+        "formula": "SUM(numerator) / NULLIF(SUM(denominator), 0)",
+        "sourceColumns": ["numerator", "denominator"],
+        "metricGrain": "tenant_event",
+        "aggregationPolicy": "ratio_of_sums",
+        "applicableTimeGrain": "period",
+        "timeColumn": "event_day",
+        "timeSemantics": {
+            "selectionPolicy": "period_window",
+            "asOfPolicy": "latest_available_partition",
+            "missingDataPolicy": "disclose_unknown",
+            "zeroValuePolicy": "preserve_observed_zero",
+        },
+        "description": "x" * 5000,
+    }
+    result = compact_tool_result_for_prompt(
+        {
+            "success": True,
+            "refId": "semantic:domain:fact:metric:opaque_metric",
+            "kind": "METRIC",
+            "content": json.dumps({"metric": metric}),
+        },
+        220,
+    )
+
+    compact = result["metric"]
+    assert result["executionContractPreserved"] is True
+    for key in [
+        "formula",
+        "sourceColumns",
+        "metricGrain",
+        "aggregationPolicy",
+        "applicableTimeGrain",
+        "timeColumn",
+        "timeSemantics",
+    ]:
+        assert compact[key] == metric[key]
 
 
 def test_adaptive_planner_reads_exact_ref_before_emitting_understanding() -> None:
@@ -383,6 +426,7 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
                                     "ownerTable": "fact_0",
                                     "sourcePhrase": "Requested 0",
                                     "groupByColumn": "event_day",
+                                    "resultMode": "metric",
                                 },
                                 "requestedMeasures": [
                                     {
@@ -390,6 +434,7 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
                                         "ownerTable": f"fact_{index % 3}",
                                         "sourcePhrase": f"Requested {index}",
                                         "groupByColumn": "event_day",
+                                        "resultMode": "metric",
                                     }
                                     for index in range(1, 5)
                                 ],
@@ -424,3 +469,136 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
     assert set(payload["_plannerLoadedRefs"]) == set(selected_refs)
     assert max(model.prompt_sizes) <= settings.agent_planner_prompt_budget_chars
     assert payload["_promptStats"]["toolRounds"][-1]["compaction"] == "active_semantic_results"
+
+
+def test_terminal_planner_round_forces_validated_emit_and_retries_invalid_structure() -> None:
+    selected_ref = "semantic:DOMAIN_0:fact_0:metric:measure_0"
+
+    class SemanticCatalog:
+        def read(self, ref_id="", path="", max_chars=0, offset=0):
+            return {
+                "success": True,
+                "refId": ref_id,
+                "kind": "METRIC",
+                "topic": "DOMAIN_0",
+                "table": "fact_0",
+                "content": json.dumps(
+                    {
+                        "metric": {
+                            "metricKey": "measure_0",
+                            "businessName": "Measure 0",
+                            "formula": "SUM(value_0)",
+                            "sourceColumns": ["value_0"],
+                        }
+                    }
+                ),
+            }
+
+        def ls(self, **kwargs):
+            return []
+
+        def grep(self, **kwargs):
+            return []
+
+    class InvalidThenValidModel:
+        configured = True
+        last_error = ""
+        error_events: list[object] = []
+
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, Any]] = []
+            self.tool_choices: list[str] = []
+
+        def tool_chat(self, system_prompt, user_prompt, tools, fallback=None, tool_choice=None, **kwargs):
+            self.payloads.append(json.loads(user_prompt))
+            self.tool_choices.append(str(tool_choice or ""))
+            round_number = len(self.payloads)
+            if round_number == 1:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "load_read_schema",
+                            "name": "load_tool_schemas",
+                            "args": {"toolNames": ["semantic_read"]},
+                        }
+                    ],
+                }
+            if round_number == 2:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "read_selected_metric",
+                            "name": "semantic_read",
+                            "args": {"refId": selected_ref, "maxChars": 1000},
+                        }
+                    ],
+                }
+            if round_number == 3:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "invalid_emit",
+                            "name": "emit_question_understanding",
+                            "args": {"status": "UNDERSTOOD", "reason": "missing understanding"},
+                        }
+                    ],
+                }
+            return {
+                "content": "",
+                "toolCalls": [
+                    {
+                        "id": "repaired_emit",
+                        "name": "emit_question_understanding",
+                        "args": {
+                            "status": "UNDERSTOOD",
+                            "reason": "repaired against validator feedback",
+                            "questionUnderstanding": {
+                                "analysisGrain": "time",
+                                "analysisIntent": "trend_check",
+                                "requiresExplanation": False,
+                                "requiredEvidenceIntents": [],
+                                "anchorMetric": {
+                                    "metricRef": "measure_0",
+                                    "ownerTable": "fact_0",
+                                    "sourcePhrase": "Requested zero",
+                                    "groupByColumn": "event_day",
+                                },
+                                "supportMetrics": [],
+                                "timeWindowDays": 11,
+                            },
+                        },
+                    }
+                ],
+            }
+
+    settings = get_settings().model_copy(
+        update={
+            "agent_planner_prompt_budget_chars": 20_000,
+            "agent_planner_tool_rounds": 3,
+            "agent_planner_invalid_output_retries": 1,
+            "agent_deferred_tool_schema_enabled": True,
+        }
+    )
+    model = InvalidThenValidModel()
+    planner = QueryGraphPlanner(model, semantic_catalog=SemanticCatalog(), settings=settings)
+
+    payload = planner._llm_understand(
+        "opaque",
+        planner_pack(),
+        [],
+        [],
+        use_tool_loop=True,
+        filesystem_context_entry="adaptive",
+    )
+
+    assert payload["status"] == "UNDERSTOOD"
+    assert payload["questionUnderstanding"]["rankingObjective"]["metricRef"] == "measure_0"
+    assert len(payload["_plannerInvalidOutputAttempts"]) == 1
+    assert model.tool_choices == ["", "", "emit_question_understanding", "emit_question_understanding"]
+    assert any(
+        item.get("errorType") == "INVALID_STRUCTURED_OUTPUT"
+        for item in model.payloads[-1]["plannerToolResults"]
+    )

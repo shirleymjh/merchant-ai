@@ -44,15 +44,75 @@ SUPPORTED_METRIC_AGGREGATION_POLICIES = frozenset(
     }
 )
 
+SUPPORTED_METRIC_AS_OF_POLICIES = frozenset(
+    {
+        "calendar",
+        "latest_available_partition",
+        "latest_observation",
+        "not_applicable",
+        "undeclared",
+    }
+)
+
+SUPPORTED_METRIC_TIME_SELECTION_POLICIES = frozenset(
+    {
+        "period_window",
+        "latest_as_of",
+        "per_time_grain",
+        "undeclared",
+    }
+)
+
+SUPPORTED_METRIC_MISSING_DATA_POLICIES = frozenset(
+    {
+        "fail_closed",
+        "disclose_unknown",
+        "skip_missing",
+        "zero_fill",
+        "not_applicable",
+        "undeclared",
+    }
+)
+
+SUPPORTED_METRIC_ZERO_VALUE_POLICIES = frozenset(
+    {
+        "preserve_observed_zero",
+        "treat_as_missing",
+        "not_applicable",
+        "undeclared",
+    }
+)
+
+# Only policies with a concrete, shared Quick/QueryGraph execution behavior may
+# pass publication. The broader enums above remain useful for proposal/review,
+# but unsupported declarations must not become governed runtime contracts.
+EXECUTABLE_METRIC_AS_OF_POLICIES_BY_SELECTION = {
+    "period_window": frozenset({"calendar", "latest_available_partition"}),
+    "latest_as_of": frozenset({"calendar", "latest_available_partition", "latest_observation"}),
+    "per_time_grain": frozenset({"calendar", "latest_available_partition"}),
+}
+EXECUTABLE_METRIC_MISSING_DATA_POLICIES = frozenset({"disclose_unknown", "fail_closed"})
+EXECUTABLE_METRIC_ZERO_VALUE_POLICIES = frozenset({"preserve_observed_zero"})
+
+# These are the table-level semantic files that are actually overlaid by every
+# active asset reader. Keep the runtime loader and activation identity derived
+# from one structural contract so a new sidecar cannot silently bypass version
+# invalidation.
+ACTIVE_SEMANTIC_SIDECAR_FIELDS = {
+    "schemaColumns": "schema.json",
+    "semanticColumns": "semantic_columns.json",
+    "metrics": "metrics.json",
+    "terms": "terms.json",
+    "knowledgeRules": "knowledge_rules.json",
+}
+ACTIVE_TOPIC_SEMANTIC_FILENAMES = frozenset({"manifest.json", "relationships.json"})
+ACTIVE_TABLE_SEMANTIC_FILENAMES = frozenset({"asset.json", *ACTIVE_SEMANTIC_SIDECAR_FIELDS.values()})
+
+SemanticActivationSignature = Tuple[Tuple[str, int, int, int, int], ...]
+
 
 class TopicAssetService:
-    SEMANTIC_LIST_FIELDS = {
-        "schemaColumns",
-        "semanticColumns",
-        "metrics",
-        "terms",
-        "knowledgeRules",
-    }
+    SEMANTIC_LIST_FIELDS = set(ACTIVE_SEMANTIC_SIDECAR_FIELDS)
     SEMANTIC_SIDECAR_FILES = {
         "schema.json",
         "semantic_columns.json",
@@ -84,7 +144,10 @@ class TopicAssetService:
         self._relationship_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._topic_names_cache: Optional[List[str]] = None
         self._topic_contract_cache: Dict[str, Dict[str, Any]] = {}
-        self._semantic_source_hash_cache: Dict[Tuple[str, ...], str] = {}
+        self._semantic_source_hash_cache: Dict[
+            Tuple[str, ...],
+            Tuple[SemanticActivationSignature, str],
+        ] = {}
 
     @property
     def root(self) -> Path:
@@ -109,7 +172,15 @@ class TopicAssetService:
         write_json(pending / "review-result.json", review_payload)
         if approved:
             target.mkdir(parents=True, exist_ok=True)
-            self._canonicalize_pending_asset(pending, topic, table_name)
+            active_asset = self._canonicalize_pending_asset(pending, topic, table_name)
+            active_asset.update(
+                {
+                    "status": "PUBLISHED",
+                    "reviewedAt": datetime.utcnow().isoformat() + "Z",
+                    "reviewer": reviewer,
+                    "reviewNote": review_note,
+                }
+            )
             changed_files: List[str] = []
             unchanged_files: List[str] = []
             deleted_files: List[str] = []
@@ -117,7 +188,14 @@ class TopicAssetService:
                 source_path = pending / name
                 target_path = target / name
                 if source_path.exists() and source_path.is_file():
-                    source_bytes = source_path.read_bytes()
+                    # Keep the reviewed candidate immutable. Publication
+                    # materializes a governed active copy; if a later index or
+                    # governance step fails, pending cannot falsely look live.
+                    source_bytes = (
+                        json.dumps(active_asset, ensure_ascii=False, indent=2).encode("utf-8")
+                        if name == "asset.json"
+                        else source_path.read_bytes()
+                    )
                     if target_path.exists() and target_path.is_file() and target_path.read_bytes() == source_bytes:
                         unchanged_files.append(name)
                         continue
@@ -132,6 +210,7 @@ class TopicAssetService:
                 if target_path.exists() and target_path.is_file():
                     target_path.unlink()
                     deleted_files.append(name)
+            manifest_changed = self._upsert_published_manifest_entry(topic, active_asset)
             self._table_asset_cache.pop((topic, table_name), None)
             self._manifest_cache.pop(topic, None)
             self._relationship_cache.pop(topic, None)
@@ -152,6 +231,7 @@ class TopicAssetService:
                 "changedFiles": changed_files,
                 "unchangedFiles": unchanged_files,
                 "deletedFiles": deleted_files,
+                "manifestChanged": manifest_changed,
             }
         return {"success": True, "status": "REJECTED", "topic": topic, "tableName": table_name}
 
@@ -283,18 +363,39 @@ class TopicAssetService:
 
     def semantic_source_hash(self, topics: Iterable[str]) -> str:
         cache_key = tuple(sorted({str(item or "") for item in topics if item}))
-        if cache_key in self._semantic_source_hash_cache:
-            return self._semantic_source_hash_cache[cache_key]
-        hasher = hashlib.sha256()
-        for path in self.canonical_semantic_files(cache_key):
-            try:
-                hasher.update(str(path.relative_to(self.root)).encode("utf-8"))
-                hasher.update(path.read_bytes())
-            except Exception:
-                continue
-        digest = hasher.hexdigest()[:16]
-        self._semantic_source_hash_cache[cache_key] = digest
+        files = self.canonical_semantic_files(cache_key)
+        signature = semantic_activation_signature(self.root, files)
+        if signature is None:
+            return ""
+        cached = self._semantic_source_hash_cache.get(cache_key)
+        if cached and cached[0] == signature:
+            return cached[1]
+        digest = active_semantic_activation_digest(self.root, files)
+        # Do not cache a digest assembled while activation files were changing.
+        # A following call will retry from a coherent filesystem snapshot.
+        if not digest or semantic_activation_signature(self.root, files) != signature:
+            return ""
+        self._semantic_source_hash_cache[cache_key] = (signature, digest)
         return digest
+
+    def semantic_table_source_hash(self, topic: str, table: str) -> str:
+        """Return the active semantic identity relevant to one governed table."""
+
+        candidates = [
+            *(self.root / topic / name for name in ACTIVE_TOPIC_SEMANTIC_FILENAMES),
+            *(
+                self.table_asset_dir(topic, table) / name
+                for name in ACTIVE_TABLE_SEMANTIC_FILENAMES
+            ),
+        ]
+        files = [
+            path
+            for path in candidates
+            if path.exists()
+            and path.is_file()
+            and is_active_semantic_activation_file(path, self.root)
+        ]
+        return active_semantic_activation_digest(self.root, files)
 
     def canonical_semantic_files(self, topics: Iterable[str]) -> List[Path]:
         files: List[Path] = []
@@ -302,15 +403,19 @@ class TopicAssetService:
             topic_dir = self.root / topic
             if not topic_dir.exists():
                 continue
-            for name in ["manifest.json", "relationships.json"]:
+            for name in ACTIVE_TOPIC_SEMANTIC_FILENAMES:
                 path = topic_dir / name
-                if path.exists() and path.is_file():
+                if path.exists() and path.is_file() and is_active_semantic_activation_file(path, self.root):
                     files.append(path)
             tables_dir = topic_dir / "tables"
-            for path in sorted(tables_dir.glob("*/asset.json")):
-                if path.exists() and path.is_file():
-                    files.append(path)
-        return files
+            if not tables_dir.exists():
+                continue
+            for table_dir in sorted((path for path in tables_dir.iterdir() if path.is_dir()), key=lambda path: path.name):
+                for name in ACTIVE_TABLE_SEMANTIC_FILENAMES:
+                    path = table_dir / name
+                    if path.exists() and path.is_file() and is_active_semantic_activation_file(path, self.root):
+                        files.append(path)
+        return sorted(files, key=lambda path: path.relative_to(self.root).as_posix())
 
     def load_topic_context(self, topic_names: Iterable[str]) -> str:
         parts: List[str] = []
@@ -346,13 +451,7 @@ class TopicAssetService:
             asset = {**asset}
             asset.setdefault("topic", topic)
             asset.setdefault("tableName", table)
-        for field, file_name in {
-            "schemaColumns": "schema.json",
-            "semanticColumns": "semantic_columns.json",
-            "metrics": "metrics.json",
-            "terms": "terms.json",
-            "knowledgeRules": "knowledge_rules.json",
-        }.items():
+        for field, file_name in ACTIVE_SEMANTIC_SIDECAR_FIELDS.items():
             sidecar = read_json(table_dir / file_name)
             if isinstance(sidecar, list):
                 asset[field] = sidecar
@@ -368,23 +467,64 @@ class TopicAssetService:
         payload: Dict[str, Any] = asset if isinstance(asset, dict) else {}
         payload.setdefault("topic", topic)
         payload.setdefault("tableName", table)
-        sidecar_fields = {
-            "schemaColumns": "schema.json",
-            "semanticColumns": "semantic_columns.json",
-            "metrics": "metrics.json",
-            "terms": "terms.json",
-            "knowledgeRules": "knowledge_rules.json",
-        }
-        changed = False
-        for field, file_name in sidecar_fields.items():
+        for field, file_name in ACTIVE_SEMANTIC_SIDECAR_FIELDS.items():
             if isinstance(payload.get(field), list):
                 continue
             sidecar = read_json(pending_dir / file_name)
             payload[field] = sidecar if isinstance(sidecar, list) else []
-            changed = True
-        if changed or not (pending_dir / "asset.json").exists():
-            write_json(pending_dir / "asset.json", payload)
         return payload
+
+    def _upsert_published_manifest_entry(self, topic: str, asset: Dict[str, Any]) -> bool:
+        table = str(asset.get("tableName") or "").strip()
+        if not table:
+            raise ValueError("published semantic asset has no tableName")
+        manifest_path = self.root / topic / "manifest.json"
+        current = read_json(manifest_path)
+        items = [dict(item) for item in current if isinstance(item, dict)] if isinstance(current, list) else []
+        existing = next((item for item in items if str(item.get("tableName") or "") == table), {})
+        metrics = [item for item in asset.get("metrics") or [] if isinstance(item, dict)]
+        rules = [item for item in asset.get("knowledgeRules") or [] if isinstance(item, dict)]
+        schema = [item for item in asset.get("schemaColumns") or [] if isinstance(item, dict)]
+        usage = normalize_table_usage_profile(asset.get("tableUsageProfile") or {}, table)
+        preferred_for = list(existing.get("preferredFor") or usage.get("defaultForIntents") or [])
+        if not preferred_for:
+            if schema:
+                preferred_for.append("DETAIL")
+            if metrics:
+                preferred_for.extend(["METRIC", "TOPN", "GROUP_AGG"])
+            if rules:
+                preferred_for.append("RULE_REFERENCE")
+        updated = {
+            **existing,
+            "tableName": table,
+            "tableComment": str(asset.get("tableComment") or existing.get("tableComment") or ""),
+            "dataGrain": str(asset.get("dataGrain") or existing.get("dataGrain") or ""),
+            "timeColumn": str(asset.get("timeColumn") or existing.get("timeColumn") or ""),
+            "merchantFilterColumn": str(
+                asset.get("merchantFilterColumn") or existing.get("merchantFilterColumn") or ""
+            ),
+            "freshnessType": str(asset.get("freshnessType") or existing.get("freshnessType") or ""),
+            "supportsDetail": bool(schema),
+            "supportsMetrics": bool(metrics),
+            "preferredFor": dedupe_strings(preferred_for),
+            "metricCount": len(metrics),
+            "ruleCount": len(rules),
+            "status": "PUBLISHED",
+        }
+        rewritten: List[Dict[str, Any]] = []
+        replaced = False
+        for item in items:
+            if str(item.get("tableName") or "") == table:
+                rewritten.append(updated)
+                replaced = True
+            else:
+                rewritten.append(item)
+        if not replaced:
+            rewritten.append(updated)
+        changed = rewritten != items
+        if changed or not manifest_path.exists():
+            write_json(manifest_path, rewritten)
+        return changed
 
     def load_table_schema(self, topic: str, table: str) -> List[Dict[str, Any]]:
         data = self.load_table_asset(topic, table).get("schemaColumns")
@@ -395,8 +535,19 @@ class TopicAssetService:
         return data if isinstance(data, list) else []
 
     def load_table_metrics(self, topic: str, table: str) -> List[Dict[str, Any]]:
-        data = self.load_table_asset(topic, table).get("metrics")
-        return data if isinstance(data, list) else []
+        asset = self.load_table_asset(topic, table)
+        data = asset.get("metrics")
+        if not isinstance(data, list):
+            return []
+        table_time_column = str(asset.get("timeColumn") or "").strip()
+        return [
+            {
+                **metric,
+                "timeColumn": str(metric.get("timeColumn") or table_time_column or "").strip(),
+            }
+            for metric in data
+            if isinstance(metric, dict)
+        ]
 
     def load_table_terms(self, topic: str, table: str) -> List[Dict[str, Any]]:
         data = self.load_table_asset(topic, table).get("terms")
@@ -1284,6 +1435,11 @@ class HybridRecallService:
                                 "metricGrain": metric.get("metricGrain") or metric.get("grainHint") or "",
                                 "metricIntent": metric.get("metricIntent") or "",
                                 "aggregationPolicy": metric.get("aggregationPolicy") or "",
+                                "applicableTimeGrain": metric.get("applicableTimeGrain") or "",
+                                "timeColumn": metric.get("timeColumn") or "",
+                                "timeSemantics": metric.get("timeSemantics") or {},
+                                "missingValuePolicy": metric.get("missingValuePolicy") or "",
+                                "zeroValueMeaning": metric.get("zeroValueMeaning") or "",
                                 "selectionGuidance": metric.get("selectionGuidance") or "",
                                 "preferredUseCases": metric.get("preferredUseCases") or [],
                                 "notPreferredUseCases": metric.get("notPreferredUseCases") or [],
@@ -1417,6 +1573,12 @@ def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
                 "sourceColumns": item.get("sourceColumns") or [],
                 "aliases": item.get("aliases") or [],
                 "description": item.get("description"),
+                "aggregationPolicy": item.get("aggregationPolicy"),
+                "applicableTimeGrain": item.get("applicableTimeGrain"),
+                "timeColumn": item.get("timeColumn"),
+                "timeSemantics": item.get("timeSemantics") or {},
+                "missingValuePolicy": item.get("missingValuePolicy"),
+                "zeroValueMeaning": item.get("zeroValueMeaning"),
             }
             for item in (asset.get("metrics") or [])[:80]
             if isinstance(item, dict)
@@ -1472,6 +1634,10 @@ def compact_metric_for_recall(topic: str, table: str, metric: Dict[str, Any]) ->
         "metricGrain": metric.get("metricGrain") or metric.get("grainHint"),
         "metricIntent": metric.get("metricIntent"),
         "aggregationPolicy": metric.get("aggregationPolicy"),
+        "applicableTimeGrain": metric.get("applicableTimeGrain"),
+        "timeSemantics": metric.get("timeSemantics") or {},
+        "missingValuePolicy": metric.get("missingValuePolicy"),
+        "zeroValueMeaning": metric.get("zeroValueMeaning"),
         "selectionGuidance": metric.get("selectionGuidance"),
         "preferredUseCases": metric.get("preferredUseCases") or [],
         "notPreferredUseCases": metric.get("notPreferredUseCases") or [],
@@ -2709,16 +2875,7 @@ class PlanningAssetPackBuilder:
         )
 
     def _semantic_source_hash(self, topic: str, table: str) -> str:
-        asset_path = self.topic_assets.root / topic / "tables" / table / "asset.json"
-        if not asset_path.exists():
-            return ""
-        hasher = hashlib.sha256()
-        try:
-            hasher.update(asset_path.name.encode("utf-8"))
-            hasher.update(asset_path.read_bytes())
-        except Exception:
-            return ""
-        return hasher.hexdigest()
+        return self.topic_assets.semantic_table_source_hash(topic, table)
 
     def _semantic_published_at(self, topic: str, table: str) -> str:
         asset_path = self.topic_assets.root / topic / "tables" / table / "asset.json"
@@ -3449,6 +3606,14 @@ def catalog_metric_evidence_payload(metric: PlanningAssetEntry, matched_label: s
         "canonicalMetricKey": str(metadata.get("canonicalMetricKey") or ""),
         "aliasOf": str(metadata.get("aliasOf") or ""),
         "metricLevel": str(metadata.get("metricLevel") or ""),
+        "metricGrain": str(metadata.get("metricGrain") or metadata.get("grainHint") or ""),
+        "metricIntent": str(metadata.get("metricIntent") or ""),
+        "aggregationPolicy": str(metadata.get("aggregationPolicy") or ""),
+        "applicableTimeGrain": str(metadata.get("applicableTimeGrain") or ""),
+        "timeColumn": str(metadata.get("timeColumn") or metadata.get("time_column") or ""),
+        "timeSemantics": metadata.get("timeSemantics") or {},
+        "missingValuePolicy": str(metadata.get("missingValuePolicy") or ""),
+        "zeroValueMeaning": str(metadata.get("zeroValueMeaning") or ""),
         "formula": str(metadata.get("formula") or metadata.get("metricFormula") or ""),
         "sourceColumns": metadata.get("sourceColumns") or metadata.get("source_columns") or metric.columns,
         "aliases": list(dict.fromkeys([*metric.aliases, *[str(alias) for alias in metadata.get("aliases") or []]])),
@@ -3815,13 +3980,7 @@ class TopicBuilderWorkflow:
         payload: Dict[str, Any] = asset if isinstance(asset, dict) else {}
         payload.setdefault("topic", topic)
         payload.setdefault("tableName", table)
-        for field, file_name in {
-            "schemaColumns": "schema.json",
-            "semanticColumns": "semantic_columns.json",
-            "metrics": "metrics.json",
-            "terms": "terms.json",
-            "knowledgeRules": "knowledge_rules.json",
-        }.items():
+        for field, file_name in ACTIVE_SEMANTIC_SIDECAR_FIELDS.items():
             sidecar = read_json(directory / file_name)
             if sidecar:
                 payload[field] = sidecar
@@ -4074,6 +4233,9 @@ class TopicBuilderWorkflow:
             "生成待审核的语义层候选资产。输出必须保守、结构化，不要编造不存在的字段，"
             "不要生成跨表 join 关系。字段角色只允许 KEY、TIME、DIMENSION、ATTRIBUTE。"
             "指标必须引用真实存在的 sourceColumns；派生指标可以引用其他 metricKey。"
+            "每个指标必须声明 aggregationPolicy、metricGrain、applicableTimeGrain 和 timeSemantics；"
+            "timeSemantics 必须分别声明 asOfPolicy、missingDataPolicy 和 zeroValuePolicy。"
+            "不得把数据缺失默认解释为业务为 0；没有可核验证据时使用 undeclared，不要猜测。"
             "如果字段疑似手机号、邮箱、身份证、地址等敏感信息，请补充 visibilityPolicy 和 maskingPolicy；"
             "如果表有明确租户过滤列，请补充 rowAccessPolicy。"
             "聚合指标结果、时间或其他维度能否返回必须通过 resultAccessPolicies 按语义角色显式声明；"
@@ -4487,7 +4649,36 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "unit": {"type": "string"},
             "currency": {"type": "string"},
             "aggregation": {"type": "string"},
+            "aggregationPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_METRIC_AGGREGATION_POLICIES),
+            },
+            "metricGrain": {"type": "string"},
+            "applicableTimeGrain": {"type": "string"},
             "timeColumn": {"type": "string"},
+            "timeSemantics": {
+                "type": "object",
+                "properties": {
+                    "selectionPolicy": {
+                        "type": "string",
+                        "enum": sorted(SUPPORTED_METRIC_TIME_SELECTION_POLICIES),
+                    },
+                    "asOfPolicy": {
+                        "type": "string",
+                        "enum": sorted(SUPPORTED_METRIC_AS_OF_POLICIES),
+                    },
+                    "missingDataPolicy": {
+                        "type": "string",
+                        "enum": sorted(SUPPORTED_METRIC_MISSING_DATA_POLICIES),
+                    },
+                    "zeroValuePolicy": {
+                        "type": "string",
+                        "enum": sorted(SUPPORTED_METRIC_ZERO_VALUE_POLICIES),
+                    },
+                },
+                "required": ["selectionPolicy", "asOfPolicy", "missingDataPolicy", "zeroValuePolicy"],
+                "additionalProperties": False,
+            },
             "requiredFilters": {"type": "array", "items": {"type": "string"}},
             "conflictsWith": {"type": "array", "items": {"type": "string"}},
             "clarificationQuestion": {"type": "string"},
@@ -4501,7 +4692,16 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "confidence": {"type": "number"},
             "evidence": {"type": "string"},
         },
-        "required": ["metricKey", "businessName", "formula", "sourceColumns"],
+        "required": [
+            "metricKey",
+            "businessName",
+            "formula",
+            "sourceColumns",
+            "aggregationPolicy",
+            "metricGrain",
+            "applicableTimeGrain",
+            "timeSemantics",
+        ],
         "additionalProperties": False,
     }
     term_schema = {
@@ -4693,6 +4893,14 @@ class SemanticAssetGovernanceService:
         live_schema = self._live_schema(table)
         builder = PlanningAssetPackBuilder(self.topic_assets, doris_repository=self.doris_repository)
         version = builder._semantic_catalog_version(topic, table, semantic_schema, live_schema)
+        pending_source_hash = semantic_candidate_source_hash(pending_dir)
+        version = version.model_copy(
+            update={
+                "semantic_version": "semantic-%s" % (pending_source_hash[:12] or "unknown"),
+                "source_hash": pending_source_hash,
+                "published_at": "",
+            }
+        )
         drift = (
             builder._schema_drift_report(topic, table, semantic_schema, live_schema, version)
             if live_schema
@@ -4724,6 +4932,7 @@ class SemanticAssetGovernanceService:
             "status": "PREFLIGHT_PASSED" if release_gate["publishable"] else "PREFLIGHT_FAILED",
             "topic": topic,
             "tableName": table,
+            "pendingSourceHash": pending_source_hash,
             "semanticGovernance": semantic_governance_envelope(
                 topic,
                 table,
@@ -4916,13 +5125,7 @@ class SemanticAssetGovernanceService:
         payload: Dict[str, Any] = asset if isinstance(asset, dict) else {}
         payload.setdefault("topic", topic)
         payload.setdefault("tableName", table)
-        for field, file_name in {
-            "schemaColumns": "schema.json",
-            "semanticColumns": "semantic_columns.json",
-            "metrics": "metrics.json",
-            "terms": "terms.json",
-            "knowledgeRules": "knowledge_rules.json",
-        }.items():
+        for field, file_name in ACTIVE_SEMANTIC_SIDECAR_FIELDS.items():
             sidecar = read_json(directory / file_name)
             if sidecar:
                 payload[field] = sidecar
@@ -5093,13 +5296,22 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             warnings.append({"code": "ALIAS_TARGET_NOT_IN_SAME_ASSET", "metricKey": metric_key, "aliasOf": alias_of})
         if canonical and canonical != metric_key:
             warnings.append({"code": "CANONICAL_METRIC_EXTERNAL_OR_ALIAS", "metricKey": metric_key, "canonicalMetricKey": canonical})
-        time_column = str(metric.get("timeColumn") or "").strip()
-        if time_column and time_column not in columns:
+        table_time_column = str(asset.get("timeColumn") or "").strip()
+        time_column = str(metric.get("timeColumn") or table_time_column or "").strip()
+        if not time_column:
+            errors.append({"code": "METRIC_TIME_COLUMN_UNDECLARED", "metricKey": metric_key})
+        elif time_column not in columns:
             errors.append({"code": "METRIC_TIME_COLUMN_MISSING", "metricKey": metric_key, "column": time_column})
         aggregation_policy = str(metric.get("aggregationPolicy") or "").strip().lower()
         formula = str(metric.get("formula") or metric.get("metricFormula") or "").strip()
         metric_type = str(metric.get("metricType") or "").strip().upper()
         ratio_metric = metric_type == "RATIO" or "/" in formula
+        metric_grain = str(metric.get("metricGrain") or "").strip().lower()
+        applicable_time_grain = str(metric.get("applicableTimeGrain") or "").strip().lower()
+        if not metric_grain:
+            errors.append({"code": "METRIC_GRAIN_UNDECLARED", "metricKey": metric_key})
+        if not applicable_time_grain:
+            errors.append({"code": "METRIC_APPLICABLE_TIME_GRAIN_UNDECLARED", "metricKey": metric_key})
         if not aggregation_policy:
             errors.append({"code": "METRIC_AGGREGATION_POLICY_UNDECLARED", "metricKey": metric_key})
         elif aggregation_policy not in SUPPORTED_METRIC_AGGREGATION_POLICIES:
@@ -5120,10 +5332,114 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             )
         if ratio_metric and aggregation_policy not in {"ratio_of_sums", "daily_value_only", "period_rollup"}:
             errors.append({"code": "RATIO_AGGREGATION_POLICY_UNDECLARED", "metricKey": metric_key})
+        if aggregation_policy == "ratio_of_sums" and (
+            "/" not in formula or len(re.findall(r"\bSUM\s*\(", formula, flags=re.IGNORECASE)) < 2
+        ):
+            errors.append(
+                {
+                    "code": "RATIO_OF_SUMS_FORMULA_INVALID",
+                    "metricKey": metric_key,
+                    "formula": formula,
+                }
+            )
+        raw_time_semantics = metric.get("timeSemantics")
+        if raw_time_semantics is not None and not isinstance(raw_time_semantics, dict):
+            errors.append({"code": "METRIC_TIME_SEMANTICS_INVALID", "metricKey": metric_key})
+        elif isinstance(raw_time_semantics, dict):
+            selection_policy = str(raw_time_semantics.get("selectionPolicy") or "").strip().lower()
+            as_of_policy = str(raw_time_semantics.get("asOfPolicy") or "").strip().lower()
+            missing_data_policy = str(raw_time_semantics.get("missingDataPolicy") or "").strip().lower()
+            zero_value_policy = str(raw_time_semantics.get("zeroValuePolicy") or "").strip().lower()
+            declared_policies = {
+                "selectionPolicy": (selection_policy, SUPPORTED_METRIC_TIME_SELECTION_POLICIES),
+                "asOfPolicy": (as_of_policy, SUPPORTED_METRIC_AS_OF_POLICIES),
+                "missingDataPolicy": (missing_data_policy, SUPPORTED_METRIC_MISSING_DATA_POLICIES),
+                "zeroValuePolicy": (zero_value_policy, SUPPORTED_METRIC_ZERO_VALUE_POLICIES),
+            }
+            for policy_name, (policy_value, supported_values) in declared_policies.items():
+                if not policy_value or policy_value == "undeclared":
+                    errors.append(
+                        {
+                            "code": "METRIC_TIME_SEMANTICS_UNDECLARED",
+                            "metricKey": metric_key,
+                            "policy": policy_name,
+                        }
+                    )
+                elif policy_value not in supported_values:
+                    errors.append(
+                        {
+                            "code": "METRIC_TIME_SEMANTICS_POLICY_INVALID",
+                            "metricKey": metric_key,
+                            "policy": policy_name,
+                            "value": policy_value,
+                        }
+                    )
+            if aggregation_policy == "latest_value_only" and as_of_policy in {"", "not_applicable", "undeclared"}:
+                errors.append({"code": "LATEST_VALUE_AS_OF_POLICY_UNDECLARED", "metricKey": metric_key})
+            expected_selection_policy = {
+                "latest_value_only": "latest_as_of",
+                "daily_value_only": "per_time_grain",
+                "period_rollup": "period_window",
+                "period_recompute": "period_window",
+                "ratio_of_sums": "period_window",
+            }.get(aggregation_policy, "")
+            if (
+                expected_selection_policy
+                and selection_policy not in {"", "undeclared"}
+                and selection_policy != expected_selection_policy
+            ):
+                errors.append(
+                    {
+                        "code": "METRIC_TIME_SELECTION_POLICY_CONFLICT",
+                        "metricKey": metric_key,
+                        "aggregationPolicy": aggregation_policy,
+                        "selectionPolicy": selection_policy,
+                    }
+                )
+            if missing_data_policy == "zero_fill" and zero_value_policy == "treat_as_missing":
+                errors.append({"code": "METRIC_MISSING_ZERO_POLICY_CONFLICT", "metricKey": metric_key})
+            executable_as_of_policies = EXECUTABLE_METRIC_AS_OF_POLICIES_BY_SELECTION.get(
+                selection_policy,
+                frozenset(),
+            )
+            if as_of_policy and as_of_policy not in executable_as_of_policies:
+                errors.append(
+                    {
+                        "code": "METRIC_AS_OF_POLICY_NOT_EXECUTABLE",
+                        "metricKey": metric_key,
+                        "selectionPolicy": selection_policy,
+                        "asOfPolicy": as_of_policy,
+                    }
+                )
+            if missing_data_policy and missing_data_policy not in EXECUTABLE_METRIC_MISSING_DATA_POLICIES:
+                errors.append(
+                    {
+                        "code": "METRIC_MISSING_DATA_POLICY_NOT_EXECUTABLE",
+                        "metricKey": metric_key,
+                        "missingDataPolicy": missing_data_policy,
+                    }
+                )
+            if zero_value_policy and zero_value_policy not in EXECUTABLE_METRIC_ZERO_VALUE_POLICIES:
+                errors.append(
+                    {
+                        "code": "METRIC_ZERO_VALUE_POLICY_NOT_EXECUTABLE",
+                        "metricKey": metric_key,
+                        "zeroValuePolicy": zero_value_policy,
+                    }
+                )
+        else:
+            errors.append({"code": "METRIC_TIME_SEMANTICS_UNDECLARED", "metricKey": metric_key})
         if aggregation_policy == "daily_value_only":
-            applicable_time_grain = str(metric.get("applicableTimeGrain") or "").strip().lower()
             if not applicable_time_grain:
                 errors.append({"code": "DAILY_VALUE_TIME_GRAIN_UNDECLARED", "metricKey": metric_key})
+            elif applicable_time_grain != "day":
+                errors.append(
+                    {
+                        "code": "DAILY_VALUE_TIME_GRAIN_INVALID",
+                        "metricKey": metric_key,
+                        "applicableTimeGrain": applicable_time_grain,
+                    }
+                )
             if re.search(r"\b(?:SUM|AVG)\s*\(", formula, flags=re.IGNORECASE):
                 errors.append(
                     {
@@ -5967,6 +6283,108 @@ def read_json(path: Path) -> Any:
         return None
 
 
+def is_active_semantic_activation_file(path: Path, root: Path) -> bool:
+    """Classify files that can change the active runtime semantic view."""
+
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    if len(parts) == 2:
+        return bool(parts[0]) and parts[1] in ACTIVE_TOPIC_SEMANTIC_FILENAMES
+    if len(parts) == 4:
+        topic, tables_segment, table, file_name = parts
+        return (
+            bool(topic)
+            and tables_segment == "tables"
+            and bool(table)
+            and file_name in ACTIVE_TABLE_SEMANTIC_FILENAMES
+        )
+    return False
+
+
+def stable_relative_file_digest(root: Path, files: Iterable[Path]) -> str:
+    """Hash relative path and bytes in a deterministic, boundary-safe form."""
+
+    try:
+        indexed = sorted(
+            {
+                path.relative_to(root).as_posix(): path
+                for path in files
+                if path.is_file()
+            }.items()
+        )
+    except (OSError, ValueError):
+        return ""
+    hasher = hashlib.sha256()
+    for relative_text, path in indexed:
+        try:
+            relative = relative_text.encode("utf-8")
+            content = path.read_bytes()
+        except OSError:
+            return ""
+        hasher.update(len(relative).to_bytes(8, "big"))
+        hasher.update(relative)
+        hasher.update(len(content).to_bytes(8, "big"))
+        hasher.update(content)
+    return hasher.hexdigest()
+
+
+def active_semantic_activation_digest(root: Path, files: Iterable[Path]) -> str:
+    """Return the identity of the effective, active semantic filesystem view."""
+
+    return stable_relative_file_digest(
+        root,
+        (path for path in files if is_active_semantic_activation_file(path, root)),
+    )
+
+
+def semantic_activation_signature(
+    root: Path,
+    files: Iterable[Path],
+) -> Optional[SemanticActivationSignature]:
+    """Cheap cache signature that also detects out-of-band active file edits."""
+
+    signature: List[Tuple[str, int, int, int, int]] = []
+    try:
+        indexed = sorted(
+            {
+                path.relative_to(root).as_posix(): path
+                for path in files
+                if is_active_semantic_activation_file(path, root)
+            }.items()
+        )
+        for relative, path in indexed:
+            stat = path.stat()
+            signature.append(
+                (
+                    relative,
+                    int(stat.st_size),
+                    int(stat.st_mtime_ns),
+                    int(stat.st_ctime_ns),
+                    int(stat.st_ino),
+                )
+            )
+    except (OSError, ValueError):
+        return None
+    return tuple(signature)
+
+
+def semantic_candidate_source_hash(candidate_dir: Path) -> str:
+    """Return a stable hash for the immutable semantic publish candidate."""
+
+    if not candidate_dir.exists() or not candidate_dir.is_dir():
+        return ""
+    return stable_relative_file_digest(
+        candidate_dir,
+        (
+            path
+            for path in candidate_dir.rglob("*")
+            if path.is_file() and path.name != "review-result.json"
+        ),
+    )
+
+
 def merge_semantic_layer_list(base: Any, override: Any, field: str) -> Any:
     if not isinstance(base, list) or not isinstance(override, list):
         return override
@@ -6071,6 +6489,7 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
         if current is None:
             evidence_by_identity[identity] = {
                 "ownerTable": table,
+                "topic": str(item.topic or metadata.get("topic") or ""),
                 "metricKey": metric_key,
                 "semanticRefId": semantic_ref_id,
                 "docId": item.doc_id,
@@ -6081,6 +6500,18 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
                 "canonicalMetricKey": str(metadata.get("canonicalMetricKey") or ""),
                 "aliasOf": str(metadata.get("aliasOf") or ""),
                 "metricLevel": str(metadata.get("metricLevel") or ""),
+                "metricGrain": str(metadata.get("metricGrain") or metadata.get("grainHint") or ""),
+                "metricIntent": str(metadata.get("metricIntent") or ""),
+                "aggregationPolicy": str(metadata.get("aggregationPolicy") or ""),
+                "applicableTimeGrain": str(metadata.get("applicableTimeGrain") or ""),
+                "timeColumn": str(metadata.get("timeColumn") or metadata.get("time_column") or ""),
+                "timeSemantics": metadata.get("timeSemantics") or {},
+                "missingValuePolicy": str(metadata.get("missingValuePolicy") or ""),
+                "zeroValueMeaning": str(metadata.get("zeroValueMeaning") or ""),
+                "selectionGuidance": str(metadata.get("selectionGuidance") or ""),
+                "preferredUseCases": metadata.get("preferredUseCases") or [],
+                "notPreferredUseCases": metadata.get("notPreferredUseCases") or [],
+                "temporalVariants": metadata.get("temporalVariants") or {},
                 "formula": str(metadata.get("formula") or ""),
                 "sourceColumns": metadata.get("sourceColumns") or [],
                 "aliases": metadata.get("aliases") or [],
@@ -6108,6 +6539,35 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
                     "canonicalMetricKey": str(metadata.get("canonicalMetricKey") or current.get("canonicalMetricKey") or ""),
                     "aliasOf": str(metadata.get("aliasOf") or current.get("aliasOf") or ""),
                     "metricLevel": str(metadata.get("metricLevel") or current.get("metricLevel") or ""),
+                    "metricGrain": str(metadata.get("metricGrain") or current.get("metricGrain") or ""),
+                    "metricIntent": str(metadata.get("metricIntent") or current.get("metricIntent") or ""),
+                    "aggregationPolicy": str(
+                        metadata.get("aggregationPolicy") or current.get("aggregationPolicy") or ""
+                    ),
+                    "applicableTimeGrain": str(
+                        metadata.get("applicableTimeGrain") or current.get("applicableTimeGrain") or ""
+                    ),
+                    "timeColumn": str(
+                        metadata.get("timeColumn")
+                        or metadata.get("time_column")
+                        or current.get("timeColumn")
+                        or ""
+                    ),
+                    "timeSemantics": metadata.get("timeSemantics") or current.get("timeSemantics") or {},
+                    "missingValuePolicy": str(
+                        metadata.get("missingValuePolicy") or current.get("missingValuePolicy") or ""
+                    ),
+                    "zeroValueMeaning": str(
+                        metadata.get("zeroValueMeaning") or current.get("zeroValueMeaning") or ""
+                    ),
+                    "selectionGuidance": str(
+                        metadata.get("selectionGuidance") or current.get("selectionGuidance") or ""
+                    ),
+                    "preferredUseCases": metadata.get("preferredUseCases") or current.get("preferredUseCases") or [],
+                    "notPreferredUseCases": (
+                        metadata.get("notPreferredUseCases") or current.get("notPreferredUseCases") or []
+                    ),
+                    "temporalVariants": metadata.get("temporalVariants") or current.get("temporalVariants") or {},
                     "formula": str(metadata.get("formula") or current.get("formula") or ""),
                     "sourceColumns": metadata.get("sourceColumns") or current.get("sourceColumns") or [],
                     "aliases": metadata.get("aliases") or current.get("aliases") or [],

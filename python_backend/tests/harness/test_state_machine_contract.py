@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 import pytest
 from langgraph.graph import END as LANGGRAPH_END
@@ -12,7 +12,14 @@ import merchant_ai.graph.workflow as workflow_module
 from merchant_ai.graph.policy import AgentActionRegistry, V2AgentPolicy
 from merchant_ai.graph.state import AgentState
 from merchant_ai.graph.workflow import MerchantQaWorkflow
-from merchant_ai.models import AgentActionTrace, AgentDecision, GraphValidationGap, QuestionCategory
+from merchant_ai.models import (
+    AgentActionTrace,
+    AgentDecision,
+    GraphValidationGap,
+    PlannerRepairInput,
+    QueryGraphRepairDelta,
+    QuestionCategory,
+)
 from merchant_ai.services.middleware import ActionContractMiddleware, MiddlewareChain
 
 
@@ -65,6 +72,7 @@ def test_action_registry_has_unique_nodes_and_closed_contracts() -> None:
 
 def test_graph_repair_attempt_flag_has_a_persisted_state_channel() -> None:
     assert "query_graph_repair_attempted" in AgentState.__annotations__
+    assert "query_graph_repair_progressed" in AgentState.__annotations__
 
 
 def test_cross_node_control_channels_round_trip_through_langgraph_state_schema() -> None:
@@ -99,6 +107,19 @@ def test_cross_node_control_channels_round_trip_through_langgraph_state_schema()
         "middleware_action_context_hashes": {"plan_graph": "context_hash"},
         "middleware_blocked": True,
         "preflight_understanding": {"surfaceSignals": {"business": True}},
+        "planner_repair_input": PlannerRepairInput(scope_key="repair_scope_1"),
+        "query_graph_repair_scope_attempts": {"repair_scope_1": 1},
+        "query_graph_repair_scope_key": "repair_scope_1",
+        "query_graph_repair_scope_attempt_count": 1,
+        "query_graph_repair_exhausted": False,
+        "query_graph_repair_history": [
+            QueryGraphRepairDelta(attempt=1, scope_attempt=1, scope_key="repair_scope_1")
+        ],
+        "last_query_graph_repair_delta": QueryGraphRepairDelta(
+            attempt=1,
+            scope_attempt=1,
+            scope_key="repair_scope_1",
+        ),
         "semantic_preflight_route_trace": {"source": "semantic_assets"},
         "time_window_contract": {"kind": "rolling", "days": 30},
     }
@@ -430,10 +451,56 @@ def test_adaptive_lead_selects_between_any_multiple_safe_actions() -> None:
     assert state["bounded_lead_llm_trace"]["status"] == "accepted"
 
     repeated = workflow.arbitrate_lead_action_if_needed(state, decision)
-    assert repeated.selected_action == "ask_human"
-    assert repeated.source == "runtime_fail_closed"
+    assert repeated.selected_action == "plan_graph"
+    assert repeated.source == "runtime_safe_fallback"
     assert llm.calls == 1
     assert state["bounded_lead_llm_trace"]["errorCode"] == "LEAD_DECISION_UNAVAILABLE"
+    assert not state.get("human_clarification_required")
+
+
+def test_lead_timeout_is_explicit_and_preserves_governed_policy_action() -> None:
+    class TimedOutLeadLlm:
+        configured = True
+        last_error = "timeout: provider call exceeded 12 seconds"
+
+        def tool_json_chat(self, *_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            return {}
+
+    workflow = object.__new__(MerchantQaWorkflow)
+    workflow.settings = SimpleNamespace(
+        lead_action_llm_mode="always",
+        llm_lead_timeout_seconds=12,
+        llm_request_timeout_seconds=20,
+        openai_model="test-model",
+        openai_base_url="test-provider",
+    )
+    workflow.policy = V2AgentPolicy()
+    workflow.planner = SimpleNamespace(llm=TimedOutLeadLlm())
+    spans: List[Dict[str, Any]] = []
+    workflow.record_span = lambda *_args, **kwargs: spans.append(kwargs)
+    decision = AgentDecision(
+        selected_action="plan_graph",
+        selected_node=workflow.policy.registry.node_for("plan_graph"),
+        available_actions=["plan_graph", "retrieve_knowledge"],
+        reason="governed policy selection",
+    )
+    state = {
+        "question": "governed question",
+        "main_agent_observations": [{"summary": "two safe tools remain"}],
+        "action_history": [],
+        "pending_knowledge_requests": [],
+        "planner_repair_requests": [],
+    }
+
+    selected = workflow.arbitrate_lead_action_if_needed(state, decision)
+
+    assert selected.selected_action == "plan_graph"
+    assert selected.source == "runtime_safe_fallback"
+    assert state["bounded_lead_llm_trace"]["errorCode"] == "LEAD_LLM_TIMEOUT"
+    assert state["bounded_lead_llm_trace"]["status"] == "failed_closed"
+    assert spans[-1]["status"] == "failed"
+    assert spans[-1]["error_code"] == "LEAD_LLM_TIMEOUT"
+    assert not state.get("human_clarification_required")
 
 
 def test_lead_catalog_preserves_safe_answer_action_without_business_preference() -> None:

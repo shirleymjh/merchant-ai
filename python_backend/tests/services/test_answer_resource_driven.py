@@ -151,6 +151,12 @@ def test_metric_formatting_uses_metadata_not_metric_identifier_tokens():
         "占位比率",
         {"unit": "%", "valueFormat": "percent"},
     ) == "12.5%"
+    assert format_metric_value_for_answer(
+        121.5,
+        "opaque_value",
+        "任意名称",
+        {"unit": "元", "valueFormat": "currency", "decimalPlaces": 2},
+    ) == "121.50元"
 
 
 def test_metric_disclosure_preserves_placeholder_display_contract():

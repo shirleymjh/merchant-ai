@@ -10,18 +10,46 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Union
 
 from merchant_ai.config import Settings
 from merchant_ai.models import SubAgentResultEnvelope
 from merchant_ai.services.runtime_state import NodeTaskState, RuntimeStateStore, create_runtime_state_store, safe_name
 
 
-TERMINAL_TASK_STATUSES = {"completed", "failed", "timeout", "canceled"}
+TERMINAL_TASK_STATUSES = {"completed", "partial", "failed", "timeout", "canceled"}
 
 
 class DistributedTaskError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class HandlerOutcome:
+    """Typed logical outcome returned by any Sub-Agent handler.
+
+    Existing handlers may keep returning a payload dictionary, which is treated
+    as a completed outcome.  Handlers that produced useful but incomplete work
+    can return ``partial`` without relying on payload contents or task-kind
+    specific rules in the local/distributed wrappers.
+    """
+
+    status: Literal["completed", "partial", "failed"]
+    payload: Dict[str, Any]
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in {"completed", "partial", "failed"}:
+            raise ValueError("invalid Sub-Agent handler outcome status: %s" % self.status)
+        object.__setattr__(self, "payload", dict(self.payload or {}))
+
+
+def coerce_handler_outcome(result: Union["HandlerOutcome", Dict[str, Any]]) -> HandlerOutcome:
+    if isinstance(result, HandlerOutcome):
+        return result
+    if isinstance(result, dict):
+        return HandlerOutcome(status="completed", payload=dict(result))
+    raise TypeError("Sub-Agent handler must return HandlerOutcome or dict payload")
 
 
 @dataclass
@@ -66,6 +94,8 @@ def normalize_subagent_result(
         normalized_status = "failed"
     if normalized_status == "completed":
         next_action = "return_to_lead_agent"
+    elif normalized_status == "partial":
+        next_action = "retry_or_continue_partial" if retryable else "return_partial_to_lead_agent"
     elif retryable:
         next_action = "retry_or_switch_strategy"
     else:
@@ -249,7 +279,10 @@ class DistributedSubAgentClient:
         )
 
 
-TaskHandler = Callable[[Dict[str, Any], Callable[[], bool]], Dict[str, Any]]
+TaskHandler = Callable[
+    [Dict[str, Any], Callable[[], bool]],
+    Union[HandlerOutcome, Dict[str, Any]],
+]
 
 
 class CancellationProbe:
@@ -314,11 +347,11 @@ class DistributedSubAgentWorker:
         heartbeat = threading.Thread(target=self._heartbeat_loop, args=(state, heartbeat_stop), daemon=True)
         heartbeat.start()
         try:
-            result = self._run_handler_isolated(state, handler, request)
+            outcome = coerce_handler_outcome(self._run_handler_isolated(state, handler, request))
             if self.state_store.run_canceled(state.run_id):
                 self.state_store.complete_node_task(state.run_id, state.task_id, "canceled", {"error": "run canceled during execution"})
                 return
-            contract = normalize_subagent_result(task_kind, "completed", result)
+            contract = normalize_subagent_result(task_kind, outcome.status, outcome.payload, outcome.error)
             result_uri = self.artifact_store.write_json(state.run_id, state.task_id, "result", contract)
             summary_contract = {key: value for key, value in contract.items() if key != "payload"}
             summary_contract["artifactRefs"] = list(summary_contract.get("artifactRefs") or []) + [
@@ -327,7 +360,7 @@ class DistributedSubAgentWorker:
             self.state_store.complete_node_task(
                 state.run_id,
                 state.task_id,
-                "completed",
+                str(contract.get("status") or outcome.status),
                 {
                     "resultArtifactUri": result_uri,
                     "resultContract": summary_contract,
@@ -353,7 +386,12 @@ class DistributedSubAgentWorker:
             heartbeat_stop.set()
             heartbeat.join(timeout=1)
 
-    def _run_handler_isolated(self, state: NodeTaskState, handler: TaskHandler, request: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_handler_isolated(
+        self,
+        state: NodeTaskState,
+        handler: TaskHandler,
+        request: Dict[str, Any],
+    ) -> Union[HandlerOutcome, Dict[str, Any]]:
         backend = str(self.settings.distributed_worker_execution_backend or "process").lower()
 
         def canceled() -> bool:
@@ -385,7 +423,9 @@ class DistributedSubAgentWorker:
                 raise DistributedTaskError("worker process exited without a result") from exc
             if status == "error":
                 raise DistributedTaskError(str(payload))
-            return payload if isinstance(payload, dict) else {"value": payload}
+            if isinstance(payload, (HandlerOutcome, dict)):
+                return payload
+            raise DistributedTaskError("worker process returned an invalid handler outcome")
         finally:
             if process.is_alive():
                 process.terminate()
@@ -504,7 +544,11 @@ def execute_hypothesis_review_task(request: Dict[str, Any], canceled: Callable[[
     return {"reviews": reviews}
 
 
-def execute_document_analysis_task(settings: Settings, request: Dict[str, Any], canceled: Callable[[], bool]) -> Dict[str, Any]:
+def execute_document_analysis_task(
+    settings: Settings,
+    request: Dict[str, Any],
+    canceled: Callable[[], bool],
+) -> HandlerOutcome:
     from merchant_ai.services.llm import LlmClient
 
     if canceled():
@@ -512,7 +556,19 @@ def execute_document_analysis_task(settings: Settings, request: Dict[str, Any], 
     content = str(request.get("content") or "")
     question = str(request.get("question") or "请总结文档中的关键事实、风险与待确认项")
     if not content:
-        return {"answer": "", "error": "empty document content"}
+        return HandlerOutcome(
+            status="failed",
+            payload={
+                "answer": "",
+                "gaps": [
+                    {
+                        "code": "DOCUMENT_CONTENT_EMPTY",
+                        "message": "empty document content",
+                    }
+                ],
+            },
+            error="empty document content",
+        )
     llm = LlmClient(settings)
     answer = llm.chat(
         "你是隔离的文档分析 Sub-Agent。只基于文档内容回答，明确区分事实与推断。",
@@ -531,7 +587,8 @@ def execute_document_analysis_task(settings: Settings, request: Dict[str, Any], 
                 "message": str(llm.last_error or "document analysis used extractive fallback")[:1000],
             }
         ]
-    return result
+        return HandlerOutcome(status="partial", payload=result)
+    return HandlerOutcome(status="completed", payload=result)
 
 
 def execute_python_batch_task(settings: Settings, request: Dict[str, Any], canceled: Callable[[], bool]) -> Dict[str, Any]:

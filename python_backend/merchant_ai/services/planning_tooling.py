@@ -111,6 +111,156 @@ def payload_has_understanding(payload: Dict[str, Any]) -> bool:
     return isinstance(understanding, dict) and bool(understanding)
 
 
+def structured_output_validation_errors(
+    payload: Any,
+    schema: Dict[str, Any],
+    path: str = "$",
+    limit: int = 12,
+) -> List[str]:
+    """Validate the JSON-Schema subset emitted by runtime tool definitions.
+
+    Provider-side tool binding is not a sufficient output guarantee: compatible
+    gateways can return missing fields, invalid enum values, or plain JSON text.
+    Keeping this validator next to the tool-schema helpers makes the runtime
+    contract provider-independent without introducing a second handwritten
+    question-understanding schema.
+    """
+
+    errors: List[str] = []
+
+    def add(message: str) -> None:
+        if len(errors) < max(1, limit):
+            errors.append(message)
+
+    def visit(value: Any, contract: Any, current_path: str) -> None:
+        if len(errors) >= max(1, limit) or not isinstance(contract, dict):
+            return
+        expected_type = str(contract.get("type") or "")
+        valid_type = True
+        if expected_type == "object":
+            valid_type = isinstance(value, dict)
+        elif expected_type == "array":
+            valid_type = isinstance(value, list)
+        elif expected_type == "string":
+            valid_type = isinstance(value, str)
+        elif expected_type == "integer":
+            valid_type = isinstance(value, int) and not isinstance(value, bool)
+        elif expected_type == "number":
+            valid_type = isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif expected_type == "boolean":
+            valid_type = isinstance(value, bool)
+        if expected_type and not valid_type:
+            add("%s: expected %s" % (current_path, expected_type))
+            return
+
+        enum = contract.get("enum")
+        if isinstance(enum, list) and value not in enum:
+            add("%s: value is not in enum" % current_path)
+        if expected_type in {"integer", "number"} and valid_type and contract.get("minimum") is not None:
+            try:
+                if value < contract.get("minimum"):
+                    add("%s: value is below minimum" % current_path)
+            except TypeError:
+                add("%s: minimum comparison failed" % current_path)
+        if expected_type == "object" and isinstance(value, dict):
+            for key in contract.get("required") or []:
+                if key not in value:
+                    add("%s.%s: required field is missing" % (current_path, key))
+            properties = contract.get("properties") or {}
+            if isinstance(properties, dict):
+                for key, child_contract in properties.items():
+                    if key in value:
+                        visit(value[key], child_contract, "%s.%s" % (current_path, key))
+        if expected_type == "array" and isinstance(value, list):
+            item_contract = contract.get("items") or {}
+            for index, item in enumerate(value):
+                visit(item, item_contract, "%s[%d]" % (current_path, index))
+
+    visit(payload, schema or {}, path)
+    return errors
+
+
+def normalize_question_understanding_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the emitted tool vocabulary to the compiler vocabulary.
+
+    The public tool contract uses anchorMetric/supportMetrics while the graph
+    compiler historically consumes rankingObjective/requestedMeasures. Keeping
+    that translation at the structured-output boundary prevents a schema-valid
+    model response from becoming an empty QueryGraph.
+    """
+
+    normalized = deepcopy(payload or {})
+    normalized.setdefault("reason", "")
+    understanding = normalized.get("questionUnderstanding") or normalized.get("question_understanding")
+    if not isinstance(understanding, dict):
+        return normalized
+    if str(normalized.get("status") or "").strip().upper() in {"PLAN_READY", "READY"}:
+        normalized["status"] = "UNDERSTOOD"
+    understanding = deepcopy(understanding)
+    understanding.setdefault("analysisGrain", "unknown")
+    understanding.setdefault("analysisIntent", "none")
+    understanding.setdefault("requiresExplanation", False)
+    anchor = understanding.get("anchorMetric") or understanding.get("anchor_metric")
+    ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective")
+    if isinstance(anchor, dict) and anchor and not isinstance(ranking, dict):
+        understanding["rankingObjective"] = deepcopy(anchor)
+        ranking = understanding["rankingObjective"]
+    elif isinstance(ranking, dict) and "anchorMetric" not in understanding:
+        understanding["anchorMetric"] = deepcopy(ranking)
+    support = understanding.get("supportMetrics") or understanding.get("support_metrics")
+    requested = understanding.get("requestedMeasures") or understanding.get("requested_measures")
+    if isinstance(support, list) and not isinstance(requested, list):
+        understanding["requestedMeasures"] = deepcopy(support)
+    elif isinstance(requested, list) and "supportMetrics" not in understanding:
+        understanding["supportMetrics"] = deepcopy(requested)
+    for key in [
+        "requiredEvidenceIntents",
+        "metricCandidateDecisions",
+        "calculationIntents",
+        "scopeConstraints",
+        "filters",
+        "supportMetrics",
+        "requestedMeasures",
+    ]:
+        understanding.setdefault(key, [])
+    normalized["questionUnderstanding"] = understanding
+    normalized.pop("question_understanding", None)
+    return normalized
+
+
+def planner_structured_output_validation_errors(
+    payload: Dict[str, Any],
+    schema: Dict[str, Any],
+) -> List[str]:
+    """Validate one of the Planner's typed terminal states.
+
+    UNDERSTOOD is checked against the complete tool schema. NEED_MORE_KNOWLEDGE
+    and INVALID are terminal control states and therefore do not need a fake,
+    fully populated questionUnderstanding object.
+    """
+
+    status = str((payload or {}).get("status") or "").strip().upper()
+    if status == "NEED_MORE_KNOWLEDGE":
+        requests = (payload or {}).get("knowledgeRequests") or (payload or {}).get("knowledge_requests") or []
+        errors: List[str] = []
+        if not isinstance(requests, list) or not requests:
+            errors.append("$.knowledgeRequests: at least one request is required")
+        if not isinstance((payload or {}).get("reason"), str):
+            errors.append("$.reason: expected string")
+        return errors
+    if status == "INVALID":
+        return [] if isinstance((payload or {}).get("reason"), str) else ["$.reason: expected string"]
+    if status != "UNDERSTOOD":
+        return ["$.status: expected a typed Planner terminal state"]
+    errors = structured_output_validation_errors(payload, schema)
+    understanding = (payload or {}).get("questionUnderstanding") or {}
+    anchor = understanding.get("anchorMetric") if isinstance(understanding, dict) else None
+    filters = understanding.get("filters") if isinstance(understanding, dict) else None
+    if isinstance(anchor, dict) and not anchor and isinstance(filters, list) and filters:
+        errors = [error for error in errors if not error.startswith("$.questionUnderstanding.anchorMetric.")]
+    return errors
+
+
 def normalize_llm_tool_calls(calls: List[Dict[str, Any]], round_index: int) -> List[ToolCallRequest]:
     normalized: List[ToolCallRequest] = []
     for index, call in enumerate(calls):
@@ -176,7 +326,13 @@ def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Di
                         "aliases": list(metric.get("aliases") or [])[:3],
                         "formula": str(metric.get("formula") or "")[:300],
                         "sourceColumns": list(metric.get("sourceColumns") or [])[:8],
+                        "metricGrain": metric.get("metricGrain"),
                         "aggregationPolicy": metric.get("aggregationPolicy"),
+                        "applicableTimeGrain": metric.get("applicableTimeGrain"),
+                        "timeColumn": metric.get("timeColumn"),
+                        "timeSemantics": metric.get("timeSemantics") or {},
+                        "missingValuePolicy": metric.get("missingValuePolicy"),
+                        "zeroValueMeaning": metric.get("zeroValueMeaning"),
                     }.items()
                     if value not in (None, "", [], {})
                 },
@@ -207,10 +363,19 @@ def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Di
             for key, value in {
                 "metricKey": metric.get("metricKey"),
                 "businessName": metric.get("businessName"),
+                "formula": str(metric.get("formula") or "")[:300],
                 "sourceColumns": list(metric.get("sourceColumns") or [])[:4],
+                "metricGrain": metric.get("metricGrain"),
+                "aggregationPolicy": metric.get("aggregationPolicy"),
+                "applicableTimeGrain": metric.get("applicableTimeGrain"),
+                "timeColumn": metric.get("timeColumn"),
+                "timeSemantics": metric.get("timeSemantics") or {},
+                "missingValuePolicy": metric.get("missingValuePolicy"),
+                "zeroValueMeaning": metric.get("zeroValueMeaning"),
             }.items()
             if value not in (None, "", [], {})
         }
+        compact["executionContractPreserved"] = True
         compact["truncated"] = True
     return compact
 
@@ -244,6 +409,7 @@ def compact_semantic_metric_read_result(result: Dict[str, Any]) -> Dict[str, Any
         "grainHint",
         "metricIntent",
         "aggregationPolicy",
+        "applicableTimeGrain",
         "selectionGuidance",
         "preferredUseCases",
         "notPreferredUseCases",
@@ -253,6 +419,8 @@ def compact_semantic_metric_read_result(result: Dict[str, Any]) -> Dict[str, Any
         "timeColumn",
         "timeGrain",
         "timeSemantics",
+        "missingValuePolicy",
+        "zeroValueMeaning",
         "status",
         "version",
     }

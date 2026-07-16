@@ -721,6 +721,38 @@ def latest_partition_anchor_sql(
     return "(SELECT MAX(%s) FROM %s%s)" % (partition_sql, table_sql, where_sql)
 
 
+def latest_as_of_partition_predicate_sql(
+    table: str,
+    partition_column: str,
+    *,
+    anchor_value_sql: str = "",
+    tenant_column: str = "",
+    tenant_value_sql: str = "",
+) -> str:
+    """Compile one point-in-time selector shared by Quick and QueryGraph.
+
+    Callers decide whether values are literals or bound placeholders.  The
+    temporal operator itself is identical: select the latest tenant-scoped
+    observation not after the runtime anchor.
+    """
+
+    if not str(partition_column or "").strip():
+        raise ValueError("partition_column must be declared by the semantic contract")
+    predicates: list[str] = []
+    if tenant_column and tenant_value_sql:
+        predicates.append("%s = %s" % (quote_sql_identifier(tenant_column), tenant_value_sql))
+    if anchor_value_sql:
+        predicates.append("%s <= %s" % (quote_sql_identifier(partition_column), anchor_value_sql))
+    where_sql = " WHERE " + " AND ".join(predicates) if predicates else ""
+    partition_sql = quote_sql_identifier(partition_column)
+    return "%s = (SELECT MAX(%s) FROM %s%s)" % (
+        partition_sql,
+        partition_sql,
+        quote_sql_identifier(table),
+        where_sql,
+    )
+
+
 def latest_partition_window_predicate(
     table: str,
     days: Any,
@@ -769,13 +801,25 @@ def time_window_contract_payload(
         "offsetDays": int(time_range.offset_days or 0),
         "comparisonType": time_range.comparison_type,
     }
+    if time_range.execution_start_date and time_range.execution_end_date:
+        contract.update(
+            {
+                "executionStartDate": time_range.execution_start_date,
+                "executionEndDate": time_range.execution_end_date,
+                "executionStartValue": time_range.execution_start_value or time_range.execution_start_date,
+                "executionEndValue": time_range.execution_end_value or time_range.execution_end_date,
+                "executionAnchorPolicy": time_range.execution_anchor_policy or "source_snapshot",
+            }
+        )
     if partition_column:
         contract["partitionColumn"] = partition_column
     if table:
         contract["table"] = table
     if tenant_column:
         contract["tenantColumn"] = tenant_column
-    if anchor_policy == LATEST_PARTITION_ANCHOR_POLICY and partition_column:
+    if contract.get("executionStartValue") and contract.get("executionEndValue"):
+        contract["executionRule"] = "use the runtime-bound executionStartValue/executionEndValue directly"
+    elif anchor_policy == LATEST_PARTITION_ANCHOR_POLICY and partition_column:
         contract["executionRule"] = "relative windows must anchor to MAX(%s) after tenant filter" % quote_sql_identifier(partition_column)
     elif anchor_policy == LATEST_PARTITION_ANCHOR_POLICY:
         contract["executionRule"] = "relative window execution requires a semantic partitionColumn binding"

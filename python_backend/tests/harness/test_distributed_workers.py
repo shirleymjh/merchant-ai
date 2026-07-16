@@ -21,6 +21,7 @@ from merchant_ai.services.distributed_workers import (
     DistributedArtifactStore,
     DistributedSubAgentClient,
     DistributedSubAgentWorker,
+    builtin_worker_handlers,
 )
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService
@@ -90,6 +91,36 @@ def test_distributed_worker_round_trip_persists_result_artifact(tmp_path):
     assert summary_only.result == {}
     assert summary_only.contract["summary"] == "MERCHANT INSIGHT"
     assert summary_only.contract["artifactRefs"]
+
+
+def test_distributed_document_fallback_is_terminal_partial_not_completed(tmp_path):
+    settings = distributed_settings(tmp_path, openai_api_key="")
+    store = FileRuntimeStateStore(settings)
+    artifacts = DistributedArtifactStore(settings)
+    client = DistributedSubAgentClient(settings, store, artifacts)
+    worker = DistributedSubAgentWorker(
+        settings,
+        handlers=builtin_worker_handlers(settings),
+        state_store=store,
+        artifact_store=artifacts,
+        worker_id="worker-document-partial",
+    )
+    client.submit(
+        "run_document_partial",
+        "task_document_partial",
+        "document_analysis",
+        {"content": "GMV 增长 12%，退款率上升。", "question": "总结异常"},
+    )
+
+    assert worker.run_once()
+    result = client.wait("run_document_partial", "task_document_partial")
+
+    assert result.status == "partial"
+    assert result.contract["status"] == "partial"
+    assert result.contract["recommendedNextAction"] == "return_partial_to_lead_agent"
+    assert result.contract["payload"]["fallbackUsed"] is True
+    assert result.contract["gaps"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
+    assert store.get_node_task("run_document_partial", "task_document_partial").status == "partial"
 
 
 def test_distributed_client_waits_for_independent_worker_loop(tmp_path):

@@ -431,6 +431,13 @@
       "metricGrain": "merchant_deposit_detail",
       "metricIntent": "detail_drilldown",
       "aggregationPolicy": "period_rollup",
+      "applicableTimeGrain": "period",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      },
       "ambiguousAliases": [],
       "naturalName": "保证金充值金额",
       "originalBusinessName": "保证金充值金额",
@@ -463,6 +470,13 @@
       "metricGrain": "merchant_deposit_detail",
       "metricIntent": "detail_drilldown",
       "aggregationPolicy": "period_rollup",
+      "applicableTimeGrain": "period",
+      "timeSemantics": {
+        "selectionPolicy": "period_window",
+        "asOfPolicy": "latest_available_partition",
+        "missingDataPolicy": "disclose_unknown",
+        "zeroValuePolicy": "preserve_observed_zero"
+      },
       "ambiguousAliases": [],
       "naturalName": "保证金充值流水数",
       "originalBusinessName": "保证金充值流水数",

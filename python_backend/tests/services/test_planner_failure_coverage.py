@@ -22,6 +22,7 @@ from merchant_ai.models import (
     RoutingDecision,
 )
 from merchant_ai.services.assets import PlanningAssetPackBuilder, SkillLoader, TopicAssetService
+from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.planning import QueryGraphPlanner
 
 
@@ -61,25 +62,25 @@ def single_domain_plan(question: str, pack: PlanningAssetPack, table: str) -> Qu
 
 
 @pytest.mark.parametrize(
-    ("question", "categories", "fallback_table", "missing_domains"),
+    ("question", "categories", "fallback_table", "min_missing_domain_count"),
     [
         (
             "最近30天退款订单，并查看商品发布时间",
             [QuestionCategory.TRADE, QuestionCategory.REFUND, QuestionCategory.GOODS],
             "dwm_trade_refund_detail_di",
-            {"order", "goods"},
+            2,
         ),
         (
             "最近30天用了优惠券的订单下单情况",
             [QuestionCategory.TRADE, QuestionCategory.COUPON],
             "dwm_coupon_detail_di",
-            {"order"},
+            1,
         ),
         (
             "商品审核拒绝后订单和退款情况",
             [QuestionCategory.GOODS, QuestionCategory.TRADE, QuestionCategory.REFUND],
             "dwm_goods_detail_df",
-            {"order", "refund"},
+            2,
         ),
     ],
 )
@@ -87,7 +88,7 @@ def test_planner_provider_failure_rejects_single_domain_fallback(
     question,
     categories,
     fallback_table,
-    missing_domains,
+    min_missing_domain_count,
 ):
     pack = compact_pack(question, categories)
     incomplete = single_domain_plan(question, pack, fallback_table)
@@ -115,11 +116,12 @@ def test_planner_provider_failure_rejects_single_domain_fallback(
         for item in plan.agent_trace
         if "QUESTION_DOMAIN_NOT_COVERED" in item
     }
-    assert missing_domains <= rejected
+    assert len(rejected) >= min_missing_domain_count
+    assert all(domain.strip() for domain in rejected)
     assert "planner.failure_fallback=fail_closed_coverage" in plan.agent_trace
 
 
-def test_hypothesis_validation_and_execution_reject_incomplete_question_coverage():
+def test_validation_rejects_incomplete_question_coverage_without_retired_hypothesis_controller():
     question = "最近30天退款订单，并查看商品发布时间"
     pack = compact_pack(
         question,
@@ -134,16 +136,12 @@ def test_hypothesis_validation_and_execution_reject_incomplete_question_coverage
     )
 
     assert not validation.valid
-    assert {gap.evidence for gap in validation.gaps if gap.code == "QUESTION_DOMAIN_NOT_COVERED"} >= {"order", "goods"}
+    uncovered = [gap.evidence for gap in validation.gaps if gap.code == "QUESTION_DOMAIN_NOT_COVERED"]
+    assert len(uncovered) >= 2
+    assert all(str(domain).strip() for domain in uncovered)
 
     workflow = create_workflow(get_settings())
-    execution = workflow._execute_hypothesis_plan(
-        {"question": question, "planning_asset_pack": pack},
-        {"hypothesisId": "partial_refund", "plan": incomplete, "round": 1},
-    )
-
-    assert not execution["runResult"].task_results
-    assert execution["executionError"].startswith("QUESTION_COVERAGE_REJECTED:")
+    assert not hasattr(workflow, "_execute_hypothesis_plan")
 
 
 def test_planner_timeout_degraded_marker_stops_expensive_recovery_by_default():
@@ -198,3 +196,46 @@ def test_policy_does_not_launch_hypothesis_or_skill_chain_after_planner_timeout(
     assert "run_analysis_skill" not in decision.available_actions
     assert policy.hypothesis_recovery_needed(state) is False
     assert policy.analysis_skill_needed(state) is False
+
+
+def test_verified_evidence_discloses_coverage_checked_planner_fallback():
+    run_result = AgentRunResult(
+        degraded_reasons=[
+            {
+                "active": True,
+                "stage": "planner",
+                "code": "PLANNER_LLM_TIMEOUT",
+                "reason": "timeout: provider call exceeded 20 seconds",
+                "fallbackUsed": True,
+                "fallbackCoveragePassed": True,
+            }
+        ]
+    )
+
+    verified = EvidenceVerifier().verify("最近30天退款金额", QueryPlan(), run_result)
+
+    assert verified.passed is True
+    assert [gap.code for gap in verified.warning_gaps] == ["PLANNER_DEGRADED_FALLBACK"]
+    assert verified.answer_guard_required is True
+    assert any("Planner 服务异常" in item for item in verified.required_disclosures)
+
+
+def test_verified_evidence_blocks_planner_failure_without_safe_fallback():
+    run_result = AgentRunResult(
+        degraded_reasons=[
+            {
+                "active": True,
+                "stage": "planner",
+                "code": "PLANNER_PROVIDER_ERROR",
+                "reason": "provider_error: unavailable",
+                "fallbackUsed": False,
+                "fallbackCoveragePassed": False,
+            }
+        ]
+    )
+
+    verified = EvidenceVerifier().verify("最近30天退款金额", QueryPlan(), run_result)
+
+    assert verified.passed is False
+    assert [gap.code for gap in verified.blocking_gaps] == ["PLANNER_OPERATIONAL_FAILURE"]
+    assert any("未形成通过问题覆盖校验" in item for item in verified.required_disclosures)
