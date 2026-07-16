@@ -86,7 +86,7 @@ class SkillEvaluationService:
     def _plan_from_case(self, case: SkillEvaluationCase) -> QueryPlan:
         intents: List[QuestionIntent] = []
         for index, item in enumerate(case.planned_evidence or []):
-            category = self._category(str(item.get("category") or "TRADE"))
+            category = self._category(str(item.get("category") or ""))
             answer_mode = self._answer_mode(str(item.get("answerMode") or "GROUP_AGG"))
             intents.append(
                 QuestionIntent(
@@ -106,7 +106,7 @@ class SkillEvaluationService:
                 QuestionIntent(
                     question=case.question,
                     intent_type="VALID",
-                    category=QuestionCategory.TRADE,
+                    category=QuestionCategory.UNKNOWN,
                     answer_mode=AnswerMode.GROUP_AGG,
                     plan_task_id="eval_task",
                     metric_name=str((case.question_understanding or {}).get("metric") or ""),
@@ -122,13 +122,8 @@ class SkillEvaluationService:
         return QueryPlan(question_understanding=understanding, intents=intents)
 
     def _category(self, value: str) -> QuestionCategory:
-        try:
-            return QuestionCategory(value)
-        except Exception:
-            for item in QuestionCategory:
-                if item.name == value:
-                    return item
-            return QuestionCategory.TRADE
+        normalized = str(value or "").strip()
+        return QuestionCategory(normalized) if normalized else QuestionCategory.UNKNOWN
 
     def _answer_mode(self, value: str) -> AnswerMode:
         try:

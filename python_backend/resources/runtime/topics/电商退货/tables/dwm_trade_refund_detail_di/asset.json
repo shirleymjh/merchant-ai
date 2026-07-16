@@ -6,6 +6,8 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615180837",
   "generatedAt": "2026-06-15T18:08:37",
@@ -3364,42 +3366,49 @@
       ]
     },
     {
-      "metricKey": "refund_rate",
-      "businessName": "商品维度退货率口径说明",
-      "formula": "",
+      "metricKey": "product_refund_order_share",
+      "businessName": "商品退款订单占比",
+      "formula": "refund_bill_cnt / NULLIF(order_detail_cnt, 0)",
       "unit": "%",
-      "description": "商品维度退货率需要同商品粒度的退货量和订单量作为分子分母；当前退货明细表只提供退货侧分子，不能单表直接产出完整退货率。",
+      "description": "商品粒度的退款明细单量占订单明细去重下单数的比例；这是商品退款订单占比，不是商家退货率或直接退款率。",
       "sourceColumns": [
-        "refund_id"
+        "refund_bill_cnt",
+        "order_detail_cnt"
       ],
       "aliases": [
-        "商品维度退货率口径说明",
-        "商品退货率口径",
-        "按商品退货率口径"
+        "商品退款订单占比",
+        "按商品退款订单占比",
+        "SPU退款订单占比",
+        "商品发生退款订单占比",
+        "product_refund_order_share"
       ],
       "confidence": 0.86,
-      "evidence": "语义层派生指标：商品粒度退货量 / 订单量",
-      "displayName": "商品维度退货率口径说明",
-      "disambiguationName": "商品维度退货率口径说明（需订单分母）",
+      "evidence": "语义层派生指标：商品粒度退款明细单量 / 订单明细去重下单数",
+      "displayName": "商品退款订单占比",
+      "disambiguationName": "商品退款订单占比（退款明细单量/订单明细下单数）",
       "tableKind": "detail_fact",
-      "metricGrain": "refund_detail",
+      "metricGrain": "product_period",
       "metricIntent": "detail_drilldown",
       "ambiguousAliases": [],
-      "naturalName": "商品退货率",
-      "originalBusinessName": "商品退货率",
-      "naturalAlias": "商品退货率",
+      "naturalName": "商品退款订单占比",
+      "originalBusinessName": "商品退款订单占比",
+      "naturalAlias": "商品退款订单占比",
       "sourceColumnAliases": [
-        "order_detail_cnt",
-        "refund_bill_cnt"
+        "refund_bill_cnt",
+        "order_detail_cnt"
       ],
-      "semanticCleanup": {
-        "droppedNonSchemaSourceColumns": [
-          "refund_bill_cnt",
-          "order_detail_cnt"
-        ]
-      },
-      "metricFormula": "",
-      "metricLevel": "requires_denominator",
+      "metricFormula": "refund_bill_cnt / NULLIF(order_detail_cnt, 0)",
+      "metricLevel": "derived_cross_table",
+      "selectionGuidance": "仅在用户明确要求商品或 SPU 粒度的退款订单占比时使用；不得用于裸“退款率”或商家周期退货率。",
+      "preferredUseCases": [
+        "product_refund_order_share",
+        "spu_refund_order_share"
+      ],
+      "notPreferredUseCases": [
+        "merchant_period_return_rate",
+        "direct_refund_rate",
+        "daily_return_rate"
+      ],
       "requiresMetrics": [
         "refund_bill_cnt",
         "order_detail_cnt"
@@ -3408,7 +3417,7 @@
         "dwm_trade_refund_detail_di",
         "dwm_trade_order_detail_di"
       ],
-      "clarificationQuestion": "商品维度退货率需要同时读取退货量和订单量，是否按商品粒度做跨表计算？"
+      "clarificationQuestion": "商品退款订单占比需要同时读取退款明细单量和订单明细下单数，是否按商品粒度做跨表计算？"
     }
   ],
   "terms": [
@@ -4736,16 +4745,18 @@
       "evidence": "由表名/字段语义自动沉淀"
     },
     {
-      "term": "退款率",
-      "description": "未发布为独立指标的业务词；不要等同于商品退货率。若用户实际想看商品退货率，需要按商品粒度同时读取退货量和订单量。",
+      "term": "商品退款订单占比",
+      "description": "商品粒度的退款明细单量占订单明细去重下单数的比例，不得解释为商家退货率或直接退款率。",
       "aliases": [
-        "退款率",
-        "商品退款率",
-        "按商品退款率"
+        "商品退款订单占比",
+        "按商品退款订单占比",
+        "SPU退款订单占比"
       ],
-      "relatedColumns": [],
-      "evidence": "语义层口径治理词条",
-      "clarificationQuestion": "当前没有独立的商品退款率指标口径，你是想按商品看退货率吗？"
+      "relatedColumns": [
+        "refund_id"
+      ],
+      "evidence": "语义层口径：refund_bill_cnt / order_detail_cnt",
+      "canonicalMetricKey": "product_refund_order_share"
     }
   ],
   "knowledgeRules": [

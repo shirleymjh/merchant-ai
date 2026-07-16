@@ -4707,23 +4707,6 @@ def analysis_intent_from_plan(plan: Any) -> str:
 def memory_question_terms(question: str) -> List[str]:
     text = str(question or "")
     terms = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", text))
-    phrase_hints = [
-        "哪个品",
-        "哪款",
-        "哪几个",
-        "退得最凶",
-        "最凶",
-        "不对劲",
-        "咋回事",
-        "为啥",
-        "这阵子",
-        "这段时间",
-    ]
-    for phrase in phrase_hints:
-        if phrase in text:
-            terms.add(phrase)
-    if re.search(r"(哪个|哪款|哪些|哪几个).{0,4}(品|货|sku|SKU|商品)", text):
-        terms.update(["商品", "单品"])
     return unique_strings(sorted(terms, key=lambda item: (-len(item), item)))
 
 
@@ -4733,8 +4716,7 @@ def memory_expanded_terms(
     metrics: Iterable[Any] = (),
     analysis_intent: str = "",
 ) -> List[str]:
-    text = str(question or "")
-    lowered = text.lower()
+    del question
     expanded: List[str] = []
 
     def add(*items: str) -> None:
@@ -4742,18 +4724,7 @@ def memory_expanded_terms(
             if item and item not in expanded:
                 expanded.append(item)
 
-    if any(marker in text for marker in ["退款", "退货", "售后", "退得", "退单", "退了"]) or re.search(r"退.{0,4}(最|多|高|凶)", text):
-        add("退款", "退货", "售后")
-    if any(marker in text for marker in ["哪个品", "哪款", "哪几个品", "单品", "货品", "商品", "宝贝"]) or re.search(r"(哪个|哪款|哪些|哪几个).{0,4}(品|货|sku|SKU)", text):
-        add("商品", "单品", "SKU")
-    if any(marker in text for marker in ["这阵子", "这段时间", "最近", "近来", "近期", "这几天", "这两天"]):
-        add("近期", "默认时间窗")
-    if any(marker in lowered for marker in ["top", "topn"]) or any(marker in text for marker in ["哪个", "哪些", "哪款", "最高", "最多", "最差", "最凶", "最厉害", "排行", "排名", "前几"]):
-        add("排行", "TopN", "异常突出", "风险")
-    if any(marker in text for marker in ["咋", "怎么", "为啥", "为什么", "原因", "排查", "诊断", "归因", "不对劲"]):
-        add("原因", "排查", "诊断", "异常")
-    if any(marker in str(analysis_intent or "") for marker in ["ranking", "risk"]):
-        add("排行", "风险")
+    add(str(analysis_intent or ""))
     for topic in unique_strings(topics):
         if topic:
             add(topic)
@@ -4764,28 +4735,16 @@ def memory_expanded_terms(
 
 
 def memory_analysis_intent_hints(question: str, analysis_intent: str = "") -> List[str]:
-    text = str(question or "")
-    lowered = text.lower()
+    del question
     intents: List[str] = []
     if analysis_intent and analysis_intent != "none":
         intents.append(analysis_intent)
-    if any(marker in lowered for marker in ["top", "topn"]) or any(marker in text for marker in ["哪个", "哪些", "哪款", "最高", "最多", "最差", "最凶", "排行", "排名", "前几"]):
-        intents.extend(["ranking", "risk_ranking"])
-    if any(marker in text for marker in ["咋", "怎么", "为啥", "为什么", "原因", "排查", "诊断", "归因", "不对劲"]):
-        intents.extend(["diagnosis", "anomaly_check"])
     return unique_strings(intents)
 
 
 def memory_query_variants(question: str, expanded_terms: Iterable[Any]) -> List[str]:
     text = str(question or "").strip()
-    expanded = set(unique_strings(expanded_terms))
     variants: List[str] = []
-    if {"商品", "退款"}.issubset(expanded) or {"商品", "退货"}.issubset(expanded):
-        variants.extend(["近期商品退款退货表现排行", "高退款商品排行", "商品售后异常风险"])
-    elif {"退款", "退货"} & expanded:
-        variants.append("退款退货售后表现")
-    if "诊断" in expanded or "排查" in expanded:
-        variants.append("原因诊断排查")
     compact = " ".join(item for item in unique_strings(expanded_terms)[:10] if item)
     if compact:
         variants.append(compact)
@@ -4938,11 +4897,12 @@ class MemoryQueryUnderstandingService:
             return False
         if analysis_intents & {"ranking", "risk_ranking", "diagnosis", "anomaly_check"}:
             return True
-        if {"商品", "单品", "SKU"} & expanded_terms and {"退款", "退货", "售后"} & expanded_terms:
-            return True
         if not has_structured_scope and not has_metric_or_object and len(expanded_terms) >= 2:
             return True
-        return False
+        # When deterministic state carries no governed semantic signal, the
+        # small model is the generic interpreter.  Runtime code must not infer
+        # business concepts from a compiled keyword dictionary.
+        return bool(question.strip()) and not (has_structured_scope and has_metric_or_object)
 
     def cache_key(self, state: AgentState) -> str:
         return stable_cache_key(
@@ -6021,7 +5981,7 @@ def is_metric_definition_dispute(question: str, metrics: Iterable[Any] = ()) -> 
     if not text:
         return False
     metric_terms = set(unique_strings(metrics)) | extract_metric_like_terms(text)
-    has_metric_context = bool(metric_terms) or any(marker in text for marker in ["指标", "口径", "GMV", "gmv"])
+    has_metric_context = bool(metric_terms) or any(marker in text for marker in ["指标", "口径"])
     if not has_metric_context:
         return False
     dispute_markers = [
@@ -6045,15 +6005,11 @@ def is_metric_definition_dispute(question: str, metrics: Iterable[Any] = ()) -> 
     ]
     if any(marker in text for marker in dispute_markers):
         return True
-    return bool(re.search(r"(率|金额|订单量|GMV|gmv).{0,16}(=|/|÷|占比|比例)", text))
+    return bool(re.search(r"[^\s]{1,32}\s*(?:=|/|÷)\s*[^\s]{1,32}", text))
 
 
 def extract_metric_like_terms(text: str) -> set[str]:
-    terms = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text or ""))
-    for token in re.findall(r"[\u4e00-\u9fff]{2,}", text or ""):
-        if any(marker in token for marker in ["金额", "订单", "退款", "退货", "工单", "赔付", "GMV", "gmv", "下单", "优惠", "商品", "审核", "入库", "发货", "超时", "率", "量"]):
-            terms.add(token)
-    return terms
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text or ""))
 
 
 def extract_time_windows(text: str) -> List[int]:

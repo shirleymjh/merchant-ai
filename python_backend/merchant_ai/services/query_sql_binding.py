@@ -35,18 +35,20 @@ def normalize_inclusive_relative_window_sql(sql: str, days: Any) -> str:
     return pattern.sub(lambda match: "DATE_SUB(%s, INTERVAL %d DAY)" % (match.group(1), inclusive_interval), text)
 
 
-def split_detail_sql_by_pt_windows(
+def split_detail_sql_by_time_windows(
     sql: str,
     days: int,
     chunk_days: int,
     max_chunks: int,
     limit: int,
+    time_column: str,
     anchor_date: str = "",
 ) -> List[str]:
     text = str(sql or "").strip()
+    partition_column = normalize_identifier(time_column)
     if not text or re.search(r"\b(group\s+by|union|join)\b", text, flags=re.I):
         return []
-    if not re.search(r"\bpt\b|`pt`", text, flags=re.I):
+    if not partition_column or not sql_references_column(text, partition_column):
         return []
     total_days = max(1, int(days or 0))
     window_days = max(1, int(chunk_days or 1))
@@ -61,11 +63,16 @@ def split_detail_sql_by_pt_windows(
             break
         upper = min(total_days, offset + window_days)
         lower = offset
-        lower_bound = "`pt` >= DATE_SUB(%s, INTERVAL %d DAY)" % (anchor_expr, inclusive_day_interval(upper))
+        quoted_column = quote_identifier(partition_column)
+        lower_bound = "%s >= DATE_SUB(%s, INTERVAL %d DAY)" % (quoted_column, anchor_expr, inclusive_day_interval(upper))
         if lower <= 0:
-            upper_bound = "`pt` < DATE_ADD(%s, INTERVAL 1 DAY)" % anchor_expr
+            upper_bound = "%s < DATE_ADD(%s, INTERVAL 1 DAY)" % (quoted_column, anchor_expr)
         else:
-            upper_bound = "`pt` < DATE_SUB(%s, INTERVAL %d DAY)" % (anchor_expr, inclusive_day_interval(lower))
+            upper_bound = "%s < DATE_SUB(%s, INTERVAL %d DAY)" % (
+                quoted_column,
+                anchor_expr,
+                inclusive_day_interval(lower),
+            )
         chunk_sql = add_sql_where_condition(text, "(%s AND %s)" % (lower_bound, upper_bound))
         chunk_sql = replace_sql_limit(chunk_sql, capped_limit)
         result.append(chunk_sql)
@@ -90,23 +97,6 @@ def replace_sql_limit(sql: str, limit: int) -> str:
     if re.search(r"\s+limit\s+\d+\s*$", text, flags=re.I):
         return re.sub(r"\s+limit\s+\d+\s*$", " LIMIT %d" % value, text, flags=re.I)
     return "%s LIMIT %d" % (text, value)
-
-
-def is_dependent_context_column(column: str) -> bool:
-    text = (column or "").lower()
-    return any(
-        token in text
-        for token in [
-            "status",
-            "create_time",
-            "close_time",
-            "priority",
-            "assignee",
-            "operator",
-            "type_code",
-            "type_name",
-        ]
-    )
 
 
 def quote_identifier(column: str) -> str:
@@ -215,14 +205,19 @@ def add_bind_values(target: Dict[str, List[Any]], column: str, values: List[Any]
             break
 
 
-def node_bind_values_by_column(intent: QuestionIntent, columns: set, context: NodeExecutionContext, max_values: int = 200) -> Dict[str, List[Any]]:
+def node_bind_values_by_column(
+    intent: QuestionIntent,
+    asset_pack: PlanningAssetPack,
+    columns: set,
+    context: NodeExecutionContext,
+    max_values: int = 200,
+) -> Dict[str, List[Any]]:
     normalized_columns = {normalize_identifier(column) for column in columns}
     values_by_column: Dict[str, List[Any]] = {}
     merchant_id = str(context.merchant_id or "").strip()
-    if merchant_id:
-        for column in ["seller_id", "merchant_id"]:
-            if column in normalized_columns:
-                add_bind_values(values_by_column, column, [merchant_id], 1)
+    tenant_column = declared_tenant_column(intent, asset_pack, context, normalized_columns)
+    if merchant_id and tenant_column:
+        add_bind_values(values_by_column, tenant_column, [merchant_id], 1)
     region_column = normalize_identifier((context.context_package or {}).get("regionFilterColumn"))
     if context.authorized_region and region_column in normalized_columns:
         add_bind_values(values_by_column, region_column, [context.authorized_region], 1)
@@ -241,6 +236,33 @@ def node_bind_values_by_column(intent: QuestionIntent, columns: set, context: No
             if normalized in normalized_columns:
                 add_bind_values(values_by_column, normalized, list(values or []), max_values)
     return values_by_column
+
+
+def declared_tenant_column(
+    intent: QuestionIntent,
+    asset_pack: PlanningAssetPack,
+    context: NodeExecutionContext,
+    columns: set,
+) -> str:
+    package = dict(context.context_package or {})
+    table_contracts = package.get("tableContracts") if isinstance(package.get("tableContracts"), dict) else {}
+    table_contract = table_contracts.get(intent.preferred_table) if isinstance(table_contracts, dict) else {}
+    asset_metadata: Dict[str, Any] = {}
+    for item in asset_pack.tables:
+        if (item.table or item.key) == intent.preferred_table:
+            asset_metadata = dict(item.metadata or {})
+            break
+    row_policy = asset_metadata.get("rowAccessPolicy") if isinstance(asset_metadata.get("rowAccessPolicy"), dict) else {}
+    candidates = [
+        asset_metadata.get("merchantFilterColumn"),
+        asset_metadata.get("tenantFilterColumn"),
+        row_policy.get("filterColumn") if isinstance(row_policy, dict) else "",
+        package.get("merchantFilterColumn"),
+        package.get("tenantFilterColumn"),
+        (table_contract or {}).get("merchantFilterColumn") if isinstance(table_contract, dict) else "",
+        (table_contract or {}).get("tenantFilterColumn") if isinstance(table_contract, dict) else "",
+    ]
+    return next((normalize_identifier(item) for item in candidates if normalize_identifier(item) in columns), "")
 
 
 def append_note(existing: str, note: str) -> str:
@@ -347,7 +369,7 @@ def sql_expression_is_placeholder(expression: Any) -> bool:
 
 
 def has_merchant_filter_predicate(sql: str, columns: set) -> bool:
-    merchant_columns = [column for column in ["seller_id", "merchant_id", "shop_id"] if column in {normalize_identifier(item) for item in columns}]
+    merchant_columns = sorted({normalize_identifier(item) for item in columns if normalize_identifier(item)})
     parsed = parse_sql_for_binding(sql)
     if parsed is not None:
         for predicate in list(parsed.find_all(exp.EQ)) + list(parsed.find_all(exp.In)):
@@ -358,7 +380,7 @@ def has_merchant_filter_predicate(sql: str, columns: set) -> bool:
 
 
 def sql_has_bound_merchant_filter(sql: str, columns: set) -> bool:
-    merchant_columns = [column for column in ["seller_id", "merchant_id", "shop_id"] if column in {normalize_identifier(item) for item in columns}]
+    merchant_columns = sorted({normalize_identifier(item) for item in columns if normalize_identifier(item)})
     if not merchant_columns:
         return False
     parsed = parse_sql_for_binding(sql)
@@ -397,30 +419,6 @@ def sql_has_bound_column_filter(sql: str, column: str) -> bool:
     return any("%s" in str(match.group("rhs") or "") or "?" in str(match.group("rhs") or "") for match in pattern.finditer(sql or ""))
 
 
-def has_pt_filter_predicate(sql: str) -> bool:
-    parsed = parse_sql_for_binding(sql)
-    if parsed is not None:
-        predicate_types = (
-            exp.Between,
-            exp.EQ,
-            exp.GT,
-            exp.GTE,
-            exp.In,
-            exp.LT,
-            exp.LTE,
-        )
-        for predicate in parsed.find_all(*predicate_types):
-            if predicate_references_column(predicate, "pt"):
-                return True
-    return bool(
-        re.search(
-            r"(?:`pt`|\bpt\b)\s*(?:=|>=|>|<=|<|BETWEEN\b|IN\s*\()",
-            sql or "",
-            flags=re.I,
-        )
-    )
-
-
 def predicate_references_column(expression: Any, column: str) -> bool:
     normalized = normalize_identifier(column)
     if not normalized:
@@ -429,6 +427,16 @@ def predicate_references_column(expression: Any, column: str) -> bool:
         if normalize_identifier(item.name) == normalized:
             return True
     return False
+
+
+def sql_references_column(sql: str, column: str) -> bool:
+    normalized = normalize_identifier(column)
+    if not normalized:
+        return False
+    parsed = parse_sql_for_binding(sql)
+    if parsed is not None:
+        return any(normalize_identifier(item.name) == normalized for item in parsed.find_all(exp.Column))
+    return bool(re.search(r"(?:`%s`|\b%s\b)" % (re.escape(normalized), re.escape(normalized)), sql or "", flags=re.I))
 
 
 def bind_node_sql_parameters_ast(
@@ -487,7 +495,7 @@ def bind_node_sql_parameters_ast(
     bound = parsed.transform(transform, copy=True)
     bound_sql = normalize_ast_bound_sql_text(bound.sql(dialect="mysql", identify=True).replace("?", "%s"))
     if merchant_columns and not merchant_bound:
-        return bound_sql, params, "SQL 缺少可由后端绑定的商家过滤字段 seller_id/merchant_id/shop_id", True
+        return bound_sql, params, "SQL 缺少语义资产声明的租户过滤字段", True
     if not bound_any:
         return sql, [], "", True
     return bound_sql, params, "", True
@@ -537,12 +545,12 @@ def bind_node_sql_parameters(
     context: NodeExecutionContext,
 ) -> Tuple[str, List[Any], str]:
     columns = {normalize_identifier(column) for column in asset_pack.known_columns(intent.preferred_table)}
-    values_by_column = node_bind_values_by_column(intent, columns, context)
+    values_by_column = node_bind_values_by_column(intent, asset_pack, columns, context)
     pattern = bindable_predicate_pattern(list(values_by_column.keys()))
     if not pattern:
         return sql, [], ""
     params: List[Any] = []
-    merchant_columns = {"seller_id", "merchant_id", "shop_id"} & columns
+    merchant_columns = {declared_tenant_column(intent, asset_pack, context, columns)} - {""}
     ast_sql, ast_params, ast_error, ast_used = bind_node_sql_parameters_ast(sql, values_by_column, merchant_columns, context)
     if ast_used:
         return ast_sql, ast_params, ast_error
@@ -570,7 +578,7 @@ def bind_node_sql_parameters(
 
     bound_sql = pattern.sub(replace, sql or "")
     if merchant_columns and not merchant_bound:
-        return bound_sql, params, "SQL 缺少可由后端绑定的商家过滤字段 seller_id/merchant_id"
+        return bound_sql, params, "SQL 缺少语义资产声明的租户过滤字段"
     return bound_sql, params, ""
 
 

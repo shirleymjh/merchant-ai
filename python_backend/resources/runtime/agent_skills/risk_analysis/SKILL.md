@@ -1,6 +1,9 @@
 ---
 name: risk_analysis
 description: Use when verified BI evidence must rank or explain merchant operational risk across products, orders, refunds, compensation, tickets, coupons, or fulfillment. The skill must only use verified evidence rows and must separate observed facts from risk hypotheses.
+title: 风险分析
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # Risk Analysis Skill

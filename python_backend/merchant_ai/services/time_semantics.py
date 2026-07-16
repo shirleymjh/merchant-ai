@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from merchant_ai.models import QueryPlan, ResolvedTimeRange
+from merchant_ai.models import AnswerMode, QueryPlan, ResolvedTimeRange
 
 
 CALENDAR_ANCHOR_POLICY = "calendar"
@@ -17,6 +17,7 @@ ROLLING_MONTH_PATTERN = re.compile(r"(?:最近|近)\s*(?:一|1)\s*个?月")
 PREVIOUS_DAYS_PATTERN = re.compile(r"(?:前|上一个|上一|上期|上一期)\s*(\d{1,3})?\s*天")
 COMPARISON_MARKER_PATTERN = re.compile(r"相比|对比|比较|变化|环比|较|比|上升|下降|增长|减少|升高|降低")
 DAILY_GRAIN_PATTERN = re.compile(r"每天|每日|按天|逐日|日趋势|每天的|按日|走势|趋势")
+TIME_SERIES_ANALYSIS_PATTERN = re.compile(r"波动|同步上升|同步下降|持续上升|持续下降|上升|下降|增长|减少|变化|异常|走势|趋势")
 
 
 def resolve_time_range(
@@ -89,7 +90,7 @@ def resolve_time_window_contract(
     primary = resolve_time_range(text, timezone_name, now=now, default_days=default_days)
     primary.window_role = "primary"
     comparison = resolve_comparison_time_range(text, primary, timezone_name, now=now)
-    grain = "day" if DAILY_GRAIN_PATTERN.search(text) else "period"
+    grain = resolve_time_grain(text, comparison)
     contract: Dict[str, Any] = {
         "primary": primary.model_dump(by_alias=True),
         "comparison": comparison.model_dump(by_alias=True) if comparison else {},
@@ -189,6 +190,19 @@ def ambiguous_recent_month(text: str) -> bool:
     return bool(ROLLING_MONTH_PATTERN.search(str(text or "")) and "自然月" not in str(text or ""))
 
 
+def resolve_time_grain(text: str, comparison: Optional[ResolvedTimeRange]) -> str:
+    value = str(text or "")
+    if DAILY_GRAIN_PATTERN.search(value):
+        return "day"
+    # If the user explicitly asks for a period-to-period comparison, keep the
+    # answer at period grain unless they also ask for daily/point trends.
+    if comparison:
+        return "period"
+    if TIME_SERIES_ANALYSIS_PATTERN.search(value):
+        return "day"
+    return "period"
+
+
 def resolved_comparison_range(
     kind: str,
     start: date,
@@ -251,6 +265,11 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
     plan = apply_time_range_to_plan(plan, primary)
     understanding = dict(plan.question_understanding or {})
     understanding["timeWindowContract"] = contract
+    if contract.get("grain") == "day":
+        plan = apply_time_grain_to_plan(plan, "day", primary, contract)
+        understanding = dict(plan.question_understanding or understanding)
+        understanding["timeWindowContract"] = contract
+        understanding["analysisGrain"] = "day"
     if contract.get("requiresComparison"):
         understanding["analysisIntent"] = "comparison"
         plan = add_comparison_baseline_to_plan(plan, contract)
@@ -258,6 +277,187 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
         understanding["timeWindowContract"] = contract
         understanding["analysisIntent"] = "comparison"
     return plan.model_copy(update={"question_understanding": understanding})
+
+
+def apply_time_grain_to_plan(
+    plan: QueryPlan,
+    grain: str,
+    time_range: ResolvedTimeRange,
+    time_contract: Optional[Dict[str, Any]] = None,
+) -> QueryPlan:
+    if grain != "day" or not plan.intents:
+        return plan
+    intents = []
+    time_column_by_task: Dict[str, str] = {}
+    unbound_task_ids: list[str] = []
+    for intent in plan.intents:
+        mode = str(getattr(intent.answer_mode, "value", intent.answer_mode) or "").upper()
+        if mode not in {"METRIC", "GROUP_AGG", "DERIVED"}:
+            intents.append(intent)
+            continue
+        time_column = declared_time_column_for_intent(intent, time_contract)
+        if not time_column:
+            intents.append(intent)
+            if intent.plan_task_id:
+                unbound_task_ids.append(intent.plan_task_id)
+            continue
+        resolution = dict(intent.metric_resolution or {})
+        resolution.setdefault("displayRole", "trend_context")
+        resolution.setdefault("visualization", "line_chart")
+        resolution["timeColumn"] = time_column
+        resolution["groupByColumn"] = time_column
+        if intent.plan_task_id:
+            time_column_by_task[intent.plan_task_id] = time_column
+        intents.append(
+            intent.model_copy(
+                update={
+                    "answer_mode": AnswerMode.DERIVED if mode == "DERIVED" else AnswerMode.GROUP_AGG,
+                    "group_by_column": time_column,
+                    "limit": max(int(time_range.days or intent.days or 0), int(intent.limit or 0), 7),
+                    "required_evidence": time_grain_evidence_keys(intent.required_evidence, time_column),
+                    "output_keys": time_grain_evidence_keys(intent.output_keys, time_column),
+                    "metric_resolution": resolution,
+                    "analysis_note": append_note(intent.analysis_note, "time grain day"),
+                }
+            )
+        )
+    dependencies = []
+    for dep in plan.dependencies:
+        anchor_time_column = time_column_by_task.get(dep.anchor_task_id, "")
+        dependent_time_column = time_column_by_task.get(dep.dependent_task_id, "")
+        if anchor_time_column and dependent_time_column and dep.relation_type == "DERIVED_COMPONENT":
+            dependencies.append(
+                dep.model_copy(
+                    update={
+                        "join_key": anchor_time_column,
+                        "anchor_column": anchor_time_column,
+                        "dependent_column": dependent_time_column,
+                    }
+                )
+            )
+        else:
+            dependencies.append(dep)
+    trace = list(plan.compiler_trace or [])
+    if "TIME_WINDOW_GRAIN:day" not in trace:
+        trace.append("TIME_WINDOW_GRAIN:day")
+    trace.extend("TIME_WINDOW_GRAIN_UNBOUND:%s" % task_id for task_id in unbound_task_ids)
+    updated = plan.model_copy(update={"intents": intents, "dependencies": dependencies, "compiler_trace": trace})
+    return updated.model_copy(update={"evidence_contracts": evidence_contracts_from_current_intents(updated)})
+
+
+def time_grain_evidence_keys(values: list[str], group_key: str) -> list[str]:
+    keys = [str(item) for item in values or [] if str(item or "").strip()]
+    updated = list(keys)
+    if group_key and group_key not in updated:
+        updated.insert(0, group_key)
+    return dedupe_text(updated)
+
+
+def dedupe_text(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def evidence_contracts_from_current_intents(plan: QueryPlan) -> list[Dict[str, Any]]:
+    contracts: list[Dict[str, Any]] = []
+    for intent in plan.intents:
+        label = ""
+        resolution = dict(intent.metric_resolution or {})
+        if resolution:
+            label = str(resolution.get("displayName") or resolution.get("naturalName") or resolution.get("metricKey") or "")
+        label = label or str(intent.metric_name or intent.metric_column or intent.preferred_table or intent.plan_task_id or "")
+        columns: list[str] = []
+        for column in [intent.group_by_column, intent.filter_column, metric_contract_column(intent)]:
+            text = str(column or "").strip()
+            if text and text not in columns:
+                columns.append(text)
+        if not columns:
+            columns = time_grain_evidence_keys(
+                list(intent.output_keys or []) + list(intent.required_evidence or []),
+                declared_time_column_for_intent(intent),
+            )
+        contract: Dict[str, Any] = {
+            "taskId": intent.plan_task_id,
+            "table": intent.preferred_table,
+            "semanticLabel": label,
+            "requiredLevel": "required",
+            "columns": columns[:8],
+        }
+        if resolution:
+            contract["metricResolution"] = resolution
+        contracts.append(contract)
+    return contracts
+
+
+def metric_contract_column(intent: Any) -> str:
+    resolution = dict(getattr(intent, "metric_resolution", None) or {})
+    for key in ["metricKey", "metric_key"]:
+        value = str(resolution.get(key) or "").strip()
+        if value:
+            return value
+    return str(getattr(intent, "metric_name", "") or getattr(intent, "metric_column", "") or "").strip()
+
+
+def declared_time_column_for_intent(
+    intent: Any,
+    time_contract: Optional[Dict[str, Any]] = None,
+    *,
+    accept_selected_group: bool = False,
+) -> str:
+    """Return a physical time column only when a runtime contract declares it.
+
+    The semantic layer may bind the column on the metric resolution, a nested
+    time-window contract, or the selected intent grouping.  There is deliberately
+    no warehouse-specific fallback.
+    """
+
+    resolution = dict(getattr(intent, "metric_resolution", None) or {})
+    nested_contract = resolution.get("timeWindowContract") or resolution.get("time_window_contract") or {}
+    sources = [nested_contract, resolution, time_contract or {}]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ["partitionColumn", "partition_column", "timeColumn", "time_column"]:
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    selected_group = str(
+        resolution.get("groupByColumn")
+        or resolution.get("group_by_column")
+        or getattr(intent, "group_by_column", "")
+        or ""
+    ).strip()
+    if not selected_group:
+        return ""
+    temporal_role = str(resolution.get("displayRole") or resolution.get("display_role") or "").lower()
+    visualization = str(resolution.get("visualization") or "").lower()
+    semantic_grain = str(
+        resolution.get("timeGrain")
+        or resolution.get("time_grain")
+        or resolution.get("analysisGrain")
+        or resolution.get("analysis_grain")
+        or ""
+    ).lower()
+    mode = str(getattr(getattr(intent, "answer_mode", ""), "value", getattr(intent, "answer_mode", "")) or "").upper()
+    question_declares_series = mode in {"GROUP_AGG", "DERIVED"} and bool(
+        DAILY_GRAIN_PATTERN.search(str(getattr(intent, "question", "") or ""))
+        or TIME_SERIES_ANALYSIS_PATTERN.search(str(getattr(intent, "question", "") or ""))
+    )
+    if (
+        accept_selected_group
+        or temporal_role == "trend_context"
+        or visualization in {"line_chart", "area_chart", "time_series"}
+        or semantic_grain in {"day", "date", "time", "daily"}
+        or question_declares_series
+    ):
+        return selected_group
+    return ""
 
 
 def add_comparison_baseline_to_plan(plan: QueryPlan, contract: Dict[str, Any]) -> QueryPlan:
@@ -393,12 +593,14 @@ def quote_sql_identifier(value: object) -> str:
 
 def latest_partition_anchor_sql(
     table: str,
-    partition_column: str = "pt",
+    partition_column: str = "",
     tenant_column: str = "",
     tenant_value_sql: str = "",
 ) -> str:
+    if not str(partition_column or "").strip():
+        raise ValueError("partition_column must be declared by the semantic contract")
     table_sql = quote_sql_identifier(table)
-    partition_sql = quote_sql_identifier(partition_column or "pt")
+    partition_sql = quote_sql_identifier(partition_column)
     where_sql = ""
     if tenant_column and tenant_value_sql:
         where_sql = " WHERE %s = %s" % (quote_sql_identifier(tenant_column), tenant_value_sql)
@@ -408,7 +610,7 @@ def latest_partition_anchor_sql(
 def latest_partition_window_predicate(
     table: str,
     days: Any,
-    partition_column: str = "pt",
+    partition_column: str = "",
     tenant_column: str = "",
     tenant_value_sql: str = "",
     offset_days: Any = 0,
@@ -422,7 +624,7 @@ def latest_partition_window_predicate(
         offset = max(int(offset_days or 0), 0)
     except (TypeError, ValueError):
         offset = 0
-    partition_sql = quote_sql_identifier(partition_column or "pt")
+    partition_sql = quote_sql_identifier(partition_column)
     upper_anchor_sql = anchor_sql if offset <= 0 else "DATE_SUB(%s, INTERVAL %d DAY)" % (anchor_sql, offset)
     lower_interval = interval_days if offset <= 0 else offset + interval_days
     return "%s BETWEEN DATE_SUB(%s, INTERVAL %d DAY) AND %s" % (
@@ -436,7 +638,7 @@ def latest_partition_window_predicate(
 def time_window_contract_payload(
     time_range: ResolvedTimeRange,
     table: str = "",
-    partition_column: str = "pt",
+    partition_column: str = "",
     tenant_column: str = "",
 ) -> Dict[str, Any]:
     anchor_policy = time_range.anchor_policy or time_window_anchor_policy(time_range.kind)
@@ -448,18 +650,21 @@ def time_window_contract_payload(
         "endDate": time_range.end_date,
         "timezone": time_range.timezone,
         "anchorPolicy": anchor_policy,
-        "partitionColumn": partition_column or "pt",
         "source": time_range.source,
         "windowRole": time_range.window_role,
         "offsetDays": int(time_range.offset_days or 0),
         "comparisonType": time_range.comparison_type,
     }
+    if partition_column:
+        contract["partitionColumn"] = partition_column
     if table:
         contract["table"] = table
     if tenant_column:
         contract["tenantColumn"] = tenant_column
-    if anchor_policy == LATEST_PARTITION_ANCHOR_POLICY:
-        contract["executionRule"] = "relative windows must anchor to MAX(%s) after merchant filter" % quote_sql_identifier(partition_column or "pt")
+    if anchor_policy == LATEST_PARTITION_ANCHOR_POLICY and partition_column:
+        contract["executionRule"] = "relative windows must anchor to MAX(%s) after tenant filter" % quote_sql_identifier(partition_column)
+    elif anchor_policy == LATEST_PARTITION_ANCHOR_POLICY:
+        contract["executionRule"] = "relative window execution requires a semantic partitionColumn binding"
     else:
         contract["executionRule"] = "calendar/exact windows use startDate/endDate directly"
     return contract

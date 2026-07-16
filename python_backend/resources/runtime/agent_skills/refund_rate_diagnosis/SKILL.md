@@ -1,6 +1,9 @@
 ---
 name: refund_rate_diagnosis
 description: Use when a merchant asks why refund rate, refund amount, after-sales, or return pressure rose. The skill follows a fixed refund diagnosis SOP and must disclose numerator/denominator evidence.
+title: 指标变化诊断
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # Refund Rate Diagnosis Skill

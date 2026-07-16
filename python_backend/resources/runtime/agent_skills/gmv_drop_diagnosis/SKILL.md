@@ -1,6 +1,9 @@
 ---
 name: gmv_drop_diagnosis
 description: Use when a merchant asks why GMV, sales amount, paid orders, or order volume dropped or moved abnormally. The skill is a fixed merchant-operation SOP and must only use verified evidence rows.
+title: 指标下降诊断
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # GMV Drop Diagnosis Skill

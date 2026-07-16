@@ -22,6 +22,7 @@ from merchant_ai.models import (
     ContextSnapshot,
     FreshnessCheckResult,
     FastUnderstandingResult,
+    GraphValidationGap,
     GraphValidationResult,
     IntentSignals,
     KnowledgeBundle,
@@ -136,6 +137,8 @@ class AgentState(TypedDict, total=False):
     available_actions: List[AgentAction]
     lead_decisions: List[AgentDecision]
     action_history: List[AgentActionTrace]
+    action_outcomes: List[Dict[str, Any]]
+    _pending_action_contract: Dict[str, Any]
     last_action_result: ActionResult
     planner_reflection: PlannerReflectionResult
     node_tool_traces: List[NodeToolCall]
@@ -204,6 +207,7 @@ class AgentState(TypedDict, total=False):
     open_diagnostic_scope: str
     open_diagnostic_intent: str
     open_diagnostic_goal: str
+    open_diagnostic_profile: Dict[str, Any]
     open_diagnostic_seed_topics: List[QuestionCategory]
     hypothesis_exploration: Dict[str, Any]
     hypothesis_results: List[Dict[str, Any]]
@@ -260,6 +264,10 @@ class AgentState(TypedDict, total=False):
     rule_recall_refs: List[str]
     rule_recall_context: str
     query_graph_validated: bool
+    query_graph_validation_attempted: bool
+    query_graph_validation_passed: bool
+    query_graph_validation_status: str
+    validated_query_graph_fingerprint: str
     query_graph_reflected: bool
     sql_repair_reviewed: bool
     evidence_graph_verified: bool
@@ -275,6 +283,7 @@ class AgentState(TypedDict, total=False):
     chat_bi_completed: bool
     run_canceled: bool
     middleware_loop_blocked: bool
+    runtime_guard_gaps: List[GraphValidationGap]
     terminal_status: Dict[str, Any]
     should_persist: bool
     persisted: bool

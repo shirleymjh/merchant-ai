@@ -316,7 +316,7 @@ class UnderstandingCoverageCritic:
                 evidence_items = []
                 updated["requiredEvidenceIntents"] = evidence_items
             for field, matched_label in field_candidates[: self.MAX_COMPLETIONS]:
-                domain = semantic_domain_for_table(field.table)
+                domain = semantic_domain_for_table(field.table, asset_pack)
                 evidence = {
                     "semanticLabel": field.title or field.key,
                     "sourcePhrase": matched_label,
@@ -338,7 +338,7 @@ class UnderstandingCoverageCritic:
                 evidence_items = []
                 updated["requiredEvidenceIntents"] = evidence_items
             for table, matched_label, fields in table_candidates[: self.MAX_COMPLETIONS]:
-                domain = semantic_domain_for_table(table)
+                domain = semantic_domain_for_table(table, asset_pack)
                 evidence = {
                     "semanticLabel": matched_label,
                     "sourcePhrase": matched_label,
@@ -507,8 +507,8 @@ def understanding_coverage_text(question: str, understanding: Dict[str, Any]) ->
 def understanding_field_coverage_text(question: str, understanding: Dict[str, Any]) -> str:
     """Natural-language evidence text for field coverage.
 
-    Field evidence must not be inferred from LLM-internal metric refs such as
-    pay_amt. Those refs are candidates that the resolver may correct later.
+    Field evidence must not be inferred from LLM-internal metric refs. Those
+    refs are candidates that the governed resolver may correct later.
     """
     parts = [question or ""]
     for item in understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []:
@@ -615,20 +615,10 @@ def semantic_field_evidence_allowed(field: PlanningAssetEntry, understanding: Di
     key = str(field.key or "")
     if not key:
         return False
-    entity_like = {
-        "seller_id",
-        "merchant_id",
-        "order_id",
-        "sub_order_id",
-        "spu_id",
-        "sku_id",
-        "refund_id",
-        "ticket_id",
-        "coupon_id",
-        "bill_id",
-        "pt",
-    }
-    if key in entity_like or key.endswith("_id"):
+    metadata = field.metadata or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    role = str(semantic.get("role") or metadata.get("semanticRole") or "").strip().upper()
+    if role in {"KEY", "TIME", "PARTITION", "TENANT_CONTEXT"}:
         return False
     filter_fields = {
         str(item.get("field") or item.get("column") or "")
@@ -792,7 +782,7 @@ def semantic_table_evidence_fields(asset_pack: PlanningAssetPack, table: str, te
     columns = set(asset_pack.known_columns(table))
     fields = [field for field in asset_pack.fields if field.table == table and field.key in columns]
     if not fields:
-        return generic_output_keys(QuestionIntent(preferred_table=table), columns)[:8]
+        return generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)[:8]
     normalized_text = normalize_semantic_text(text)
     scored: List[Tuple[int, str]] = []
     for field in fields:
@@ -804,7 +794,9 @@ def semantic_table_evidence_fields(asset_pack: PlanningAssetPack, table: str, te
         role_bonus = {"KEY": 8, "DIMENSION": 6, "TIME": 5, "METRIC": 4, "OTHER": 2}.get(role, 1)
         scored.append((overlap + role_bonus, field.key))
     scored.sort(key=lambda item: item[0], reverse=True)
-    selected = dedupe_strings(generic_output_keys(QuestionIntent(preferred_table=table), columns) + [key for _, key in scored])[:12]
+    selected = dedupe_strings(
+        generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack) + [key for _, key in scored]
+    )[:12]
     return selected
 
 
@@ -865,22 +857,32 @@ def semantic_metric_evidence_exact_label_match(evidence: Dict[str, Any], text: s
 
 
 def derived_metric_requires_explicit_request(metric: Any) -> bool:
-    formula = metric_formula_for_entry(metric).lower()
-    labels = metric_label_texts(metric)
-    normalized_labels = normalize_metric_match_text(" ".join(labels))
-    return "/" in formula or any(token in normalized_labels for token in ["rate", "ratio"])
+    metadata = getattr(metric, "metadata", {}) or {}
+    formula = metric_formula_for_entry(metric)
+    source_columns = metric_source_columns_for_entry(metric)
+    semantic_role = str(metadata.get("semanticRole") or metadata.get("semantic_role") or "").strip().lower()
+    return bool(
+        metadata.get("derived")
+        or metadata.get("requiresExplicitRequest")
+        or metadata.get("requires_explicit_request")
+        or semantic_role in {"derived", "ratio", "rate", "share", "proportion"}
+        or "/" in formula
+        or (len(source_columns) > 1 and any(operator in formula for operator in ["+", "-", "*"]))
+    )
 
 
 def metric_evidence_requires_explicit_request(evidence: Dict[str, Any]) -> bool:
-    formula = str(evidence.get("formula") or evidence.get("metricFormula") or "").lower()
-    labels = [
-        str(evidence.get("metricKey") or ""),
-        str(evidence.get("businessName") or ""),
-        str(evidence.get("title") or ""),
-        *[str(alias) for alias in evidence.get("aliases") or []],
-    ]
-    normalized_labels = normalize_metric_match_text(" ".join(labels))
-    return "/" in formula or any(token in normalized_labels for token in ["rate", "ratio"])
+    formula = str(evidence.get("formula") or evidence.get("metricFormula") or "")
+    source_columns = evidence.get("sourceColumns") or evidence.get("source_columns") or []
+    semantic_role = str(evidence.get("semanticRole") or evidence.get("semantic_role") or "").strip().lower()
+    return bool(
+        evidence.get("derived")
+        or evidence.get("requiresExplicitRequest")
+        or evidence.get("requires_explicit_request")
+        or semantic_role in {"derived", "ratio", "rate", "share", "proportion"}
+        or "/" in formula
+        or (len(source_columns) > 1 and any(operator in formula for operator in ["+", "-", "*"]))
+    )
 
 
 def derived_metric_completion_allowed(metric: Any, question: str, understanding: Dict[str, Any]) -> bool:
@@ -1077,7 +1079,8 @@ class QueryGraphPlanner:
             selection_status = str(selection_payload.get("status") or "")
             if selection_status:
                 trace.append("planner.semantic_asset_selection.status=%s" % selection_status)
-            if not self._legacy_question_planner_enabled():
+            requires_full_planner = self._semantic_selection_requires_full_planner(selection_plan, selection_payload)
+            if not self._legacy_question_planner_enabled() and not requires_full_planner:
                 if selection_payload:
                     append_prompt_trace(selection_plan, selection_payload)
                     attach_planner_tool_trace(selection_plan, selection_payload)
@@ -1209,6 +1212,18 @@ class QueryGraphPlanner:
     def _legacy_question_planner_enabled(self) -> bool:
         return bool(getattr(self.settings, "legacy_question_planner_enabled", False))
 
+    def _semantic_selection_requires_full_planner(self, plan: QueryPlan, payload: Dict[str, Any]) -> bool:
+        trace = " ".join(str(item) for item in (plan.agent_trace or []) + (plan.compiler_trace or []))
+        if "planner.semantic_asset_selection.requires_full_planner" in trace:
+            return True
+        contract = payload.get("queryContract") or payload.get("query_contract") or {}
+        contract_type = str((contract or {}).get("contractType") or (contract or {}).get("contract_type") or "").strip().lower()
+        if contract_type in {"requires_planner", "complex_query", "query_graph", "planner"}:
+            return True
+        action = str(payload.get("action") or "").strip().lower()
+        status = str(payload.get("status") or "").strip().upper()
+        return action in {"unsupported", "invalid"} or status in {"UNSUPPORTED", "INVALID"}
+
     def _failure_candidate_coverage_gaps(
         self,
         question: str,
@@ -1265,6 +1280,9 @@ class QueryGraphPlanner:
     def _multi_metric_trend_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         return compile_semantic_multi_metric_trend_fallback_graph(question, asset_pack)
 
+    def _semantic_topn_metric_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
+        return compile_semantic_topn_metric_fast_graph(question, asset_pack)
+
     def _recalled_metric_diagnostic_fallback(self, question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
         evidence = canonical_recalled_metric_evidence_for_question(question, asset_pack)
         if not evidence or not diagnostic_metric_fallback_safe(question):
@@ -1272,9 +1290,13 @@ class QueryGraphPlanner:
         metric_key = str(evidence.get("metricKey") or "")
         owner_table = str(evidence.get("ownerTable") or "")
         source_phrase = str(evidence.get("matchedMetricLabel") or evidence.get("businessName") or metric_key)
+        metric = metric_entry_by_identity(asset_pack, owner_table, metric_key)
+        time_column = time_column_for_metric(metric, asset_pack) if metric else ""
+        if not metric or not time_column:
+            return QueryPlan(agent_trace=["planner.recalled_metric_diagnostic_fallback.no_time_contract"])
         understanding = {
             "originalQuestion": question,
-            "analysisGrain": "day",
+            "analysisGrain": semantic_fast_path_grain("", time_column, asset_pack, owner_table) or "time",
             "analysisIntent": "diagnosis",
             "requiresExplanation": True,
             "reusableAnalysis": True,
@@ -1283,7 +1305,7 @@ class QueryGraphPlanner:
                 "ownerTable": owner_table,
                 "sourcePhrase": source_phrase,
                 "objectiveType": "trend_anchor",
-                "groupByColumn": "pt",
+                "groupByColumn": time_column,
                 "order": "desc",
                 "limit": max(2, extract_days(question, 30)),
                 "displayRole": "trend_context",
@@ -1434,21 +1456,13 @@ class QueryGraphPlanner:
             if not budget or int(stats.get("totalChars") or 0) <= budget:
                 break
         user = json.dumps(selected_payload, ensure_ascii=False)
-        try:
-            payload = self.llm.json_chat(
-                prompt.system_prompt,
-                user,
-                {},
-                timeout_seconds=self._semantic_asset_selection_timeout_seconds(),
-            )
-        except TypeError:
-            payload = self.llm.json_chat(prompt.system_prompt, user, {})
+        payload = self._semantic_selector_json_chat(prompt.system_prompt, user)
         if not isinstance(payload, dict) or not payload:
             payload = {
                 "status": "INVALID",
                 "selectedRefs": [],
                 "gaps": [],
-                "reason": self.llm.last_error or "empty selector response",
+                "reason": getattr(self.llm, "last_error", "") or "empty selector response",
             }
         payload = self._normalize_semantic_selection_payload(payload, selected_payload)
         read_refs = self._semantic_selection_read_refs(payload, selected_payload)
@@ -1468,28 +1482,31 @@ class QueryGraphPlanner:
             }
             read_user = json.dumps(read_payload, ensure_ascii=False)
             read_stats = planner_prompt_stats(prompt.system_prompt, read_user, {})
-            try:
-                read_result = self.llm.json_chat(
-                    prompt.system_prompt,
-                    read_user,
-                    {},
-                    timeout_seconds=self._semantic_asset_selection_timeout_seconds(),
-                )
-            except TypeError:
-                read_result = self.llm.json_chat(prompt.system_prompt, read_user, {})
+            read_result = self._semantic_selector_json_chat(prompt.system_prompt, read_user)
             if isinstance(read_result, dict) and read_result:
                 payload = self._normalize_semantic_selection_payload(read_result, read_payload, allow_read=False)
                 payload["_previousSelectorDecision"] = read_payload["previousDecision"]
                 payload["_semanticReadResults"] = read_payload["semanticReadResults"]
             else:
-                payload = {
-                    "status": "INVALID",
-                    "selectedRefs": [],
+                fallback_refs = dedupe_strings(
+                    [
+                        *[str(ref) for ref in read_payload["previousDecision"].get("selectedRefs") or [] if str(ref or "")],
+                        *self._semantic_selection_group_fallback_refs(selected_payload),
+                    ]
+                )
+                payload = self._normalize_semantic_selection_payload({
+                    "status": "SELECTED" if fallback_refs else "INVALID",
+                    "action": "select" if fallback_refs else "invalid",
+                    "selectedRefs": fallback_refs,
                     "gaps": [],
-                    "reason": self.llm.last_error or "empty selector read response",
+                    "reason": (
+                        "semantic_read selector failed; using deterministic candidate-group fallback"
+                        if fallback_refs
+                        else getattr(self.llm, "last_error", "") or "empty selector read response"
+                    ),
                     "_previousSelectorDecision": read_payload["previousDecision"],
                     "_semanticReadResults": read_payload["semanticReadResults"],
-                }
+                }, selected_payload, allow_read=False)
         payload["_promptStats"] = selected_stats
         payload["_promptStats"]["budgetTrace"] = budget_trace
         if read_stats:
@@ -1500,6 +1517,21 @@ class QueryGraphPlanner:
         self.artifact_store.write_json("planner", "semantic_asset_selection_prompt.json", selected_payload, preview_chars=0)
         self.artifact_store.write_json("planner", "semantic_asset_selection_payload.json", payload, preview_chars=0)
         return payload
+
+    def _semantic_selector_json_chat(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        selector = getattr(self.llm, "json_chat", None)
+        if not callable(selector):
+            return {}
+        try:
+            payload = selector(
+                system_prompt,
+                user_prompt,
+                {},
+                timeout_seconds=self._semantic_asset_selection_timeout_seconds(),
+            )
+        except TypeError:
+            payload = selector(system_prompt, user_prompt, {})
+        return payload if isinstance(payload, dict) else {}
 
     def _semantic_asset_selection_payload(
         self,
@@ -1512,14 +1544,15 @@ class QueryGraphPlanner:
         candidate_limit = 8 if budget_level == 0 else 6 if budget_level == 1 else 4
         metric_phrases = self._semantic_selection_metric_phrases(question, planner_context, asset_pack)
         candidates = self._semantic_selection_recalled_candidates(recall_bundle, asset_pack, candidate_limit, metric_phrases)
+        candidates = self._semantic_selection_add_asset_candidates(question, asset_pack, candidates, metric_phrases, candidate_limit)
         return {
             "question": question,
             "metricPhrases": metric_phrases,
             "retrievedCandidates": candidates,
             "candidateGroups": self._semantic_selection_candidate_groups(metric_phrases, candidates),
             "outputContract": {
-                "format": '{"action":"select|semantic_read|ask_human|unsupported","selectedRefs":["semantic:..."],"readRefs":["semantic:..."],"clarifications":[{"phrase":"","question":"","options":[{"ref":"","label":""}]}],"reason":""}',
-                "rule": "Use short cards first. If a metric definition is needed, request semantic_read for at most 3 refs. Do not generate SQL or QueryGraph.",
+                "format": '{"action":"select|semantic_read|ask_human|unsupported","queryContract":{"contractType":"independent_metrics|time_series_metrics|requires_planner"},"selectedRefs":["semantic:..."],"readRefs":["semantic:..."],"clarifications":[{"phrase":"","question":"","options":[{"ref":"","label":""}]}],"reason":""}',
+                "rule": "Select independent/time-series metrics only when the selected refs can directly answer the question without entity ranking, detail rows, joins, dependency chains, or causal analysis. If the question needs QueryGraph planning, return action=unsupported with queryContract.contractType=requires_planner and keep useful selectedRefs as asset hints. If a metric definition is needed, request semantic_read for at most 3 refs. Do not generate SQL or QueryGraph.",
             },
             "plannerBudgetLevel": budget_level,
         }
@@ -1561,7 +1594,173 @@ class QueryGraphPlanner:
         phrases = fast.get("metricPhrases") or fast.get("metric_phrases") or []
         if isinstance(phrases, str):
             phrases = [phrases]
-        return dedupe_strings([str(item).strip() for item in phrases if str(item or "").strip()])[:8]
+        asset_phrases: List[str] = []
+        for metric in asset_pack.metrics:
+            phrase = self._semantic_selection_best_question_phrase(question, self._semantic_selection_metric_labels(metric))
+            if phrase:
+                asset_phrases.append(phrase)
+        merged: List[str] = []
+        seen_normalized: set[str] = set()
+        for item in [*phrases, *asset_phrases]:
+            raw = str(item or "").strip()
+            normalized = normalize_semantic_text(raw)
+            if not normalized or normalized in seen_normalized:
+                continue
+            seen_normalized.add(normalized)
+            merged.append(raw)
+        return self._semantic_selection_prune_embedded_phrases(question, merged)[:12]
+
+    def _semantic_selection_add_asset_candidates(
+        self,
+        question: str,
+        asset_pack: PlanningAssetPack,
+        candidates: List[Dict[str, Any]],
+        metric_phrases: List[str],
+        base_limit: int,
+    ) -> List[Dict[str, Any]]:
+        seen = {str(item.get("ref") or "") for item in candidates if isinstance(item, dict) and item.get("ref")}
+        max_total = min(14, max(base_limit, base_limit + max(4, len(metric_phrases))))
+        scored: List[Tuple[int, RecallItem]] = []
+        for metric in asset_pack.metrics:
+            ref = str(metric.source_ref_id or "")
+            if not ref or ref in seen:
+                continue
+            # Asset expansion is a precision lane. A short label must not
+            # expand every qualified metric whose label merely contains it.
+            phrase = self._semantic_selection_exact_question_phrase(
+                question,
+                self._semantic_selection_metric_labels(metric),
+            )
+            if not phrase:
+                continue
+            score = 100 + len(normalize_semantic_text(phrase))
+            item = RecallItem(
+                doc_id=ref,
+                title=metric.title or metric.key,
+                content=metric.description,
+                source_type="SEMANTIC_METRIC",
+                topic=metric.topic,
+                table=metric.table,
+                fusion_score=min(0.95, 0.85 + len(normalize_semantic_text(phrase)) * 0.01),
+                metadata={
+                    **dict(metric.metadata or {}),
+                    "semanticRefId": ref,
+                    "semanticKind": "METRIC",
+                    "metricKey": metric.key,
+                    "displayName": metric.title or (metric.metadata or {}).get("displayName") or metric.key,
+                    "matchedMetricLabel": phrase,
+                    "metricResolutionType": "asset_phrase_match",
+                },
+            )
+            scored.append((score, item))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        for _, item in scored:
+            if len(candidates) >= max_total:
+                break
+            ref = str((item.metadata or {}).get("semanticRefId") or item.doc_id or "")
+            if ref in seen:
+                continue
+            seen.add(ref)
+            candidates.append(self._semantic_selection_candidate_card(item, asset_pack, "M%d" % len(candidates), metric_phrases))
+        return candidates
+
+    def _semantic_selection_metric_labels(self, metric: PlanningAssetEntry | None) -> List[str]:
+        if not metric:
+            return []
+        metadata = dict(getattr(metric, "metadata", {}) or {})
+        return dedupe_strings(
+            [
+                str(getattr(metric, "title", "") or ""),
+                str(getattr(metric, "key", "") or ""),
+                str(metadata.get("displayName") or ""),
+                str(metadata.get("businessName") or ""),
+                str(metadata.get("naturalName") or ""),
+                str(metadata.get("originalBusinessName") or ""),
+                str(metadata.get("disambiguationName") or ""),
+                *[str(alias) for alias in getattr(metric, "aliases", []) or []],
+                *[str(alias) for alias in metadata.get("aliases") or []],
+            ]
+        )
+
+    def _semantic_selection_best_question_phrase(self, question: str, labels: List[str]) -> str:
+        normalized_question = normalize_semantic_text(question)
+        if not normalized_question:
+            return ""
+        scored: List[Tuple[int, str]] = []
+        for label in labels:
+            raw = str(label or "").strip()
+            normalized = normalize_semantic_text(raw)
+            if not normalized:
+                continue
+            if normalized in normalized_question:
+                scored.append((1000 + len(normalized), raw))
+                continue
+            for term in semantic_phrase_terms(normalized):
+                if len(term) < 3 or term not in normalized_question:
+                    continue
+                ratio = len(term) / max(1, len(normalized))
+                if ratio >= 0.45 or re.search(r"[a-zA-Z]", term):
+                    scored.append((100 + len(term) + int(ratio * 20), term))
+        if not scored:
+            return ""
+        scored.sort(key=lambda item: (item[0], len(normalize_semantic_text(item[1]))), reverse=True)
+        return scored[0][1]
+
+    def _semantic_selection_exact_question_phrase(self, question: str, labels: List[str]) -> str:
+        """Return the longest complete metric label present in the question.
+
+        Unlike ``_semantic_selection_best_question_phrase``, this helper never
+        decomposes a qualified label into generic semantic terms.  It is used
+        only when augmenting recalled candidates from the broader asset pack.
+        """
+
+        normalized_question = normalize_semantic_text(question)
+        matches: List[Tuple[int, str]] = []
+        for label in labels:
+            raw = str(label or "").strip()
+            normalized = normalize_semantic_text(raw)
+            if normalized and normalized in normalized_question:
+                matches.append((len(normalized), raw))
+        if not matches:
+            return ""
+        matches.sort(key=lambda item: item[0], reverse=True)
+        return matches[0][1]
+
+    def _semantic_selection_prune_embedded_phrases(self, question: str, phrases: List[str]) -> List[str]:
+        normalized_question = normalize_semantic_text(question)
+        normalized_phrases = [(phrase, normalize_semantic_text(phrase)) for phrase in phrases if normalize_semantic_text(phrase)]
+        kept: List[str] = []
+        for phrase, normalized in normalized_phrases:
+            starts = [match.start() for match in re.finditer(re.escape(normalized), normalized_question)]
+            if starts:
+                covered = True
+                for start in starts:
+                    end = start + len(normalized)
+                    container_found = False
+                    for other_phrase, other in normalized_phrases:
+                        if other == normalized or len(other) <= len(normalized) or normalized not in other:
+                            continue
+                        for other_match in re.finditer(re.escape(other), normalized_question):
+                            if other_match.start() <= start and end <= other_match.end():
+                                container_found = True
+                                break
+                        if container_found:
+                            break
+                    if not container_found:
+                        covered = False
+                        break
+                if covered:
+                    continue
+            kept.append(phrase)
+        result: List[str] = []
+        seen_normalized: set[str] = set()
+        for phrase in kept:
+            normalized = normalize_semantic_text(phrase)
+            if not normalized or normalized in seen_normalized:
+                continue
+            seen_normalized.add(normalized)
+            result.append(phrase)
+        return result
 
     def _semantic_selection_candidate_card(
         self,
@@ -1600,6 +1799,7 @@ class QueryGraphPlanner:
             confidence_value = round(float(confidence), 3)
         except (TypeError, ValueError):
             confidence_value = round(float(item.fusion_score or 0.0), 3)
+        confidence_value = min(1.0, max(0.0, confidence_value))
         grain = str(
             merged.get("metricGrain")
             or merged.get("grainHint")
@@ -1612,6 +1812,7 @@ class QueryGraphPlanner:
             "ref": ref,
             "metricKey": metric_key[:120],
             "name": name[:80],
+            "aliases": [alias[:80] for alias in aliases[:8]],
             "matched": matched[:80],
             "matchType": str(merged.get("metricResolutionType") or "")[:40],
             "confidence": confidence_value,
@@ -1619,6 +1820,9 @@ class QueryGraphPlanner:
             "table": table[:100],
             "grain": grain,
             "kind": self._semantic_selection_metric_kind(merged),
+            "metricIntent": str(merged.get("metricIntent") or "")[:60],
+            "aggregationPolicy": str(merged.get("aggregationPolicy") or "")[:80],
+            "selectionGuidance": trim_text(merged.get("selectionGuidance") or "", 180),
             "description": trim_text(
                 merged.get("selectionGuidance")
                 or merged.get("disambiguationName")
@@ -1693,10 +1897,13 @@ class QueryGraphPlanner:
             ids = []
             for card in candidates:
                 labels = [card.get("matched"), card.get("name"), card.get("metricKey"), *(card.get("aliases") or [])]
-                if normalized and any(normalized in normalize_semantic_text(label) or normalize_semantic_text(label) in normalized for label in labels if label):
+                if normalized and any(
+                    normalize_semantic_text(label) == normalized
+                    for label in labels
+                    if label
+                ):
                     ids.append(card.get("id"))
-            if ids:
-                groups.append({"phrase": phrase, "candidateIds": dedupe_strings([str(item) for item in ids if item])[:4]})
+            groups.append({"phrase": phrase, "candidateIds": dedupe_strings([str(item) for item in ids if item])[:4]})
         return groups
 
     def _normalize_semantic_selection_payload(
@@ -1734,35 +1941,124 @@ class QueryGraphPlanner:
         selected_refs = refs_from("selectedRefs", "selected_refs", "selectedIds", "selected_ids")
         read_refs = refs_from("readRefs", "read_refs", "refs")
         uncovered_phrases = self._semantic_selection_uncovered_phrases(selected_refs, request_payload)
+        uncovered_read_refs = self._semantic_selection_uncovered_read_refs(selected_refs, request_payload)
+        clarifications = normalized.get("clarifications") or normalized.get("clarification") or []
+        if isinstance(clarifications, (str, dict)):
+            clarifications = [clarifications]
+        has_clarifications = any(
+            bool(str(item or "").strip())
+            if not isinstance(item, dict)
+            else bool(
+                str(item.get("question") or item.get("phrase") or "").strip()
+                or item.get("options")
+            )
+            for item in clarifications
+        )
         action = str(normalized.get("action") or normalized.get("tool") or "").strip().lower()
         status = str(normalized.get("status") or "").strip().upper()
-        if allow_read and read_refs and (action in {"semantic_read", "read", "need_read"} or status == "NEED_READ"):
+        if (
+            allow_read
+            and selected_refs
+            and uncovered_read_refs
+            and not has_clarifications
+            and action not in {"unsupported", "fail"}
+            and status != "UNSUPPORTED"
+        ):
+            read_refs = dedupe_strings([*read_refs, *uncovered_read_refs])[:3]
+            status = "NEED_READ"
+            action = "semantic_read"
+        if action in {"unsupported", "fail"} or status == "UNSUPPORTED":
+            status = "UNSUPPORTED"
+            action = "unsupported"
+        elif has_clarifications or action in {"ask_human", "clarify", "clarification"} or status in {"AMBIGUOUS", "NEED_CLARIFICATION"}:
+            status = "NEED_CLARIFICATION"
+            action = "ask_human"
+        elif allow_read and read_refs and (action in {"semantic_read", "read", "need_read"} or status == "NEED_READ"):
             status = "NEED_READ"
             action = "semantic_read"
         elif allow_read and read_refs and uncovered_phrases:
             status = "NEED_READ"
             action = "semantic_read"
-        elif action in {"select", "selected"} or selected_refs:
+        elif uncovered_phrases and (
+            selected_refs
+            or action in {"select", "selected", "ask_human", "clarify", "clarification"}
+            or status in {"SELECTED", "AMBIGUOUS", "NEED_CLARIFICATION"}
+        ):
+            status = "NEED_CLARIFICATION"
+            action = "ask_human"
+        elif selected_refs:
             status = "SELECTED"
             action = "select"
         elif allow_read and (action in {"semantic_read", "read", "need_read"} or status == "NEED_READ" or read_refs):
             status = "NEED_READ"
             action = "semantic_read"
-        elif action in {"ask_human", "clarify", "clarification"} or status in {"AMBIGUOUS", "NEED_CLARIFICATION"}:
-            status = "NEED_CLARIFICATION"
-            action = "ask_human"
-        elif action in {"unsupported", "fail"} or status == "UNSUPPORTED":
-            status = "UNSUPPORTED"
-            action = "unsupported"
-        elif not status:
+        else:
             status = "INVALID"
+            action = "invalid"
         normalized["action"] = action or status.lower()
         normalized["status"] = status
         normalized["selectedRefs"] = selected_refs
         normalized["readRefs"] = read_refs[:3]
+        normalized.pop("_uncoveredPhrases", None)
         if uncovered_phrases:
             normalized["_uncoveredPhrases"] = uncovered_phrases
         return normalized
+
+    def _semantic_selection_uncovered_read_refs(self, selected_refs: List[str], request_payload: Dict[str, Any]) -> List[str]:
+        if not selected_refs:
+            return []
+        candidate_id_by_ref = {
+            str(item.get("ref") or ""): str(item.get("id") or "")
+            for item in request_payload.get("retrievedCandidates") or []
+            if isinstance(item, dict) and item.get("ref") and item.get("id")
+        }
+        candidate_ref_by_id = {
+            str(item.get("id") or ""): str(item.get("ref") or "")
+            for item in request_payload.get("retrievedCandidates") or []
+            if isinstance(item, dict) and item.get("ref") and item.get("id")
+        }
+        selected_ids = {candidate_id_by_ref.get(ref, ref) for ref in selected_refs}
+        refs: List[str] = []
+        for group in request_payload.get("candidateGroups") or []:
+            if not isinstance(group, dict):
+                continue
+            candidate_ids = [str(item) for item in group.get("candidateIds") or [] if str(item or "")]
+            if not candidate_ids or not set(candidate_ids).isdisjoint(selected_ids):
+                continue
+            refs.extend(candidate_ref_by_id.get(candidate_id, "") for candidate_id in candidate_ids)
+        return dedupe_strings([ref for ref in refs if ref])[:3]
+
+    def _semantic_selection_group_fallback_refs(self, request_payload: Dict[str, Any]) -> List[str]:
+        candidates = {
+            str(item.get("id") or ""): item
+            for item in request_payload.get("retrievedCandidates") or []
+            if isinstance(item, dict) and item.get("id") and item.get("ref")
+        }
+        selected: List[str] = []
+        selected_tables: set[str] = set()
+        deferred_groups: List[List[Dict[str, Any]]] = []
+        for group in request_payload.get("candidateGroups") or []:
+            if not isinstance(group, dict):
+                continue
+            group_candidates = [candidates.get(str(candidate_id or "")) for candidate_id in group.get("candidateIds") or []]
+            group_candidates = [item for item in group_candidates if isinstance(item, dict)]
+            if len(group_candidates) == 1:
+                ref = str(group_candidates[0].get("ref") or "")
+                if ref:
+                    selected.append(ref)
+                    table = str(group_candidates[0].get("table") or "")
+                    if table:
+                        selected_tables.add(table)
+            elif group_candidates:
+                deferred_groups.append(group_candidates)
+        for group_candidates in deferred_groups:
+            metric_keys = {str(item.get("metricKey") or "") for item in group_candidates if item.get("metricKey")}
+            if len(metric_keys) != 1:
+                continue
+            same_table = next((item for item in group_candidates if str(item.get("table") or "") in selected_tables), None)
+            if same_table and same_table.get("ref"):
+                selected.append(str(same_table.get("ref") or ""))
+        return dedupe_strings(selected)
 
     def _semantic_selection_uncovered_phrases(self, selected_refs: List[str], request_payload: Dict[str, Any]) -> List[str]:
         if not selected_refs:
@@ -1783,6 +2079,10 @@ class QueryGraphPlanner:
                 continue
             candidate_ids = {str(item) for item in group.get("candidateIds") or [] if str(item or "")}
             if candidate_ids and candidate_ids.isdisjoint(selected_ids):
+                phrase = str(group.get("phrase") or "")
+                if phrase:
+                    uncovered.append(phrase)
+            elif not candidate_ids:
                 phrase = str(group.get("phrase") or "")
                 if phrase:
                     uncovered.append(phrase)
@@ -1910,13 +2210,6 @@ class QueryGraphPlanner:
         plan: QueryPlan,
         asset_pack: PlanningAssetPack,
     ) -> List[GraphValidationGap]:
-        understanding = plan.question_understanding or {}
-        if isinstance(understanding, dict) and str(understanding.get("source") or "") == "semantic_asset_selection":
-            # The semantic selector has already bound every metric phrase to a
-            # formal semantic ref.  Do not re-interpret the raw question with a
-            # keyword domain scan here; profile-level metrics can legitimately
-            # cover refund/coupon/order business concepts.
-            return explicit_object_ref_filter_gaps(question, plan, asset_pack)
         return query_plan_question_coverage_gaps(question, plan, asset_pack)
 
     def _semantic_asset_selection_timeout_seconds(self) -> int:
@@ -1930,11 +2223,48 @@ class QueryGraphPlanner:
         asset_pack: PlanningAssetPack,
     ) -> QueryPlan:
         status = str(payload.get("status") or "").strip().upper()
+        raw_uncovered = payload.get("_uncoveredPhrases") or []
+        if isinstance(raw_uncovered, str):
+            raw_uncovered = [raw_uncovered]
+        uncovered_phrases = dedupe_strings(
+            [str(item).strip() for item in raw_uncovered if str(item or "").strip()]
+        )
+        clarification_needs = self._semantic_selection_clarification_needs(payload, uncovered_phrases)
+        if uncovered_phrases or clarification_needs:
+            return QueryPlan(
+                agent_trace=[
+                    "planner.semantic_asset_selection.status=NEED_CLARIFICATION",
+                    "planner.semantic_asset_selection.incomplete=%s" % ",".join(uncovered_phrases),
+                ],
+                compiler_trace=[
+                    "SEMANTIC_SELECTION_INCOMPLETE:%s" % (",".join(uncovered_phrases) or "clarification_required")
+                ],
+                clarification_needs=clarification_needs,
+                knowledge_requests=self._semantic_selection_knowledge_requests(question, payload),
+            )
         contract = payload.get("queryContract") or payload.get("query_contract") or {}
         contract_type = str((contract or {}).get("contractType") or (contract or {}).get("contract_type") or "").strip()
+        if contract_type in {"requires_planner", "complex_query", "query_graph", "planner"}:
+            return QueryPlan(
+                agent_trace=[
+                    "planner.semantic_asset_selection.requires_full_planner",
+                    "planner.semantic_asset_selection.contract=%s" % contract_type,
+                ],
+                compiler_trace=["SEMANTIC_SELECTION_REQUIRES_FULL_PLANNER"],
+                knowledge_requests=self._semantic_selection_knowledge_requests(question, payload),
+            )
         if not contract_type and payload.get("selectedRefs"):
             contract_type = "independent_metrics"
         if status != "SELECTED":
+            if status == "UNSUPPORTED":
+                return QueryPlan(
+                    agent_trace=[
+                        "planner.semantic_asset_selection.requires_full_planner",
+                        "planner.semantic_asset_selection.status=UNSUPPORTED",
+                    ],
+                    compiler_trace=["SEMANTIC_SELECTION_REQUIRES_FULL_PLANNER"],
+                    knowledge_requests=self._semantic_selection_knowledge_requests(question, payload),
+                )
             return QueryPlan(
                 agent_trace=["planner.semantic_asset_selection.status=%s" % (status or "EMPTY")],
                 compiler_trace=["SEMANTIC_SELECTION_NOT_SELECTED:%s" % (status or "EMPTY")],
@@ -1952,52 +2282,118 @@ class QueryGraphPlanner:
                 compiler_trace=["SEMANTIC_SELECTION_NO_RESOLVED_METRICS"],
                 knowledge_requests=self._semantic_selection_knowledge_requests(question, payload),
             )
+        daily_value_metrics = [
+            item["metric"]
+            for item in selected
+            if self._semantic_selection_aggregation_policy(item["metric"]) == "daily_value_only"
+        ]
+        time_window_days = self._semantic_selection_time_window_days(question, contract)
+        if daily_value_metrics and time_window_days > 1:
+            explicit_daily_series = self._semantic_selection_explicit_daily_series(question)
+            if contract_type != "time_series_metrics" and not explicit_daily_series:
+                identities = ",".join("%s.%s" % (metric.table, metric.key) for metric in daily_value_metrics)
+                return QueryPlan(
+                    agent_trace=[
+                        "planner.semantic_asset_selection.requires_full_planner",
+                        "planner.semantic_asset_selection.daily_value_period_rollup_unsafe=%s" % identities,
+                    ],
+                    compiler_trace=["SEMANTIC_SELECTION_DAILY_VALUE_PERIOD_ROLLUP_UNSAFE:%s" % identities],
+                    knowledge_requests=self._semantic_selection_knowledge_requests(question, payload),
+                )
+            # A daily-value-only metric is valid over a multi-day window only as
+            # a daily series.  Promote an explicit daily-series question even if
+            # the selector mislabeled the contract as independent_metrics.
+            contract_type = "time_series_metrics"
+            contract = {**dict(contract or {}), "contractType": contract_type, "timeWindowDays": time_window_days}
+        plan = self._compile_selected_semantic_metric_plan(question, selected, payload, contract, contract_type, asset_pack)
+        if plan.intents:
+            plan.agent_trace.append("planner.semantic_asset_selection.contract=%s" % contract_type)
+            if daily_value_metrics and time_window_days > 1:
+                plan.compiler_trace.append("SEMANTIC_SELECTION_DAILY_VALUE_FORCED_PT")
+            plan.compiler_trace.append(
+                "SEMANTIC_SELECTION_METRICS:%s"
+                % ",".join("%s.%s" % (item["metric"].table, item["metric"].key) for item in selected)
+            )
+        else:
+            plan.agent_trace.append("planner.semantic_asset_selection.compile_failed")
+        return plan
+
+    def _semantic_selection_clarification_needs(
+        self,
+        payload: Dict[str, Any],
+        uncovered_phrases: List[str] | None = None,
+    ) -> List[str]:
+        needs: List[str] = []
+        clarified_phrases: List[str] = []
+        clarifications = payload.get("clarifications") or payload.get("clarification") or []
+        if isinstance(clarifications, (str, dict)):
+            clarifications = [clarifications]
+        for item in clarifications:
+            if isinstance(item, dict):
+                text = str(item.get("question") or item.get("phrase") or "").strip()
+                phrase = str(item.get("phrase") or "").strip()
+                if phrase:
+                    clarified_phrases.append(phrase)
+                if not text and item.get("options"):
+                    text = "请确认候选指标的业务口径"
+            else:
+                text = str(item or "").strip()
+            if text:
+                needs.append(text)
+        for phrase in uncovered_phrases or []:
+            if any(metric_phrases_equivalent(phrase, clarified) for clarified in clarified_phrases):
+                continue
+            needs.append("请确认指标“%s”的业务口径" % phrase)
+        return dedupe_strings(needs)
+
+    def _semantic_selection_aggregation_policy(self, metric: Any) -> str:
+        metadata = dict(getattr(metric, "metadata", {}) or {})
+        return str(metadata.get("aggregationPolicy") or metadata.get("aggregation_policy") or "").strip().lower()
+
+    def _semantic_selection_explicit_daily_series(self, question: str) -> bool:
+        text = normalize_text(question)
+        return any(
+            marker in text
+            for marker in ["每天", "每日", "按天", "按日", "逐日", "日序列", "走势", "趋势", "波动", "同步", "哪一天"]
+        )
+
+    def _compile_selected_semantic_metric_plan(
+        self,
+        question: str,
+        selected: List[Dict[str, Any]],
+        payload: Dict[str, Any],
+        contract: Dict[str, Any],
+        contract_type: str,
+        asset_pack: PlanningAssetPack,
+    ) -> QueryPlan:
         time_window_days = self._semantic_selection_time_window_days(question, contract)
         time_series = contract_type == "time_series_metrics"
-        ranking_item = selected[0]
-        ranking_group_by = self._semantic_selection_group_by(ranking_item["metric"], asset_pack, time_series=time_series)
-        if not ranking_group_by:
-            return QueryPlan(
-                agent_trace=["planner.semantic_asset_selection.no_group_by"],
-                compiler_trace=["SEMANTIC_SELECTION_GROUP_BY_UNAVAILABLE:%s.%s" % (ranking_item["metric"].table, ranking_item["metric"].key)],
-            )
-        requested_measures = []
-        for item in selected[1:]:
-            group_by = self._semantic_selection_group_by(item["metric"], asset_pack, time_series=time_series)
-            requested_measures.append(
+        selected_metrics = []
+        for item in selected:
+            metric = item["metric"]
+            selected_metrics.append(
                 {
-                    "metricRef": item["metric"].key,
-                    "ownerTable": item["metric"].table,
+                    "metricRef": metric.key,
+                    "ownerTable": metric.table,
                     "sourcePhrase": item["sourcePhrase"],
-                    "groupByColumn": group_by,
-                    "resolvedMetricRef": item["metric"].key,
-                    "resolvedOwnerTable": item["metric"].table,
-                    "semanticRefId": item["metric"].source_ref_id,
-                    "metricResolutionSource": "semantic_metric_ref",
-                    "metricGovernanceMode": "published_semantic",
+                    "semanticRefId": metric.source_ref_id,
+                    "groupByColumn": self._semantic_selection_group_by(metric, asset_pack, time_series=time_series),
                 }
             )
+        first_metric = selected[0]["metric"] if selected else None
+        first_group_by = selected_metrics[0].get("groupByColumn", "") if selected_metrics else ""
+        analysis_grain = (
+            semantic_fast_path_grain("", first_group_by, asset_pack, first_metric.table)
+            if first_metric and first_group_by
+            else "metric"
+        )
         understanding = {
             "originalQuestion": question,
-            "analysisGrain": "day" if time_series else "merchant",
+            "analysisGrain": analysis_grain or "metric",
             "analysisIntent": "none",
             "requiresExplanation": False,
             "requiredEvidenceIntents": [],
-            "rankingObjective": {
-                "metricRef": ranking_item["metric"].key,
-                "sourcePhrase": ranking_item["sourcePhrase"],
-                "ownerTable": ranking_item["metric"].table,
-                "objectiveType": "trend_anchor" if time_series else "metric_total",
-                "groupByColumn": ranking_group_by,
-                "order": "desc",
-                "limit": max(2, time_window_days) if time_series else 1,
-                "resolvedMetricRef": ranking_item["metric"].key,
-                "resolvedOwnerTable": ranking_item["metric"].table,
-                "semanticRefId": ranking_item["metric"].source_ref_id,
-                "metricResolutionSource": "semantic_metric_ref",
-                "metricGovernanceMode": "published_semantic",
-            },
-            "requestedMeasures": requested_measures,
+            "selectedMetrics": selected_metrics,
             "metricCandidateDecisions": self._semantic_selection_metric_decisions(payload, selected),
             "filters": [],
             "scopeConstraints": [],
@@ -2007,18 +2403,75 @@ class QueryGraphPlanner:
             "source": "semantic_asset_selection",
         }
         expansion_trace = self._expand_asset_pack_from_understanding(asset_pack, understanding)
-        plan = compile_query_graph_from_understanding(question, understanding, asset_pack)
-        if expansion_trace:
-            plan.compiler_trace.extend(expansion_trace)
-        if plan.intents:
-            plan.agent_trace.append("planner.semantic_asset_selection.contract=%s" % contract_type)
-            plan.compiler_trace.append(
-                "SEMANTIC_SELECTION_METRICS:%s"
-                % ",".join("%s.%s" % (item["metric"].table, item["metric"].key) for item in selected)
+        index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
+        dag_compiler = MetricDAGCompiler(asset_pack, index)
+        intents: List[QuestionIntent] = []
+        dependencies: List[PlanDependency] = []
+        compiler_trace: List[str] = list(expansion_trace)
+        for item in selected:
+            metric = item["metric"]
+            group_by = self._semantic_selection_group_by(metric, asset_pack, time_series=time_series)
+            if not group_by:
+                compiler_trace.append("SEMANTIC_SELECTION_GROUP_BY_UNAVAILABLE:%s.%s" % (metric.table, metric.key))
+                continue
+            resolution = SemanticMetricResolution(
+                requested_metric_ref=metric.key,
+                source_phrase=item["sourcePhrase"],
+                metric=metric,
+                confidence=1.0,
+                resolution_source="semantic_metric_ref",
+                field_warning=semantic_metric_field_warning(metric),
             )
-        else:
-            plan.agent_trace.append("planner.semantic_asset_selection.compile_failed")
-        return plan
+            if derived_metric_components(metric, asset_pack):
+                metric_grain = semantic_fast_path_grain("", group_by, asset_pack, metric.table)
+                if not dag_compiler.append_requested_metric(
+                    question=question,
+                    understanding=understanding,
+                    metric=metric,
+                    metric_resolution=resolution,
+                    parent_task="",
+                    parent_table="",
+                    grain=metric_grain,
+                    requested_group_by=group_by,
+                    ranking={"limit": max(2, time_window_days) if time_series else 1, "groupByColumn": group_by},
+                    intents=intents,
+                    dependencies=dependencies,
+                    compiler_trace=compiler_trace,
+                ):
+                    compiler_trace.append("SEMANTIC_SELECTION_DERIVED_UNAVAILABLE:%s.%s" % (metric.table, metric.key))
+                continue
+            task_id = unique_task_id(
+                "%s_%s_metric"
+                % (semantic_domain_for_metric(metric, asset_pack) or semantic_domain_for_table(metric.table, asset_pack), metric.key),
+                [intent.plan_task_id for intent in intents],
+            )
+            metric_grain = semantic_fast_path_grain("", group_by, asset_pack, metric.table)
+            intent = compiled_metric_intent(
+                question=question,
+                metric=metric,
+                task_id=task_id,
+                role=TaskRole.ANCHOR,
+                mode=AnswerMode.GROUP_AGG,
+                grain=metric_grain,
+                group_by=group_by,
+                depends_on=[],
+                limit=max(2, time_window_days) if time_series else 1,
+                asset_pack=asset_pack,
+                metric_resolution=resolution.payload(),
+            )
+            if intent:
+                intents.append(intent)
+            else:
+                compiler_trace.append("SEMANTIC_SELECTION_METRIC_UNAVAILABLE:%s.%s" % (metric.table, metric.key))
+        plan = QueryPlan(
+            intents=intents,
+            dependencies=dependencies,
+            agent_trace=["planner=semantic_asset_selection_direct_compiler"],
+            question_understanding=understanding,
+            compiler_trace=compiler_trace,
+            knowledge_requests=dedupe_knowledge_requests(self._semantic_selection_knowledge_requests(question, payload)),
+        )
+        return finalize_compiled_query_plan(question, plan, understanding, asset_pack)
 
     def _selected_semantic_metrics(
         self,
@@ -2037,11 +2490,11 @@ class QueryGraphPlanner:
             raw_items = [
                 {
                     "semanticRefId": ref,
-                    "sourcePhrase": str(
-                        (candidate_by_ref.get(ref) or {}).get("matched")
-                        or (candidate_by_ref.get(ref) or {}).get("name")
-                        or (candidate_by_ref.get(ref) or {}).get("metricKey")
-                        or ref.rsplit(":", 1)[-1]
+                    "sourcePhrase": self._semantic_selection_source_phrase_for_ref(
+                        question,
+                        ref,
+                        candidate_by_ref.get(ref) or {},
+                        asset_pack,
                     ),
                     "ownerTable": str((candidate_by_ref.get(ref) or {}).get("table") or ""),
                     "metricRef": str((candidate_by_ref.get(ref) or {}).get("metricKey") or ""),
@@ -2053,12 +2506,12 @@ class QueryGraphPlanner:
             return []
         # Ensure owner tables for selected refs are available before resolving.
         expansion_understanding = {
-            "rankingObjective": {},
-            "requestedMeasures": [
+            "selectedMetrics": [
                 {
                     "metricRef": str(item.get("metricRef") or item.get("metric_ref") or ""),
                     "ownerTable": str(item.get("ownerTable") or item.get("owner_table") or ""),
                     "sourcePhrase": str(item.get("sourcePhrase") or item.get("source_phrase") or ""),
+                    "semanticRefId": str(item.get("semanticRefId") or item.get("semantic_ref_id") or ""),
                 }
                 for item in raw_items
                 if isinstance(item, dict)
@@ -2102,6 +2555,24 @@ class QueryGraphPlanner:
                 }
             )
         return selected
+
+    def _semantic_selection_source_phrase_for_ref(
+        self,
+        question: str,
+        ref: str,
+        candidate: Dict[str, Any],
+        asset_pack: PlanningAssetPack,
+    ) -> str:
+        metric = metric_entry_by_ref(ref, asset_pack, str(candidate.get("table") or ""))
+        phrase = self._semantic_selection_best_question_phrase(question, self._semantic_selection_metric_labels(metric))
+        if phrase:
+            return phrase[:120]
+        return str(
+            candidate.get("matched")
+            or candidate.get("name")
+            or candidate.get("metricKey")
+            or ref.rsplit(":", 1)[-1]
+        )[:120]
 
     def _semantic_selection_metric_decisions(self, payload: Dict[str, Any], selected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rejected_by_phrase: Dict[str, List[str]] = {}
@@ -2160,15 +2631,23 @@ class QueryGraphPlanner:
 
     def _semantic_selection_group_by(self, metric: Any, asset_pack: PlanningAssetPack, time_series: bool = False) -> str:
         columns = set(asset_pack.known_columns(metric.table))
-        if time_series and "pt" in columns:
-            return "pt"
-        if "seller_id" in columns:
-            return "seller_id"
-        if "merchant_id" in columns:
-            return "merchant_id"
+        if time_series:
+            return time_column_for_metric(metric, asset_pack)
+        metadata = getattr(metric, "metadata", {}) or {}
+        table_entry = planning_table_entry(asset_pack, metric.table)
+        table_metadata = table_entry.metadata if table_entry else {}
+        for key in [
+            "groupByColumn",
+            "group_by_column",
+            "defaultGroupByColumn",
+            "default_group_by_column",
+        ]:
+            candidate = str(metadata.get(key) or table_metadata.get(key) or "")
+            if candidate in columns:
+                return candidate
         if time_series:
             return ""
-        return "pt" if "pt" in columns else ""
+        return time_column_for_metric(metric, asset_pack)
 
     def _expand_asset_pack_from_understanding(self, asset_pack: PlanningAssetPack, understanding: Dict[str, Any]) -> List[str]:
         if not self.semantic_catalog:
@@ -2553,9 +3032,9 @@ class QueryGraphPlanner:
                 "tool": "emit_question_understanding",
                 "status": "UNDERSTOOD | INVALID" if force_catalog else "UNDERSTOOD | NEED_MORE_KNOWLEDGE | INVALID",
                 "metricRefRule": (
-                    "rankingObjective/requestedMeasures.metricRef must come from semantic_read loaded metric definitions or semanticCatalog.candidateMetrics.key"
+                    "anchorMetric/supportMetrics.metricRef must come from semantic_read loaded metric definitions or semanticCatalog.candidateMetrics.key"
                     if include_full_file_context
-                    else "rankingObjective/requestedMeasures.metricRef must come from semanticCatalog.candidateMetrics.key"
+                    else "anchorMetric/supportMetrics.metricRef must come from semanticCatalog.candidateMetrics.key"
                 ),
                 "ownerTableRule": "ownerTable must equal the selected metric table",
                 "metricOnlyCatalogRule": "candidateMetrics may be present while tables is empty; select metricRef/ownerTable from candidateMetrics first, and rely on semantic_read/on-demand expansion only when table schema, formula detail, or relationships are needed",
@@ -2566,18 +3045,14 @@ class QueryGraphPlanner:
                     "memoryConstraints are validate-only hints: use them only by selecting semanticCatalog-supported "
                     "metricRefs/filters; never rewrite semanticCatalog formulas, fields, or relationships from memory"
                 ),
-                "populationRatioExamples": [
-                    "使用优惠券的订单中有退货占多少 => base=使用优惠券的订单,event=有退货的订单,denom=order_detail_cnt,numer=refund_bill_cnt",
-                    "有客服工单的订单后来发生赔付占多少 => base=有客服工单的订单,event=发生赔付的订单,denom=order_detail_cnt,numer=repay_bill_cnt",
-                    "订单里发货超时占比 => base=订单,event=发货超时的订单,denom=order_detail_cnt,numer=ship_timeout_order_cnt",
-                ],
+                "populationRatioContract": (
+                    "for a requested ratio, bind the user-declared base population to a denominator metric and the "
+                    "event/subset population to a distinct numerator metric from semanticCatalog; never infer either "
+                    "metric from a business keyword"
+                ),
                 "repairRule": "if repairFeedback is non-empty, fix questionUnderstanding according to it; do not repeat an invalid numerator/denominator pair",
                 "analysisRule": "analysisIntent none => requiresExplanation false and requiredEvidenceIntents []; otherwise include evidence intents",
-                "skillWorkflowRule": (
-                    "only declare skillWorkflow/reusableAnalysis/fixedAnalysisWorkflow/recommendedSkill for fixed merchant SOP analysis; "
-                    "allowed skills: gmv_drop_diagnosis, refund_rate_diagnosis, merchant_daily_briefing, bi_trend_attribution, "
-                    "risk_analysis, ratio_analysis, rule_compliance, new_product_risk"
-                ),
+                "skillWorkflowRule": "skill matching is owned by the Lead Agent from dynamically loaded skill headers, not by this Planner",
             },
         }
         if include_full_file_context:
@@ -2926,7 +3401,7 @@ class QueryGraphPlanner:
         prompt = self.prompt_assembler.render(
             "planner.repair_understanding",
             sections={
-                "repair_policy": "只修正 questionUnderstanding；anchor 错就重新选择 rankingObjective，不生成 SQL 或 QueryGraph。",
+                "repair_policy": "只修正 questionUnderstanding；anchor 错就重新选择 anchorMetric，不生成 SQL 或 QueryGraph。",
             },
         )
         catalog = ultra_compact_understanding_catalog(asset_pack, question)
@@ -2948,7 +3423,7 @@ class QueryGraphPlanner:
                 "requiredSchema": {
                     "status": "UNDERSTOOD | NEED_MORE_KNOWLEDGE | INVALID",
                     "questionUnderstanding": {
-                        "analysisGrain": "product|order|day|ticket|refund|coupon|unknown",
+                        "analysisGrain": "asset-declared grain value or unknown",
                         "analysisIntent": "none|diagnosis|trend_check|risk_ranking|overview|comparison|anomaly_check",
                         "requiresExplanation": True,
                         "requiredEvidenceIntents": [
@@ -2957,10 +3432,10 @@ class QueryGraphPlanner:
                                 "reason": "why this evidence is needed",
                                 "requiredLevel": "required|optional",
                                 "suggestedMetricRefs": ["candidate metric keys"],
-                                "suggestedDomains": ["trade|refund|goods|ticket|compensation|coupon|scm"],
+                                "suggestedDomains": ["topic/domain values present in semanticCatalog"],
                             }
                         ],
-                        "rankingObjective": {
+                        "anchorMetric": {
                             "metricRef": "candidate metric key used for sorting",
                             "sourcePhrase": "exact phrase from question",
                             "ownerTable": "metric owner table",
@@ -2968,7 +3443,7 @@ class QueryGraphPlanner:
                             "order": "desc|asc",
                             "limit": 10,
                         },
-                        "requestedMeasures": [
+                        "supportMetrics": [
                             {
                                 "metricRef": "candidate metric key",
                                 "sourcePhrase": "exact phrase from question",
@@ -3056,7 +3531,11 @@ class PlannerReflectionAgent:
                     }
                 )
         requested_domains = requested_semantic_domains_from_understanding(plan.question_understanding or {}, asset_pack)
-        covered_domains = {semantic_domain_for_table(intent.preferred_table) for intent in plan.intents if intent.preferred_table}
+        covered_domains = {
+            semantic_domain_for_table(intent.preferred_table, asset_pack)
+            for intent in plan.intents
+            if intent.preferred_table
+        }
         for intent in plan.intents:
             metric_domain = metric_domain_for_intent(intent, asset_pack)
             if metric_domain:
@@ -3141,7 +3620,11 @@ class PlannerReflectionAgent:
                     }
                 )
                 suggested_actions.append("repair_graph")
-            if intent.preferred_table and "pt" in asset_pack.known_columns(intent.preferred_table) and int(intent.days or 0) <= 2:
+            if (
+                intent.preferred_table
+                and time_column_for_table(asset_pack, intent.preferred_table)
+                and int(intent.days or 0) <= 2
+            ):
                 issues.append(
                     {
                         "code": "FRESHNESS_RISK",
@@ -3219,7 +3702,7 @@ class PlannerReflectionAgent:
             issues.insert(0, anchor_mismatch)
             suggested_actions.insert(0, "plan_graph")
             repair_hints.insert(0, "rerun LLM question understanding with anchor mismatch feedback")
-        sanity_gaps = GraphSanityCheck().validate(plan)
+        sanity_gaps = GraphSanityCheck().validate(plan, asset_pack)
         if sanity_gaps:
             issues.extend(critic_issue_from_gap(gap) for gap in sanity_gaps)
             for gap in sanity_gaps:
@@ -3400,7 +3883,10 @@ class SemanticRelationshipGraphIndex:
                 queue.append((edge.to_table, next_path))
         if not candidates:
             return []
-        desired = {key for key in (preferred_keys or []) if key} | relationship_preferred_keys_for_grain(analysis_grain)
+        desired = {key for key in (preferred_keys or []) if key} | relationship_preferred_keys_for_grain(
+            analysis_grain,
+            self.asset_pack,
+        )
         return sorted(
             candidates,
             key=lambda item: self._path_score(item, start_table, target_table, analysis_grain, desired),
@@ -3450,17 +3936,11 @@ class SemanticRelationshipGraphIndex:
         for edge in path:
             edge_columns = set(edge.from_columns) | set(edge.to_columns)
             path_columns |= edge_columns
-            business_columns = edge_columns - {"seller_id", "merchant_id", "pt"}
             semantics = edge.path_semantics
-            if len(path) == 1 and business_columns:
+            if len(path) == 1 and edge_columns:
                 score -= 50
-            if business_columns:
-                score -= min(len(business_columns), 3) * 2
-            else:
-                score += 20
+            score -= min(len(edge_columns), 3) * 2
             if "tenant_context" in semantics and not relationship_path_allows_tenant_context(
-                start_table,
-                target_table,
                 analysis_grain,
             ):
                 score += 35
@@ -3471,13 +3951,11 @@ class SemanticRelationshipGraphIndex:
                 score -= 12
             elif analysis_grain and semantics and "tenant_context" not in semantics:
                 score += 4
-            if relationship_edge_touches_hub(edge, start_table, target_table):
-                score += 30 if not business_columns else 12
+            if relationship_edge_touches_hub(edge):
+                score += 12
         if desired_keys:
             matched = desired_keys & path_columns
             score += 35 if not matched else -min(len(matched), 3) * 8
-        if analysis_grain and semantic_domain_for_table(target_table) in {"profile", "merchant"}:
-            score -= 6
         return score
 
     def _relationship_columns_available(self, rel: Any) -> bool:
@@ -3495,55 +3973,57 @@ class SemanticRelationshipGraphIndex:
         return bool(rel.join_keys)
 
 
-def relationship_preferred_keys_for_grain(analysis_grain: str) -> set[str]:
-    grain = (analysis_grain or "").strip().lower()
-    mapping = {
-        "order": {"sub_order_id", "order_id"},
-        "product": {"spu_id", "spu_name"},
-        "goods": {"spu_id", "spu_name"},
-        "ticket": {"ticket_id", "sub_order_id", "order_id"},
-        "refund": {"refund_id", "sub_order_id", "order_id"},
-        "coupon": {"coupon_id", "discount_rel_id", "sub_order_id", "order_id"},
-        "scm": {"spu_id", "spu_name", "sub_order_id"},
-        "day": {"pt"},
+def relationship_preferred_keys_for_grain(
+    analysis_grain: str,
+    asset_pack: PlanningAssetPack | None = None,
+) -> set[str]:
+    grain = normalize_semantic_namespace(analysis_grain)
+    if not asset_pack or grain == "unknown":
+        return set()
+    preferred = {
+        entry.key
+        for entry in asset_pack.entity_keys
+        if entry.key and declared_grain_for_entry(entry) == grain
     }
-    return set(mapping.get(grain, set()))
+    for rel in asset_pack.relationships:
+        declared = normalize_semantic_namespace(rel.grain) if rel.grain else "unknown"
+        semantic_match = relationship_semantics_match_grain(set(rel.path_semantics or []), grain)
+        if declared != grain and not semantic_match:
+            continue
+        for key in rel.join_keys:
+            preferred.update(
+                str(value)
+                for value in [key.get("leftColumn"), key.get("rightColumn")]
+                if str(value or "")
+            )
+    return preferred
 
 
 def relationship_semantics_match_grain(semantics: set[str], analysis_grain: str) -> bool:
-    grain = (analysis_grain or "").strip().lower()
+    grain = normalize_relationship_semantic(analysis_grain)
     if not grain:
         return False
-    grain_semantics = {
-        "order": {"order_entity"},
-        "product": {"product_entity"},
-        "goods": {"product_entity"},
-        "ticket": {"ticket_entity"},
-        "refund": {"refund_entity", "order_entity"},
-        "coupon": {"coupon_entity", "order_entity"},
-        "scm": {"product_entity"},
-        "compensation": {"compensation_entity", "order_entity"},
-        "repay": {"compensation_entity", "order_entity"},
-        "day": set(),
-        "merchant": {"tenant_context"},
-    }
-    expected = grain_semantics.get(grain, set())
-    return bool(expected and semantics & expected)
+    return any(normalize_relationship_semantic(value) == grain for value in semantics)
 
 
-def relationship_path_allows_tenant_context(start_table: str, target_table: str, analysis_grain: str) -> bool:
-    domains = {semantic_domain_for_table(start_table), semantic_domain_for_table(target_table)}
-    if domains <= {"profile", "merchant"}:
-        return True
-    return (analysis_grain or "").strip().lower() in {"merchant", "shop", "seller"}
+def normalize_relationship_semantic(value: Any) -> str:
+    normalized = normalize_semantic_namespace(value)
+    if normalized == "unknown":
+        return ""
+    for suffix in ["_entity", "_grain", "_context", "_scope"]:
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+    return normalized
 
 
-def relationship_edge_touches_hub(edge: RelationshipGraphEdge, start_table: str, target_table: str) -> bool:
-    endpoint_domains = {semantic_domain_for_table(edge.from_table), semantic_domain_for_table(edge.to_table)}
-    if not (endpoint_domains & {"profile", "merchant"}):
-        return False
-    terminal_domains = {semantic_domain_for_table(start_table), semantic_domain_for_table(target_table)}
-    return not terminal_domains <= {"profile", "merchant"}
+def relationship_path_allows_tenant_context(analysis_grain: str) -> bool:
+    return not analysis_grain or normalize_relationship_semantic(analysis_grain) == normalize_relationship_semantic(
+        "tenant_context"
+    )
+
+
+def relationship_edge_touches_hub(edge: RelationshipGraphEdge) -> bool:
+    return bool(edge.path_semantics & {"hub", "tenant_context"})
 
 
 class SemanticLayerIndex:
@@ -3690,6 +4170,9 @@ class EvidenceContractBuilder:
                     }
                 )
                 continue
+            if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC, AnswerMode.DERIVED} and intent.metric_specs:
+                contracts.extend(self._contracts_from_metric_specs(intent))
+                continue
             contract = {
                 "taskId": intent.plan_task_id,
                 "table": intent.preferred_table,
@@ -3725,21 +4208,61 @@ class EvidenceContractBuilder:
             contracts.append(contract)
         return contracts
 
+    def _contracts_from_metric_specs(self, intent: QuestionIntent) -> List[Dict[str, Any]]:
+        contracts: List[Dict[str, Any]] = []
+        primary_metric = self._metric_contract_column(intent)
+        for raw_spec in intent.metric_specs:
+            if not isinstance(raw_spec, dict):
+                continue
+            metric_column = str(raw_spec.get("metricColumn") or raw_spec.get("metric_column") or "")
+            metric_name = str(raw_spec.get("metricName") or raw_spec.get("metric_name") or "")
+            if not metric_name and metric_column:
+                metric_name = str(raw_spec.get("outputAlias") or raw_spec.get("output_alias") or metric_column)
+            if not metric_name:
+                continue
+            columns: List[str] = []
+            for column in [intent.group_by_column, intent.filter_column, metric_name]:
+                if column and column not in columns:
+                    columns.append(column)
+            aliases = {
+                metric_name: dedupe_strings(
+                    [
+                        metric_name,
+                        metric_column,
+                        *[str(item) for item in raw_spec.get("outputAliases") or raw_spec.get("output_aliases") or []],
+                    ]
+                )
+            }
+            contract: Dict[str, Any] = {
+                "taskId": intent.plan_task_id,
+                "table": intent.preferred_table,
+                "semanticLabel": metric_name,
+                "requiredLevel": "required",
+                "columns": columns,
+                "semanticAliases": aliases,
+                "metricSpec": dict(raw_spec),
+            }
+            if intent.metric_resolution and metric_name == primary_metric:
+                contract["metricResolution"] = intent.metric_resolution
+            contracts.append(contract)
+        return contracts
+
     def _contract_any_of_groups(self, intent: QuestionIntent) -> List[List[str]]:
-        fields = set(intent.output_keys + [intent.group_by_column, intent.filter_column])
         groups: List[List[str]] = []
-        if fields & {"spu_id", "spu_name"}:
-            groups.append(["spu_id", "spu_name"])
-        if fields & {"sub_order_id", "order_id"}:
-            groups.append(["sub_order_id", "order_id"])
-        if fields & {"ticket_id"} or "ticket" in intent.preferred_table:
-            groups.append(["ticket_id", "sub_order_id", "order_id"])
-        if fields & {"bill_id"} or "repay" in intent.preferred_table:
-            groups.append(["bill_id", "ticket_id", "sub_order_id", "order_id"])
-        if fields & {"coupon_id", "discount_rel_id"} or "coupon" in intent.preferred_table:
-            groups.append(["coupon_id", "discount_rel_id"])
-        if fields & {"pt"} and not groups:
-            groups.append(["pt"])
+        resolution = intent.metric_resolution or {}
+        declared_groups = (
+            resolution.get("evidenceAnyOf")
+            or resolution.get("evidence_any_of")
+            or resolution.get("equivalentColumns")
+            or resolution.get("equivalent_columns")
+            or []
+        )
+        if isinstance(declared_groups, list):
+            for item in declared_groups:
+                if isinstance(item, str):
+                    groups.append([item])
+                elif isinstance(item, list):
+                    groups.append([str(column) for column in item if str(column or "")])
         deduped: List[List[str]] = []
         for group in groups:
             compact = [column for column in group if column]
@@ -3751,29 +4274,66 @@ class EvidenceContractBuilder:
         if intent.metric_name:
             return intent.metric_name
         if intent.metric_column:
-            return "sum_%s" % intent.metric_column
+            return intent.metric_column
         return ""
 
     def _semantic_aliases_for_contract(self, intent: QuestionIntent) -> Dict[str, List[str]]:
         aliases: Dict[str, List[str]] = {}
         metric_alias = self._metric_contract_column(intent)
-        if metric_alias and intent.metric_column:
-            aliases[metric_alias] = dedupe_strings([metric_alias, intent.metric_column, "sum_%s" % intent.metric_column])
-        if intent.metric_name and intent.metric_name.endswith(("_cnt", "_count")):
-            aliases[intent.metric_name] = dedupe_strings([intent.metric_name, "cnt", "count"])
+        if not metric_alias:
+            return aliases
+        resolution = intent.metric_resolution or {}
+        declared_aliases: List[str] = []
+        for key in [
+            "outputAliases",
+            "output_aliases",
+            "evidenceAliases",
+            "evidence_aliases",
+            "aliases",
+        ]:
+            value = resolution.get(key)
+            if isinstance(value, str):
+                declared_aliases.append(value)
+            elif isinstance(value, list):
+                declared_aliases.extend(str(item) for item in value if str(item or ""))
+        aliases[metric_alias] = dedupe_strings(
+            [metric_alias, intent.metric_name, intent.metric_column, *declared_aliases]
+        )
         return aliases
 
     def _semantic_label(self, intent: QuestionIntent) -> str:
         if intent.metric_name:
             return intent.metric_name
+        if intent.metric_column:
+            return intent.metric_column
+        resolution = intent.metric_resolution or {}
+        metric_ref = str(
+            resolution.get("metricKey")
+            or resolution.get("metric_key")
+            or resolution.get("requestedMetricRef")
+            or resolution.get("requested_metric_ref")
+            or ""
+        )
+        if metric_ref:
+            return metric_ref
         return str(getattr(intent, "semantic_label", "") or intent.preferred_table or "")
 
     def final_evidence_labels(self, intents: List[QuestionIntent]) -> List[str]:
         labels: List[str] = []
         for intent in intents:
-            label = self._semantic_label(intent)
-            if label not in labels:
-                labels.append(label)
+            metric_spec_labels: List[str] = []
+            for spec in intent.metric_specs or []:
+                if not isinstance(spec, dict):
+                    continue
+                label = str(spec.get("metricName") or spec.get("metric_name") or "")
+                column = str(spec.get("metricColumn") or spec.get("metric_column") or "")
+                if not label and column:
+                    label = str(spec.get("outputAlias") or spec.get("output_alias") or column)
+                if label:
+                    metric_spec_labels.append(label)
+            for label in metric_spec_labels or [self._semantic_label(intent)]:
+                if label and label not in labels:
+                    labels.append(label)
         return labels
 
 
@@ -4274,11 +4834,7 @@ class QueryGraphValidator:
         intent_by_task: Dict[str, QuestionIntent],
     ) -> List[GraphValidationGap]:
         anchor = intent_by_task[dep.anchor_task_id]
-        join_tokens = [
-            token
-            for token in split_join_tokens(dep.anchor_column or dep.join_key)
-            if token not in {"seller_id", "merchant_id"}
-        ]
+        join_tokens = split_join_tokens(dep.anchor_column or dep.join_key)
         if not join_tokens:
             return []
         produced = set(anchor.output_keys + anchor.required_evidence)
@@ -4300,15 +4856,13 @@ class QueryGraphValidator:
             return True
         if not dep.join_key:
             return True
-        if dep.join_key in {"pt", "merchant_id", "seller_id"}:
-            return True
         if intent_by_task and dep.anchor_task_id in intent_by_task and dep.dependent_task_id in intent_by_task:
             anchor = intent_by_task[dep.anchor_task_id]
             dependent = intent_by_task[dep.dependent_task_id]
             if anchor.preferred_table == dependent.preferred_table:
                 columns = set(asset_pack.known_columns(anchor.preferred_table))
                 tokens = split_join_tokens(dep.anchor_column or dep.join_key) + split_join_tokens(dep.dependent_column or dep.join_key)
-                return all(token in columns for token in tokens if token not in {"seller_id", "merchant_id"})
+                return all(token in columns for token in tokens)
         wanted_tokens = split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)
         for rel in asset_pack.relationships:
             relationship_tokens: List[str] = []
@@ -4318,21 +4872,23 @@ class QueryGraphValidator:
                     return True
                 if dep.join_key in key.values():
                     return True
-            if wanted_tokens and all(token in relationship_tokens for token in wanted_tokens if token not in {"seller_id", "merchant_id"}):
+            if wanted_tokens and all(token in relationship_tokens for token in wanted_tokens):
                 return True
         return not asset_pack.relationships
 
 
 class GraphSanityCheck:
-    TECHNICAL_KEYS = {"seller_id", "merchant_id", "pt", "dt", "date", "biz_date"}
-
-    def validate(self, plan: QueryPlan) -> List[GraphValidationGap]:
+    def validate(
+        self,
+        plan: QueryPlan,
+        asset_pack: PlanningAssetPack | None = None,
+    ) -> List[GraphValidationGap]:
         if not plan.question_understanding:
             return []
         gaps: List[GraphValidationGap] = []
         gaps.extend(self._root_metric_gaps(plan))
-        gaps.extend(self._dependency_entity_filter_gaps(plan))
-        target_gap = self._target_grain_gap(plan)
+        gaps.extend(self._dependency_entity_filter_gaps(plan, asset_pack))
+        target_gap = self._target_grain_gap(plan, asset_pack)
         if target_gap:
             gaps.append(target_gap)
         return gaps
@@ -4369,16 +4925,20 @@ class GraphSanityCheck:
             )
         ]
 
-    def _dependency_entity_filter_gaps(self, plan: QueryPlan) -> List[GraphValidationGap]:
+    def _dependency_entity_filter_gaps(
+        self,
+        plan: QueryPlan,
+        asset_pack: PlanningAssetPack | None,
+    ) -> List[GraphValidationGap]:
         gaps: List[GraphValidationGap] = []
         requested = requested_measure_metric_refs(plan.question_understanding or {})
         intent_by_task = {intent.plan_task_id: intent for intent in plan.intents if intent.plan_task_id}
         for dep in plan.dependencies:
             if dep.relation_type == "DERIVED_COMPONENT":
                 continue
-            if dependency_is_time_alignment(dep):
+            if dependency_is_time_alignment(dep, asset_pack, intent_by_task):
                 continue
-            if dependency_has_entity_filter(dep):
+            if dependency_has_entity_filter(dep, asset_pack, intent_by_task):
                 continue
             dependent = intent_by_task.get(dep.dependent_task_id)
             if dependent and intent_is_graph_helper(dependent):
@@ -4394,12 +4954,17 @@ class GraphSanityCheck:
             )
         return gaps
 
-    def _target_grain_gap(self, plan: QueryPlan) -> GraphValidationGap | None:
+    def _target_grain_gap(
+        self,
+        plan: QueryPlan,
+        asset_pack: PlanningAssetPack | None,
+    ) -> GraphValidationGap | None:
         ranking = (plan.question_understanding or {}).get("rankingObjective") or (plan.question_understanding or {}).get("ranking_objective") or {}
         if not isinstance(ranking, dict):
             return None
         group_by = str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "").strip()
-        if not group_by or not graph_sanity_entity_key(group_by):
+        owner_table = str(ranking.get("ownerTable") or ranking.get("owner_table") or "")
+        if not group_by or not graph_sanity_entity_key(group_by, asset_pack, owner_table):
             return None
         for intent in executable_graph_intents(plan):
             produced = set(intent.output_keys + intent.required_evidence)
@@ -4481,28 +5046,85 @@ def requested_measure_metric_refs(understanding: Dict[str, Any]) -> set[str]:
     return refs
 
 
-def dependency_has_entity_filter(dep: PlanDependency) -> bool:
+def dependency_has_entity_filter(
+    dep: PlanDependency,
+    asset_pack: PlanningAssetPack | None = None,
+    intent_by_task: Dict[str, QuestionIntent] | None = None,
+) -> bool:
     tokens = split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)
-    return any(graph_sanity_entity_key(token) for token in tokens)
+    tables: List[str] = []
+    if intent_by_task:
+        tables = [
+            str(getattr(intent_by_task.get(dep.anchor_task_id), "preferred_table", "") or ""),
+            str(getattr(intent_by_task.get(dep.dependent_task_id), "preferred_table", "") or ""),
+        ]
+    return any(
+        graph_sanity_entity_key(token, asset_pack, table)
+        for token in tokens
+        for table in tables or [""]
+    )
 
 
-def dependency_is_time_alignment(dep: PlanDependency) -> bool:
+def dependency_is_time_alignment(
+    dep: PlanDependency,
+    asset_pack: PlanningAssetPack | None = None,
+    intent_by_task: Dict[str, QuestionIntent] | None = None,
+) -> bool:
     tokens = [token.lower() for token in split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)]
     if not tokens:
         return False
     non_empty = [token for token in tokens if token]
-    if not non_empty:
+    if not non_empty or not asset_pack:
         return False
-    return all(token in GraphSanityCheck.TECHNICAL_KEYS for token in non_empty) and any(
-        token in {"pt", "dt", "date", "biz_date"} for token in non_empty
+    tables: List[str] = []
+    if intent_by_task:
+        tables = [
+            str(getattr(intent_by_task.get(dep.anchor_task_id), "preferred_table", "") or ""),
+            str(getattr(intent_by_task.get(dep.dependent_task_id), "preferred_table", "") or ""),
+        ]
+    roles = [
+        semantic_role_for_column(asset_pack, table, token)
+        for token in non_empty
+        for table in tables or [""]
+    ]
+    declared_roles = [role for role in roles if role]
+    return bool(declared_roles) and all(role in {"TIME", "PARTITION"} for role in declared_roles)
+
+
+def graph_sanity_entity_key(
+    column: str,
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> bool:
+    text = str(column or "").strip().lower()
+    if not text or not asset_pack:
+        return False
+    role = semantic_role_for_column(asset_pack, table, column)
+    if role in {"PARTITION", "TENANT_CONTEXT", "CONTEXT", "TIME"}:
+        return False
+    if role in {"KEY", "DIMENSION", "ENTITY"}:
+        return True
+    return any(
+        entry.key == column and (not table or entry.table == table)
+        for entry in asset_pack.entity_keys
     )
 
 
-def graph_sanity_entity_key(column: str) -> bool:
-    text = str(column or "").strip().lower()
-    if not text or text in GraphSanityCheck.TECHNICAL_KEYS:
-        return False
-    return text == "spu_name" or text.endswith("_id") or text in {"order_no", "bill_no"}
+def semantic_role_for_column(
+    asset_pack: PlanningAssetPack,
+    table: str,
+    column: str,
+) -> str:
+    roles: List[str] = []
+    for entry in asset_pack.fields + asset_pack.entity_keys:
+        if entry.key != column or (table and entry.table != table):
+            continue
+        metadata = entry.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        role = str(semantic.get("role") or metadata.get("semanticRole") or "").strip().upper()
+        if role:
+            roles.append(role)
+    return roles[0] if len(set(roles)) == 1 else ""
 
 
 def dependency_cycle(dependencies: List[PlanDependency]) -> List[str]:
@@ -4594,8 +5216,8 @@ def compact_understanding_catalog(asset_pack: PlanningAssetPack, question: str =
         "tables": [
             {
                 "table": item.table or item.key,
-                "domain": semantic_domain_for_table(item.table or item.key),
-                "keyColumns": select_planner_columns(item.columns, question)[:12],
+                "domain": semantic_domain_for_table(item.table or item.key, asset_pack),
+                "keyColumns": select_planner_columns(item.columns, question, getattr(item, "metadata", {}) or {})[:12],
             }
             for item in table_entries
         ],
@@ -4643,8 +5265,12 @@ def ultra_compact_understanding_catalog(
         "tables": [
             {
                 "table": item.table or item.key,
-                "domain": semantic_domain_for_table(item.table or item.key),
-                "keyColumns": select_planner_columns(item.columns, question)[: 2 if budget_level >= 2 else 3 if budget_level >= 1 else 4],
+                "domain": semantic_domain_for_table(item.table or item.key, asset_pack),
+                "keyColumns": select_planner_columns(
+                    item.columns,
+                    question,
+                    getattr(item, "metadata", {}) or {},
+                )[: 2 if budget_level >= 2 else 3 if budget_level >= 1 else 4],
                 "sourceRefId": item.source_ref_id,
             }
             for item in table_entries
@@ -4851,7 +5477,9 @@ def semantic_manifest_from_asset_pack(
                 "contextLayer": "L0",
                 "dataGrain": (item.metadata or {}).get("dataGrain", ""),
                 "timeColumn": (item.metadata or {}).get("timeColumn", ""),
-                "merchantFilterColumn": (item.metadata or {}).get("merchantFilterColumn", ""),
+                "entityFilterColumn": (item.metadata or {}).get("entityFilterColumn", ""),
+                "scopeFilterColumn": (item.metadata or {}).get("scopeFilterColumn", ""),
+                "tenantContextColumn": (item.metadata or {}).get("tenantContextColumn", ""),
                 "sourceRefId": item.source_ref_id,
                 "refId": (
                     item.source_ref_id.rsplit(":", 1)[0] + ":asset"
@@ -5108,11 +5736,17 @@ def diagnostic_catalog_table_entries(asset_pack: PlanningAssetPack, question: st
     table_by_name = {item.table or item.key: item for item in asset_pack.tables if item.table or item.key}
     selected: List[Any] = []
     selected_tables: set[str] = set()
-    for table in asset_pack.known_tables():
-        if semantic_domain_for_table(table) != "profile":
+    declared_anchors = sorted(
+        asset_pack.tables,
+        key=lambda entry: int((entry.metadata or {}).get("diagnosticPriority") or 0),
+        reverse=True,
+    )
+    for entry in declared_anchors:
+        metadata = entry.metadata or {}
+        if not boolish(metadata.get("diagnosticAnchor", metadata.get("diagnostic_anchor"))):
             continue
-        entry = table_by_name.get(table)
-        if entry:
+        table = str(entry.table or entry.key or "")
+        if table:
             selected.append(entry)
             selected_tables.add(table)
             return selected[:limit]
@@ -5174,7 +5808,7 @@ def planner_catalog_table_entries(asset_pack: PlanningAssetPack, question: str, 
 def planner_catalog_seed_tables(asset_pack: PlanningAssetPack, question: str, limit: int) -> List[str]:
     table_by_domain: Dict[str, List[str]] = {}
     for table in asset_pack.known_tables():
-        table_by_domain.setdefault(semantic_domain_for_table(table), []).append(table)
+        table_by_domain.setdefault(semantic_domain_for_table(table, asset_pack), []).append(table)
     selected: List[str] = []
     for table in question_understanding_expanded_tables(asset_pack):
         if table in asset_pack.known_tables() and table not in selected:
@@ -5219,11 +5853,14 @@ def best_catalog_table_for_domain(domain: str, tables: List[str], question: str)
 
 
 def catalog_table_score(table: str, question: str) -> int:
-    lower = (table or "").lower()
-    score = asset_entry_score(type("CatalogTable", (), {"key": table, "title": table, "aliases": [], "description": "", "metadata": {}})(), extract_question_terms(question))
-    if "detail" in lower or lower.startswith("dwm_") or lower.startswith("dwd_"):
-        score += 3
-    return score
+    return asset_entry_score(
+        type(
+            "CatalogTable",
+            (),
+            {"key": table, "title": table, "aliases": [], "description": "", "metadata": {}},
+        )(),
+        extract_question_terms(question),
+    )
 
 
 def prompt_metric_entries(asset_pack: PlanningAssetPack, question: str, limit: int) -> List[Any]:
@@ -5601,9 +6238,11 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
     ranking_parent_table = scope_context.leaf_table if scope_context else ""
     anchor_role = TaskRole.DEPENDENT if scope_context else TaskRole.ANCHOR
     anchor_task_id = (
-        "%s_lookup" % (semantic_domain_for_metric(ranking_metric) or semantic_domain_for_table(ranking_metric.table))
+        "%s_lookup"
+        % (semantic_domain_for_metric(ranking_metric, asset_pack) or semantic_domain_for_table(ranking_metric.table, asset_pack))
         if scope_context
-        else "anchor_%s" % (semantic_domain_for_metric(ranking_metric) or semantic_domain_for_table(ranking_metric.table))
+        else "anchor_%s"
+        % (semantic_domain_for_metric(ranking_metric, asset_pack) or semantic_domain_for_table(ranking_metric.table, asset_pack))
     )
     anchor = compiled_metric_intent(
         question=question,
@@ -5715,7 +6354,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
                             parent_table_for_metric,
                             metric.table,
                             analysis_grain=grain,
-                            preferred_keys=relationship_preferred_keys_for_grain(grain),
+                            preferred_keys=relationship_preferred_keys_for_grain(grain, asset_pack),
                         )
                     )
                 )
@@ -5748,10 +6387,10 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
             intent = compiled_metric_intent(
                 question=question,
                 metric=metric,
-                task_id="%s_%s_context" % (semantic_domain_for_metric(metric), metric.key),
+                task_id="%s_%s_context" % (semantic_domain_for_metric(metric, asset_pack), metric.key),
                 role=TaskRole.ANCHOR,
                 mode=AnswerMode.GROUP_AGG,
-                grain="day" if group_by == "pt" else grain,
+                grain=semantic_fast_path_grain("", group_by, asset_pack, metric.table) or grain,
                 group_by=group_by,
                 depends_on=[],
                 limit=20,
@@ -5776,7 +6415,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
             intent = compiled_metric_intent(
                 question=question,
                 metric=metric,
-                task_id="%s_%s_lookup" % (semantic_domain_for_metric(metric), metric.key),
+                task_id="%s_%s_lookup" % (semantic_domain_for_metric(metric, asset_pack), metric.key),
                 role=TaskRole.DEPENDENT,
                 mode=AnswerMode.GROUP_AGG,
                 grain=grain,
@@ -5808,16 +6447,16 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
             parent_table,
             metric.table,
             analysis_grain=grain,
-            preferred_keys=relationship_preferred_keys_for_grain(grain),
+            preferred_keys=relationship_preferred_keys_for_grain(grain, asset_pack),
         )
         path = [edge.relationship for edge in path_edges]
         if not path and parent_table != metric.table:
             group_by = independent_requested_group_by(measure, understanding, metric, asset_pack, grain, ranking)
-            independent_grain = "day" if group_by == "pt" else grain
+            independent_grain = semantic_fast_path_grain("", group_by, asset_pack, metric.table) or grain
             intent = compiled_metric_intent(
                 question=question,
                 metric=metric,
-                task_id="%s_%s_context" % (semantic_domain_for_metric(metric), metric.key),
+                task_id="%s_%s_context" % (semantic_domain_for_metric(metric, asset_pack), metric.key),
                 role=TaskRole.ANCHOR,
                 mode=AnswerMode.GROUP_AGG,
                 grain=independent_grain,
@@ -5858,7 +6497,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
                 intent = compiled_metric_intent(
                     question=question,
                     metric=metric,
-                    task_id="%s_lookup" % semantic_domain_for_table(next_table),
+                    task_id="%s_lookup" % semantic_domain_for_table(next_table, asset_pack),
                     role=TaskRole.DEPENDENT,
                     mode=AnswerMode.GROUP_AGG,
                     grain=grain,
@@ -5886,7 +6525,7 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
                         intent = compiled_metric_intent(
                             question=question,
                             metric=metric,
-                            task_id="%s_lookup" % semantic_domain_for_table(next_table),
+                            task_id="%s_lookup" % semantic_domain_for_table(next_table, asset_pack),
                             role=TaskRole.DEPENDENT,
                             mode=AnswerMode.GROUP_AGG,
                             grain=grain,
@@ -5913,9 +6552,6 @@ def compile_query_graph_from_understanding(question: str, understanding: Dict[st
             parent_task = dependent_task
         if metric.table not in task_by_table:
             unplanned_measure_refs.append("UNPLANNED_REQUESTED_MEASURE:%s:%s:no_target_node" % (metric_ref, metric.table))
-    structured_domains = requested_semantic_domains_from_understanding(understanding, asset_pack)
-    if grain == "product" or "goods" in structured_domains:
-        add_product_dimension_lookup(question, intents, dependencies, task_by_table, index, asset_pack)
     compiled = sync_intent_dependencies(
         QueryPlan(
             intents=intents,
@@ -5986,7 +6622,7 @@ def requested_measure_graph_contract(
     grain: str,
     asset_pack: PlanningAssetPack,
 ) -> GraphMetricContract:
-    if requested_measure_is_merchant_baseline(metric, ranking, anchor):
+    if requested_measure_is_independent_baseline(metric, ranking, anchor):
         graph_role = GRAPH_ROLE_SIBLING_METRIC
     elif scope_context:
         graph_role = GRAPH_ROLE_DEPENDENT_METRIC
@@ -6010,14 +6646,11 @@ def requested_measure_graph_contract(
     )
 
 
-def requested_measure_is_merchant_baseline(metric: Any, ranking: Dict[str, Any], anchor: QuestionIntent) -> bool:
-    metric_table = str(getattr(metric, "table", "") or "")
-    if semantic_domain_for_table(metric_table) not in {"profile", "merchant"}:
-        return False
-    root_group = anchor.group_by_column or str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "")
-    if root_group and root_group not in {"seller_id", "merchant_id", "pt"}:
-        return True
-    return False
+def requested_measure_is_independent_baseline(metric: Any, ranking: Dict[str, Any], anchor: QuestionIntent) -> bool:
+    metadata = getattr(metric, "metadata", {}) or {}
+    semantic_role = str(metadata.get("semanticRole") or metadata.get("semantic_role") or "").strip().lower()
+    graph_role = str(metadata.get("graphRole") or metadata.get("graph_role") or "").strip().lower()
+    return semantic_role in {"baseline", "comparison_baseline", "context"} or graph_role == "sibling_metric"
 
 
 def primary_metric_produces_filter_set(ranking: Dict[str, Any], anchor: QuestionIntent, grain: str) -> bool:
@@ -6025,7 +6658,7 @@ def primary_metric_produces_filter_set(ranking: Dict[str, Any], anchor: Question
     if objective in {"metric_total", "total", "metric", "trend_anchor", "trend", "time_series"}:
         return False
     if objective == "detail_anchor":
-        return bool(anchor.filter_column or anchor.group_by_column not in {"", "seller_id", "merchant_id", "pt"})
+        return bool(anchor.filter_column or anchor.group_by_column)
     order = str(ranking.get("order") or "").lower()
     try:
         limit = int(ranking.get("limit") or 0)
@@ -6037,16 +6670,13 @@ def primary_metric_produces_filter_set(ranking: Dict[str, Any], anchor: Question
     group_by = anchor.group_by_column or str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "")
     if not group_by:
         return False
-    if group_by in {"seller_id", "merchant_id"}:
-        return False
-    return group_by in set(anchor.output_keys + anchor.required_evidence + [anchor.group_by_column, anchor.filter_column, "pt"]) or grain in {
-        "product",
-        "order",
-        "day",
-        "ticket",
-        "refund",
-        "coupon",
-    }
+    if "producesFilterSet" in ranking or "produces_filter_set" in ranking:
+        return boolish(ranking.get("producesFilterSet", ranking.get("produces_filter_set")))
+    return group_by in set(
+        anchor.output_keys
+        + anchor.required_evidence
+        + [anchor.group_by_column, anchor.filter_column]
+    )
 
 
 def requested_measure_group_by_for_contract(
@@ -6185,13 +6815,16 @@ def add_scope_event_ratio_compute(
     dependencies = list(plan.dependencies)
     compiler_trace = list(plan.compiler_trace)
     index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
-    group_by = denominator.group_by_column or "seller_id"
+    group_by = denominator.group_by_column
     if group_by not in asset_pack.known_columns(numerator_metric.table):
         group_by = shared_scope_ratio_group_key(denominator, numerator_metric, asset_pack)
     if not group_by:
         return plan
     if not numerator:
-        task_id = unique_task_id("%s_%s_ratio_numerator" % (semantic_domain_for_metric(numerator_metric), numerator_metric.key), [intent.plan_task_id for intent in intents])
+        task_id = unique_task_id(
+            "%s_%s_ratio_numerator" % (semantic_domain_for_metric(numerator_metric, asset_pack), numerator_metric.key),
+            [intent.plan_task_id for intent in intents],
+        )
         numerator_resolution = (
             numerator_metric_resolution
             if numerator_metric_resolution and numerator_metric_resolution.metric
@@ -6204,13 +6837,14 @@ def add_scope_event_ratio_compute(
                 field_warning=semantic_metric_field_warning(numerator_metric),
             )
         )
+        numerator_grain = semantic_fast_path_grain("", group_by, asset_pack, numerator_metric.table)
         numerator = compiled_metric_intent(
             question=question,
             metric=numerator_metric,
             task_id=task_id,
             role=TaskRole.DEPENDENT,
             mode=AnswerMode.GROUP_AGG,
-            grain="merchant" if group_by in {"seller_id", "merchant_id"} else "",
+            grain=numerator_grain,
             group_by=group_by,
             depends_on=[parent.plan_task_id],
             limit=max(200, denominator.limit or infer_limit(question)),
@@ -6228,7 +6862,7 @@ def add_scope_event_ratio_compute(
             parent_table=parent.preferred_table,
             metric_intent=numerator,
             metric_table=numerator_metric.table,
-            grain="order",
+            grain=numerator_grain,
             asset_pack=asset_pack,
             index=index,
             compiler_trace=compiler_trace,
@@ -6495,20 +7129,32 @@ def event_count_metric_for_table(table: str, asset_pack: PlanningAssetPack) -> A
     canonical = [metric for metric in candidates if str((metric.metadata or {}).get("canonicalMetricKey") or (metric.metadata or {}).get("canonical_metric_key") or "") == metric.key]
     if canonical:
         return canonical[0]
-    return sorted(candidates, key=lambda metric: (0 if "cnt" in metric.key.lower() else 1, metric.key))[0]
+    return sorted(
+        candidates,
+        key=lambda metric: (
+            -int((metric.metadata or {}).get("selectionPriority") or 0),
+            metric.key,
+        ),
+    )[0]
 
 
 def metric_is_count_metric(metric: Any) -> bool:
     formula = metric_formula_for_entry(metric).lower()
     if "count(" in formula or "count distinct" in formula:
         return True
-    key = str(getattr(metric, "key", "") or "").lower()
-    return key.endswith("_cnt") or key.endswith("_count")
+    metadata = getattr(metric, "metadata", {}) or {}
+    semantic_role = str(metadata.get("semanticRole") or metadata.get("semantic_role") or "").strip().lower()
+    return semantic_role in {"count", "distinct_count"} or declared_metric_aggregation(metric) in {
+        "count",
+        "count_distinct",
+        "distinct_count",
+        "countdistinct",
+    }
 
 
 def shared_scope_ratio_group_key(denominator: QuestionIntent, numerator_metric: Any, asset_pack: PlanningAssetPack) -> str:
     numerator_columns = set(asset_pack.known_columns(numerator_metric.table))
-    for candidate in [denominator.group_by_column, *denominator.output_keys, *denominator.required_evidence, "seller_id", "merchant_id"]:
+    for candidate in [denominator.group_by_column, *denominator.output_keys, *denominator.required_evidence]:
         if candidate and candidate in numerator_columns:
             return candidate
     return ""
@@ -6693,11 +7339,11 @@ def compiled_projection_group_aggregate_intent(
     bridge_columns = set(asset_pack.known_columns(bridge.preferred_table))
     if requested_group not in bridge_columns or root.group_by_column not in bridge_columns:
         return None
-    carry_columns = [
-        column
-        for column in ["seller_id", "merchant_id", requested_group, "spu_name", "order_id", "sub_order_id"]
-        if column in bridge_columns
-    ]
+    carry_columns = generic_output_keys(bridge, bridge_columns, asset_pack)
+    carry_columns = dedupe_strings(
+        [column for column in [requested_group, root.group_by_column] if column in bridge_columns]
+        + carry_columns
+    )
     metric_name = root.metric_name or root.metric_column or "metric_value"
     task_id = unique_task_id("projected_%s_by_%s" % (metric_name, requested_group), [intent.plan_task_id for intent in plan.intents])
     knowledge_refs = dedupe_knowledge_refs(list(root.knowledge_refs) + list(bridge.knowledge_refs))
@@ -6747,10 +7393,6 @@ def dependency_uses_group_key(dep: PlanDependency, group_key: str) -> bool:
         return False
     tokens = split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)
     if group_key in tokens:
-        return True
-    if group_key == "spu_id" and "spu_name" in tokens:
-        return True
-    if group_key == "spu_name" and "spu_id" in tokens:
         return True
     return False
 
@@ -6861,7 +7503,7 @@ class MetricDAGCompiler:
                 compiler_trace.append("DERIVED_COMPONENT_REUSE:%s:%s" % (metric.key, existing.plan_task_id))
                 continue
             component_task_id = unique_task_id(
-                "component_%s_%s" % (semantic_domain_for_metric(component), component.key),
+                "component_%s_%s" % (semantic_domain_for_metric(component, self.asset_pack), component.key),
                 existing_task_ids,
             )
             component_resolution = SemanticMetricResolution(
@@ -6930,7 +7572,7 @@ class MetricDAGCompiler:
         derived_intent = QuestionIntent(
             question=question,
             intent_type=IntentType.VALID,
-            category=category_for_metric(metric, metric.table),
+            category=category_for_metric(metric, metric.table, self.asset_pack),
             answer_mode=AnswerMode.DERIVED,
             plan_task_id=derived_task_id,
             task_role=TaskRole.DEPENDENT,
@@ -6997,7 +7639,7 @@ class MetricDAGCompiler:
             parent_table,
             component_table,
             analysis_grain=grain,
-            preferred_keys=relationship_preferred_keys_for_grain(grain),
+            preferred_keys=relationship_preferred_keys_for_grain(grain, self.asset_pack),
         )
         if not path_edges:
             compiler_trace.append("DERIVED_REQUESTED_COMPONENT_NO_RELATIONSHIP:%s->%s" % (parent_table, component_table))
@@ -7116,14 +7758,23 @@ def append_requested_measures_to_existing_plan(
             elif len(intents) == before:
                 compiler_trace.append("REQUESTED_DERIVED_MEASURE_UNPLANNED:%s:%s" % (metric.table, metric.key))
             continue
-        group_by = requested_group_by or grain_column_for_table(grain, set(asset_pack.known_columns(metric.table)))
-        if detail_parent and detail_parent.plan_task_id and not requested_measure_is_merchant_baseline(metric, ranking, detail_parent):
+        group_by = requested_group_by or grain_column_for_table(
+            grain,
+            set(asset_pack.known_columns(metric.table)),
+            asset_pack,
+            metric.table,
+        )
+        if detail_parent and detail_parent.plan_task_id and not requested_measure_is_independent_baseline(
+            metric,
+            ranking,
+            detail_parent,
+        ):
             can_depend = detail_parent.preferred_table == metric.table or bool(
                 index.relationship_edge_path(
                     detail_parent.preferred_table,
                     metric.table,
                     analysis_grain=grain,
-                    preferred_keys=relationship_preferred_keys_for_grain(grain),
+                    preferred_keys=relationship_preferred_keys_for_grain(grain, asset_pack),
                 )
             )
             if can_depend:
@@ -7131,7 +7782,7 @@ def append_requested_measures_to_existing_plan(
                 intent = compiled_metric_intent(
                     question=question,
                     metric=metric,
-                    task_id="%s_%s_lookup" % (semantic_domain_for_metric(metric), metric.key),
+                    task_id="%s_%s_lookup" % (semantic_domain_for_metric(metric, asset_pack), metric.key),
                     role=TaskRole.DEPENDENT,
                     mode=AnswerMode.GROUP_AGG,
                     grain=grain,
@@ -7165,7 +7816,7 @@ def append_requested_measures_to_existing_plan(
         intent = compiled_metric_intent(
             question=question,
             metric=metric,
-            task_id="%s_%s_context" % (semantic_domain_for_metric(metric), metric.key),
+            task_id="%s_%s_context" % (semantic_domain_for_metric(metric, asset_pack), metric.key),
             role=TaskRole.ANCHOR,
             mode=AnswerMode.GROUP_AGG,
             grain=grain,
@@ -7230,13 +7881,13 @@ def dependent_metric_group_by_from_parent(parent: QuestionIntent, metric_table: 
     metric_columns = set(asset_pack.known_columns(metric_table))
     if parent.preferred_table == metric_table:
         for column in [parent.filter_column, parent.group_by_column, *parent.output_keys]:
-            if column and column in metric_columns and column not in {"seller_id", "merchant_id", "pt"}:
+            if column and column in metric_columns and not column_is_context_only(column, metric_table, asset_pack):
                 return column
         return ""
     rel = find_relationship(asset_pack, "", parent.preferred_table, metric_table)
     _, dependent_column, join_key = relationship_columns(rel, parent.preferred_table, metric_table)
     for token in split_join_tokens(dependent_column or join_key):
-        if token and token in metric_columns and token not in {"seller_id", "merchant_id"}:
+        if token and token in metric_columns and not column_is_context_only(token, metric_table, asset_pack):
             return token
     return ""
 
@@ -7301,7 +7952,7 @@ def compile_derived_metric_graph_from_understanding(
         )
         role = TaskRole.ANCHOR
         depends_on: List[str] = []
-        task_id = "component_%s_%s" % (semantic_domain_for_metric(component), component.key)
+        task_id = "component_%s_%s" % (semantic_domain_for_metric(component, asset_pack), component.key)
         task_id = unique_task_id(task_id, existing_task_ids)
         parent_task = scope_context.leaf_task_id if scope_context else ""
         parent_table = scope_context.leaf_table if scope_context else ""
@@ -7325,7 +7976,7 @@ def compile_derived_metric_graph_from_understanding(
                     parent_table,
                     component.table,
                     analysis_grain=grain,
-                    preferred_keys=relationship_preferred_keys_for_grain(grain),
+                    preferred_keys=relationship_preferred_keys_for_grain(grain, asset_pack),
                 )
                 if not path_edges:
                     compiler_trace.append("DERIVED_COMPONENT_NO_RELATIONSHIP:%s->%s" % (parent_table, component.table))
@@ -7401,7 +8052,7 @@ def compile_derived_metric_graph_from_understanding(
     derived_intent = QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_metric(ranking_metric, ranking_metric.table),
+        category=category_for_metric(ranking_metric, ranking_metric.table, asset_pack),
         answer_mode=AnswerMode.DERIVED,
         plan_task_id=derived_task_id,
         task_role=TaskRole.DEPENDENT,
@@ -7460,7 +8111,7 @@ def compile_derived_metric_graph_from_understanding(
 
 
 def compile_entity_detail_graph_from_understanding(question: str, understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> QueryPlan:
-    filter_column, filter_value = detail_filter_from_understanding(question, understanding)
+    filter_column, filter_value = detail_filter_from_understanding(question, understanding, asset_pack)
     if not filter_column or not filter_value:
         return QueryPlan(
             agent_trace=["planner.understanding_compile.missing_detail_filter"],
@@ -7476,14 +8127,26 @@ def compile_entity_detail_graph_from_understanding(question: str, understanding:
         )
     columns = set(asset_pack.known_columns(anchor_table))
     index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
-    output_keys = generic_output_keys(QuestionIntent(filter_column=filter_column), columns)
-    required = dedupe_strings(output_keys + domain_evidence_columns(semantic_domain_for_table(anchor_table), columns))
+    output_keys = generic_output_keys(
+        QuestionIntent(filter_column=filter_column, preferred_table=anchor_table),
+        columns,
+        asset_pack,
+    )
+    required = dedupe_strings(
+        output_keys
+        + domain_evidence_columns(
+            semantic_domain_for_table(anchor_table, asset_pack),
+            columns,
+            asset_pack,
+            anchor_table,
+        )
+    )
     anchor = QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(anchor_table),
+        category=category_for_table(anchor_table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
-        plan_task_id="anchor_%s" % semantic_domain_for_table(anchor_table),
+        plan_task_id="anchor_%s" % semantic_domain_for_table(anchor_table, asset_pack),
         task_role=TaskRole.ANCHOR,
         preferred_table=anchor_table,
         filter_column=filter_column,
@@ -7529,13 +8192,13 @@ def compile_entity_detail_graph_from_question_entity(question: str, asset_pack: 
         for metric in semantic_fast_path_explicit_metrics(question, asset_pack)
     ]
     understanding = {
-        "analysisGrain": semantic_grain_for_filter_column(filter_column),
+        "analysisGrain": semantic_grain_for_filter_column(filter_column, asset_pack),
         "analysisIntent": "none",
         "requiresExplanation": False,
         # Explicit entity questions still need the full semantic relationship
         # closure. Preserve every directly named metric and field so the same
-        # finalizer used by LLM understanding adds refund/goods/etc. branches
-        # instead of returning only the anchor table.
+        # finalizer used by LLM understanding adds every asset-bound evidence
+        # branch instead of returning only the anchor table.
         "requiredEvidenceIntents": semantic_fast_path_required_evidence(question, asset_pack),
         "rankingObjective": {},
         "requestedMeasures": requested_measures,
@@ -7558,29 +8221,7 @@ def compile_entity_detail_graph_from_question_entity(question: str, asset_pack: 
 
 def entity_filter_from_question(question: str, asset_pack: PlanningAssetPack) -> Tuple[str, str]:
     text = question or ""
-    priority = [
-        "sub_order_id",
-        "order_id",
-        "refund_id",
-        "ticket_id",
-        "bill_id",
-        "spu_id",
-        "sku_id",
-        "coupon_id",
-    ]
-    known = {column for table in asset_pack.known_tables() for column in asset_pack.known_columns(table)}
-    candidates = [column for column in priority if column in known]
-    candidates.extend(
-        sorted(
-            {
-                column
-                for column in known
-                if column.endswith("_id") and column not in {"seller_id", "merchant_id", "buyer_id"} and column not in candidates
-            },
-            key=len,
-            reverse=True,
-        )
-    )
+    candidates = entity_filter_candidate_columns(asset_pack)
     for column in candidates:
         match = re.search(r"\b%s_[A-Za-z0-9_]+\b" % re.escape(column), text, re.I)
         if match:
@@ -7588,41 +8229,36 @@ def entity_filter_from_question(question: str, asset_pack: PlanningAssetPack) ->
     return "", ""
 
 
+def entity_filter_candidate_columns(asset_pack: PlanningAssetPack) -> List[str]:
+    scored: List[Tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for entry in asset_pack.entity_keys:
+        column = str(entry.key or "")
+        if not column or column in seen:
+            continue
+        metadata = entry.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        if boolish(metadata.get("contextOnly", semantic.get("contextOnly"))):
+            continue
+        role = str(semantic.get("role") or metadata.get("semanticRole") or "").strip().upper()
+        if role in {"PARTITION", "TENANT_CONTEXT", "CONTEXT", "TIME"}:
+            continue
+        priority = int(metadata.get("filterPriority") or metadata.get("filter_priority") or 0)
+        scored.append((priority, len(column), column))
+        seen.add(column)
+    scored.sort(reverse=True)
+    return [column for _, _, column in scored]
+
+
 def explicit_object_refs_from_question(question: str, asset_pack: PlanningAssetPack) -> List[Tuple[str, str]]:
     text = question or ""
-    known = {column for table in asset_pack.known_tables() for column in asset_pack.known_columns(table)}
-    priority = [
-        "sub_order_id",
-        "order_id",
-        "refund_id",
-        "ticket_id",
-        "bill_id",
-        "spu_id",
-        "sku_id",
-        "coupon_id",
-    ]
-    candidates = [column for column in priority if column in known]
-    candidates.extend(
-        sorted(
-            {
-                column
-                for column in known
-                if column.endswith("_id")
-                and column not in {"seller_id", "merchant_id", "buyer_id"}
-                and column not in candidates
-            },
-            key=len,
-            reverse=True,
-        )
-    )
+    candidates = entity_filter_candidate_columns(asset_pack)
     refs: List[Tuple[str, str]] = []
     seen: set[Tuple[str, str]] = set()
     for column in candidates:
         pattern = re.compile(r"\b%s[_:=：-]*[A-Za-z0-9_-]+\b" % re.escape(column), re.IGNORECASE)
         for match in pattern.finditer(text):
             value = match.group(0).strip(":=：-")
-            if column == "order_id" and value.lower().startswith("sub_order_id"):
-                continue
             key = (column, normalize_entity_filter_value(value))
             if key in seen:
                 continue
@@ -7675,18 +8311,14 @@ def explicit_object_ref_filter_gaps(question: str, plan: QueryPlan, asset_pack: 
     return gaps
 
 
-def semantic_grain_for_filter_column(column: str) -> str:
-    if column in {"order_id", "sub_order_id"}:
-        return "order"
-    if column in {"spu_id", "sku_id"}:
-        return "product"
-    if column in {"refund_id"}:
-        return "refund"
-    if column in {"ticket_id"}:
-        return "ticket"
-    if column in {"coupon_id"}:
-        return "coupon"
-    return "unknown"
+def semantic_grain_for_filter_column(column: str, asset_pack: PlanningAssetPack | None = None) -> str:
+    if not asset_pack or not column:
+        return "unknown"
+    matches = [entry for entry in asset_pack.entity_keys if entry.key == column]
+    declared = [declared_grain_for_entry(entry) for entry in matches if declared_grain_for_entry(entry)]
+    if len(set(declared)) == 1:
+        return declared[0]
+    return column if len(matches) == 1 else "unknown"
 
 
 def compile_semantic_entity_chain_graph(question: str, asset_pack: PlanningAssetPack) -> QueryPlan:
@@ -7700,21 +8332,24 @@ def compile_semantic_entity_chain_graph(question: str, asset_pack: PlanningAsset
 
     if not asset_pack.relationships or len(asset_pack.known_tables()) < 2:
         return QueryPlan(agent_trace=["planner.semantic_entity_chain_fallback.skipped"])
-    root_table = semantic_entity_chain_anchor_table(asset_pack)
+    root_table = semantic_entity_chain_anchor_table(asset_pack, question)
     if not root_table:
         return QueryPlan(agent_trace=["planner.semantic_entity_chain_fallback.no_anchor"])
     columns = set(asset_pack.known_columns(root_table))
     if not columns:
         return QueryPlan(agent_trace=["planner.semantic_entity_chain_fallback.no_anchor_schema"])
-    domain = semantic_domain_for_table(root_table)
-    output_keys = dedupe_strings(generic_output_keys(QuestionIntent(), columns) + domain_evidence_columns(domain, columns))
+    domain = semantic_domain_for_table(root_table, asset_pack)
+    output_keys = dedupe_strings(
+        generic_output_keys(QuestionIntent(preferred_table=root_table), columns, asset_pack)
+        + domain_evidence_columns(domain, columns, asset_pack, root_table)
+    )
     if not output_keys:
         return QueryPlan(agent_trace=["planner.semantic_entity_chain_fallback.no_anchor_keys"])
     index = SemanticLayerIndex(question, RecallBundle(), asset_pack)
     anchor = QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(root_table),
+        category=category_for_table(root_table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
         plan_task_id="anchor_%s" % (domain or "entity"),
         task_role=TaskRole.ANCHOR,
@@ -7732,7 +8367,7 @@ def compile_semantic_entity_chain_graph(question: str, asset_pack: PlanningAsset
     plan = QueryPlan(
         intents=[anchor],
         question_understanding={
-            "analysisGrain": semantic_grain_for_domain(domain),
+            "analysisGrain": semantic_grain_for_domain(domain, asset_pack),
             "analysisIntent": "none",
             "rankingObjective": {},
             "requestedMeasures": [],
@@ -7761,7 +8396,7 @@ def compile_semantic_metric_fallback_graph(
 
     The fallback is bounded by semantic metric resolution. It is intentionally
     narrower than normal planning: one high-confidence metric, one owner table,
-    merchant grain, and the same QuestionUnderstandingCompiler path.
+    one asset-declared grain, and the same QuestionUnderstandingCompiler path.
     """
 
     resolver = SemanticMetricResolver(asset_pack)
@@ -7777,10 +8412,23 @@ def compile_semantic_metric_fallback_graph(
     columns = set(asset_pack.known_columns(metric.table))
     if not columns:
         return QueryPlan(agent_trace=["planner.semantic_metric_fallback.no_schema"], compiler_trace=["SEMANTIC_METRIC_FALLBACK_NO_SCHEMA:%s" % metric.table])
-    group_by = "merchant_id" if "merchant_id" in columns else "seller_id" if "seller_id" in columns else ""
+    metric_metadata = getattr(metric, "metadata", {}) or {}
+    table_entry = planning_table_entry(asset_pack, metric.table)
+    table_metadata = table_entry.metadata if table_entry else {}
+    group_by = ""
+    for key in [
+        "groupByColumn",
+        "group_by_column",
+        "defaultGroupByColumn",
+        "default_group_by_column",
+    ]:
+        candidate = str(metric_metadata.get(key) or table_metadata.get(key) or "")
+        if candidate in columns:
+            group_by = candidate
+            break
     source_phrase = resolution.source_phrase or semantic_fast_path_metric_phrase(metric, question)
     understanding = {
-        "analysisGrain": "merchant" if group_by else "unknown",
+        "analysisGrain": semantic_fast_path_grain("", group_by, asset_pack, metric.table) if group_by else "unknown",
         "analysisIntent": "none",
         "requiresExplanation": False,
         "requiredEvidenceIntents": [],
@@ -7928,25 +8576,43 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
     text = normalize_text(question)
     if not any(term in text for term in ["最高", "最低", "最多", "最少", "前", "top"]):
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_not_ranking"])
-    if any(term in text for term in ["明细", "详情", "记录", "order_id_", "sub_order_id_", "refund_id_", "ticket_id_"]):
+    if any(term in text for term in ["明细", "详情", "记录"]) or entity_filter_from_question(question, asset_pack)[0]:
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_detail"])
     explicit_metrics = semantic_fast_path_explicit_metrics(question, asset_pack)
     if not explicit_metrics:
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_no_explicit_metric"])
-    ranking_metric = semantic_fast_path_ranking_metric(question, explicit_metrics)
+    ranking_metric = semantic_fast_path_ranking_metric(question, explicit_metrics, asset_pack)
     if not ranking_metric:
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_no_ranking_metric"])
     group_by = semantic_fast_path_group_by(question, ranking_metric, asset_pack)
     if not group_by:
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_no_group_by"])
+    requested_metrics = semantic_fast_path_requested_metrics(
+        question,
+        explicit_metrics,
+        ranking_metric,
+        group_by,
+        asset_pack,
+    )
     requested = [
         {
             "metricRef": metric.key,
             "ownerTable": metric.table,
             "sourcePhrase": semantic_fast_path_metric_phrase(metric, question),
+            "groupByColumn": grain_column_for_table(
+                semantic_fast_path_grain(question, group_by, asset_pack, ranking_metric.table),
+                set(asset_pack.known_columns(metric.table)),
+                asset_pack,
+                metric.table,
+            )
+            or group_by,
+            "resolvedMetricRef": metric.key,
+            "resolvedOwnerTable": metric.table,
+            "semanticRefId": str(getattr(metric, "source_ref_id", "") or ""),
+            "metricResolutionSource": "semantic_metric_ref",
+            "metricGovernanceMode": "published_semantic" if published_semantic_metric_ref(metric) else "compiled_local",
         }
-        for metric in explicit_metrics
-        if metric.table != ranking_metric.table or metric.key != ranking_metric.key
+        for metric in requested_metrics
     ]
     requires_explanation = any(term in text for term in ["风险", "异常", "判断", "分析"])
     required_evidence = semantic_fast_path_required_evidence(question, asset_pack)
@@ -7960,14 +8626,14 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
                 "suggestedDomains": list(
                     dict.fromkeys(
                         domain
-                        for domain in [semantic_domain_for_table(metric.table) for metric in explicit_metrics]
+                        for domain in [semantic_domain_for_table(metric.table, asset_pack) for metric in explicit_metrics]
                         if domain and domain != "unknown"
                     )
                 ),
             }
         )
     understanding = {
-        "analysisGrain": semantic_fast_path_grain(question, group_by),
+        "analysisGrain": semantic_fast_path_grain(question, group_by, asset_pack, ranking_metric.table),
         "analysisIntent": "risk_ranking" if any(term in text for term in ["风险", "异常", "判断"]) else "none",
         "requiresExplanation": requires_explanation,
         "requiredEvidenceIntents": required_evidence,
@@ -7975,6 +8641,11 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
             "metricRef": ranking_metric.key,
             "sourcePhrase": semantic_fast_path_metric_phrase(ranking_metric, question),
             "ownerTable": ranking_metric.table,
+            "resolvedMetricRef": ranking_metric.key,
+            "resolvedOwnerTable": ranking_metric.table,
+            "semanticRefId": str(getattr(ranking_metric, "source_ref_id", "") or ""),
+            "metricResolutionSource": "semantic_metric_ref",
+            "metricGovernanceMode": "published_semantic" if published_semantic_metric_ref(ranking_metric) else "compiled_local",
             "objectiveType": "topn_metric",
             "groupByColumn": group_by,
             "order": "asc" if any(term in text for term in ["最低", "最少"]) else "desc",
@@ -8027,7 +8698,11 @@ def semantic_fast_path_can_bypass_configured_llm(
         features.metric_count > 1
         and not plan.dependencies
         and plan.intents
-        and all(intent.group_by_column == "pt" for intent in plan.intents)
+        and asset_pack is not None
+        and all(
+            intent.group_by_column == time_column_for_table(asset_pack, intent.preferred_table)
+            for intent in plan.intents
+        )
     )
     if features.intent_kind == "detail_lookup":
         capability_id = "semantic_detail_fast"
@@ -8085,17 +8760,258 @@ def query_plan_question_coverage_gaps(
     plan: QueryPlan,
     asset_pack: PlanningAssetPack,
 ) -> List[GraphValidationGap]:
-    """Validate only explicit coverage contracts that survive planning.
+    """Validate explicit object filters and the frozen requested-metric set.
 
-    The selector/planner owns semantic interpretation. This guard should not
-    reinterpret the raw question by scanning every field alias in the asset
-    pack, because field aliases can conflict with formal metric refs and
-    incorrectly reject a valid QueryGraph. Required field evidence is still
-    checked through questionUnderstanding.requiredEvidenceIntents by
-    QueryGraphContractValidator.
+    Metric completeness is checked only against metric phrases captured during
+    understanding and their recalled semantic bindings.  It deliberately does
+    not rescan every alias in the asset pack, which would turn this validator
+    into a second, unconstrained semantic parser.
     """
 
-    return dedupe_graph_validation_gaps(explicit_object_ref_filter_gaps(question, plan, asset_pack))
+    gaps = explicit_object_ref_filter_gaps(question, plan, asset_pack)
+    gaps.extend(requested_metric_question_coverage_gaps(plan, asset_pack))
+    understanding = plan.question_understanding or {}
+    has_structured_metric_contract = bool(
+        requested_metric_items_from_understanding(understanding, include_ranking=True)
+    )
+    if str(understanding.get("source") or "") != "semantic_asset_selection" and not has_structured_metric_contract:
+        gaps.extend(question_domain_coverage_gaps(question, plan, asset_pack))
+    return dedupe_graph_validation_gaps(gaps)
+
+
+def question_domain_coverage_gaps(
+    question: str,
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+) -> List[GraphValidationGap]:
+    requested = explicit_question_semantic_domains(question, asset_pack)
+    if not requested:
+        return []
+    covered = query_plan_covered_semantic_domains(plan, asset_pack)
+    return [
+        GraphValidationGap(
+            code="QUESTION_DOMAIN_NOT_COVERED",
+            evidence=domain,
+            reason="原始问题明确要求 %s 业务证据，但 QueryGraph 没有对应语义域节点" % domain,
+        )
+        for domain in requested
+        if domain not in covered
+    ]
+
+
+def explicit_question_semantic_domains(question: str, asset_pack: PlanningAssetPack) -> List[str]:
+    normalized_question = normalize_metric_match_text(question)
+    if not normalized_question:
+        return []
+    domains: List[str] = []
+    for entry in [*asset_pack.metrics, *asset_pack.fields, *asset_pack.terms, *asset_pack.tables]:
+        labels = semantic_entry_match_labels(entry)
+        if not any(
+            semantic_asset_label_matches_question(label, normalized_question)
+            for label in labels
+        ):
+            continue
+        domain = semantic_domain_for_entry(entry, asset_pack)
+        if domain not in {"", "unknown"} and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def semantic_entry_match_labels(entry: PlanningAssetEntry) -> List[str]:
+    metadata = entry.metadata or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    return dedupe_strings(
+        [
+            str(entry.key or ""),
+            str(entry.title or ""),
+            *[str(alias) for alias in entry.aliases or []],
+            str(metadata.get("displayName") or ""),
+            str(metadata.get("businessName") or ""),
+            str(metadata.get("naturalName") or ""),
+            *[str(alias) for alias in metadata.get("aliases") or []],
+            str(semantic.get("businessName") or ""),
+            *[str(alias) for alias in semantic.get("aliases") or []],
+        ]
+    )
+
+
+def semantic_asset_label_matches_question(label: str, normalized_question: str) -> bool:
+    normalized_label = normalize_metric_match_text(label)
+    if explicit_metric_label_text_match(normalized_label, normalized_question):
+        return True
+
+    label_cjk = "".join(re.findall(r"[\u4e00-\u9fff]+", normalized_label))
+    question_cjk = "".join(re.findall(r"[\u4e00-\u9fff]+", normalized_question))
+    if len(label_cjk) >= 2 and len(question_cjk) >= 2:
+        overlap = longest_shared_text_span(label_cjk, question_cjk, max_size=8)
+        prefix_requested = label_cjk[:2] in question_cjk
+        if overlap >= 4 or prefix_requested or (overlap >= 2 and overlap * 5 >= len(label_cjk) * 3):
+            return True
+
+    question_tokens = set(re.findall(r"[a-z][a-z0-9]*", normalized_question))
+    label_tokens = re.findall(r"[a-z][a-z0-9]*", str(label or "").lower())
+    return any(len(token) >= 4 and token in question_tokens for token in label_tokens)
+
+
+def longest_shared_text_span(left: str, right: str, max_size: int = 8) -> int:
+    upper = min(max_size, len(left), len(right))
+    for size in range(upper, 1, -1):
+        if any(left[index : index + size] in right for index in range(len(left) - size + 1)):
+            return size
+    return 0
+
+
+def requested_metric_question_coverage_gaps(
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+) -> List[GraphValidationGap]:
+    understanding = plan.question_understanding or {}
+    phrases = original_requested_metric_phrases(understanding, asset_pack)
+    structured_items = requested_metric_items_from_understanding(understanding, include_ranking=True)
+    planned_refs = planned_metric_refs(plan)
+    gaps: List[GraphValidationGap] = []
+    phrase_norms = {normalize_metric_phrase(phrase) for phrase in phrases if normalize_metric_phrase(phrase)}
+
+    for phrase in phrases:
+        candidates = recalled_metric_identities_for_phrase(phrase, asset_pack)
+        for item in structured_items:
+            source_phrase = str(item.get("sourcePhrase") or item.get("source_phrase") or "")
+            if metric_phrases_equivalent(phrase, source_phrase):
+                identity = requested_metric_identity(item)
+                if identity != ("", "") and identity not in candidates:
+                    candidates.append(identity)
+        if candidates:
+            if any(planned_metric_identity_covered(owner_table, metric_ref, planned_refs) for owner_table, metric_ref in candidates):
+                continue
+        elif planned_metric_source_phrase_covered(phrase, plan):
+            continue
+        gaps.append(
+            GraphValidationGap(
+                code="QUESTION_METRIC_NOT_COVERED",
+                evidence=phrase,
+                reason="原始问题中的指标“%s”没有对应的 QueryGraph 指标节点或合并 metricSpec" % phrase,
+            )
+        )
+
+    # Structured metric selections remain a coverage contract even when the
+    # fast-understanding payload is unavailable (for example a repaired plan).
+    for item in structured_items:
+        source_phrase = str(item.get("sourcePhrase") or item.get("source_phrase") or "").strip()
+        if source_phrase and normalize_metric_phrase(source_phrase) in phrase_norms:
+            continue
+        owner_table, metric_ref = requested_metric_identity(item)
+        if not metric_ref or planned_metric_identity_covered(owner_table, metric_ref, planned_refs):
+            continue
+        gaps.append(
+            GraphValidationGap(
+                code="QUESTION_METRIC_NOT_COVERED",
+                evidence=source_phrase or metric_ref,
+                reason="questionUnderstanding 选择的指标 %s.%s 没有进入 QueryGraph" % (owner_table or "*", metric_ref),
+            )
+        )
+    return gaps
+
+
+def original_requested_metric_phrases(
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> List[str]:
+    fast = (asset_pack.metric_compaction or {}).get("fastUnderstanding") or (asset_pack.metric_compaction or {}).get("fast_understanding") or {}
+    values: List[Any] = []
+    for source in [fast, understanding if isinstance(understanding, dict) else {}]:
+        for key in ["metricPhrases", "metric_phrases", "originalMetricPhrases", "original_metric_phrases"]:
+            raw = source.get(key) if isinstance(source, dict) else []
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, list):
+                values.extend(raw)
+    phrases: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        phrase = str(value or "").strip()
+        normalized = normalize_metric_phrase(phrase)
+        if not phrase or not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        phrases.append(phrase)
+    return phrases
+
+
+def recalled_metric_identities_for_phrase(
+    phrase: str,
+    asset_pack: PlanningAssetPack,
+) -> List[Tuple[str, str]]:
+    identities: List[Tuple[str, str]] = []
+    for evidence in (asset_pack.metric_compaction or {}).get("recalledMetricEvidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        labels = [
+            evidence.get("matchedMetricLabel"),
+            evidence.get("matchedExactMetricLabel"),
+            evidence.get("sourcePhrase"),
+        ]
+        if not any(metric_phrases_equivalent(phrase, str(label or "")) for label in labels):
+            continue
+        identity = (
+            str(evidence.get("ownerTable") or evidence.get("owner_table") or ""),
+            str(evidence.get("metricKey") or evidence.get("metric_key") or ""),
+        )
+        if identity[1] and identity not in identities:
+            identities.append(identity)
+    return identities
+
+
+def requested_metric_identity(item: Dict[str, Any]) -> Tuple[str, str]:
+    return (
+        str(
+            item.get("resolvedOwnerTable")
+            or item.get("resolved_owner_table")
+            or item.get("ownerTable")
+            or item.get("owner_table")
+            or ""
+        ),
+        str(
+            item.get("resolvedMetricRef")
+            or item.get("resolved_metric_ref")
+            or item.get("metricRef")
+            or item.get("metric_ref")
+            or ""
+        ),
+    )
+
+
+def planned_metric_identity_covered(owner_table: str, metric_ref: str, planned_refs: set[Any]) -> bool:
+    if not metric_ref:
+        return False
+    if owner_table:
+        return (owner_table, metric_ref) in planned_refs
+    return metric_ref in planned_refs
+
+
+def metric_phrases_equivalent(left: str, right: str) -> bool:
+    left_normalized = normalize_metric_phrase(left)
+    right_normalized = normalize_metric_phrase(right)
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized == right_normalized:
+        return True
+    shorter, longer = sorted([left_normalized, right_normalized], key=len)
+    return bool(
+        len(shorter) >= 3
+        and shorter in longer
+        and len(longer) <= max(len(shorter) + 6, len(shorter) * 2)
+    )
+
+
+def planned_metric_source_phrase_covered(phrase: str, plan: QueryPlan) -> bool:
+    for intent in plan.intents:
+        if intent.intent_type != IntentType.VALID or intent.answer_mode == AnswerMode.RULE:
+            continue
+        resolution = intent.metric_resolution or {}
+        source_phrase = str(resolution.get("sourcePhrase") or resolution.get("source_phrase") or "")
+        if metric_phrases_equivalent(phrase, source_phrase) and (intent.metric_name or intent.metric_column or intent.metric_specs):
+            return True
+    return False
 
 
 def query_plan_covered_semantic_domains(plan: QueryPlan, asset_pack: PlanningAssetPack) -> set[str]:
@@ -8103,12 +9019,31 @@ def query_plan_covered_semantic_domains(plan: QueryPlan, asset_pack: PlanningAss
     for intent in plan.intents:
         if intent.intent_type != IntentType.VALID or intent.answer_mode == AnswerMode.RULE:
             continue
-        table_domain = semantic_domain_for_table(intent.preferred_table)
+        table_domain = semantic_domain_for_table(intent.preferred_table, asset_pack)
         if table_domain and table_domain != "unknown":
             covered.add(table_domain)
         metric_domain = metric_domain_for_intent(intent, asset_pack)
         if metric_domain:
             covered.add(metric_domain)
+        for spec in intent.metric_specs or []:
+            if not isinstance(spec, dict):
+                continue
+            owner_table = str(spec.get("ownerTable") or spec.get("owner_table") or intent.preferred_table or "")
+            owner_domain = semantic_domain_for_table(owner_table, asset_pack)
+            if owner_domain not in {"", "unknown"}:
+                covered.add(owner_domain)
+                continue
+            metric_ref = str(
+                spec.get("metricRef")
+                or spec.get("metric_ref")
+                or spec.get("metricName")
+                or spec.get("metric_name")
+                or ""
+            )
+            metric = metric_entry_by_identity(asset_pack, owner_table, metric_ref)
+            metric_domain = semantic_domain_for_metric(metric, asset_pack)
+            if metric_domain not in {"", "unknown"}:
+                covered.add(metric_domain)
     return covered
 
 
@@ -8166,10 +9101,82 @@ def semantic_fast_path_explicit_metrics(question: str, asset_pack: PlanningAsset
         if not any(item.table == metric.table and item.key == metric.key for item in matched):
             matched.append(metric)
     matched.sort(key=lambda metric: semantic_fast_path_metric_score(metric, question), reverse=True)
-    return matched[:6]
+    return matched[:12]
 
 
-def semantic_fast_path_ranking_metric(question: str, metrics: List[Any]) -> Any:
+def semantic_fast_path_requested_metrics(
+    question: str,
+    metrics: List[Any],
+    ranking_metric: Any,
+    group_by: str,
+    asset_pack: PlanningAssetPack,
+) -> List[Any]:
+    grouped: Dict[str, List[Any]] = {}
+    ranking_identity = (str(getattr(ranking_metric, "table", "") or ""), str(getattr(ranking_metric, "key", "") or ""))
+    for metric in metrics:
+        identity = (str(getattr(metric, "table", "") or ""), str(getattr(metric, "key", "") or ""))
+        if identity == ranking_identity:
+            continue
+        phrase = semantic_fast_path_metric_phrase(metric, question)
+        key = normalize_metric_match_text(phrase)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(metric)
+    selected: List[Any] = []
+    seen: set[Tuple[str, str]] = set()
+    for candidates in grouped.values():
+        ranked = sorted(
+            candidates,
+            key=lambda metric: (
+                semantic_fast_path_requested_metric_support_score(metric, ranking_metric, group_by, asset_pack),
+                semantic_fast_path_metric_score(metric, question),
+                len(semantic_fast_path_metric_phrase(metric, question)),
+            ),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+        metric = ranked[0]
+        identity = (str(getattr(metric, "table", "") or ""), str(getattr(metric, "key", "") or ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        selected.append(metric)
+    return selected
+
+
+def semantic_fast_path_requested_metric_support_score(
+    metric: Any,
+    ranking_metric: Any,
+    group_by: str,
+    asset_pack: PlanningAssetPack,
+) -> int:
+    table = str(getattr(metric, "table", "") or "")
+    ranking_table = str(getattr(ranking_metric, "table", "") or "")
+    columns = set(asset_pack.known_columns(table))
+    score = 0
+    grain = semantic_fast_path_grain("", group_by, asset_pack, ranking_table)
+    if group_by and group_by in columns:
+        score += 120
+    elif grain and grain_column_for_table(grain, columns, asset_pack, table):
+        score += 90
+    elif group_by:
+        score -= 160
+    if table == ranking_table:
+        score += 50
+    elif grain:
+        index = SemanticLayerIndex("", RecallBundle(), asset_pack)
+        if index.relationship_edge_path(
+            ranking_table,
+            table,
+            analysis_grain=grain,
+            preferred_keys=relationship_preferred_keys_for_grain(grain, asset_pack),
+        ):
+            score += 45
+    return score
+
+
+def semantic_fast_path_ranking_metric(question: str, metrics: List[Any], asset_pack: PlanningAssetPack | None = None) -> Any:
     text = normalize_text(question)
     ranking_window = text
     for marker in ["最高", "最低", "最多", "最少"]:
@@ -8177,9 +9184,12 @@ def semantic_fast_path_ranking_metric(question: str, metrics: List[Any]) -> Any:
         if idx > 0:
             ranking_window = text[max(0, idx - 18) : idx + len(marker) + 8]
             break
+    ranking_positions = semantic_ranking_signal_positions(question)
     ranked = sorted(
         metrics,
         key=lambda metric: (
+            semantic_ranking_phrase_proximity_score(metric, question, ranking_positions),
+            semantic_fast_path_group_by_support_score(question, metric, asset_pack),
             semantic_fast_path_metric_score(metric, ranking_window),
             semantic_fast_path_metric_score(metric, question),
             1 if derived_metric_requires_explicit_request(metric) else 0,
@@ -8187,6 +9197,56 @@ def semantic_fast_path_ranking_metric(question: str, metrics: List[Any]) -> Any:
         reverse=True,
     )
     return ranked[0] if ranked and semantic_fast_path_metric_score(ranked[0], ranking_window) > 0 else None
+
+
+def semantic_ranking_signal_positions(question: str) -> List[int]:
+    text = normalize_metric_match_text(question)
+    positions: List[int] = []
+    for pattern in [r"前\d+", r"top\d*", r"最高", r"最低", r"最多", r"最少"]:
+        positions.extend(match.start() for match in re.finditer(pattern, text))
+    return sorted(set(positions))
+
+
+def semantic_metric_label_spans(metric: Any, question: str) -> List[Tuple[int, int, str]]:
+    text = normalize_metric_match_text(question)
+    spans: List[Tuple[int, int, str]] = []
+    for label in metric_label_texts(metric):
+        normalized = normalize_metric_match_text(label)
+        if not normalized:
+            continue
+        start = text.find(normalized)
+        while start >= 0:
+            spans.append((start, start + len(normalized), str(label)))
+            start = text.find(normalized, start + 1)
+    return spans
+
+
+def semantic_ranking_phrase_proximity_score(metric: Any, question: str, ranking_positions: List[int]) -> int:
+    spans = semantic_metric_label_spans(metric, question)
+    if not spans:
+        return 0
+    longest = max((end - start for start, end, _ in spans), default=0)
+    if not ranking_positions:
+        return longest
+    best_distance = min(
+        min(abs(pos - start), abs(pos - end))
+        for start, end, _ in spans
+        for pos in ranking_positions
+    )
+    return max(0, 120 - best_distance) + longest
+
+
+def semantic_fast_path_group_by_support_score(question: str, metric: Any, asset_pack: PlanningAssetPack | None) -> int:
+    if asset_pack is None:
+        return 0
+    group_by = semantic_fast_path_group_by(question, metric, asset_pack)
+    if not group_by:
+        return -1000
+    requested = semantic_fast_path_requested_grains(question, asset_pack)
+    if requested:
+        grain = semantic_fast_path_grain(question, group_by, asset_pack, str(getattr(metric, "table", "") or ""))
+        return 60 if grain in requested else -200
+    return 20
 
 
 def semantic_fast_path_metric_score(metric: Any, question: str) -> int:
@@ -8214,34 +9274,89 @@ def semantic_fast_path_metric_phrase(metric: Any, question: str) -> str:
     return str(getattr(metric, "title", "") or key or question[:80])
 
 
+def semantic_fast_path_requested_grains(
+    question: str,
+    asset_pack: PlanningAssetPack | None = None,
+) -> List[str]:
+    if not asset_pack:
+        return []
+    normalized_question = normalize_metric_match_text(question)
+    grains: List[str] = []
+    for entry in [*asset_pack.entity_keys, *asset_pack.fields]:
+        if not any(
+            explicit_metric_label_text_match(normalize_metric_match_text(label), normalized_question)
+            for label in semantic_entry_labels(entry)
+        ):
+            continue
+        grain = declared_grain_for_entry(entry) or entry.key
+        if grain and grain not in grains:
+            grains.append(grain)
+    return grains
+
+
 def semantic_fast_path_group_by(question: str, ranking_metric: Any, asset_pack: PlanningAssetPack) -> str:
-    text = normalize_text(question)
-    columns = set(asset_pack.known_columns(ranking_metric.table))
-    if any(term in text for term in ["商品", "spu"]):
-        for column in ["spu_id", "sku_id", "goods_id"]:
-            if column in columns:
-                return column
-    if any(term in text for term in ["天", "日", "趋势", "走势"]) and "pt" in columns:
-        return "pt"
-    if "seller_id" in columns:
-        return "seller_id"
-    if "merchant_id" in columns:
-        return "merchant_id"
+    table = str(getattr(ranking_metric, "table", "") or "")
+    columns = set(asset_pack.known_columns(table))
+    normalized_question = normalize_metric_match_text(question)
+    matched: List[Tuple[int, str]] = []
+    for entry in [*asset_pack.entity_keys, *asset_pack.fields]:
+        if entry.table != table or entry.key not in columns:
+            continue
+        labels = semantic_entry_labels(entry)
+        score = max(
+            [
+                len(normalize_metric_match_text(label))
+                for label in labels
+                if explicit_metric_label_text_match(normalize_metric_match_text(label), normalized_question)
+            ]
+            or [0]
+        )
+        if score:
+            matched.append((score, entry.key))
+    if matched:
+        matched.sort(reverse=True)
+        return matched[0][1]
+
+    metric_metadata = getattr(ranking_metric, "metadata", {}) or {}
+    table_entry = planning_table_entry(asset_pack, table)
+    table_metadata = table_entry.metadata if table_entry else {}
+    for key in ["groupByColumn", "group_by_column", "defaultGroupByColumn", "default_group_by_column"]:
+        candidate = str(metric_metadata.get(key) or table_metadata.get(key) or "")
+        if candidate in columns:
+            return candidate
     return ""
 
 
-def semantic_fast_path_grain(question: str, group_by: str) -> str:
-    if group_by in {"spu_id", "sku_id", "goods_id"}:
-        return "product"
-    if group_by == "pt":
-        return "day"
-    return "merchant"
+def semantic_fast_path_grain(
+    question: str,
+    group_by: str,
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> str:
+    if not group_by:
+        return ""
+    if asset_pack:
+        entries = [
+            entry
+            for entry in [*asset_pack.entity_keys, *asset_pack.fields]
+            if entry.key == group_by and (not table or entry.table == table)
+        ]
+        for entry in entries:
+            declared = declared_grain_for_entry(entry)
+            if declared:
+                return declared
+        table_entry = planning_table_entry(asset_pack, table)
+        table_metadata = table_entry.metadata if table_entry else {}
+        time_column = str(table_metadata.get("timeColumn") or table_metadata.get("time_column") or "")
+        if time_column and group_by == time_column:
+            return str(table_metadata.get("timeGrain") or table_metadata.get("time_grain") or "time")
+    return group_by
 
 
 def semantic_fast_path_required_evidence(question: str, asset_pack: PlanningAssetPack) -> List[Dict[str, Any]]:
     intents: List[Dict[str, Any]] = []
     for field, matched_label in semantic_field_evidence_candidates(asset_pack, question, {"requiredEvidenceIntents": []}):
-        domain = semantic_domain_for_table(field.table)
+        domain = semantic_domain_for_table(field.table, asset_pack)
         intents.append(
             {
                 "semanticLabel": field.title or field.key,
@@ -8314,17 +9429,19 @@ def compile_semantic_multi_metric_trend_fallback_graph(question: str, asset_pack
         candidate
         for candidate in SemanticMetricIndex(asset_pack.metrics).candidates("", "", question)
         if candidate.phrase_score >= SemanticMetricIndex.PHRASE_OVERRIDE_MIN_SCORE
-        and "pt" in asset_pack.known_columns(candidate.metric.table)
+        and time_column_for_metric(candidate.metric, asset_pack)
         and not metric_is_unrequested_derived(candidate.metric, question)
     ]
     if len(candidates) < 2:
         return QueryPlan(agent_trace=["planner.semantic_trend_fallback.insufficient_metrics"])
-    selected = select_trend_fallback_metrics(candidates)
+    selected = select_trend_fallback_metrics(candidates, asset_pack=asset_pack)
     if len(selected) < 2:
         return QueryPlan(agent_trace=["planner.semantic_trend_fallback.insufficient_selected_metrics"])
     first = selected[0].metric
+    time_column = time_column_for_metric(first, asset_pack)
+    time_grain = semantic_fast_path_grain("", time_column, asset_pack, first.table) or "time"
     understanding = {
-        "analysisGrain": "day",
+        "analysisGrain": time_grain,
         "analysisIntent": "trend_check",
         "requiresExplanation": True,
         "requiredEvidenceIntents": [
@@ -8333,7 +9450,7 @@ def compile_semantic_multi_metric_trend_fallback_graph(question: str, asset_pack
                 "reason": "semantic metric fallback compiled multiple time-series metrics after planner LLM failure",
                 "requiredLevel": "required",
                 "suggestedMetricRefs": [item.metric.key for item in selected],
-                "suggestedDomains": [semantic_domain_for_table(item.metric.table) for item in selected],
+                "suggestedDomains": [semantic_domain_for_table(item.metric.table, asset_pack) for item in selected],
             }
         ],
         "rankingObjective": {
@@ -8341,7 +9458,7 @@ def compile_semantic_multi_metric_trend_fallback_graph(question: str, asset_pack
             "ownerTable": first.table,
             "sourcePhrase": selected[0].source_phrase or question,
             "objectiveType": "trend_anchor",
-            "groupByColumn": "pt",
+            "groupByColumn": time_column,
             "order": "desc",
             "limit": 30,
         },
@@ -8373,32 +9490,30 @@ def semantic_trend_fallback_safe(question: str) -> bool:
 
 
 def metric_is_unrequested_derived(metric: Any, question: str) -> bool:
-    formula = str(metric_formula_for_entry(metric) or "").lower()
-    key = str(getattr(metric, "key", "") or "").lower()
-    title = str(getattr(metric, "title", "") or "").lower()
-    text = normalize_text(question)
-    derived = "/" in formula or "-" in formula or any(token in key + title for token in ["rate", "ratio", "率", "扣", "净"])
-    if not derived:
-        return False
-    return not any(term in text for term in ["率", "占比", "比例", "扣", "净", "after"])
+    return derived_metric_requires_explicit_request(metric) and not metric_explicitly_mentioned_in_question(metric, question)
 
 
-def select_trend_fallback_metrics(candidates: List[Any], limit: int = 4) -> List[Any]:
+def select_trend_fallback_metrics(
+    candidates: List[Any],
+    limit: int = 4,
+    asset_pack: PlanningAssetPack | None = None,
+) -> List[Any]:
     table_counts: Dict[str, int] = {}
     for item in candidates:
         table_counts[item.metric.table] = table_counts.get(item.metric.table, 0) + 1
-    preferred_table = max(table_counts, key=lambda table: (table_counts[table], "profile" in table))
+    table_order = {item.metric.table: index for index, item in enumerate(candidates)}
+    preferred_table = max(table_counts, key=lambda table: (table_counts[table], -table_order[table]))
     # Prefer a table that covers several requested metrics, then backfill from
     # other owner tables. Previously the preferred-table-only pool could
     # collapse to one item after metric-family deduplication (for example
-    # refund amount + refund count) and silently drop an explicitly requested
-    # order metric from another table.
+    # two distinct measures) and silently drop an explicitly requested metric
+    # from another table.
     pool = [item for item in candidates if item.metric.table == preferred_table]
     pool.extend(item for item in candidates if item.metric.table != preferred_table)
     selected: List[Any] = []
     seen_metric_families: set[str] = set()
     for item in pool:
-        family = trend_metric_family(item.metric)
+        family = trend_metric_family(item.metric, asset_pack)
         if family in seen_metric_families:
             continue
         selected.append(item)
@@ -8408,19 +9523,149 @@ def select_trend_fallback_metrics(candidates: List[Any], limit: int = 4) -> List
     return selected
 
 
-def trend_metric_family(metric: Any) -> str:
-    text = normalize_text("%s %s" % (getattr(metric, "key", ""), getattr(metric, "title", "")))
-    if "refund" in text or "退款" in text or "退货" in text:
-        return "refund"
-    if "gmv" in text or "成交" in text:
-        return "gmv"
-    if "order" in text or "订单" in text:
-        return "order"
-    if "ticket" in text or "工单" in text:
-        return "ticket"
-    if "repay" in text or "赔付" in text:
-        return "repay"
-    return text[:24]
+def trend_metric_family(metric: Any, asset_pack: PlanningAssetPack | None = None) -> str:
+    metadata = getattr(metric, "metadata", {}) or {}
+    for key in [
+        "metricFamily",
+        "metric_family",
+        "familyKey",
+        "family_key",
+        "canonicalMetricKey",
+        "canonical_metric_key",
+    ]:
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return "%s:%s" % (str(getattr(metric, "table", "") or ""), value)
+
+    related = temporal_metric_family_component(metric, asset_pack)
+    if related:
+        explicit_families = sorted(
+            {
+                str((getattr(item, "metadata", {}) or {}).get(key) or "").strip()
+                for item in related
+                for key in [
+                    "metricFamily",
+                    "metric_family",
+                    "familyKey",
+                    "family_key",
+                    "canonicalMetricKey",
+                    "canonical_metric_key",
+                ]
+                if str((getattr(item, "metadata", {}) or {}).get(key) or "").strip()
+            }
+        )
+        family_key = explicit_families[0] if explicit_families else sorted(
+            str(getattr(item, "key", "") or getattr(item, "source_ref_id", "") or "metric")
+            for item in related
+        )[0]
+        return "%s:%s" % (str(getattr(metric, "table", "") or ""), family_key)
+
+    linked_variant = str(metadata.get("linkedVariantOf") or metadata.get("linked_variant_of") or "").strip()
+    if linked_variant:
+        return "%s:%s" % (
+            str(getattr(metric, "table", "") or ""),
+            canonical_metric_reference(linked_variant),
+        )
+    return "%s:%s" % (
+        str(getattr(metric, "table", "") or ""),
+        str(getattr(metric, "key", "") or getattr(metric, "source_ref_id", "") or "metric"),
+    )
+
+
+def temporal_metric_family_component(
+    metric: Any,
+    asset_pack: PlanningAssetPack | None,
+) -> List[Any]:
+    if not asset_pack:
+        return []
+    metrics = list(asset_pack.metrics or [])
+    identity = (str(getattr(metric, "table", "") or ""), str(getattr(metric, "key", "") or ""))
+    start = next(
+        (
+            item
+            for item in metrics
+            if (str(getattr(item, "table", "") or ""), str(getattr(item, "key", "") or "")) == identity
+        ),
+        metric,
+    )
+    component: List[Any] = []
+    pending = [start]
+    seen: set[Tuple[str, str]] = set()
+    while pending:
+        current = pending.pop()
+        current_identity = (
+            str(getattr(current, "table", "") or ""),
+            str(getattr(current, "key", "") or ""),
+        )
+        if current_identity in seen:
+            continue
+        seen.add(current_identity)
+        component.append(current)
+        for candidate in metrics:
+            candidate_identity = (
+                str(getattr(candidate, "table", "") or ""),
+                str(getattr(candidate, "key", "") or ""),
+            )
+            if candidate_identity in seen:
+                continue
+            if temporal_metrics_are_linked(current, candidate):
+                pending.append(candidate)
+    return component if len(component) > 1 else []
+
+
+def temporal_metrics_are_linked(left: Any, right: Any) -> bool:
+    left_refs = temporal_metric_references(left)
+    right_refs = temporal_metric_references(right)
+    return metric_reference_targets(left, right, left_refs) or metric_reference_targets(right, left, right_refs)
+
+
+def temporal_metric_references(metric: Any) -> set[str]:
+    metadata = getattr(metric, "metadata", {}) or {}
+    references: set[str] = set()
+    for key in ["linkedVariantOf", "linked_variant_of"]:
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            references.add(value)
+
+    variants = metadata.get("temporalVariants") or metadata.get("temporal_variants") or {}
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            if value.strip():
+                references.add(value.strip())
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for child in value:
+                visit(child)
+
+    visit(variants)
+    return references
+
+
+def metric_reference_targets(source: Any, target: Any, references: set[str]) -> bool:
+    if not references:
+        return False
+    source_table = str(getattr(source, "table", "") or "")
+    target_table = str(getattr(target, "table", "") or "")
+    target_key = str(getattr(target, "key", "") or "")
+    target_ref = str(getattr(target, "source_ref_id", "") or "")
+    for reference in references:
+        if target_ref and reference == target_ref:
+            return True
+        if source_table == target_table and canonical_metric_reference(reference) == target_key:
+            return True
+    return False
+
+
+def canonical_metric_reference(reference: Any) -> str:
+    value = str(reference or "").strip()
+    if ":metric:" in value:
+        return value.rsplit(":metric:", 1)[-1]
+    return value
 
 
 def semantic_metric_fallback_safe(question: str, asset_pack: PlanningAssetPack, metric: Any) -> bool:
@@ -8434,7 +9679,7 @@ def semantic_metric_fallback_safe(question: str, asset_pack: PlanningAssetPack, 
     if len(semantic_metric_fallback_metric_phrases(question, asset_pack)) > 1:
         return False
     text = normalize_text(question)
-    if re.search(r"(order_id|sub_order_id|spu_id|sku_id|refund_id|ticket_id|bill_id)_[a-z0-9_]+", text):
+    if entity_filter_from_question(question, asset_pack)[0]:
         return False
     if any(term in text for term in ["明细", "详情", "关联", "对应", "状态", "列表", "记录"]):
         return False
@@ -8458,27 +9703,39 @@ def semantic_metric_fallback_metric_phrases(question: str, asset_pack: PlanningA
     return dedupe_strings([label for label in labels if label])
 
 
-def semantic_entity_chain_anchor_table(asset_pack: PlanningAssetPack) -> str:
-    domains = {semantic_domain_for_table(table): table for table in asset_pack.known_tables()}
-    for domain in ["refund", "order", "ticket", "repay", "coupon", "scm", "goods"]:
-        table = domains.get(domain)
-        if table:
-            return table
-    return asset_pack.known_tables()[0] if asset_pack.known_tables() else ""
+def semantic_entity_chain_anchor_table(asset_pack: PlanningAssetPack, question: str = "") -> str:
+    explicit_refs = explicit_object_refs_from_question(question, asset_pack) if question else []
+    for column, _ in explicit_refs:
+        owners = dedupe_strings([entry.table for entry in asset_pack.entity_keys if entry.key == column and entry.table])
+        if len(owners) == 1:
+            return owners[0]
+
+    ranked: List[Tuple[int, int, str]] = []
+    relationship_degree: Dict[str, int] = {}
+    for rel in asset_pack.relationships:
+        relationship_degree[rel.left_table] = relationship_degree.get(rel.left_table, 0) + 1
+        relationship_degree[rel.right_table] = relationship_degree.get(rel.right_table, 0) + 1
+    for index, entry in enumerate(asset_pack.tables):
+        table = str(entry.table or entry.key or "")
+        if not table:
+            continue
+        metadata = entry.metadata or {}
+        priority = int(metadata.get("anchorPriority") or metadata.get("anchor_priority") or 0)
+        match_score = asset_entry_score(entry, extract_question_terms(question)) if question else 0
+        ranked.append((priority * 1000 + match_score * 10 + relationship_degree.get(table, 0), -index, table))
+    return max(ranked)[2] if ranked else ""
 
 
-def semantic_grain_for_domain(domain: str) -> str:
-    mapping = {
-        "merchant": "merchant",
-        "refund": "order",
-        "order": "order",
-        "ticket": "order",
-        "repay": "order",
-        "coupon": "coupon",
-        "scm": "product",
-        "goods": "product",
-    }
-    return mapping.get(domain, "order")
+def semantic_grain_for_domain(domain: str, asset_pack: PlanningAssetPack | None = None) -> str:
+    if asset_pack:
+        grains = [
+            declared_grain_for_entry(entry)
+            for entry in asset_pack.tables
+            if semantic_domain_for_entry(entry, asset_pack) == domain and declared_grain_for_entry(entry)
+        ]
+        if len(set(grains)) == 1:
+            return grains[0]
+    return domain or "unknown"
 
 
 def scope_constraints_from_understanding(understanding: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -8557,7 +9814,9 @@ def compile_scope_context(
         root = root.model_copy(
             update={
                 "plan_task_id": unique_task_id(
-                    root.plan_task_id if not current_task else "%s_scope" % (semantic_domain_for_table(source_table) or "entity"),
+                    root.plan_task_id
+                    if not current_task
+                    else "%s_scope" % (semantic_domain_for_table(source_table, asset_pack) or "entity"),
                     [item.plan_task_id for item in intents],
                 ),
                 "task_role": TaskRole.ANCHOR if not current_task else TaskRole.DEPENDENT,
@@ -8587,7 +9846,7 @@ def compile_scope_context(
                 current_table,
                 source_table,
                 analysis_grain=scope.get("entityGrain", ""),
-                preferred_keys=relationship_preferred_keys_for_grain(scope.get("entityGrain", "")),
+                preferred_keys=relationship_preferred_keys_for_grain(scope.get("entityGrain", ""), asset_pack),
             )
             if not path_edges:
                 trace.append("SCOPE_CHAIN_UNREACHABLE:%s->%s" % (current_table, source_table))
@@ -8621,7 +9880,14 @@ def compile_scope_context(
                 if not bridge:
                     trace.append("SCOPE_CHAIN_BRIDGE_UNAVAILABLE:%s" % next_table)
                     break
-                bridge = bridge.model_copy(update={"plan_task_id": unique_task_id("%s_scope" % (semantic_domain_for_table(next_table) or "entity"), [item.plan_task_id for item in intents])})
+                bridge = bridge.model_copy(
+                    update={
+                        "plan_task_id": unique_task_id(
+                            "%s_scope" % (semantic_domain_for_table(next_table, asset_pack) or "entity"),
+                            [item.plan_task_id for item in intents],
+                        )
+                    }
+                )
                 intents.append(bridge)
                 dep = dependency_from_relationship(current_task, bridge.plan_task_id, current_table, next_table, edge.relationship)
                 add_dependency_if_valid(dependencies, dep)
@@ -8636,7 +9902,7 @@ def compile_scope_context(
                 source_table,
                 target_table,
                 analysis_grain=scope.get("entityGrain", ""),
-                preferred_keys=relationship_preferred_keys_for_grain(scope.get("entityGrain", "")),
+                preferred_keys=relationship_preferred_keys_for_grain(scope.get("entityGrain", ""), asset_pack),
             )
             if not path_edges:
                 trace.append("SCOPE_TARGET_UNREACHABLE:%s->%s" % (source_table, target_table))
@@ -8647,7 +9913,7 @@ def compile_scope_context(
                 if not bridge:
                     trace.append("SCOPE_BRIDGE_UNAVAILABLE:%s" % next_table)
                     break
-                task_base = "%s_scope" % (semantic_domain_for_table(next_table) or "entity")
+                task_base = "%s_scope" % (semantic_domain_for_table(next_table, asset_pack) or "entity")
                 bridge = bridge.model_copy(update={"plan_task_id": unique_task_id(task_base, [item.plan_task_id for item in intents])})
                 intents.append(bridge)
                 dep = dependency_from_relationship(current_task, bridge.plan_task_id, current_table, next_table, edge.relationship)
@@ -8677,14 +9943,14 @@ def normalize_scope_source_for_compilation(
 
     For population scopes the LLM should set ownerTable to the source business
     object that defines the population. In practice it may put the target
-    population table there (for example order table) and use targetDomain to
-    name the source domain (for example coupon). When that scope duplicates the
+    population table there and use targetDomain to name the source domain.
+    When that scope duplicates the
     metric obligation, treating it as same-table scope would silently drop the
     real population filter. Use semantic table domains to swap source/target.
     """
 
     owner_table = str(scope.get("ownerTable") or "")
-    owner_domain = semantic_domain_for_table(owner_table)
+    owner_domain = semantic_domain_for_table(owner_table, asset_pack)
     hinted_domain = normalize_semantic_domain(str(scope.get("targetDomain") or ""))
     if not owner_table or not owner_domain or not hinted_domain or hinted_domain == owner_domain:
         return scope, []
@@ -8723,15 +9989,15 @@ def compiled_scope_anchor_intent(
     columns = set(asset_pack.known_columns(table))
     if not columns:
         return None
-    output_keys = scope_output_keys(table, columns, scope.get("entityGrain", ""))
+    output_keys = scope_output_keys(table, columns, scope.get("entityGrain", ""), asset_pack)
     if not output_keys:
         return None
     refs = SemanticLayerIndex(question, RecallBundle(), asset_pack).knowledge_refs_for_table(table, output_keys, reason="scope constraint selected entity set")
-    domain = semantic_domain_for_table(table) or "scope"
+    domain = semantic_domain_for_table(table, asset_pack) or "scope"
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(table),
+        category=category_for_table(table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
         plan_task_id="anchor_%s_scope" % domain,
         task_role=TaskRole.ANCHOR,
@@ -8748,22 +10014,17 @@ def compiled_scope_anchor_intent(
     )
 
 
-def scope_output_keys(table: str, columns: set, entity_grain: str) -> List[str]:
-    domain = semantic_domain_for_table(table)
-    priority = ["seller_id", "merchant_id"]
-    priority.extend(
-        {
-            "coupon": ["coupon_id", "discount_rel_id", "discount_id"],
-            "order": ["sub_order_id", "order_id", "spu_id", "spu_name", "discount_rel_id", "discount_id"],
-            "refund": ["sub_order_id", "order_id", "refund_id", "spu_name", "discount_id", "discount_rel_id"],
-            "goods": ["spu_id", "spu_name"],
-            "product": ["spu_id", "spu_name"],
-            "ticket": ["ticket_id", "sub_order_id", "order_id"],
-            "repay": ["bill_id", "sub_order_id", "order_id"],
-        }.get(domain, [])
-    )
-    priority.extend(list(relationship_preferred_keys_for_grain(entity_grain)))
-    priority.append("pt")
+def scope_output_keys(
+    table: str,
+    columns: set,
+    entity_grain: str,
+    asset_pack: PlanningAssetPack,
+) -> List[str]:
+    priority = generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)
+    priority.extend(list(relationship_preferred_keys_for_grain(entity_grain, asset_pack)))
+    grain_column = grain_column_for_table(entity_grain, columns, asset_pack, table)
+    if grain_column:
+        priority.append(grain_column)
     return [column for column in dedupe_strings(priority) if column in columns]
 
 
@@ -8771,7 +10032,7 @@ def scope_target_table(source_table: str, scope: Dict[str, Any], asset_pack: Pla
     target_domain = normalize_semantic_domain(str(scope.get("targetDomain") or scope.get("entityGrain") or ""))
     if not target_domain or target_domain == "unknown":
         return source_table
-    if target_domain == semantic_domain_for_table(source_table):
+    if target_domain == semantic_domain_for_table(source_table, asset_pack):
         return source_table
     return best_table_for_domain(target_domain, asset_pack) or source_table
 
@@ -8892,7 +10153,7 @@ def attach_metric_dependency_from_parent(
         parent_table,
         metric_table,
         analysis_grain=grain,
-        preferred_keys=relationship_preferred_keys_for_grain(grain),
+        preferred_keys=relationship_preferred_keys_for_grain(grain, asset_pack),
     )
     if not path_edges:
         compiler_trace.append("SCOPE_METRIC_PATH_MISSING:%s->%s" % (parent_table, metric_table))
@@ -8909,7 +10170,14 @@ def attach_metric_dependency_from_parent(
         if not bridge:
             compiler_trace.append("SCOPE_METRIC_BRIDGE_UNAVAILABLE:%s" % next_table)
             return
-        bridge = bridge.model_copy(update={"plan_task_id": unique_task_id("%s_scope" % semantic_domain_for_table(next_table), [item.plan_task_id for item in intents])})
+        bridge = bridge.model_copy(
+            update={
+                "plan_task_id": unique_task_id(
+                    "%s_scope" % semantic_domain_for_table(next_table, asset_pack),
+                    [item.plan_task_id for item in intents],
+                )
+            }
+        )
         intents.append(bridge)
         dep = dependency_from_relationship(current_task, bridge.plan_task_id, current_table, next_table, edge.relationship)
         add_dependency_if_valid(dependencies, dep)
@@ -8929,7 +10197,11 @@ def same_table_dependency_from_parent(
     columns = set(asset_pack.known_columns(table))
     produced = set(parent.output_keys + parent.required_evidence)
     produced.update(column for column in [parent.group_by_column, parent.filter_column] if column)
-    for key in ["sub_order_id", "order_id", "spu_id", "spu_name", "coupon_id", "discount_rel_id", "discount_id", "refund_id", "ticket_id", "bill_id"]:
+    candidates = dedupe_strings(
+        relationship_columns_for_table(asset_pack, table)
+        + [entry.key for entry in asset_pack.entity_keys if entry.table == table and entry.key]
+    )
+    for key in candidates:
         if key in columns and key in produced:
             return PlanDependency(
                 anchor_task_id=parent.plan_task_id,
@@ -8942,7 +10214,11 @@ def same_table_dependency_from_parent(
     return None
 
 
-def detail_filter_from_understanding(question: str, understanding: Dict[str, Any]) -> Tuple[str, str]:
+def detail_filter_from_understanding(
+    question: str,
+    understanding: Dict[str, Any],
+    asset_pack: PlanningAssetPack,
+) -> Tuple[str, str]:
     filters = understanding.get("filters") or []
     if isinstance(filters, list):
         for item in filters:
@@ -8952,7 +10228,7 @@ def detail_filter_from_understanding(question: str, understanding: Dict[str, Any
             value = str(item.get("value") or "")
             if field and value:
                 return field, value
-    for column in ["sub_order_id", "order_id", "refund_id", "ticket_id", "bill_id", "coupon_id", "spu_id"]:
+    for column in entity_filter_candidate_columns(asset_pack):
         value = extract_entity_value(question, column)
         if value:
             return column, value
@@ -9179,13 +10455,7 @@ def phrase_requests_detail_evidence(normalized_phrase: str) -> bool:
         "列表",
         "详情",
         "信息",
-        "哪几单",
-        "哪些订单",
-        "订单详情",
-        "商品详情",
-        "工单详情",
-        "退款详情",
-        "赔付详情",
+        "哪些",
         "给我看",
         "看一下",
     ]
@@ -9193,9 +10463,23 @@ def phrase_requests_detail_evidence(normalized_phrase: str) -> bool:
 
 
 def table_is_detail_asset(entry: PlanningAssetEntry) -> bool:
-    table = str(entry.table or entry.key or "").lower()
-    text = normalize_semantic_text(" ".join(table_semantic_labels(entry)))
-    return "detail" in table or "detail" in text or "明细" in text or "流水" in text
+    metadata = entry.metadata or {}
+    if boolish(metadata.get("isDetail", metadata.get("is_detail"))):
+        return True
+    declared = " ".join(
+        str(metadata.get(key) or "")
+        for key in [
+            "semanticRole",
+            "semantic_role",
+            "tableKind",
+            "table_kind",
+            "assetRole",
+            "asset_role",
+            "dataGrain",
+            "data_grain",
+        ]
+    ).lower()
+    return "detail" in declared or "明细" in declared or "流水" in declared
 
 
 def table_semantic_labels(entry: PlanningAssetEntry) -> List[str]:
@@ -9257,14 +10541,17 @@ def detail_evidence_intent(
     columns = set(asset_pack.known_columns(table))
     if not columns:
         return None
-    output_keys = generic_output_keys(QuestionIntent(preferred_table=table), columns)[:18]
+    output_keys = generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)[:18]
     if not output_keys:
         output_keys = sorted(columns)[:12]
-    task_id = unique_task_id("%s_detail" % (semantic_domain_for_table(table) or "detail"), existing_task_ids)
+    task_id = unique_task_id(
+        "%s_detail" % (semantic_domain_for_table(table, asset_pack) or "detail"),
+        existing_task_ids,
+    )
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(table),
+        category=category_for_table(table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
         plan_task_id=task_id,
         task_role=TaskRole.ANCHOR,
@@ -9302,7 +10589,7 @@ def required_evidence_parent_intent(
             intent.preferred_table,
             target_table,
             analysis_grain="",
-            preferred_keys=relationship_preferred_keys_for_grain(""),
+            preferred_keys=relationship_preferred_keys_for_grain("", asset_pack),
         ):
             return intent
     return None
@@ -9319,13 +10606,18 @@ def required_evidence_lookup_intent(
     columns = set(asset_pack.known_columns(table))
     if field not in columns:
         return None
-    output_keys = dedupe_strings(generic_output_keys(QuestionIntent(preferred_table=table), columns) + [field])[:18]
+    output_keys = dedupe_strings(
+        generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack) + [field]
+    )[:18]
     required = dedupe_strings(output_keys + [field])[:18]
-    task_id = unique_task_id("%s_lookup" % semantic_domain_for_table(table), [intent.plan_task_id for intent in intents])
+    task_id = unique_task_id(
+        "%s_lookup" % semantic_domain_for_table(table, asset_pack),
+        [intent.plan_task_id for intent in intents],
+    )
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(table),
+        category=category_for_table(table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
         plan_task_id=task_id,
         task_role=TaskRole.DEPENDENT,
@@ -9349,20 +10641,21 @@ def required_evidence_lookup_days(
 ) -> int:
     table_entry = next((item for item in asset_pack.tables if item.table == table), None)
     metadata = table_entry.metadata if table_entry and isinstance(table_entry.metadata, dict) else {}
-    semantic_text = normalize_text(
-        " ".join(
-            [
-                str(metadata.get("dataGrain") or metadata.get("data_grain") or ""),
-                str(metadata.get("tableComment") or metadata.get("table_comment") or ""),
-                str(getattr(table_entry, "title", "") or ""),
-            ]
-        )
-    )
-    time_column = str(metadata.get("timeColumn") or metadata.get("time_column") or "pt")
+    semantic_role = str(
+        metadata.get("semanticRole")
+        or metadata.get("semantic_role")
+        or metadata.get("tableKind")
+        or metadata.get("table_kind")
+        or ""
+    ).strip().lower()
+    time_column = time_column_for_table(asset_pack, table)
     # A lifecycle attribute on a published full/snapshot entity table describes
     # the entity's history, not the fact query's relative window. Keep tenant
     # and relationship filters but do not hide an older attribute record.
-    if field and field != time_column and any(marker in semantic_text for marker in ["全量", "快照", "snapshot", "dimension"]):
+    if field and field != time_column and (
+        boolish(metadata.get("snapshot", metadata.get("isSnapshot")))
+        or semantic_role in {"snapshot", "dimension", "entity_snapshot"}
+    ):
         return 0
     return int(parent.days or 0)
 
@@ -9388,7 +10681,7 @@ def add_rule_evidence_branch(
     intent = QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=QuestionCategory.PLATFORM_RULE,
+        category=category_for_rule_evidence(asset_pack),
         answer_mode=AnswerMode.RULE,
         plan_task_id=task_id,
         task_role=TaskRole.ANCHOR,
@@ -9473,6 +10766,28 @@ def rule_evidence_knowledge_refs(asset_pack: PlanningAssetPack) -> List[Knowledg
             )
         )
     return refs[:8]
+
+
+def category_for_rule_evidence(asset_pack: PlanningAssetPack) -> QuestionCategory:
+    """Return an unambiguous category declared by the selected rule assets."""
+
+    candidates: List[QuestionCategory] = []
+    for entry in asset_pack.rules:
+        category = question_category_from_metadata(entry.metadata or {})
+        if category == QuestionCategory.UNKNOWN:
+            category = question_category_from_value(entry.topic)
+        if category != QuestionCategory.UNKNOWN and category not in candidates:
+            candidates.append(category)
+    for item in asset_pack.source_refs.values():
+        if not recall_item_requires_rule_evidence(item):
+            continue
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        category = question_category_from_metadata(metadata)
+        if category == QuestionCategory.UNKNOWN:
+            category = question_category_from_value(item.topic)
+        if category != QuestionCategory.UNKNOWN and category not in candidates:
+            candidates.append(category)
+    return candidates[0] if len(candidates) == 1 else QuestionCategory.UNKNOWN
 
 
 def recall_item_requires_rule_evidence(item: Any) -> bool:
@@ -9680,78 +10995,35 @@ def best_detail_anchor_table(filter_column: str, question: str, asset_pack: Plan
     candidates = [table for table in asset_pack.known_tables() if filter_column in asset_pack.known_columns(table)]
     if not candidates:
         return ""
-    domain_priority = {
-        "sub_order_id": ["order", "refund", "ticket", "repay"],
-        "order_id": ["order", "refund", "ticket", "repay"],
-        "refund_id": ["refund", "order"],
-        "ticket_id": ["ticket", "repay", "order"],
-        "bill_id": ["repay", "ticket", "order"],
-        "coupon_id": ["coupon", "order"],
-        "spu_id": ["goods", "order", "scm", "refund"],
-    }.get(filter_column, [])
-    for domain in domain_priority:
-        for table in candidates:
-            if semantic_domain_for_table(table) == domain:
-                return table
-    return candidates[0]
+    table_entries = {str(entry.table or entry.key or ""): entry for entry in asset_pack.tables}
+    entity_entries = {
+        entry.table: entry
+        for entry in asset_pack.entity_keys
+        if entry.key == filter_column and entry.table in candidates
+    }
 
-
-def add_product_dimension_lookup(
-    question: str,
-    intents: List[QuestionIntent],
-    dependencies: List[PlanDependency],
-    task_by_table: Dict[str, str],
-    index: SemanticLayerIndex,
-    asset_pack: PlanningAssetPack,
-) -> None:
-    goods_table = best_table_for_domain("goods", asset_pack)
-    if not goods_table or goods_table in task_by_table:
-        return
-    intent_by_task = {intent.plan_task_id: intent for intent in intents if intent.plan_task_id}
-    candidates = []
-    existing = [
-        (position, intent.preferred_table, intent.plan_task_id)
-        for position, intent in enumerate(intents)
-        if intent.preferred_table and intent.plan_task_id
-    ]
-    for position, parent_table, parent_task in existing:
-        path = index.relationship_path(
-            parent_table,
-            goods_table,
-            analysis_grain="product",
-            preferred_keys={"spu_id", "spu_name"},
+    def score(table: str) -> Tuple[int, int, int]:
+        table_entry = table_entries.get(table)
+        entity_entry = entity_entries.get(table)
+        table_metadata = table_entry.metadata if table_entry else {}
+        entity_metadata = entity_entry.metadata if entity_entry else {}
+        declared = int(
+            entity_metadata.get("anchorPriority")
+            or entity_metadata.get("anchor_priority")
+            or table_metadata.get("anchorPriority")
+            or table_metadata.get("anchor_priority")
+            or 0
         )
-        if not path and parent_table != goods_table:
-            continue
-        parent_intent = intent_by_task.get(parent_task)
-        if path and parent_intent and dependency_requires_unproduced_key(path[0], parent_table, parent_intent):
-            continue
-        candidates.append((len(path), position, parent_table, parent_task, path))
-    for _, _, parent_table, parent_task, path in sorted(candidates):
-        current_table = parent_table
-        current_task = parent_task
-        for rel in path:
-            next_table = rel.right_table if rel.left_table == current_table else rel.left_table
-            next_is_goods = next_table == goods_table
-            if next_table not in task_by_table:
-                intent = compiled_goods_lookup_intent(question, goods_table, asset_pack, current_task) if next_is_goods else compiled_bridge_intent(question, next_table, asset_pack, current_task)
-                if intent:
-                    intent = intent.model_copy(update={"plan_task_id": unique_task_id(intent.plan_task_id, [item.plan_task_id for item in intents])})
-                    intents.append(intent)
-                    task_by_table[next_table] = intent.plan_task_id
-            dependent_task = task_by_table.get(next_table, "")
-            dep = dependency_from_relationship(current_task, dependent_task, current_table, next_table, rel)
-            if dep:
-                add_dependency_if_valid(dependencies, dep)
-            current_table = next_table
-            current_task = dependent_task
-        if goods_table in task_by_table:
-            return
+        detail = 1 if table_entry and table_is_detail_asset(table_entry) else 0
+        semantic_match = asset_entry_score(table_entry, extract_question_terms(question)) if table_entry else 0
+        return declared, detail, semantic_match
+
+    return max(candidates, key=score)
 
 
 def best_table_for_domain(domain: str, asset_pack: PlanningAssetPack) -> str:
     for table in asset_pack.known_tables():
-        if semantic_domain_for_table(table) == domain:
+        if semantic_domain_for_table(table, asset_pack) == domain:
             return table
     return ""
 
@@ -10400,28 +11672,31 @@ def default_time_series_context_intent(
         return None
     if anchor.task_role != TaskRole.ANCHOR or anchor.depends_on_task_ids:
         return None
-    if anchor.group_by_column == "pt":
+    time_column = time_column_for_metric(metric, asset_pack)
+    if time_column and anchor.group_by_column == time_column:
         return None
-    columns = set(asset_pack.known_columns(metric.table))
-    if "pt" not in columns:
+    if not time_column:
         return None
     payload = dict(metric_resolution or {})
     payload.update(
         {
             "displayRole": "trend_context",
             "visualization": "line_chart",
-            "groupByColumn": "pt",
+            "groupByColumn": time_column,
         }
     )
-    base_task_id = "trend_%s_%s" % (semantic_domain_for_metric(metric) or semantic_domain_for_table(metric.table), metric.key)
+    base_task_id = "trend_%s_%s" % (
+        semantic_domain_for_metric(metric, asset_pack) or semantic_domain_for_table(metric.table, asset_pack),
+        metric.key,
+    )
     intent = compiled_metric_intent(
         question=question,
         metric=metric,
         task_id=unique_task_id(base_task_id, existing_task_ids),
         role=TaskRole.ANCHOR,
         mode=AnswerMode.GROUP_AGG,
-        grain="day",
-        group_by="pt",
+        grain=semantic_fast_path_grain("", time_column, asset_pack, metric.table) or "time",
+        group_by=time_column,
         depends_on=[],
         limit=min(max(days, 7), 60),
         asset_pack=asset_pack,
@@ -10429,7 +11704,7 @@ def default_time_series_context_intent(
     )
     if not intent:
         return None
-    note = "%s; default daily trend context" % (intent.analysis_note or "")
+    note = "%s; default time-series context" % (intent.analysis_note or "")
     return intent.model_copy(update={"analysis_note": note.strip("; ")})
 
 
@@ -10477,8 +11752,12 @@ def compiled_metric_intent(
         reconciliation,
         resolution_source="semantic_metric_compiler",
     )
-    group_column = metric_group_by_column(grain, columns, group_by)
-    output_keys = [column for column in ["seller_id", "merchant_id", group_column, "spu_name"] if column and column in columns]
+    group_column = metric_group_by_column(grain, columns, group_by, asset_pack, table)
+    output_keys = generic_output_keys(
+        QuestionIntent(preferred_table=table, group_by_column=group_column),
+        columns,
+        asset_pack,
+    )
     required = [column for column in [group_column] + metric_formula_columns(metric_formula, columns) + [source_column] if column and column in columns]
     knowledge_refs = SemanticLayerIndex(question, RecallBundle(), asset_pack).knowledge_refs_for_table(
         table,
@@ -10488,7 +11767,7 @@ def compiled_metric_intent(
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_metric(metric, table),
+        category=category_for_metric(metric, table, asset_pack),
         answer_mode=mode,
         plan_task_id=task_id,
         task_role=role,
@@ -10511,28 +11790,45 @@ def compiled_metric_intent(
     )
 
 
-def grain_column_for_table(grain: str, columns: set) -> str:
-    grain_map = {
-        "merchant": ["seller_id", "merchant_id"],
-        "product": ["spu_id", "spu_name"],
-        "order": ["sub_order_id", "order_id"],
-        "day": ["pt"],
-        "ticket": ["ticket_id", "sub_order_id"],
-        "refund": ["refund_id", "sub_order_id"],
-        "coupon": ["coupon_id", "discount_rel_id"],
-    }
-    for column in grain_map.get(grain, []):
-        if column in columns:
-            return column
-    return compatible_group_by("", columns)
+def grain_column_for_table(
+    grain: str,
+    columns: set,
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> str:
+    if grain in columns:
+        return grain
+    if not asset_pack:
+        return ""
+    candidates: List[str] = []
+    for entry in [*asset_pack.entity_keys, *asset_pack.fields]:
+        if table and entry.table != table:
+            continue
+        if entry.key not in columns or declared_grain_for_entry(entry) != normalize_semantic_namespace(grain):
+            continue
+        if entry.key not in candidates:
+            candidates.append(entry.key)
+    table_entry = planning_table_entry(asset_pack, table)
+    metadata = table_entry.metadata if table_entry else {}
+    mapping = metadata.get("grainColumns") or metadata.get("grain_columns") or {}
+    if isinstance(mapping, dict):
+        declared = mapping.get(grain) or mapping.get(normalize_semantic_namespace(grain)) or []
+        if isinstance(declared, str):
+            declared = [declared]
+        candidates = [str(column) for column in declared if str(column) in columns] + candidates
+    return candidates[0] if candidates else ""
 
 
-def metric_group_by_column(grain: str, columns: set, requested_group_by: str = "") -> str:
-    if grain == "day" and "pt" in columns:
-        return "pt"
+def metric_group_by_column(
+    grain: str,
+    columns: set,
+    requested_group_by: str = "",
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> str:
     if requested_group_by and requested_group_by in columns:
         return requested_group_by
-    return grain_column_for_table(grain, columns)
+    return grain_column_for_table(grain, columns, asset_pack, table)
 
 
 def independent_requested_group_by(
@@ -10545,22 +11841,23 @@ def independent_requested_group_by(
 ) -> str:
     """Choose a safe grouping key for sibling KPI nodes without inventing table relations."""
     columns = set(asset_pack.known_columns(metric.table))
-    if grain == "day" and "pt" in columns:
-        return "pt"
     requested = str(measure.get("groupByColumn") or measure.get("group_by_column") or "")
     if requested and requested in columns:
         return requested
     ranking_group = str(ranking.get("groupByColumn") or ranking.get("group_by_column") or "")
     if ranking_group and ranking_group in columns:
         return ranking_group
-    if str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").lower() != "none" and "pt" in columns:
-        return "pt"
-    grain_candidate = grain_column_for_table(grain, columns)
+    metric_metadata = getattr(metric, "metadata", {}) or {}
+    if str(understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none").lower() != "none":
+        temporal = str(metric_metadata.get("timeColumn") or metric_metadata.get("time_column") or "")
+        table_entry = planning_table_entry(asset_pack, metric.table)
+        table_metadata = table_entry.metadata if table_entry else {}
+        temporal = temporal or str(table_metadata.get("timeColumn") or table_metadata.get("time_column") or "")
+        if temporal in columns:
+            return temporal
+    grain_candidate = grain_column_for_table(grain, columns, asset_pack, metric.table)
     if grain_candidate:
         return grain_candidate
-    for column in ["pt", "seller_id", "merchant_id"]:
-        if column in columns:
-            return column
     return ""
 
 
@@ -10568,25 +11865,14 @@ def compiled_entity_expansion_intent(question: str, anchor: QuestionIntent, asse
     columns = set(asset_pack.known_columns(anchor.preferred_table))
     if not anchor.group_by_column or anchor.group_by_column not in columns:
         return None
-    output_keys = dedupe_strings([
-        column
-        for column in [
-            "seller_id",
-            "merchant_id",
-            anchor.group_by_column,
-            "sub_order_id",
-            "order_id",
-            "ticket_id",
-            "bill_id",
-            "refund_id",
-            "spu_id",
-            "spu_name",
-            "coupon_id",
-            "discount_rel_id",
-            "discount_id",
+    output_keys = dedupe_strings(
+        generic_output_keys(anchor, columns, asset_pack)
+        + [
+            column
+            for column in relationship_columns_for_table(asset_pack, anchor.preferred_table)
+            if column in columns
         ]
-        if column in columns
-    ])
+    )
     knowledge_refs = SemanticLayerIndex(question, RecallBundle(), asset_pack).knowledge_refs_for_table(
         anchor.preferred_table,
         output_keys,
@@ -10595,9 +11881,9 @@ def compiled_entity_expansion_intent(question: str, anchor: QuestionIntent, asse
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(anchor.preferred_table),
+        category=category_for_table(anchor.preferred_table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
-        plan_task_id="%s_entity_expand" % semantic_domain_for_table(anchor.preferred_table),
+        plan_task_id="%s_entity_expand" % semantic_domain_for_table(anchor.preferred_table, asset_pack),
         task_role=TaskRole.DEPENDENT,
         preferred_table=anchor.preferred_table,
         days=anchor.days,
@@ -10617,25 +11903,10 @@ def compiled_bridge_intent(question: str, table: str, asset_pack: PlanningAssetP
     columns = set(asset_pack.known_columns(table))
     if not columns:
         return None
-    output_keys = [
-        column
-        for column in [
-            "seller_id",
-            "merchant_id",
-            "sub_order_id",
-            "order_id",
-            "ticket_id",
-            "bill_id",
-            "refund_id",
-            "spu_id",
-            "spu_name",
-            "coupon_id",
-            "discount_rel_id",
-            "discount_id",
-            "pt",
-        ]
-        if column in columns
-    ]
+    output_keys = dedupe_strings(
+        generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)
+        + [column for column in relationship_columns_for_table(asset_pack, table) if column in columns]
+    )
     knowledge_refs = SemanticLayerIndex(question, RecallBundle(), asset_pack).knowledge_refs_for_table(
         table,
         output_keys,
@@ -10644,9 +11915,9 @@ def compiled_bridge_intent(question: str, table: str, asset_pack: PlanningAssetP
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_table(table),
+        category=category_for_table(table, asset_pack),
         answer_mode=AnswerMode.DETAIL,
-        plan_task_id="%s_bridge" % semantic_domain_for_table(table),
+        plan_task_id="%s_bridge" % semantic_domain_for_table(table, asset_pack),
         task_role=TaskRole.DEPENDENT,
         preferred_table=table,
         days=extract_days(question, 30),
@@ -10668,7 +11939,11 @@ def repair_missing_domain_dependencies(question: str, plan: QueryPlan, asset_pac
     requested_domains = requested_semantic_domains_for_plan(question, plan, asset_pack)
     if not requested_domains:
         return plan
-    covered_domains = {semantic_domain_for_table(intent.preferred_table) for intent in plan.intents if intent.preferred_table}
+    covered_domains = {
+        semantic_domain_for_table(intent.preferred_table, asset_pack)
+        for intent in plan.intents
+        if intent.preferred_table
+    }
     for intent in plan.intents:
         metric_domain = metric_domain_for_intent(intent, asset_pack)
         if metric_domain:
@@ -10676,7 +11951,7 @@ def repair_missing_domain_dependencies(question: str, plan: QueryPlan, asset_pac
     missing_domains = [
         domain
         for domain in requested_domains
-        if domain not in covered_domains and domain not in {"profile", "merchant"}
+        if domain not in covered_domains
     ]
     if not missing_domains:
         return plan
@@ -10718,10 +11993,13 @@ def repair_missing_domain_dependencies(question: str, plan: QueryPlan, asset_pac
                         add_dependency_if_valid(dependencies, dep)
                         current_task = expansion.plan_task_id
                         current_table = expansion.preferred_table
-                final_intent = (
-                    compiled_goods_lookup_intent(question, target_table, asset_pack, current_task)
-                    if domain == "goods"
-                    else compiled_domain_lookup_intent(question, domain, target_table, asset_pack, current_task, next_task_id(domain, intents))
+                final_intent = compiled_domain_lookup_intent(
+                    question,
+                    domain,
+                    target_table,
+                    asset_pack,
+                    current_task,
+                    next_task_id(domain, intents),
                 )
                 if not final_intent:
                     break
@@ -10743,7 +12021,14 @@ def repair_missing_domain_dependencies(question: str, plan: QueryPlan, asset_pac
             bridge_intent = compiled_bridge_intent(question, next_table, asset_pack, current_task)
             if not bridge_intent:
                 break
-            bridge_intent = bridge_intent.model_copy(update={"plan_task_id": next_task_id(semantic_domain_for_table(next_table) or "bridge", intents)})
+            bridge_intent = bridge_intent.model_copy(
+                update={
+                    "plan_task_id": next_task_id(
+                        semantic_domain_for_table(next_table, asset_pack) or "bridge",
+                        intents,
+                    )
+                }
+            )
             intents.append(bridge_intent)
             task_by_table[next_table] = bridge_intent.plan_task_id
             table_by_task[bridge_intent.plan_task_id] = next_table
@@ -10840,7 +12125,7 @@ def best_existing_path_to_table(
             table,
             target_table,
             analysis_grain=analysis_grain,
-            preferred_keys=relationship_preferred_keys_for_grain(analysis_grain),
+            preferred_keys=relationship_preferred_keys_for_grain(analysis_grain, index.asset_pack),
         )
         if not path:
             continue
@@ -10870,15 +12155,24 @@ def compiled_domain_lookup_intent(
     if not metric_column and metric:
         metric_column = next((column for column in getattr(metric, "columns", []) if column in columns), "")
     metric_formula = reconciliation.formula if reconciliation else ""
-    group_column = preferred_dependent_group_column(columns)
-    evidence_columns = domain_evidence_columns(domain, columns)
+    group_column = preferred_dependent_group_column(columns, asset_pack, table)
+    evidence_columns = domain_evidence_columns(domain, columns, asset_pack, table)
     formula_columns = metric_formula_columns(metric_formula, columns)
     required = dedupe_strings([group_column] + evidence_columns + formula_columns + ([metric_column] if metric_column else []))
-    output_keys = dedupe_strings(generic_output_keys(QuestionIntent(group_by_column=group_column), columns) + evidence_columns)
+    output_keys = dedupe_strings(
+        generic_output_keys(
+            QuestionIntent(group_by_column=group_column, preferred_table=table),
+            columns,
+            asset_pack,
+        )
+        + evidence_columns
+    )
     return QuestionIntent(
         question=question,
         intent_type=IntentType.VALID,
-        category=category_for_metric(metric, table) if metric else category_for_table(table),
+        category=category_for_metric(metric, table, asset_pack)
+        if metric
+        else category_for_table(table, asset_pack),
         answer_mode=AnswerMode.GROUP_AGG if metric else AnswerMode.DETAIL,
         plan_task_id=task_id,
         task_role=TaskRole.DEPENDENT,
@@ -10910,41 +12204,48 @@ def compiled_domain_lookup_intent(
 def best_metric_for_domain(domain: str, table: str, asset_pack: PlanningAssetPack, question: str) -> Any:
     metrics = [metric for metric in rank_asset_entries(asset_pack.metrics, question) if metric.table == table]
     for metric in metrics:
-        if semantic_domain_for_metric(metric) == domain:
+        if semantic_domain_for_metric(metric, asset_pack) == domain:
             return metric
     return metrics[0] if metrics else None
 
 
-def preferred_dependent_group_column(columns: set) -> str:
-    for column in ["sub_order_id", "order_id", "spu_id", "spu_name", "ticket_id", "refund_id", "bill_id", "pt"]:
-        if column in columns:
-            return column
-    return compatible_group_by("", columns)
+def preferred_dependent_group_column(
+    columns: set,
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> str:
+    return compatible_group_by("", columns, asset_pack, table)
 
 
-def domain_evidence_columns(domain: str, columns: set) -> List[str]:
-    candidates = {
-        "refund": [
-            "sub_order_id",
-            "order_id",
-            "refund_id",
-            "buyer_id",
-            "buyer_name",
-            "refund_status_name",
-            "refund_create_time",
-            "pay_amt",
-            "spu_id",
-            "spu_name",
-            "pt",
-        ],
-        "ticket": ["sub_order_id", "order_id", "ticket_id", "ticket_status_name", "ticket_create_time", "spu_id", "spu_name", "pt"],
-        "repay": ["sub_order_id", "order_id", "ticket_id", "bill_id", "repay_amt", "pay_status_name", "pt"],
-        "order": ["sub_order_id", "order_id", "pay_amt", "spu_id", "spu_name", "pt"],
-        "goods": ["spu_id", "spu_name", "spu_apply_create_time", "spu_status_name", "pt"],
-        "coupon": ["coupon_id", "discount_rel_id", "coupon_amt", "pt"],
-        "scm": ["spu_id", "spu_name", "inbound_cnt", "pt"],
-    }
-    return [column for column in candidates.get(domain, []) if column in columns]
+def domain_evidence_columns(
+    domain: str,
+    columns: set,
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> List[str]:
+    if not asset_pack:
+        return []
+    table_entry = planning_table_entry(asset_pack, table)
+    metadata = table_entry.metadata if table_entry else {}
+    declared = metadata.get("evidenceColumns") or metadata.get("evidence_columns") or []
+    if isinstance(declared, str):
+        declared = [declared]
+    selected = known_columns_only([str(column) for column in declared], columns)
+    selected = dedupe_strings(
+        selected
+        + generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)
+    )
+    for field in asset_pack.fields:
+        if field.table != table or field.key not in columns:
+            continue
+        field_metadata = field.metadata or {}
+        semantic = field_metadata.get("semantic") if isinstance(field_metadata.get("semantic"), dict) else {}
+        role = str(semantic.get("role") or field_metadata.get("semanticRole") or "").strip().upper()
+        if role in {"KEY", "DIMENSION", "TIME", "STATUS"} or boolish(
+            semantic.get("requiredEvidence", field_metadata.get("requiredEvidence"))
+        ):
+            selected.append(field.key)
+    return dedupe_strings(selected)
 
 
 def next_task_id(prefix: str, intents: List[QuestionIntent]) -> str:
@@ -10958,51 +12259,13 @@ def next_task_id(prefix: str, intents: List[QuestionIntent]) -> str:
     return "%s_%d" % (base, index)
 
 
-def compiled_goods_lookup_intent(question: str, table: str, asset_pack: PlanningAssetPack, parent_task: str) -> QuestionIntent | None:
-    columns = set(asset_pack.known_columns(table))
-    if not columns:
-        return None
-    output_keys = [
-        column
-        for column in ["seller_id", "merchant_id", "spu_id", "spu_name", "spu_apply_create_time", "spu_status_name", "pt"]
-        if column in columns
-    ]
-    knowledge_refs = SemanticLayerIndex(question, RecallBundle(), asset_pack).knowledge_refs_for_table(
-        table,
-        output_keys,
-        reason="product dimension lookup",
-    )
-    return QuestionIntent(
-        question=question,
-        intent_type=IntentType.VALID,
-        category=category_for_table(table),
-        answer_mode=AnswerMode.DETAIL,
-        plan_task_id="goods_lookup",
-        task_role=TaskRole.DEPENDENT,
-        preferred_table=table,
-        # This is an entity/dimension lookup for lifecycle attributes, not a
-        # fact-window query. Restricting it to the order's recent time window
-        # can hide an older SPU publication record.
-        days=0,
-        limit=200,
-        required_evidence=output_keys,
-        output_keys=output_keys,
-        depends_on_task_ids=[parent_task],
-        knowledge_refs=knowledge_refs,
-        knowledge_ref_ids=[ref.ref_id for ref in knowledge_refs if ref.ref_id],
-        analysis_source="llm_question_understanding_compiler",
-        analysis_note="product dimension lookup",
-        sql_strategy="llm_plan_bound_first",
-    )
-
-
 def dependency_requires_unproduced_key(rel: Any, parent_table: str, parent: QuestionIntent) -> bool:
     next_table = rel.right_table if rel.left_table == parent_table else rel.left_table
     dep = dependency_from_relationship(parent.plan_task_id, "probe", parent_table, next_table, rel)
     if not dep:
         return False
     produced = set(parent.output_keys + [parent.group_by_column, parent.filter_column])
-    needed = [token for token in split_join_tokens(dep.anchor_column or dep.join_key) if token not in {"seller_id", "merchant_id"}]
+    needed = split_join_tokens(dep.anchor_column or dep.join_key)
     return any(token not in produced for token in needed)
 
 
@@ -11011,7 +12274,7 @@ def dependency_unproduced_anchor_tokens(dep: PlanDependency, anchor: QuestionInt
         return []
     produced = set(anchor.output_keys)
     produced.update(column for column in [anchor.group_by_column, anchor.filter_column] if column)
-    needed = [token for token in split_join_tokens(dep.anchor_column or dep.join_key) if token not in {"seller_id", "merchant_id"}]
+    needed = split_join_tokens(dep.anchor_column or dep.join_key)
     return [token for token in needed if token not in produced]
 
 
@@ -11042,7 +12305,7 @@ def ensure_bridge_for_relationship_edge(
             compiler_trace.append("ENTITY_BRIDGE_UNAVAILABLE:%s:%s" % (parent_task, ",".join(missing)))
         return parent_task
     bridge_key = parent_intent.group_by_column or parent_intent.filter_column
-    if bridge_key in {"", "seller_id", "merchant_id", "pt"}:
+    if not bridge_key or column_is_context_only(bridge_key, parent_intent.preferred_table, asset_pack):
         if compiler_trace is not None:
             compiler_trace.append("ENTITY_BRIDGE_SKIPPED_TECHNICAL_KEY:%s:%s" % (parent_task, bridge_key or "missing"))
         return parent_task
@@ -11065,7 +12328,7 @@ def ensure_bridge_for_relationship_edge(
 
 
 def find_existing_entity_bridge(intents: List[QuestionIntent], parent: QuestionIntent, required_tokens: List[str]) -> QuestionIntent | None:
-    required = {token for token in required_tokens if token not in {"seller_id", "merchant_id"}}
+    required = {token for token in required_tokens if token}
     for intent in intents:
         if intent.preferred_table != parent.preferred_table:
             continue
@@ -11108,7 +12371,11 @@ def enrich_llm_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPac
                 updates["metric_column"] = metric_column
             if metric.table and metric.table != intent.preferred_table:
                 updates["preferred_table"] = metric.table
-            updates["category"] = category_for_metric(metric, metric.table or intent.preferred_table)
+            updates["category"] = category_for_metric(
+                metric,
+                metric.table or intent.preferred_table,
+                asset_pack,
+            )
             existing_resolution = intent.metric_resolution or {}
             canonical_resolution = SemanticMetricResolution(
                 requested_metric_ref=str(existing_resolution.get("requestedMetricRef") or intent.metric_name or intent.metric_column or ""),
@@ -11127,12 +12394,21 @@ def enrich_llm_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPac
         table = intent.preferred_table
         columns = set(asset_pack.known_columns(table))
         if intent.group_by_column and intent.group_by_column not in columns:
-            intent = intent.model_copy(update={"group_by_column": compatible_group_by(intent.group_by_column, columns)})
+            intent = intent.model_copy(
+                update={
+                    "group_by_column": compatible_group_by(
+                        intent.group_by_column,
+                        columns,
+                        asset_pack,
+                        intent.preferred_table,
+                    )
+                }
+            )
         output_keys = known_columns_only(intent.output_keys, columns)
         if intent.answer_mode in {AnswerMode.TOPN, AnswerMode.GROUP_AGG, AnswerMode.METRIC}:
-            output_keys = aggregate_entity_output_keys(intent, columns)
+            output_keys = aggregate_entity_output_keys(intent, columns, asset_pack)
         else:
-            for column in generic_output_keys(intent, columns):
+            for column in generic_output_keys(intent, columns, asset_pack):
                 if column not in output_keys:
                     output_keys.append(column)
         required = known_columns_only(intent.required_evidence, columns)
@@ -11151,7 +12427,7 @@ def enrich_llm_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPac
                 update={
                     "question": intent.question or question,
                     "intent_type": intent.intent_type or IntentType.VALID,
-                    "category": updates.get("category") or category_for_table(table),
+                    "category": updates.get("category") or category_for_table(table, asset_pack),
                     # Zero is an explicit semantic contract for snapshot or
                     # lifecycle lookups: do not turn it into the fact query's
                     # relative window merely because zero is falsey.
@@ -11180,36 +12456,30 @@ def enrich_llm_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPac
     return plan
 
 
-def aggregate_entity_output_keys(intent: QuestionIntent, columns: set) -> List[str]:
+def aggregate_entity_output_keys(
+    intent: QuestionIntent,
+    columns: set,
+    asset_pack: PlanningAssetPack,
+) -> List[str]:
     """Return only entity keys a grouped result can actually produce."""
 
-    keys: List[str] = []
-    for column in ["seller_id", "merchant_id", intent.group_by_column]:
-        if column and column in columns and column not in keys:
-            keys.append(column)
-    companion_keys = {
-        "spu_id": ["spu_name"],
-        "spu_name": ["spu_id"],
-        "coupon_id": ["discount_rel_id"],
-        "discount_rel_id": ["coupon_id"],
-        "sub_order_id": ["order_id"],
-        "order_id": ["sub_order_id"],
-        "ticket_id": ["sub_order_id", "order_id"],
-        "bill_id": ["ticket_id", "sub_order_id", "order_id"],
-    }
-    for column in companion_keys.get(intent.group_by_column or "", []):
-        if column in columns and column not in keys:
-            keys.append(column)
-    for column in intent.output_keys:
-        if not column or column not in columns or column in keys:
-            continue
-        if column == intent.group_by_column:
-            keys.append(column)
-        elif column in companion_keys.get(intent.group_by_column or "", []):
-            keys.append(column)
-        elif column in {"seller_id", "merchant_id"}:
-            keys.append(column)
-    return keys
+    keys = known_columns_only([intent.group_by_column, intent.filter_column], columns)
+    group_grain = ""
+    for entry in asset_pack.entity_keys + asset_pack.fields:
+        if entry.table == intent.preferred_table and entry.key == intent.group_by_column:
+            group_grain = declared_grain_for_entry(entry)
+            if group_grain:
+                break
+    if group_grain:
+        for entry in asset_pack.entity_keys + asset_pack.fields:
+            if (
+                entry.table == intent.preferred_table
+                and entry.key in columns
+                and declared_grain_for_entry(entry) == group_grain
+                and entry.key not in keys
+            ):
+                keys.append(entry.key)
+    return dedupe_strings(keys)
 
 
 def metric_entry_for_intent(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> Any:
@@ -11256,11 +12526,11 @@ def metric_entry_for_intent(intent: QuestionIntent, asset_pack: PlanningAssetPac
 
 
 def metric_domain_for_intent(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> str:
-    resolution_domain = semantic_domain_for_metric_resolution(intent.metric_resolution)
-    if resolution_domain:
+    resolution_domain = semantic_domain_for_metric_resolution(intent.metric_resolution, asset_pack)
+    if resolution_domain not in {"", "unknown"}:
         return resolution_domain
     metric = metric_entry_for_intent(intent, asset_pack)
-    return semantic_domain_for_metric(metric) if metric else ""
+    return semantic_domain_for_metric(metric, asset_pack) if metric else semantic_domain_for_table(intent.preferred_table, asset_pack)
 
 
 def anchor_mismatch_issue(plan: QueryPlan) -> Dict[str, Any]:
@@ -11383,6 +12653,9 @@ def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPa
         if not intent:
             continue
         if role == GRAPH_ROLE_SIBLING_METRIC and intent.depends_on_task_ids:
+            incoming = [dep for dep in plan.dependencies if dep.dependent_task_id == task_id]
+            if incoming and all(dep.relation_type == "DERIVED_COMPONENT" for dep in incoming):
+                continue
             issues.append(
                 {
                     "code": "SIBLING_METRIC_WRONGLY_DEPENDENT",
@@ -11399,9 +12672,18 @@ def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPa
         if dep.relation_type == "DERIVED_COMPONENT" or semantics in {"entity_filter", "scope_filter", "derived_component"}:
             continue
         tokens = split_join_tokens(dep.join_key) + split_join_tokens(dep.anchor_column) + split_join_tokens(dep.dependent_column)
-        if dependency_is_time_alignment(dep):
+        if dependency_is_time_alignment(dep, asset_pack, intent_by_task):
             continue
-        meaningful = [token for token in tokens if token and token not in {"seller_id", "merchant_id"}]
+        tables = [
+            str(getattr(intent_by_task.get(dep.anchor_task_id), "preferred_table", "") or ""),
+            str(getattr(intent_by_task.get(dep.dependent_task_id), "preferred_table", "") or ""),
+        ]
+        meaningful = [
+            token
+            for token in tokens
+            if token
+            and not all(column_is_context_only(token, table, asset_pack) for table in tables if table)
+        ]
         if not meaningful:
             issues.append(
                 {
@@ -11409,7 +12691,7 @@ def business_graph_alignment_issues(plan: QueryPlan, asset_pack: PlanningAssetPa
                     "severity": "error",
                     "taskId": dep.dependent_task_id,
                     "evidence": "%s->%s" % (dep.anchor_task_id, dep.dependent_task_id),
-                    "reason": "dependency only aligns merchant keys and does not narrow an entity/scope set",
+                    "reason": "dependency only aligns context keys and does not narrow an entity/scope set",
                 }
             )
     return issues
@@ -11597,12 +12879,7 @@ def analysis_contract_issue(plan: QueryPlan) -> Dict[str, Any]:
     if not analysis_declared:
         return {}
     if (requires_explanation or analysis_intent != "none") and not required_evidence:
-        low_risk_analysis_intents = {"none", "lookup", "metric", "ranking", "trend_check", "comparison"}
-        if (
-            not requires_explanation
-            and analysis_intent in low_risk_analysis_intents
-            and analysis_requested_metrics_covered(plan)
-        ):
+        if analysis_requested_metrics_covered(plan):
             return {}
         return {
             "code": "MISSING_ANALYSIS_EVIDENCE_CONTRACT",
@@ -12215,52 +13492,11 @@ def formula_identifier_refs(formula: str) -> set[str]:
 def local_metric_column_can_back_metric(metric_key: str, column: str) -> bool:
     key = str(metric_key or "").lower()
     col = str(column or "").lower()
-    if not key or not col:
-        return False
-    if key == col:
-        return metric_like_physical_column(col)
-    if col.endswith("_id"):
-        return any(token in key for token in ["cnt", "count", "num", "quantity", "bill_cnt", "detail_cnt"])
-    value_tokens = ["amt", "amount", "gmv", "pay", "refund", "repay", "coupon", "price", "fee", "cost"]
-    if any(token in key for token in value_tokens) and any(token in col for token in value_tokens):
-        return True
-    count_tokens = ["cnt", "count", "num", "quantity"]
-    if any(token in key for token in count_tokens) and any(token in col for token in count_tokens):
-        return True
-    rate_tokens = ["rate", "ratio", "pct", "percent"]
-    if any(token in key for token in rate_tokens) and any(token in col for token in rate_tokens):
-        return True
-    return False
+    return bool(key and col and key == col)
 
 
 def metric_like_physical_column(column: str) -> bool:
-    col = str(column or "").lower()
-    if not col:
-        return False
-    if col.endswith(("_name", "_status", "_status_name", "_type", "_type_name", "_code", "_time", "_date")):
-        return False
-    return any(
-        token in col
-        for token in [
-            "amt",
-            "amount",
-            "gmv",
-            "cnt",
-            "count",
-            "num",
-            "quantity",
-            "rate",
-            "ratio",
-            "pct",
-            "pay",
-            "refund",
-            "repay",
-            "coupon",
-            "price",
-            "fee",
-            "cost",
-        ]
-    )
+    return bool(str(column or "").strip())
 
 
 def locally_compiled_intent_contract_valid(intent: QuestionIntent, asset_pack: PlanningAssetPack) -> bool:
@@ -12368,6 +13604,34 @@ def planned_metric_refs(plan: QueryPlan) -> set[Any]:
                 refs.add(value)
                 if intent.preferred_table:
                     refs.add((intent.preferred_table, value))
+        for spec in intent.metric_specs or []:
+            if not isinstance(spec, dict):
+                continue
+            owner_table = str(spec.get("ownerTable") or spec.get("owner_table") or intent.preferred_table or "")
+            for key in [
+                "metricName",
+                "metric_name",
+                "metricColumn",
+                "metric_column",
+                "metricRef",
+                "metric_ref",
+                "requestedMetricRef",
+                "requested_metric_ref",
+                "semanticRefId",
+                "semantic_ref_id",
+            ]:
+                value = str(spec.get(key) or "")
+                if not value:
+                    continue
+                refs.add(value)
+                if owner_table:
+                    refs.add((owner_table, value))
+            for column in spec.get("sourceColumns") or spec.get("source_columns") or []:
+                value = str(column or "")
+                if value:
+                    refs.add(value)
+                    if owner_table:
+                        refs.add((owner_table, value))
     return refs
 
 
@@ -12531,90 +13795,44 @@ def planner_repair_action(reason: str) -> str:
     return mapping.get(reason, "graph_repair")
 
 
-def semantic_domain_for_metric(metric: Any) -> str:
+def semantic_domain_for_metric(metric: Any, asset_pack: PlanningAssetPack | None = None) -> str:
     if not metric:
         return ""
-    owner_domain = semantic_domain_for_table(str(getattr(metric, "table", "") or ""))
-    if owner_domain not in {"", "unknown", "profile"}:
+    owner_domain = semantic_domain_for_table(str(getattr(metric, "table", "") or ""), asset_pack)
+    if owner_domain not in {"", "unknown"}:
         return owner_domain
-    text = " ".join(
-        [
-            str(getattr(metric, "key", "")),
-            str(getattr(metric, "title", "")),
-            str(getattr(metric, "table", "")),
-            " ".join(getattr(metric, "aliases", []) or []),
-            str((getattr(metric, "metadata", {}) or {}).get("displayName") or ""),
-            str((getattr(metric, "metadata", {}) or {}).get("businessName") or ""),
-            str((getattr(metric, "metadata", {}) or {}).get("naturalName") or ""),
-            str((getattr(metric, "metadata", {}) or {}).get("originalBusinessName") or ""),
-        ]
-    ).lower()
-    if any(token in text for token in ["refund", "return", "退款", "退货", "售后"]):
-        return "refund"
-    if any(token in text for token in ["repay", "compensation", "赔付", "理赔", "补偿"]):
-        return "repay"
-    if any(token in text for token in ["ticket", "cs_", "工单", "客服"]):
-        return "ticket"
-    if any(token in text for token in ["coupon", "优惠券", "券"]):
-        return "coupon"
-    if any(token in text for token in ["scm", "inbound", "供应链", "入库"]):
-        return "scm"
-    if any(token in text for token in ["goods", "spu", "sku", "商品", "上架", "审核"]):
-        return "goods"
-    if any(token in text for token in ["gmv", "order", "pay", "trade", "订单", "支付", "成交"]):
-        return "order"
+    metadata = getattr(metric, "metadata", {}) or {}
+    declared = semantic_namespace_from_metadata(metadata, str(getattr(metric, "topic", "") or ""))
+    if declared:
+        return declared
     return owner_domain
 
 
-def semantic_domain_for_metric_resolution(resolution: Dict[str, Any]) -> str:
+def semantic_domain_for_metric_resolution(
+    resolution: Dict[str, Any],
+    asset_pack: PlanningAssetPack | None = None,
+) -> str:
     if not resolution or not resolution.get("metricKey"):
         return ""
-    owner_domain = semantic_domain_for_table(str(resolution.get("ownerTable") or ""))
-    # Ordinary fact tables own their metric domain.  The source phrase can
-    # mention several comparison metrics (for example deposit + GMV), so it
-    # must not reclassify every resolved metric into every domain in the
-    # question.  Profile tables are intentionally cross-domain and therefore
-    # continue to derive the domain from the canonical metric identity below.
-    if owner_domain not in {"", "unknown", "profile"}:
+    owner_domain = semantic_domain_for_table(str(resolution.get("ownerTable") or ""), asset_pack)
+    if owner_domain not in {"", "unknown"}:
         return owner_domain
-    text = " ".join(
-        [
-            str(resolution.get("requestedMetricRef") or ""),
-            str(resolution.get("metricKey") or ""),
-            str(resolution.get("displayName") or ""),
-            " ".join(str(item) for item in resolution.get("sourceColumns") or []),
-        ]
-    ).lower()
-    if any(token in text for token in ["refund", "return", "退款", "退货", "售后"]):
-        return "refund"
-    if any(token in text for token in ["repay", "compensation", "赔付", "理赔", "补偿"]):
-        return "repay"
-    if any(token in text for token in ["ticket", "cs_", "工单", "客服"]):
-        return "ticket"
-    if any(token in text for token in ["coupon", "优惠券", "券"]):
-        return "coupon"
-    if any(token in text for token in ["scm", "inbound", "供应链", "入库"]):
-        return "scm"
-    if any(token in text for token in ["goods", "spu", "sku", "商品", "上架", "审核"]):
-        return "goods"
-    if any(token in text for token in ["gmv", "order", "pay", "trade", "订单", "支付", "成交"]):
-        return "order"
+    declared = semantic_namespace_from_metadata(resolution)
+    if declared:
+        return declared
     return owner_domain
 
 
-def category_for_metric(metric: Any, fallback_table: str = "") -> QuestionCategory:
-    domain = semantic_domain_for_metric(metric)
-    mapping = {
-        "refund": QuestionCategory.REFUND,
-        "goods": QuestionCategory.GOODS,
-        "ticket": QuestionCategory.CS_TICKET,
-        "repay": QuestionCategory.COMPENSATION,
-        "coupon": QuestionCategory.COUPON,
-        "scm": QuestionCategory.SCM,
-        "order": QuestionCategory.TRADE,
-        "profile": QuestionCategory.TRADE,
-    }
-    return mapping.get(domain) or category_for_table(fallback_table)
+def category_for_metric(
+    metric: Any,
+    fallback_table: str = "",
+    asset_pack: PlanningAssetPack | None = None,
+) -> QuestionCategory:
+    if metric:
+        category = question_category_from_metadata(getattr(metric, "metadata", {}) or {})
+        if category != QuestionCategory.UNKNOWN:
+            return category
+    return category_for_table(fallback_table or str(getattr(metric, "table", "") or ""), asset_pack)
 
 
 def metric_formula_for_entry(metric: Any) -> str:
@@ -12849,23 +14067,18 @@ def metric_is_rate_like(metric: Any) -> bool:
     unit = str(metadata.get("unit") or metadata.get("valueUnit") or "").strip().lower()
     if unit in {"%", "percent", "percentage"}:
         return True
-    text_parts = [
-        str(getattr(metric, "key", "") or ""),
-        str(getattr(metric, "title", "") or ""),
-        str(getattr(metric, "description", "") or ""),
-        " ".join(str(item) for item in getattr(metric, "aliases", []) or []),
-        str(metadata.get("formula") or metadata.get("metricFormula") or ""),
-        str(metadata.get("businessName") or metadata.get("semanticName") or ""),
-    ]
-    text = " ".join(text_parts).lower()
-    return any(token in text for token in ["rate", "ratio", "share", "proportion", "率", "比例", "占比"])
+    semantic_role = str(metadata.get("semanticRole") or metadata.get("semantic_role") or "").strip().lower()
+    return semantic_role in {"rate", "ratio", "share", "proportion"}
 
 
 def materialized_metric_formula(metric: Any, column: str) -> str:
     if not column:
         return ""
-    aggregate = "AVG" if metric_is_rate_like(metric) else "SUM"
-    return "%s(`%s`)" % (aggregate, column)
+    declared = metric_formula_for_entry(metric)
+    if declared:
+        return declared
+    aggregation = declared_metric_aggregation(metric)
+    return formula_for_declared_aggregation(aggregation, "`%s`" % column) if aggregation else ""
 
 
 def derived_metric_components(metric: Any, asset_pack: PlanningAssetPack) -> List[Any]:
@@ -12915,12 +14128,9 @@ def shared_group_column_for_metrics(
     shared = set.intersection(*column_sets) if column_sets else set()
     if requested_group_by and requested_group_by in shared:
         return requested_group_by
-    grain_candidate = grain_column_for_table(grain, shared)
+    grain_candidate = grain_column_for_table(grain, shared, asset_pack)
     if grain_candidate:
         return grain_candidate
-    for candidate in ["spu_id", "spu_name", "sub_order_id", "order_id", "pt", "seller_id", "merchant_id"]:
-        if candidate in shared:
-            return candidate
     return ""
 
 
@@ -13007,16 +14217,28 @@ def metric_formula_columns(formula: str, available_columns: set) -> List[str]:
     return schema_formula_columns(formula, available_columns)
 
 
-def compatible_group_by(requested: str, columns: set) -> str:
+def compatible_group_by(
+    requested: str,
+    columns: set,
+    asset_pack: PlanningAssetPack | None = None,
+    table: str = "",
+) -> str:
     if requested in columns:
         return requested
-    if requested in {"spu_id", "spu_name"}:
-        for column in ["spu_id", "spu_name", "sub_order_id", "order_id", "ticket_id", "bill_id"]:
-            if column in columns:
-                return column
-    for column in ["sub_order_id", "order_id", "spu_id", "spu_name", "ticket_id", "bill_id", "refund_id", "pt"]:
-        if column in columns:
-            return column
+    if asset_pack:
+        requested_grain = ""
+        for entry in [*asset_pack.entity_keys, *asset_pack.fields]:
+            if entry.key == requested and (not table or entry.table == table):
+                requested_grain = declared_grain_for_entry(entry)
+                if requested_grain:
+                    break
+        if requested_grain:
+            candidate = grain_column_for_table(requested_grain, columns, asset_pack, table)
+            if candidate:
+                return candidate
+        candidates = generic_output_keys(QuestionIntent(preferred_table=table), columns, asset_pack)
+        if candidates:
+            return candidates[0]
     return ""
 
 
@@ -13102,24 +14324,87 @@ def sync_intent_dependencies(plan: QueryPlan) -> QueryPlan:
     return plan.model_copy(update={"intents": intents})
 
 
-def generic_output_keys(intent: QuestionIntent, columns: set) -> List[str]:
-    candidates = [
-        "seller_id",
-        "merchant_id",
-        intent.filter_column,
-        intent.group_by_column,
-        "sub_order_id",
-        "order_id",
-        "spu_id",
-        "spu_name",
-        "refund_id",
-        "ticket_id",
-        "bill_id",
-        "coupon_id",
-        "discount_rel_id",
-        "pt",
-    ]
-    return [column for column in candidates if column and column in columns]
+def generic_output_keys(
+    intent: QuestionIntent,
+    columns: set,
+    asset_pack: PlanningAssetPack | None = None,
+) -> List[str]:
+    selected = known_columns_only(
+        [
+            intent.filter_column,
+            intent.group_by_column,
+            *intent.output_keys,
+            *intent.required_evidence,
+        ],
+        columns,
+    )
+    if not asset_pack:
+        return selected
+    table = intent.preferred_table
+    table_entry = planning_table_entry(asset_pack, table)
+    metadata = table_entry.metadata if table_entry else {}
+    declared: List[str] = []
+    for key in [
+        "primaryKey",
+        "primary_key",
+        "entityFilterColumn",
+        "entity_filter_column",
+        "scopeFilterColumn",
+        "scope_filter_column",
+        "tenantContextColumn",
+        "tenant_context_column",
+        "timeColumn",
+        "time_column",
+        "defaultGroupByColumn",
+        "default_group_by_column",
+    ]:
+        value = metadata.get(key)
+        if isinstance(value, list):
+            declared.extend(str(item) for item in value)
+        elif value:
+            declared.append(str(value))
+    declared.extend(
+        entry.key
+        for entry in asset_pack.entity_keys
+        if entry.table == table and entry.key
+    )
+    for field in asset_pack.fields:
+        if field.table != table or field.key not in columns:
+            continue
+        field_metadata = field.metadata or {}
+        semantic = field_metadata.get("semantic") if isinstance(field_metadata.get("semantic"), dict) else {}
+        role = str(semantic.get("role") or field_metadata.get("semanticRole") or "").strip().upper()
+        if role in {"KEY", "DIMENSION", "TIME"} or boolish(semantic.get("defaultEvidence")):
+            declared.append(field.key)
+    return dedupe_strings(selected + known_columns_only(declared, columns))
+
+
+def relationship_columns_for_table(asset_pack: PlanningAssetPack, table: str) -> List[str]:
+    columns: List[str] = []
+    for rel in asset_pack.relationships:
+        for key in rel.join_keys:
+            if rel.left_table == table:
+                value = str(key.get("leftColumn") or "")
+            elif rel.right_table == table:
+                value = str(key.get("rightColumn") or "")
+            else:
+                value = ""
+            if value and value not in columns:
+                columns.append(value)
+    return columns
+
+
+def column_is_context_only(column: str, table: str, asset_pack: PlanningAssetPack) -> bool:
+    for field in asset_pack.fields + asset_pack.entity_keys:
+        if field.table != table or field.key != column:
+            continue
+        metadata = field.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        role = str(semantic.get("role") or metadata.get("semanticRole") or "").strip().upper()
+        return role in {"PARTITION", "TENANT_CONTEXT", "CONTEXT"} or boolish(
+            semantic.get("contextOnly", metadata.get("contextOnly"))
+        )
+    return False
 
 
 def known_columns_only(values: List[str], columns: set) -> List[str]:
@@ -13192,8 +14477,8 @@ def normalize_query_graph_payload(question: str, payload: Dict[str, Any], asset_
             QuestionIntent(
                 question=str(node.get("question") or question),
                 intent_type=IntentType.VALID,
-                category=category_for_table(table),
-                answer_mode=answer_mode_for_node(node, question),
+                category=category_for_table(table, asset_pack),
+                answer_mode=answer_mode_for_node(node),
                 plan_task_id=node_id,
                 task_role=role,
                 preferred_table=table,
@@ -13296,8 +14581,7 @@ def relationship_columns(rel: Any, anchor_table: str, dependent_table: str) -> T
         anchor_cols, dependent_cols = left_cols, right_cols
     anchor_column = "+".join(column for column in anchor_cols if column)
     dependent_column = "+".join(column for column in dependent_cols if column)
-    business_keys = [column for column in dependent_cols if column not in {"seller_id", "merchant_id"}]
-    join_key = "+".join(business_keys) or dependent_column or anchor_column
+    join_key = dependent_column or anchor_column
     if rel.left_table == anchor_table and rel.right_table == dependent_table:
         return anchor_column, dependent_column, join_key
     if rel.right_table == anchor_table and rel.left_table == dependent_table:
@@ -13308,9 +14592,34 @@ def relationship_columns(rel: Any, anchor_table: str, dependent_table: str) -> T
 def infer_join_key(anchor_table: str, dependent_table: str, asset_pack: PlanningAssetPack) -> str:
     anchor_cols = set(asset_pack.known_columns(anchor_table))
     dependent_cols = set(asset_pack.known_columns(dependent_table))
-    for candidate in ["sub_order_id", "order_id", "spu_id", "spu_name", "ticket_id", "bill_id", "refund_id", "seller_id", "merchant_id"]:
-        if candidate in anchor_cols and candidate in dependent_cols:
-            return candidate
+    shared = anchor_cols & dependent_cols
+    declared: List[str] = []
+    for table in [anchor_table, dependent_table]:
+        entry = planning_table_entry(asset_pack, table)
+        metadata = entry.metadata if entry else {}
+        values = metadata.get("joinKeys") or metadata.get("join_keys") or []
+        if isinstance(values, str):
+            values = [values]
+        declared.extend(str(value) for value in values if str(value) in shared)
+    for field in asset_pack.fields + asset_pack.entity_keys:
+        if field.table not in {anchor_table, dependent_table} or field.key not in shared:
+            continue
+        metadata = field.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        if boolish(metadata.get("joinKey", semantic.get("joinKey"))):
+            declared.append(field.key)
+    declared = dedupe_strings(declared)
+    if len(declared) == 1:
+        return declared[0]
+    shared_entities = dedupe_strings(
+        [
+            entry.key
+            for entry in asset_pack.entity_keys
+            if entry.key in shared and entry.table in {anchor_table, dependent_table}
+        ]
+    )
+    if len(shared_entities) == 1:
+        return shared_entities[0]
     return ""
 
 
@@ -13326,35 +14635,69 @@ def first_filter(node: Dict[str, Any]) -> Tuple[str, str]:
     return "", ""
 
 
-def category_for_table(table: str) -> QuestionCategory:
-    lower = table.lower()
-    if "profile" in lower:
-        return QuestionCategory.TRADE
-    if "refund" in lower:
-        return QuestionCategory.REFUND
-    if "goods" in lower:
-        return QuestionCategory.GOODS
-    if "ticket" in lower:
-        return QuestionCategory.CS_TICKET
-    if "repay" in lower or "compensation" in lower:
-        return QuestionCategory.COMPENSATION
-    if "coupon" in lower:
-        return QuestionCategory.COUPON
-    if "scm" in lower:
-        return QuestionCategory.SCM
-    if "deposit" in lower or "appeal" in lower:
-        return QuestionCategory.MERCHANT_OTHER
-    if "order" in lower or "trade" in lower:
-        return QuestionCategory.TRADE
-    return QuestionCategory.UNKNOWN
+def category_for_table(
+    table: str,
+    asset_pack: PlanningAssetPack | None = None,
+) -> QuestionCategory:
+    entry = planning_table_entry(asset_pack, table)
+    if not entry:
+        return QuestionCategory.UNKNOWN
+    category = question_category_from_metadata(entry.metadata or {})
+    if category != QuestionCategory.UNKNOWN:
+        return category
+    return question_category_from_value(entry.topic)
 
 
-def answer_mode_for_node(node: Dict[str, Any], question: str) -> AnswerMode:
-    text = ("%s %s" % (node.get("role") or "", question)).lower()
-    if any(word in text for word in ["top", "最多", "最高", "前"]):
-        return AnswerMode.TOPN
-    if any(word in text for word in ["量", "金额", "cnt", "amt", "count", "sum"]) and "明细" not in text:
-        return AnswerMode.GROUP_AGG
+def answer_mode_for_node(node: Dict[str, Any]) -> AnswerMode:
+    for key in ["answerMode", "answer_mode", "mode"]:
+        value = str(node.get(key) or "").strip().upper()
+        if not value:
+            continue
+        try:
+            return AnswerMode(value)
+        except ValueError:
+            pass
+
+    role = normalize_semantic_namespace(
+        node.get("nodeType")
+        or node.get("node_type")
+        or node.get("semanticRole")
+        or node.get("semantic_role")
+        or node.get("role")
+    )
+    role_modes = {
+        "ranking": AnswerMode.TOPN,
+        "topn": AnswerMode.TOPN,
+        "aggregate": AnswerMode.GROUP_AGG,
+        "group_agg": AnswerMode.GROUP_AGG,
+        "metric": AnswerMode.METRIC,
+        "measure": AnswerMode.METRIC,
+        "derived": AnswerMode.DERIVED,
+        "detail": AnswerMode.DETAIL,
+        "lookup": AnswerMode.DETAIL,
+    }
+    if role in role_modes:
+        return role_modes[role]
+    has_metric_contract = any(
+        node.get(key)
+        for key in [
+            "metricRef",
+            "metric_ref",
+            "metricFormula",
+            "metric_formula",
+            "aggregation",
+            "metricSpecs",
+            "metric_specs",
+        ]
+    )
+    if has_metric_contract:
+        has_grouping = bool(
+            node.get("groupByColumn")
+            or node.get("group_by_column")
+            or node.get("groupBy")
+            or node.get("group_by")
+        )
+        return AnswerMode.GROUP_AGG if has_grouping else AnswerMode.METRIC
     return AnswerMode.DETAIL
 
 
@@ -13382,27 +14725,177 @@ def group_entries_by_table(entries: List[Any]) -> Dict[str, List[Any]]:
     return grouped
 
 
-def semantic_domain_for_table(table: str) -> str:
-    lower = (table or "").lower()
-    if "profile" in lower:
-        return "profile"
-    if "refund" in lower:
-        return "refund"
-    if "goods" in lower:
-        return "goods"
-    if "ticket" in lower:
-        return "ticket"
-    if "repay" in lower or "compensation" in lower:
-        return "repay"
-    if "coupon" in lower:
-        return "coupon"
-    if "scm" in lower:
-        return "scm"
-    if "deposit" in lower or "appeal" in lower:
-        return "merchant"
-    if "order" in lower or "trade" in lower:
-        return "order"
-    return "unknown"
+def planning_table_entry(
+    asset_pack: PlanningAssetPack | None,
+    table: str,
+) -> PlanningAssetEntry | None:
+    if not asset_pack or not table:
+        return None
+    return next(
+        (
+            entry
+            for entry in asset_pack.tables
+            if str(entry.table or entry.key or "") == str(table)
+        ),
+        None,
+    )
+
+
+def metric_entry_by_identity(
+    asset_pack: PlanningAssetPack | None,
+    owner_table: str,
+    metric_ref: str,
+) -> PlanningAssetEntry | None:
+    if not asset_pack or not metric_ref:
+        return None
+    matches = [
+        metric
+        for metric in asset_pack.metrics
+        if metric.key == metric_ref and (not owner_table or metric.table == owner_table)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def semantic_entry_labels(entry: PlanningAssetEntry) -> List[str]:
+    metadata = entry.metadata or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    return dedupe_strings(
+        [
+            str(entry.key or ""),
+            str(entry.title or ""),
+            *[str(alias) for alias in entry.aliases or []],
+            str(metadata.get("displayName") or ""),
+            str(metadata.get("businessName") or ""),
+            str(metadata.get("naturalName") or ""),
+            str(metadata.get("tableComment") or ""),
+            str(semantic.get("businessName") or ""),
+            str(semantic.get("description") or ""),
+            *[str(alias) for alias in semantic.get("aliases") or []],
+        ]
+    )
+
+
+def semantic_domain_for_entry(
+    entry: PlanningAssetEntry,
+    asset_pack: PlanningAssetPack | None = None,
+) -> str:
+    owner_domain = semantic_domain_for_table(entry.table or entry.key, asset_pack)
+    if owner_domain not in {"", "unknown"}:
+        return owner_domain
+    declared = semantic_namespace_from_metadata(entry.metadata or {}, entry.topic)
+    if declared:
+        return declared
+    return owner_domain
+
+
+def declared_grain_for_entry(entry: PlanningAssetEntry) -> str:
+    metadata = entry.metadata or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    for key in [
+        "analysisGrain",
+        "analysis_grain",
+        "metricGrain",
+        "metric_grain",
+        "entityGrain",
+        "entity_grain",
+        "grain",
+        "dataGrain",
+        "data_grain",
+    ]:
+        value = str(metadata.get(key) or semantic.get(key) or "").strip()
+        if value:
+            return normalize_semantic_namespace(value)
+    return ""
+
+
+def time_column_for_metric(metric: Any, asset_pack: PlanningAssetPack) -> str:
+    table = str(getattr(metric, "table", "") or "")
+    metadata = getattr(metric, "metadata", {}) or {}
+    for key in ["timeColumn", "time_column"]:
+        candidate = str(metadata.get(key) or "")
+        if candidate in set(asset_pack.known_columns(table)):
+            return candidate
+    return time_column_for_table(asset_pack, table)
+
+
+def time_column_for_table(asset_pack: PlanningAssetPack, table: str) -> str:
+    columns = set(asset_pack.known_columns(table))
+    table_entry = planning_table_entry(asset_pack, table)
+    table_metadata = table_entry.metadata if table_entry else {}
+    for key in ["timeColumn", "time_column"]:
+        candidate = str(table_metadata.get(key) or "")
+        if candidate in columns:
+            return candidate
+    for field in asset_pack.fields:
+        if field.table != table or field.key not in columns:
+            continue
+        field_metadata = field.metadata or {}
+        semantic = field_metadata.get("semantic") if isinstance(field_metadata.get("semantic"), dict) else {}
+        role = str(semantic.get("role") or field_metadata.get("semanticRole") or "").strip().upper()
+        if role == "TIME":
+            return field.key
+    return ""
+
+
+def question_category_from_value(value: Any) -> QuestionCategory:
+    raw = str(value or "").strip()
+    if not raw:
+        return QuestionCategory.UNKNOWN
+    try:
+        return QuestionCategory(raw.upper())
+    except (TypeError, ValueError):
+        return QuestionCategory.UNKNOWN
+
+
+def question_category_from_metadata(metadata: Dict[str, Any]) -> QuestionCategory:
+    if not isinstance(metadata, dict):
+        return QuestionCategory.UNKNOWN
+    for key in [
+        "questionCategory",
+        "question_category",
+        "topicCategory",
+        "topic_category",
+        "category",
+    ]:
+        category = question_category_from_value(metadata.get(key))
+        if category != QuestionCategory.UNKNOWN:
+            return category
+    return QuestionCategory.UNKNOWN
+
+
+def semantic_namespace_from_metadata(metadata: Dict[str, Any], topic: str = "") -> str:
+    if not isinstance(metadata, dict):
+        metadata = {}
+    for key in [
+        "semanticDomain",
+        "semantic_domain",
+        "domain",
+        "topic",
+        "questionCategory",
+        "question_category",
+        "topicCategory",
+        "topic_category",
+        "category",
+    ]:
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return normalize_semantic_namespace(value)
+    return normalize_semantic_namespace(topic) if str(topic or "").strip() else ""
+
+
+def normalize_semantic_namespace(value: Any) -> str:
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "_", str(value or "").strip().lower()).strip("_")
+    return normalized or "unknown"
+
+
+def semantic_domain_for_table(
+    table: str,
+    asset_pack: PlanningAssetPack | None = None,
+) -> str:
+    entry = planning_table_entry(asset_pack, table)
+    if not entry:
+        return "unknown"
+    return semantic_namespace_from_metadata(entry.metadata or {}, entry.topic)
 
 
 def requested_semantic_domains_for_plan(question: str, plan: QueryPlan, asset_pack: PlanningAssetPack) -> List[str]:
@@ -13413,7 +14906,7 @@ def requested_semantic_domains_for_plan(question: str, plan: QueryPlan, asset_pa
 def requested_semantic_domains_from_understanding(understanding: Dict[str, Any], asset_pack: PlanningAssetPack) -> List[str]:
     if not isinstance(understanding, dict):
         return []
-    available = {semantic_domain_for_table(table) for table in asset_pack.known_tables()}
+    available = {semantic_domain_for_table(table, asset_pack) for table in asset_pack.known_tables()}
     domains: List[str] = []
     for item in requested_metric_items_from_understanding(understanding, include_ranking=True):
         if requested_measure_is_detail_evidence(item, asset_pack):
@@ -13425,37 +14918,23 @@ def requested_semantic_domains_from_understanding(understanding: Dict[str, Any],
             or item.get("owner_table")
             or ""
         )
-        domain = semantic_domain_for_table(owner_table)
+        domain = semantic_domain_for_table(owner_table, asset_pack)
         if domain in available:
             domains.append(domain)
     return dedupe_strings(domains)
 
 
 def normalize_semantic_domain(value: str) -> str:
-    text = (value or "").strip().lower()
-    aliases = {
-        "trade": "order",
-        "order": "order",
-        "refund": "refund",
-        "goods": "goods",
-        "product": "goods",
-        "ticket": "ticket",
-        "cs_ticket": "ticket",
-        "compensation": "repay",
-        "repay": "repay",
-        "coupon": "coupon",
-        "scm": "scm",
-        "merchant": "merchant",
-        "merchant_other": "merchant",
-        "profile": "profile",
-    }
-    return aliases.get(text, text)
+    return normalize_semantic_namespace(value)
 
 
 def requested_metric_items_from_understanding(understanding: Dict[str, Any], include_ranking: bool = False) -> List[Dict[str, Any]]:
     if not isinstance(understanding, dict):
         return []
     items: List[Dict[str, Any]] = []
+    selected = understanding.get("selectedMetrics") or understanding.get("selected_metrics") or []
+    if isinstance(selected, list):
+        items.extend(item for item in selected if isinstance(item, dict))
     ranking = understanding.get("rankingObjective") or understanding.get("ranking_objective") or {}
     if include_ranking and isinstance(ranking, dict) and str(ranking.get("metricRef") or ranking.get("metric_ref") or ""):
         items.append(ranking)
@@ -13500,8 +14979,7 @@ def dependency_from_relationship(anchor_task_id: str, dependent_task_id: str, an
             dependent_columns.append(left)
     anchor_column = "+".join(column for column in anchor_columns if column)
     dependent_column = "+".join(column for column in dependent_columns if column)
-    non_partition = [column for column in dependent_columns if column not in {"seller_id", "merchant_id"}]
-    join_key = "+".join(non_partition) or dependent_column or anchor_column
+    join_key = dependent_column or anchor_column
     return PlanDependency(
         anchor_task_id=anchor_task_id,
         dependent_task_id=dependent_task_id,
@@ -13527,14 +15005,7 @@ def dedupe_knowledge_refs(refs: List[KnowledgeRef]) -> List[KnowledgeRef]:
 def extract_entity_value(question: str, column: str) -> str:
     text = question or ""
     normalized_column = (column or "").lower()
-    if normalized_column == "sub_order_id":
-        match = re.search(r"\bsub_order_id[_:=：-]*[A-Za-z0-9_-]*\b", text, re.IGNORECASE)
-        return match.group(0).strip(":=：-") if match else ""
-    if normalized_column == "order_id":
-        for match in re.finditer(r"\border_id[_:=：-]*[A-Za-z0-9_-]*\b", text, re.IGNORECASE):
-            value = match.group(0).strip(":=：-")
-            if not value.lower().startswith("sub_order_id"):
-                return value
+    if not normalized_column:
         return ""
     match = re.search(r"\b%s[_:=：-]*[A-Za-z0-9_-]*\b" % re.escape(normalized_column), text, re.IGNORECASE)
     return match.group(0).strip(":=：-") if match else ""
@@ -13557,13 +15028,18 @@ def normalize_output_evidence(payload: Dict[str, Any]) -> List[str]:
 
 
 def compact_table_entry(item: Any, question: str = "") -> Dict[str, Any]:
-    return {
+    payload = {
         "table": item.table or item.key,
         "topic": item.topic,
         "title": item.title,
-        "keyColumns": select_planner_columns(item.columns, question),
+        "aliases": [str(alias) for alias in (getattr(item, "aliases", []) or [])[:6]],
+        "keyColumns": select_planner_columns(item.columns, question, getattr(item, "metadata", {}) or {}),
         "description": trim_text(item.description, 80),
     }
+    metadata = compact_metadata(getattr(item, "metadata", {}) or {})
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
 
 
 def compact_metric_entry(item: Any) -> Dict[str, Any]:
@@ -13572,8 +15048,9 @@ def compact_metric_entry(item: Any) -> Dict[str, Any]:
         "key": item.key,
         "table": item.table,
         "title": item.title,
+        "aliases": [str(alias) for alias in (getattr(item, "aliases", []) or [])[:6]],
         "columns": item.columns[:4],
-        "tableKind": metric_table_kind(item.table),
+        "tableKind": metric_table_kind(item),
         "grainHint": metric_grain_hint(item),
         "displayName": str((getattr(item, "metadata", {}) or {}).get("displayName") or item.title or ""),
         "naturalName": str((getattr(item, "metadata", {}) or {}).get("naturalName") or ""),
@@ -13600,7 +15077,7 @@ def compact_ultra_metric_entry(item: Any, question: str, budget_level: int = 0) 
         "columns": item.columns[: 1 if budget_level >= 2 else 2],
         "matchedPhrases": metric_matched_phrases(question, item)[: 1 if budget_level >= 2 else 2 if budget_level >= 1 else 3],
         "sourceRefId": item.source_ref_id,
-        "tableKind": metric_table_kind(item.table),
+        "tableKind": metric_table_kind(item),
         "grainHint": metric_grain_hint(item),
         "metricIntent": str(metadata.get("metricIntent") or ""),
     }
@@ -13633,14 +15110,19 @@ def compact_ultra_metric_entry(item: Any, question: str, budget_level: int = 0) 
     return payload
 
 
-def metric_table_kind(table: str) -> str:
-    name = str(table or "").lower()
-    if name.startswith("ads_") or "profile" in name:
-        return "aggregate_profile"
-    if "detail" in name or name.startswith(("dwm_", "dwd_")):
-        return "detail_fact"
-    if name.startswith("dim_"):
-        return "dimension"
+def metric_table_kind(item: Any) -> str:
+    metadata = getattr(item, "metadata", {}) or {}
+    for key in [
+        "tableKind",
+        "table_kind",
+        "tableRole",
+        "table_role",
+        "ownerTableKind",
+        "owner_table_kind",
+    ]:
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
     return "semantic_table"
 
 
@@ -13649,29 +15131,23 @@ def metric_grain_hint(item: Any) -> str:
     explicit = str(metadata.get("grain") or metadata.get("analysisGrain") or metadata.get("metricGrain") or "").strip()
     if explicit:
         return explicit
-    table = str(getattr(item, "table", "") or "").lower()
-    columns = {str(column) for column in getattr(item, "columns", []) or []}
-    if table.startswith("ads_") or "profile" in table:
-        return "merchant_day" if "pt" in columns else "merchant"
-    if "goods" in table or {"spu_id", "sku_id", "goods_id"} & columns:
-        return "goods_detail"
-    if "order" in table or {"order_id", "sub_order_id"} & columns:
-        return "order_detail"
-    if "refund" in table or "refund_id" in columns:
-        return "refund_detail"
-    if "ticket" in table or "ticket_id" in columns:
-        return "ticket_detail"
-    if "coupon" in table or "coupon_id" in columns:
-        return "coupon_detail"
     return "unknown"
 
 
 def compact_field_entry(item: Any) -> Dict[str, Any]:
-    return {
+    metadata = getattr(item, "metadata", {}) or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    payload = {
         "key": item.key,
         "table": item.table,
         "title": item.title,
+        "aliases": [str(alias) for alias in (getattr(item, "aliases", []) or [])[:6]],
+        "semanticRole": str(semantic.get("role") or metadata.get("semanticRole") or ""),
     }
+    compacted = compact_metadata(metadata)
+    if compacted:
+        payload["metadata"] = compacted
+    return payload
 
 
 def compact_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -13687,21 +15163,68 @@ def compact_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "warning",
         "joinKey",
         "semanticType",
+        "semanticRole",
         "dataType",
+        "aggregationPolicy",
+        "selectionGuidance",
+        "temporalVariants",
+        "linkedVariantOf",
+        "linkedVariantPath",
+        "metricFamily",
+        "familyKey",
+        "canonicalMetricKey",
+        "metricIntent",
+        "metricGrain",
+        "dataGrain",
+        "analysisGrain",
+        "grain",
+        "timeColumn",
+        "timeGrain",
+        "groupByColumn",
+        "defaultGroupByColumn",
+        "entityFilterColumn",
+        "scopeFilterColumn",
+        "tenantContextColumn",
+        "primaryKey",
+        "joinKeys",
+        "sourceColumns",
+        "evidenceColumns",
+        "aliases",
+        "preferredUseCases",
+        "notPreferredUseCases",
+        "derived",
+        "requiresExplicitRequest",
+        "semanticDomain",
+        "questionCategory",
+        "topicCategory",
+        "category",
+        "tableKind",
+        "tableRole",
+        "semantic",
     }
     compacted: Dict[str, Any] = {}
     for key, value in metadata.items():
         if key not in allowed:
             continue
-        if isinstance(value, str):
-            compacted[key] = trim_text(value, 80)
-        elif isinstance(value, (int, float, bool)):
-            compacted[key] = value
-        elif isinstance(value, list):
-            compacted[key] = [trim_text(str(item), 50) for item in value[:4]]
-        elif isinstance(value, dict):
-            compacted[key] = {str(k): trim_text(str(v), 50) for k, v in list(value.items())[:4]}
+        compacted[key] = compact_metadata_value(value)
     return compacted
+
+
+def compact_metadata_value(value: Any, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return trim_text(value, 80 if depth == 0 else 60)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [compact_metadata_value(item, depth + 1) for item in list(value)[:6]]
+    if isinstance(value, dict):
+        if depth >= 2:
+            return trim_text(json.dumps(value, ensure_ascii=False, default=str), 100)
+        return {
+            str(key): compact_metadata_value(item, depth + 1)
+            for key, item in list(value.items())[:8]
+        }
+    return trim_text(str(value), 60)
 
 
 def compact_relationship_entry(item: Any) -> Dict[str, Any]:
@@ -13741,7 +15264,6 @@ def rank_asset_entries(entries: List[Any], question: str) -> List[Any]:
 
 
 def asset_entry_score(item: Any, terms: List[str]) -> int:
-    metadata = getattr(item, "metadata", {}) or {}
     strong_text = " ".join(
         [
             str(getattr(item, "key", "")),
@@ -13754,64 +15276,77 @@ def asset_entry_score(item: Any, terms: List[str]) -> int:
     description = str(getattr(item, "description", "")).lower()
     score = sum(3 for term in terms if term and term in strong_text)
     score += sum(1 for term in terms if term and term in description)
-    term_set = set(terms)
-    if not (term_set & {"rate", "ratio", "率", "比例", "占比"}) and any(token in strong_text for token in ["rate", "ratio", "比例", "占比"]):
-        score -= 2
-    if not (term_set & {"优惠", "优惠券", "coupon", "券", "补贴", "discount"}) and any(
-        token in strong_text for token in ["coupon", "discount", "优惠", "券", "补贴"]
-    ):
-        score -= 1
-    source_columns = metadata.get("sourceColumns") or metadata.get("source_columns") or []
-    formula = str(metadata.get("formula") or metadata.get("metricFormula") or "").lower()
-    if (len(source_columns) > 1 or "/" in formula or "-" in formula) and not (
-        term_set & {"净", "扣", "扣除", "after", "综合", "派生"}
-    ):
+    if not score and derived_metric_requires_explicit_request(item):
         score -= 4
     return score
 
 
-def select_planner_columns(columns: List[str], question: str) -> List[str]:
+def select_planner_columns(
+    columns: List[str],
+    question: str,
+    metadata: Dict[str, Any] | None = None,
+) -> List[str]:
+    metadata = metadata or {}
     terms = extract_question_terms(question)
-    priority_fragments = [
-        "merchant_id",
-        "seller_id",
-        "order_id",
-        "sub_order_id",
-        "refund_id",
-        "ticket_id",
-        "compensation",
-        "repay",
-        "spu",
-        "sku",
-        "goods",
-        "coupon",
-        "warehouse",
-        "pt",
-        "date",
-        "time",
-        "create",
-        "publish",
-        "audit",
-        "status",
-        "amt",
-        "amount",
-        "gmv",
-        "cnt",
-        "user",
-    ]
     selected: List[str] = []
-    for column in columns:
-        lowered = column.lower()
-        if any(fragment in lowered for fragment in priority_fragments) or any(term in lowered for term in terms):
+    for key in [
+        "primaryKey",
+        "primary_key",
+        "entityFilterColumn",
+        "entity_filter_column",
+        "scopeFilterColumn",
+        "scope_filter_column",
+        "tenantContextColumn",
+        "tenant_context_column",
+        "timeColumn",
+        "time_column",
+        "defaultGroupByColumn",
+        "default_group_by_column",
+        "joinKeys",
+        "join_keys",
+        "evidenceColumns",
+        "evidence_columns",
+    ]:
+        value = metadata.get(key)
+        values = value if isinstance(value, list) else [value]
+        for column in values:
+            column = str(column or "")
+            if column in columns and column not in selected:
+                selected.append(column)
+
+    column_labels: Dict[str, str] = {str(column): str(column).lower() for column in columns}
+    for row in metadata.get("schemaColumns") or metadata.get("schema_columns") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("columnName") or row.get("column_name") or row.get("Field") or "")
+        if name not in column_labels:
+            continue
+        column_labels[name] = " ".join(
+            [
+                name,
+                str(row.get("businessName") or ""),
+                str(row.get("comment") or row.get("Comment") or ""),
+                str(row.get("description") or ""),
+                *[str(alias) for alias in row.get("aliases") or []],
+            ]
+        ).lower()
+
+    scored: List[Tuple[int, int, str]] = []
+    for index, column in enumerate(columns):
+        label_text = column_labels.get(column, column.lower())
+        score = sum(len(term) for term in terms if term and term in label_text)
+        if score:
+            scored.append((score, -index, column))
+    for _, _, column in sorted(scored, reverse=True):
+        if column not in selected:
             selected.append(column)
         if len(selected) >= 16:
             break
-    if len(selected) < 12:
-        for column in columns:
-            if column not in selected:
-                selected.append(column)
-            if len(selected) >= 12:
-                break
+    for column in columns:
+        if column not in selected:
+            selected.append(column)
+        if len(selected) >= 12:
+            break
     return selected
 
 
@@ -13822,55 +15357,20 @@ def extract_question_terms(question: str) -> List[str]:
 
 
 def re_split_terms(text: str) -> List[str]:
-    normalized = text.replace("_", " ")
     terms: List[str] = []
-    for chunk in normalized.replace("，", " ").replace("。", " ").replace(",", " ").split():
-        chunk = chunk.strip()
-        if chunk and chunk not in terms:
-            terms.append(chunk)
     for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]*|\d+", text):
         normalized_token = token.lower()
         if normalized_token and normalized_token not in terms:
             terms.append(normalized_token)
-    for keyword in [
-        "订单",
-        "子订单",
-        "下单",
-        "下单数",
-        "下单量",
-        "订单数",
-        "订单量",
-        "销量",
-        "退款",
-        "退款量",
-        "退款金额",
-        "退款率",
-        "退货",
-        "商品",
-        "spu",
-        "sku",
-        "工单",
-        "工单量",
-        "赔付",
-        "赔付金额",
-        "赔付单量",
-        "优惠券",
-        "供应链",
-        "入库",
-        "入库量",
-        "审核",
-        "发布",
-        "发布成功",
-        "金额",
-        "最多",
-        "最高",
-        "净",
-        "扣",
-        "扣除",
-    ]:
-        if keyword in text and keyword not in terms:
-            terms.append(keyword)
-    return terms
+    for sequence in re.findall(r"[\u4e00-\u9fff]+", text):
+        for size in range(min(8, len(sequence)), 1, -1):
+            for index in range(0, len(sequence) - size + 1):
+                token = sequence[index : index + size]
+                if token not in terms:
+                    terms.append(token)
+                if len(terms) >= 64:
+                    return terms
+    return terms[:64]
 
 
 def split_join_tokens(value: str) -> List[str]:

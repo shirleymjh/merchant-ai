@@ -14,6 +14,30 @@ from merchant_ai.services.llm import LlmClient, TaskModelRouter
 from merchant_ai.services.sandbox import MerchantAnalysisSandbox
 
 
+def normalize_skill_execution_mode(metadata: Dict[str, Any]) -> str:
+    value = str(metadata.get("executionMode") or metadata.get("execution_mode") or "").strip().lower()
+    aliases = {
+        "script": "python_script",
+        "python": "python_script",
+        "renderer": "structured_renderer",
+        "structured": "structured_renderer",
+    }
+    return aliases.get(value, value)
+
+
+def resolve_skill_script(skill_dir: Path, metadata: Dict[str, Any]) -> Path | None:
+    relative = str(metadata.get("script") or metadata.get("scriptPath") or metadata.get("script_path") or "").strip()
+    if not relative:
+        return None
+    root = skill_dir.resolve()
+    candidate = (skill_dir / relative).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
+
+
 @dataclass
 class SkillWorkerResult:
     answer: str
@@ -111,7 +135,50 @@ class SkillWorkerExecutor:
         personalization_context: Optional[Dict[str, Any]] = None,
         initial_trace: Optional[Dict[str, Any]] = None,
     ) -> SkillWorkerResult:
-        selected_skill = skill_name or "bi_trend_attribution"
+        selected_skill = str(skill_name or "").strip()
+        if not selected_skill:
+            return SkillWorkerResult(
+                answer="",
+                trace={
+                    **dict(initial_trace or {}),
+                    "skillName": "",
+                    "activated": False,
+                    "lifecycleStage": "skipped",
+                    "matchStatus": "no_match",
+                    "progress": ["no_match", "skipped"],
+                },
+            )
+        skill_dir = self.settings.resources_root / "runtime" / "agent_skills" / selected_skill
+        skill_file = skill_dir / "SKILL.md"
+        if not skill_file.exists():
+            return SkillWorkerResult(
+                answer="",
+                trace={
+                    **dict(initial_trace or {}),
+                    "skillName": selected_skill,
+                    "activated": False,
+                    "lifecycleStage": "failed",
+                    "error": "skill package missing",
+                    "progress": ["matched", "failed:skill package missing"],
+                },
+            )
+
+        from merchant_ai.services.answer import load_skill_frontmatter
+
+        skill_meta = load_skill_frontmatter(skill_file)
+        execution_mode = normalize_skill_execution_mode(skill_meta)
+        renderer = str(skill_meta.get("renderer") or "").strip()
+        script = resolve_skill_script(skill_dir, skill_meta)
+        if execution_mode not in {"python_script", "structured_renderer"}:
+            return self._unsupported_resource_result(
+                selected_skill,
+                initial_trace,
+                "skill executionMode is missing or unsupported",
+            )
+        if execution_mode == "python_script" and script is None:
+            return self._unsupported_resource_result(selected_skill, initial_trace, "skill script metadata is invalid")
+        if execution_mode == "structured_renderer" and not renderer:
+            return self._unsupported_resource_result(selected_skill, initial_trace, "skill renderer metadata is missing")
         if bool(self.settings.distributed_subagents_enabled):
             return self._execute_distributed_skill(
                 question,
@@ -131,9 +198,6 @@ class SkillWorkerExecutor:
         )
         confirmed = bool(incoming_trace.get("confirmed", not requires_confirmation))
         isolated_run_id = "skill_%s_%s" % (selected_skill, uuid.uuid4().hex[:10])
-        skill_dir = self.settings.resources_root / "runtime" / "agent_skills" / selected_skill
-        skill_file = skill_dir / "SKILL.md"
-        script = skill_dir / "scripts" / "profile_timeseries.py"
         workspace = self._workspace(outputs_path, selected_skill, isolated_run_id)
         checkpoint_path = workspace / "skill_checkpoint.json"
         input_path = workspace / "skill_input.json"
@@ -144,12 +208,14 @@ class SkillWorkerExecutor:
             "matchedBy": incoming_trace.get("matchedBy") or "questionUnderstanding+verifiedEvidence",
             "matchTrace": incoming_trace,
             "activated": False,
-            "executionMode": "isolated_skill_worker",
+            "executionMode": execution_mode,
+            "renderer": renderer,
+            "executionHost": "isolated_skill_worker",
             "workerType": "SKILL_WORKER",
             "subAgentType": "SKILL_WORKER",
             "isolatedExecution": True,
             "skillPath": str(skill_file),
-            "scriptPath": str(script),
+            "scriptPath": str(script) if script else "",
             "lifecycleStage": "matched",
             "requiresConfirmation": requires_confirmation,
             "confirmed": confirmed,
@@ -173,12 +239,6 @@ class SkillWorkerExecutor:
                 }
             )
             return SkillWorkerResult(answer="", trace=trace)
-        if not skill_file.exists():
-            return self._fail(trace, checkpoint_path, "skill package missing")
-
-        from merchant_ai.services.answer import load_skill_frontmatter
-
-        skill_meta = load_skill_frontmatter(skill_file)
         trace["metadata"] = skill_meta
         workspace.mkdir(parents=True, exist_ok=True)
         context_package = self._context_package(
@@ -192,7 +252,7 @@ class SkillWorkerExecutor:
             output_path,
             context_path,
             bool(rule_context),
-            script.exists() and selected_skill == "bi_trend_attribution",
+            execution_mode == "python_script" and bool(script and script.exists()),
         )
         context_path.write_text(json.dumps(context_package, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         trace["contextPackage"] = self._compact_context_package(context_package)
@@ -219,9 +279,27 @@ class SkillWorkerExecutor:
             }
         )
         self._write_checkpoint(checkpoint_path, trace, status="running")
-        if selected_skill == "bi_trend_attribution":
+        if execution_mode == "python_script" and script is not None:
             return self._execute_script_skill(script, input_path, output_path, checkpoint_path, trace)
-        return self._execute_structured_skill(selected_skill, payload, output_path, checkpoint_path, trace)
+        return self._execute_structured_skill(selected_skill, renderer, payload, output_path, checkpoint_path, trace)
+
+    def _unsupported_resource_result(
+        self,
+        skill_name: str,
+        initial_trace: Optional[Dict[str, Any]],
+        message: str,
+    ) -> SkillWorkerResult:
+        return SkillWorkerResult(
+            answer="",
+            trace={
+                **dict(initial_trace or {}),
+                "skillName": skill_name,
+                "activated": False,
+                "lifecycleStage": "failed",
+                "error": message,
+                "progress": ["matched", "failed:invalid skill resource metadata"],
+            },
+        )
 
     def _execute_distributed_skill(
         self,
@@ -348,6 +426,7 @@ class SkillWorkerExecutor:
     def _execute_structured_skill(
         self,
         skill_name: str,
+        renderer: str,
         payload: Dict[str, Any],
         output_path: Path,
         checkpoint_path: Path,
@@ -355,7 +434,9 @@ class SkillWorkerExecutor:
     ) -> SkillWorkerResult:
         from merchant_ai.services.answer import render_structured_skill_answer
 
-        answer = render_structured_skill_answer(skill_name, payload)
+        if renderer != "verified_evidence":
+            return self._fail(trace, checkpoint_path, "unsupported skill renderer")
+        answer = render_structured_skill_answer(renderer, payload)
         output = {
             "skillName": skill_name,
             "rowCount": len(payload.get("dataRows") or []),

@@ -13,7 +13,8 @@ from merchant_ai.models import (
     QueryPlan,
     VerifiedFact,
 )
-from merchant_ai.services.answer_formatting import humanize_column_name, source_aware_metric_label
+from merchant_ai.services.answer_formatting import source_aware_metric_label
+from merchant_ai.services.time_semantics import declared_time_column_for_intent
 
 
 NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?%?")
@@ -47,7 +48,7 @@ class AnswerClaimVerifier:
         facts = build_verified_facts(plan, run_result)
         if run_result is not None:
             run_result.verified_facts = facts
-        claims = extract_answer_claims(answer)
+        claims = extract_answer_claims(answer, facts)
         allowed_numbers = supported_numbers(facts)
         allowed_entities = supported_entities(question, facts)
         checked: List[AnswerClaim] = []
@@ -84,7 +85,12 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
             continue
         intent = intent_by_task.get(task.task_id) or singleton_intent
         table = next(iter(task.query_bundle.tables or []), "") or str(getattr(intent, "preferred_table", "") or "")
-        role = fact_result_role(getattr(intent, "answer_mode", ""), str(getattr(intent, "group_by_column", "") or ""))
+        time_column = task_time_column(intent, task)
+        role = fact_result_role(
+            getattr(intent, "answer_mode", ""),
+            str(getattr(intent, "group_by_column", "") or ""),
+            time_column,
+        )
         resolution = dict(getattr(intent, "metric_resolution", {}) or {})
         metric_key = str(resolution.get("metricKey") or getattr(intent, "metric_name", "") or "")
         metric_label = str(
@@ -96,15 +102,23 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
             )
             or metric_key
         )
+        governed_columns = governed_fact_columns(intent, task)
+        column_labels = governed_column_labels(intent, task)
         for row_index, row in enumerate(task.query_bundle.rows[:200]):
             for column, value in row.items():
                 if value in (None, "") or str(column).startswith("__"):
+                    continue
+                if decimal_value(value) is not None and governed_columns and str(column) not in governed_columns:
                     continue
                 key = (task.task_id, row_index, str(column), stable_value(value))
                 if key in seen:
                     continue
                 seen.add(key)
-                label = metric_label if metric_key and str(column) == metric_key else str(column)
+                label = (
+                    metric_label
+                    if metric_key and str(column) == metric_key
+                    else str(column_labels.get(str(column)) or column)
+                )
                 facts.append(
                     VerifiedFact(
                         fact_id=fact_id(task.task_id, row_index, str(column)),
@@ -114,12 +128,17 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
                         column=str(column),
                         label=label,
                         value=value,
-                        value_type=fact_value_type(str(column), value),
+                        value_type=fact_value_type(str(column), value, {time_column} if time_column else set()),
                         result_role=role,
                     )
                 )
     if facts or not run_result.merged_query_bundle.rows:
         return facts
+    time_columns = {
+        declared_time_column_for_intent(intent)
+        for intent in plan.intents
+        if declared_time_column_for_intent(intent)
+    }
     for row_index, row in enumerate(run_result.merged_query_bundle.rows[:200]):
         for column, value in row.items():
             if value in (None, "") or str(column).startswith("__"):
@@ -133,14 +152,21 @@ def build_verified_facts(plan: QueryPlan, run_result: AgentRunResult | None) -> 
                     column=str(column),
                     label=str(column),
                     value=value,
-                    value_type=fact_value_type(str(column), value),
+                    value_type=fact_value_type(str(column), value, time_columns),
                 )
             )
     return facts
 
 
-def extract_answer_claims(answer: str) -> List[AnswerClaim]:
+def extract_answer_claims(answer: str, facts: List[VerifiedFact] | None = None) -> List[AnswerClaim]:
     body = factual_answer_body(answer)
+    non_entity_tokens = {
+        normalize_label_text(value)
+        for fact in facts or []
+        if decimal_value(fact.value) is not None
+        for value in [fact.column, fact.label]
+        if value
+    }
     claims: List[AnswerClaim] = []
     prose_lines: List[str] = []
     lines = body.splitlines()
@@ -149,7 +175,7 @@ def extract_answer_claims(answer: str) -> List[AnswerClaim]:
         headers = markdown_table_cells(lines[line_index])
         separator = markdown_table_cells(lines[line_index + 1]) if line_index + 1 < len(lines) else []
         if headers and separator and markdown_separator_row(separator):
-            append_prose_claims("\n".join(prose_lines), claims)
+            append_prose_claims("\n".join(prose_lines), claims, non_entity_tokens)
             prose_lines = []
             line_index += 2
             row_position = 1
@@ -157,7 +183,7 @@ def extract_answer_claims(answer: str) -> List[AnswerClaim]:
                 cells = markdown_table_cells(lines[line_index])
                 if not cells or markdown_separator_row(cells):
                     break
-                claim = markdown_table_claim(headers, cells, row_position)
+                claim = markdown_table_claim(headers, cells, row_position, non_entity_tokens)
                 if claim is not None:
                     claims.append(claim)
                 row_position += 1
@@ -165,17 +191,17 @@ def extract_answer_claims(answer: str) -> List[AnswerClaim]:
             continue
         prose_lines.append(lines[line_index])
         line_index += 1
-    append_prose_claims("\n".join(prose_lines), claims)
+    append_prose_claims("\n".join(prose_lines), claims, non_entity_tokens)
     return claims
 
 
-def append_prose_claims(text: str, claims: List[AnswerClaim]) -> None:
+def append_prose_claims(text: str, claims: List[AnswerClaim], non_entity_tokens: Set[str] | None = None) -> None:
     for match in FACTUAL_SENTENCE_PATTERN.finditer(text):
         sentence = match.group(0).strip(" -*\t\r\n")
         if not sentence:
             continue
         numbers = extract_numeric_tokens(sentence)
-        entities = [item for item in ENTITY_PATTERN.findall(sentence) if is_business_entity_token(item)]
+        entities = [item for item in ENTITY_PATTERN.findall(sentence) if is_business_entity_token(item, non_entity_tokens)]
         entities = dedupe_texts(entities)
         if not numbers and not entities:
             continue
@@ -197,7 +223,12 @@ def markdown_separator_row(cells: List[str]) -> bool:
     return bool(cells) and all(MARKDOWN_SEPARATOR_CELL_PATTERN.fullmatch(cell.strip()) for cell in cells)
 
 
-def markdown_table_claim(headers: List[str], cells: List[str], row_position: int) -> AnswerClaim | None:
+def markdown_table_claim(
+    headers: List[str],
+    cells: List[str],
+    row_position: int,
+    non_entity_tokens: Set[str] | None = None,
+) -> AnswerClaim | None:
     pairs: List[str] = []
     numbers: List[str] = []
     entities: List[str] = []
@@ -209,7 +240,7 @@ def markdown_table_claim(headers: List[str], cells: List[str], row_position: int
         pairs.append("%s：%s" % (header, value))
         if not deterministic_position_cell(header, value, row_position):
             numbers.extend(extract_numeric_tokens(value))
-        entities.extend(item for item in ENTITY_PATTERN.findall(value) if is_business_entity_token(item))
+        entities.extend(item for item in ENTITY_PATTERN.findall(value) if is_business_entity_token(item, non_entity_tokens))
     numeric_values = dedupe_texts(numbers)
     entity_values = dedupe_texts(entities)
     if not numeric_values and not entity_values:
@@ -390,10 +421,10 @@ def trend_fact_groups(facts: List[VerifiedFact]) -> List[Dict[str, Any]]:
         by_task_row.setdefault((fact.task_id, fact.row_index), []).append(fact)
     rows_by_task: Dict[str, List[Dict[str, Any]]] = {}
     for (task_id, row_index), row_facts in by_task_row.items():
-        date_fact = next((fact for fact in row_facts if fact.value_type == "date" or fact.column == "pt"), None)
+        date_fact = next((fact for fact in row_facts if fact.value_type == "date"), None)
         for fact in row_facts:
             value = decimal_value(fact.value)
-            if value is None or fact.value_type != "number" or fact.column == "pt":
+            if value is None or fact.value_type != "number":
                 continue
             rows_by_task.setdefault("%s:%s" % (task_id, fact.column), []).append(
                 {
@@ -543,12 +574,14 @@ def fact_semantically_matches_claim(fact: VerifiedFact, claim_text: str, facts: 
     labels = fact_label_candidates(fact)
     if any(label and label in normalized_claim for label in labels):
         return True
+    if claim_asserts_direct_metric_value(claim_text):
+        return False
     numeric_candidates = [
         item
         for item in facts
         if decimal_value(item.value) is not None and decimal_value(item.value) == decimal_value(fact.value)
     ]
-    return len(numeric_candidates) == 1 and not claim_has_measure_label(normalized_claim, labels)
+    return len(numeric_candidates) == 1 and not claim_has_competing_fact_label(normalized_claim, labels, facts)
 
 
 def fact_label_candidates(fact: VerifiedFact) -> List[str]:
@@ -556,38 +589,23 @@ def fact_label_candidates(fact: VerifiedFact) -> List[str]:
         [
             normalize_label_text(fact.label),
             normalize_label_text(fact.column),
-            normalize_label_text(humanize_column_name(fact.column)),
         ]
     )
 
 
-def claim_has_measure_label(normalized_claim: str, expected_labels: List[str]) -> bool:
-    expected_tokens = {token for label in expected_labels for token in measure_label_tokens(label)}
-    claim_tokens = measure_label_tokens(normalized_claim)
-    return bool(claim_tokens - expected_tokens)
-
-
-def measure_label_tokens(text: str) -> Set[str]:
-    normalized = normalize_label_text(text)
-    tokens = {
-        token
-        for token in [
-            "gmv",
-            "金额",
-            "数量",
-            "比例",
-            "支付",
-            "退款",
-            "退货",
-            "订单",
-            "工单",
-            "赔付",
-            "优惠",
-            "用户",
-        ]
-        if token in normalized
+def claim_has_competing_fact_label(
+    normalized_claim: str,
+    expected_labels: List[str],
+    facts: List[VerifiedFact],
+) -> bool:
+    expected = {normalize_label_text(item) for item in expected_labels if item}
+    known = {
+        normalize_label_text(value)
+        for fact in facts
+        for value in [fact.label, fact.column]
+        if value
     }
-    return tokens
+    return any(label not in expected and label in normalized_claim for label in known)
 
 
 def normalize_label_text(value: Any) -> str:
@@ -650,13 +668,11 @@ def numeric_occurrences_are_contextual(raw: str, text: str) -> bool:
     )
 
 
-def is_business_entity_token(value: str) -> bool:
+def is_business_entity_token(value: str, non_entity_tokens: Set[str] | None = None) -> bool:
     text = str(value or "").strip().lower()
     if not text:
         return False
-    if re.search(r"_\d+[dhwmy]$", text):
-        return False
-    if any(fragment in text for fragment in ["_amt", "_amount", "_cnt", "_count", "_rate", "_ratio", "_gmv"]):
+    if normalize_label_text(text) in (non_entity_tokens or set()):
         return False
     return True
 
@@ -682,7 +698,54 @@ def claim_asserts_direct_metric_value(claim_text: str) -> bool:
     text = str(claim_text or "")
     if re.search(r"(变化|变动|差值|差额|增量|减少|增加|上升|下降|提升|降低|波动|环比|同比|涨幅|跌幅|少了|多了|change|delta|diff|increase|decrease)", text, flags=re.I):
         return False
-    return bool(re.search(r"(?:为|是|达到|等于|合计|总计|当前|本次|查询范围内).{0,12}[-+]?\d", text))
+    return bool(re.search(r"(?:为|是|达到|等于|合计|总计|当前|本次|查询范围内|[:：]).{0,12}[-+]?\d", text))
+
+
+def governed_fact_columns(intent: Any, task: Any) -> Set[str]:
+    columns: Set[str] = set()
+    contract = getattr(task, "node_plan_contract", None)
+    columns.update(str(item) for item in getattr(contract, "visible_columns", []) or [] if str(item))
+    if intent is None:
+        return columns
+    columns.update(
+        str(item)
+        for item in [
+            getattr(intent, "metric_column", ""),
+            getattr(intent, "metric_name", ""),
+            getattr(intent, "group_by_column", ""),
+            getattr(intent, "filter_column", ""),
+            *(getattr(intent, "output_keys", []) or []),
+            *(getattr(intent, "required_evidence", []) or []),
+        ]
+        if str(item)
+    )
+    resolution = dict(getattr(intent, "metric_resolution", {}) or {})
+    columns.update(str(item) for item in resolution.get("sourceColumns") or [] if str(item))
+    for spec in getattr(intent, "metric_specs", []) or []:
+        if not isinstance(spec, dict):
+            continue
+        columns.update(str(item) for item in spec.get("sourceColumns") or [] if str(item))
+        if spec.get("metricName"):
+            columns.add(str(spec.get("metricName")))
+    return columns
+
+
+def governed_column_labels(intent: Any, task: Any) -> Dict[str, str]:
+    labels: Dict[str, str] = {}
+    if intent is not None:
+        resolution = dict(getattr(intent, "metric_resolution", {}) or {})
+        for key in ["sourceColumnLabels", "columnLabels", "outputColumnLabels"]:
+            raw = resolution.get(key)
+            if isinstance(raw, dict):
+                labels.update({str(column): str(label) for column, label in raw.items() if column and label})
+    contract = getattr(task, "node_plan_contract", None)
+    for column, policy in (getattr(contract, "column_display_policy", {}) or {}).items():
+        if not isinstance(policy, dict):
+            continue
+        label = policy.get("displayName") or policy.get("label") or policy.get("title")
+        if label:
+            labels[str(column)] = str(label)
+    return labels
 
 
 def decimal_close(left: Decimal, right: Decimal) -> bool:
@@ -715,9 +778,15 @@ def decimal_value(value: Any) -> Decimal | None:
         return None
 
 
-def fact_value_type(column: str, value: Any) -> str:
+def fact_value_type(column: str, value: Any, declared_time_columns: Set[str] | None = None) -> str:
     text = str(column or "").lower()
-    if isinstance(value, (date, datetime)) or text == "pt" or re.search(r"(?:date|time|日期|时间)$", text):
+    temporal_value = str(value or "").strip()
+    if (
+        isinstance(value, (date, datetime))
+        or text in {str(item or "").strip().lower() for item in (declared_time_columns or set()) if str(item or "").strip()}
+        or bool(DATETIME_PATTERN.fullmatch(temporal_value))
+        or bool(DATE_PATTERN.fullmatch(temporal_value))
+    ):
         return "date"
     if decimal_value(value) is not None and not text.endswith("_id"):
         return "number"
@@ -726,9 +795,9 @@ def fact_value_type(column: str, value: Any) -> str:
     return "text"
 
 
-def fact_result_role(answer_mode: Any, group_by: str) -> str:
+def fact_result_role(answer_mode: Any, group_by: str, time_column: str = "") -> str:
     mode = str(getattr(answer_mode, "value", answer_mode) or "").upper()
-    if group_by == "pt" and mode == "GROUP_AGG":
+    if time_column and group_by == time_column and mode == "GROUP_AGG":
         return "trend_context"
     return {
         "METRIC": "summary",
@@ -737,6 +806,23 @@ def fact_result_role(answer_mode: Any, group_by: str) -> str:
         "DETAIL": "detail",
         "DERIVED": "derived",
     }.get(mode, "result")
+
+
+def task_time_column(intent: Any, task: Any) -> str:
+    contract = getattr(task, "node_plan_contract", None)
+    time_contract = getattr(contract, "time_window_contract", None) or {}
+    contract_column = declared_time_column_from_contract(time_contract)
+    return contract_column or declared_time_column_for_intent(intent)
+
+
+def declared_time_column_from_contract(contract: Any) -> str:
+    if not isinstance(contract, dict):
+        return ""
+    for key in ["partitionColumn", "partition_column", "timeColumn", "time_column"]:
+        value = str(contract.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def fact_id(task_id: str, row_index: int, column: str) -> str:

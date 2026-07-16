@@ -13,45 +13,27 @@ from merchant_ai.models import ChatResponse, GoldenEvaluationRequest
 from merchant_ai.services.repositories import write_json
 
 
-GOLDEN_QUESTIONS: List[Dict[str, Any]] = [
-    {
-        "id": "scm_inbound_7d",
-        "question": "最近 7 天入库量怎么样",
-        "expectedIntent": "metric_query",
-        "expectedTopics": ["SCM"],
-        "expectedSourceTypes": ["SEMANTIC_METRIC"],
-        "expectedMetrics": ["inbound_cnt"],
-    },
-    {
-        "id": "trade_order_count_7d",
-        "question": "最近7天订单量是多少？",
-        "expectedIntent": "metric_query",
-        "expectedTopics": ["TRADE"],
-        "expectedSourceTypes": ["SEMANTIC_METRIC"],
-        "expectedMetrics": ["order_detail_cnt"],
-    },
-    {
-        "id": "refund_metric_dispute",
-        "question": "退款率口径是不是退款单数除以下单订单数？",
-        "expectedIntent": "rule_data_mixed",
-        "expectedTopics": ["REFUND"],
-        "expectedDisclosure": ["metric_dispute"],
-    },
-    {
-        "id": "cross_table_refund_goods",
-        "question": "最近 7 天有退款的订单，关联看一下对应商品发布时间。",
-        "expectedIntent": "multi_hop",
-        "expectedTopics": ["REFUND", "GOODS"],
-        "expectedSourceTypes": ["SEMANTIC_RELATIONSHIP", "SEMANTIC_METRIC"],
-    },
-    {
-        "id": "platform_rule_only",
-        "question": "商家入驻资质规则是什么？",
-        "expectedIntent": "rule_only",
-        "expectedTopics": ["PLATFORM_RULE"],
-        "expectedSourceTypes": ["GOVERNED_RULE"],
-    },
-]
+def _bundled_golden_questions() -> List[Dict[str, Any]]:
+    """Expose the bundled evaluation resource without duplicating cases in code."""
+
+    source = Path(__file__).resolve().parents[2] / "resources" / "evaluation" / "golden_cases.jsonl"
+    if not source.exists():
+        return []
+    cases: List[Dict[str, Any]] = []
+    for line in source.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            item = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict) and item.get("id") and item.get("question"):
+            cases.append(item)
+    return cases
+
+
+GOLDEN_QUESTIONS: List[Dict[str, Any]] = _bundled_golden_questions()
 
 
 def evaluation_observability_record(debug_trace: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,7 +77,7 @@ class GoldenCaseLoader:
                     cases.append(item)
         if cases:
             return cases
-        return [dict(item) for item in GOLDEN_QUESTIONS]
+        return []
 
 
 class GoldenEvaluationService:

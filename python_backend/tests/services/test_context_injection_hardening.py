@@ -550,8 +550,8 @@ def test_memory_recall_profile_expands_colloquial_question():
         }
     )
 
-    assert {"商品", "退款", "退货", "排行", "风险"} <= set(context["expandedTerms"])
-    assert "高退款商品排行" in context["queryVariants"]
+    assert context["expandedTerms"] == set()
+    assert "这阵子哪个品退得最凶" in context["queryVariants"]
     assert {"ranking", "risk_ranking"} <= set(context["analysisIntents"])
     assert context["timeWindows"] == set()
 
@@ -655,7 +655,8 @@ def test_memory_query_understanding_falls_back_to_rules_when_small_model_unavail
     profile = service.ensure_state_profile({"question": "这阵子哪个品退得最凶"})
 
     assert profile["status"] == "unavailable"
-    assert {"商品", "退款", "退货", "排行", "风险"} <= set(profile["expandedTerms"])
+    assert profile["expandedTerms"] == []
+    assert profile["queryVariants"] == ["这阵子哪个品退得最凶"]
 
 
 def test_memory_query_understanding_preserves_provider_failure_reason():

@@ -1,6 +1,9 @@
 ---
 name: new_product_risk
 description: Use when verified evidence combines product publish or audit lifecycle with order, refund, compensation, or ticket evidence to judge risk for recently published or newly active products.
+title: 风险分析
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # New Product Risk Skill

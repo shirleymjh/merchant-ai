@@ -6,6 +6,8 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615180837",
   "generatedAt": "2026-06-15T18:08:37",
@@ -2576,14 +2578,20 @@
     {
       "metricKey": "ticket_rate",
       "businessName": "商品维度工单率",
-      "formula": "工单量 / 订单量",
+      "formula": "ticket_cnt / NULLIF(order_detail_cnt, 0)",
       "unit": "%",
-      "description": "工单量与订单量的比值",
-      "sourceColumns": [],
+      "description": "同一商品、订单集合或日期粒度下，客服工单明细量占订单明细去重下单数的比例；分子来自客服工单明细量，分母来自订单明细去重下单数。",
+      "sourceColumns": [
+        "ticket_cnt",
+        "order_detail_cnt"
+      ],
       "aliases": [
         "商品维度工单率",
         "ticket_rate",
-        "客服工单率"
+        "商品工单率",
+        "按商品工单率",
+        "商品客服工单率",
+        "工单明细率"
       ],
       "confidence": 0.8,
       "evidence": "由 Topic Builder 基于语义指标公式自动生成",
@@ -2592,6 +2600,9 @@
       "tableKind": "detail_fact",
       "metricGrain": "ticket_detail",
       "metricIntent": "detail_drilldown",
+      "metricType": "RATIO",
+      "aliasConflictScope": "SCOPED",
+      "metricDependencies": ["ticket_cnt", "order_detail_cnt"],
       "ambiguousAliases": [],
       "naturalName": "商品工单率",
       "originalBusinessName": "商品工单率",
@@ -2599,13 +2610,7 @@
       "sourceColumnAliases": [
         "order_detail_cnt",
         "ticket_cnt"
-      ],
-      "semanticCleanup": {
-        "droppedNonSchemaSourceColumns": [
-          "ticket_cnt",
-          "order_detail_cnt"
-        ]
-      }
+      ]
     }
   ],
   "terms": [

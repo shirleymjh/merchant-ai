@@ -37,6 +37,7 @@ from merchant_ai.services.evaluation import GoldenEvaluationService
 from merchant_ai.services.memory import MemoryGovernanceService, MemoryManagementService
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.repositories import write_json
+from merchant_ai.services.semantic_publish import SemanticPublishCoordinator
 from merchant_ai.services.runs import (
     AgentAsyncRunService,
     AgentRunManager,
@@ -74,6 +75,7 @@ golden_evaluation_service: GoldenEvaluationService
 topic_builder_workflow: TopicBuilderWorkflow
 semantic_governance: SemanticAssetGovernanceService
 recall_index_manager: RecallIndexManager
+semantic_publish_coordinator: SemanticPublishCoordinator
 attachment_store: AttachmentStore
 
 
@@ -95,6 +97,7 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     global topic_builder_workflow
     global semantic_governance
     global recall_index_manager
+    global semantic_publish_coordinator
     global attachment_store
 
     settings = runtime_settings or get_settings()
@@ -132,6 +135,12 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
             workflow.node_worker.doris_repository.clear_cache,
             workflow.keyword_service.reload_semantic_lexicon,
         ],
+    )
+    semantic_publish_coordinator = SemanticPublishCoordinator(
+        settings,
+        topic_assets,
+        semantic_governance,
+        recall_index_manager,
     )
     attachment_store = AttachmentStore(settings)
 
@@ -916,17 +925,15 @@ def publish_topic_asset(
             "tableName": table_name,
             "preflight": preflight,
         }
-    result = topic_assets.publish(topic, table_name, request.approved, request.reviewer, request.review_note)
-    if preflight:
-        result["preflight"] = preflight
-    if request.approved and result.get("status") == "PUBLISHED":
-        governance_result = semantic_governance.after_publish(topic, table_name, request.reviewer, request.review_note)
-        result["semanticGovernance"] = governance_result
-        index_result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
-        result["recallIndex"] = index_result
-        result["esUpsert"] = index_result.get("es", {})
-        result["cacheInvalidated"] = bool(index_result.get("cacheInvalidated"))
-    return result
+    if request.approved:
+        return semantic_publish_coordinator.publish_approved(
+            topic,
+            table_name,
+            request.reviewer,
+            request.review_note,
+            preflight,
+        )
+    return topic_assets.publish(topic, table_name, False, request.reviewer, request.review_note)
 
 
 @router.post("/api/topics/{topic}/tables/{table_name}/schema-diff")

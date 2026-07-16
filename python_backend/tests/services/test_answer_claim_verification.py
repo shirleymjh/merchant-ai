@@ -10,9 +10,15 @@ from merchant_ai.models import (
     QueryBundle,
     QueryPlan,
     QuestionIntent,
+    ResolvedTimeRange,
     VerifiedEvidence,
 )
-from merchant_ai.services.answer import AnswerComposeService
+from merchant_ai.services.answer import (
+    AnswerComposeService,
+    answer_requirement_coverage,
+    deterministic_structured_answer,
+    lightweight_answer_contract_verification,
+)
 from merchant_ai.services.answer_claims import AnswerClaimVerifier, build_verified_facts
 from merchant_ai.services.evaluation import GoldenEvaluationService
 
@@ -44,6 +50,7 @@ def detail_plan():
                 filter_column="order_id",
                 filter_value="order_1",
                 output_keys=["order_id", "pay_amt"],
+                metric_resolution={"sourceColumnLabels": {"pay_amt": "支付金额"}},
             )
         ]
     )
@@ -94,6 +101,69 @@ def metric_run(value=188.0):
         merged_query_bundle=bundle,
         verified_evidence=VerifiedEvidence(passed=True),
     )
+
+
+def comparison_metric_plan_and_run():
+    question = "最近30天GMV是多少？与前30天相比有什么变化？"
+    resolution = {
+        "semanticRefId": "semantic:经营画像:ads_merchant_profile:metric:order_gmv_amt_1d",
+        "metricKey": "order_gmv_amt_1d",
+        "ownerTable": "ads_merchant_profile",
+        "displayName": "GMV",
+        "unit": "元",
+        "valueFormat": "decimal",
+        "sourceColumns": ["order_gmv_amt_1d"],
+    }
+    plan = QueryPlan(
+        question_understanding={"timeWindowContract": {"requiresComparison": True}},
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="gmv_primary",
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_column="order_gmv_amt_1d",
+                metric_resolution=resolution,
+                time_range=ResolvedTimeRange(label="最近30天", window_role="primary"),
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="gmv_comparison",
+                preferred_table="ads_merchant_profile",
+                metric_name="order_gmv_amt_1d",
+                metric_column="order_gmv_amt_1d",
+                metric_resolution=resolution,
+                time_range=ResolvedTimeRange(label="前30天", window_role="comparison"),
+            ),
+        ],
+    )
+    primary = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[{"merchant_id": "100", "order_gmv_amt_1d": 27352.5}],
+        original_row_count=1,
+    )
+    comparison = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[{"merchant_id": "100", "order_gmv_amt_1d": 27471.0}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="gmv_primary", success=True, query_bundle=primary),
+            AgentTaskResult(task_id="gmv_comparison", success=True, query_bundle=comparison),
+        ],
+        merged_query_bundle=QueryBundle(
+            tables=["ads_merchant_profile"],
+            rows=[*primary.rows, *comparison.rows],
+            original_row_count=2,
+        ),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    return question, plan, run
 
 
 def test_verified_facts_are_task_and_cell_bound():
@@ -289,7 +359,121 @@ def test_answer_compose_keeps_verified_single_metric_fallback_when_llm_fact_is_w
     assert "999" not in answer
     assert "以结构化数据区域为准" not in answer
     assert service.last_answer_claim_trace["passed"] is True
+    assert service.last_answer_claim_trace["fallbackUsed"] is False
+    assert llm.payloads == []
+
+
+def test_lightweight_contract_allows_absolute_rendering_of_negative_change():
+    question, plan, run = comparison_metric_plan_and_run()
+
+    answer = deterministic_structured_answer(question, plan, run)
+    verification = lightweight_answer_contract_verification(question, plan, run, answer)
+
+    assert "下降 118.5元" in answer
+    assert verification is not None
+    assert verification.passed is True
+    assert verification.unsupported_claims == []
+
+
+def test_comparison_answer_keeps_verified_values_while_disclosing_missing_rate():
+    _, plan, run = comparison_metric_plan_and_run()
+    question = "最近30天GMV和退款率分别是多少？与前30天相比有什么变化？"
+    service = AnswerComposeService(ClaimAnswerLlm(""))
+
+    answer = service.compose(
+        question,
+        MerchantInfo(merchant_id="100"),
+        plan,
+        run,
+        "",
+        allow_llm=False,
+    )
+
+    assert "缺少的关键结果：退款率" in answer
+    assert "GMV为 27352.5元" in answer
+    assert "下降 118.5元" in answer
+    assert service.last_answer_claim_trace["passed"] is True
+
+
+def test_finalize_answer_recovers_verified_facts_when_supplied_fallback_also_fails():
+    service = AnswerComposeService(ClaimAnswerLlm(""))
+    plan = metric_plan()
+    run = metric_run(188.0)
+
+    answer = service._finalize_answer(
+        "最近7天总GMV金额为 999元。",
+        "最近7天GMV是多少？",
+        plan,
+        run,
+        fallback_answer="这题目前不能直接给出完整结论。已覆盖的结果：GMV。",
+    )
+
+    assert "188" in answer
+    assert "999" not in answer
+    assert service.last_answer_claim_trace["passed"] is True
     assert service.last_answer_claim_trace["fallbackUsed"] is True
+    assert any(
+        "unsupported_extra_value:999" in claim.get("reasons", [])
+        for claim in service.last_answer_claim_trace["rejectedClaims"]
+    )
+
+
+def test_rate_request_is_a_named_missing_requirement_instead_of_empty_block():
+    question = "最近30天GMV和退款率分别是多少？"
+    plan = metric_plan()
+    run = metric_run(188.0)
+
+    coverage = answer_requirement_coverage(question, plan, run)
+    answer = AnswerComposeService(ClaimAnswerLlm("")).compose(
+        question,
+        MerchantInfo(merchant_id="100"),
+        plan,
+        run,
+        "",
+        allow_llm=False,
+    )
+
+    assert coverage["shouldBlockDirectAnswer"] is True
+    assert [item["label"] for item in coverage["missing"]] == ["退款率"]
+    assert "缺少的关键结果：退款率" in answer
+    assert "188" in answer
+
+
+def test_rate_request_does_not_add_a_duplicate_gap_when_rate_metric_is_available():
+    question = "最近30天退款率是多少？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="refund_rate",
+                preferred_table="ads_merchant_profile",
+                metric_name="direct_refund_rate_by_pay_order",
+                metric_column="direct_refund_rate_by_pay_order",
+                metric_resolution={
+                    "metricKey": "direct_refund_rate_by_pay_order",
+                    "displayName": "退款率",
+                    "sourceColumns": ["direct_refund_rate_by_pay_order"],
+                },
+            )
+        ]
+    )
+    bundle = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[{"direct_refund_rate_by_pay_order": 0.12}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="refund_rate", success=True, query_bundle=bundle)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    coverage = answer_requirement_coverage(question, plan, run)
+
+    assert coverage["missing"] == []
+    assert coverage["shouldBlockDirectAnswer"] is False
 
 
 def test_golden_answer_score_honors_runtime_claim_verification():

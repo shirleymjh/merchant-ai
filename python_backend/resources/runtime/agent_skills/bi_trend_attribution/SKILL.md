@@ -1,6 +1,9 @@
 ---
 name: bi_trend_attribution
 description: Use when a merchant BI question asks whether a metric trend is normal, why a business metric changed, whether multiple KPI time series move together, or which measured drivers explain risk. The skill must only use verified SQL evidence rows and must attach every conclusion to data.
+title: BI 趋势与归因
+executionMode: python_script
+script: scripts/profile_timeseries.py
 ---
 
 # BI Trend And Attribution Skill

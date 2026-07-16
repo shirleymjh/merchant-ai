@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field
+from pydantic_core import core_schema
 
 
 def to_camel(value: str) -> str:
@@ -53,60 +54,80 @@ class QuestionRoute(str, Enum):
     BUSINESS = "BUSINESS"
 
 
-class QuestionCategory(str, Enum):
-    PLATFORM_RULE = "PLATFORM_RULE"
-    TRADE = "TRADE"
-    REFUND = "REFUND"
-    CS_TICKET = "CS_TICKET"
-    COMPENSATION = "COMPENSATION"
-    COUPON = "COUPON"
-    GOODS = "GOODS"
-    MERCHANT_OTHER = "MERCHANT_OTHER"
-    IDENTITY = "IDENTITY"
-    SCM = "SCM"
-    UNKNOWN = "UNKNOWN"
+class _OpenCategoryMeta(type):
+    """Compatibility surface for legacy ``QuestionCategory.NAME`` callers.
+
+    Attribute access is intentionally generic: no business category is compiled
+    into Python.  A new category published by an asset is accepted without a
+    code deployment, while old callers can continue treating the value like a
+    string enum during the migration.
+    """
+
+    _values: Dict[str, "QuestionCategory"] = {}
+
+    def __getattr__(cls, name: str) -> "QuestionCategory":
+        if name.isupper() and name.replace("_", "").isalnum():
+            return cls(name)
+        raise AttributeError(name)
+
+    def __iter__(cls) -> Iterator["QuestionCategory"]:
+        return iter(list(cls._values.values()))
 
 
-QUESTION_CATEGORY_DISPLAY: Dict[QuestionCategory, str] = {
-    QuestionCategory.PLATFORM_RULE: "平台商家规则",
-    QuestionCategory.TRADE: "电商交易",
-    QuestionCategory.REFUND: "电商退货",
-    QuestionCategory.CS_TICKET: "电商客服工单",
-    QuestionCategory.COMPENSATION: "电商理赔/赔付",
-    QuestionCategory.COUPON: "电商优惠券",
-    QuestionCategory.GOODS: "商品管理",
-    QuestionCategory.MERCHANT_OTHER: "商家其他信息",
-    QuestionCategory.IDENTITY: "身份信息",
-    QuestionCategory.SCM: "供应链",
-    QuestionCategory.UNKNOWN: "未知",
-}
+class QuestionCategory(str, metaclass=_OpenCategoryMeta):
+    """Open category identifier loaded from semantic assets at runtime.
+
+    This is not a closed business enum.  It keeps the historical public type
+    name and ``.value`` property only as a generic API compatibility shim.
+    """
+
+    def __new__(cls, value: Any = "UNKNOWN") -> "QuestionCategory":
+        normalized = str(getattr(value, "value", value) or "UNKNOWN").strip() or "UNKNOWN"
+        existing = _OpenCategoryMeta._values.get(normalized)
+        if existing is not None:
+            return existing
+        instance = str.__new__(cls, normalized)
+        _OpenCategoryMeta._values[normalized] = instance
+        return instance
+
+    @property
+    def value(self) -> str:
+        return str(self)
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _source: Any, _handler: Any) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(cls, core_schema.str_schema())
 
 
-TOPIC_TO_CATEGORY: Dict[str, QuestionCategory] = {
-    "平台商家规则": QuestionCategory.PLATFORM_RULE,
-    "电商交易": QuestionCategory.TRADE,
-    "电商退货": QuestionCategory.REFUND,
-    "客服工单": QuestionCategory.CS_TICKET,
-    "电商客服工单": QuestionCategory.CS_TICKET,
-    "客服理赔": QuestionCategory.COMPENSATION,
-    "电商理赔/赔付": QuestionCategory.COMPENSATION,
-    "电商优惠券": QuestionCategory.COUPON,
-    "商品管理": QuestionCategory.GOODS,
-    "商家其他信息": QuestionCategory.MERCHANT_OTHER,
-    "身份信息": QuestionCategory.IDENTITY,
-    "供应链": QuestionCategory.SCM,
-    "经营画像": QuestionCategory.TRADE,
-}
+# These exported dictionaries remain for import compatibility only.  They are
+# populated by TopicAssetService from published semantic assets, never by a
+# Python business-domain table.
+QUESTION_CATEGORY_DISPLAY: Dict[QuestionCategory, str] = {}
+TOPIC_TO_CATEGORY: Dict[str, QuestionCategory] = {}
 
 
-def category_display(category: QuestionCategory) -> str:
-    if isinstance(category, QuestionCategory):
-        return QUESTION_CATEGORY_DISPLAY.get(category, category.value)
-    try:
-        enum_category = QuestionCategory(str(category))
-        return QUESTION_CATEGORY_DISPLAY.get(enum_category, enum_category.value)
-    except Exception:
-        return str(category or QuestionCategory.UNKNOWN.value)
+def register_topic_contract(
+    topic: str,
+    category: Any,
+    display_name: str = "",
+    aliases: Optional[List[str]] = None,
+) -> QuestionCategory:
+    """Register one asset-declared topic/category/display contract."""
+
+    topic_name = str(topic or "").strip()
+    category_id = QuestionCategory(category or topic_name or QuestionCategory.UNKNOWN)
+    display = str(display_name or topic_name or category_id).strip()
+    QUESTION_CATEGORY_DISPLAY[category_id] = display
+    for name in [topic_name, display, str(category_id), *(aliases or [])]:
+        normalized = str(name or "").strip()
+        if normalized:
+            TOPIC_TO_CATEGORY[normalized] = category_id
+    return category_id
+
+
+def category_display(category: Any) -> str:
+    category_id = QuestionCategory(category)
+    return QUESTION_CATEGORY_DISPLAY.get(category_id, str(category_id))
 
 
 class AnswerMode(str, Enum):
@@ -1269,12 +1290,38 @@ class FreshnessCheckResult(APIModel):
     table: str = ""
     checked: bool = False
     status: str = ""
-    pt_column: str = "pt"
+    time_column: str = Field(
+        "",
+        validation_alias=AliasChoices("timeColumn", "time_column", "ptColumn", "pt_column"),
+    )
     requested_days: int = 0
-    min_pt: str = ""
-    max_pt: str = ""
+    min_time_value: str = Field(
+        "",
+        validation_alias=AliasChoices("minTimeValue", "min_time_value", "minPt", "min_pt"),
+    )
+    max_time_value: str = Field(
+        "",
+        validation_alias=AliasChoices("maxTimeValue", "max_time_value", "maxPt", "max_pt"),
+    )
     fallback_table: str = ""
     reason: str = ""
+
+    # Compatibility projections for callers and persisted traces created before
+    # freshness checks became physical-time-column agnostic.
+    @computed_field(alias="ptColumn", return_type=str)
+    @property
+    def pt_column(self) -> str:
+        return self.time_column
+
+    @computed_field(alias="minPt", return_type=str)
+    @property
+    def min_pt(self) -> str:
+        return self.min_time_value
+
+    @computed_field(alias="maxPt", return_type=str)
+    @property
+    def max_pt(self) -> str:
+        return self.max_time_value
 
 
 class NodePlanContract(APIModel):
@@ -1707,10 +1754,18 @@ class QueryBundle(APIModel):
     summary: str = ""
     offloaded_files: List[str] = Field(default_factory=list)
     original_row_count: int = 0
+    is_truncated: bool = False
+    lineage_complete: bool = True
+    source_row_counts: Dict[str, int] = Field(default_factory=dict)
+    source_artifact_refs: Dict[str, List[str]] = Field(default_factory=dict)
     duration_ms: int = 0
     cache_hit: bool = False
     cache_key: str = ""
     runtime_events: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.original_row_count > len(self.rows):
+            self.is_truncated = True
 
     def effective_row_count(self) -> int:
         return self.original_row_count or len(self.rows)

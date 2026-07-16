@@ -6,6 +6,8 @@
   "dataGrain": "商品/SPU 全流程快照粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615181734",
   "generatedAt": "2026-06-15T18:17:34",
@@ -4153,7 +4155,8 @@
         "供应链明细入库数量",
         "scm_inbound_total_cnt",
         "供应链入库数量",
-        "供应链入库量"
+        "供应链入库量",
+        "入库量"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=入库数量",

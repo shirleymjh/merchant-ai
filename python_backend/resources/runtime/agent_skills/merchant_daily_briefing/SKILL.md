@@ -1,6 +1,9 @@
 ---
 name: merchant_daily_briefing
 description: Use when a merchant asks for a daily/weekly operating briefing, store health summary, or what to prioritize today. The skill summarizes verified business signals into action priorities.
+title: 经营简报
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # Merchant Daily Briefing Skill

@@ -6,6 +6,8 @@
   "dataGrain": "商家申诉明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWD", "queryableByAgent": true, "authorityLevel": 85, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615181735",
   "generatedAt": "2026-06-15T18:17:35",

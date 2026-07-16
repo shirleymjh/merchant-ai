@@ -1,6 +1,9 @@
 ---
 name: ratio_analysis
 description: Use when the answer depends on a derived ratio, percentage, or population subset calculation. The skill must expose numerator, denominator, formula, and coverage gaps.
+title: 派生指标分析
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # Ratio Analysis Skill

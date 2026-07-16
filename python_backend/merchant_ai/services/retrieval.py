@@ -138,7 +138,11 @@ class EsKnowledgeRetrievalService:
         query_text = retrieval_query_text(request, rewritten_query=rewritten_query)
         normalized_categories = [category for category in [normalize_question_category(item) for item in request.topic_categories] if category]
         topics = self._allowed_topics(normalized_categories)
-        include_rules = QuestionCategory.PLATFORM_RULE in set(normalized_categories) or route_is_rule_sensitive(request)
+        include_rules = topic_categories_support_knowledge_capability(
+            self.topic_assets,
+            normalized_categories,
+            "rule",
+        ) or route_is_rule_sensitive(request)
         metric_candidates = self._resolve_metric_candidates(query_text, topics)
         retrieval_profile = build_retrieval_profile(
             query_text=query_text,
@@ -521,6 +525,8 @@ class EsKnowledgeRetrievalService:
         topic_names = topics or self.topic_assets.all_topic_names()
         candidates: list[dict[str, Any]] = []
         by_id: dict[str, dict[str, Any]] = {}
+        metrics_by_scope: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+        governance_by_scope: dict[tuple[str, str], dict[str, Any]] = {}
         for topic in topic_names:
             for manifest_item in self.topic_assets.load_manifest(topic):
                 table = str(manifest_item.get("tableName") or "")
@@ -534,6 +540,8 @@ class EsKnowledgeRetrievalService:
                     for metric in metrics
                     if str(metric.get("metricKey") or "")
                 }
+                metrics_by_scope[(topic, table)] = metrics_by_key
+                governance_by_scope[(topic, table)] = table_governance
                 for metric in metrics:
                     candidate = resolve_metric_candidate(metric, topic, table, query)
                     if candidate is None:
@@ -553,6 +561,26 @@ class EsKnowledgeRetrievalService:
                     current = by_id.get(semantic_ref_id)
                     if current is None or float(candidate.get("metricResolutionConfidence") or 0.0) > float(current.get("metricResolutionConfidence") or 0.0):
                         by_id[semantic_ref_id] = candidate
+        candidates = suppress_embedded_generic_metric_candidates(query, list(by_id.values()))
+        by_id = {str(candidate.get("semanticRefId") or ""): candidate for candidate in candidates}
+        for (topic, table), metrics_by_key in metrics_by_scope.items():
+            scoped_matches = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("topic") or "") == topic
+                and str(candidate.get("tableName") or "") == table
+            ]
+            for linked_candidate in linked_metric_variant_candidates(
+                scoped_matches,
+                metrics_by_key,
+                topic,
+                table,
+                governance_by_scope.get((topic, table), {}),
+            ):
+                semantic_ref_id = str(linked_candidate.get("semanticRefId") or "")
+                current = by_id.get(semantic_ref_id)
+                if current is None or compare_metric_candidate(linked_candidate, current) > 0:
+                    by_id[semantic_ref_id] = linked_candidate
         candidates = list(by_id.values())
         label_groups: dict[str, list[dict[str, Any]]] = {}
         for candidate in candidates:
@@ -631,6 +659,15 @@ class EsKnowledgeRetrievalService:
                 "canonicalMetricKey": candidate.get("canonicalMetricKey") or "",
                 "aliasOf": candidate.get("aliasOf") or "",
                 "metricLevel": candidate.get("metricLevel") or "",
+                "metricGrain": candidate.get("metricGrain") or "",
+                "metricIntent": candidate.get("metricIntent") or "",
+                "aggregationPolicy": candidate.get("aggregationPolicy") or "",
+                "selectionGuidance": candidate.get("selectionGuidance") or "",
+                "preferredUseCases": candidate.get("preferredUseCases") or [],
+                "notPreferredUseCases": candidate.get("notPreferredUseCases") or [],
+                "temporalVariants": candidate.get("temporalVariants") or {},
+                "linkedVariantOf": candidate.get("linkedVariantOf") or "",
+                "linkedVariantPath": candidate.get("linkedVariantPath") or "",
                 "formula": candidate.get("formula") or "",
                 "sourceColumns": candidate.get("sourceColumns") or [],
                 "aliases": candidate.get("aliases") or [],
@@ -732,6 +769,129 @@ def resolve_metric_candidate(metric: dict[str, Any], topic: str, table: str, que
     return best
 
 
+def linked_metric_variant_candidates(
+    base_candidates: list[dict[str, Any]],
+    metrics_by_key: dict[str, dict[str, Any]],
+    topic: str,
+    table: str,
+    table_governance: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Expand only links explicitly published in a metric's variant contract.
+
+    Retrieval does not decide which linked metric fits the question.  It exposes
+    compact candidates with the asset's aggregation and selection metadata so a
+    downstream semantic selector can make that decision.
+    """
+
+    linked: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for base_candidate in base_candidates:
+        base_metric = base_candidate.get("metric") if isinstance(base_candidate.get("metric"), dict) else {}
+        base_key = str(base_candidate.get("metricKey") or "")
+        base_ref = str(base_candidate.get("semanticRefId") or "")
+        base_confidence = max(0.0, min(1.0, float(base_candidate.get("metricResolutionConfidence") or 0.0)))
+        for link_path, variant_key in metric_linked_variant_refs(base_metric):
+            if not variant_key or variant_key == base_key or (base_ref, variant_key) in seen:
+                continue
+            seen.add((base_ref, variant_key))
+            variant_metric = metrics_by_key.get(variant_key)
+            if not isinstance(variant_metric, dict):
+                continue
+            linked_confidence = min(0.94, max(0.4, base_confidence - 0.03))
+            candidate = build_metric_candidate(
+                variant_metric,
+                topic,
+                table,
+                str(base_candidate.get("matchedMetricLabel") or base_candidate.get("businessName") or variant_key),
+                "linked_variant",
+                linked_confidence,
+                "temporalVariants.%s" % link_path,
+            )
+            candidate["metricResolutionReason"] = "%s; linked_variant_of=%s; link_path=%s" % (
+                str(candidate.get("metricResolutionReason") or ""),
+                base_key,
+                link_path,
+            )
+            candidate["linkedVariantOf"] = base_ref
+            candidate["linkedVariantPath"] = link_path
+            candidate["governance"] = {
+                **table_governance,
+                **recall_governance_metadata(variant_metric),
+            }
+            linked.append(candidate)
+    return linked
+
+
+def metric_linked_variant_refs(metric: dict[str, Any]) -> list[tuple[str, str]]:
+    variants = metric.get("temporalVariants") or metric.get("temporal_variants") or {}
+    if not isinstance(variants, (dict, list, tuple)):
+        return []
+    refs: list[tuple[str, str]] = []
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, str):
+            metric_ref = value.strip()
+            if metric_ref:
+                refs.append((path, metric_ref))
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = "%s.%s" % (path, key) if path else str(key)
+                visit(child, child_path)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                child_path = "%s[%d]" % (path, index)
+                visit(child, child_path)
+
+    visit(variants, "")
+    deduped: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for path, metric_ref in refs:
+        if metric_ref in seen:
+            continue
+        seen.add(metric_ref)
+        deduped.append((path, metric_ref))
+    return deduped
+
+
+def suppress_embedded_generic_metric_candidates(
+    query_text: str,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Prefer an explicit qualified label over its embedded generic label.
+
+    If a qualified label contains a shorter independent label, an occurrence
+    embedded only inside the qualified phrase does not count as a second request.
+    If the query separately contains both labels, both candidates are retained.
+    """
+
+    query = normalize_recall_label(query_text)
+    if not query or len(candidates) <= 1:
+        return candidates
+    suppressed: set[str] = set()
+    labelled = [
+        (candidate, normalize_recall_label(str(candidate.get("matchedMetricLabel") or "")))
+        for candidate in candidates
+    ]
+    for qualified, long_label in labelled:
+        if not long_label or long_label not in query:
+            continue
+        remainder = query.replace(long_label, " ")
+        for generic, short_label in labelled:
+            if generic is qualified or not short_label or short_label == long_label:
+                continue
+            if short_label not in long_label or short_label in remainder:
+                continue
+            qualified_ref = str(qualified.get("semanticRefId") or "")
+            generic_ref = str(generic.get("semanticRefId") or "")
+            if qualified_ref and generic_ref and qualified_ref != generic_ref:
+                suppressed.add(generic_ref)
+    if not suppressed:
+        return candidates
+    return [candidate for candidate in candidates if str(candidate.get("semanticRefId") or "") not in suppressed]
+
+
 def resolve_term_metric_candidate(term: dict[str, Any], metrics_by_key: dict[str, dict[str, Any]], topic: str, table: str, query_text: str) -> dict[str, Any] | None:
     if not isinstance(term, dict) or not metrics_by_key:
         return None
@@ -786,6 +946,13 @@ def build_metric_candidate(
         "canonicalMetricKey": str(metric.get("canonicalMetricKey") or ""),
         "aliasOf": str(metric.get("aliasOf") or ""),
         "metricLevel": str(metric.get("metricLevel") or ""),
+        "metricGrain": str(metric.get("metricGrain") or metric.get("grainHint") or ""),
+        "metricIntent": str(metric.get("metricIntent") or ""),
+        "aggregationPolicy": str(metric.get("aggregationPolicy") or ""),
+        "selectionGuidance": str(metric.get("selectionGuidance") or ""),
+        "preferredUseCases": metric.get("preferredUseCases") or [],
+        "notPreferredUseCases": metric.get("notPreferredUseCases") or [],
+        "temporalVariants": metric.get("temporalVariants") or {},
         "formula": str(metric.get("formula") or metric.get("metricFormula") or ""),
         "sourceColumns": metric.get("sourceColumns") or [],
         "aliases": metric.get("aliases") or [],
@@ -883,6 +1050,11 @@ def metric_trace_payload(candidates: list[dict[str, Any]]) -> list[dict[str, Any
                 "metricResolutionReason": str(item.get("metricResolutionReason") or ""),
                 "metricResolutionConfidence": float(item.get("metricResolutionConfidence") or 0.0),
                 "metricResolutionAmbiguous": bool(item.get("metricResolutionAmbiguous") or False),
+                "aggregationPolicy": str(item.get("aggregationPolicy") or ""),
+                "selectionGuidance": str(item.get("selectionGuidance") or ""),
+                "temporalVariants": item.get("temporalVariants") or {},
+                "linkedVariantOf": str(item.get("linkedVariantOf") or ""),
+                "linkedVariantPath": str(item.get("linkedVariantPath") or ""),
             }
         )
     return payload
@@ -1063,7 +1235,7 @@ def classify_query_type(
     metric_count = len(metric_candidates)
     relationship_tokens = ["关联", "对应", "join", "同时看", "再看", "并看"]
     analysis_tokens = ["趋势", "分析", "波动", "判断", "风险", "最高", "最低", "top", "前", "对比"]
-    detail_tokens = ["明细", "详情", "订单号", "sub_order", "id", "查询订单"]
+    detail_tokens = ["明细", "详情", "记录", "id"]
     has_relationship = any(token in query for token in relationship_tokens)
     has_analysis = any(token in query for token in analysis_tokens)
     has_detail = any(token in query for token in detail_tokens)
@@ -1179,7 +1351,7 @@ def source_type_top_k_policy(
             }
     query = str(query_text or "")
     relationship_heavy = any(token in query for token in ["关联", "对应", "join", "同时看", "再看", "并看"])
-    metric_heavy = bool(metric_candidates) or any(token in query for token in ["金额", "率", "量", "GMV", "退款", "下单"])
+    metric_heavy = bool(metric_candidates)
     if relationship_heavy:
         policy["SEMANTIC_RELATIONSHIP"] = min(policy["SEMANTIC_RELATIONSHIP"] + 2, 12)
     if metric_heavy:
@@ -1347,7 +1519,7 @@ def rewrite_retrieval_query(request: KnowledgeRetrievalRequest) -> str:
     if not current or not previous or current == previous:
         return current
     follow_up = bool(FOLLOW_UP_QUERY_RE.search(current)) or any(
-        token in current for token in ["按商品看", "按天看", "按周看", "细分一下", "继续下钻", "换个维度"]
+        token in current for token in ["按天看", "按周看", "细分一下", "继续下钻", "换个维度"]
     )
     if not follow_up:
         return current
@@ -1612,21 +1784,6 @@ def retrieval_query_text(request: KnowledgeRetrievalRequest, rewritten_query: st
     return " ".join(values)
 
 
-GENERIC_METRIC_LABELS = {
-    "金额",
-    "数量",
-    "单量",
-    "商品",
-    "订单",
-    "退款",
-    "退货",
-    "售后",
-    "支付",
-    "下单",
-    "情况",
-}
-
-
 def exact_metric_label_in_query(metric: dict[str, object], query_text: str) -> str:
     query = normalize_recall_label(query_text)
     if not query:
@@ -1650,7 +1807,7 @@ def normalize_recall_label(value: str) -> str:
 
 
 def is_protective_metric_label(label: str) -> bool:
-    if not label or label in GENERIC_METRIC_LABELS:
+    if not label:
         return False
     if "_" in label:
         return len(label) >= 4
@@ -1671,6 +1828,41 @@ def normalize_question_category(category: object) -> QuestionCategory | None:
         if category_display(item) == raw:
             return item
     return None
+
+
+def topic_categories_support_knowledge_capability(
+    topic_assets: TopicAssetService,
+    categories: list[QuestionCategory],
+    capability: str,
+) -> bool:
+    """Resolve retrieval lanes from published topic roles, never topic IDs."""
+
+    expected = re.sub(r"[^A-Z0-9]+", "_", str(capability or "").upper()).strip("_")
+    if not expected:
+        return False
+    for topic in topic_assets.topic_names_for_categories(categories):
+        contract = topic_assets.load_topic_contract(topic)
+        metadata = contract.get("metadata") if isinstance(contract.get("metadata"), dict) else {}
+        declared_values: list[Any] = []
+        for source in (contract, metadata):
+            for key in (
+                "capabilities",
+                "knowledgeCapabilities",
+                "knowledgeCapability",
+                "knowledgeRoles",
+                "knowledgeRole",
+                "retrievalCapabilities",
+                "routingRole",
+                "topicRole",
+            ):
+                value = source.get(key)
+                declared_values.extend(value if isinstance(value, list) else [value])
+        for value in declared_values:
+            normalized = re.sub(r"[^A-Z0-9]+", "_", str(value or "").upper()).strip("_")
+            tokens = [token for token in normalized.split("_") if token]
+            if normalized == expected or expected in tokens:
+                return True
+    return False
 
 
 def route_is_rule_sensitive(request: KnowledgeRetrievalRequest) -> bool:

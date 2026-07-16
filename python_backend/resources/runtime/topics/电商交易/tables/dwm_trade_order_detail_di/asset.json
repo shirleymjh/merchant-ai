@@ -6,6 +6,8 @@
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615180836",
   "generatedAt": "2026-06-15T18:08:36",
@@ -3834,7 +3836,11 @@
         "订单去重下单数",
         "按订单下单数",
         "订单明细下单数",
-        "关联下单量"
+        "关联下单量",
+        "关联订单量",
+        "商品订单量",
+        "按商品订单量",
+        "后续订单量"
       ],
       "confidence": 0.88,
       "evidence": "semantic metric from sub_order_id distinct count",
@@ -4051,7 +4057,12 @@
         "pay_amt",
         "按订单支付金额",
         "交易支付金额",
-        "交易成交金额"
+        "交易成交金额",
+        "订单GMV",
+        "商品GMV",
+        "按商品GMV",
+        "关联GMV",
+        "后续GMV"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=支付金额，分; samples=[11.61, 12.72, 13.83, 14.94, 16.05, 17.16, 18.27, 19.38]",

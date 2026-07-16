@@ -136,11 +136,12 @@ def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", ta
     if not target_name and isinstance(raw_target, dict):
         target_name = str(raw_target.get("name") or raw_target.get("endpoint") or "")
     service = service_name or str(safe_args.get("_service") or safe_args.get("service") or "")
-    merchant_id = str(
-        safe_args.get("merchantId")
-        or safe_args.get("merchant_id")
-        or safe_args.get("sellerId")
-        or safe_args.get("seller_id")
+    scope = safe_args.get("_scope") if isinstance(safe_args.get("_scope"), dict) else {}
+    principal_id = str(
+        scope.get("principalId")
+        or scope.get("tenantId")
+        or safe_args.get("principalId")
+        or safe_args.get("tenantId")
         or ""
     )
     thread_id = str(safe_args.get("threadId") or safe_args.get("thread_id") or "")
@@ -150,7 +151,7 @@ def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", ta
         tool_name,
         service,
         target_name or "default",
-        merchant_id or "*",
+        principal_id or "*",
         thread_id or "*",
     )
     fingerprint = "%s|params=%s" % (circuit_key, params_hash)
@@ -158,7 +159,7 @@ def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", ta
         "toolName": tool_name,
         "serviceName": service,
         "target": target_name or "default",
-        "merchantId": merchant_id,
+        "merchantId": principal_id,
         "threadId": thread_id,
         "paramsHash": params_hash,
         "circuitKey": circuit_key,

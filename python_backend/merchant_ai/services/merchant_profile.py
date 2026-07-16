@@ -101,11 +101,20 @@ class MerchantProfileSummaryService:
             focus_categories=focus_categories,
             constraints=memory_constraints,
         )
-        time_window_days = int(route_payload.get("timeWindowDays") or time_window.get("days") or 0)
+        fast_time_range = fast_payload.get("timeRange") or fast_payload.get("time_range") or {}
+        if not isinstance(fast_time_range, dict):
+            fast_time_range = {}
+        time_window_days = int(
+            route_payload.get("timeWindowDays")
+            or time_window.get("days")
+            or fast_payload.get("timeWindowDays")
+            or fast_time_range.get("days")
+            or 0
+        )
         return {
             "merchantId": merchant.merchant_id,
             "merchantName": merchant.merchant_name or merchant.company_name,
-            "defaultTimeWindow": time_window_days or 7,
+            "defaultTimeWindow": time_window_days,
             "defaultTimeWindowDays": time_window_days,
             "preferredMetrics": preferred_metrics,
             "businessFocus": focus_categories,
@@ -129,23 +138,19 @@ class MerchantProfileSummaryService:
         focus_categories: List[str],
         constraints: List[Dict[str, Any]],
     ) -> List[str]:
-        candidates: List[str] = []
-        pattern = str(recent_focus.get("focusPattern") or recent_focus.get("focus_pattern") or "")
-        for keyword in ["退款率升高", "GMV下滑", "GMV 下降", "订单下降", "工单升高", "客诉升高", "履约异常", "赔付升高"]:
-            if keyword.replace(" ", "") in pattern.replace(" ", ""):
-                candidates.append(keyword.replace("GMV 下降", "GMV下滑"))
-        metric_text = " ".join(preferred_metrics)
-        focus_text = " ".join(focus_categories)
-        if "退款" in metric_text or "退款" in focus_text:
-            candidates.append("退款率升高")
-        if "工单" in metric_text or "客诉" in metric_text or "客服" in focus_text:
-            candidates.append("客诉/工单升高")
-        if "履约" in focus_text or "发货" in focus_text:
-            candidates.append("履约异常")
+        del preferred_metrics, focus_categories
+        candidates = _clean_list(
+            recent_focus.get("riskSignals")
+            or recent_focus.get("risk_signals")
+            or recent_focus.get("recentRisks")
+            or recent_focus.get("recent_risks"),
+            limit=6,
+        )
         for item in constraints or []:
-            text = str(item.get("instruction") or "")
-            if "风险" in text or "异常" in text or "升高" in text or "下降" in text:
-                candidates.append(text[:80])
+            classification = str(item.get("classification") or item.get("kind") or "").lower()
+            severity = str(item.get("severity") or item.get("riskLevel") or "").lower()
+            if classification in {"risk", "anomaly"} or severity in {"high", "critical", "warning"}:
+                candidates.append(str(item.get("instruction") or item.get("summary") or "")[:80])
         return _clean_list(candidates, limit=6)
 
 
@@ -215,7 +220,7 @@ class MerchantProfileStore:
             "updatedAt": profile.get("updatedAt", ""),
             "validUntil": profile.get("validUntil", ""),
         }
-        merged["defaultTimeWindow"] = int(profile.get("defaultTimeWindow") or merged.get("defaultTimeWindow") or 7)
+        merged["defaultTimeWindow"] = int(profile.get("defaultTimeWindow") or merged.get("defaultTimeWindow") or 0)
         merged["preferredMetrics"] = _clean_list([*(profile.get("preferredMetrics") or []), *(merged.get("preferredMetrics") or [])], limit=12)
         merged["confirmedRules"] = self._merge_rules(profile.get("confirmedRules") or [], merged.get("confirmedRules") or [])
         merged["confirmedRuleTexts"] = _clean_list(
@@ -253,7 +258,7 @@ class MerchantProfileStore:
     def _default_profile(self, merchant_id: str) -> Dict[str, Any]:
         return {
             "merchantId": str(merchant_id or self.settings.merchant_id),
-            "defaultTimeWindow": 7,
+            "defaultTimeWindow": 0,
             "preferredMetrics": [],
             "confirmedRules": [],
             "confirmedRuleTexts": [],

@@ -6,6 +6,8 @@
   "dataGrain": "保证金充值流水粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWD", "queryableByAgent": true, "authorityLevel": 85, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615181735",
   "generatedAt": "2026-06-15T18:17:35",
@@ -410,6 +412,8 @@
       ],
       "aliases": [
         "保证金明细充值金额",
+        "保证金充值金额",
+        "充值金额",
         "deposit_recharge_amt",
         "金额, 通用单位元",
         "保证金补缴金额",
@@ -441,6 +445,9 @@
       ],
       "aliases": [
         "保证金明细充值流水数",
+        "保证金充值流水数",
+        "充值流水数",
+        "流水数",
         "deposit_recharge_cnt"
       ],
       "confidence": 0.82,

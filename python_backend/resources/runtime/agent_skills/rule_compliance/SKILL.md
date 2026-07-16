@@ -1,6 +1,9 @@
 ---
 name: rule_compliance
 description: Use when a merchant BI answer combines platform rules or policy guidance with measured evidence. The skill must keep recalled rule evidence separate from SQL facts.
+title: 规则与数据核对
+executionMode: structured_renderer
+renderer: verified_evidence
 ---
 
 # Rule Compliance Skill

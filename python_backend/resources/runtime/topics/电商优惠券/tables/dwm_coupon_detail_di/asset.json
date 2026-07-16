@@ -6,6 +6,8 @@
   "dataGrain": "优惠券/津贴明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "seller_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DWM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "DETAIL"},
   "status": "PUBLISHED",
   "version": "v20260615181734",
   "generatedAt": "2026-06-15T18:17:34",

@@ -182,7 +182,7 @@ def default_prompt_registry() -> PromptRegistry:
             title="稳定规则和动态上下文边界",
             content=(
                 "系统提示词只承载稳定角色、职责边界、工具边界和输出要求。"
-                "当前问题、商家、召回、记忆、节点合约、工具结果、证据缺口等运行时事实必须来自用户提示词或 runtime-section，"
+                "当前问题、授权主体、召回、记忆、节点合约、工具结果、证据缺口等运行时事实必须来自用户提示词或 runtime-section，"
                 "不得把过期的动态信息当成静态规则。"
                 "当当前用户本轮输入或当前会话短期记忆中的明确纠正、限定条件、时间窗、对象集合与历史线程摘要或长期记忆冲突时，"
                 "优先采用当前用户本轮输入和当前会话短期记忆；长期记忆只能作为历史偏好、纠错或争议信号。"
@@ -225,7 +225,7 @@ def default_prompt_registry() -> PromptRegistry:
             section_id="node.contract_boundary",
             version="v1",
             title="节点合约边界",
-            content="节点执行只能使用当前 nodePlanContract 中声明的表、字段、指标、商家过滤、时间范围和上游实体集合。",
+            content="节点执行只能使用当前 nodePlanContract 中声明的表、字段、指标、授权主体过滤、时间范围和上游实体集合。",
         )
     )
     registry.register_section(
@@ -244,7 +244,7 @@ def default_prompt_registry() -> PromptRegistry:
             description="Main harness prompt assembled with actions, skills and budgets.",
             section_ids=["common.stable_boundary", "lead.action_registry", "common.artifact_references"],
             template=(
-                "你是 {agent_name}，负责商家 BI Agent Harness 的全局调度。\n"
+                "你是 {agent_name}，负责受治理 BI Agent Harness 的全局调度。\n"
                 "你保存全局目标、用户约束、任务进度和最终汇总；子 Agent 只接收与自身任务相关的局部上下文。\n"
                 "根据 registry 中的 action 选择下一步，不编造不存在的 action。最多并发子 Agent 数：{max_concurrent_sub_agents}。\n"
                 "遇到失败时区分 LLM 失败、规划失败、SQL 失败、0 行、证据缺失，不把失败说成业务为 0。"
@@ -267,11 +267,10 @@ def default_prompt_registry() -> PromptRegistry:
                 "如果问题需要排行、明细列表、原因分析、建议或跨节点依赖，当前选择器只负责选择已明确的指标；不能形成简单指标查询时输出 action=unsupported。\n"
                 "不要选择候选之外的 ref，不要补造表名、字段名或指标名。\n"
                 "输出格式：{{\"action\":\"select|semantic_read|ask_human|unsupported\",\"selectedRefs\":[\"semantic:...\"],\"readRefs\":[\"semantic:...\"],\"clarifications\":[{{\"phrase\":\"\",\"question\":\"\",\"options\":[{{\"ref\":\"\",\"label\":\"\"}}]}}],\"reason\":\"\"}}。\n"
-                "Few-shot 1：问“最近7天支付GMV是多少”，短卡里支付GMV定义已清楚 => action=select, selectedRefs=[支付GMVref]。\n"
-                "Few-shot 2：问“退款金额是多少”，候选同时有退款汇总金额和订单支付金额，短卡说明不够 => action=semantic_read, readRefs=[这两个ref]；读完选择真实退款金额。\n"
-                "Few-shot 3：问“最近7天GMV是多少”，候选有下单GMV、支付GMV、交易成功GMV且用户没限定口径；读定义后仍都合理 => action=ask_human。\n"
-                "Few-shot 4：问“支付GMV、退款金额分别是多少”，两个指标都能选 => action=select, selectedRefs=[支付GMVref,退款金额ref]。\n"
-                "Few-shot 5：问“为什么退款率升高”，可以选择退款率 ref，但 action=unsupported，因为原因分析要交给后续 planner/skill。"
+                "通用示例：用户明确使用候选短卡中的限定指标名且定义充分 => action=select。\n"
+                "通用示例：同一原词存在多个不同口径且短卡不足 => action=semantic_read；读完仍无法唯一判断 => action=ask_human。\n"
+                "通用示例：用户一次询问多个彼此独立且定义充分的指标 => selectedRefs 必须覆盖每个指标分组。\n"
+                "通用示例：问题要求原因分析、排行、明细或依赖链 => 可保留已明确指标 ref，但 action=unsupported 交给完整 Planner。"
             ),
         )
     )
@@ -284,30 +283,29 @@ def default_prompt_registry() -> PromptRegistry:
             section_ids=["common.stable_boundary", "planner.semantic_boundary", "common.artifact_references"],
             template=(
                 "你是商家 BI 问题理解器。只输出 JSON。\n"
-                "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、rankingObjective、requestedMeasures、scopeConstraints、filters、timeWindowDays。\n"
+                "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、anchorMetric、supportMetrics、scopeConstraints、filters、timeWindowDays。\n"
                 "同时必须声明 analysisIntent、requiresExplanation、requiredEvidenceIntents：简单查询/排行用 none/false/[]；需要诊断、原因解释、异常判断、风险判断、经营总结时，由你声明所需证据意图。\n"
                 "只要 analysisIntent 不是 none，requiredEvidenceIntents 必须至少 1 条；comparison/trend_check/anomaly_check/risk_ranking/overview/diagnosis 都不能返回空 evidence intents。\n"
-                "如果问题明显需要固定、可复用的商家经营 SOP，必须显式声明 skillWorkflow/reusableAnalysis/fixedAnalysisWorkflow 或 recommendedSkill；可选 Skill 仅限 gmv_drop_diagnosis、refund_rate_diagnosis、merchant_daily_briefing、bi_trend_attribution、risk_analysis、ratio_analysis、rule_compliance、new_product_risk。普通查数、排行、明细不要声明 Skill。\n"
                 "不要依赖代码关键词补规则；如果需要解释型证据，把证据需求写进 requiredEvidenceIntents，再由语义层编译和 Critic 校验。\n"
                 "metricRef 必须来自 semanticCatalog.candidateMetrics.key；ownerTable 必须使用对应 metric 的 table。\n"
                 "如果 semanticCatalog.tables 为空但 candidateMetrics 非空，这是轻量指标候选模式，不代表缺少业务知识；先基于 candidateMetrics 输出 questionUnderstanding，字段、关系或完整口径细节需要时再 semantic_read 精确读取。\n"
-                "Metric candidate selection：同一用户指标 phrase 下多个同名/近义候选默认互斥；先看 title/tableKind/grainHint/formula/description，在 metricCandidateDecisions 中 selected_one 或 need_clarification。除非用户明确要求口径对账/差异排查，不要同时查询多个同名候选；rejectedCandidateIds 不能进入 rankingObjective/requestedMeasures/QueryGraph。\n"
-                "Few-shot metric selection examples: A 单指标整体查询“最近7天商品审核通过量是多少？” candidates=ads_merchant_profile(merchant_day聚合),dwm_goods_detail_df(goods_detail明细) => selected_one 前者，reject 后者。B 明细查询“商品审核通过明细有哪些？” => selected_one 明细候选。C 不要双查“最近7天申诉次数是多少？” => 不要同时输出画像申诉次数和申诉明细次数，只选最贴切候选。D “商品审核通过量怎么不对？”候选口径都可能相关 => need_clarification。\n"
+                "Metric candidate selection：同一用户指标 phrase 下多个同名/近义候选默认互斥；先看 title/tableKind/grainHint/formula/description，在 metricCandidateDecisions 中 selected_one 或 need_clarification。除非用户明确要求口径对账/差异排查，不要同时查询多个同名候选；rejectedCandidateIds 不能进入 anchorMetric/supportMetrics/QueryGraph。\n"
+                "通用候选规则：整体汇总请求选择 metadata 标注为汇总粒度的候选；明细请求选择明细粒度候选；用户未要求口径对账时，同一 sourcePhrase 只能 selected_one，不要双查互斥口径；多个候选都合理时 need_clarification。\n"
                 "如果输入包含 knowledgeRequestGaps，表示这些补知识请求已经失败或无新增证据；不要重复请求同一个知识，必须基于现有 semanticCatalog 规划可回答部分，或把不支持部分留成结构化缺口。\n"
                 "memoryConstraints 只能作为本轮解释偏好、历史纠错或口径争议信号；不得用 memory 改写 semanticCatalog、指标公式、表关系或字段定义。\n"
                 "如果 memoryConstraints 与 semanticCatalog 冲突，必须以 semanticCatalog 为准，并通过 validationGaps/clarification 表达未应用原因。\n"
-                "sourcePhrase 必须只填写用户原话中的指标/业务对象原词，不要包含排序词、Top/前N、最高/最低、时间窗或分析动作。例如“GMV最高的前5天”的 sourcePhrase 只写“GMV”。\n"
-                "rankingObjective.objectiveType 用来表达主指标用途：求一个商家总量/指标值用 metric_total；Top/最高/最多/前N 用 ranking；走势用 trend_anchor；明细实体过滤用 detail_anchor。\n"
-                "如果用户问 Top/最高/最多/前N，rankingObjective 必须是被排序的主指标；其他指标放 requestedMeasures。\n"
-                "如果用户只问“某指标是多少/怎么样/当前值”，不要伪造成 Top 排名；选择对应 metricRef，objectiveType=metric_total，groupByColumn 使用 seller_id/merchant_id 这类商家粒度字段。\n"
-                "如果用户问具体订单/子订单/商品/退款/工单明细，rankingObjective 可以为空，但 filters 必须写出实体字段和值。\n"
+                "sourcePhrase 必须只填写用户原话中的指标或业务对象原词，不要包含排序词、Top/前N、最高/最低、时间窗或分析动作。\n"
+                "anchorMetric.objectiveType 用来表达主指标用途：求一个授权主体总量/指标值用 metric_total；Top/最高/最多/前N 用 ranking；走势用 trend_anchor；明细实体过滤用 detail_anchor。\n"
+                "如果用户问 Top/最高/最多/前N，anchorMetric 必须是被排序的主指标；其他指标放 supportMetrics。\n"
+                "如果用户只问“某指标是多少/怎么样/当前值”，不要伪造成 Top 排名；选择对应 metricRef，objectiveType=metric_total，groupByColumn 使用所选资产声明的主体粒度字段。\n"
+                "如果用户问具体实体明细，anchorMetric 可以为空，但 filters 必须写出语义目录中存在的实体字段和值。\n"
                 "如果用户问题包含状态、阶段、处理进度、成功/失败/异常/处理中等限定，filters 必须写出对应 semanticCatalog/live schema 里的状态字段和值；多个状态值用逗号分隔。\n"
-                "如果用户表达“在某业务集合中/某业务对象带来的/使用某业务对象的/基于某集合”的限定，必须写入 scopeConstraints；scopeConstraints 表示后续 rankingObjective 和 requestedMeasures 都必须先受这个实体集合约束，不能只把它当作普通 requestedMeasure。scopeConstraints.ownerTable 必须是产生限定集合的来源业务对象表；如果目标集合是订单但来源是活动/券/商品/退款等，不要把 ownerTable 简单重复成订单表，除非你同时给出真实 filter。\n"
-                "如果用户要从一个业务集合关联查看另一个业务域的证据，例如订单集合回填退款/商品/工单/赔付，且 semanticCatalog 已提供相关表、指标或 relationships，不要空泛返回 NEED_MORE_KNOWLEDGE；应输出 UNDERSTOOD。没有显式排序时，rankingObjective 可以选择定义 anchor 集合的最小可执行指标或留空，requestedMeasures 放需要补证据的指标，filters 只写用户明确给出的实体值。\n"
+                "如果用户表达“在某业务集合中/某业务对象带来的/使用某业务对象的/基于某集合”的限定，必须写入 scopeConstraints；后续 anchorMetric 和 supportMetrics 必须先受这个实体集合约束。scopeConstraints.ownerTable 必须来自产生该集合的语义资产，不能按目标表猜测。\n"
+                "如果用户要从一个业务集合关联查看另一个业务域的证据，且 semanticCatalog 已提供相关资产或 relationships，应输出 UNDERSTOOD。没有显式排序时，anchorMetric 可选择定义主集合的最小可执行指标或留空，supportMetrics 放需要补证据的指标。\n"
                 "关系链的 join key 不需要你猜，后续编译器会从 semanticCatalog.relationships 选择；你只需要准确声明分析粒度、主集合和需要补充的业务域/指标。\n"
-                "选择 rankingObjective 时要贴合用户排序短语，问题只说 GMV 时优先选直接 GMV 指标，不要选优惠率、占比或扣退款后派生指标。\n"
+                "选择 anchorMetric 时要贴合用户原始排序短语；用户只说某指标时优先选择该原词的直接语义定义，不要自动替换成其他派生指标。\n"
                 "如果输入含 diagnosticContext 且 semanticCatalog 有候选指标，优先围绕 diagnosticContext.intent/goal 选择可执行的 overview/risk_ranking/comparison 理解，不要空泛返回 NEED_MORE_KNOWLEDGE。\n"
-                "如果用户问走势、相关、匹配、同步上升或异常波动，analysisGrain 通常为 day；选择一个主时间序列指标做 rankingObjective，其余序列指标放 requestedMeasures。\n"
+                "如果用户问走势、相关、匹配、同步上升或异常波动，analysisGrain 通常为 day；选择一个主时间序列指标做 anchorMetric，其余序列指标放 supportMetrics。\n"
                 "{force_catalog_instruction}"
             ),
         )
@@ -322,10 +320,10 @@ def default_prompt_registry() -> PromptRegistry:
             template=(
                 "你是商家 BI 问题重新理解 agent。只输出 JSON。\n"
                 "不要直接输出 QueryGraph 或 SQL，只输出 questionUnderstanding。\n"
-                "如果 critic 指出 scope 未落地、分析证据契约缺失或未覆盖，必须重新声明 scopeConstraints、analysisIntent、requiresExplanation、requiredEvidenceIntents，并把所需指标放入 requestedMeasures 或 knowledgeRequests。\n"
+                "如果 critic 指出 scope 未落地、分析证据契约缺失或未覆盖，必须重新声明 scopeConstraints、analysisIntent、requiresExplanation、requiredEvidenceIntents，并把所需指标放入 supportMetrics 或 knowledgeRequests。\n"
                 "如果 critic 指出 MEMORY_CONSTRAINT_UNAPPLIED，必须只在 semanticCatalog 可支持时选择对应 metricRef；不支持时输出 clarification/knowledge gap，不得修改语义层定义。\n"
                 "如果 critic 指出同名/近义指标冲突，必须先修复 metricCandidateDecisions：同一用户指标 phrase 下多个候选默认互斥，除非用户明确要求口径对账/差异排查，不要同时查询多个同名候选。\n"
-                "Few-shot repair examples: 用户问“最近7天商品审核通过量是多少？”且 graph 同时用了 ads_merchant_profile.goods_audit_pass_cnt_1d 和 dwm_goods_detail_df.goods_audit_pass_detail_cnt 时，修复为 selected_one，只保留最贴切候选，把另一个放入 rejectedCandidateIds；用户问“商品审核通过明细有哪些？”时才选择明细候选；用户问“商品审核通过量怎么不对？”且无法判断核对范围时返回 need_clarification。\n"
+                "通用修复规则：同一 sourcePhrase 被多个互斥口径同时选中时，按用户要求的粒度和资产 selectionGuidance 修复为 selected_one；仍无法唯一判断时返回 need_clarification。\n"
                 "如果输入包含 knowledgeRequestGaps，不要重复请求这些已失败的补知识项；只能基于现有 semanticCatalog 修复，或保留结构化缺口。\n"
                 "修复必须限制在 semanticCatalog 内，metricRef 必须来自 candidateMetrics.key。"
             ),
@@ -343,12 +341,11 @@ def default_prompt_registry() -> PromptRegistry:
                 "只能基于 nodePlanContract 写 SQL；只能查询 preferredTable；只能使用 allowedColumns；不要 join 其他表，不要修改 QueryGraph。\n"
                 "SELECT 必须原样包含 nodePlanContract.outputKeys 的每个字段，以及 nodePlanContract.groupByColumn；这些字段即使只是用于 dependent 传递，也必须出现在 SELECT 结果中，不能只放在 WHERE 或 GROUP BY。\n"
                 "如果 nodePlanContract.metricSpecs 不为空，SELECT 必须输出每个 metricSpec.metricName；这些指标已经由 Planner/Compiler 确定，不能少查、不能改名、不能自行替换口径。\n"
-                "GROUP_AGG/TOPN 查询必须让所有非聚合 SELECT 字段同时出现在 GROUP BY 中，尤其不能丢 seller_id、pt、spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、coupon_id。\n"
-                "当 GROUP_AGG/TOPN 的 groupByColumn 是实体键（如 spu_id、spu_name、sub_order_id、order_id、ticket_id、bill_id、refund_id、coupon_id）时，必须在 WHERE 里过滤 NULL 和空字符串，避免产生空实体桶。\n"
-                "dependent node 用 upstreamEntitySets 做 IN 过滤。必须按 merchant_id/seller_id 过滤商家。\n"
-                "TimeWindowContract 必须落地：pt 是 Doris DATE 分区列；相对时间窗（最近N天/近N天）必须锚定 preferredTable 在当前商家过滤后的 MAX(pt)，不要用 CURDATE()/CURRENT_DATE。"
-                "写法：`pt` BETWEEN DATE_SUB((SELECT MAX(`pt`) FROM `preferredTable` WHERE `merchantFilterColumn` = <same merchant>), INTERVAL N-1 DAY) AND (SELECT MAX(`pt`) FROM `preferredTable` WHERE `merchantFilterColumn` = <same merchant>)。"
-                "Few-shot：最近7天且 seller_id='100'，写 `pt` BETWEEN DATE_SUB((SELECT MAX(`pt`) FROM `ads_merchant_profile` WHERE `seller_id`='100'), INTERVAL 6 DAY) AND (SELECT MAX(`pt`) FROM `ads_merchant_profile` WHERE `seller_id`='100')。"
+                "GROUP_AGG/TOPN 查询必须让 nodePlanContract 中所有非聚合 SELECT 字段同时出现在 GROUP BY 中，不能丢 outputKeys 或 groupByColumn。\n"
+                "当 groupByColumn 的语义角色是实体键时，必须按 nodePlanContract 的空值策略过滤 NULL 和空字符串，避免产生空实体桶。\n"
+                "dependent node 用 upstreamEntitySets 做 IN 过滤。主体过滤必须使用 nodePlanContract.merchantFilterColumn 和授权值。\n"
+                "TimeWindowContract 必须落地：相对时间窗必须锚定 preferredTable 在当前授权主体过滤后的 MAX(timeColumn)，不要用 CURDATE()/CURRENT_DATE。"
+                "通用写法：`timeColumn` BETWEEN DATE_SUB((SELECT MAX(`timeColumn`) FROM `preferredTable` WHERE `merchantFilterColumn` = <authorized value>), INTERVAL N-1 DAY) AND (SELECT MAX(`timeColumn`) FROM `preferredTable` WHERE `merchantFilterColumn` = <authorized value>)。"
                 "显式日期/明确 startDate-endDate 且 anchorPolicy=calendar 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
             ),
         )
@@ -374,9 +371,9 @@ def default_prompt_registry() -> PromptRegistry:
             description="Compose BI answer only from verified evidence.",
             section_ids=["common.stable_boundary", "answer.verified_evidence", "common.artifact_references"],
             template=(
-                "你是商家经营分析助手。只基于输入的已验证数据回答，缺失证据要明确说明，不要把缺失解释成 0。\n"
+                "你是受治理的业务分析助手。只基于输入的已验证数据回答，缺失证据要明确说明，不要把缺失解释成 0。\n"
                 "回答要自然、简洁、先说结论，避免研发调试口吻。\n"
-                "Few-shot evidence usage: 如果 verified evidence 同时出现同名指标的画像口径和明细口径，但 questionUnderstanding.metricCandidateDecisions 已 selected_one，最终答案只能使用 selectedCandidateId 对应证据；rejectedCandidateIds 只能作为“未采用口径”解释，不能作为并列结论。用户只问“最近7天商品审核通过量是多少？”时，不要回答“0 和 33”两个同名数；只回答被选中的候选。用户明确问“两个口径为什么不一致/对账”时，才可以并列比较。\n"
+                "如果 verified evidence 同时出现同一 sourcePhrase 的多个口径，但 metricCandidateDecisions 已 selected_one，最终答案只能使用 selectedCandidateId 对应证据；rejectedCandidateIds 不能作为并列结论。只有用户明确要求口径对账时才可并列比较。\n"
                 "指标名称和口径以 verified evidence 中的 metric_resolution / metricDisclosures 为准；字段名带 raw 表示原始字段值，不要把 raw 字段当作正式指标口径。"
             ),
         )
@@ -389,7 +386,7 @@ def default_prompt_registry() -> PromptRegistry:
             description="Produce business interpretation from evidence.",
             section_ids=["common.stable_boundary", "answer.verified_evidence", "common.artifact_references"],
             template=(
-                "你是经营分析助手。基于当前数据给出商家能读懂的经营判断，不在 SQL 阶段硬编码业务假设。\n"
+                "你是经营分析助手。基于当前数据给出业务用户能读懂的判断，不在 SQL 阶段硬编码业务假设。\n"
                 "不要输出“分析结论/关键证据/限制/口径”这类固定报告标题，不要暴露字段名、表名或 SQL。"
             ),
         )
@@ -399,9 +396,9 @@ def default_prompt_registry() -> PromptRegistry:
             prompt_id="answer.rule",
             version="v1",
             agent="AnswerAgent",
-            description="Answer platform rule questions from retrieved knowledge only.",
+            description="Answer governed knowledge questions from retrieved evidence only.",
             section_ids=["common.stable_boundary", "answer.verified_evidence", "common.artifact_references"],
-            template="你是平台规则助手。只基于给定知识回答；没有依据时说需要运营补充规则。",
+            template="你是治理知识问答助手。只基于给定知识回答；没有依据时明确说明需要补充权威知识。",
         )
     )
     return registry

@@ -402,16 +402,18 @@
   "sampleValues" : [ ]
 }, {
   "columnName" : "direct_refund_cnt_1d",
-  "sampleCount" : 20,
-  "nullRate" : 0.0,
-  "distinctSampleCount" : 8,
-  "sampleValues" : [ "2", "3", "4", "5", "6", "7", "8", "9" ]
+  "sampleCount" : 0,
+  "nullRate" : null,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ],
+  "evidenceStatus" : "STALE"
 }, {
   "columnName" : "refund_rate_1d",
-  "sampleCount" : 20,
-  "nullRate" : 0.0,
-  "distinctSampleCount" : 8,
-  "sampleValues" : [ "11.6100", "12.7200", "13.8300", "14.9400", "16.0500", "17.1600", "18.2700", "19.3800" ]
+  "sampleCount" : 0,
+  "nullRate" : null,
+  "distinctSampleCount" : 0,
+  "sampleValues" : [ ],
+  "evidenceStatus" : "STALE"
 }, {
   "columnName" : "ticket_reopen_cnt_1d",
   "sampleCount" : 20,

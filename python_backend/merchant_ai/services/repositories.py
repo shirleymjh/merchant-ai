@@ -425,24 +425,39 @@ class PendingAnswerStore:
 
 
 class MerchantService:
-    def __init__(self, settings: Settings, doris_repository: DorisRepository):
+    def __init__(self, settings: Settings, doris_repository: DorisRepository, profile_binding: Optional[Dict[str, Any]] = None):
         self.settings = settings
         self.doris_repository = doris_repository
+        self.profile_binding = dict(profile_binding or {})
         self.last_degraded_reason: Dict[str, Any] = {}
 
     def current_merchant(self, merchant_id: str) -> MerchantInfo:
         target = merchant_id or self.settings.merchant_id
+        table = str(self.profile_binding.get("table") or "")
+        lookup_column = str(self.profile_binding.get("lookupColumn") or "")
+        id_column = str(self.profile_binding.get("idColumn") or lookup_column)
+        display_columns = [str(item) for item in self.profile_binding.get("displayColumns") or [] if str(item)]
+        if not table or not lookup_column:
+            self.last_degraded_reason = {
+                "component": "merchant_service",
+                "operation": "current_merchant",
+                "errorType": "MISSING_SEMANTIC_RUNTIME_BINDING",
+                "message": "principal profile binding is not uniquely declared by a published semantic asset",
+                "timestamp": datetime.now().isoformat(),
+            }
+            return MerchantInfo(merchant_id=target, merchant_name="yshopping商家%s" % target)
         try:
             rows = self.doris_repository.query(
-                "SELECT * FROM dim_merchant_df WHERE merchant_id = %s LIMIT 1",
+                "SELECT * FROM `%s` WHERE `%s` = %%s LIMIT 1" % (table, lookup_column),
                 [target],
             )
             if rows:
                 row = rows[0]
+                display_name = next((str(row.get(column) or "") for column in display_columns if row.get(column)), "")
                 return MerchantInfo(
-                    merchant_id=str(row.get("merchant_id") or target),
-                    merchant_name=str(row.get("merchant_name") or row.get("company_name") or "yshopping商家%s" % target),
-                    company_name=str(row.get("company_name") or ""),
+                    merchant_id=str(row.get(id_column) or target),
+                    merchant_name=display_name or "yshopping商家%s" % target,
+                    company_name=display_name,
                     rows=row,
                 )
         except Exception as exc:

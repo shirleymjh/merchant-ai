@@ -137,11 +137,6 @@ class Settings(BaseSettings):
     sandbox_container_cpus: float = Field(1.0, validation_alias="YSHOPPING_SANDBOX_CONTAINER_CPUS")
     skill_worker_parallel_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_PARALLEL_ENABLED")
     max_concurrent_skill_workers: int = Field(2, validation_alias="YSHOPPING_MAX_CONCURRENT_SKILL_WORKERS")
-    skill_worker_complex_names: str = Field(
-        "bi_trend_attribution,risk_analysis,rule_compliance,ratio_analysis,new_product_risk,gmv_drop_diagnosis,refund_rate_diagnosis,merchant_daily_briefing",
-        validation_alias="YSHOPPING_SKILL_WORKER_COMPLEX_NAMES",
-    )
-
     embedding_base_url: str = Field("https://api.openai.com/v1", validation_alias="YSHOPPING_EMBEDDING_BASE_URL")
     embedding_model: str = Field("text-embedding-3-small", validation_alias="YSHOPPING_EMBEDDING_MODEL")
     embedding_api_key: str = Field("", validation_alias="YSHOPPING_EMBEDDING_API_KEY")

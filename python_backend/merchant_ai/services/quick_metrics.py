@@ -25,31 +25,8 @@ from merchant_ai.services.time_semantics import (
 COMPLEX_TERMS = ["明细", "详情", "列表", "记录", "对应", "关联", "拆解", "归因"]
 ANALYSIS_TERMS = ["为什么", "原因", "分析", "归因", "诊断", "异常", "建议"]
 DEFINITION_TERMS = ["口径", "定义", "含义", "什么意思", "是否扣", "怎么算", "计算方式"]
-DETAIL_SCOPE_TERMS = [
-    "明细",
-    "详情",
-    "列表",
-    "记录",
-    "拆解",
-    "排名",
-    "排行",
-    "top",
-    "前",
-    "最高",
-    "最低",
-    "哪些",
-    "哪个",
-    "按商品",
-    "按spu",
-    "按sku",
-    "按类目",
-    "按订单",
-    "分商品",
-    "分spu",
-    "分sku",
-    "分类目",
-]
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TIME_DIMENSION_KEY = "time_dimension"
 QUICK_RESPONSE_CACHE = TTLCache("quick_metric_response", max_entries=512, ttl_seconds=30)
 
 
@@ -107,11 +84,12 @@ def quick_metric_response(
     tenant_column = metric["tenant_column"]
     time_filter, time_params = quick_metric_time_filter(time_range, table, time_column, tenant_column, merchant_id)
     rows = repository.query(
-        "SELECT `%s` AS pt, %s AS value FROM `%s` "
+        "SELECT `%s` AS `%s`, %s AS value FROM `%s` "
         "WHERE `%s`=%%s AND %s "
         "GROUP BY `%s` ORDER BY `%s`"
         % (
             time_column,
+            TIME_DIMENSION_KEY,
             formula,
             table,
             tenant_column,
@@ -123,7 +101,7 @@ def quick_metric_response(
     )
     if not rows:
         return None
-    latest_partition = str(rows[-1].get("pt") or "")
+    latest_partition = row_time_dimension(rows[-1], time_column)
     if time_range.kind == "exact_date" and not partition_date_matches(latest_partition, time_range.end_date):
         return None
     total_rows = repository.query(
@@ -145,7 +123,14 @@ def quick_metric_response(
     # The range total is therefore evaluated independently by Doris using the
     # exact same published semantic formula.
     total = float(total_rows[0]["value"])
-    normalized_rows = [{"metric_name": metric["label"], "pt": str(row.get("pt") or ""), "value": float(row.get("value") or 0)} for row in rows]
+    normalized_rows = [
+        {
+            "metric_name": metric["label"],
+            TIME_DIMENSION_KEY: row_time_dimension(row, time_column),
+            "value": float(row.get("value") or 0),
+        }
+        for row in rows
+    ]
     first, last = values[0], values[-1]
     direction = "上升" if last > first else "下降" if last < first else "持平"
     delta = abs(last - first)
@@ -164,7 +149,7 @@ def quick_metric_response(
         if all_zero
         else (
             f"从每日表现看，{metric['label']}由 {format_value(first, metric)} 变化到 {format_value(last, metric)}，{direction_text}；"
-            f"峰值日期为 {peak['pt']}，峰值为 {format_value(peak['value'], metric)}。"
+            f"峰值日期为 {peak[TIME_DIMENSION_KEY]}，峰值为 {format_value(peak['value'], metric)}。"
         )
     )
     answer = (
@@ -181,7 +166,7 @@ def quick_metric_response(
         "merchantId": merchant_id,
         "timeRange": time_label,
         "timeWindowContract": time_window_contract_payload(time_range, table, time_column, tenant_column),
-        "dataUpdatedAt": normalized_rows[-1]["pt"],
+        "dataUpdatedAt": normalized_rows[-1][TIME_DIMENSION_KEY],
         "rowCount": len(normalized_rows),
         "sourceTables": [table],
         "evidenceStatus": "verified",
@@ -250,6 +235,15 @@ def quick_metric_time_filter(
         tenant_value_sql="%s",
     )
     return predicate, [merchant_id, merchant_id]
+
+
+def row_time_dimension(row: Dict[str, Any], declared_time_column: str) -> str:
+    """Read the generic projection or the exact semantic column used by test adapters."""
+
+    value = row.get(TIME_DIMENSION_KEY)
+    if value in (None, "") and declared_time_column:
+        value = row.get(declared_time_column)
+    return str(value or "")
 
 
 def verify_quick_metric_answer(
@@ -457,9 +451,14 @@ def structured_keywords_require_planner(keywords: Any, matched_metrics: Optional
         )
     if any(len(candidates) > 1 for candidates in metric_candidates.values()):
         return True
+    declared_time_columns = {
+        str(metric.get("time_column") or "").strip()
+        for metric in (matched_metrics or [])
+        if str(metric.get("time_column") or "").strip()
+    }
     return any(
         str(getattr(item, "kind", "") or "") == "dimension"
-        and str(getattr(item, "canonical_key", "") or "") != "pt"
+        and str(getattr(item, "canonical_key", "") or "") not in declared_time_columns
         for item in (getattr(keywords, "mentions", None) or [])
     )
 
@@ -619,11 +618,6 @@ def unresolved_cross_table_metric_candidates(scored: list[tuple[int, Dict[str, A
     return len(top_tables) > 1
 
 
-def question_requests_detail_scope(question: str) -> bool:
-    text = normalize_question(question)
-    return any(normalize_question(term) in text for term in DETAIL_SCOPE_TERMS)
-
-
 def semantic_phrase_score(metric: Dict[str, Any], phrase: str) -> int:
     normalized = normalize_question(phrase)
     if not normalized:
@@ -703,7 +697,7 @@ def metric_advice(label: str) -> list[str]:
 
 
 def zero_metric_advice(label: str) -> list[str]:
-    return [f"当前{label}为 0，先确认是否符合预期。", f"后续可继续观察该指标是否出现新增波动。"]
+    return [f"当前{label}为 0，先确认是否符合预期。", "后续可继续观察该指标是否出现新增波动。"]
 
 
 def metric_suggestions(label: str, days: int) -> list[str]:

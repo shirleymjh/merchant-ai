@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Set
 
-from merchant_ai.models import AgentRunResult, EvidenceGap, QueryPlan, VerifiedEvidence
+from merchant_ai.models import AgentRunResult, AnswerMode, EvidenceGap, QueryPlan, VerifiedEvidence
 from merchant_ai.services.memory_constraints import memory_constraint_evidence_gaps
 
 
@@ -19,9 +19,10 @@ class EvidenceVerifier:
         gaps: List[EvidenceGap] = []
         covered = self._covered_keys(run_result)
         derived_evidence = self._derived_evidence(plan, run_result)
+        zero_filled_component_tasks, zero_filled_edges = self._zero_filled_derived_components(plan, run_result)
         table_names = set(run_result.merged_query_bundle.tables)
         if plan.evidence_contracts:
-            gaps.extend(self._contract_gaps(plan.evidence_contracts, run_result, allowed_knowledge_refs))
+            gaps.extend(self._contract_gaps(plan.evidence_contracts, run_result, allowed_knowledge_refs, zero_filled_component_tasks))
             covered.update(self._covered_contract_labels(plan.evidence_contracts, run_result, allowed_knowledge_refs))
         else:
             for evidence in plan.final_required_evidence:
@@ -34,6 +35,8 @@ class EvidenceVerifier:
         gaps.extend(metric_resolution_warning_gaps(plan))
         gaps.extend(memory_constraint_evidence_gaps(question, plan, memory_constraints or []))
         for gap in run_result.evidence_check.gaps:
+            if any(edge and edge in str(gap) for edge in zero_filled_edges):
+                continue
             gaps.append(EvidenceGap(code="DEPENDENCY_GAP", evidence=gap, reason=gap))
         succeeded_tasks = [item for item in run_result.task_results if not item.query_bundle.failed]
         failed_tasks = [item for item in run_result.task_results if item.query_bundle.failed]
@@ -132,8 +135,10 @@ class EvidenceVerifier:
         contracts: List[Dict[str, Any]],
         run_result: AgentRunResult,
         allowed_knowledge_refs: Set[str] | None = None,
+        zero_filled_component_tasks: Set[str] | None = None,
     ) -> List[EvidenceGap]:
         gaps: List[EvidenceGap] = []
+        zero_filled_component_tasks = zero_filled_component_tasks or set()
         for contract in contracts:
             level = str(contract.get("requiredLevel") or contract.get("required_level") or "required").lower()
             if level in {"optional", "info", "warning"}:
@@ -181,6 +186,8 @@ class EvidenceVerifier:
                 )
                 continue
             if not task_result.query_bundle.rows:
+                if task_result.task_id in zero_filled_component_tasks:
+                    continue
                 gaps.append(
                     EvidenceGap(
                         code="ZERO_ROWS",
@@ -195,7 +202,7 @@ class EvidenceVerifier:
             if missing_columns:
                 gaps.append(
                     EvidenceGap(
-                        code=missing_gap_code(missing_columns),
+                        code=missing_gap_code(contract),
                         task_id=task_result.task_id,
                         evidence=",".join(missing_columns),
                         reason="%s 缺少结构化证据字段: %s" % (semantic_label, ",".join(missing_columns)),
@@ -213,6 +220,41 @@ class EvidenceVerifier:
                     )
                 )
         return gaps
+
+    def _zero_filled_derived_components(self, plan: QueryPlan, run_result: AgentRunResult) -> tuple[Set[str], Set[str]]:
+        results_by_task = {item.task_id: item for item in run_result.task_results}
+        zero_row_tasks = {
+            item.task_id
+            for item in run_result.task_results
+            if not item.query_bundle.failed and not item.query_bundle.rows and int(item.query_bundle.effective_row_count() or 0) == 0
+        }
+        tasks: Set[str] = set()
+        edges: Set[str] = set()
+        for intent in plan.intents:
+            if intent.answer_mode != AnswerMode.DERIVED:
+                continue
+            derived_result = results_by_task.get(intent.plan_task_id)
+            if not derived_result or derived_result.query_bundle.failed:
+                continue
+            if not (derived_result.query_bundle.rows or int(derived_result.query_bundle.effective_row_count() or 0) > 0):
+                continue
+            resolution = intent.metric_resolution or {}
+            formula = str(intent.metric_formula or resolution.get("formula") or "")
+            components = [item for item in resolution.get("componentMetrics") or [] if isinstance(item, dict)]
+            if "/" not in formula or len(components) < 2:
+                continue
+            numerator_task = str(components[0].get("taskId") or "")
+            denominator_task = str(components[1].get("taskId") or "")
+            denominator_result = results_by_task.get(denominator_task)
+            if not numerator_task or numerator_task not in zero_row_tasks:
+                continue
+            if not denominator_result or denominator_result.query_bundle.failed:
+                continue
+            if not (denominator_result.query_bundle.rows or int(denominator_result.query_bundle.effective_row_count() or 0) > 0):
+                continue
+            tasks.add(numerator_task)
+            edges.add("%s->%s" % (numerator_task, intent.plan_task_id))
+        return tasks, edges
 
     def _covered_contract_labels(
         self,
@@ -260,12 +302,20 @@ class EvidenceVerifier:
         return normalized.issubset({str(ref or "").strip() for ref in allowed_knowledge_refs if str(ref or "").strip()})
 
     def _matching_task_result(self, task_id: str, table: str, run_result: AgentRunResult):
-        for task_result in run_result.task_results:
-            if task_id and task_result.task_id == task_id:
-                return task_result
-        for task_result in run_result.task_results:
-            if table and table in task_result.query_bundle.tables:
-                return task_result
+        if task_id:
+            return next(
+                (task_result for task_result in run_result.task_results if task_result.task_id == task_id),
+                None,
+            )
+        if not table:
+            return None
+        table_matches = [
+            task_result
+            for task_result in run_result.task_results
+            if table in task_result.query_bundle.tables
+        ]
+        if len(table_matches) == 1:
+            return table_matches[0]
         return None
 
     def _row_columns(self, rows: List[Dict[str, Any]]) -> Set[str]:
@@ -277,22 +327,8 @@ class EvidenceVerifier:
     def _column_covered(self, column: str, row_columns: Set[str], semantic_aliases: Dict[str, Set[str]] | None = None) -> bool:
         if column in row_columns:
             return True
-        aliases = {
-            "refund_related_pay_amt": {"refund_related_pay_amt", "refund_related_pay_amt_raw", "pay_amt", "sum_pay_amt"},
-            "order_cnt": {"order_cnt", "cnt", "count", "sub_order_cnt"},
-            "refund_cnt": {"refund_cnt", "cnt", "count", "refund_bill_cnt"},
-            "ticket_cnt": {"ticket_cnt", "cnt", "count", "ticket_bill_cnt"},
-            "repay_cnt": {"repay_cnt", "cnt", "count", "repay_bill_cnt"},
-            "coupon_cnt": {"coupon_cnt", "cnt", "count"},
-            "scm_cnt": {"scm_cnt", "cnt", "count"},
-            "goods_cnt": {"goods_cnt", "cnt", "count"},
-            "repay_amt": {"repay_amt", "sum_repay_amt"},
-            "order_pay_amt": {"order_pay_amt", "pay_amt", "sum_pay_amt"},
-        }
-        if semantic_aliases:
-            for key, values in semantic_aliases.items():
-                aliases.setdefault(key, set()).update(values)
-        return bool(aliases.get(column, set()) & row_columns)
+        aliases = (semantic_aliases or {}).get(column, set())
+        return bool(aliases & row_columns)
 
     def _natural_evidence_covered(self, evidence: str, covered: Set[str], table_names: Set[str]) -> bool:
         if evidence in covered or evidence in table_names:
@@ -370,10 +406,17 @@ def normalize_semantic_aliases(value: Any) -> Dict[str, Set[str]]:
     return aliases
 
 
-def missing_gap_code(columns: List[str]) -> str:
-    if all(is_entity_key(column) for column in columns):
+def missing_gap_code(contract: Dict[str, Any]) -> str:
+    evidence_role = str(
+        contract.get("evidenceRole")
+        or contract.get("evidence_role")
+        or contract.get("semanticRole")
+        or contract.get("semantic_role")
+        or ""
+    ).lower()
+    if evidence_role in {"entity", "entity_key", "dimension"}:
         return "MISSING_ENTITY_KEY"
-    if any(is_metric_key(column) for column in columns):
+    if evidence_role in {"metric", "measure", "ratio", "derived_metric"}:
         return "MISSING_METRIC_EVIDENCE"
     return "MISSING_REQUIRED_COLUMNS"
 
@@ -426,7 +469,7 @@ def evidence_gap_source(code: str) -> str:
 
 def answer_instruction_for_gap(gap: EvidenceGap) -> str:
     if gap.code == "FIELD_AMBIGUOUS":
-        return "说明该指标口径未完全确认，不能表述为已确认的独立退款金额。"
+        return "说明该字段或指标口径未完全确认，不能把候选值表述为已确认事实。"
     if gap.code == "ZERO_ROWS":
         return "说明 SQL 成功但返回 0 行，不能解释为业务指标为 0。"
     if gap.code.startswith("UPSTREAM") or gap.code == "JOIN_KEY_NOT_PRODUCED":
@@ -569,12 +612,3 @@ def classify_task_failure(message: str) -> str:
     if "上游实体集缺失" in text:
         return "UPSTREAM_ENTITY_MISSING"
     return "SQL_EXECUTION_FAILED"
-
-
-def is_entity_key(column: str) -> bool:
-    return column in {"order_id", "sub_order_id", "spu_id", "spu_name", "refund_id", "ticket_id", "bill_id", "coupon_id", "discount_rel_id", "pt"}
-
-
-def is_metric_key(column: str) -> bool:
-    text = column.lower()
-    return any(token in text for token in ["amt", "cnt", "count", "rate", "gmv", "pay", "repay"])

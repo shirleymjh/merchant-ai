@@ -11,9 +11,6 @@ from merchant_ai.models import (
 from merchant_ai.services.query_sql_binding import normalize_identifier, sql_has_bound_column_filter, sql_has_bound_merchant_filter
 
 
-TENANT_FILTER_COLUMNS = {"seller_id", "merchant_id", "shop_id"}
-
-
 def contract_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List[EvidenceGap]:
     gaps: List[EvidenceGap] = []
     for task_result in task_results:
@@ -50,9 +47,8 @@ def contract_issue_evidence(task_result: AgentTaskResult) -> str:
 
 
 def tenant_filter_columns(contract: NodePlanContract) -> Set[str]:
-    columns = {normalize_identifier(contract.merchant_filter_column)}
-    columns.update(normalize_identifier(column) for column in contract.allowed_columns)
-    return {column for column in columns if column in TENANT_FILTER_COLUMNS}
+    column = normalize_identifier(contract.merchant_filter_column)
+    return {column} if column else set()
 
 
 def tenant_scope_binding_error(

@@ -6,6 +6,18 @@
   "dataGrain": "商家主体/资质快照粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
+  "rowAccessPolicy": {"scopeType": "merchant", "filterColumn": "merchant_id", "operator": "eq", "valueSource": "merchant_id", "required": true},
+  "tableUsageProfile": {"contractStatus": "APPROVED", "businessLayer": "DIM", "queryableByAgent": true, "authorityLevel": 90, "topicRole": "PROFILE"},
+  "runtimeBindings": [
+    {
+      "role": "principal_profile",
+      "lookupColumn": "merchant_id",
+      "idColumn": "merchant_id",
+      "displayColumns": [
+        "company_name"
+      ]
+    }
+  ],
   "status": "PUBLISHED",
   "version": "v20260615181734",
   "generatedAt": "2026-06-15T18:17:34",
@@ -2216,6 +2228,8 @@
       ],
       "aliases": [
         "冻结保证金",
+        "冻结金额",
+        "保证金冻结金额",
         "merchant_deposit_freeze_amt"
       ],
       "confidence": 0.82,

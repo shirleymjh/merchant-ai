@@ -104,6 +104,13 @@ class UnderstandingExtractor:
                 trend_plan.agent_trace.extend([trace_reason, "planner.multi_metric_trend_fallback_after_llm_failure"])
                 return trend_plan, [], "SEMANTIC_FAST_PATH"
             rejected_trace.extend(fallback_coverage_rejection_trace("multi_metric_trend", coverage_gaps))
+        topn_plan = self.planner._semantic_topn_metric_fallback(question, asset_pack)
+        if topn_plan.intents:
+            coverage_gaps = self.planner._failure_candidate_coverage_gaps(question, topn_plan, asset_pack)
+            if not coverage_gaps:
+                topn_plan.agent_trace.extend([trace_reason, "planner.semantic_topn_metric_fallback_after_llm_failure"])
+                return topn_plan, [], "SEMANTIC_FAST_PATH"
+            rejected_trace.extend(fallback_coverage_rejection_trace("semantic_topn_metric", coverage_gaps))
         return QueryPlan(agent_trace=[trace_reason, *rejected_trace, "planner.failure_fallback=fail_closed_coverage"]), [], trace_reason
 
 

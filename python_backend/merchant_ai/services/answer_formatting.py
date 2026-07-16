@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Mapping
 
 
 def answer_numeric_value(value: Any) -> float | None:
@@ -18,28 +18,40 @@ def answer_numeric_value(value: Any) -> float | None:
         return None
 
 
-def format_metric_value_for_answer(value: Any, metric_key: str, label: str = "") -> str:
+def format_metric_value_for_answer(
+    value: Any,
+    metric_key: str = "",
+    label: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
+    del metric_key, label
     text = format_cell(value)
     numeric = answer_numeric_value(value)
     if numeric is None:
         return text
-    metric_text = "%s %s" % (metric_key or "", label or "")
-    if re.search(r"(rate|ratio|比例|占比|率)", metric_text, flags=re.I):
+    contract = dict(metadata or {})
+    value_format = str(contract.get("valueFormat") or contract.get("value_format") or "").strip().lower()
+    unit = str(contract.get("unit") or "").strip()
+    decimals = contract.get("decimalPlaces", contract.get("decimal_places", 2))
+    try:
+        decimal_places = max(0, min(int(decimals), 8))
+    except (TypeError, ValueError):
+        decimal_places = 2
+    if value_format in {"percent", "percentage", "ratio"} or unit == "%":
         percent = numeric * 100 if abs(numeric) <= 1 else numeric
-        if float(percent).is_integer():
-            return "%s%%" % int(percent)
-        return ("%.2f%%" % percent).replace(".00%", "%")
-    if re.search(r"(cnt|count|num|数量|单量|订单量|工单量|用户量|件数|人数)", metric_text, flags=re.I):
-        if float(numeric).is_integer():
-            return str(int(numeric))
-        return text
-    if re.search(r"(gmv|amt|amount|金额|赔付|退款|优惠|补贴)", metric_text, flags=re.I):
-        if float(numeric).is_integer():
-            return "%s元" % int(numeric)
-        return ("%s元" % ("%.2f" % numeric)).replace(".00元", "元")
-    if float(numeric).is_integer():
-        return str(int(numeric))
-    return text
+        return "%s%%" % _format_number(percent, decimal_places)
+    if value_format in {"integer", "int", "count"}:
+        rendered = str(int(numeric)) if float(numeric).is_integer() else _format_number(numeric, decimal_places)
+    else:
+        rendered = _format_number(numeric, decimal_places)
+    return "%s%s" % (rendered, unit) if unit else rendered
+
+
+def _format_number(value: float, decimal_places: int) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    rendered = ("%%.%df" % decimal_places) % value
+    return rendered.rstrip("0").rstrip(".")
 
 
 def extract_question_time_phrase(question: str) -> str:
@@ -62,43 +74,17 @@ def extract_question_time_phrase(question: str) -> str:
 
 def humanize_column_name(column: str) -> str:
     text = str(column or "").strip()
-    dictionary = {
-        "order": "订单",
-        "detail": "明细",
-        "cnt": "数量",
-        "amt": "金额",
-        "gmv": "GMV",
-        "refund": "退款",
-        "return": "退货",
-        "rate": "比例",
-        "pay": "支付",
-        "user": "用户",
-        "ticket": "工单",
-        "goods": "商品",
-        "spu": "商品",
-        "create": "创建",
-        "time": "时间",
-    }
-    parts = [dictionary.get(part, "") for part in re.split(r"[_\s]+", text.lower())]
-    label = "".join(part for part in parts if part)
-    return label or text
+    return "指标" if text else ""
 
 
 def source_aware_metric_label(column: str, table: str = "", category: str = "") -> str:
-    text = str(column or "").strip()
-    if text != "pay_amt":
-        return ""
-    source = "%s %s" % (str(table or "").lower(), str(category or "").lower())
-    if "refund" in source or "退货" in source or "退款" in source:
-        return "退款金额"
-    if any(token in source for token in ["trade", "order", "交易", "订单"]):
-        return "支付金额"
+    del column, table, category
     return ""
 
 
 def identifier_like_column(column: str) -> bool:
     text = str(column or "").strip().lower()
-    return text in {"seller_id", "merchant_id", "user_id", "pt"} or text.endswith("_id") or text.endswith("_no")
+    return text == "id" or text.endswith("_id") or text.endswith("_no")
 
 
 def format_cell(value: Any) -> str:

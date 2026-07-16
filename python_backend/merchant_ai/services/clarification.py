@@ -4,11 +4,11 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from merchant_ai.graph.message_history import append_context_section
-from merchant_ai.models import ChatContext, QuestionCategory, RouteSlots, RouteTimeWindow
+from merchant_ai.models import ChatContext, RouteSlots, RouteTimeWindow
 
 
 class ClarificationResolutionService:
-    """Resolve merchant clarification answers into structured runtime slots."""
+    """Resolve user clarification answers into structured runtime slots."""
 
     def resolve_context(self, context: ChatContext, answer_text: str) -> Dict[str, Any]:
         raw_answer = str(answer_text or "").strip()
@@ -31,17 +31,15 @@ class ClarificationResolutionService:
             if days:
                 resolution.update({"timeWindowDays": days, "timeExpression": label, "clarificationResolved": True})
         elif pending_type == "metric_focus":
-            metric_focus = answer[:120] if selected_index >= 0 else self.parse_metric_focus(answer)
+            metric_focus = answer[:120]
             if metric_focus:
                 resolution.update({"metricFocus": metric_focus, "clarificationResolved": True})
         elif pending_type == "priority_goal":
             resolution.update({"priorityGoal": answer[:80], "clarificationResolved": True})
         elif pending_type == "topic_required":
-            topics = self.parse_topic_focus(answer)
             resolution.update(
                 {
                     "topicFocus": answer[:80],
-                    "topics": [topic.value for topic in topics],
                     "clarificationResolved": True,
                 }
             )
@@ -49,10 +47,15 @@ class ClarificationResolutionService:
             days, label = self.parse_time_window(answer)
             if days:
                 resolution.update({"timeWindowDays": days, "timeExpression": label})
-            metric_focus = self.parse_metric_focus(answer)
+            metric_focus = answer[:120] if not days else ""
             if metric_focus:
                 resolution["metricFocus"] = metric_focus
             resolution["clarificationResolved"] = bool(days or metric_focus)
+        elif pending_type == "planner_clarification":
+            # PlannerAgent already selected the blocking question. The harness
+            # records the user's answer for the resumed planning turn without
+            # reinterpreting that business choice.
+            resolution["clarificationResolved"] = True
         if not resolution.get("clarificationResolved"):
             return {}
         self.apply_to_context(context, resolution)
@@ -80,16 +83,6 @@ class ClarificationResolutionService:
             )
         if resolution.get("topicFocus"):
             context.topic = str(resolution.get("topicFocus") or "")
-            topics = []
-            for value in resolution.get("topics") or []:
-                try:
-                    topic = QuestionCategory(str(value))
-                except Exception:
-                    continue
-                if topic not in topics:
-                    topics.append(topic)
-            if topics:
-                context.topics = topics
 
     def apply_to_route_slots(self, route_slots: RouteSlots, resolution: Dict[str, Any]) -> Tuple[RouteSlots, List[Dict[str, Any]]]:
         trace: List[Dict[str, Any]] = []
@@ -134,23 +127,6 @@ class ClarificationResolutionService:
             return 30, "本月"
         return 0, ""
 
-    def parse_metric_focus(self, answer: str) -> str:
-        text = str(answer or "").lower()
-        patterns = [
-            (r"综合经营|综合风险|经营风险|整体", "综合经营风险"),
-            (r"gmv|销售额|成交额", "GMV/销售额"),
-            (r"订单量|订单|下单|支付订单", "订单量"),
-            (r"退款率|退款|退货", "退款率"),
-            (r"客诉|工单|客服", "客诉/工单"),
-            (r"赔付|理赔|补偿", "赔付/理赔"),
-            (r"商品|动销|新品", "商品动销"),
-            (r"履约|发货|供应链", "履约/供应链"),
-        ]
-        for pattern, value in patterns:
-            if re.search(pattern, text):
-                return value
-        return ""
-
     def resolve_option(self, options: List[str], answer: str) -> tuple[str, int]:
         text = str(answer or "").strip()
         match = re.fullmatch(r"(?:选|第)?\s*(\d{1,2})\s*(?:个|项)?", text)
@@ -161,21 +137,3 @@ class ClarificationResolutionService:
         if index < 0 or index >= len(normalized_options) or not normalized_options[index]:
             return text, -1
         return normalized_options[index], index
-
-    def parse_topic_focus(self, answer: str) -> List[QuestionCategory]:
-        text = str(answer or "").lower()
-        patterns = [
-            (r"平台|规则|处罚|申诉", QuestionCategory.PLATFORM_RULE),
-            (r"交易|gmv|销售额|订单", QuestionCategory.TRADE),
-            (r"退款|退货|售后", QuestionCategory.REFUND),
-            (r"客服|工单|客诉", QuestionCategory.CS_TICKET),
-            (r"赔付|理赔|补偿", QuestionCategory.COMPENSATION),
-            (r"优惠券|优惠", QuestionCategory.COUPON),
-            (r"商品|动销|新品|审核", QuestionCategory.GOODS),
-            (r"履约|发货|供应链", QuestionCategory.SCM),
-        ]
-        topics: List[QuestionCategory] = []
-        for pattern, topic in patterns:
-            if re.search(pattern, text) and topic not in topics:
-                topics.append(topic)
-        return topics

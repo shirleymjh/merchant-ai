@@ -11,13 +11,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.graph.state import AgentState, mark_terminal_status, merge_agent_state_update
+from merchant_ai.graph.query_graph_contract import graph_validation_passed, query_graph_fingerprint
 from merchant_ai.models import (
+    ActionResult,
     AgentDecision,
     ArtifactRef,
     ContextBudgetReport,
     ContextCompressionEvent,
     GraphValidationGap,
-    GraphValidationResult,
     MiddlewareEvent,
     ToolCallExecutionResult,
     ToolCallLedgerEntry,
@@ -58,6 +59,9 @@ class HarnessMiddleware:
     def before_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
         return state
 
+    def after_action(self, state: AgentState) -> AgentState:
+        return state
+
 
 class MiddlewareChain:
     def __init__(self, middlewares: Iterable[HarnessMiddleware]):
@@ -73,6 +77,29 @@ class MiddlewareChain:
         self._record_chain_order(state, "before_action")
         for middleware in self.middlewares:
             state = self._safe_call(middleware, "before_action", state, decision)
+        return state
+
+    def capture_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
+        from merchant_ai.graph.policy import AgentActionRegistry
+
+        action = AgentActionRegistry().get(decision.selected_action)
+        state["_pending_action_contract"] = {
+            "action": decision.selected_action,
+            "node": decision.selected_node,
+            "expectedStateKeys": list(action.expected_state_keys),
+            "expectedStateFlags": list(action.expected_state_flags),
+            "preValues": action_contract_values(state, action.expected_state_keys, action.expected_state_flags),
+            "inputFingerprint": orchestration_progress_fingerprint(state),
+        }
+        return state
+
+    def after_action(self, state: AgentState) -> AgentState:
+        if not state.get("_pending_action_contract"):
+            return state
+        self._record_chain_order(state, "after_action")
+        for middleware in self.middlewares:
+            state = self._safe_call(middleware, "after_action", state)
+        state.pop("_pending_action_contract", None)
         return state
 
     def _safe_call(self, middleware: HarnessMiddleware, method: str, state: AgentState, *args: Any) -> AgentState:
@@ -271,7 +298,7 @@ class ActionContractMiddleware(HarnessMiddleware):
     def before_action(self, state: AgentState, decision: AgentDecision) -> AgentState:
         action = self.registry.get(decision.selected_action)
         missing_keys = [key for key in action.required_state_keys if not state_path_ready(state, key)]
-        missing_flags = [flag for flag in action.required_state_flags if not bool(state.get(flag))]
+        missing_flags = [flag for flag in action.required_state_flags if not action_state_flag_ready(state, flag)]
         if not missing_keys and not missing_flags:
             return state
 
@@ -310,6 +337,65 @@ class ActionContractMiddleware(HarnessMiddleware):
         )
         return state
 
+    def after_action(self, state: AgentState) -> AgentState:
+        snapshot = state.get("_pending_action_contract") or {}
+        if not isinstance(snapshot, dict) or not snapshot.get("action"):
+            return state
+        action_id = str(snapshot.get("action") or "")
+        expected_keys = list(snapshot.get("expectedStateKeys") or [])
+        expected_flags = list(snapshot.get("expectedStateFlags") or [])
+        missing_keys = [key for key in expected_keys if not state_path_ready(state, key)]
+        missing_flags = [flag for flag in expected_flags if not action_state_flag_ready(state, flag)]
+        post_values = action_contract_values(state, expected_keys, expected_flags)
+        output_fingerprint = orchestration_progress_fingerprint(state)
+        input_fingerprint = str(snapshot.get("inputFingerprint") or "")
+        if missing_keys or missing_flags:
+            status = "failed"
+            retryable = True
+            message = "action did not establish declared postconditions"
+        elif output_fingerprint == input_fingerprint:
+            status = "no_progress"
+            retryable = True
+            message = "action completed without observable contract progress"
+        else:
+            status = "success"
+            retryable = False
+            message = "action established its declared postconditions"
+        state["last_action_result"] = ActionResult(
+            action=action_id,
+            node=str(snapshot.get("node") or ""),
+            status=status,
+            message=message,
+            retryable=retryable,
+        )
+        for trace in reversed(state.get("action_history") or []):
+            if str(getattr(trace, "action", "") or "") == action_id and str(getattr(trace, "status", "") or "") == "selected":
+                trace.status = status
+                break
+        outcome = {
+            "action": action_id,
+            "node": str(snapshot.get("node") or ""),
+            "status": status,
+            "inputFingerprint": input_fingerprint,
+            "outputFingerprint": output_fingerprint,
+            "missingStateKeys": missing_keys,
+            "missingStateFlags": missing_flags,
+            "preValues": snapshot.get("preValues") or {},
+            "postValues": post_values,
+        }
+        state.setdefault("action_outcomes", []).append(outcome)
+        state["action_outcomes"] = state["action_outcomes"][-64:]
+        append_middleware_event(
+            state,
+            self.name,
+            "after_action",
+            status="ok" if status == "success" else status,
+            code="ACTION_CONTRACT_%s" % status.upper(),
+            message=message,
+            metadata=outcome,
+        )
+        return state
+
     def fallback_action(self, configured: str, missing_keys: List[str], missing_flags: List[str]) -> str:
         if "topic_routed" in missing_flags:
             return "route_topic"
@@ -319,7 +405,7 @@ class ActionContractMiddleware(HarnessMiddleware):
             return "compact_assets"
         if "plan.intents" in missing_keys:
             return "plan_graph"
-        if "query_graph_validated" in missing_flags:
+        if "query_graph_validated" in missing_flags or "query_graph_validation_passed" in missing_flags:
             return "validate_graph"
         if "sql_generated" in missing_flags:
             return "execute_graph"
@@ -727,38 +813,55 @@ class LoopGuardMiddleware(HarnessMiddleware):
     def before_policy(self, state: AgentState) -> AgentState:
         if state.get("middleware_loop_blocked"):
             return state
+        plan = state.get("plan")
+        if state.get("human_clarification_required") or bool(
+            plan and getattr(plan, "clarification_needs", None)
+        ):
+            return state
         self._check_tool_call_loops(state)
         if state.get("middleware_loop_blocked"):
             return state
-        history = state.get("action_history") or []
+        outcomes = state.get("action_outcomes") or []
         threshold = max(2, int(self.settings.middleware_loop_guard_threshold or 3))
-        if len(history) < threshold:
+        if len(outcomes) < threshold:
             return state
-        recent = history[-threshold:]
-        actions = [str(getattr(item, "action", "") or "") for item in recent]
-        if len(set(actions)) != 1 or actions[0] in {"answer_data", "answer_rule", "cache_answer", "ask_human"}:
+        recent = outcomes[-threshold:]
+        actions = [str(item.get("action") or "") for item in recent if isinstance(item, dict)]
+        if not actions or any(action in {"answer_data", "answer_rule", "cache_answer", "ask_human", "terminal_end"} for action in actions):
+            return state
+        statuses = [str(item.get("status") or "") for item in recent if isinstance(item, dict)]
+        if any(status == "success" for status in statuses):
+            return state
+        transitions = {
+            "%s:%s:%s"
+            % (item.get("action") or "", item.get("inputFingerprint") or "", item.get("outputFingerprint") or "")
+            for item in recent
+            if isinstance(item, dict)
+        }
+        output_fingerprints = {
+            str(item.get("outputFingerprint") or "") for item in recent if isinstance(item, dict)
+        }
+        same_transition = len(transitions) == 1
+        short_cycle_without_progress = len(output_fingerprints) <= 2
+        if not same_transition and not short_cycle_without_progress:
             return state
         state["middleware_loop_blocked"] = True
-        state["query_graph_validation_result"] = GraphValidationResult(
-            valid=False,
-            gaps=[
-                GraphValidationGap(
-                    code="LOOP_DETECTED",
-                    reason="LeadAgent repeated the same action without observable progress",
-                    evidence="action=%s repeats=%d" % (actions[0], threshold),
-                )
-            ],
-            repairable=False,
+        append_runtime_guard_gap(
+            state,
+            GraphValidationGap(
+                code="LOOP_DETECTED",
+                reason="LeadAgent repeated a transition or short action cycle without observable contract progress",
+                evidence="actions=%s outcomes=%d" % (actions, threshold),
+            ),
         )
-        state["query_graph_validated"] = True
         append_middleware_event(
             state,
             self.name,
             "before_policy",
             status="blocked",
             code="LOOP_DETECTED",
-            message="blocked repeated action pattern: %s" % actions[0],
-            metadata={"actions": actions},
+            message="blocked action cycle without observable progress",
+            metadata={"actions": actions, "outcomes": recent},
         )
         return state
 
@@ -826,18 +929,14 @@ class LoopGuardMiddleware(HarnessMiddleware):
             state["chat_bi_completed"] = True
             state["tool_call_requests"] = []
             state["forced_tool_loop_stop_message"] = "[FORCED STOP] Repeated tool calls exceeded the safety limit. Producing final answer with results collected so far."
-            state["query_graph_validation_result"] = GraphValidationResult(
-                valid=False,
-                gaps=[
-                    GraphValidationGap(
-                        code="TOOL_CALL_LOOP_DETECTED",
-                        reason=reason,
-                        evidence=json.dumps({"comboCounts": combo_counts, "typeCounts": type_counts}, ensure_ascii=False, default=str)[:1000],
-                    )
-                ],
-                repairable=False,
+            append_runtime_guard_gap(
+                state,
+                GraphValidationGap(
+                    code="TOOL_CALL_LOOP_DETECTED",
+                    reason=reason,
+                    evidence=json.dumps({"comboCounts": combo_counts, "typeCounts": type_counts}, ensure_ascii=False, default=str)[:1000],
+                ),
             )
-            state["query_graph_validated"] = True
             append_middleware_event(
                 state,
                 self.name,
@@ -901,7 +1000,7 @@ class MemoryMiddleware(HarnessMiddleware):
             )
             return state
         trace = dict(state.get("memory_injection_trace") or {})
-        if (state.get("_memory_snapshot_locked") or state.get("memory_recalled")) and trace:
+        if state.get("_memory_snapshot_locked") and trace:
             self._render_existing_snapshot(state)
             state["_memory_middleware_snapshot_ready"] = True
             state["_memory_snapshot_locked"] = True
@@ -1323,7 +1422,30 @@ def retain_middleware_events(events: List[MiddlewareEvent], limit: int = 200) ->
     return merged[-limit:]
 
 
-def state_path_ready(state: AgentState, path: str) -> bool:
+def action_state_flag_ready(state: AgentState, flag: str) -> bool:
+    if flag == "query_graph_validation_passed":
+        return graph_validation_passed(state)
+    return bool(state.get(flag))
+
+
+def append_runtime_guard_gap(state: AgentState, gap: GraphValidationGap) -> None:
+    gaps = list(state.get("runtime_guard_gaps") or [])
+    fingerprint = (gap.code, gap.task_id, gap.evidence, gap.reason)
+    if not any((item.code, item.task_id, item.evidence, item.reason) == fingerprint for item in gaps):
+        gaps.append(gap)
+    state["runtime_guard_gaps"] = gaps[-32:]
+
+
+def action_contract_values(state: AgentState, keys: List[str], flags: List[str]) -> Dict[str, Any]:
+    values: Dict[str, Any] = {}
+    for path in keys:
+        values["key:%s" % path] = state_path_value(state, path)
+    for flag in flags:
+        values["flag:%s" % flag] = action_state_flag_ready(state, flag)
+    return values
+
+
+def state_path_value(state: AgentState, path: str) -> Any:
     value: Any = state
     for part in [item for item in str(path or "").split(".") if item]:
         if isinstance(value, dict):
@@ -1331,7 +1453,72 @@ def state_path_ready(state: AgentState, path: str) -> bool:
         else:
             value = getattr(value, part, None)
         if value is None:
-            return False
+            break
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True)
+    return value
+
+
+def orchestration_progress_fingerprint(state: AgentState) -> str:
+    plan = state.get("plan")
+    run_result = state.get("agent_run_result")
+    task_results = list(getattr(run_result, "task_results", None) or [])
+    payload = {
+        "planFingerprint": query_graph_fingerprint(plan),
+        "validationStatus": state.get("query_graph_validation_status"),
+        "validatedPlanFingerprint": state.get("validated_query_graph_fingerprint"),
+        "pendingKnowledge": [
+            item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item
+            for item in state.get("pending_knowledge_requests", [])
+        ],
+        "generations": {
+            "execution": state.get("execution_generation"),
+            "result": state.get("result_generation"),
+            "evidence": state.get("evidence_generation"),
+            "analysis": state.get("analysis_generation"),
+        },
+        "flags": {
+            key: bool(state.get(key))
+            for key in [
+                "topic_routed",
+                "memory_recalled",
+                "fast_understood",
+                "data_discovered",
+                "planning_assets_compacted",
+                "query_graph_reflected",
+                "sql_generated",
+                "evidence_graph_verified",
+                "evidence_accepted",
+                "human_clarification_required",
+                "chat_bi_completed",
+            ]
+        },
+        "tasks": [
+            {
+                "taskId": getattr(item, "task_id", ""),
+                "success": bool(getattr(item, "success", False)),
+                "failed": bool(getattr(getattr(item, "query_bundle", None), "failed", False)),
+                "rowCount": int(getattr(getattr(item, "query_bundle", None), "original_row_count", 0) or len(getattr(getattr(item, "query_bundle", None), "rows", []) or [])),
+                "contract": getattr(item, "execution_contract_hash", ""),
+            }
+            for item in task_results
+        ],
+        "outputs": {
+            "answer": stable_json_hash(state.get("answer")),
+            "analysis": stable_json_hash(state.get("analysis_summary")),
+            "clarification": stable_json_hash(
+                {
+                    "question": state.get("human_clarification_question"),
+                    "options": state.get("human_clarification_options"),
+                }
+            ),
+        },
+    }
+    return stable_json_hash(payload)
+
+
+def state_path_ready(state: AgentState, path: str) -> bool:
+    value = state_path_value(state, path)
     if value is None:
         return False
     if isinstance(value, str):

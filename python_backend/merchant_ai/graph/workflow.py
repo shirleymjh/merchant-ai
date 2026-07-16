@@ -18,6 +18,12 @@ from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.policy import REPAIRABLE_QUERY_GRAPH_GAP_CODES, V2AgentPolicy
+from merchant_ai.graph.query_graph_contract import (
+    graph_validation_failure_reason,
+    invalidate_graph_validation,
+    mark_graph_validation_stale,
+    record_graph_validation,
+)
 from merchant_ai.graph.message_history import (
     MAX_SHORT_TERM_MESSAGES,
     MAX_SHORT_TERM_CONTEXT_CHARS,
@@ -82,7 +88,6 @@ from merchant_ai.models import (
     SkillMatchState,
     SubAgentDelegationPlan,
     SubAgentDelegationTask,
-    TOPIC_TO_CATEGORY,
     ToolCallRequest,
     ToolCachePolicy,
     RoutingDecision,
@@ -145,8 +150,9 @@ from merchant_ai.services.planning import (
 )
 from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
-from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, merge_task_result_bundles
+from merchant_ai.services.query import NodeWorkerExecutor, SqlValidationService, merge_task_result_bundles, query_bundle_complete_rows
 from merchant_ai.services.repositories import AnswerRepository, DorisRepository, MerchantService, PendingAnswerStore
+from merchant_ai.services.runtime_bindings import SemanticRuntimeBindingRegistry
 from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     HybridKnowledgeRetrievalService,
@@ -207,7 +213,7 @@ class MerchantQaWorkflow:
         self.keyword_service = keyword_service
         self.routing_service = routing_service
         self.topic_router = topic_router
-        self.route_slot_extractor = RouteSlotExtractor()
+        self.route_slot_extractor = RouteSlotExtractor(getattr(keyword_service, "topic_assets", None))
         self.recall_service = recall_service
         self.knowledge_retriever = knowledge_retriever
         self.asset_builder = asset_builder
@@ -362,6 +368,7 @@ class MerchantQaWorkflow:
             available_actions=[],
             lead_decisions=[],
             action_history=[],
+            action_outcomes=[],
             last_action_result=ActionResult(),
             planner_reflection=PlannerReflectionResult(),
             node_tool_traces=[],
@@ -429,6 +436,7 @@ class MerchantQaWorkflow:
             open_diagnostic_scope="",
             open_diagnostic_intent="",
             open_diagnostic_goal="",
+            open_diagnostic_profile={},
             open_diagnostic_seed_topics=[],
             hypothesis_exploration={},
             hypothesis_results=[],
@@ -471,6 +479,7 @@ class MerchantQaWorkflow:
             query_graph_supplemental_retrieve_count=0,
             query_graph_plan_attempts=0,
             query_graph_repair_attempts=0,
+            query_graph_repair_attempted=False,
             execution_generation=0,
             result_generation=-1,
             evidence_generation=-1,
@@ -485,6 +494,10 @@ class MerchantQaWorkflow:
             rule_recall_refs=[],
             rule_recall_context="",
             query_graph_validated=False,
+            query_graph_validation_attempted=False,
+            query_graph_validation_passed=False,
+            query_graph_validation_status="not_run",
+            validated_query_graph_fingerprint="",
             query_graph_reflected=False,
             sql_repair_reviewed=False,
             evidence_graph_verified=False,
@@ -499,6 +512,7 @@ class MerchantQaWorkflow:
             chat_bi_completed=False,
             run_canceled=False,
             middleware_loop_blocked=False,
+            runtime_guard_gaps=[],
             terminal_status={},
             should_persist=False,
             persisted=False,
@@ -512,35 +526,30 @@ class MerchantQaWorkflow:
 
     def _build_graph(self):
         builder = StateGraph(AgentState)
-        builder.add_node("preflight_route", self.preflight_route)
-        builder.add_node("inherit_context", self.inherit_context)
-        builder.add_node("runtime_bootstrap", self.runtime_bootstrap)
-        builder.add_node("recall_memory", self.recall_memory)
-        builder.add_node("policy", self.policy_node)
-        builder.add_node("route_topic", self.route_topic)
-        builder.add_node("fast_understand", self.fast_understand)
-        builder.add_node("try_fast_metric", self.try_fast_metric)
-        builder.add_node("retrieve_knowledge", self.retrieve_knowledge)
-        builder.add_node("compact_assets", self.compact_assets)
-        builder.add_node("query_metric", self.query_metric)
-        builder.add_node("plan_query_graph", self.plan_query_graph)
-        builder.add_node("reflect_query_graph", self.reflect_query_graph)
-        builder.add_node("validate_query_graph", self.validate_query_graph)
-        builder.add_node("repair_query_graph", self.repair_query_graph)
-        builder.add_node("execute_query_graph", self.execute_query_graph)
-        builder.add_node("execute_query_graph_direct", self.execute_query_graph_direct)
-        builder.add_node("execute_query_graph_agent", self.execute_query_graph_agent)
-        builder.add_node("repair_sql", self.repair_sql)
-        builder.add_node("verify_evidence_graph", self.verify_evidence_graph)
-        builder.add_node("explore_hypotheses", self.explore_hypotheses)
-        builder.add_node("run_analysis_worker", self.run_analysis_worker)
-        builder.add_node("run_analysis_skill", self.run_analysis_skill)
-        builder.add_node("delegate_subagent", self.delegate_subagent)
-        builder.add_node("answer_rule", self.answer_rule)
-        builder.add_node("answer_analysis", self.answer_analysis)
-        builder.add_node("human_in_loop", self.human_in_loop)
-        builder.add_node("cache_answer", self.cache_answer)
-        builder.add_node("terminal_end", self.terminal_end)
+        registry = self.policy.registry
+        policy_routes = registry.policy_routing_map()
+        for node in ["preflight_route", "inherit_context", "runtime_bootstrap", "policy"]:
+            builder.add_node(node, getattr(self, "policy_node" if node == "policy" else node))
+        for node in policy_routes:
+            handler = getattr(self, node, None)
+            if not callable(handler):
+                raise ValueError("registered agent action has no workflow node handler: %s" % node)
+            builder.add_node(node, handler)
+
+        human_node = registry.node_for("ask_human")
+        terminal_node = registry.node_for("terminal_end")
+        policy_control_routes = {
+            "policy": "policy",
+            human_node: human_node,
+            terminal_node: terminal_node,
+        }
+
+        def conditional_routes(*action_ids: str) -> Dict[str, str]:
+            routes = {
+                registry.node_for(action_id): registry.node_for(action_id)
+                for action_id in action_ids
+            }
+            return {**routes, **policy_control_routes}
 
         builder.add_edge(START, "preflight_route")
         builder.add_conditional_edges(
@@ -553,115 +562,78 @@ class MerchantQaWorkflow:
         )
         builder.add_edge("inherit_context", "runtime_bootstrap")
         builder.add_edge("runtime_bootstrap", "policy")
-        builder.add_edge("recall_memory", "policy")
         builder.add_conditional_edges(
             "policy",
-            lambda state: state.get("_next_action", "cache_answer"),
-            {
-                "route_topic": "route_topic",
-                "recall_memory": "recall_memory",
-                "fast_understand": "fast_understand",
-                "try_fast_metric": "try_fast_metric",
-                "retrieve_knowledge": "retrieve_knowledge",
-                "compact_assets": "compact_assets",
-                "query_metric": "query_metric",
-                "plan_query_graph": "plan_query_graph",
-                "reflect_query_graph": "reflect_query_graph",
-                "validate_query_graph": "validate_query_graph",
-                "repair_query_graph": "repair_query_graph",
-                "execute_query_graph": "execute_query_graph",
-                "execute_query_graph_direct": "execute_query_graph_direct",
-                "execute_query_graph_agent": "execute_query_graph_agent",
-                "repair_sql": "repair_sql",
-                "verify_evidence_graph": "verify_evidence_graph",
-                "explore_hypotheses": "explore_hypotheses",
-                "run_analysis_worker": "run_analysis_worker",
-                "run_analysis_skill": "run_analysis_skill",
-                "delegate_subagent": "delegate_subagent",
-                "answer_rule": "answer_rule",
-                "answer_analysis": "answer_analysis",
-                "human_in_loop": "human_in_loop",
-                "cache_answer": "cache_answer",
-                "terminal_end": "terminal_end",
-            },
+            lambda state: state.get("_next_action", registry.node_for("cache_answer")),
+            policy_routes,
         )
-        builder.add_edge("route_topic", "policy")
-        builder.add_edge("fast_understand", "policy")
-        builder.add_edge("try_fast_metric", "policy")
+        retrieve_node = registry.node_for("retrieve_knowledge")
         builder.add_conditional_edges(
-            "retrieve_knowledge",
+            retrieve_node,
             self.route_after_retrieve_knowledge,
-            {
-                "compact_assets": "compact_assets",
-                "policy": "policy",
-                "human_in_loop": "human_in_loop",
-                "terminal_end": "terminal_end",
-            },
+            conditional_routes("compact_assets"),
         )
-        builder.add_edge("compact_assets", "policy")
-        builder.add_edge("query_metric", "policy")
+        plan_node = registry.node_for("plan_graph")
         builder.add_conditional_edges(
-            "plan_query_graph",
+            plan_node,
             self.route_after_plan_query_graph,
-            {
-                "reflect_query_graph": "reflect_query_graph",
-                "validate_query_graph": "validate_query_graph",
-                "policy": "policy",
-                "human_in_loop": "human_in_loop",
-                "terminal_end": "terminal_end",
-            },
+            conditional_routes("reflect_plan", "validate_graph"),
         )
+        reflect_node = registry.node_for("reflect_plan")
         builder.add_conditional_edges(
-            "reflect_query_graph",
+            reflect_node,
             self.route_after_reflect_query_graph,
-            {
-                "validate_query_graph": "validate_query_graph",
-                "policy": "policy",
-                "human_in_loop": "human_in_loop",
-                "terminal_end": "terminal_end",
-            },
+            conditional_routes("validate_graph"),
         )
+        repair_graph_node = registry.node_for("repair_graph")
         builder.add_conditional_edges(
-            "repair_query_graph",
+            repair_graph_node,
             self.route_after_repair_query_graph,
-            {
-                "reflect_query_graph": "reflect_query_graph",
-                "policy": "policy",
-                "human_in_loop": "human_in_loop",
-                "terminal_end": "terminal_end",
-            },
+            conditional_routes("reflect_plan"),
         )
-        builder.add_edge("validate_query_graph", "policy")
-        builder.add_edge("execute_query_graph", "repair_sql")
-        builder.add_edge("execute_query_graph_direct", "repair_sql")
-        builder.add_edge("execute_query_graph_agent", "repair_sql")
+        repair_sql_node = registry.node_for("repair_sql")
+        execution_nodes = {
+            registry.node_for(action_id)
+            for action_id in ("execute_graph", "execute_graph_direct", "execute_graph_agent")
+        }
+        for node in execution_nodes:
+            builder.add_edge(node, repair_sql_node)
         builder.add_conditional_edges(
-            "repair_sql",
+            repair_sql_node,
             self.route_after_repair_sql,
-            {
-                "verify_evidence_graph": "verify_evidence_graph",
-                "policy": "policy",
-                "human_in_loop": "human_in_loop",
-                "terminal_end": "terminal_end",
-            },
+            conditional_routes("verify_evidence"),
         )
-        builder.add_edge("verify_evidence_graph", "policy")
-        builder.add_edge("explore_hypotheses", "policy")
-        builder.add_edge("run_analysis_worker", "policy")
-        builder.add_edge("run_analysis_skill", "policy")
-        builder.add_edge("delegate_subagent", "policy")
-        builder.add_edge("answer_rule", "cache_answer")
-        builder.add_edge("answer_analysis", "cache_answer")
-        builder.add_edge("human_in_loop", END)
-        builder.add_edge("cache_answer", END)
-        builder.add_edge("terminal_end", END)
+        cache_node = registry.node_for("cache_answer")
+        answer_nodes = {
+            registry.node_for("answer_rule"),
+            registry.node_for("answer_data"),
+        }
+        for node in answer_nodes:
+            builder.add_edge(node, cache_node)
+
+        terminal_nodes = {human_node, cache_node, terminal_node}
+        for node in terminal_nodes:
+            builder.add_edge(node, END)
+
+        special_nodes = {
+            retrieve_node,
+            plan_node,
+            reflect_node,
+            repair_graph_node,
+            repair_sql_node,
+            *execution_nodes,
+            *answer_nodes,
+            *terminal_nodes,
+        }
+        for node in policy_routes.keys() - special_nodes:
+            builder.add_edge(node, "policy")
         return builder.compile(checkpointer=self.checkpoint_manager.saver())
 
     def terminal_or_human_node(self, state: AgentState) -> str:
         if state.get("run_canceled") or (state.get("terminal_status") or {}).get("active"):
-            return "terminal_end"
+            return self.policy.registry.node_for("terminal_end")
         if state.get("human_clarification_required"):
-            return "human_in_loop"
+            return self.policy.registry.node_for("ask_human")
         return ""
 
     def can_retry_knowledge(self, state: AgentState) -> bool:
@@ -763,7 +735,7 @@ class MerchantQaWorkflow:
         if self.policy.has_rule_recall_ready(state) or self.should_answer_with_rule_recall(state):
             return "policy"
         if state.get("data_discovered") and not state.get("planning_assets_compacted"):
-            return "compact_assets"
+            return self.policy.registry.node_for("compact_assets")
         return "policy"
 
     def route_after_plan_query_graph(self, state: AgentState) -> str:
@@ -776,8 +748,8 @@ class MerchantQaWorkflow:
         if not plan.intents:
             return "policy"
         if self.policy.fast_path_bypasses_reflection(state):
-            return "validate_query_graph"
-        return "reflect_query_graph"
+            return self.policy.registry.node_for("validate_graph")
+        return self.policy.registry.node_for("reflect_plan")
 
     def route_after_reflect_query_graph(self, state: AgentState) -> str:
         terminal = self.terminal_or_human_node(state)
@@ -787,7 +759,7 @@ class MerchantQaWorkflow:
             return "policy"
         reflection = state.get("planner_reflection") or PlannerReflectionResult()
         if getattr(reflection, "passed", True):
-            return "validate_query_graph"
+            return self.policy.registry.node_for("validate_graph")
         return "policy"
 
     def route_after_repair_query_graph(self, state: AgentState) -> str:
@@ -799,7 +771,7 @@ class MerchantQaWorkflow:
         plan = state.get("plan") or QueryPlan()
         if not plan.intents:
             return "policy"
-        return "reflect_query_graph"
+        return self.policy.registry.node_for("reflect_plan")
 
     def route_after_repair_sql(self, state: AgentState) -> str:
         terminal = self.terminal_or_human_node(state)
@@ -807,7 +779,7 @@ class MerchantQaWorkflow:
             return terminal
         if self.policy.has_graph_repairable_execution_gap(state):
             return "policy"
-        return "verify_evidence_graph"
+        return self.policy.registry.node_for("verify_evidence")
 
     def preflight_route(self, state: AgentState) -> AgentState:
         started = now_ms()
@@ -844,7 +816,7 @@ class MerchantQaWorkflow:
                 stage = "UNSUPPORTED_OPERATION"
             else:
                 clarification = understanding.clarification_question or self.build_scope_clarification_prompt(state)
-                options = business_scope_options()
+                options = business_scope_options(self.recall_service.topic_assets)
                 clarification_type = "business_scope"
                 stage = "BUSINESS_SCOPE"
             self.request_human_clarification(state, clarification, stage, clarification_type, options)
@@ -1200,6 +1172,8 @@ class MerchantQaWorkflow:
     def policy_node(self, state: AgentState) -> AgentState:
         started = now_ms()
         step = self.start_run_step(state, "policy", "LeadAgent", "MAIN_AGENT_POLICY", input_summary=state.get("agent_decision_reason", ""))
+        state = self.middleware_chain.after_action(state)
+        self.materialize_plan_clarification(state)
         state = self.middleware_chain.before_policy(state)
         self.refresh_execution_tier_policy(state)
         observation = self.main_agent_observation(state)
@@ -1220,6 +1194,7 @@ class MerchantQaWorkflow:
                 budget_exhausted=True,
                 source="terminal_status",
             )
+        state = self.middleware_chain.capture_action(state, decision)
         state["_next_action"] = decision.selected_node
         state["available_actions"] = self.policy.registry.actions(decision.available_actions)
         state["agent_decision_reason"] = decision.reason
@@ -1544,37 +1519,13 @@ class MerchantQaWorkflow:
             return ""
         fast = state.get("fast_understanding") or FastUnderstandingResult()
         slots = state.get("route_slots") or RouteSlots()
-        question = str(state.get("question") or "")
-        knowledge_sensitive_terms = [
-            "为什么",
-            "原因",
-            "归因",
-            "诊断",
-            "异常",
-            "建议",
-            "口径",
-            "规则",
-            "含义",
-            "什么意思",
-            "状态",
-            "status",
-            "枚举",
-        ]
-        if re.search(r"口径|定义|含义|什么意思|是否扣|怎么算|计算方式", question) and re.search(
-            r"gmv|销售额|成交额|订单|退款|退款率|工单|客诉|赔付",
-            question.lower(),
-        ):
-            return ""
         if str(getattr(slots, "risk_level", "") or "") in {"rule_sensitive", "high_risk"}:
             return "本轮问题涉及平台规则或业务口径，必须先刷新 Topic 知识，history 不作为权威依据"
-        topic_values = {enum_value(topic) for topic in list(getattr(fast, "topics", []) or [])}
-        if QuestionCategory.PLATFORM_RULE.value in topic_values:
-            return "本轮问题命中平台规则 Topic，必须走最新知识检索"
         if str(getattr(fast, "intent_kind", "") or "") in {"rule_only", "rule_data_mix", "multi_hop"}:
             return "本轮问题不是简单指标查询，必须走最新知识检索后再分析"
-        if str(getattr(fast, "intent_kind", "") or "") in {"analysis", "unknown"} and any(term in question for term in knowledge_sensitive_terms):
+        if str(getattr(fast, "intent_kind", "") or "") in {"analysis", "unknown"}:
             return "本轮问题涉及归因、口径或规则解释，必须走最新知识检索后再分析"
-        if str(getattr(fast, "complexity", "") or "") == "complex" and any(term in question for term in knowledge_sensitive_terms):
+        if str(getattr(fast, "complexity", "") or "") == "complex":
             return "本轮问题复杂度较高，必须走最新知识检索后再规划"
         return ""
 
@@ -1975,17 +1926,19 @@ class MerchantQaWorkflow:
             return
         reason = str(getattr(decision, "reason", "") or "LeadAgent selected answer without executable QueryGraph")
         gap_code = "AGENT_DECISION_EXHAUSTED" if getattr(decision, "budget_exhausted", False) else "MISSING_QUERY_GRAPH"
-        state["query_graph_validation_result"] = GraphValidationResult(
-            valid=False,
-            repairable=False,
-            gaps=[
-                GraphValidationGap(
-                    code=gap_code,
-                    reason=reason,
-                )
-            ],
+        record_graph_validation(
+            state,
+            GraphValidationResult(
+                valid=False,
+                repairable=False,
+                gaps=[
+                    GraphValidationGap(
+                        code=gap_code,
+                        reason=reason,
+                    )
+                ],
+            ),
         )
-        state["query_graph_validated"] = True
 
     def route_topic(self, state: AgentState) -> AgentState:
         started = now_ms()
@@ -2046,6 +1999,7 @@ class MerchantQaWorkflow:
         )
         decision, route_llm_trace = self.apply_bounded_route_llm_decision(state, decision, route_slots)
         state["bounded_route_llm_trace"] = route_llm_trace
+        self.bootstrap_asset_diagnostic_state(state)
         state["route_decision_trace"].append(
             {
                 "stage": "topic_router",
@@ -2101,7 +2055,13 @@ class MerchantQaWorkflow:
         state["context_loaded"] = True
         state["scope_clarified"] = not decision.clarification_required
         if decision.clarification_required:
-            self.request_human_clarification(state, self.build_topic_clarification_prompt(state), "BUSINESS_SCOPE", "topic_required", business_scope_options())
+            self.request_human_clarification(
+                state,
+                self.build_topic_clarification_prompt(state),
+                "BUSINESS_SCOPE",
+                "topic_required",
+                business_scope_options(self.recall_service.topic_assets),
+            )
         else:
             diagnostic_topics = self.apply_open_diagnostic_policy(state, decision)
             if state.get("human_clarification_required"):
@@ -2158,9 +2118,8 @@ class MerchantQaWorkflow:
             )
         )
         open_discovery = bool(
-            is_store_health_overview_question(state.get("question", ""))
-            or is_priority_recommendation_question(state.get("question", ""))
-            or (context and context.pending_clarification_type == "priority_goal")
+            decision.routing_mode == "open_discovery"
+            or state.get("open_diagnostic_intent")
         )
         explicit_single_topic_lock = bool(
             len(topics) == 1
@@ -2237,8 +2196,8 @@ class MerchantQaWorkflow:
         keywords = state.get("extracted_keywords") or ExtractedKeywords()
         topics = self._effective_topic_categories(state)
         has_data = self.requires_bi_execution(state, keywords)
-        has_rule = QuestionCategory.PLATFORM_RULE in set(topics) or slots.risk_level in {"rule_sensitive", "high_risk"}
-        business_topic_count = len([topic for topic in topics if topic not in {QuestionCategory.UNKNOWN, QuestionCategory.MERCHANT_OTHER}])
+        has_rule = slots.risk_level in {"rule_sensitive", "high_risk"}
+        business_topic_count = len(self._asset_backed_topic_categories(topics))
         object_refs: Dict[str, List[str]] = {}
         for ref in slots.object_refs:
             object_refs.setdefault(ref.ref_type, [])
@@ -2526,7 +2485,7 @@ class MerchantQaWorkflow:
         display_name = str(metric_disclosures[0].get("displayName") or metric_key or debug_trace.get("metric") or "指标口径")
         table = str(semantic_identity.get("table") or ((response.doris_tables or [""])[0] if response.doris_tables else ""))
         topic_name = str(semantic_identity.get("category") or semantic_identity.get("topic") or "")
-        category = TOPIC_TO_CATEGORY.get(topic_name, QuestionCategory.UNKNOWN)
+        category = self.recall_service.topic_assets.resolve_topic_category(topic_name)
         state["plan"] = QueryPlan(
             intents=[
                 QuestionIntent(
@@ -2564,7 +2523,7 @@ class MerchantQaWorkflow:
         display_name = str(metric_disclosures[0].get("displayName") or metric_key or debug_trace.get("metric") or "value")
         table = str(semantic_identity.get("table") or ((response.doris_tables or [""])[0] if response.doris_tables else ""))
         topic_name = str(semantic_identity.get("category") or semantic_identity.get("topic") or "")
-        category = TOPIC_TO_CATEGORY.get(topic_name, QuestionCategory.UNKNOWN)
+        category = self.recall_service.topic_assets.resolve_topic_category(topic_name)
         days = int(debug_trace.get("days") or ((debug_trace.get("timeRange") or {}).get("days") or 0))
         summary_rows: List[Dict[str, Any]] = []
         for section in response.data_sections or []:
@@ -2632,70 +2591,47 @@ class MerchantQaWorkflow:
         context = state.get("request_context")
         if context and context.pending_clarification_stage:
             return {}
-        text = state.get("question", "")
         slots = state.get("route_slots") or RouteSlots()
         topics = set(fast.topics or self._effective_topic_categories(state))
-        business_topics = {
-            topic
-            for topic in topics
-            if topic not in {QuestionCategory.UNKNOWN, QuestionCategory.MERCHANT_OTHER, QuestionCategory.IDENTITY}
-        }
+        business_topics = set(self._asset_backed_topic_categories(list(topics)))
         if fast.intent_kind in {"chat", "invalid", "write_requested", "rule_only"}:
             return {}
-        if is_store_health_overview_question(text) or state.get("open_diagnostic_intent") == "STORE_HEALTH_DIAGNOSIS":
+        if state.get("open_diagnostic_intent"):
             return {}
-        if is_priority_recommendation_question(text) and not state.get("open_diagnostic_goal"):
-            return {
-                "stage": "OPEN_DIAGNOSTIC",
-                "type": "priority_goal",
-                "question": self.build_priority_goal_clarification_prompt(state),
-                "options": priority_goal_options(),
-                "reason": "开放优先级问题缺少排序目标，先确认商家最关心的经营目标",
-            }
         if (
             slots.time_window.days <= 0
             and not (state.get("extracted_keywords") or ExtractedKeywords()).time_keywords
             and business_topics
-            and self.question_needs_time_clarification(text, fast)
+            and self.question_needs_time_clarification(fast)
         ):
+            contract = topic_clarification_contract(self.recall_service.topic_assets, "time_window")
             return {
                 "stage": "BUSINESS_SCOPE",
                 "type": "time_window",
-                "question": "你想按哪个时间范围看？我可以先按近7天，也可以切到昨天、近30天或你指定的时间。",
-                "options": ["近7天", "昨天", "近30天", "我补充具体时间"],
+                "question": str(contract.get("prompt") or "请补充本次查询的时间范围。"),
+                "options": list(contract.get("options") or []),
                 "reason": "经营查询缺少时间范围，先确认口径避免默认时间误导",
             }
         if (
             not fast.metric_phrases
             and fast.intent_kind in {"analysis", "multi_hop", "unknown"}
-            and self.question_needs_metric_clarification(text)
+            and self.question_needs_metric_clarification(fast)
         ):
+            contract = topic_clarification_contract(self.recall_service.topic_assets, "metric_focus")
             return {
                 "stage": "BUSINESS_SCOPE",
                 "type": "metric_focus",
-                "question": "你说的表现/异常主要想看哪个指标？我可以按 GMV、订单量、退款率、客诉/工单或综合经营风险来分析。",
-                "options": ["综合经营风险", "GMV/销售额", "订单量", "退款率", "客诉/工单"],
+                "question": str(contract.get("prompt") or "请补充希望分析的指标或目标。"),
+                "options": list(contract.get("options") or []),
                 "reason": "开放经营分析缺少目标指标，先确认分析重心",
             }
         return {}
 
-    def question_needs_time_clarification(self, text: str, fast: FastUnderstandingResult) -> bool:
-        lowered = (text or "").lower()
-        if re.search(r"今天|昨日|昨天|近\d+天|最近\d+天|本周|上周|本月|上月|\d{4}[-/年]\d{1,2}", lowered):
-            return False
-        if re.search(r"口径|定义|含义|什么意思|是否扣|规则|枚举|status|状态", lowered):
-            return False
-        if fast.object_refs and re.search(r"明细|详情|记录|单号|流水|状态", lowered):
-            return False
-        if fast.intent_kind in {"detail_lookup"} and not re.search(r"趋势|变化|下降|上升|异常|表现|为什么|原因|归因|分析|多少|情况", lowered):
-            return False
-        return bool(re.search(r"多少|情况|趋势|变化|下降|上升|异常|表现|为什么|原因|归因|分析|top|排行|退款|订单|gmv|销售额|工单|客诉|赔付", lowered))
+    def question_needs_time_clarification(self, fast: FastUnderstandingResult) -> bool:
+        return str(fast.intent_kind or "") not in {"chat", "invalid", "write_requested", "rule_only", "detail_lookup"}
 
-    def question_needs_metric_clarification(self, text: str) -> bool:
-        lowered = (text or "").lower()
-        if re.search(r"gmv|销售额|成交额|订单|退款|退款率|退货|工单|客诉|赔付|优惠券|库存|履约|发货|商品|转化", lowered):
-            return False
-        return bool(re.search(r"表现|异常|不好|下滑|下降|变差|风险|优先|原因|归因|分析|怎么了", lowered))
+    def question_needs_metric_clarification(self, fast: FastUnderstandingResult) -> bool:
+        return not bool(fast.metric_phrases)
 
     def apply_bounded_route_llm_decision(
         self,
@@ -2778,19 +2714,17 @@ class MerchantQaWorkflow:
     def topic_clarification_gate_reason(self, state: AgentState, decision: TopicRoutingDecision, route_slots: RouteSlots) -> str:
         if not bool(getattr(self.settings, "route_force_clarification_enabled", True)):
             return ""
-        text = state.get("question", "")
-        context = state.get("request_context")
-        if is_store_health_overview_question(text) or is_priority_recommendation_question(text):
+        if decision.routing_mode == "open_discovery":
             return ""
-        if context and context.pending_clarification_type == "priority_goal":
+        context = state.get("request_context")
+        if state.get("open_diagnostic_intent"):
+            return ""
+        profile = state.get("open_diagnostic_profile") or {}
+        if context and str(context.pending_clarification_type or "") == str(profile.get("clarificationType") or ""):
             return ""
         topics = decision.recall_topics()
-        business_topics = [
-            topic
-            for topic in topics
-            if topic not in {QuestionCategory.UNKNOWN, QuestionCategory.MERCHANT_OTHER}
-        ]
-        data_topics = [topic for topic in business_topics if topic != QuestionCategory.PLATFORM_RULE]
+        business_topics = [topic for topic in topics if topic != QuestionCategory.UNKNOWN]
+        data_topics = self._asset_backed_topic_categories(business_topics)
         confidence = max(float(decision.confidence or 0.0), float(route_slots.route_confidence or 0.0))
         min_confidence = float(getattr(self.settings, "route_topic_min_confidence", 0.52) or 0.52)
         max_candidates = int(getattr(self.settings, "route_topic_max_candidates", 4) or 4)
@@ -2801,7 +2735,7 @@ class MerchantQaWorkflow:
             return "Topic 低置信，缺少明确对象或业务关键词，先确认分析范围"
         if len(business_topics) > max_candidates and confidence < 0.82:
             return "候选 Topic 过多且未形成稳定主域，先确认优先业务范围"
-        if QuestionCategory.PLATFORM_RULE in business_topics and data_topics and confidence < mixed_min_confidence:
+        if route_slots.risk_level == "rule_sensitive" and data_topics and confidence < mixed_min_confidence:
             return "规则问题和数据分析域混在一起且置信度不足，先确认是查规则还是查经营数据"
         if "BROAD_TOPIC_SET" in route_slots.route_warnings and confidence < mixed_min_confidence:
             return "路由命中范围过宽，先确认要看的业务域"
@@ -3025,7 +2959,7 @@ class MerchantQaWorkflow:
                 add_step(state, "Rule Recall：命中平台规则知识，作为后续 Answer 证据，不短路 BI QueryGraph")
         state["intent_signals"] = self.build_intent_signals(state)
         state["planning_assets_compacted"] = False
-        state["query_graph_validated"] = False
+        invalidate_graph_validation(state)
         state["query_graph_reflected"] = False
         if was_data_discovered or had_pending_requests:
             self.invalidate_execution_outputs(state, "知识召回已更新")
@@ -3080,13 +3014,7 @@ class MerchantQaWorkflow:
         expanded = [
             topic
             for topic in self._merge_topic_categories(candidates, [])
-            if topic not in set(base_topics)
-            and topic
-            not in {
-                QuestionCategory.UNKNOWN,
-                QuestionCategory.IDENTITY,
-                QuestionCategory.MERCHANT_OTHER,
-            }
+            if topic not in set(base_topics) and topic != QuestionCategory.UNKNOWN
         ]
         return expanded[:4]
 
@@ -3185,17 +3113,7 @@ class MerchantQaWorkflow:
 
     def build_intent_signals(self, state: AgentState) -> IntentSignals:
         topics = self._effective_topic_categories(state)
-        data_topics = [
-            topic
-            for topic in topics
-            if topic
-            not in {
-                QuestionCategory.UNKNOWN,
-                QuestionCategory.PLATFORM_RULE,
-                QuestionCategory.MERCHANT_OTHER,
-                QuestionCategory.IDENTITY,
-            }
-        ]
+        data_topics = self._asset_backed_topic_categories(topics)
         recall_items = (state.get("recall_bundle") or RecallBundle()).items
         rule_items = [item for item in recall_items[:8] if rule_recall_item(item)]
         keywords = state.get("extracted_keywords") or ExtractedKeywords()
@@ -3204,8 +3122,8 @@ class MerchantQaWorkflow:
         has_analysis_intent = bool(state.get("open_diagnostic_intent"))
         rule_confidence = max([float(item.fusion_score or 0.0) for item in rule_items] or [0.0])
         data_confidence = max([float(item.fusion_score or 0.0) for item in recall_items if not rule_recall_item(item)] or [0.0])
-        has_rule_topic = QuestionCategory.PLATFORM_RULE in set(topics)
-        rule_needed = bool(rule_items) and (has_rule_topic or not has_data_intent)
+        has_rule_signal = route_slots.risk_level in {"rule_sensitive", "high_risk"}
+        rule_needed = bool(rule_items) and (has_rule_signal or not has_data_intent)
         rule_refs = [item.doc_id for item in rule_items if item.doc_id] if rule_needed else []
         suggested_actions: List[str] = []
         observations: List[str] = []
@@ -3225,7 +3143,7 @@ class MerchantQaWorkflow:
             suggested_actions.append("answer_rule")
         if has_data_intent:
             suggested_actions.extend(["compact_assets", "plan_graph"])
-        if not rule_refs and has_rule_topic:
+        if not rule_refs and has_rule_signal:
             observations.append("rule_topic_without_rule_evidence")
         return IntentSignals(
             has_rule_evidence=bool(rule_refs),
@@ -3245,37 +3163,26 @@ class MerchantQaWorkflow:
         keywords = state.get("extracted_keywords") or ExtractedKeywords()
         if self.requires_bi_execution(state, keywords):
             return False
-        topics = set(self._effective_topic_categories(state))
         recall_items = (state.get("recall_bundle") or RecallBundle()).items
-        has_rule_topic = QuestionCategory.PLATFORM_RULE in topics
+        route_slots = state.get("route_slots") or RouteSlots()
+        has_rule_signal = route_slots.risk_level in {"rule_sensitive", "high_risk"}
         has_rule_recall = any(rule_recall_item(item) for item in recall_items[:6])
-        return has_rule_topic or has_rule_recall
+        return has_rule_signal or has_rule_recall
 
     def requires_bi_execution(self, state: AgentState, keywords: ExtractedKeywords | None = None) -> bool:
-        question = state.get("question", "")
-        text = question.lower()
+        text = str(state.get("question") or "").lower()
         keywords = keywords or state.get("extracted_keywords") or ExtractedKeywords()
         route_slots = state.get("route_slots") or RouteSlots()
         if route_slots.operation == "write_requested":
             return False
         if route_slots.object_refs:
             return True
-        if re.search(r"\b(order_id|sub_order_id|spu_id|sku_id|refund_id|ticket_id|bill_id)_[a-z0-9_]+\b", text):
-            return True
-        topics = set(self._effective_topic_categories(state))
-        data_topics = {
-            topic
-            for topic in topics
-            if topic
-            not in {
-                QuestionCategory.UNKNOWN,
-                QuestionCategory.PLATFORM_RULE,
-                QuestionCategory.MERCHANT_OTHER,
-                QuestionCategory.IDENTITY,
-            }
-        }
+        topics = self._effective_topic_categories(state)
+        data_topics = self._asset_backed_topic_categories(topics)
         if not data_topics:
             return False
+        if keywords.metric_keywords or keywords.dimension_keywords:
+            return True
         data_action_terms = [
             "查询",
             "查看",
@@ -3287,11 +3194,7 @@ class MerchantQaWorkflow:
             "详情",
             "列表",
             "记录",
-            "订单量",
-            "下单量",
-            "退款量",
             "金额",
-            "退款率",
             "趋势",
             "top",
             "前",
@@ -3302,7 +3205,7 @@ class MerchantQaWorkflow:
         has_data_action = any(term in text for term in data_action_terms)
         if has_data_action:
             return True
-        if getattr(keywords, "time_keywords", []) and QuestionCategory.PLATFORM_RULE not in topics:
+        if getattr(keywords, "time_keywords", []):
             return True
         return False
 
@@ -3327,11 +3230,27 @@ class MerchantQaWorkflow:
         return "\n\n".join("召回规则片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in rule_items)
 
     def build_rule_recall_plan(self, state: AgentState) -> QueryPlan:
+        rule_items = [
+            item
+            for item in (state.get("recall_bundle") or RecallBundle()).items
+            if rule_recall_item(item)
+        ]
         ref_ids = list(state.get("rule_recall_refs") or self.rule_recall_ref_ids(state))
+        rule_topic = ""
+        if rule_items:
+            metadata = rule_items[0].metadata or {}
+            rule_topic = str(
+                rule_items[0].topic
+                or metadata.get("categoryId")
+                or metadata.get("questionCategory")
+                or metadata.get("topic")
+                or rule_items[0].source_type
+                or ""
+            )
         intent = QuestionIntent(
             question=state["question"],
             intent_type=IntentType.VALID,
-            category=QuestionCategory.PLATFORM_RULE,
+            category=self.recall_service.topic_assets.resolve_topic_category(rule_topic),
             answer_mode=AnswerMode.RULE,
             plan_task_id="rule_recall_answer",
             knowledge_ref_ids=ref_ids,
@@ -3387,8 +3306,7 @@ class MerchantQaWorkflow:
             )
         state["planning_assets_compacted"] = True
         self.reconcile_fast_request_agent_gates(state)
-        state["query_graph_validation_result"] = GraphValidationResult()
-        state["query_graph_validated"] = False
+        invalidate_graph_validation(state)
         state["query_graph_reflected"] = False
         state["planner_reflection"] = PlannerReflectionResult()
         self.planner.artifact_store.write_json("planner", "planning_asset_pack.json", pack.model_dump(by_alias=True), preview_chars=0)
@@ -3723,6 +3641,10 @@ class MerchantQaWorkflow:
             )
             emit(state, "node.completed", "QUERY_METRIC", {"supported": False, "fallback": "plan_query_graph"})
             return state
+        if self.settings.calendar_time_semantics_enabled:
+            time_window_contract = resolve_time_window_contract(state["question"], self.settings.business_timezone)
+            state["time_window_contract"] = time_window_contract
+            plan = apply_time_window_contract_to_plan(plan, time_window_contract)
         state["plan"] = plan
         state["query_graph_reflected"] = True
         state["planner_reflection"] = PlannerReflectionResult()
@@ -3737,8 +3659,7 @@ class MerchantQaWorkflow:
             state.get("memory_constraints", []),
         )
         validation = validation_with_question_coverage(state["question"], plan, pack, validation)
-        state["query_graph_validation_result"] = validation
-        state["query_graph_validated"] = True
+        record_graph_validation(state, validation, plan)
         state["last_query_graph_validation_gaps"] = [] if validation.valid else list(validation.gaps)
         state["pending_knowledge_requests"] = filter_blocked_knowledge_requests(
             state,
@@ -3832,10 +3753,13 @@ class MerchantQaWorkflow:
         run_result.partial_answer_reason = verified.partial_answer_reason
         graph_repair_gaps = graph_repair_validation_gaps(verified.gaps)
         if graph_repair_gaps:
-            state["query_graph_validation_result"] = GraphValidationResult(
-                valid=False,
-                gaps=graph_repair_gaps,
-                repairable=True,
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    gaps=graph_repair_gaps,
+                    repairable=True,
+                ),
             )
         state["evidence_graph_verified"] = True
         state["verification_status"] = "passed" if verified.passed else "failed"
@@ -3950,6 +3874,7 @@ class MerchantQaWorkflow:
             state["time_window_contract"] = time_window_contract
             plan = apply_time_window_contract_to_plan(plan, time_window_contract)
         state["plan"] = plan
+        self.materialize_plan_clarification(state)
         state["candidate_query_graphs"] = self.controlled_react_explorer.evaluate_candidates(
             state.get("hypothesis_exploration") or {},
             state["planning_asset_pack"],
@@ -4049,7 +3974,7 @@ class MerchantQaWorkflow:
             if (state.get("analysis_skill_status") or {}).get("source") == "planner_degraded":
                 state["analysis_skill_status"] = {"status": "pending", "source": "runtime"}
                 state["analysis_skill_bypassed"] = False
-        state["query_graph_validated"] = False
+        invalidate_graph_validation(state)
         state["query_graph_reflected"] = False
         state["planner_reflection"] = PlannerReflectionResult()
         if active_requests:
@@ -4251,8 +4176,7 @@ class MerchantQaWorkflow:
             state["planning_asset_pack"],
             result,
         )
-        state["query_graph_validation_result"] = result
-        state["query_graph_validated"] = True
+        record_graph_validation(state, result)
         state["latency_optimization"] = self.latency_optimizer.update_after_validation(
             state.get("latency_optimization") or {},
             result,
@@ -4264,6 +4188,9 @@ class MerchantQaWorkflow:
             dedupe_workflow_knowledge_requests(list(state.get("pending_knowledge_requests") or []) + list(result.recommended_knowledge_requests or [])),
         )
         if result.valid:
+            state["planner_reflection"] = PlannerReflectionResult()
+            state["planner_repair_reason"] = ""
+            state["planner_repair_requests"] = []
             state["should_persist"] = any(intent.answer_mode != AnswerMode.RULE for intent in state["plan"].intents)
             add_step(state, "Main Agent Tool validate_query_graph：QueryGraph 通过校验，edges=%d" % len(state["plan"].dependencies))
         else:
@@ -4292,6 +4219,7 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "repair_graph", "PlannerAgent", "REPAIR_QUERY_GRAPH", reason=state.get("planner_repair_reason", ""))
         increment_round(state)
         state["query_graph_repair_attempts"] = int(state.get("query_graph_repair_attempts") or 0) + 1
+        state["query_graph_repair_attempted"] = True
         emit(state, "node.started", "REPAIR_QUERY_GRAPH", {})
         before_nodes = len(state["plan"].intents)
         repair_reason = state.get("planner_repair_reason", "")
@@ -4305,6 +4233,7 @@ class MerchantQaWorkflow:
             knowledge_context(state),
             state["recall_bundle"],
         )
+        self.materialize_plan_clarification(state)
         if state["plan"].knowledge_requests:
             state["pending_knowledge_requests"] = filter_blocked_knowledge_requests(
                 state,
@@ -4312,10 +4241,11 @@ class MerchantQaWorkflow:
                     list(state.get("pending_knowledge_requests") or []) + list(state["plan"].knowledge_requests or [])
                 ),
             )
-        state["query_graph_validated"] = False
+        invalidate_graph_validation(state)
         state["query_graph_reflected"] = False
         state["planner_reflection"] = PlannerReflectionResult()
         state["planner_repair_reason"] = ""
+        state["planner_repair_requests"] = []
         self.invalidate_execution_outputs(state, "QueryGraph 修复后需要重新执行")
         add_step(state, "Main Agent Tool repair_query_graph：完成 QueryGraph 修复尝试")
         repair_artifact = Path(state["thread_data"].outputs_path) / "artifacts" / "planner" / ("repair_attempt_%d.json" % state["query_graph_repair_attempts"])
@@ -4374,7 +4304,18 @@ class MerchantQaWorkflow:
         state["worker_dispatch_context"] = self.worker_dispatch_context(state)
         emit(state, "node.started", "EXECUTE_QUERY_GRAPH", {"workerDispatch": state.get("worker_dispatch_context", {})})
         validation = state.get("query_graph_validation_result")
-        if state.get("query_graph_validated") and validation and not validation.valid:
+        validation_failure = graph_validation_failure_reason(state)
+        if validation_failure:
+            if validation_failure == "QUERY_GRAPH_CHANGED_AFTER_VALIDATION":
+                mark_graph_validation_stale(state)
+            validation_gaps = list(getattr(validation, "gaps", None) or [])
+            if not validation_gaps:
+                validation_gaps = [
+                    GraphValidationGap(
+                        code=validation_failure,
+                        reason="The current QueryGraph does not have a matching passed validation contract",
+                    )
+                ]
             gaps = [
                 EvidenceGap(
                     code=gap.code,
@@ -4385,17 +4326,17 @@ class MerchantQaWorkflow:
                     source="query_graph_validator",
                     answer_instruction="不要执行 SQL；先补知识或修复 QueryGraph 后再回答。",
                 )
-                for gap in validation.gaps
+                for gap in validation_gaps
             ]
             run_result = AgentRunResult(
                 merged_query_bundle=QueryBundle(
                     failed=True,
-                    error="QueryGraph validation failed before SQL execution",
-                    summary="QueryGraph 未通过校验，NodeAgent 未执行 SQL",
+                    error=validation_failure,
+                    summary="QueryGraph execution was rejected by the validation contract",
                 ),
                 evidence_gaps=gaps,
-                partial_answer_reason="QUERY_GRAPH_VALIDATION_FAILED",
-                reflection_notes=["NodeAgent skipped because QueryGraph validation failed"],
+                partial_answer_reason=validation_failure,
+                reflection_notes=["NodeAgent skipped because the current graph has no matching passed validation"],
             )
             state["agent_run_result"] = run_result
             state["query_bundle"] = run_result.merged_query_bundle
@@ -4405,22 +4346,22 @@ class MerchantQaWorkflow:
             state["sql_generated"] = True
             state["result_generation"] = int(state.get("execution_generation") or 0)
             self.planner.artifact_store.write_json("node", "agent_run_result.json", run_result.model_dump(by_alias=True), preview_chars=0)
-            add_step(state, "Main Agent Tool execute_query_graph：QueryGraph 未通过校验，跳过 NodeWorker SQL 执行")
+            add_step(state, "Main Agent Tool execute_query_graph：validation contract rejected execution; NodeWorker was not called")
             self.record_span(
                 state,
                 "action",
                 "execute_query_graph",
                 started,
                 status="failed",
-                error_code="QUERY_GRAPH_VALIDATION_FAILED",
-                metadata={"gaps": [gap.model_dump(by_alias=True) for gap in validation.gaps[:12]]},
+                error_code=validation_failure,
+                metadata={"gaps": [gap.model_dump(by_alias=True) for gap in validation_gaps[:12]]},
             )
             self.finish_run_step(
                 state,
                 step,
                 "gap",
-                output_summary="skipped SQL because queryGraph valid=false gaps=%d" % len(validation.gaps),
-                error_code="QUERY_GRAPH_VALIDATION_FAILED",
+                output_summary="skipped SQL because validation=%s gaps=%d" % (validation_failure, len(validation_gaps)),
+                error_code=validation_failure,
                 artifact_paths=[str(Path(state["thread_data"].outputs_path) / "artifacts" / "node" / "agent_run_result.json")],
             )
             emit(state, "node.completed", "EXECUTE_QUERY_GRAPH", {"tasks": 0, "rows": 0, "skipped": True})
@@ -4533,10 +4474,13 @@ class MerchantQaWorkflow:
         state["sql_repair_reviewed"] = True
         graph_gaps = graph_gaps_from_node_failures(state["agent_run_result"].task_results)
         if graph_gaps:
-            state["query_graph_validation_result"] = GraphValidationResult(
-                valid=False,
-                gaps=graph_gaps,
-                repairable=True,
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    gaps=graph_gaps,
+                    repairable=True,
+                ),
             )
             state["last_action_result"] = ActionResult(
                 action="repair_sql",
@@ -4591,10 +4535,13 @@ class MerchantQaWorkflow:
         state["agent_run_result"].partial_answer_reason = verified.partial_answer_reason
         graph_repair_gaps = graph_repair_validation_gaps(verified.gaps)
         if graph_repair_gaps:
-            state["query_graph_validation_result"] = GraphValidationResult(
-                valid=False,
-                gaps=graph_repair_gaps,
-                repairable=True,
+            record_graph_validation(
+                state,
+                GraphValidationResult(
+                    valid=False,
+                    gaps=graph_repair_gaps,
+                    repairable=True,
+                ),
             )
         add_step(state, "Main Agent Tool verify_evidence_graph：" + ("证据门禁通过" if verified.passed else "证据存在缺口 %d 个" % len(verified.gaps)))
         state["evidence_graph_verified"] = True
@@ -4851,7 +4798,6 @@ class MerchantQaWorkflow:
         if promoted_count:
             state["sql_generated"] = True
             state["result_generation"] = int(state.get("execution_generation") or 0)
-            state["query_graph_validated"] = True
             state["query_graph_reflected"] = True
             state["planner_provider_error"] = ""
             state["should_persist"] = True
@@ -5324,7 +5270,7 @@ class MerchantQaWorkflow:
         state["query_bundles"] = curated.query_bundles
         state["node_tool_traces"] = curated.node_tool_traces
         state["freshness_reports"] = curated.freshness_reports
-        state["query_graph_validation_result"] = curated_validation
+        record_graph_validation(state, curated_validation, curated_plan)
         return len(successful)
 
     def _render_hypothesis_ledger_for_answer(self, ledger: HypothesisEvidenceLedger) -> str:
@@ -5413,8 +5359,7 @@ class MerchantQaWorkflow:
         increment_round(state)
         emit(state, "node.started", "ANSWER_RULE", {})
         state["plan"] = self.build_rule_recall_plan(state)
-        state["query_graph_validation_result"] = GraphValidationResult(valid=True, repairable=False)
-        state["query_graph_validated"] = True
+        record_graph_validation(state, GraphValidationResult(valid=True, repairable=False))
         state["query_graph_reflected"] = True
         state["planner_provider_error"] = ""
         rule_context = state.get("rule_recall_context") or knowledge_context(state)
@@ -6194,7 +6139,13 @@ class MerchantQaWorkflow:
                 personalization_context=personalization_context,
             )
         elif route == QuestionRoute.INVALID:
-            self.request_human_clarification(state, self.build_scope_clarification_prompt(state), "BUSINESS_SCOPE", "business_scope", business_scope_options())
+            self.request_human_clarification(
+                state,
+                self.build_scope_clarification_prompt(state),
+                "BUSINESS_SCOPE",
+                "business_scope",
+                business_scope_options(self.recall_service.topic_assets),
+            )
             return self.human_in_loop(state)
         else:
             self.guard_unaccepted_evidence_for_answer(state)
@@ -6327,15 +6278,21 @@ class MerchantQaWorkflow:
             state["skill_match"],
             {"status": "waiting_confirmation"},
         )
+        published_skills = (
+            state.get("planning_asset_pack", PlanningAssetPack()).skills
+            if state.get("planning_asset_pack")
+            else []
+        )
+        action_label = merchant_analysis_action_label(skill_name, published_skills)
         self.request_human_clarification(
             state,
             "为了让结论更可靠，建议继续进行“%s”。系统会基于已校验的经营数据做专项拆解，不会修改任何业务数据。是否开始？"
-            % merchant_analysis_action_label(skill_name),
+            % action_label,
             "DEEP_ANALYSIS",
             "skill_confirm",
             ["开始深度分析", "先看当前结果"],
         )
-        add_step(state, "专项分析确认：命中 %s，等待商家确认是否继续深挖" % merchant_analysis_action_label(skill_name))
+        add_step(state, "专项分析确认：命中 %s，等待商家确认是否继续深挖" % action_label)
         return True
 
     def confirmation_evidence_path(self, state: AgentState, source_run_id: str = "") -> Path:
@@ -6357,9 +6314,11 @@ class MerchantQaWorkflow:
         plan_payload = state["plan"].model_dump(by_alias=True)
         run_result_payload = state["agent_run_result"].model_dump(by_alias=True)
         skill_name = str(getattr(state.get("skill_match"), "skill_name", "") or "")
+        semantic_topics = self.confirmation_semantic_topics(state)
+        semantic_source_hash = self.recall_service.topic_assets.semantic_source_hash(semantic_topics)
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
         payload = {
-            "version": 2,
+            "version": 3,
             "sourceRunId": source_run_id,
             "nonce": token,
             "expiresAt": expires_at.isoformat(),
@@ -6370,6 +6329,8 @@ class MerchantQaWorkflow:
             "questionHash": stable_payload_hash(original_question.strip()),
             "planFingerprint": stable_payload_hash(plan_payload),
             "evidenceFingerprint": stable_payload_hash(run_result_payload),
+            "semanticTopics": semantic_topics,
+            "semanticSourceHash": semantic_source_hash,
             "skillName": skill_name,
             "routingDecision": state["routing_decision"].model_dump(by_alias=True),
             "topicRoutingDecision": state["topic_routing_decision"].model_dump(by_alias=True),
@@ -6411,7 +6372,7 @@ class MerchantQaWorkflow:
             payload = {}
         if (
             not payload
-            or int(payload.get("version") or 0) != 2
+            or int(payload.get("version") or 0) != 3
             or str(payload.get("sourceRunId") or "") != source_run_id
             or str(payload.get("nonce") or "") != token
             or payload.get("consumedAt")
@@ -6438,6 +6399,21 @@ class MerchantQaWorkflow:
             return False
         if stable_payload_hash(payload.get("agentRunResult") or {}) != str(payload.get("evidenceFingerprint") or ""):
             return False
+        semantic_topics = [str(item) for item in payload.get("semanticTopics") or [] if str(item)]
+        stored_semantic_hash = str(payload.get("semanticSourceHash") or "")
+        current_semantic_hash = self.recall_service.topic_assets.semantic_source_hash(semantic_topics)
+        if not semantic_topics or not stored_semantic_hash or current_semantic_hash != stored_semantic_hash:
+            state["confirmation_restore_status"] = {
+                "status": "stale",
+                "code": "CONFIRMATION_SEMANTIC_VERSION_CHANGED",
+                "sourceRunId": source_run_id,
+                "semanticTopics": semantic_topics,
+                "storedSemanticSourceHash": stored_semantic_hash,
+                "currentSemanticSourceHash": current_semantic_hash,
+                "recommendedAction": "refresh_recall_and_replan",
+            }
+            state.setdefault("route_decision_trace", []).append(dict(state["confirmation_restore_status"]))
+            return False
         run_result = AgentRunResult.model_validate(payload.get("agentRunResult") or {})
         if not run_result.task_results or not run_result.verified_evidence.passed:
             return False
@@ -6453,7 +6429,8 @@ class MerchantQaWorkflow:
         state["topic_routing_decision"] = TopicRoutingDecision.model_validate(payload.get("topicRoutingDecision") or {})
         state["plan"] = QueryPlan.model_validate(payload.get("plan") or {})
         state["planning_asset_pack"] = PlanningAssetPack.model_validate(payload.get("planningAssetPack") or {})
-        state["query_graph_validation_result"] = GraphValidationResult.model_validate(payload.get("queryGraphValidation") or {})
+        restored_validation = GraphValidationResult.model_validate(payload.get("queryGraphValidation") or {})
+        record_graph_validation(state, restored_validation)
         state["agent_run_result"] = run_result
         state["query_bundle"] = run_result.merged_query_bundle
         state["query_bundles"] = run_result.query_bundles
@@ -6479,7 +6456,6 @@ class MerchantQaWorkflow:
         state["data_discovered"] = True
         state["planning_assets_compacted"] = True
         state["query_graph_reflected"] = True
-        state["query_graph_validated"] = bool(state["query_graph_validation_result"].valid)
         state["sql_generated"] = True
         state["result_generation"] = int(state.get("execution_generation") or 0)
         state["sql_repair_reviewed"] = True
@@ -6491,6 +6467,19 @@ class MerchantQaWorkflow:
             state["analysis_generation"] = int(state.get("execution_generation") or 0)
         add_step(state, "确认续跑：恢复已验证 QueryGraph、数据结果与专项分析选择")
         return True
+
+    def confirmation_semantic_topics(self, state: AgentState) -> List[str]:
+        topics: List[str] = []
+        pack = state.get("planning_asset_pack") or PlanningAssetPack()
+        for item in pack.tables:
+            topic = str(item.topic or "")
+            if topic and topic not in topics:
+                topics.append(topic)
+        decision = state.get("topic_routing_decision") or TopicRoutingDecision()
+        for topic in self.recall_service.topic_assets.topic_names_for_categories(decision.recall_topics()):
+            if topic and topic not in topics:
+                topics.append(topic)
+        return sorted(topics)
 
     def record_skill_lifecycle(self, state: AgentState, trace: Dict[str, Any]) -> None:
         for child_trace in trace.get("skillBatchResults") or []:
@@ -6575,7 +6564,7 @@ class MerchantQaWorkflow:
         state["answer"] = prompt
         state["should_persist"] = False
         state["persisted"] = False
-        state["suggestions"] = state.get("human_clarification_options") or business_scope_options()
+        state["suggestions"] = list(state.get("human_clarification_options") or [])
         if state.get("clarification_tool_message"):
             add_step(state, "ClarificationMiddleware：已拦截 ask_clarification 工具调用，并以 Command(goto=END) 语义暂停当前 run")
         add_step(state, "Human-in-the-loop / ask_human Tool：已用业务问题暂停自动推进，等待商家补充确认")
@@ -6673,7 +6662,12 @@ class MerchantQaWorkflow:
                 for item in (getattr(fast_response, "merchant_experience", {}) or {}).get("metricDisclosures", [])
                 if item.get("metricKey")
             ]
-            state["response_context"].dimension_keys = [] if (getattr(fast_response, "debug_trace", {}) or {}).get("definitionOnly") else ["pt"]
+            fast_debug = getattr(fast_response, "debug_trace", {}) or {}
+            time_contract = fast_debug.get("timeWindowContract") if isinstance(fast_debug.get("timeWindowContract"), dict) else {}
+            declared_time_column = str(time_contract.get("partitionColumn") or time_contract.get("timeColumn") or "")
+            state["response_context"].dimension_keys = (
+                [] if fast_debug.get("definitionOnly") or not declared_time_column else [declared_time_column]
+            )
             state["response_context"].data_catalog = ",".join(getattr(fast_response, "doris_tables", []) or [])
         emit(state, "node.completed", "CACHE_ANSWER", {"persisted": state["persisted"]})
         self.refresh_context_snapshot(state, "cache_answer")
@@ -7355,6 +7349,13 @@ class MerchantQaWorkflow:
             }
         )
         audit_summary = self.node_worker.access_control.audit_summary(limit=5) if hasattr(self.node_worker, "access_control") else {}
+        tenant_filter_columns = sorted(
+            {
+                str(contract.merchant_filter_column)
+                for contract in contracts
+                if str(contract.merchant_filter_column or "").strip()
+            }
+        )
         return {
             "policy": "readonly_merchant_scoped",
             "merchantId": merchant_id,
@@ -7365,7 +7366,8 @@ class MerchantQaWorkflow:
             "readOnly": True,
             "rowLevelSecurity": {
                 "enabled": bool(merchant_id),
-                "filter": "merchant_id/seller_id scoped by request merchant",
+                "filterColumns": tenant_filter_columns,
+                "source": "validated node plan contracts",
             },
             "tableAccess": {
                 "checked": True,
@@ -7453,6 +7455,7 @@ class MerchantQaWorkflow:
         mapping = {
             "time_window": "确认分析时间范围",
             "metric_focus": "确认指标口径",
+            "planner_clarification": "确认查询口径",
             "priority_goal": "确认优化目标",
             "skill_confirmation": "是否开始深度分析",
             "skill_confirm": "是否开始深度分析",
@@ -7484,15 +7487,6 @@ class MerchantQaWorkflow:
                     "reuseScope": "merchant_or_industry_template",
                 }
             )
-        built_in = [
-            {"name": "gmv_drop_diagnosis", "displayName": "GMV 下跌归因", "version": "v1", "reuseScope": "merchant_sop"},
-            {"name": "refund_rate_diagnosis", "displayName": "退款率升高归因", "version": "v1", "reuseScope": "merchant_sop"},
-            {"name": "merchant_daily_briefing", "displayName": "经营简报", "version": "v1", "reuseScope": "merchant_sop"},
-        ]
-        market_names = {item["name"] for item in market_items if item.get("name")}
-        for item in built_in:
-            if item["name"] not in market_names:
-                market_items.append(item)
         return {
             "mode": "governed_skill_ecosystem",
             "creator": {
@@ -7536,8 +7530,8 @@ class MerchantQaWorkflow:
         root.mkdir(parents=True, exist_ok=True)
         for task in visible_successful_tasks(state.get("plan") or QueryPlan(), run_result):
             bundle = task.query_bundle
-            rows = list(bundle.rows or [])
-            if bundle.failed or len(rows) < min_rows:
+            rows, complete = query_bundle_complete_rows(bundle)
+            if bundle.failed or not complete or len(rows) < min_rows:
                 continue
             intent = intent_map.get(task.task_id)
             title = section_title_for_intent(state.get("plan") or QueryPlan(), intent, task.task_id) if intent else task.task_id
@@ -8222,6 +8216,26 @@ class MerchantQaWorkflow:
             },
         }
 
+    def materialize_plan_clarification(self, state: AgentState) -> bool:
+        """Project PlannerAgent's terminal clarification contract into workflow state."""
+
+        if state.get("human_clarification_required"):
+            return True
+        plan = state.get("plan") or QueryPlan()
+        needs = dedupe_texts(
+            [str(item).strip() for item in (getattr(plan, "clarification_needs", None) or []) if str(item or "").strip()]
+        )
+        if not needs:
+            return False
+        question = needs[0]
+        if len(needs) > 1:
+            question = "为确保查询口径一致，请确认以下问题：\n" + "\n".join(
+                "%d. %s" % (index, item) for index, item in enumerate(needs, start=1)
+            )
+        self.request_human_clarification(state, question, "QUERY_PLAN", "planner_clarification", [])
+        add_step(state, "PlannerAgent：查询计划需要确认业务口径，已转入 ask_human，未进入 QueryGraph 校验")
+        return True
+
     def request_human_clarification(self, state: AgentState, question: str, stage: str, type_: str, options: List[str]) -> None:
         question_text = str(question or "").strip()
         metric_gap = re.search(r"(?:当前)?候选(?:指标)?中没有明确的[“\"]?(.+?)[”\"]?指标", question_text)
@@ -8346,44 +8360,77 @@ class MerchantQaWorkflow:
         return state
 
     def build_scope_clarification_prompt(self, state: AgentState) -> str:
-        return "你想看哪个范围？我可以按最近7天、最近30天或昨天来查，也可以直接看交易、退款、客服或商品。"
+        topic_names = [
+            str(item.get("displayName") or item.get("topic") or "")
+            for item in self.recall_service.topic_assets.topic_contracts()
+            if str(item.get("categoryId") or "") != str(QuestionCategory.UNKNOWN)
+        ][:5]
+        suffix = "，也可以直接指定 Topic：%s" % "、".join(topic_names) if topic_names else ""
+        return "你想看哪个范围？可以指定时间范围和业务 Topic%s。" % suffix
 
     def build_topic_clarification_prompt(self, state: AgentState) -> str:
-        return "这个问题可能涉及多个业务域。你想优先看交易、退款售后、客服工单、商品还是供应链？"
+        topic_names = [
+            str(item.get("displayName") or item.get("topic") or "")
+            for item in self.recall_service.topic_assets.topic_contracts()
+            if str(item.get("categoryId") or "") != str(QuestionCategory.UNKNOWN)
+        ][:6]
+        return "这个问题可能涉及多个业务域。请从已发布 Topic 中指定优先范围：%s。" % (
+            "、".join(topic_names) if topic_names else "请补充业务范围"
+        )
 
-    def build_priority_goal_clarification_prompt(self, state: AgentState) -> str:
-        return "你希望“优先处理”按什么目标排序？我可以按综合经营风险默认评估，也可以更偏向退款/赔付损失、GMV 下单或客服压力。"
+    def bootstrap_asset_diagnostic_state(self, state: AgentState) -> None:
+        profile = diagnostic_profile_for_question(
+            state.get("question", ""),
+            self.recall_service.topic_assets,
+            state.get("request_context"),
+        )
+        if not profile:
+            return
+        state["open_diagnostic_profile"] = profile
+        state["open_diagnostic_scope"] = "OPEN_DIAGNOSTIC"
+        state["open_diagnostic_intent"] = str(profile.get("id") or "")
+        if not state.get("open_diagnostic_goal"):
+            state["open_diagnostic_goal"] = str(profile.get("defaultGoal") or "")
+
+    def build_diagnostic_goal_clarification_prompt(self, profile: Dict[str, Any]) -> str:
+        prompt = str(profile.get("clarificationPrompt") or "").strip()
+        if prompt:
+            return prompt
+        return "请补充本次分析的排序目标或约束；系统只会使用已发布语义资产。"
 
     def apply_open_diagnostic_policy(self, state: AgentState, decision: TopicRoutingDecision) -> List[QuestionCategory]:
         if state["routing_decision"].route != QuestionRoute.BUSINESS:
             return []
-        text = state.get("question", "")
-        context = state.get("request_context")
-        if context and context.pending_clarification_type == "priority_goal":
-            goal = str((state.get("clarification_resolution") or {}).get("priorityGoal") or getattr(context, "priority_goal", "") or state.get("original_question") or text or "综合经营风险").strip()
-            return self.mark_open_diagnostic(
-                state,
-                intent="PRIORITY_RECOMMENDATION",
-                goal=goal,
-            )
-        if is_store_health_overview_question(text) or state["routing_decision"].reason == "店铺整体经营问题":
-            return self.mark_open_diagnostic(state, intent="STORE_HEALTH_DIAGNOSIS", goal="综合经营健康度")
-        if decision.recall_topics():
+        del decision
+        profile = state.get("open_diagnostic_profile") or {}
+        intent = str(state.get("open_diagnostic_intent") or profile.get("id") or "")
+        if not intent:
             return []
-        if is_priority_recommendation_question(text):
-            self.mark_open_diagnostic(state, intent="PRIORITY_RECOMMENDATION", goal="")
+        context = state.get("request_context")
+        clarification_type = str(profile.get("clarificationType") or "diagnostic_goal")
+        if context and str(context.pending_clarification_type or "") == clarification_type:
+            goal = str(
+                (state.get("clarification_resolution") or {}).get("diagnosticGoal")
+                or getattr(context, "priority_goal", "")
+                or state.get("question")
+                or ""
+            ).strip()
+            return self.mark_open_diagnostic(state, intent=intent, goal=goal)
+        goal = str(state.get("open_diagnostic_goal") or profile.get("defaultGoal") or "").strip()
+        if bool(profile.get("goalRequired")) and not goal:
+            self.mark_open_diagnostic(state, intent=intent, goal="")
             self.request_human_clarification(
                 state,
-                self.build_priority_goal_clarification_prompt(state),
+                self.build_diagnostic_goal_clarification_prompt(profile),
                 "OPEN_DIAGNOSTIC",
-                "priority_goal",
-                priority_goal_options(),
+                clarification_type,
+                [str(item) for item in profile.get("goalOptions") or []],
             )
             return []
-        return []
+        return self.mark_open_diagnostic(state, intent=intent, goal=goal)
 
     def mark_open_diagnostic(self, state: AgentState, intent: str, goal: str) -> List[QuestionCategory]:
-        seed_topics = diagnostic_seed_topics(intent)
+        seed_topics = diagnostic_seed_topics(intent, self.recall_service.topic_assets)
         state["open_diagnostic_scope"] = "OPEN_DIAGNOSTIC"
         state["open_diagnostic_intent"] = intent
         state["open_diagnostic_goal"] = goal
@@ -8394,6 +8441,16 @@ class MerchantQaWorkflow:
     def _topic_names_for_categories(self, categories: List[Any]) -> List[str]:
         topic_asset_service = self.recall_service.topic_assets
         return topic_asset_service.topic_names_for_categories(categories)
+
+    def _asset_backed_topic_categories(self, categories: List[Any]) -> List[QuestionCategory]:
+        result: List[QuestionCategory] = []
+        for item in categories:
+            category = QuestionCategory(item)
+            if category == QuestionCategory.UNKNOWN:
+                continue
+            if self._topic_names_for_categories([category]) and category not in result:
+                result.append(category)
+        return result
 
     def _effective_topic_categories(self, state: AgentState) -> List[QuestionCategory]:
         base = state["topic_routing_decision"].recall_topics()
@@ -8413,7 +8470,7 @@ class MerchantQaWorkflow:
         lowered = (text or "").lower()
         found: List[QuestionCategory] = []
         for topic_name in self.recall_service.topic_assets.all_topic_names():
-            category = TOPIC_TO_CATEGORY.get(topic_name)
+            category = self.recall_service.topic_assets.resolve_topic_category(topic_name)
             if not category:
                 continue
             for manifest_item in self.recall_service.topic_assets.load_manifest(topic_name):
@@ -8440,7 +8497,7 @@ class MerchantQaWorkflow:
             for target in mentioned_tables[index + 1 :]:
                 for table in shortest_table_path(start, target, adjacency):
                     topic_name = table_topic.get(table, "")
-                    category = TOPIC_TO_CATEGORY.get(topic_name)
+                    category = self.recall_service.topic_assets.resolve_topic_category(topic_name)
                     if category and category not in topics:
                         topics.append(category)
         return topics
@@ -8476,8 +8533,44 @@ class MerchantQaWorkflow:
         return merged
 
 
-def business_scope_options() -> List[str]:
-    return ["最近7天整体经营", "最近30天退款售后", "昨天客服工单"]
+def business_scope_options(topic_assets: Any = None) -> List[str]:
+    contracts = topic_assets.topic_contracts() if topic_assets is not None else []
+    options = [
+        str(item.get("displayName") or item.get("topic") or "")
+        for item in contracts
+        if str(item.get("categoryId") or "") != str(QuestionCategory.UNKNOWN)
+    ]
+    return dedupe_texts(options)[:6]
+
+
+def topic_clarification_contract(topic_assets: Any, clarification_type: str) -> Dict[str, Any]:
+    """Merge an optional clarification contract declared by published Topics."""
+
+    if topic_assets is None or not clarification_type:
+        return {}
+    prompts: List[str] = []
+    options: List[str] = []
+    for topic in topic_assets.topic_contracts():
+        metadata = topic.get("metadata") if isinstance(topic.get("metadata"), dict) else {}
+        contracts = metadata.get("clarificationContracts")
+        contract: Dict[str, Any] = {}
+        if isinstance(contracts, dict):
+            candidate = contracts.get(clarification_type)
+            contract = candidate if isinstance(candidate, dict) else {}
+        elif isinstance(contracts, list):
+            contract = next(
+                (
+                    item
+                    for item in contracts
+                    if isinstance(item, dict) and str(item.get("type") or "") == clarification_type
+                ),
+                {},
+            )
+        prompt = str(contract.get("prompt") or "").strip()
+        if prompt:
+            prompts.append(prompt)
+        options.extend(str(item) for item in contract.get("options") or [] if str(item or "").strip())
+    return {"prompt": prompts[0] if prompts else "", "options": dedupe_texts(options)[:8]}
 
 
 def submit_with_current_context(executor: ThreadPoolExecutor, fn: Any, *args: Any):
@@ -8495,17 +8588,13 @@ def merge_clarification_question(pending_question: str, normalized_answer: str) 
     return "%s %s" % (pending, answer)
 
 
-def merchant_analysis_action_label(skill_name: str) -> str:
-    return {
-        "bi_trend_attribution": "指标波动原因深挖",
-        "gmv_drop_diagnosis": "GMV下降原因诊断",
-        "merchant_daily_briefing": "店铺经营体检",
-        "new_product_risk": "新品经营风险排查",
-        "ratio_analysis": "占比口径核验",
-        "refund_rate_diagnosis": "退款压力专项诊断",
-        "risk_analysis": "经营风险优先级分析",
-        "rule_compliance": "平台规则影响核对",
-    }.get(str(skill_name or ""), "经营专项分析")
+def merchant_analysis_action_label(skill_name: str, skills: Optional[List[Any]] = None) -> str:
+    requested = str(skill_name or "").strip()
+    for skill in skills or []:
+        domain = str(getattr(skill, "domain", "") or "").strip()
+        if domain == requested:
+            return str(getattr(skill, "display_name", "") or domain)
+    return requested or "已发布分析技能"
 
 
 def skill_confirmation_declined(text: str) -> bool:
@@ -8525,21 +8614,67 @@ def merchant_access_role(role: str) -> str:
     }.get(str(role or ""), "merchant_analyst")
 
 
-def priority_goal_options() -> List[str]:
-    return ["综合经营风险", "降低退款/赔付损失", "稳住 GMV 和下单", "降低客服压力"]
+def diagnostic_profile_for_question(
+    question: str,
+    topic_assets: Any = None,
+    request_context: Any = None,
+) -> Dict[str, Any]:
+    """Resolve an open-diagnostic intent only from published Topic metadata."""
+
+    if topic_assets is None:
+        return {}
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for contract in topic_assets.topic_contracts():
+        metadata = contract.get("metadata") if isinstance(contract.get("metadata"), dict) else {}
+        declared = metadata.get("diagnosticIntents") or []
+        for raw_profile in declared if isinstance(declared, list) else []:
+            if not isinstance(raw_profile, dict):
+                continue
+            profile_id = str(raw_profile.get("id") or raw_profile.get("profile") or "").strip()
+            if not profile_id:
+                continue
+            target = profiles.setdefault(profile_id, {"id": profile_id, "triggerTerms": [], "goalOptions": []})
+            for key in ("defaultGoal", "goalRequired", "clarificationType", "clarificationPrompt"):
+                if key in raw_profile and raw_profile.get(key) not in (None, ""):
+                    target[key] = raw_profile.get(key)
+            for source_key, target_key in (("triggerTerms", "triggerTerms"), ("aliases", "triggerTerms"), ("goalOptions", "goalOptions")):
+                values = raw_profile.get(source_key) or []
+                target[target_key] = dedupe_texts(
+                    [*target.get(target_key, []), *[str(item) for item in values if str(item or "").strip()]]
+                )
+    pending_type = str(getattr(request_context, "pending_clarification_type", "") or "")
+    if pending_type:
+        matched = next(
+            (profile for profile in profiles.values() if str(profile.get("clarificationType") or "") == pending_type),
+            {},
+        )
+        if matched:
+            return dict(matched)
+    normalized_question = normalize_for_match(question)
+    for profile in profiles.values():
+        for term in profile.get("triggerTerms") or []:
+            normalized_term = normalize_for_match(term)
+            if normalized_term and normalized_term in normalized_question:
+                return dict(profile)
+    return {}
 
 
-def diagnostic_seed_topics(intent: str) -> List[QuestionCategory]:
-    base = [
-        QuestionCategory.TRADE,
-        QuestionCategory.REFUND,
-        QuestionCategory.CS_TICKET,
-        QuestionCategory.COMPENSATION,
-        QuestionCategory.GOODS,
-    ]
-    if intent == "PRIORITY_RECOMMENDATION":
-        return base + [QuestionCategory.COUPON, QuestionCategory.SCM]
-    return base
+def diagnostic_seed_topics(intent: str, topic_assets: Any = None) -> List[QuestionCategory]:
+    """Select diagnostic scope only from asset-declared topic contracts."""
+
+    if topic_assets is None:
+        return []
+    selected: List[QuestionCategory] = []
+    for contract in topic_assets.topic_contracts():
+        metadata = contract.get("metadata") or {}
+        profiles = [str(item) for item in metadata.get("diagnosticProfiles") or []]
+        enabled = bool(metadata.get("openDiagnostic")) or bool(profiles)
+        if not enabled or (profiles and intent not in profiles):
+            continue
+        category = QuestionCategory(contract.get("categoryId") or contract.get("topic"))
+        if category != QuestionCategory.UNKNOWN and category not in selected:
+            selected.append(category)
+    return selected
 
 
 def dedupe_texts(values: List[str]) -> List[str]:
@@ -8549,19 +8684,6 @@ def dedupe_texts(values: List[str]) -> List[str]:
         if text and text not in seen:
             seen.append(text)
     return seen
-
-
-def is_priority_recommendation_question(question: str) -> bool:
-    text = question or ""
-    decision_terms = ["优先处理", "先处理", "优先解决", "最值得优先", "建议我先", "只优先处理", "排优先级"]
-    return any(term in text for term in decision_terms)
-
-
-def is_store_health_overview_question(question: str) -> bool:
-    text = question or ""
-    subject_terms = ["店铺", "商家", "我店", "当前店铺"]
-    overview_terms = ["整体经营", "经营情况", "经营概况", "店铺情况", "风险和机会", "总结风险", "经营健康", "店铺整体"]
-    return any(term in text for term in subject_terms) and any(term in text for term in overview_terms)
 
 
 def shortest_table_path(start: str, target: str, adjacency: Dict[str, List[str]]) -> List[str]:
@@ -8790,12 +8912,18 @@ def answer_guard_debug(run_result: AgentRunResult) -> Dict[str, Any]:
 def rule_recall_item(item: Any) -> bool:
     answer_mode = str(getattr(item, "answer_mode", "") or "").upper()
     source_type = str(getattr(item, "source_type", "") or "").upper()
-    title = str(getattr(item, "title", "") or "")
-    doc_id = str(getattr(item, "doc_id", "") or "")
+    metadata = getattr(item, "metadata", {}) if isinstance(getattr(item, "metadata", {}), dict) else {}
+    declared_role = str(
+        metadata.get("knowledgeRole")
+        or metadata.get("topicRole")
+        or metadata.get("routingRole")
+        or metadata.get("semanticKind")
+        or ""
+    ).upper()
     answer_modes = {part.strip() for part in re.split(r"[,|/]", answer_mode) if part.strip()}
-    if answer_modes & {"RULE", "RULE_ANSWER", "PLATFORM_RULE", "RULE_REFERENCE"}:
+    if answer_modes & {"RULE", "RULE_ANSWER", "RULE_REFERENCE"}:
         return True
-    return source_type == "GOVERNED_RULE" and ("rule" in doc_id.lower() or "规则" in title)
+    return source_type == "GOVERNED_RULE" or declared_role in {"RULE", "GOVERNED_RULE", "RULE_REFERENCE"}
 
 
 def merge_recall_item_queries(current: RecallItem, incoming: RecallItem) -> RecallItem:
@@ -9332,12 +9460,16 @@ def create_workflow(settings: Optional[Settings] = None) -> MerchantQaWorkflow:
     asset_builder = PlanningAssetPackBuilder(topic_assets, skill_loader, doris_repository)
     return MerchantQaWorkflow(
         settings=settings,
-        merchant_service=MerchantService(settings, doris_repository),
+        merchant_service=MerchantService(
+            settings,
+            doris_repository,
+            SemanticRuntimeBindingRegistry(settings).resolve("principal_profile"),
+        ),
         answer_repository=answer_repository,
         pending_store=pending_store,
         keyword_service=KeywordExtractService(topic_assets),
-        routing_service=QuestionRoutingService(),
-        topic_router=TopicRouterService(),
+        routing_service=QuestionRoutingService(topic_assets),
+        topic_router=TopicRouterService(topic_assets),
         recall_service=recall_service,
         knowledge_retriever=knowledge_retriever,
         asset_builder=asset_builder,

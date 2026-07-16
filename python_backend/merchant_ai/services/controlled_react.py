@@ -35,9 +35,9 @@ class ControlledReactExplorer:
             "budget": {"maxHypotheses": self.MAX_HYPOTHESES, "maxCandidateGraphs": self.MAX_CANDIDATES},
             "questionSignals": {
                 "mentionsDrop": bool(re.search(r"下降|下跌|降低|drop", text, re.I)),
-                "mentionsRefund": bool(re.search(r"退款|退货|refund", text, re.I)),
                 "mentionsAttribution": bool(re.search(r"原因|归因|why|attribution", text, re.I)),
                 "intentKind": str((fast_understanding or {}).get("intentKind") or (fast_understanding or {}).get("intent_kind") or ""),
+                "recalledMetricCount": len(metric_names),
             },
             "assetCoverage": {
                 "tables": len(table_names),
@@ -291,6 +291,7 @@ class ControlledReactExplorer:
                         "metric_name": metric.key or metric.title,
                         "metric_column": metric_column,
                         "metric_formula": str((metric.metadata or {}).get("formula") or ""),
+                        "metric_resolution": resource_metric_resolution(metric),
                         "depends_on_task_ids": [],
                         "analysis_source": "hypothesis_table_switch",
                         "analysis_note": "独立假设无数据后切换语义表验证",
@@ -303,8 +304,8 @@ class ControlledReactExplorer:
             for field in pack.fields
             if field.table == table
             and field.key in set(pack.known_columns(table))
-            and field.key not in {"pt", "seller_id", "merchant_id", "shop_id", source.metric_column, source.group_by_column}
-            and not any(token in field.key.lower() for token in ["time", "date", "amount", "amt", "count", "cnt"])
+            and field.key not in {source.metric_column, source.group_by_column}
+            and semantic_asset_role(field) == "DIMENSION"
         ]
         if dimensions:
             dimension = dimensions[0]
@@ -359,7 +360,8 @@ class ControlledReactExplorer:
         metric_key = str(metric.key or metric.title or "")
         metric_column = next((item for item in source_columns if item in columns), "") or (metric_key if metric_key in columns else "")
         formula = str(metadata.get("formula") or metadata.get("metricFormula") or "")
-        group_by = "pt" if "pt" in columns else ""
+        group_by = resource_time_column(pack, metric)
+        group_by_name = resource_field_label(pack, metric.table, group_by) if group_by else ""
         answer_mode = AnswerMode.GROUP_AGG if group_by else AnswerMode.METRIC
         intent = QuestionIntent(
             question=question,
@@ -370,8 +372,9 @@ class ControlledReactExplorer:
             metric_name=metric_key,
             metric_column=metric_column,
             metric_formula=formula,
+            metric_resolution=resource_metric_resolution(metric),
             group_by_column=group_by,
-            group_by_name="日期" if group_by else "",
+            group_by_name=group_by_name,
             days=max(1, int(days or 7)),
             limit=30,
             required_evidence=list(hypothesis.get("requiredEvidence") or []),
@@ -439,32 +442,89 @@ class ControlledReactExplorer:
         return switches
 
     def _hypothesis_templates(self, question: str, metric_names: List[str]) -> List[Dict[str, Any]]:
-        text = question or ""
-        wanted = set(metric_names)
-        def metrics(*names: str) -> List[str]:
-            selected = [name for name in names if name in wanted]
-            return selected or metric_names[:3]
-
-        templates = [
+        del question
+        primary = metric_names[:1]
+        related = metric_names[:4]
+        return [
             {
-                "title": "核心经营指标变化来自交易规模或转化变化",
-                "reason": "优先验证主指标是否真的异常，再拆成交、订单、商品或时间维度。",
-                "metricHints": metrics("order_gmv_amt_1d", "pay_amt", "order_detail_cnt"),
+                "title": "验证首个已召回指标的时间变化",
+                "reason": "先验证指标变化是否由完整的时间序列和可比基线支持。",
+                "metricHints": primary,
                 "requiredEvidence": ["trend", "baseline", "dimension_breakdown"],
             },
             {
-                "title": "售后或退款因素影响经营结果",
-                "reason": "问题包含退款/售后/风险信号时，需要把退款率、退款金额或工单证据接入主图。",
-                "metricHints": metrics("refund_rate", "refund_amt", "refund_cnt"),
-                "requiredEvidence": ["refund_trend", "refund_reason", "related_orders"],
+                "title": "比较已召回指标是否同步变化",
+                "reason": "只在多个已召回指标具有可比时间覆盖时检验同步性。",
+                "metricHints": related,
+                "requiredEvidence": ["aligned_series", "comparable_windows", "coverage_check"],
             },
             {
-                "title": "数据口径或新鲜度导致观察偏差",
-                "reason": "BI Agent 需要确认离线表延迟、实时 fallback 和口径规则，避免把缺数据当业务为 0。",
-                "metricHints": metric_names[:3],
+                "title": "核对语义口径与数据覆盖",
+                "reason": "确认指标元数据、数据更新时间和覆盖范围，避免把缺失值解释为业务事实。",
+                "metricHints": related,
                 "requiredEvidence": ["freshness_check", "semantic_rule", "data_update_time"],
             },
         ]
-        if not re.search(r"退款|退货|售后|refund", text, re.I):
-            templates = [templates[0], templates[2], templates[1]]
-        return templates
+
+
+def semantic_asset_role(entry: Any) -> str:
+    metadata = getattr(entry, "metadata", {}) or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    return str(semantic.get("role") or metadata.get("semanticRole") or metadata.get("role") or "").strip().upper()
+
+
+def resource_time_column(pack: PlanningAssetPack, metric: Any) -> str:
+    table = str(getattr(metric, "table", "") or "")
+    known = set(pack.known_columns(table))
+    metadata_sources = [getattr(metric, "metadata", {}) or {}]
+    metadata_sources.extend(
+        getattr(entry, "metadata", {}) or {}
+        for entry in pack.tables
+        if str(getattr(entry, "table", "") or getattr(entry, "key", "") or "") == table
+    )
+    for metadata in metadata_sources:
+        for key in ["timeColumn", "time_column", "timeDimension", "time_dimension", "defaultGroupBy", "default_group_by"]:
+            value = metadata.get(key)
+            candidates = value if isinstance(value, list) else [value]
+            for candidate in candidates:
+                column = str(candidate or "").strip()
+                if column and column in known:
+                    return column
+    for field in pack.fields:
+        if field.table == table and field.key in known and semantic_asset_role(field) in {"TIME", "PARTITION"}:
+            return str(field.key)
+    return ""
+
+
+def resource_field_label(pack: PlanningAssetPack, table: str, column: str) -> str:
+    for field in pack.fields:
+        if field.table != table or field.key != column:
+            continue
+        metadata = field.metadata or {}
+        semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+        return str(field.title or semantic.get("businessName") or semantic.get("description") or "").strip()
+    return ""
+
+
+def resource_metric_resolution(metric: Any) -> Dict[str, Any]:
+    metadata = getattr(metric, "metadata", {}) or {}
+    resolution: Dict[str, Any] = {"metricKey": str(getattr(metric, "key", "") or "").strip()}
+    display_name = str(metadata.get("displayName") or metadata.get("display_name") or getattr(metric, "title", "") or "").strip()
+    if display_name:
+        resolution["displayName"] = display_name
+    for target, aliases in {
+        "description": ["description"],
+        "unit": ["unit"],
+        "valueFormat": ["valueFormat", "value_format"],
+        "sourceColumnLabels": ["sourceColumnLabels", "source_column_labels"],
+        "sourceColumns": ["sourceColumns", "source_columns"],
+        "entityColumns": ["entityColumns", "entity_columns"],
+        "scopeColumns": ["scopeColumns", "scope_columns"],
+    }.items():
+        value = next((metadata.get(alias) for alias in aliases if metadata.get(alias) not in (None, "", [], {})), None)
+        if value not in (None, "", [], {}):
+            resolution[target] = value
+    source_ref = str(getattr(metric, "source_ref_id", "") or "").strip()
+    if source_ref:
+        resolution["semanticRefId"] = source_ref
+    return resolution

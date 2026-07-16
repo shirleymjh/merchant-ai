@@ -146,7 +146,7 @@ RUNTIME_NODE_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "inspect_schema": "inspect asset/live schema available for this node",
     "resolve_columns": "resolve required columns and output keys",
     "contract_critic": "check whether node plan contract is executable before SQL draft",
-    "check_freshness": "check pt freshness/fallback risk",
+    "check_freshness": "check the semantic contract's declared time column and fallback risk",
     "choose_sql_strategy": "choose plan-bound LLM SQL or structured fallback",
     "draft_structured_sql": "draft safe one-table structured SQL",
     "draft_llm_sql": "draft one-table SQL with LLM bound to node plan contract",
@@ -330,7 +330,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "sourcePhrase": string_property("exact source phrase from the user question"),
             "ownerTable": string_property("metric owner table from semanticCatalog"),
             "objectiveType": string_property("metric objective type", ["metric_total", "ranking", "trend_anchor", "detail_anchor"]),
-            "groupByColumn": string_property("grain column such as spu_id, sub_order_id, order_id or pt"),
+            "groupByColumn": string_property("grain column selected from semanticCatalog"),
             "order": string_property("sort direction", ["desc", "asc"]),
             "limit": integer_property("top N limit", 1),
         },
@@ -363,38 +363,19 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
     )
     scope_schema = object_schema(
         {
-            "scopeId": string_property("stable id for this bounded entity set, e.g. coupon_order_scope"),
-            "sourcePhrase": string_property("exact source phrase that limits the population, e.g. orders brought by a campaign"),
+            "scopeId": string_property("stable id for this bounded entity set"),
+            "sourcePhrase": string_property("exact source phrase that limits the population"),
             "ownerTable": string_property("semanticCatalog table that defines the bounded population"),
             "metricRef": string_property("optional candidate metric key that describes the scope source"),
-            "entityGrain": string_property("entity grain produced by the scope", ["merchant", "product", "order", "day", "ticket", "refund", "coupon", "unknown"]),
-            "targetDomain": string_property("optional semantic domain that the scope should constrain, e.g. order/refund/product/coupon"),
-            "required": boolean_property("true when this scope must be applied before computing rankingObjective/requestedMeasures"),
+            "entityGrain": string_property("entity grain declared by the selected semantic asset"),
+            "targetDomain": string_property("optional semantic topic that the scope should constrain"),
+            "required": boolean_property("true when this scope must be applied before computing anchor/support metrics"),
         },
         required=["sourcePhrase", "ownerTable", "entityGrain"],
     )
     filter_schema = object_schema(
         {
-            "field": string_property(
-                "filter field from semanticCatalog/live schema",
-                [
-                    "order_id",
-                    "sub_order_id",
-                    "spu_id",
-                    "refund_id",
-                    "ticket_id",
-                    "bill_id",
-                    "coupon_id",
-                    "refund_status_name",
-                    "refund_amt_status_name",
-                    "process_status_name",
-                    "pay_status_name",
-                    "sub_order_status_name",
-                    "spu_status_name",
-                    "ticket_status_name",
-                    "repay_status_name",
-                ],
-            ),
+            "field": string_property("filter field from semanticCatalog/live schema"),
             "value": string_property("entity or status value from the user question; use comma-separated values for OR/IN filters"),
         },
         required=["field", "value"],
@@ -411,7 +392,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
     )
     understanding_schema = object_schema(
         {
-            "analysisGrain": string_property("analysis grain", ["merchant", "product", "order", "day", "ticket", "refund", "coupon", "unknown"]),
+            "analysisGrain": string_property("analysis grain declared by the selected semantic asset or user request"),
             "analysisIntent": string_property(
                 "analysis intent declared by the LLM understanding stage",
                 ["none", "diagnosis", "trend_check", "risk_ranking", "overview", "comparison", "anomaly_check"],
@@ -421,8 +402,8 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
                 "evidence intents required to support the declared analysis intent; must be non-empty when analysisIntent is not none; empty only for simple lookup/ranking questions",
                 evidence_intent_schema,
             ),
-            "rankingObjective": ranking_schema,
-            "requestedMeasures": array_property("additional requested metrics", measure_schema),
+            "anchorMetric": ranking_schema,
+            "supportMetrics": array_property("additional requested metrics", measure_schema),
             "metricCandidateDecisions": array_property(
                 "same/near-name metric candidate arbitration before planning",
                 metric_candidate_decision_schema,
@@ -433,12 +414,8 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
                     {
                         "operation": string_property("calculation operation", ["ratio", "percentage", "difference", "comparison"]),
                         "sourcePhrase": string_property("exact phrase from the user expressing this calculation"),
-                        "basePopulationPhrase": string_property(
-                            "base population phrase for ratio/percentage, e.g. '使用优惠券的订单' in '使用优惠券的订单中，有退货的订单占多少'"
-                        ),
-                        "eventPopulationPhrase": string_property(
-                            "event/subset population phrase for ratio/percentage numerator, e.g. '有退货的订单' in '使用优惠券的订单中，有退货的订单占多少'"
-                        ),
+                        "basePopulationPhrase": string_property("exact user phrase naming the base population for a ratio/percentage"),
+                        "eventPopulationPhrase": string_property("exact user phrase naming the event/subset numerator population"),
                         "numeratorMetricRef": string_property(
                             "semantic metric key for the event/subset numerator; for ratio/percentage it must not equal denominatorMetricRef"
                         ),
@@ -451,7 +428,7 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
                 ),
             ),
             "scopeConstraints": array_property(
-                "bounded entity sets that must constrain the graph before ranking/measures, e.g. orders from a campaign, refunded orders, newly published products",
+                "bounded entity sets that must constrain the graph before computing anchor/support metrics",
                 scope_schema,
             ),
             "filters": array_property("explicit entity filters", filter_schema),
@@ -462,8 +439,8 @@ def question_understanding_tool(force_catalog: bool = False) -> AgentToolDefinit
             "analysisIntent",
             "requiresExplanation",
             "requiredEvidenceIntents",
-            "rankingObjective",
-            "requestedMeasures",
+            "anchorMetric",
+            "supportMetrics",
             "metricCandidateDecisions",
             "calculationIntents",
             "scopeConstraints",
@@ -574,7 +551,7 @@ def semantic_file_tool_definitions() -> List[AgentToolDefinition]:
             description="List semantic-layer file refs before reading large table or relationship assets.",
             parameters=object_schema(
                 {
-                    "topic": string_property("optional topic display name, e.g. 电商交易"),
+                    "topic": string_property("optional topic id or display name from the runtime topic catalog"),
                     "query": string_property("optional search phrase for narrowing refs"),
                     "limit": integer_property("maximum refs to return", 1),
                     "reason": string_property("why these semantic refs are needed now"),
@@ -586,8 +563,8 @@ def semantic_file_tool_definitions() -> List[AgentToolDefinition]:
             description="Read one semantic-layer file ref by refId or path. Use only after semantic_ls/grep indicates it is needed.",
             parameters=object_schema(
                 {
-                    "refId": string_property("semantic ref id, e.g. semantic:电商交易:dwm_trade_order_detail_di:asset"),
-                    "path": string_property("semantic file path, e.g. topics/电商交易/tables/dwm_trade_order_detail_di/asset.json"),
+                    "refId": string_property("semantic ref id returned by semantic_ls or semantic_grep"),
+                    "path": string_property("semantic file path returned by semantic_ls or semantic_grep"),
                     "maxChars": integer_property("maximum characters to read", 1),
                     "offset": integer_property("character offset for progressive reads", 0),
                     "reason": string_property("why this file content is required"),

@@ -9,33 +9,157 @@ from merchant_ai.services.retrieval import (
     canonical_metric_family_owner,
     filter_recall_items_by_governance,
     limit_recall_items_by_source_type,
+    merge_recall_items,
     metric_candidate_fusion_score,
     rrf_fuse_recall_items,
     rewrite_retrieval_query,
 )
 
 
+class LinkedVariantTopicAssets:
+    def all_topic_names(self):
+        return ["finance"]
+
+    def load_manifest(self, topic):
+        return [{"tableName": "account_metrics"}]
+
+    def load_table_asset(self, topic, table):
+        return {"status": "PUBLISHED"}
+
+    def load_table_terms(self, topic, table):
+        return []
+
+    def load_table_metrics(self, topic, table):
+        return [
+            {
+                "metricKey": "revenue_period",
+                "businessName": "Revenue",
+                "aliases": ["Revenue"],
+                "formula": "SUM(revenue_amount)",
+                "metricGrain": "account_period",
+                "metricIntent": "summary",
+                "aggregationPolicy": "period_rollup",
+                "selectionGuidance": "Use for one value over a bounded period.",
+                "temporalVariants": {
+                    "series": {"metricKey": "revenue_daily"},
+                    "alternatives": ["revenue_snapshot"],
+                },
+            },
+            {
+                "metricKey": "revenue_daily",
+                "businessName": "Daily Revenue",
+                "aliases": ["Daily Revenue"],
+                "formula": "SUM(revenue_amount)",
+                "metricGrain": "account_day",
+                "metricIntent": "series",
+                "aggregationPolicy": "daily_value_only",
+                "selectionGuidance": "Use only with a daily grouping.",
+                "temporalVariants": {"summary": "revenue_period"},
+            },
+            {
+                "metricKey": "revenue_snapshot",
+                "businessName": "Revenue Snapshot",
+                "aliases": ["Revenue Snapshot"],
+                "formula": "MAX(revenue_amount)",
+                "metricGrain": "account_snapshot",
+                "metricIntent": "snapshot",
+                "aggregationPolicy": "latest_value_only",
+                "selectionGuidance": "Use only for an explicit snapshot request.",
+            },
+        ]
+
+
 def test_follow_up_query_is_rewritten_with_previous_user_question():
     request = KnowledgeRetrievalRequest(
-        query="那按商品看呢",
-        previous_user_question="最近30天退款率是多少",
+        query="那按区域看呢",
+        previous_user_question="Revenue for the last 30 days",
     )
 
-    assert rewrite_retrieval_query(request) == "最近30天退款率是多少；追问补充：那按商品看呢"
+    assert rewrite_retrieval_query(request) == "Revenue for the last 30 days；追问补充：那按区域看呢"
 
 
 def test_standalone_query_is_not_rewritten():
     request = KnowledgeRetrievalRequest(
-        query="最近7天各商品退款率是多少",
-        previous_user_question="最近30天退款率是多少",
+        query="Revenue by region for the last 7 days",
+        previous_user_question="Revenue for the last 30 days",
     )
 
     assert rewrite_retrieval_query(request) == request.query
 
 
+def test_metric_resolver_exposes_all_asset_linked_variants_without_question_based_selection():
+    service = EsKnowledgeRetrievalService(get_settings(), LinkedVariantTopicAssets())
+
+    total = service._resolve_metric_candidates("Revenue total", ["finance"])
+    trend = service._resolve_metric_candidates("Revenue over time", ["finance"])
+
+    assert {item["metricKey"] for item in total} == {
+        "revenue_period",
+        "revenue_daily",
+        "revenue_snapshot",
+    }
+    assert [item["metricKey"] for item in total] == [item["metricKey"] for item in trend]
+    linked = {item["metricKey"]: item for item in total if item["metricResolutionType"] == "linked_variant"}
+    assert linked["revenue_daily"]["linkedVariantPath"] == "series.metricKey"
+    assert linked["revenue_snapshot"]["linkedVariantPath"] == "alternatives[0]"
+    assert linked["revenue_daily"]["linkedVariantOf"].endswith(":revenue_period")
+    assert linked["revenue_daily"]["aggregationPolicy"] == "daily_value_only"
+    assert linked["revenue_daily"]["selectionGuidance"] == "Use only with a daily grouping."
+    assert all(0.0 <= item["metricResolutionConfidence"] <= 1.0 for item in total)
+
+    cards = service._metric_candidate_items("Revenue total", total)
+    daily_card = next(item for item in cards if item.metadata["metricKey"] == "revenue_daily")
+    assert daily_card.metadata["linkedVariantPath"] == "series.metricKey"
+    assert daily_card.metadata["aggregationPolicy"] == "daily_value_only"
+
+
+def test_qualified_label_suppresses_embedded_bare_label_unless_both_are_requested():
+    service = EsKnowledgeRetrievalService(get_settings(), LinkedVariantTopicAssets())
+    service.topic_assets.load_table_metrics = lambda topic, table: [
+        {
+            "metricKey": "revenue",
+            "businessName": "Revenue",
+            "aliases": ["Revenue"],
+            "formula": "SUM(amount)",
+        },
+        {
+            "metricKey": "net_revenue",
+            "businessName": "Net Revenue",
+            "aliases": ["Net Revenue"],
+            "formula": "SUM(net_amount)",
+        },
+    ]
+
+    qualified = service._resolve_metric_candidates("Net Revenue", ["finance"])
+    both = service._resolve_metric_candidates("Revenue and Net Revenue", ["finance"])
+
+    assert [item["metricKey"] for item in qualified] == ["net_revenue"]
+    assert {item["metricKey"] for item in both} == {"revenue", "net_revenue"}
+
+
+def test_raw_metric_hits_remain_broad_after_resolver_candidates_are_merged():
+    raw_items = [
+        RecallItem(doc_id="metric:a", source_type="SEMANTIC_METRIC", fusion_score=0.7),
+        RecallItem(doc_id="metric:b", source_type="SEMANTIC_METRIC", fusion_score=0.6),
+    ]
+    resolved_items = [
+        RecallItem(
+            doc_id="metric:a",
+            source_type="SEMANTIC_METRIC",
+            fusion_score=0.9,
+            metadata={"metricResolutionType": "exact_alias"},
+        )
+    ]
+
+    merged = merge_recall_items(raw_items, resolved_items)
+
+    assert {item.doc_id for item in merged} == {"metric:a", "metric:b"}
+    assert next(item for item in merged if item.doc_id == "metric:a").fusion_score == 0.9
+
+
 def test_governance_filter_blocks_cross_merchant_role_status_version_and_expiry():
     request = KnowledgeRetrievalRequest(
-        query="退款率",
+        query="Revenue",
         merchant_id="merchant-100",
         access_role="merchant_analyst",
         permissions=["metric:read"],
@@ -65,25 +189,25 @@ def test_governance_filter_blocks_cross_merchant_role_status_version_and_expiry(
 
 
 def test_business_rerank_prefers_metric_matching_the_question():
-    request = KnowledgeRetrievalRequest(query="最近7天退款率", intent_kind="metric_query")
+    request = KnowledgeRetrievalRequest(query="Gross Revenue", intent_kind="metric_query")
     items = [
         RecallItem(
-            doc_id="refund_rate",
+            doc_id="gross_revenue",
             source_type="SEMANTIC_METRIC",
             fusion_score=10,
-            metadata={"businessName": "退款率", "metricKey": "refund_rate"},
+            metadata={"businessName": "Gross Revenue", "metricKey": "gross_revenue"},
         ),
         RecallItem(
-            doc_id="gmv",
+            doc_id="net_revenue",
             source_type="SEMANTIC_METRIC",
             fusion_score=11,
-            metadata={"businessName": "GMV", "metricKey": "gmv"},
+            metadata={"businessName": "Net Revenue", "metricKey": "net_revenue"},
         ),
     ]
 
     reranked = business_rerank_recall_items(items, request.query, request)
 
-    assert reranked[0].doc_id == "refund_rate"
+    assert reranked[0].doc_id == "gross_revenue"
     assert "exact_business_label" in reranked[0].metadata["businessRerankReasons"]
     assert 0.0 <= reranked[0].fusion_score <= 1.0
     assert reranked[0].metadata["scoreVersion"] == "recall_v2"
@@ -168,14 +292,14 @@ def test_es_search_uses_active_profile_hybrid_top_k(monkeypatch):
 
 
 def test_exact_unambiguous_metric_uses_protection_tier_instead_of_magic_score():
-    request = KnowledgeRetrievalRequest(query="最近7天退款率", intent_kind="metric_query")
+    request = KnowledgeRetrievalRequest(query="Gross Revenue", intent_kind="metric_query")
     items = [
         RecallItem(
             doc_id="exact_metric",
             source_type="SEMANTIC_METRIC",
             fusion_score=0.55,
             metadata={
-                "businessName": "退款率",
+                "businessName": "Gross Revenue",
                 "metricResolutionType": "exact_business_name",
                 "metricResolutionConfidence": 0.97,
                 "metricResolutionAmbiguous": False,
