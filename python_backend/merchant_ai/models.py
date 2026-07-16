@@ -753,6 +753,27 @@ class KnowledgeRetrievalRequest(APIModel):
     round: int = 0
 
 
+class RetrievalIssue(APIModel):
+    """Backend-agnostic operational outcome for one retrieval lane.
+
+    An empty result is a valid retrieval outcome.  Operational failures must be
+    represented separately so downstream planning and evidence gates cannot
+    mistake an unavailable lane for a genuine zero-match search.
+    """
+
+    code: str = ""
+    message: str = ""
+    backend: str = ""
+    lane: str = ""
+    stage: str = ""
+    severity: str = "warning"
+    retryable: bool = True
+    fallback_used: bool = False
+    resolved: bool = False
+    request_key: str = ""
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RecallRoundTrace(APIModel):
     request_key: str = ""
     query: str = ""
@@ -776,6 +797,8 @@ class RecallRoundTrace(APIModel):
     rewritten_query: str = ""
     governance_filtered: Dict[str, int] = Field(default_factory=dict)
     rerank_applied: bool = False
+    retrieval_status: str = "not_started"
+    retrieval_issues: List[RetrievalIssue] = Field(default_factory=list)
 
 
 class KnowledgeBundle(APIModel):
@@ -785,6 +808,8 @@ class KnowledgeBundle(APIModel):
     backend: str = "hybrid"
     index_version: str = ""
     semantic_source_hash: str = ""
+    retrieval_status: str = "not_started"
+    retrieval_issues: List[RetrievalIssue] = Field(default_factory=list)
 
 
 class KnowledgeRef(APIModel):
@@ -1624,6 +1649,15 @@ class SqlRepairAttempt(APIModel):
     error_code: str = ""
     error_message: str = ""
     success: bool = False
+    source_error_code: str = ""
+    status: str = ""
+    progressed: bool = False
+    exhausted: bool = False
+    input_sql_hash: str = ""
+    output_sql_hash: str = ""
+    contract_hash: str = ""
+    state_fingerprint: str = ""
+    observation: str = ""
 
 
 class EntitySet(APIModel):

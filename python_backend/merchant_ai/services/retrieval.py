@@ -17,6 +17,7 @@ from merchant_ai.models import (
     RecallBundle,
     RecallItem,
     RecallRoundTrace,
+    RetrievalIssue,
     category_display,
 )
 from merchant_ai.services.assets import HybridRecallService, TopicAssetService, compact_metric_for_recall
@@ -32,6 +33,16 @@ class KnowledgeRetrievalService(Protocol):
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
         ...
+
+
+class RetrievalLaneFailure(RuntimeError):
+    """A supplemental retrieval lane failed after another lane completed."""
+
+    def __init__(self, code: str, lane: str, message: str, partial_items: list[RecallItem]):
+        super().__init__(message)
+        self.code = code
+        self.lane = lane
+        self.partial_items = list(partial_items or [])
 
 
 class HybridKnowledgeRetrievalService:
@@ -79,6 +90,7 @@ class HybridKnowledgeRetrievalService:
             ),
         )
         source_refs = unique_source_refs(recall_bundle.items)
+        retrieval_status = "success" if recall_bundle.items else "empty"
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
         trace = RecallRoundTrace(
             request_key=str(request_key or ""),
@@ -92,6 +104,7 @@ class HybridKnowledgeRetrievalService:
             governance_filtered=filtered,
             rerank_applied=bool(reranked_items),
             source_type_top_k=source_caps,
+            retrieval_status=retrieval_status,
         )
         return KnowledgeBundle(
             recall_bundle=recall_bundle,
@@ -100,6 +113,7 @@ class HybridKnowledgeRetrievalService:
             backend=self.backend_name,
             index_version=self._index_version(),
             semantic_source_hash=semantic_hash_for_items(recall_bundle.items),
+            retrieval_status=retrieval_status,
         )
 
     def _index_version(self) -> str:
@@ -204,11 +218,27 @@ class EsKnowledgeRetrievalService:
         )
         cached = self._recall_cache.get(cache_key)
         if cached is not None:
-            return KnowledgeBundle.model_validate(cached)
+            return normalize_knowledge_bundle_status(KnowledgeBundle.model_validate(cached))
         self._active_retrieval_profile = retrieval_profile
+        retrieval_issues: list[RetrievalIssue] = []
         try:
             try:
-                items = self._search(query_text, topics, include_rules=include_rules)
+                try:
+                    items = self._search(query_text, topics, include_rules=include_rules)
+                except RetrievalLaneFailure as exc:
+                    items = list(exc.partial_items)
+                    retrieval_issues.append(
+                        RetrievalIssue(
+                            code=exc.code,
+                            message=str(exc)[:500],
+                            backend=self.backend_name,
+                            lane=exc.lane,
+                            stage="topic_scope",
+                            severity="warning",
+                            request_key=str(request_key or ""),
+                            details={"partialItemCount": len(items)},
+                        )
+                    )
                 if topics and not request.knowledge_request and bool(retrieval_profile.get("broadSearchEnabled", True)):
                     try:
                         broad_items = self._search(query_text, [], include_rules=False)
@@ -218,8 +248,39 @@ class EsKnowledgeRetrievalService:
                             score_scale=self.settings.es_rrf_score_scale,
                             limit=max(1, int(retrieval_profile.get("hybridTopK") or self.settings.es_hybrid_top_k or 24)),
                         )
-                    except Exception:
-                        pass
+                    except RetrievalLaneFailure as exc:
+                        broad_items = list(exc.partial_items)
+                        retrieval_issues.append(
+                            RetrievalIssue(
+                                code=exc.code,
+                                message=str(exc)[:500],
+                                backend=self.backend_name,
+                                lane=exc.lane,
+                                stage="broad_scope",
+                                severity="warning",
+                                request_key=str(request_key or ""),
+                                details={"partialItemCount": len(broad_items)},
+                            )
+                        )
+                        items = rrf_fuse_recall_items(
+                            [("topic_scope", items), ("broad_scope", broad_items)],
+                            rrf_k=self.settings.es_rrf_k,
+                            score_scale=self.settings.es_rrf_score_scale,
+                            limit=max(1, int(retrieval_profile.get("hybridTopK") or self.settings.es_hybrid_top_k or 24)),
+                        )
+                    except Exception as exc:
+                        retrieval_issues.append(
+                            RetrievalIssue(
+                                code="ES_RETRIEVAL_SCOPE_FAILED",
+                                message=str(exc)[:500],
+                                backend=self.backend_name,
+                                lane="broad",
+                                stage="broad_scope",
+                                severity="warning",
+                                request_key=str(request_key or ""),
+                                details={"topicScopedItemCount": len(items)},
+                            )
+                        )
                 items = merge_recall_items(items, self._metric_candidate_items(query_text, metric_candidates))
                 items = merge_recall_items(items, self._exact_metric_evidence(query_text, topics))
                 items = self._attach_current_asset_governance(items)
@@ -230,13 +291,31 @@ class EsKnowledgeRetrievalService:
                     source_type_top_k,
                     limit=max(1, int(retrieval_profile.get("hybridTopK") or self.settings.es_hybrid_top_k or len(items) or 1)),
                 )
-                blocked_reason = ""
             except Exception as exc:
                 items = []
                 governance_filtered = {}
-                blocked_reason = "ES_RETRIEVAL_FAILED:%s" % str(exc)[:240]
+                retrieval_issues.append(
+                    RetrievalIssue(
+                        code="ES_RETRIEVAL_FAILED",
+                        message=str(exc)[:500],
+                        backend=self.backend_name,
+                        lane="primary",
+                        stage="retrieve",
+                        severity="blocking",
+                        request_key=str(request_key or ""),
+                    )
+                )
         finally:
             self._active_retrieval_profile = None
+        retrieval_status = retrieval_status_for(items, retrieval_issues)
+        blocked_reason = next(
+            (
+                "%s:%s" % (issue.code, issue.message[:240])
+                for issue in retrieval_issues
+                if issue.severity == "blocking" or retrieval_status == "failed"
+            ),
+            "",
+        )
         source_refs = unique_source_refs(items)
         trace = RecallRoundTrace(
             request_key=str(request_key or ""),
@@ -266,6 +345,8 @@ class EsKnowledgeRetrievalService:
             rewritten_query=rewritten_query,
             governance_filtered=governance_filtered,
             rerank_applied=bool(items),
+            retrieval_status=retrieval_status,
+            retrieval_issues=retrieval_issues,
         )
         merged = "\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items)
         bundle = KnowledgeBundle(
@@ -279,8 +360,10 @@ class EsKnowledgeRetrievalService:
             backend=self.backend_name,
             index_version=self._index_version(),
             semantic_source_hash=semantic_hash_for_items(items),
+            retrieval_status=retrieval_status,
+            retrieval_issues=retrieval_issues,
         )
-        if not blocked_reason:
+        if retrieval_status in {"success", "empty"}:
             self._recall_cache.set(cache_key, bundle.model_dump(by_alias=True))
         return bundle
 
@@ -346,8 +429,13 @@ class EsKnowledgeRetrievalService:
         try:
             vector = self._embed_text(query_text)
             vector_items = self._vector_search(query_text, vector, topics, include_rules=include_rules) if vector else []
-        except Exception:
-            vector_items = []
+        except Exception as exc:
+            raise RetrievalLaneFailure(
+                "ES_RETRIEVAL_LANE_FAILED",
+                "vector",
+                str(exc)[:500],
+                text_items,
+            ) from exc
         if not vector_items:
             return rrf_fuse_recall_items(
                 [("bm25", text_items)],
@@ -1299,6 +1387,137 @@ def merge_recall_bundles(primary: RecallBundle, secondary: RecallBundle) -> Reca
         items=items,
         top_score=items[0].fusion_score if items else 0.0,
         merged_context="\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items),
+    )
+
+
+def retrieval_status_for(items: list[RecallItem], issues: list[RetrievalIssue]) -> str:
+    unresolved = [issue for issue in issues or [] if not issue.resolved]
+    if unresolved and not items:
+        return "failed"
+    if issues:
+        return "degraded"
+    return "success" if items else "empty"
+
+
+def normalize_knowledge_bundle_status(bundle: KnowledgeBundle) -> KnowledgeBundle:
+    """Backfill status for providers/checkpoints created before the contract."""
+
+    status = str(bundle.retrieval_status or "").strip().lower()
+    if status not in {"success", "empty", "degraded", "failed"}:
+        status = retrieval_status_for(bundle.recall_bundle.items, bundle.retrieval_issues)
+    rounds = [
+        trace.model_copy(
+            update={
+                "retrieval_status": (
+                    trace.retrieval_status
+                    if str(trace.retrieval_status or "").strip().lower() in {"success", "empty", "degraded", "failed"}
+                    else status
+                ),
+                "retrieval_issues": list(trace.retrieval_issues or bundle.retrieval_issues),
+            }
+        )
+        for trace in bundle.recall_rounds
+    ]
+    return bundle.model_copy(update={"retrieval_status": status, "recall_rounds": rounds})
+
+
+def dedupe_retrieval_issues(issues: list[RetrievalIssue]) -> list[RetrievalIssue]:
+    deduped: list[RetrievalIssue] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for issue in issues or []:
+        identity = (
+            str(issue.code or ""),
+            str(issue.backend or ""),
+            str(issue.lane or ""),
+            str(issue.stage or ""),
+            str(issue.request_key or ""),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(issue)
+    return deduped
+
+
+def failed_knowledge_bundle(
+    request: KnowledgeRetrievalRequest,
+    backend: str,
+    code: str,
+    message: str,
+    *,
+    stage: str = "retrieve",
+) -> KnowledgeBundle:
+    request_key = request.knowledge_request.request_key if request.knowledge_request else ""
+    issue = RetrievalIssue(
+        code=code,
+        message=str(message or code)[:500],
+        backend=str(backend or "unknown"),
+        lane="primary",
+        stage=stage,
+        severity="blocking",
+        request_key=str(request_key or ""),
+    )
+    trace = RecallRoundTrace(
+        request_key=str(request_key or ""),
+        query=request.query,
+        topics=[str(item.value if hasattr(item, "value") else item) for item in request.topic_categories],
+        backend=str(backend or "unknown"),
+        blocked_reason="%s:%s" % (code, issue.message[:240]),
+        retrieval_status="failed",
+        retrieval_issues=[issue],
+    )
+    return KnowledgeBundle(
+        backend=str(backend or "unknown"),
+        recall_rounds=[trace],
+        retrieval_status="failed",
+        retrieval_issues=[issue],
+    )
+
+
+def merge_knowledge_fallback(primary: KnowledgeBundle, fallback: KnowledgeBundle) -> KnowledgeBundle:
+    """Merge a backend fallback without erasing the primary operational state."""
+
+    primary = normalize_knowledge_bundle_status(primary)
+    fallback = normalize_knowledge_bundle_status(fallback)
+    fallback_has_evidence = bool(fallback.recall_bundle.items)
+    primary_issues = [
+        issue.model_copy(
+            update={
+                "fallback_used": True,
+                "resolved": fallback_has_evidence,
+                "severity": "warning" if fallback_has_evidence else issue.severity,
+                "details": {
+                    **dict(issue.details or {}),
+                    "fallbackBackend": fallback.backend,
+                    "fallbackItemCount": len(fallback.recall_bundle.items),
+                },
+            }
+        )
+        for issue in primary.retrieval_issues
+    ]
+    issues = dedupe_retrieval_issues([*primary_issues, *fallback.retrieval_issues])
+    items = merge_recall_items(primary.recall_bundle.items, fallback.recall_bundle.items)
+    status = retrieval_status_for(items, issues)
+    return KnowledgeBundle(
+        recall_bundle=RecallBundle(
+            items=items,
+            top_score=items[0].fusion_score if items else 0.0,
+            merged_context="\n\n".join(
+                "召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200])
+                for item in items
+            ),
+        ),
+        source_refs=unique_source_refs(items),
+        recall_rounds=[*primary.recall_rounds, *fallback.recall_rounds],
+        backend="%s_fallback_%s" % (primary.backend or "primary", fallback.backend or "secondary"),
+        index_version=primary.index_version or fallback.index_version,
+        semantic_source_hash=(
+            fallback.semantic_source_hash
+            if fallback_has_evidence
+            else primary.semantic_source_hash
+        ),
+        retrieval_status=status,
+        retrieval_issues=issues,
     )
 
 

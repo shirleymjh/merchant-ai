@@ -143,6 +143,8 @@ def test_workflow_delegates_document_and_records_uniform_result(tmp_path: Path):
     response = workflow.to_response(result_state)
     assert response.debug_trace["degradedReasons"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
     assert response.debug_trace["evidenceGaps"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
+    guarded = workflow.answer_service._apply_answer_guard("文档摘录已生成。", result_state["agent_run_result"])
+    assert "Sub-Agent 未完整执行" in guarded
 
 
 def test_parallel_delegation_counts_only_completed_outcomes_as_success(tmp_path: Path):

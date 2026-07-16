@@ -563,12 +563,40 @@ class EvidenceVerifier:
         return bool(aliases & row_columns)
 
     def _natural_evidence_covered(self, evidence: str, covered: Set[str], table_names: Set[str]) -> bool:
-        if evidence in covered or evidence in table_names:
-            return True
-        evidence_text = evidence.lower()
-        if any(table and table.lower() in evidence_text for table in table_names):
-            return True
-        return any(key and key.lower() in evidence_text for key in covered)
+        evidence_text = str(evidence or "").strip().casefold()
+        if not evidence_text:
+            return False
+        return any(
+            explicit_evidence_reference(evidence_text, reference)
+            for reference in {*covered, *table_names}
+        )
+
+
+def explicit_evidence_reference(evidence_text: str, reference: Any) -> bool:
+    """Match a result/table reference without allowing identifier substrings.
+
+    ``id`` is not evidence for ``refund_order_id``.  Natural evidence labels may
+    still embed an exact governed identifier (for example ``orders.order_id``),
+    but both sides must be identifier boundaries.  This keeps the fallback
+    generic while preventing a short, unrelated column from satisfying a more
+    specific evidence obligation.
+    """
+
+    normalized_reference = str(reference or "").strip().strip("`").casefold()
+    if not normalized_reference:
+        return False
+    if evidence_text == normalized_reference:
+        return True
+    if re.fullmatch(r"[a-z_][a-z0-9_]*", normalized_reference):
+        return bool(
+            re.search(
+                r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(normalized_reference),
+                evidence_text,
+            )
+        )
+    # Non-identifier labels are deliberately exact.  Their aliases belong in
+    # the typed evidence contract rather than being inferred by substring.
+    return False
 
 
 def normalize_any_of(value: Any) -> List[List[str]]:

@@ -137,6 +137,9 @@ class AgentState(TypedDict, total=False):
     knowledge_request_fingerprints: Dict[str, str]
     blocked_knowledge_request_keys: List[str]
     knowledge_request_gaps: List[Dict[str, Any]]
+    knowledge_retrieval_status: str
+    knowledge_retrieval_issues: List[Dict[str, Any]]
+    knowledge_retrieval_outcomes: List[Dict[str, Any]]
     knowledge_expanded_topics: List[QuestionCategory]
     knowledge_recall_coverage: Dict[str, Any]
     agent_run_result: AgentRunResult

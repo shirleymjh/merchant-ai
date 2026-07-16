@@ -21,6 +21,7 @@ from merchant_ai.services.distributed_workers import (
     DistributedArtifactStore,
     DistributedSubAgentClient,
     DistributedSubAgentWorker,
+    HandlerOutcome,
     builtin_worker_handlers,
 )
 from merchant_ai.services.llm import LlmClient
@@ -121,6 +122,42 @@ def test_distributed_document_fallback_is_terminal_partial_not_completed(tmp_pat
     assert result.contract["payload"]["fallbackUsed"] is True
     assert result.contract["gaps"][0]["code"] == "DOCUMENT_LLM_UNAVAILABLE"
     assert store.get_node_task("run_document_partial", "task_document_partial").status == "partial"
+    assert client.submit(
+        "run_document_partial",
+        "task_document_partial",
+        "document_analysis",
+        {"content": "duplicate submission"},
+    ).status == "partial"
+
+
+def test_distributed_wrapper_preserves_generic_typed_partial_outcome(tmp_path):
+    settings = distributed_settings(tmp_path)
+    store = FileRuntimeStateStore(settings)
+    artifacts = DistributedArtifactStore(settings)
+    client = DistributedSubAgentClient(settings, store, artifacts)
+    worker = DistributedSubAgentWorker(
+        settings,
+        handlers={
+            "hypothesis_review": lambda request, canceled: HandlerOutcome(
+                status="partial",
+                payload={
+                    "summary": "one hypothesis could not be checked",
+                    "gaps": [{"code": "UPSTREAM_EVIDENCE_UNAVAILABLE", "message": "missing evidence"}],
+                },
+            )
+        },
+        state_store=store,
+        artifact_store=artifacts,
+        worker_id="worker-generic-partial",
+    )
+    client.submit("run_generic_partial", "task_generic_partial", "hypothesis_review", {})
+
+    assert worker.run_once()
+    result = client.wait("run_generic_partial", "task_generic_partial")
+
+    assert result.status == "partial"
+    assert result.contract["status"] == "partial"
+    assert result.contract["gaps"][0]["code"] == "UPSTREAM_EVIDENCE_UNAVAILABLE"
 
 
 def test_distributed_client_waits_for_independent_worker_loop(tmp_path):

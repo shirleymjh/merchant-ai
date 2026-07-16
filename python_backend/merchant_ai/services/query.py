@@ -78,6 +78,7 @@ from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.query_contracts import (
     collect_degraded_reasons,
     contract_gaps_from_task_results,
+    sql_repair_gaps_from_task_results,
     tenant_scope_binding_error,
 )
 from merchant_ai.services.repositories import DorisRepository
@@ -1169,6 +1170,7 @@ class NodeWorkerExecutor:
             + lineage_gaps
             + split_window_coverage_gaps(result.task_results)
             + contract_gaps_from_task_results(result.task_results)
+            + sql_repair_gaps_from_task_results(result.task_results)
             + [EvidenceGap(code="DEPENDENCY_GAP", task_id=gap, reason=gap) for gap in dependency_check_gaps]
         )
         result.degraded_reasons = collect_degraded_reasons(result.task_results)
@@ -2306,9 +2308,64 @@ class NodeWorkerExecutor:
             )
         validation_results: List[SqlValidationResult] = []
         repair_attempts: List[SqlRepairAttempt] = []
+        repair_observations: List[Dict[str, Any]] = []
+        seen_repair_states: Set[str] = set()
+        seen_sql_hashes: Set[str] = set()
+        repair_contract_hash = sql_repair_contract_hash(contract)
         for round_index in range(self.settings.agent_sql_repair_rounds + 1):
             sql = self._enforce_identity_scope_sql(sql, contract, context)
             sql = normalize_inclusive_relative_window_sql(sql, intent.days)
+            current_sql_hash = canonical_sql_hash(sql)
+            if current_sql_hash in seen_sql_hashes:
+                previous = repair_observations[-1] if repair_observations else {}
+                stalled = repeated_sql_repair_attempt(
+                    task_id=intent.plan_task_id,
+                    repair_round=round_index + 1,
+                    sql=sql,
+                    error_code=str(previous.get("sourceErrorCode") or "SQL_REPAIR_STATE_REPEAT"),
+                    error_message=str(previous.get("observation") or "normalized SQL repeats a prior candidate"),
+                    contract_hash=repair_contract_hash,
+                )
+                repair_attempts.append(stalled)
+                message = "REPAIR_NO_PROGRESS: %s" % stalled.error_message
+                trace.append(
+                    ReActStep(
+                        round=2 + round_index * 3,
+                        reason="SQL 规范化后回到已尝试状态，停止修复循环",
+                        action="repair_sql.no_progress",
+                        observation=stalled.observation,
+                    )
+                )
+                record_tool(
+                    tool_traces,
+                    intent,
+                    "repair_sql",
+                    "failed",
+                    str(previous.get("sourceErrorCode") or "SQL_REPAIR_STATE_REPEAT"),
+                    stalled.observation,
+                    "REPAIR_NO_PROGRESS",
+                    round_index,
+                )
+                return AgentTaskResult(
+                    success=False,
+                    summary=message,
+                    query_bundle=QueryBundle(
+                        sql=sql,
+                        tables=[intent.preferred_table] if intent.preferred_table else [],
+                        failed=True,
+                        error=message,
+                    ),
+                    react_trace=trace,
+                    sql_repairs=repair_attempts,
+                    validation_results=validation_results,
+                    node_tool_traces=tool_traces,
+                    node_task_profile=node_task_profile,
+                    freshness_reports=[freshness],
+                    node_plan_contract=contract,
+                    node_plan_critique=critique,
+                    sql_draft_decision=draft_decision,
+                )
+            seen_sql_hashes.add(current_sql_hash)
             validation_started = time.perf_counter()
             validation = self.validator.validate(sql, asset_pack)
             validation = self._node_scope_validation(validation, intent, sql, asset_pack)
@@ -2335,9 +2392,85 @@ class NodeWorkerExecutor:
                 )
             )
             if not validation.valid:
+                repair_state = sql_repair_state_fingerprint(
+                    sql,
+                    validation.error_code,
+                    repair_contract_hash,
+                )
+                if repair_state in seen_repair_states:
+                    stalled = repeated_sql_repair_attempt(
+                        task_id=intent.plan_task_id,
+                        repair_round=round_index + 1,
+                        sql=sql,
+                        error_code=validation.error_code,
+                        error_message=validation.message,
+                        contract_hash=repair_contract_hash,
+                    )
+                    repair_attempts.append(stalled)
+                    record_tool(
+                        tool_traces,
+                        intent,
+                        "repair_sql",
+                        "failed",
+                        validation.error_code,
+                        stalled.observation,
+                        "REPAIR_NO_PROGRESS",
+                        round_index + 1,
+                    )
+                    trace.append(
+                        ReActStep(
+                            round=3 + round_index * 3,
+                            reason="SQL 修复状态重复，停止无进展循环",
+                            action="repair_sql.no_progress",
+                            observation=stalled.observation,
+                        )
+                    )
+                    message = "REPAIR_NO_PROGRESS: %s" % stalled.error_message
+                    return AgentTaskResult(
+                        success=False,
+                        summary=message,
+                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=message),
+                        react_trace=trace,
+                        sql_repairs=repair_attempts,
+                        validation_results=validation_results,
+                        node_tool_traces=tool_traces,
+                        node_task_profile=node_task_profile,
+                        freshness_reports=[freshness],
+                        node_plan_contract=contract,
+                        node_plan_critique=critique,
+                        sql_draft_decision=draft_decision,
+                    )
+                seen_repair_states.add(repair_state)
                 structured_attempt = self._structured_fallback_attempt(sql, validation, intent, asset_pack, context)
                 if structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                    structured_attempt = finalize_sql_repair_attempt(
+                        structured_attempt.model_copy(
+                            update={
+                                "round": round_index + 1,
+                                "source_error_code": validation.error_code,
+                            }
+                        ),
+                        repair_contract_hash,
+                        seen_sql_hashes,
+                    )
                     repair_attempts.append(structured_attempt)
+                    repair_observations.append(sql_repair_observation(structured_attempt))
+                    if not structured_attempt.progressed:
+                        message = "REPAIR_NO_PROGRESS: %s" % structured_attempt.error_message
+                        return AgentTaskResult(
+                            success=False,
+                            summary=message,
+                            query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=message),
+                            react_trace=trace,
+                            sql_repairs=repair_attempts,
+                            validation_results=validation_results,
+                            node_tool_traces=tool_traces,
+                            node_task_profile=node_task_profile,
+                            freshness_reports=[freshness],
+                            node_plan_contract=contract,
+                            node_plan_critique=critique,
+                            sql_draft_decision=draft_decision,
+                        )
                     record_tool(
                         tool_traces,
                         intent,
@@ -2374,10 +2507,22 @@ class NodeWorkerExecutor:
                         sql_draft_decision=draft_decision,
                     )
                 if round_index >= self.settings.agent_sql_repair_rounds:
+                    message = validation.message
+                    if repair_attempts:
+                        exhausted = repair_attempts[-1].model_copy(
+                            update={
+                                "status": "exhausted",
+                                "exhausted": True,
+                                "observation": "SQL repair budget exhausted after the latest validation observation: %s"
+                                % validation.message[:240],
+                            }
+                        )
+                        repair_attempts[-1] = exhausted
+                        message = "SQL_REPAIR_EXHAUSTED: %s" % validation.message
                     return AgentTaskResult(
                         success=False,
-                        summary=validation.message,
-                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=validation.message),
+                        summary=message,
+                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=message),
                         react_trace=trace,
                         sql_repairs=repair_attempts,
                         validation_results=validation_results,
@@ -2389,9 +2534,20 @@ class NodeWorkerExecutor:
                         sql_draft_decision=draft_decision,
                     )
                 repair_started = time.perf_counter()
-                repaired = self._repair_sql(sql, validation, intent, asset_pack, context)
+                repaired = self._repair_sql(
+                    sql,
+                    validation,
+                    intent,
+                    asset_pack,
+                    context,
+                    contract=contract,
+                    repair_round=round_index + 1,
+                    previous_observations=repair_observations,
+                    seen_sql_hashes=seen_sql_hashes,
+                )
                 repair_duration_ms = int((time.perf_counter() - repair_started) * 1000)
                 repair_attempts.append(repaired)
+                repair_observations.append(sql_repair_observation(repaired))
                 repair_summary = trim_sql(repaired.repaired_sql)
                 repair_prompt = pop_node_prompt_trace(context, prompt_trace_key(intent, "repair"))
                 if repair_prompt:
@@ -2403,18 +2559,31 @@ class NodeWorkerExecutor:
                     tool_traces,
                     intent,
                     "repair_sql",
-                    "success" if repaired.repaired_sql else "failed",
+                    "success" if repaired.progressed else "failed",
                     validation.error_code,
                     repair_summary,
-                    validation.error_code,
+                    repaired.error_code or validation.error_code,
                     round_index + 1,
                     duration_ms=repair_duration_ms,
                 )
-                if not repaired.repaired_sql:
+                if not repaired.progressed:
+                    message = (
+                        "REPAIR_NO_PROGRESS: %s" % repaired.error_message
+                        if repaired.error_code == "REPAIR_NO_PROGRESS"
+                        else "SQL_REPAIR_EXHAUSTED: %s" % (repaired.error_message or validation.message)
+                    )
+                    trace.append(
+                        ReActStep(
+                            round=3 + round_index * 3,
+                            reason="SQL 修复未产生可执行进展",
+                            action="repair_sql.no_progress" if repaired.error_code == "REPAIR_NO_PROGRESS" else "repair_sql.exhausted",
+                            observation=repaired.observation or repaired.error_message,
+                        )
+                    )
                     return AgentTaskResult(
                         success=False,
-                        summary=validation.message,
-                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=validation.message),
+                        summary=message,
+                        query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=message),
                         react_trace=trace,
                         sql_repairs=repair_attempts,
                         validation_results=validation_results,
@@ -2450,7 +2619,34 @@ class NodeWorkerExecutor:
                     context,
                 )
                 if structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                    structured_attempt = finalize_sql_repair_attempt(
+                        structured_attempt.model_copy(
+                            update={
+                                "round": round_index + 1,
+                                "source_error_code": "SQL_PARAM_BINDING_FAILED",
+                            }
+                        ),
+                        repair_contract_hash,
+                        seen_sql_hashes,
+                    )
                     repair_attempts.append(structured_attempt)
+                    repair_observations.append(sql_repair_observation(structured_attempt))
+                    if not structured_attempt.progressed:
+                        no_progress_message = "REPAIR_NO_PROGRESS: %s" % structured_attempt.error_message
+                        return AgentTaskResult(
+                            success=False,
+                            summary=no_progress_message,
+                            query_bundle=QueryBundle(sql=sql, tables=validation.base_tables, failed=True, error=no_progress_message),
+                            react_trace=trace,
+                            sql_repairs=repair_attempts,
+                            validation_results=validation_results,
+                            node_tool_traces=tool_traces,
+                            node_task_profile=node_task_profile,
+                            freshness_reports=[freshness],
+                            node_plan_contract=contract,
+                            node_plan_critique=critique,
+                            sql_draft_decision=draft_decision,
+                        )
                     record_tool(
                         tool_traces,
                         intent,
@@ -2669,6 +2865,44 @@ class NodeWorkerExecutor:
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
+                repair_state = sql_repair_state_fingerprint(
+                    sql,
+                    error_type,
+                    repair_contract_hash,
+                )
+                if repair_state in seen_repair_states:
+                    stalled = repeated_sql_repair_attempt(
+                        task_id=intent.plan_task_id,
+                        repair_round=round_index + 1,
+                        sql=sql,
+                        error_code=error_type,
+                        error_message=message,
+                        contract_hash=repair_contract_hash,
+                    )
+                    repair_attempts.append(stalled)
+                    no_progress_message = "REPAIR_NO_PROGRESS: %s" % stalled.error_message
+                    return AgentTaskResult(
+                        success=False,
+                        summary=no_progress_message,
+                        query_bundle=QueryBundle(
+                            sql=bound_sql,
+                            params=sql_params,
+                            tables=validation.base_tables,
+                            failed=True,
+                            error=no_progress_message,
+                            duration_ms=query_duration_ms,
+                        ),
+                        react_trace=trace,
+                        sql_repairs=repair_attempts,
+                        validation_results=validation_results,
+                        node_tool_traces=tool_traces,
+                        node_task_profile=node_task_profile,
+                        freshness_reports=[freshness],
+                        node_plan_contract=contract,
+                        node_plan_critique=critique,
+                        sql_draft_decision=draft_decision,
+                    )
+                seen_repair_states.add(repair_state)
                 if error_type not in {"CIRCUIT_OPEN", "RATE_LIMITED", "TIMEOUT"}:
                     policy = doris_error_policy(error_type)
                     structured_attempt = self._structured_fallback_attempt(
@@ -2679,7 +2913,40 @@ class NodeWorkerExecutor:
                         context,
                     )
                     if policy["structured_fallback"] and structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                        structured_attempt = finalize_sql_repair_attempt(
+                            structured_attempt.model_copy(
+                                update={
+                                    "round": round_index + 1,
+                                    "source_error_code": error_type,
+                                }
+                            ),
+                            repair_contract_hash,
+                            seen_sql_hashes,
+                        )
                         repair_attempts.append(structured_attempt)
+                        repair_observations.append(sql_repair_observation(structured_attempt))
+                        if not structured_attempt.progressed:
+                            no_progress_message = "REPAIR_NO_PROGRESS: %s" % structured_attempt.error_message
+                            return AgentTaskResult(
+                                success=False,
+                                summary=no_progress_message,
+                                query_bundle=QueryBundle(
+                                    sql=bound_sql,
+                                    params=sql_params,
+                                    tables=validation.base_tables,
+                                    failed=True,
+                                    error=no_progress_message,
+                                ),
+                                react_trace=trace,
+                                sql_repairs=repair_attempts,
+                                validation_results=validation_results,
+                                node_tool_traces=tool_traces,
+                                node_task_profile=node_task_profile,
+                                freshness_reports=[freshness],
+                                node_plan_contract=contract,
+                                node_plan_critique=critique,
+                                sql_draft_decision=draft_decision,
+                            )
                         record_tool(
                             tool_traces,
                             intent,
@@ -2694,7 +2961,40 @@ class NodeWorkerExecutor:
                         continue
                     resource_attempt = self._resource_safe_fallback_attempt(sql, error_type, message, intent, asset_pack, context)
                     if policy["resource_fallback"] and resource_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                        resource_attempt = finalize_sql_repair_attempt(
+                            resource_attempt.model_copy(
+                                update={
+                                    "round": round_index + 1,
+                                    "source_error_code": error_type,
+                                }
+                            ),
+                            repair_contract_hash,
+                            seen_sql_hashes,
+                        )
                         repair_attempts.append(resource_attempt)
+                        repair_observations.append(sql_repair_observation(resource_attempt))
+                        if not resource_attempt.progressed:
+                            no_progress_message = "REPAIR_NO_PROGRESS: %s" % resource_attempt.error_message
+                            return AgentTaskResult(
+                                success=False,
+                                summary=no_progress_message,
+                                query_bundle=QueryBundle(
+                                    sql=bound_sql,
+                                    params=sql_params,
+                                    tables=validation.base_tables,
+                                    failed=True,
+                                    error=no_progress_message,
+                                ),
+                                react_trace=trace,
+                                sql_repairs=repair_attempts,
+                                validation_results=validation_results,
+                                node_tool_traces=tool_traces,
+                                node_task_profile=node_task_profile,
+                                freshness_reports=[freshness],
+                                node_plan_contract=contract,
+                                node_plan_critique=critique,
+                                sql_draft_decision=draft_decision,
+                            )
                         record_tool(
                             tool_traces,
                             intent,
@@ -2882,6 +3182,44 @@ class NodeWorkerExecutor:
                         node_plan_critique=critique,
                         sql_draft_decision=draft_decision,
                     )
+                repair_state = sql_repair_state_fingerprint(
+                    sql,
+                    doris_error_code,
+                    repair_contract_hash,
+                )
+                if repair_state in seen_repair_states:
+                    stalled = repeated_sql_repair_attempt(
+                        task_id=intent.plan_task_id,
+                        repair_round=round_index + 1,
+                        sql=sql,
+                        error_code=doris_error_code,
+                        error_message=error_text,
+                        contract_hash=repair_contract_hash,
+                    )
+                    repair_attempts.append(stalled)
+                    no_progress_message = "REPAIR_NO_PROGRESS: %s" % stalled.error_message
+                    return AgentTaskResult(
+                        success=False,
+                        summary=no_progress_message,
+                        query_bundle=QueryBundle(
+                            sql=bound_sql,
+                            params=sql_params,
+                            tables=validation.base_tables,
+                            failed=True,
+                            error=no_progress_message,
+                            duration_ms=query_duration_ms,
+                        ),
+                        react_trace=trace,
+                        sql_repairs=repair_attempts,
+                        validation_results=validation_results,
+                        node_tool_traces=tool_traces,
+                        node_task_profile=node_task_profile,
+                        freshness_reports=[freshness],
+                        node_plan_contract=contract,
+                        node_plan_critique=critique,
+                        sql_draft_decision=draft_decision,
+                    )
+                seen_repair_states.add(repair_state)
                 structured_attempt = self._structured_fallback_attempt(
                     sql,
                     validation.model_copy(update={"valid": False, "error_code": doris_error_code, "message": error_text}),
@@ -2890,7 +3228,41 @@ class NodeWorkerExecutor:
                     context,
                 )
                 if policy["structured_fallback"] and structured_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                    structured_attempt = finalize_sql_repair_attempt(
+                        structured_attempt.model_copy(
+                            update={
+                                "round": round_index + 1,
+                                "source_error_code": doris_error_code,
+                            }
+                        ),
+                        repair_contract_hash,
+                        seen_sql_hashes,
+                    )
                     repair_attempts.append(structured_attempt)
+                    repair_observations.append(sql_repair_observation(structured_attempt))
+                    if not structured_attempt.progressed:
+                        no_progress_message = "REPAIR_NO_PROGRESS: %s" % structured_attempt.error_message
+                        return AgentTaskResult(
+                            success=False,
+                            summary=no_progress_message,
+                            query_bundle=QueryBundle(
+                                sql=bound_sql,
+                                params=sql_params,
+                                tables=validation.base_tables,
+                                failed=True,
+                                error=no_progress_message,
+                                duration_ms=query_duration_ms,
+                            ),
+                            react_trace=trace,
+                            sql_repairs=repair_attempts,
+                            validation_results=validation_results,
+                            node_tool_traces=tool_traces,
+                            node_task_profile=node_task_profile,
+                            freshness_reports=[freshness],
+                            node_plan_contract=contract,
+                            node_plan_critique=critique,
+                            sql_draft_decision=draft_decision,
+                        )
                     record_tool(
                         tool_traces,
                         intent,
@@ -2913,7 +3285,41 @@ class NodeWorkerExecutor:
                     continue
                 resource_attempt = self._resource_safe_fallback_attempt(sql, doris_error_code, error_text, intent, asset_pack, context)
                 if policy["resource_fallback"] and resource_attempt and round_index < self.settings.agent_sql_repair_rounds:
+                    resource_attempt = finalize_sql_repair_attempt(
+                        resource_attempt.model_copy(
+                            update={
+                                "round": round_index + 1,
+                                "source_error_code": doris_error_code,
+                            }
+                        ),
+                        repair_contract_hash,
+                        seen_sql_hashes,
+                    )
                     repair_attempts.append(resource_attempt)
+                    repair_observations.append(sql_repair_observation(resource_attempt))
+                    if not resource_attempt.progressed:
+                        no_progress_message = "REPAIR_NO_PROGRESS: %s" % resource_attempt.error_message
+                        return AgentTaskResult(
+                            success=False,
+                            summary=no_progress_message,
+                            query_bundle=QueryBundle(
+                                sql=bound_sql,
+                                params=sql_params,
+                                tables=validation.base_tables,
+                                failed=True,
+                                error=no_progress_message,
+                                duration_ms=query_duration_ms,
+                            ),
+                            react_trace=trace,
+                            sql_repairs=repair_attempts,
+                            validation_results=validation_results,
+                            node_tool_traces=tool_traces,
+                            node_task_profile=node_task_profile,
+                            freshness_reports=[freshness],
+                            node_plan_contract=contract,
+                            node_plan_critique=critique,
+                            sql_draft_decision=draft_decision,
+                        )
                     record_tool(
                         tool_traces,
                         intent,
@@ -2935,10 +3341,21 @@ class NodeWorkerExecutor:
                     sql = resource_attempt.repaired_sql
                     continue
                 if round_index >= self.settings.agent_sql_repair_rounds or not policy["llm_repair"]:
+                    failure_message = "Doris 查询失败: %s" % error_text[:200]
+                    if repair_attempts and policy["llm_repair"]:
+                        repair_attempts[-1] = repair_attempts[-1].model_copy(
+                            update={
+                                "status": "exhausted",
+                                "exhausted": True,
+                                "observation": "SQL repair budget exhausted after Doris observation: %s"
+                                % error_text[:240],
+                            }
+                        )
+                        failure_message = "SQL_REPAIR_EXHAUSTED: %s" % error_text[:200]
                     return AgentTaskResult(
                         success=False,
-                        summary="Doris 查询失败: %s" % error_text[:200],
-                        query_bundle=QueryBundle(sql=bound_sql, params=sql_params, tables=validation.base_tables, failed=True, error=error_text, duration_ms=query_duration_ms),
+                        summary=failure_message,
+                        query_bundle=QueryBundle(sql=bound_sql, params=sql_params, tables=validation.base_tables, failed=True, error=failure_message, duration_ms=query_duration_ms),
                         react_trace=trace,
                         sql_repairs=repair_attempts,
                         validation_results=validation_results,
@@ -2950,9 +3367,26 @@ class NodeWorkerExecutor:
                         sql_draft_decision=draft_decision,
                     )
                 repair_started = time.perf_counter()
-                repaired = self._repair_sql(sql, validation.model_copy(update={"valid": False, "error_code": doris_error_code, "message": error_text}), intent, asset_pack, context)
+                repaired = self._repair_sql(
+                    sql,
+                    validation.model_copy(
+                        update={
+                            "valid": False,
+                            "error_code": doris_error_code,
+                            "message": error_text,
+                        }
+                    ),
+                    intent,
+                    asset_pack,
+                    context,
+                    contract=contract,
+                    repair_round=round_index + 1,
+                    previous_observations=repair_observations,
+                    seen_sql_hashes=seen_sql_hashes,
+                )
                 repair_duration_ms = int((time.perf_counter() - repair_started) * 1000)
                 repair_attempts.append(repaired)
+                repair_observations.append(sql_repair_observation(repaired))
                 repair_summary = trim_sql(repaired.repaired_sql)
                 repair_prompt = pop_node_prompt_trace(context, prompt_trace_key(intent, "repair"))
                 if repair_prompt:
@@ -2964,18 +3398,23 @@ class NodeWorkerExecutor:
                     tool_traces,
                     intent,
                     "repair_sql",
-                    "success" if repaired.repaired_sql else "failed",
+                    "success" if repaired.progressed else "failed",
                     doris_error_code,
                     repair_summary,
-                    doris_error_code,
+                    repaired.error_code or doris_error_code,
                     round_index + 1,
                     duration_ms=repair_duration_ms,
                 )
-                if not repaired.repaired_sql:
+                if not repaired.progressed:
+                    failure_message = (
+                        "REPAIR_NO_PROGRESS: %s" % repaired.error_message
+                        if repaired.error_code == "REPAIR_NO_PROGRESS"
+                        else "SQL_REPAIR_EXHAUSTED: %s" % (repaired.error_message or error_text[:200])
+                    )
                     return AgentTaskResult(
                         success=False,
-                        summary="Doris 查询失败: %s" % error_text[:200],
-                        query_bundle=QueryBundle(sql=bound_sql, params=sql_params, tables=validation.base_tables, failed=True, error=error_text, duration_ms=query_duration_ms),
+                        summary=failure_message,
+                        query_bundle=QueryBundle(sql=bound_sql, params=sql_params, tables=validation.base_tables, failed=True, error=failure_message, duration_ms=query_duration_ms),
                         react_trace=trace,
                         sql_repairs=repair_attempts,
                         validation_results=validation_results,
@@ -3986,16 +4425,24 @@ class NodeWorkerExecutor:
         intent: QuestionIntent,
         asset_pack: PlanningAssetPack,
         context: NodeExecutionContext,
+        *,
+        contract: Optional[NodePlanContract] = None,
+        repair_round: int = 1,
+        previous_observations: Optional[List[Dict[str, Any]]] = None,
+        seen_sql_hashes: Optional[Set[str]] = None,
     ) -> SqlRepairAttempt:
         attempt = SqlRepairAttempt(
             task_id=intent.plan_task_id,
-            round=1,
+            round=repair_round,
             original_sql=sql,
             error_code=validation.error_code,
+            source_error_code=validation.error_code,
             error_message=validation.message,
         )
+        contract = contract or self._node_plan_contract(intent, asset_pack, context)
+        contract_hash = sql_repair_contract_hash(contract)
         if not self.llm.configured:
-            return attempt
+            return finalize_sql_repair_attempt(attempt, contract_hash, seen_sql_hashes or set())
         repair_args = {
             "taskId": intent.plan_task_id,
             "table": intent.preferred_table,
@@ -4005,7 +4452,7 @@ class NodeWorkerExecutor:
         blocked = self.tool_failure_registry.should_block("repair_sql", repair_args)
         if blocked:
             attempt.error_message = "repair_sql blocked by circuit breaker: %s" % blocked.reason
-            return attempt
+            return finalize_sql_repair_attempt(attempt, contract_hash, seen_sql_hashes or set())
         tool = sql_repair_tool()
         prompt = self.prompt_assembler.render(
             "node.sql_repair",
@@ -4016,12 +4463,18 @@ class NodeWorkerExecutor:
                 ),
             },
         )
-        contract = self._node_plan_contract(intent, asset_pack, context)
         user_payload = json.dumps(
             {
                 "failedSql": sql,
                 "error": validation.model_dump(by_alias=True),
                 "nodePlanContract": contract.model_dump(by_alias=True),
+                "repairRound": repair_round,
+                "repairStateFingerprint": sql_repair_state_fingerprint(
+                    sql,
+                    validation.error_code,
+                    contract_hash,
+                ),
+                "previousRepairObservations": list(previous_observations or []),
                 "rules": "只修复当前 SQL；保持单表、契约声明的租户/时间/实体过滤和 LIMIT；不要新增字段或表。",
             },
             ensure_ascii=False,
@@ -4038,12 +4491,23 @@ class NodeWorkerExecutor:
         set_node_prompt_trace(context, prompt_trace_key(intent, "repair"), prompt.trace())
         set_node_prompt_trace(context, prompt_trace_key(intent, "repair_tool"), tool.trace_schema())
         attempt.repaired_sql = str(payload.get("sql") or "").strip()
-        attempt.success = bool(attempt.repaired_sql)
-        if attempt.success:
+        attempt = finalize_sql_repair_attempt(attempt, contract_hash, seen_sql_hashes or set())
+        if attempt.progressed:
             self.tool_failure_registry.record_success("repair_sql", repair_args)
         else:
-            error_type = "PROVIDER_ERROR" if self.llm.last_error else "SQL_EMPTY"
-            self.tool_failure_registry.record_failure("repair_sql", repair_args, error_type, self.llm.last_error or "LLM returned empty repair SQL")
+            error_type = (
+                "REPAIR_NO_PROGRESS"
+                if attempt.error_code == "REPAIR_NO_PROGRESS"
+                else "PROVIDER_ERROR"
+                if self.llm.last_error
+                else "SQL_EMPTY"
+            )
+            self.tool_failure_registry.record_failure(
+                "repair_sql",
+                repair_args,
+                error_type,
+                attempt.error_message or self.llm.last_error or "LLM returned empty repair SQL",
+            )
         return attempt
 
     def _node_scope_validation(
@@ -6133,7 +6597,187 @@ def structured_limit(limit: int, detail: bool, resource_safe: bool = False) -> i
 
 
 def equivalent_sql(left: str, right: str) -> bool:
-    return " ".join((left or "").split()).lower() == " ".join((right or "").split()).lower()
+    return canonical_sql(left) == canonical_sql(right)
+
+
+def canonical_sql(sql: str) -> str:
+    """Return a stable structural representation for repair progress checks.
+
+    The repair loop compares semantics represented by the parsed SQL tree rather
+    than raw formatting.  Identifier case and optional quoting are normalized,
+    while literal values remain intact.  A token-based fallback keeps malformed
+    SQL repairable without reverting to table- or statement-specific matching.
+    """
+
+    source = str(sql or "").strip()
+    if not source:
+        return ""
+    parseable = re.sub(r"%s\b", "__sql_bind_param__", source, flags=re.I)
+    try:
+        statements = [statement for statement in sqlglot.parse(parseable, read="doris") if statement is not None]
+        if not statements:
+            return ""
+
+        def normalize_identifier(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Identifier):
+                return node
+            return exp.Identifier(this=str(node.this or "").lower(), quoted=False)
+
+        canonical_statements = []
+        for statement in statements:
+            normalized = statement.transform(normalize_identifier)
+            canonical_statements.append(
+                normalized.sql(
+                    dialect="doris",
+                    pretty=False,
+                    normalize=True,
+                    comments=False,
+                ).rstrip(";")
+            )
+        return ";".join(canonical_statements)
+    except Exception:
+        try:
+            tokenizer = sqlglot.Dialect.get_or_raise("doris").tokenizer_class()
+            tokens = tokenizer.tokenize(parseable)
+            normalized_tokens = []
+            for token in tokens:
+                token_type = str(token.token_type)
+                text = str(token.text or "")
+                if token_type not in {"TokenType.STRING", "TokenType.BIT_STRING", "TokenType.HEX_STRING"}:
+                    text = text.lower()
+                if token_type == "TokenType.SEMICOLON" and token is tokens[-1]:
+                    continue
+                normalized_tokens.append("%s:%s" % (token_type, text))
+            return "|".join(normalized_tokens)
+        except Exception:
+            return " ".join(source.rstrip(";").split()).lower()
+
+
+def canonical_sql_hash(sql: str) -> str:
+    return hashlib.sha256(canonical_sql(sql).encode("utf-8")).hexdigest()
+
+
+def sql_repair_contract_hash(contract: NodePlanContract) -> str:
+    payload = contract.model_dump(by_alias=True, mode="json")
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def sql_repair_state_fingerprint(sql: str, error_code: str, contract_hash: str) -> str:
+    payload = {
+        "canonicalSqlHash": canonical_sql_hash(sql),
+        "errorCode": str(error_code or "SQL_REPAIR_ERROR"),
+        "contractHash": str(contract_hash or ""),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def finalize_sql_repair_attempt(
+    attempt: SqlRepairAttempt,
+    contract_hash: str,
+    seen_sql_hashes: Set[str],
+) -> SqlRepairAttempt:
+    """Seal one repair proposal with a typed, generic progress decision."""
+
+    source_error_code = attempt.source_error_code or attempt.error_code or "SQL_REPAIR_ERROR"
+    input_hash = canonical_sql_hash(attempt.original_sql)
+    output_hash = canonical_sql_hash(attempt.repaired_sql) if attempt.repaired_sql else ""
+    state_fingerprint = sql_repair_state_fingerprint(
+        attempt.original_sql,
+        source_error_code,
+        contract_hash,
+    )
+    update: Dict[str, Any] = {
+        "source_error_code": source_error_code,
+        "input_sql_hash": input_hash,
+        "output_sql_hash": output_hash,
+        "contract_hash": contract_hash,
+        "state_fingerprint": state_fingerprint,
+    }
+    if not attempt.repaired_sql:
+        message = attempt.error_message or "repair_sql returned empty SQL"
+        update.update(
+            {
+                "success": False,
+                "status": "exhausted",
+                "progressed": False,
+                "exhausted": True,
+                "observation": message,
+            }
+        )
+        return attempt.model_copy(update=update)
+    if output_hash == input_hash or output_hash in seen_sql_hashes:
+        reason = (
+            "repair proposal is canonical-equivalent to its input"
+            if output_hash == input_hash
+            else "repair proposal returns a previously attempted canonical SQL"
+        )
+        update.update(
+            {
+                "error_code": "REPAIR_NO_PROGRESS",
+                "error_message": reason,
+                "success": False,
+                "status": "no_progress",
+                "progressed": False,
+                "exhausted": True,
+                "observation": reason,
+            }
+        )
+        return attempt.model_copy(update=update)
+    update.update(
+        {
+            "success": True,
+            "status": "progressed",
+            "progressed": True,
+            "exhausted": False,
+            "observation": "%s repaired to a new canonical SQL" % source_error_code,
+        }
+    )
+    return attempt.model_copy(update=update)
+
+
+def repeated_sql_repair_attempt(
+    *,
+    task_id: str,
+    repair_round: int,
+    sql: str,
+    error_code: str,
+    error_message: str,
+    contract_hash: str,
+) -> SqlRepairAttempt:
+    source_code = str(error_code or "SQL_REPAIR_ERROR")
+    reason = "repair state repeated without progress: canonical SQL, error code, and node contract are unchanged"
+    return SqlRepairAttempt(
+        task_id=task_id,
+        round=repair_round,
+        original_sql=sql,
+        error_code="REPAIR_NO_PROGRESS",
+        source_error_code=source_code,
+        error_message="%s; previous observation=%s" % (reason, str(error_message or "")[:240]),
+        success=False,
+        status="no_progress",
+        progressed=False,
+        exhausted=True,
+        input_sql_hash=canonical_sql_hash(sql),
+        contract_hash=contract_hash,
+        state_fingerprint=sql_repair_state_fingerprint(sql, source_code, contract_hash),
+        observation=reason,
+    )
+
+
+def sql_repair_observation(attempt: SqlRepairAttempt) -> Dict[str, Any]:
+    return {
+        "round": int(attempt.round or 0),
+        "status": attempt.status or ("progressed" if attempt.success else "failed"),
+        "sourceErrorCode": attempt.source_error_code or attempt.error_code,
+        "errorMessage": attempt.error_message,
+        "inputSqlHash": attempt.input_sql_hash,
+        "outputSqlHash": attempt.output_sql_hash,
+        "contractHash": attempt.contract_hash,
+        "stateFingerprint": attempt.state_fingerprint,
+        "observation": attempt.observation,
+    }
 
 
 def filter_predicate(column: str, value: Any) -> str:

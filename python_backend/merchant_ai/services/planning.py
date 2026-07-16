@@ -5890,6 +5890,7 @@ def ultra_compact_understanding_catalog(
             for item in relationships
         ],
         "knowledgeRequestGaps": compact_knowledge_request_gaps(asset_pack, budget_level=budget_level),
+        "retrievalHealth": compact_retrieval_health(asset_pack, budget_level=budget_level),
         "budgetLevel": budget_level,
         "catalogPolicy": (
             "ultra compact semantic candidates for questionUnderstanding; tables are first-layer manifests, "
@@ -5916,6 +5917,35 @@ def compact_knowledge_request_gaps(asset_pack: PlanningAssetPack, budget_level: 
             }
         )
     return compacted
+
+
+def compact_retrieval_health(asset_pack: PlanningAssetPack, budget_level: int = 0) -> Dict[str, Any]:
+    raw = (asset_pack.metric_compaction or {}).get("retrievalHealth") or {}
+    if not isinstance(raw, dict):
+        return {}
+    issue_limit = 1 if budget_level >= 2 else 2 if budget_level >= 1 else 4
+    issues: List[Dict[str, Any]] = []
+    for item in list(raw.get("issues") or [])[:issue_limit]:
+        if not isinstance(item, dict):
+            continue
+        issues.append(
+            {
+                "code": str(item.get("code") or "")[:80],
+                "backend": str(item.get("backend") or "")[:40],
+                "lane": str(item.get("lane") or "")[:40],
+                "severity": str(item.get("severity") or "")[:20],
+                "resolved": bool(item.get("resolved")),
+                "fallbackUsed": bool(item.get("fallbackUsed") or item.get("fallback_used")),
+            }
+        )
+    return {
+        "status": str(raw.get("status") or "not_started")[:20],
+        "backend": str(raw.get("backend") or "")[:80],
+        "sourceRefCount": int(raw.get("sourceRefCount") or 0),
+        "issueCount": int(raw.get("issueCount") or len(issues)),
+        "issues": issues,
+        "emptyIsSuccessful": str(raw.get("status") or "") == "empty",
+    }
 
 
 def filesystem_workspace_index_catalog(
@@ -6047,6 +6077,8 @@ def filesystem_workspace_index_catalog(
             }
             for item in relationships
         ],
+        "knowledgeRequestGaps": compact_knowledge_request_gaps(asset_pack, budget_level=budget_level),
+        "retrievalHealth": compact_retrieval_health(asset_pack, budget_level=budget_level),
         "budgetLevel": budget_level,
         "candidateBudget": {
             "tableLimit": table_limit,

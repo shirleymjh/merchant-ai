@@ -59,3 +59,34 @@ def test_error_like_or_unknown_severity_never_bypasses_blocking_gate(severity):
 
     assert verified.passed is False
     assert verified.blocking_gaps[0].severity == "blocking"
+
+
+def test_short_column_name_cannot_satisfy_a_more_specific_evidence_identifier():
+    run_result = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            tables=["refund_orders"],
+            rows=[{"id": "refund_1"}],
+            original_row_count=1,
+        )
+    )
+    plan = QueryPlan(final_required_evidence=["refund_order_id"])
+
+    verified = EvidenceVerifier().verify("退款订单是什么", plan, run_result)
+
+    assert verified.passed is False
+    assert [gap.code for gap in verified.blocking_gaps] == ["MISSING_REQUIRED_EVIDENCE"]
+
+
+def test_natural_evidence_label_may_embed_an_exact_governed_identifier():
+    run_result = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            tables=["refund_orders"],
+            rows=[{"refund_order_id": "refund_1"}],
+            original_row_count=1,
+        )
+    )
+    plan = QueryPlan(final_required_evidence=["退款订单号(refund_order_id)"])
+
+    verified = EvidenceVerifier().verify("退款订单是什么", plan, run_result)
+
+    assert verified.passed is True

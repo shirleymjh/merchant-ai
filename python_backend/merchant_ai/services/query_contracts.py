@@ -32,6 +32,51 @@ def contract_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List
     return gaps
 
 
+def sql_repair_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List[EvidenceGap]:
+    """Expose terminal SQL repair states as typed evidence gaps."""
+
+    gaps: List[EvidenceGap] = []
+    for task_result in task_results:
+        attempts = list(task_result.sql_repairs or [])
+        if not attempts or not task_result.query_bundle.failed:
+            continue
+        terminal = attempts[-1]
+        if terminal.error_code == "REPAIR_NO_PROGRESS" or terminal.status == "no_progress":
+            code = "REPAIR_NO_PROGRESS"
+            reason = terminal.error_message or "SQL repair did not change the canonical SQL state"
+        elif terminal.exhausted:
+            code = "SQL_REPAIR_EXHAUSTED"
+            reason = terminal.observation or terminal.error_message or "SQL repair budget was exhausted"
+        else:
+            continue
+        gaps.append(
+            EvidenceGap(
+                code=code,
+                task_id=task_result.task_id,
+                evidence=terminal.state_fingerprint or terminal.input_sql_hash,
+                reason=reason,
+                severity="blocking",
+                disclosure_required=True,
+                source="node_sql_repair",
+                answer_instruction="SQL 修复没有形成新的可执行查询；禁止把失败结果解释为无数据或指标为 0。",
+                suggested_action="replan_or_fix_sql_contract",
+                details={
+                    "gapCode": code,
+                    "taskId": task_result.task_id,
+                    "repairRound": terminal.round,
+                    "sourceErrorCode": terminal.source_error_code or terminal.error_code,
+                    "inputSqlHash": terminal.input_sql_hash,
+                    "outputSqlHash": terminal.output_sql_hash,
+                    "contractHash": terminal.contract_hash,
+                    "stateFingerprint": terminal.state_fingerprint,
+                    "status": terminal.status,
+                    "exhausted": terminal.exhausted,
+                },
+            )
+        )
+    return gaps
+
+
 def contract_issue_evidence(task_result: AgentTaskResult) -> str:
     critique = task_result.node_plan_critique
     contract = task_result.node_plan_contract

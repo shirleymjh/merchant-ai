@@ -179,7 +179,7 @@ def extract_answer_claims(answer: str, facts: List[VerifiedFact] | None = None) 
         normalize_label_text(value)
         for fact in facts or []
         if decimal_value(fact.value) is not None
-        for value in [fact.column, fact.label]
+        for value in [fact.column, fact.label, *fact.label_aliases]
         if value
     }
     claims: List[AnswerClaim] = []
@@ -218,9 +218,23 @@ def append_prose_claims(text: str, claims: List[AnswerClaim], non_entity_tokens:
         numbers = extract_numeric_tokens(sentence)
         entities = [item for item in ENTITY_PATTERN.findall(sentence) if is_business_entity_token(item, non_entity_tokens)]
         entities = dedupe_texts(entities)
-        if not numbers and not entities:
+        if not numbers and not entities and not qualitative_trend_assertion(sentence, non_entity_tokens or set()):
             continue
         claims.append(AnswerClaim(text=sentence, numeric_values=numbers, entity_values=entities))
+
+
+def qualitative_trend_assertion(sentence: str, known_metric_labels: Set[str]) -> bool:
+    """Return whether prose asserts a direction for a governed result label.
+
+    Direction-only conclusions previously disappeared before verification
+    because they contained neither a number nor an entity.  Labels come from
+    executed facts, so this does not encode any business metric or table name.
+    """
+
+    if not direction_word(sentence):
+        return False
+    normalized_sentence = normalize_label_text(sentence)
+    return any(label and label in normalized_sentence for label in known_metric_labels)
 
 
 def markdown_table_cells(line: str) -> List[str]:
@@ -420,16 +434,26 @@ def trend_direction_support(claim_text: str, facts: List[VerifiedFact]) -> Tuple
     if not re.search(r"(上升|增加|提升|上涨|下降|减少|降低|下滑|持平)", text):
         return "", []
     matched_fact_ids: List[str] = []
+    trends = trend_fact_groups(facts)
     clauses = [item.strip() for item in re.split(r"[；;。.!！?？\n]+", text) if item.strip()]
     for clause in clauses:
+        claimed = direction_word(clause)
+        if not claimed:
+            continue
         normalized_clause = normalize_label_text(clause)
-        for trend in trend_fact_groups(facts):
+        matching_trends = []
+        for trend in trends:
             labels = [label for label in trend["labels"] if label]
-            if not any(label in normalized_clause for label in labels):
-                continue
-            claimed = direction_word(clause)
-            if not claimed:
-                continue
+            if any(label in normalized_clause for label in labels):
+                matching_trends.append(trend)
+        if not matching_trends:
+            # A single governed series can provide the grammatical subject for
+            # a follow-on clause such as "较上期下降 5".  Multiple/no series are
+            # ambiguous and therefore fail closed.
+            matching_trends = trends if len(trends) == 1 else []
+        if not matching_trends:
+            return "unsupported_trend_direction:no_matching_series", []
+        for trend in matching_trends:
             expected = expected_trend_direction_for_clause(trend, clause)
             if claimed != expected:
                 return "unsupported_trend_direction:%s" % claimed, list(trend["fact_ids"])
@@ -453,6 +477,7 @@ def trend_fact_groups(facts: List[VerifiedFact]) -> List[Dict[str, Any]]:
                     "task_id": task_id,
                     "column": fact.column,
                     "label": fact.label,
+                    "labels": fact_label_candidates(fact),
                     "row_index": row_index,
                     "date": normalize_temporal_token(date_fact.value) if date_fact else "",
                     "value": value,
@@ -474,15 +499,10 @@ def trend_fact_groups(facts: List[VerifiedFact]) -> List[Dict[str, Any]]:
                 fact_ids.append(str(item["date_fact_id"]))
         groups.append(
             {
-                "labels": fact_label_candidates(
-                    VerifiedFact(
-                        fact_id=str(first["fact_id"]),
-                        task_id=str(first["task_id"]),
-                        row_index=int(first["row_index"]),
-                        column=str(first["column"]),
-                        label=str(first["label"]),
-                        value=first["value"],
-                    )
+                "labels": dedupe_texts(
+                    label
+                    for item in ordered
+                    for label in item.get("labels") or []
                 ),
                 "direction": direction,
                 "fact_ids": dedupe_texts(fact_ids),

@@ -87,6 +87,7 @@ from merchant_ai.models import (
     QuestionRoute,
     RecallBundle,
     RecallItem,
+    RetrievalIssue,
     RouteSlots,
     SkillDraft,
     SkillLifecycleRecord,
@@ -168,6 +169,10 @@ from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     HybridKnowledgeRetrievalService,
     KnowledgeRetrievalService,
+    dedupe_retrieval_issues,
+    failed_knowledge_bundle,
+    merge_knowledge_fallback,
+    normalize_knowledge_bundle_status,
     recall_item_sort_key,
 )
 from merchant_ai.services.routing import (
@@ -373,6 +378,9 @@ class MerchantQaWorkflow:
             blocked_knowledge_request_keys=[],
             knowledge_request_lineage={},
             knowledge_request_gaps=[],
+            knowledge_retrieval_status="not_started",
+            knowledge_retrieval_issues=[],
+            knowledge_retrieval_outcomes=[],
             agent_run_result=AgentRunResult(),
             query_bundle=QueryBundle(),
             query_bundles=[],
@@ -2869,6 +2877,7 @@ class MerchantQaWorkflow:
         round_traces = list(state.get("recall_rounds") or [])
         expanded_topics = list(state.get("knowledge_expanded_topics") or [])
         knowledge_bundles: List[KnowledgeBundle] = []
+        retrieval_outcomes: List[Dict[str, Any]] = []
         stage_items: Dict[str, Dict[str, RecallItem]] = {}
         request_result_items: Dict[str, Dict[str, RecallItem]] = {}
 
@@ -2900,14 +2909,45 @@ class MerchantQaWorkflow:
                     complexity=fast_understanding.complexity,
                     round=int(state.get("query_graph_retrieve_count") or 0),
                 )
-                knowledge_bundle = self.knowledge_retriever.retrieve(retrieval_request)
+                retriever_backend = str(getattr(self.knowledge_retriever, "backend_name", "knowledge") or "knowledge")
+                try:
+                    knowledge_bundle = normalize_knowledge_bundle_status(
+                        self.knowledge_retriever.retrieve(retrieval_request)
+                    )
+                except Exception as exc:
+                    knowledge_bundle = failed_knowledge_bundle(
+                        retrieval_request,
+                        retriever_backend,
+                        "KNOWLEDGE_RETRIEVER_FAILED",
+                        str(exc),
+                    )
                 if not knowledge_bundle.recall_bundle.items and str(knowledge_bundle.backend or "").lower().startswith("es"):
-                    fallback_bundle = HybridKnowledgeRetrievalService(self.recall_service).retrieve(retrieval_request)
-                    if fallback_bundle.recall_bundle.items:
-                        fallback_bundle.backend = "es_fallback_hybrid"
-                        fallback_bundle.recall_rounds = list(knowledge_bundle.recall_rounds or []) + list(fallback_bundle.recall_rounds or [])
-                        knowledge_bundle = fallback_bundle
+                    try:
+                        fallback_bundle = HybridKnowledgeRetrievalService(self.recall_service).retrieve(retrieval_request)
+                    except Exception as exc:
+                        fallback_bundle = failed_knowledge_bundle(
+                            retrieval_request,
+                            "hybrid",
+                            "KNOWLEDGE_FALLBACK_RETRIEVER_FAILED",
+                            str(exc),
+                            stage="fallback",
+                        )
+                    knowledge_bundle = merge_knowledge_fallback(knowledge_bundle, fallback_bundle)
                 knowledge_bundles.append(knowledge_bundle)
+                retrieval_outcomes.append(
+                    {
+                        "stage": stage,
+                        "requestKey": request_key,
+                        "query": query[:500],
+                        "backend": knowledge_bundle.backend,
+                        "status": knowledge_bundle.retrieval_status,
+                        "itemCount": len(knowledge_bundle.recall_bundle.items),
+                        "issues": [
+                            issue.model_dump(by_alias=True)
+                            for issue in knowledge_bundle.retrieval_issues
+                        ],
+                    }
+                )
                 for trace in knowledge_bundle.recall_rounds:
                     trace.new_refs = [ref for ref in trace.source_refs if ref not in existing_refs]
                     existing_refs.update(trace.source_refs)
@@ -2989,15 +3029,39 @@ class MerchantQaWorkflow:
             blocked = set(state.get("blocked_knowledge_request_keys") or [])
             blocked.update(knowledge_request_key(request) for request in no_match_requests)
             state["blocked_knowledge_request_keys"] = sorted(blocked)
-            state["knowledge_request_gaps"] = append_knowledge_request_gaps(
-                state.get("knowledge_request_gaps", []),
-                no_match_requests,
-                "KNOWLEDGE_REQUEST_NO_MATCH",
-            )
+            failed_request_keys = {
+                str(outcome.get("requestKey") or "")
+                for outcome in retrieval_outcomes
+                if str(outcome.get("status") or "") == "failed"
+            }
+            retrieval_failed_requests = [
+                request
+                for request in no_match_requests
+                if knowledge_request_key(request) in failed_request_keys
+            ]
+            genuine_no_match_requests = [
+                request
+                for request in no_match_requests
+                if knowledge_request_key(request) not in failed_request_keys
+            ]
+            gaps = state.get("knowledge_request_gaps", [])
+            if retrieval_failed_requests:
+                gaps = append_knowledge_request_gaps(
+                    gaps,
+                    retrieval_failed_requests,
+                    "KNOWLEDGE_RETRIEVAL_FAILED",
+                )
+            if genuine_no_match_requests:
+                gaps = append_knowledge_request_gaps(
+                    gaps,
+                    genuine_no_match_requests,
+                    "KNOWLEDGE_REQUEST_NO_MATCH",
+                )
+            state["knowledge_request_gaps"] = gaps
             add_step(
                 state,
-                "KnowledgeAgent：%d 个补知识请求未召回到 request-specific 证据，记录缺口并停止重试"
-                % len(no_match_requests),
+                "KnowledgeAgent：%d 个补知识请求未获得 request-specific 证据（召回失败=%d，真实零命中=%d），记录结构化缺口并停止重试"
+                % (len(no_match_requests), len(retrieval_failed_requests), len(genuine_no_match_requests)),
             )
         lineage_items = list(all_items.values())
         items = sorted(lineage_items, key=recall_item_sort_key, reverse=True)[:24]
@@ -3006,6 +3070,23 @@ class MerchantQaWorkflow:
             top_score=items[0].fusion_score if items else 0.0,
             merged_context="\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items),
         )
+        retrieval_issues = dedupe_retrieval_issues(
+            [
+                issue
+                for bundle in knowledge_bundles
+                for issue in bundle.retrieval_issues
+            ]
+        )
+        scope_statuses = {
+            str(outcome.get("status") or "")
+            for outcome in retrieval_outcomes
+        }
+        if "failed" in scope_statuses:
+            retrieval_status = "failed"
+        elif retrieval_issues or "degraded" in scope_statuses:
+            retrieval_status = "degraded"
+        else:
+            retrieval_status = "success" if items else "empty"
         backend = next((bundle.backend for bundle in knowledge_bundles if bundle.backend), "hybrid")
         state["knowledge_bundle"] = KnowledgeBundle(
             recall_bundle=state["recall_bundle"],
@@ -3014,7 +3095,15 @@ class MerchantQaWorkflow:
             backend=backend,
             index_version=next((bundle.index_version for bundle in knowledge_bundles if bundle.index_version), ""),
             semantic_source_hash=next((bundle.semantic_source_hash for bundle in knowledge_bundles if bundle.semantic_source_hash), ""),
+            retrieval_status=retrieval_status,
+            retrieval_issues=retrieval_issues,
         )
+        state["knowledge_retrieval_status"] = retrieval_status
+        state["knowledge_retrieval_issues"] = [
+            issue.model_dump(by_alias=True)
+            for issue in retrieval_issues
+        ]
+        state["knowledge_retrieval_outcomes"] = retrieval_outcomes
         state["recall_rounds"] = round_traces
         state["recall_strategy"] = self.recall_strategy_payload(fast_understanding, round_traces)
         self.update_knowledge_request_lineage(state, active_pending_requests, lineage_items)
@@ -3054,8 +3143,14 @@ class MerchantQaWorkflow:
             state["planner_provider_error"] = ""
         add_step(
             state,
-            "Main Agent Tool retrieve_knowledge：完成检索，命中 %d 条候选知识/资产片段，profile=%s skillPolicies=%s"
-            % (len(items), ",".join(state["recall_strategy"].get("profileKinds") or []) or "unknown", loaded_skills or []),
+            "Main Agent Tool retrieve_knowledge：检索状态=%s，命中 %d 条候选知识/资产片段，issues=%d，profile=%s skillPolicies=%s"
+            % (
+                retrieval_status,
+                len(items),
+                len(retrieval_issues),
+                ",".join(state["recall_strategy"].get("profileKinds") or []) or "unknown",
+                loaded_skills or [],
+            ),
         )
         self.record_span(
             state,
@@ -3063,14 +3158,43 @@ class MerchantQaWorkflow:
             "retrieve_knowledge",
             started,
             row_count=len(items),
-            metadata={"skillPolicies": loaded_skills, "pendingRequests": had_pending_requests, "recallStrategy": state.get("recall_strategy", {})},
+            status="failed" if retrieval_status == "failed" else ("partial" if retrieval_status == "degraded" else "success"),
+            error_code=(
+                next((issue.code for issue in retrieval_issues if not issue.resolved), "KNOWLEDGE_RETRIEVAL_FAILED")
+                if retrieval_status == "failed"
+                else ""
+            ),
+            metadata={
+                "skillPolicies": loaded_skills,
+                "pendingRequests": had_pending_requests,
+                "recallStrategy": state.get("recall_strategy", {}),
+                "retrievalStatus": retrieval_status,
+                "retrievalIssues": state.get("knowledge_retrieval_issues", []),
+            },
         )
-        self.finish_run_step(state, step, "success", output_summary="recallItems=%d skills=%s" % (len(items), loaded_skills or []))
+        self.finish_run_step(
+            state,
+            step,
+            "gap" if retrieval_status == "failed" else ("partial" if retrieval_status == "degraded" else "success"),
+            output_summary="status=%s recallItems=%d issues=%d skills=%s"
+            % (retrieval_status, len(items), len(retrieval_issues), loaded_skills or []),
+            error_code=(
+                next((issue.code for issue in retrieval_issues if not issue.resolved), "KNOWLEDGE_RETRIEVAL_FAILED")
+                if retrieval_status == "failed"
+                else ""
+            ),
+        )
         emit(
             state,
             "node.completed",
             "RETRIEVE_KNOWLEDGE",
-            {"recallItems": len(items), "skillPolicies": loaded_skills, "recallStrategy": state.get("recall_strategy", {})},
+            {
+                "recallItems": len(items),
+                "skillPolicies": loaded_skills,
+                "recallStrategy": state.get("recall_strategy", {}),
+                "retrievalStatus": retrieval_status,
+                "retrievalIssueCount": len(retrieval_issues),
+            },
         )
         return state
 
@@ -3371,7 +3495,25 @@ class MerchantQaWorkflow:
         knowledge_bundle = state.get("knowledge_bundle") or KnowledgeBundle()
         pack.metric_compaction["recallLineage"] = list(state.get("recall_rounds") or [])
         pack.metric_compaction["requestLineage"] = state.get("knowledge_request_lineage") or {}
-        pack.metric_compaction["knowledgeRequestGaps"] = list(state.get("knowledge_request_gaps") or [])
+        retrieval_health = knowledge_retrieval_health_payload(state)
+        pack.metric_compaction["retrievalHealth"] = retrieval_health
+        planning_gaps = list(state.get("knowledge_request_gaps") or [])
+        known_gap_ids = {
+            (str(item.get("code") or ""), str(item.get("requestKey") or ""), str(item.get("backend") or ""), str(item.get("lane") or ""))
+            for item in planning_gaps
+            if isinstance(item, dict)
+        }
+        for gap in knowledge_retrieval_planning_gaps(state):
+            identity = (
+                str(gap.get("code") or ""),
+                str(gap.get("requestKey") or ""),
+                str(gap.get("backend") or ""),
+                str(gap.get("lane") or ""),
+            )
+            if identity not in known_gap_ids:
+                planning_gaps.append(gap)
+                known_gap_ids.add(identity)
+        pack.metric_compaction["knowledgeRequestGaps"] = planning_gaps
         pack.metric_compaction["loadedSourceRefs"] = sorted(pack.source_refs.keys())
         pack.metric_compaction["recallBackend"] = knowledge_bundle.backend or "hybrid"
         pack.metric_compaction["semanticSourceHash"] = (
@@ -4763,6 +4905,7 @@ class MerchantQaWorkflow:
         started = now_ms()
         step = self.start_run_step(state, "verify_evidence", "EvidenceVerifierAgent", "VERIFY_EVIDENCE_GRAPH", input_summary="tasks=%d" % len(state["agent_run_result"].task_results))
         increment_round(state)
+        append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
         append_subagent_outcomes_to_run_result(state, state["agent_run_result"])
         verified = self.evidence_verifier.verify(
             state["question"],
@@ -4839,6 +4982,7 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "answer_rule", "RuleAnswerAgent", "ANSWER_RULE", input_summary="refs=%d" % len(state.get("rule_recall_refs") or []))
         increment_round(state)
         emit(state, "node.started", "ANSWER_RULE", {})
+        append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
         state["plan"] = self.build_rule_recall_plan(state)
         record_graph_validation(state, GraphValidationResult(valid=True, repairable=False))
         state["query_graph_reflected"] = True
@@ -5601,6 +5745,7 @@ class MerchantQaWorkflow:
         step = self.start_run_step(state, "answer", "AnswerAgent", "ANSWER_ANALYSIS", input_summary="verified=%s" % state["agent_run_result"].verified_evidence.passed)
         increment_round(state)
         emit(state, "node.started", "ANSWER_ANALYSIS", {})
+        append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
         personalization_context = self.answer_personalization_context(state)
         route = state["routing_decision"].route
         allow_answer_llm = self.latency_optimizer.answer_allows_llm(state.get("latency_optimization") or {})
@@ -6464,6 +6609,7 @@ class MerchantQaWorkflow:
             return
 
     def to_response(self, state: AgentState) -> ChatResponse:
+        append_knowledge_retrieval_outcomes_to_run_result(state, state["agent_run_result"])
         append_subagent_outcomes_to_run_result(state, state["agent_run_result"])
         execution_attempts = normalized_execution_attempt_artifacts(state)
         state["execution_attempt_artifacts"] = execution_attempts
@@ -6672,9 +6818,12 @@ class MerchantQaWorkflow:
                     "intentSignals": state.get("intent_signals", IntentSignals()).model_dump(by_alias=True),
                     "knowledgeRetrieval": {
                         "backend": (state.get("knowledge_bundle") or KnowledgeBundle()).backend,
+                        "status": state.get("knowledge_retrieval_status") or (state.get("knowledge_bundle") or KnowledgeBundle()).retrieval_status,
                         "sourceRefs": (state.get("knowledge_bundle") or KnowledgeBundle()).source_refs,
                         "rounds": state.get("recall_rounds", []),
                         "requestLineage": state.get("knowledge_request_lineage", {}),
+                        "issues": state.get("knowledge_retrieval_issues", []),
+                        "outcomes": state.get("knowledge_retrieval_outcomes", []),
                     },
                 },
                 "plannerReflection": state.get("planner_reflection", PlannerReflectionResult()).model_dump(by_alias=True),
@@ -8628,6 +8777,198 @@ def append_active_planner_degraded_reason(
     if not any(planner_degraded_reason_identity(item) == identity for item in reasons):
         reasons.append(payload)
     run_result.degraded_reasons = reasons
+
+
+def retrieval_issues_from_state(state: AgentState) -> List[RetrievalIssue]:
+    raw_items = list(state.get("knowledge_retrieval_issues") or [])
+    if not raw_items:
+        raw_items = list((state.get("knowledge_bundle") or KnowledgeBundle()).retrieval_issues or [])
+    issues: List[RetrievalIssue] = []
+    for raw in raw_items:
+        try:
+            issues.append(raw if isinstance(raw, RetrievalIssue) else RetrievalIssue.model_validate(raw))
+        except Exception:
+            continue
+    return dedupe_retrieval_issues(issues)
+
+
+def knowledge_retrieval_health_payload(state: AgentState) -> Dict[str, Any]:
+    bundle = normalize_knowledge_bundle_status(state.get("knowledge_bundle") or KnowledgeBundle())
+    status = str(state.get("knowledge_retrieval_status") or bundle.retrieval_status or "not_started")
+    issues = retrieval_issues_from_state(state)
+    return {
+        "status": status,
+        "backend": bundle.backend,
+        "sourceRefCount": len(bundle.source_refs),
+        "issueCount": len(issues),
+        "issues": [issue.model_dump(by_alias=True) for issue in issues],
+        "outcomes": list(state.get("knowledge_retrieval_outcomes") or []),
+    }
+
+
+def knowledge_retrieval_planning_gaps(state: AgentState) -> List[Dict[str, Any]]:
+    """Expose unavailable retrieval as planner input, never as a zero match."""
+
+    status = str(state.get("knowledge_retrieval_status") or "")
+    outcomes = list(state.get("knowledge_retrieval_outcomes") or [])
+    gaps: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for issue in retrieval_issues_from_state(state):
+        if issue.resolved:
+            continue
+        if status != "failed" and str(issue.severity or "").lower() != "blocking":
+            continue
+        query = next(
+            (
+                str(outcome.get("query") or "")
+                for outcome in outcomes
+                if (
+                    not issue.request_key
+                    or str(outcome.get("requestKey") or "") == issue.request_key
+                )
+                and (
+                    not issue.stage
+                    or str(outcome.get("stage") or "") == issue.stage
+                    or issue.stage in {"retrieve", "fallback"}
+                )
+            ),
+            "",
+        )
+        identity = (issue.code, issue.request_key, issue.backend, issue.lane)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        gaps.append(
+            {
+                "code": issue.code or "KNOWLEDGE_RETRIEVAL_FAILED",
+                "requestKey": issue.request_key,
+                "type": "retrieval_failure",
+                "query": query[:500],
+                "reason": issue.message[:500] or "Knowledge retrieval was unavailable",
+                "severity": "blocking",
+                "backend": issue.backend,
+                "lane": issue.lane,
+            }
+        )
+    if status == "failed" and not gaps:
+        gaps.append(
+            {
+                "code": "KNOWLEDGE_RETRIEVAL_FAILED",
+                "requestKey": "",
+                "type": "retrieval_failure",
+                "query": "",
+                "reason": "Knowledge retrieval failed without a structured backend issue",
+                "severity": "blocking",
+                "backend": (state.get("knowledge_bundle") or KnowledgeBundle()).backend,
+                "lane": "unknown",
+            }
+        )
+    return gaps
+
+
+def append_knowledge_retrieval_outcomes_to_run_result(
+    state: AgentState,
+    run_result: AgentRunResult,
+) -> None:
+    """Keep retrieval availability monotonic through planning and answering."""
+
+    status = str(state.get("knowledge_retrieval_status") or "")
+    issues = retrieval_issues_from_state(state)
+    if status not in {"failed", "degraded"} and not issues:
+        return
+    if status == "failed" and not issues:
+        issues = [
+            RetrievalIssue(
+                code="KNOWLEDGE_RETRIEVAL_FAILED",
+                message="Knowledge retrieval failed without a structured backend issue",
+                backend=(state.get("knowledge_bundle") or KnowledgeBundle()).backend,
+                lane="unknown",
+                stage="retrieve",
+                severity="blocking",
+            )
+        ]
+    reasons = [dict(item) for item in run_result.degraded_reasons or [] if isinstance(item, dict)]
+    evidence_gaps = [item.model_copy(deep=True) for item in run_result.evidence_gaps or []]
+    reason_ids = {
+        (
+            str(item.get("stage") or ""),
+            str(item.get("code") or ""),
+            str(item.get("backend") or ""),
+            str(item.get("lane") or ""),
+            str(item.get("requestKey") or ""),
+        )
+        for item in reasons
+    }
+    gap_ids = {
+        (
+            str(item.code or item.gap_code),
+            str(item.source_node_id or item.task_id),
+            str((item.details or {}).get("requestKey") or ""),
+        )
+        for item in evidence_gaps
+    }
+    for issue in issues:
+        severity = (
+            "warning"
+            if issue.resolved or (status == "degraded" and str(issue.severity or "").lower() != "blocking")
+            else "blocking"
+        )
+        code = issue.code or "KNOWLEDGE_RETRIEVAL_FAILED"
+        source_node_id = "retrieval:%s:%s" % (issue.backend or "unknown", issue.lane or "unknown")
+        details = {
+            **dict(issue.details or {}),
+            "retrievalStatus": status,
+            "backend": issue.backend,
+            "lane": issue.lane,
+            "stage": issue.stage,
+            "requestKey": issue.request_key,
+            "retryable": issue.retryable,
+            "fallbackUsed": issue.fallback_used,
+            "resolved": issue.resolved,
+        }
+        reason_identity = ("retrieval", code, issue.backend, issue.lane, issue.request_key)
+        if reason_identity not in reason_ids:
+            reasons.append(
+                {
+                    "active": True,
+                    "stage": "retrieval",
+                    "code": code,
+                    "reason": issue.message[:1000] or code,
+                    "status": status,
+                    "severity": severity,
+                    "backend": issue.backend,
+                    "lane": issue.lane,
+                    "requestKey": issue.request_key,
+                    "fallbackUsed": issue.fallback_used,
+                    "resolved": issue.resolved,
+                    "details": details,
+                }
+            )
+            reason_ids.add(reason_identity)
+        gap_identity = (code, source_node_id, issue.request_key)
+        if gap_identity in gap_ids:
+            continue
+        evidence_gaps.append(
+            EvidenceGap(
+                code=code,
+                source_node_id=source_node_id,
+                evidence=issue.backend,
+                reason=issue.message[:1000] or code,
+                severity=severity,
+                disclosure_required=True,
+                source="retrieval",
+                answer_instruction=(
+                    "说明召回后端或检索通道不可用，本轮不能把空候选解释为业务上不存在；先恢复召回再完成回答。"
+                    if severity == "blocking"
+                    else "说明主召回或部分检索通道失败，当前答案使用了可用的降级证据来源。"
+                ),
+                suggested_action="retry_knowledge_retrieval" if severity == "blocking" else "answer_with_retrieval_disclosure",
+                details=details,
+            )
+        )
+        gap_ids.add(gap_identity)
+    run_result.degraded_reasons = reasons
+    run_result.evidence_gaps = evidence_gaps
 
 
 def append_subagent_outcomes_to_run_result(

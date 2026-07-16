@@ -421,6 +421,65 @@ def test_local_day_direction_is_checked_against_adjacent_points_not_overall_tren
     assert verification.passed is True
 
 
+def test_direction_only_claim_is_verified_against_the_executed_series():
+    question = "最近两天余额有没有异常？"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="balance_series",
+                preferred_table="daily_profile",
+                metric_name="balance",
+                metric_column="balance",
+                group_by_column="pt",
+                output_keys=["pt", "balance"],
+                metric_resolution={
+                    "metricKey": "balance",
+                    "displayName": "余额",
+                    "sourceColumns": ["balance"],
+                    "timeColumn": "pt",
+                },
+            )
+        ]
+    )
+    rows = [
+        {"pt": "2026-07-10", "balance": 100},
+        {"pt": "2026-07-11", "balance": 100},
+    ]
+    bundle = QueryBundle(tables=["daily_profile"], rows=rows, original_row_count=2)
+    contract = NodePlanContract(
+        task_id="balance_series",
+        visible_columns=["pt", "balance"],
+        metric_specs=[{"metricName": "balance", "metricColumn": "balance", "displayName": "余额"}],
+        group_by_column="pt",
+        time_window_contract={"timeColumn": "pt"},
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="balance_series",
+                success=True,
+                query_bundle=bundle,
+                node_plan_contract=contract,
+            )
+        ],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    verification = AnswerClaimVerifier().verify(
+        question,
+        plan,
+        run,
+        "余额明显下降并出现异常。",
+    )
+
+    assert verification.passed is False
+    assert verification.unsupported_claims[0].reasons == ["unsupported_trend_direction:down"]
+
+
 def test_answer_claim_verifier_rejects_value_missing_from_evidence():
     verification = AnswerClaimVerifier().verify(
         "订单 order_1 为什么异常？",
