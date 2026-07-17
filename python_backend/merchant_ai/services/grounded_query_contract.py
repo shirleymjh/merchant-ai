@@ -28,7 +28,10 @@ from merchant_ai.models import (
 )
 from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
 from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution
-from merchant_ai.services.time_semantics import resolve_time_range
+from merchant_ai.services.time_semantics import (
+    extract_temporal_lexical_spans,
+    resolve_time_range,
+)
 
 
 class GroundedContractGap(APIModel):
@@ -654,6 +657,7 @@ class GroundedQueryContractBuilder:
                 or label_refs.get(ref_id)
                 or _field_aggregation_business_name(business_name, aggregation)
             ).strip()
+            phrase = _without_time_phrase(phrase)
             bindings.append(
                 GroundedMetricBinding(
                     requested_phrase=phrase,
@@ -869,6 +873,120 @@ class GroundedSemanticFitValidator:
                     ),
                 )
             )
+        gaps.extend(self._time_selection_gaps(contract, table_by_name))
+        return gaps
+
+    @staticmethod
+    def _time_selection_gaps(
+        contract: GroundedQueryContract,
+        table_by_name: dict[str, GroundedTableBinding],
+    ) -> list[GroundedContractGap]:
+        """Match one execution shape to metric-declared time semantics.
+
+        This is deliberately generic: semantic assets declare their selection
+        policy and the gate compares it with the proposed grouping/window. It
+        does not recognize metric names or business-specific formulas.
+        """
+
+        policies: dict[str, list[GroundedMetricBinding]] = {}
+        for metric in contract.metrics:
+            policy = str(
+                metric.time_semantics.get("selectionPolicy") or "period_window"
+            ).strip()
+            policies.setdefault(policy, []).append(metric)
+
+        gaps: list[GroundedContractGap] = []
+        if len(policies) > 1:
+            policy_names = sorted(policies)
+            gaps.append(
+                _gap(
+                    "INCOMPATIBLE_METRIC_TIME_POLICIES",
+                    (
+                        "One Grounded Contract cannot combine metric time selection "
+                        "policies %s; submit one coherent execution shape at a time"
+                        % ", ".join(policy_names)
+                    ),
+                    "METRIC",
+                    resolution="REVISE_BINDINGS",
+                    search_scope="CURRENT_READ_EVIDENCE",
+                    required_capability={
+                        "singleTimeSelectionPolicy": True,
+                        "availableTimeSelectionPolicies": policy_names,
+                        "splitExecutionRequired": True,
+                    },
+                    rejected_ref_ids=[
+                        metric.semantic_ref_id for metric in contract.metrics
+                    ],
+                )
+            )
+
+        grouped_time_tables = {
+            dimension.table
+            for dimension in contract.dimensions
+            if dimension.usage == "group_by"
+            and (
+                dimension.role.upper()
+                in {"TIME", "DATE", "DATETIME", "TIMESTAMP", "TIME_DIMENSION"}
+                or dimension.column
+                == str(
+                    getattr(table_by_name.get(dimension.table), "time_column", "")
+                    or ""
+                )
+            )
+        }
+        requested_days = max(0, int(contract.time_range.days or 0))
+        for metric in contract.metrics:
+            policy = str(
+                metric.time_semantics.get("selectionPolicy") or "period_window"
+            ).strip()
+            if policy == "period_window" and metric.table in grouped_time_tables:
+                gaps.append(
+                    _gap(
+                        "METRIC_TIME_GRAIN_MISMATCH",
+                        (
+                            "Metric %s declares period_window semantics and cannot be "
+                            "grouped by the table time dimension"
+                            % metric.metric_key
+                        ),
+                        "METRIC",
+                        metric.topic,
+                        metric.table,
+                        metric.requested_phrase,
+                        resolution="REVISE_BINDINGS",
+                        search_scope="CURRENT_READ_EVIDENCE",
+                        required_capability={
+                            "timeSelectionPolicy": "per_time_grain",
+                            "preserveTimeDimension": True,
+                        },
+                        rejected_ref_ids=[metric.semantic_ref_id],
+                    )
+                )
+            if (
+                policy == "per_time_grain"
+                and requested_days > 1
+                and metric.table not in grouped_time_tables
+            ):
+                gaps.append(
+                    _gap(
+                        "METRIC_TIME_GRAIN_MISMATCH",
+                        (
+                            "Metric %s declares per_time_grain semantics and a multi-day "
+                            "query must preserve the governed time dimension"
+                            % metric.metric_key
+                        ),
+                        "METRIC",
+                        metric.topic,
+                        metric.table,
+                        metric.requested_phrase,
+                        resolution="REVISE_BINDINGS",
+                        search_scope="CURRENT_READ_EVIDENCE",
+                        required_capability={
+                            "timeSelectionPolicy": "period_window",
+                            "queryShape": "SCALAR",
+                        },
+                        rejected_ref_ids=[metric.semantic_ref_id],
+                    )
+                )
         return gaps
 
 
@@ -2071,6 +2189,8 @@ _REVISE_BINDING_GAP_CODES = {
     "TABLE_INSUFFICIENT",
     "REQUIRED_CAPABILITY_NOT_BOUND",
     "REJECTED_BINDING_REUSED",
+    "INCOMPATIBLE_METRIC_TIME_POLICIES",
+    "METRIC_TIME_GRAIN_MISMATCH",
 }
 
 
@@ -2254,7 +2374,12 @@ def _rejected_bindings_for_contract(
     rejected: list[GroundedRejectedBinding] = []
     seen: set[str] = set()
     for gap in gaps:
-        if gap.code not in {"TABLE_INSUFFICIENT", "REQUIRED_CAPABILITY_NOT_BOUND"}:
+        if gap.code not in {
+            "TABLE_INSUFFICIENT",
+            "REQUIRED_CAPABILITY_NOT_BOUND",
+            "INCOMPATIBLE_METRIC_TIME_POLICIES",
+            "METRIC_TIME_GRAIN_MISMATCH",
+        }:
             continue
         target_tables = [gap.table] if gap.table else [table.table for table in contract.tables if table.table]
         for table_name in _dedupe(target_tables):
@@ -2367,6 +2492,14 @@ def _metric_phrase_in_question(question: str, aliases: Sequence[str]) -> str:
         and re.sub(r"[\s_\-—·]+", "", str(alias)).lower() in normalized_question
     ]
     return max(matches, key=lambda item: len(re.sub(r"\s+", "", item)), default="")
+
+
+def _without_time_phrase(value: str) -> str:
+    text = str(value or "").strip()
+    spans = extract_temporal_lexical_spans(text)
+    for span in reversed(spans):
+        text = text[: span.start] + text[span.end :]
+    return re.sub(r"^[\s，,、的]+|[\s，,、的]+$", "", text).strip()
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:

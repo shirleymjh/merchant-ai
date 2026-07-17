@@ -2,11 +2,22 @@
 name: refund-rate-diagnosis
 description: Use when a merchant asks why refund rate, refund amount, after-sales, or return pressure rose. The skill follows a fixed refund diagnosis SOP and must disclose numerator/denominator evidence.
 title: 指标变化诊断
+lifecyclePhase: post_query_analysis
+requiresVerifiedEvidence: true
+outputContract: verified_analysis_v1
 executionMode: structured_renderer
 renderer: verified_evidence
 ---
 
 # Refund Rate Diagnosis Skill
+
+## Runtime Boundary
+
+- Run only after a Grounded Contract has executed and EvidenceVerifier passed.
+- Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
+- Never replace or extend a governed metric formula.
+- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
+  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
 
 This skill turns verified merchant BI evidence into a constrained refund or
 after-sales diagnosis.

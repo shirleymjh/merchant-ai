@@ -9,12 +9,17 @@ import pytest
 from langchain_core.messages import ToolMessage
 
 from merchant_ai.models import (
+    AgentRunResult,
     ClarificationRequest,
     ExtractedKeywords,
     MerchantInfo,
+    QueryBundle,
+    QueryPlan,
+    QuestionIntent,
     RecallBundle,
     RecallItem,
     TopicRoutingDecision,
+    VerifiedEvidence,
 )
 from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentRunContext,
@@ -22,6 +27,7 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentSession,
     GroundedCoreToolBoundaryMiddleware,
     GroundedSemanticBackend,
+    _skill_output_contract_issues,
     _thin_recall,
 )
 from merchant_ai.services.grounded_query_contract import GroundedQueryContract
@@ -29,6 +35,7 @@ from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
 )
+from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
 
 
 class FakeSemanticCatalog:
@@ -219,7 +226,7 @@ def test_runtime_source_has_no_legacy_or_action_catalog_dependencies() -> None:
         assert forbidden not in source
 
 
-def test_initialization_keeps_one_core_native_filesystem_skills_and_isolated_subagent() -> None:
+def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     factory = CapturingFactory()
     runtime(factory)
 
@@ -228,6 +235,7 @@ def test_initialization_keeps_one_core_native_filesystem_skills_and_isolated_sub
         "propose_grounded_contract",
         "execute_grounded_query",
         "compose_verified_answer",
+        "run_skill",
         "ask_human",
     }
     contract_tool = next(
@@ -252,6 +260,8 @@ def test_initialization_keeps_one_core_native_filesystem_skills_and_isolated_sub
         "general-purpose"
     ]
     assert factory.kwargs["subagents"][0]["tools"] == []
+    assert factory.kwargs["subagents"][0]["skills"] is None
+    assert factory.kwargs["skills"] is None
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
 
 
@@ -265,11 +275,22 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
     assert kernel.route_calls == 1
     assert kernel.recall_queries == ["工单量最多的商品"]
     first = json.loads(factory.graph.invocations[0]["messages"][0]["content"])
+    assert first["userInputRequirements"]["explicitTimeExpression"] is False
     assert first["trustedExecutionScope"]["merchantScopeBound"] is True
     assert first["trustedExecutionScope"]["merchantId"] == "m-1"
     assert "automatically binds" in first["trustedExecutionScope"]["tenantFilterPolicy"]
     assert first["topicL0Manifests"][0]["topic"] == "客服工单"
     assert first["thinRecallCandidates"][0]["refId"] == "semantic:客服工单:tickets:detail"
+    assert "availableSkillHeaders" not in first
+    assert first["analysisSkillPolicy"] == {
+        "lifecyclePhase": "post_query_analysis",
+        "requiresGroundedContract": True,
+        "requiresExecutedQuery": True,
+        "requiresVerifiedEvidence": True,
+        "mayInfluenceSemanticBindings": False,
+        "mayExecuteSql": False,
+        "headersDisclosedAfterVerifiedQueryOnly": True,
+    }
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
 
@@ -436,11 +457,25 @@ def test_full_table_asset_is_never_exposed_by_grounded_filesystem_or_thin_recall
                     "semanticKind": "TABLE_DETAIL",
                 },
             ),
+            RecallItem(
+                doc_id="semantic:客服工单:tickets:metric:ticket_cnt",
+                source_type="METRIC",
+                topic="客服工单",
+                table="tickets",
+                metadata={
+                    "semanticRefId": "semantic:客服工单:tickets:metric:ticket_cnt",
+                    "semanticPath": "topics/客服工单/tables/tickets/asset.json#metric:ticket_cnt",
+                    "semanticKind": "METRIC",
+                },
+            ),
         ]
     )
-    assert [item["refId"] for item in _thin_recall(recall, 8)] == [
-        "semantic:客服工单:tickets:detail"
+    thin = _thin_recall(recall, 8)
+    assert [item["refId"] for item in thin] == [
+        "semantic:客服工单:tickets:detail",
+        "semantic:客服工单:tickets:metric:ticket_cnt",
     ]
+    assert thin[1]["path"] == "topics/客服工单/tables/tickets/metrics/ticket_cnt.json"
 
 
 def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() -> None:
@@ -556,3 +591,433 @@ def test_checkpoint_config_factory_is_used_without_rewriting_namespace() -> None
         "threadId": "t-fixed",
         "runId": "r-fixed",
     }
+
+
+def test_run_skill_is_rejected_before_query_execution_and_verification() -> None:
+    factory = CapturingFactory(action="none")
+    outer = GroundedDeepAgentRuntime(
+        FakeKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        checkpointer=object(),
+        skill_root="python_backend/resources/runtime/agent_skills",
+        agent_factory=factory,
+    )
+    kernel_session = outer.kernel.new_session("分析最近30天退款率", "m-1")
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-pre-query-skill",
+        run_id="run-pre-query-skill",
+        session=GroundedDeepAgentSession(runtime=kernel_session),
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["run_skill"].func(
+            skill_name="refund-rate-diagnosis",
+            objective="分析退款率",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "VERIFIED_EVIDENCE_REQUIRED"
+    assert kernel_session.run_result is None
+    assert context.session.skill_runs == []
+
+
+def test_execute_tool_returns_revise_instruction_instead_of_crashing_core() -> None:
+    class CompatibilityBlockedKernel(FakeKernel):
+        @staticmethod
+        def execute_active(session: GroundedRuntimeSession, **kwargs: Any) -> AgentRunResult:
+            raise RuntimeError("grounded metrics have incompatible time selection policies")
+
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory, CompatibilityBlockedKernel())
+    kernel_session = outer.kernel.new_session("最近30天退款率", "m-1")
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-execution-blocked",
+        run_id="run-execution-blocked",
+        session=GroundedDeepAgentSession(runtime=kernel_session),
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["execute_grounded_query"].func(
+            reason="执行退款率查询",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "EXECUTION_REVISE_REQUIRED"
+    assert result["nextAction"] == "REVISE_BINDINGS"
+    assert "Do not retry the same bindings" in result["instruction"]
+
+
+def test_verified_execution_discloses_analysis_skill_headers_only_after_query() -> None:
+    class VerifiedKernel(FakeKernel):
+        @staticmethod
+        def execute_active(session: GroundedRuntimeSession, **kwargs: Any) -> AgentRunResult:
+            result = AgentRunResult(
+                merged_query_bundle=QueryBundle(
+                    rows=[{"refund_rate": 0.2}],
+                    tables=["merchant_profile"],
+                )
+            )
+            session.run_result = result
+            return result
+
+        @staticmethod
+        def verify_active(session: GroundedRuntimeSession) -> VerifiedEvidence:
+            verified = VerifiedEvidence(passed=True)
+            session.verified_evidence = verified
+            return verified
+
+    factory = CapturingFactory(action="none")
+    outer = GroundedDeepAgentRuntime(
+        VerifiedKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        skill_root="python_backend/resources/runtime/agent_skills",
+        agent_factory=factory,
+    )
+    kernel_session = outer.kernel.new_session("最近30天退款率", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-skill-headers",
+        run_id="run-skill-headers",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["execute_grounded_query"].func(
+            reason="执行已激活查询",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "VERIFIED"
+    assert deep_session.analysis_skill_headers_disclosed is True
+    assert any(
+        item["name"] == "refund-rate-diagnosis"
+        for item in result["availableAnalysisSkillHeaders"]
+    )
+    assert all(
+        item["lifecyclePhase"] == "post_query_analysis"
+        for item in result["availableAnalysisSkillHeaders"]
+    )
+
+
+def test_skill_output_contract_rejects_governed_formula_drift() -> None:
+    metric_ref = "semantic:经营画像:profile:metric:refund_rate"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                metric_specs=[
+                    {
+                        "semanticRefId": metric_ref,
+                        "metricFormula": "SUM(return_cnt) / NULLIF(SUM(pay_order_cnt), 0)",
+                    }
+                ]
+            )
+        ]
+    )
+    structured = {
+        "answerMarkdown": "退款率分析。",
+        "observations": [],
+        "semanticDisclosures": [
+            {
+                "metricRef": metric_ref,
+                "formula": "(SUM(return_cnt) + SUM(direct_refund_cnt)) / SUM(pay_order_cnt)",
+            }
+        ],
+        "derivedFacts": [],
+        "hypotheses": [],
+        "recommendations": [],
+        "evidenceRefs": [],
+        "gaps": [],
+        "executionConfidence": 0.5,
+    }
+
+    issues = _skill_output_contract_issues(structured, plan)
+
+    assert any(item["code"] == "GOVERNED_FORMULA_DRIFT" for item in issues)
+
+
+def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifact(
+    tmp_path: Path,
+) -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = GroundedDeepAgentRuntime(
+        kernel,
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        checkpointer=object(),
+        checkpoint_config_factory=lambda thread_id, run_id: {
+            "configurable": {"thread_id": thread_id, "run_id": run_id}
+        },
+        skill_root="python_backend/resources/runtime/agent_skills",
+        skill_run_root=str(tmp_path / "skill-runs"),
+        agent_factory=factory,
+    )
+
+    class FakeIsolatedRuntime:
+        job: Any = None
+
+        def run(self, job: Any, *, on_progress: Any) -> IsolatedSubagentResult:
+            self.job = job
+            on_progress("subagent", "started", job.job_id)
+            on_progress("subagent_step", "running", "read_file")
+            on_progress("subagent", "completed", "updates=1")
+            return IsolatedSubagentResult(
+                job_id=job.job_id,
+                thread_id=job.thread_id,
+                checkpoint={
+                    "threadId": job.thread_id,
+                    "runId": job.job_id,
+                    "checkpointNamespace": "",
+                },
+                raw_output=json.dumps(
+                    {
+                        "answerMarkdown": "基于已验证证据完成风险分析。",
+                        "observations": [],
+                        "semanticDisclosures": [],
+                        "derivedFacts": [],
+                        "hypotheses": [],
+                        "recommendations": [],
+                        "evidenceRefs": [],
+                        "gaps": [],
+                        "executionConfidence": 0.88,
+                    },
+                    ensure_ascii=False,
+                ),
+                update_count=1,
+            )
+
+    isolated = FakeIsolatedRuntime()
+    outer.subagent_runtime = isolated
+    kernel_session = kernel.new_session("分析最近30天经营风险", "m-1")
+    kernel_session.workspace_topics = ["客服工单"]
+    kernel_session.active_contract = GroundedQueryContract(
+        question=kernel_session.question,
+        topics=["客服工单"],
+        status="READY",
+        query_shape="SCALAR",
+    )
+    kernel_session.active_plan = QueryPlan()
+    kernel_session.run_result = AgentRunResult(
+        merged_query_bundle=QueryBundle(rows=[{"risk_value": 1}], tables=["tickets"])
+    )
+    kernel_session.verified_evidence = VerifiedEvidence(passed=True)
+    session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        analysis_skill_headers_disclosed=True,
+    )
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-skill",
+        run_id="run-parent",
+        session=session,
+        listener=lambda event_type, node, payload: events.append(
+            (event_type, node, payload)
+        ),
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["run_skill"].func(
+            skill_name="risk-analysis",
+            objective="基于已验证证据输出风险优先级",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "SKILL_COMPLETED"
+    assert result["executionConfidence"] == 0.88
+    assert Path(result["artifact"]).is_file()
+    assert result["checkpoint"]["threadId"].startswith("thread-skill__skill_")
+    assert isolated.job.skills == []
+    assert isolated.job.user_payload["mountedSkill"] == "/skills/risk-analysis/SKILL.md"
+    assert "generic isolated subagent" in isolated.job.system_prompt
+    assert [item[0] for item in events] == ["skill.progress"] * len(events)
+    assert any(item[2]["stage"] == "subagent_step" for item in events)
+    assert kernel_session.answer == "基于已验证证据完成风险分析。"
+    assert kernel_session.run_result.skill_lifecycle_records[0].matched_by == (
+        "core_llm_skill_header"
+    )
+
+
+def test_skill_repairs_once_inside_isolation_without_query_mutation(
+    tmp_path: Path,
+) -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = GroundedDeepAgentRuntime(
+        kernel,
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        checkpointer=object(),
+        skill_root="python_backend/resources/runtime/agent_skills",
+        skill_run_root=str(tmp_path / "skill-runs"),
+        agent_factory=factory,
+    )
+
+    class RepairingRuntime:
+        jobs: list[Any] = []
+
+        def run(self, job: Any, *, on_progress: Any) -> IsolatedSubagentResult:
+            self.jobs.append(job)
+            on_progress("subagent", "started", job.job_id)
+            if len(self.jobs) == 1:
+                raw = json.dumps(
+                    {"answerMarkdown": "1. 未验证指标为 999。"},
+                    ensure_ascii=False,
+                )
+            else:
+                raw = json.dumps(
+                    {
+                        "answerMarkdown": "当前仅报告已验证查询结果，未补充新的归因结论。",
+                        "observations": [],
+                        "semanticDisclosures": [],
+                        "derivedFacts": [],
+                        "hypotheses": [],
+                        "recommendations": [],
+                        "evidenceRefs": [],
+                        "gaps": ["缺少可验证的归因证据"],
+                        "executionConfidence": 0.6,
+                    },
+                    ensure_ascii=False,
+                )
+            on_progress("subagent", "completed", "updates=1")
+            return IsolatedSubagentResult(
+                job_id=job.job_id,
+                thread_id=job.thread_id,
+                checkpoint={"threadId": job.thread_id, "runId": job.job_id},
+                raw_output=raw,
+                update_count=1,
+            )
+
+    repairing = RepairingRuntime()
+    outer.subagent_runtime = repairing
+    kernel_session = kernel.new_session("分析最近30天经营风险", "m-1")
+    kernel_session.active_contract = GroundedQueryContract(
+        question=kernel_session.question,
+        topics=["客服工单"],
+        status="READY",
+        query_shape="SCALAR",
+    )
+    kernel_session.active_plan = QueryPlan()
+    kernel_session.run_result = AgentRunResult(
+        merged_query_bundle=QueryBundle(rows=[{"risk_value": 1}], tables=["tickets"])
+    )
+    kernel_session.verified_evidence = VerifiedEvidence(passed=True)
+    deep_session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        analysis_skill_headers_disclosed=True,
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-skill-repair",
+        run_id="run-skill-repair",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["run_skill"].func(
+            skill_name="risk-analysis",
+            objective="基于已验证证据分析风险",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "SKILL_COMPLETED"
+    assert result["repairAttempted"] is True
+    assert result["queryMutationAllowed"] is False
+    assert len(repairing.jobs) == 2
+    assert repairing.jobs[1].user_payload["repairAttempt"] == 1
+    blocked = json.loads(
+        tools["retrieve_knowledge"].func(
+            query="再查更多指标",
+            reason="修复 Skill",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert blocked["status"] == "POST_QUERY_SKILL_BOUNDARY_CLOSED"
+
+
+def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
+    tmp_path: Path,
+) -> None:
+    class FallbackKernel(FakeKernel):
+        @staticmethod
+        def compose_answer(session: GroundedRuntimeSession, *, allow_llm: bool) -> str:
+            assert allow_llm is False
+            session.answer = "已返回确定性已验证查询结果。"
+            return session.answer
+
+    factory = CapturingFactory(action="none")
+    kernel = FallbackKernel()
+    outer = GroundedDeepAgentRuntime(
+        kernel,
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        checkpointer=object(),
+        skill_root="python_backend/resources/runtime/agent_skills",
+        skill_run_root=str(tmp_path / "skill-runs"),
+        agent_factory=factory,
+    )
+
+    class AlwaysInvalidRuntime:
+        jobs: list[Any] = []
+
+        def run(self, job: Any, *, on_progress: Any) -> IsolatedSubagentResult:
+            self.jobs.append(job)
+            return IsolatedSubagentResult(
+                job_id=job.job_id,
+                thread_id=job.thread_id,
+                checkpoint={"threadId": job.thread_id, "runId": job.job_id},
+                raw_output=json.dumps(
+                    {"answerMarkdown": "未经验证的结果为 999。"},
+                    ensure_ascii=False,
+                ),
+                update_count=1,
+            )
+
+    invalid = AlwaysInvalidRuntime()
+    outer.subagent_runtime = invalid
+    kernel_session = kernel.new_session("分析最近30天经营风险", "m-1")
+    kernel_session.active_contract = GroundedQueryContract(
+        question=kernel_session.question,
+        topics=["客服工单"],
+        status="READY",
+        query_shape="SCALAR",
+    )
+    kernel_session.active_plan = QueryPlan()
+    kernel_session.run_result = AgentRunResult(
+        merged_query_bundle=QueryBundle(rows=[{"risk_value": 1}], tables=["tickets"])
+    )
+    kernel_session.verified_evidence = VerifiedEvidence(passed=True)
+    deep_session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        analysis_skill_headers_disclosed=True,
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-skill-fallback",
+        run_id="run-skill-fallback",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["run_skill"].func(
+            skill_name="risk-analysis",
+            objective="基于已验证证据分析风险",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "SKILL_FALLBACK_ANSWERED"
+    assert result["answerMarkdown"] == "已返回确定性已验证查询结果。"
+    assert result["queryMutationAllowed"] is False
+    assert len(invalid.jobs) == 2
+    assert kernel_session.answer == result["answerMarkdown"]

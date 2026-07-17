@@ -40,7 +40,7 @@ def build_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
             caveats.append("%s：%s" % (gap.get("code"), gap.get("reason") or gap.get("answerInstruction") or "证据缺口"))
     markdown = render_answer(payload, metrics, findings, caveats)
     return {
-        "skillName": "bi_trend_attribution",
+        "skillName": "bi-trend-attribution",
         "rowCount": len(rows),
         "dateKey": date_key,
         "metricKeys": metric_keys,

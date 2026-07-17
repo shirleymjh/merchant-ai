@@ -2,11 +2,22 @@
 name: merchant-daily-briefing
 description: Use when a merchant asks for a daily/weekly operating briefing, store health summary, or what to prioritize today. The skill summarizes verified business signals into action priorities.
 title: 经营简报
+lifecyclePhase: post_query_analysis
+requiresVerifiedEvidence: true
+outputContract: verified_analysis_v1
 executionMode: structured_renderer
 renderer: verified_evidence
 ---
 
 # Merchant Daily Briefing Skill
+
+## Runtime Boundary
+
+- Run only after a Grounded Contract has executed and EvidenceVerifier passed.
+- Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
+- Never replace or extend a governed metric formula.
+- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
+  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
 
 This skill turns verified merchant BI evidence into a concise operating
 briefing.

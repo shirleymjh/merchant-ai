@@ -2,11 +2,22 @@
 name: bi-trend-attribution
 description: Use when a merchant BI question asks whether a metric trend is normal, why a business metric changed, whether multiple KPI time series move together, or which measured drivers explain risk. The skill must only use verified SQL evidence rows and must attach every conclusion to data.
 title: BI 趋势与归因
+lifecyclePhase: post_query_analysis
+requiresVerifiedEvidence: true
+outputContract: verified_analysis_v1
 executionMode: python_script
 script: scripts/profile_timeseries.py
 ---
 
 # BI Trend And Attribution Skill
+
+## Runtime Boundary
+
+- Run only after a Grounded Contract has executed and EvidenceVerifier passed.
+- Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
+- Never replace or extend a governed metric formula.
+- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
+  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
 
 This skill turns verified BI evidence into a constrained analysis answer. It is
 for trend checks, anomaly checks, attribution, risk explanation, and "what

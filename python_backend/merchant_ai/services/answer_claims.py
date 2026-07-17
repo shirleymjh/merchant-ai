@@ -28,7 +28,16 @@ DATETIME_PATTERN = re.compile(
 DATE_PATTERN = re.compile(r"(?<!\d)\d{4}[-/]\d{1,2}[-/]\d{1,2}(?!\d)")
 ENTITY_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\d[A-Za-z0-9_-]*\b")
 FACTUAL_SENTENCE_PATTERN = re.compile(r"[^。！？!?\n]+[。！？!?]?")
-SYSTEM_FORMULA_EXPLANATION_PATTERN = re.compile(r"^(?:统计说明|计算说明)[:：]", flags=re.I)
+SYSTEM_FORMULA_EXPLANATION_PATTERN = re.compile(
+    r"^(?:统计说明|计算说明|口径|公式)[:：]",
+    flags=re.I,
+)
+ORDERED_LIST_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:\d+|[一二三四五六七八九十]+)[.、)]\s*"
+)
+NEGATED_ASSERTION_PATTERN = re.compile(
+    r"(?:不能确认|无法确认|无法判断|不能判断|没有.{0,24}证据|缺少.{0,24}证据|未能证明|不代表)"
+)
 SQL_FUNCTION_PATTERN = re.compile(
     r"\b(?:sum|count|avg|min|max|coalesce|nullif|round|cast|if)\s*\(",
     flags=re.I,
@@ -47,17 +56,27 @@ class AnswerClaimVerifier:
         plan: QueryPlan,
         run_result: AgentRunResult | None,
         answer: str,
+        support_context: str = "",
     ) -> AnswerClaimVerification:
+        contextual_question = "\n".join(
+            item for item in [str(question or ""), str(support_context or "")] if item
+        )
         facts = build_verified_facts(plan, run_result)
         if run_result is not None:
             run_result.verified_facts = facts
         claims = extract_answer_claims(answer, facts)
         allowed_numbers = supported_numbers(facts)
-        allowed_entities = supported_entities(question, facts)
+        allowed_entities = supported_entities(contextual_question, facts, plan)
         checked: List[AnswerClaim] = []
         unsupported: List[AnswerClaim] = []
         for claim in claims:
-            fact_ids, reasons = support_for_claim(claim, question, facts, allowed_numbers, allowed_entities)
+            fact_ids, reasons = support_for_claim(
+                claim,
+                contextual_question,
+                facts,
+                allowed_numbers,
+                allowed_entities,
+            )
             verified = claim.model_copy(
                 update={
                     "fact_ids": fact_ids,
@@ -213,6 +232,7 @@ def extract_answer_claims(answer: str, facts: List[VerifiedFact] | None = None) 
 def append_prose_claims(text: str, claims: List[AnswerClaim], non_entity_tokens: Set[str] | None = None) -> None:
     for match in FACTUAL_SENTENCE_PATTERN.finditer(text):
         sentence = match.group(0).strip(" -*\t\r\n")
+        sentence = ORDERED_LIST_PREFIX_PATTERN.sub("", sentence).strip()
         if not sentence:
             continue
         numbers = extract_numeric_tokens(sentence)
@@ -231,6 +251,8 @@ def qualitative_trend_assertion(sentence: str, known_metric_labels: Set[str]) ->
     executed facts, so this does not encode any business metric or table name.
     """
 
+    if NEGATED_ASSERTION_PATTERN.search(str(sentence or "")):
+        return False
     if not direction_word(sentence):
         return False
     normalized_sentence = normalize_label_text(sentence)
@@ -431,6 +453,8 @@ def support_for_claim(
 
 def trend_direction_support(claim_text: str, facts: List[VerifiedFact]) -> Tuple[str, List[str]]:
     text = str(claim_text or "")
+    if NEGATED_ASSERTION_PATTERN.search(text):
+        return "", []
     if not re.search(r"(上升|增加|提升|上涨|下降|减少|降低|下滑|持平)", text):
         return "", []
     matched_fact_ids: List[str] = []
@@ -617,7 +641,11 @@ def supported_numbers(facts: List[VerifiedFact]) -> List[DerivedNumber]:
     return dedupe_derived_numbers(derived)
 
 
-def supported_entities(question: str, facts: List[VerifiedFact]) -> Set[str]:
+def supported_entities(
+    question: str,
+    facts: List[VerifiedFact],
+    plan: QueryPlan | None = None,
+) -> Set[str]:
     values = {
         normalize_entity(item)
         for item in ENTITY_PATTERN.findall(str(question or ""))
@@ -626,6 +654,33 @@ def supported_entities(question: str, facts: List[VerifiedFact]) -> Set[str]:
     for fact in facts:
         if fact.value_type == "entity":
             values.add(normalize_entity(fact.value))
+    for intent in list(getattr(plan, "intents", []) or []):
+        for value in [
+            getattr(intent, "preferred_table", ""),
+            getattr(intent, "metric_name", ""),
+            getattr(intent, "metric_column", ""),
+            getattr(intent, "group_by_column", ""),
+        ]:
+            if str(value or "").strip():
+                values.add(normalize_entity(value))
+        resolution = dict(getattr(intent, "metric_resolution", {}) or {})
+        for value in [
+            resolution.get("metricKey"),
+            resolution.get("ownerTable"),
+            *(resolution.get("sourceColumns") or []),
+        ]:
+            if str(value or "").strip():
+                values.add(normalize_entity(value))
+        for spec in getattr(intent, "metric_specs", []) or []:
+            if not isinstance(spec, dict):
+                continue
+            for value in [
+                spec.get("metricName"),
+                spec.get("ownerTable"),
+                *(spec.get("sourceColumns") or []),
+            ]:
+                if str(value or "").strip():
+                    values.add(normalize_entity(value))
     return {item for item in values if item}
 
 
@@ -776,6 +831,7 @@ def contextual_number_patterns() -> List[str]:
         r"(?:最近|近|过去)\s*(\d+(?:\.\d+)?)\s*(?:天|日|周|月|年)",
         r"(?:前|top)\s*(\d+(?:\.\d+)?)\s*(?:个|名|条|项|笔|天)?",
         r"(?:超过|高于|低于|不少于|不超过|阈值)\s*(\d+(?:\.\d+)?%?)",
+        r"(?:merchant_id|merchantId|商家ID)\s*[=:：]\s*(\d+(?:\.\d+)?)",
     ]
 
 

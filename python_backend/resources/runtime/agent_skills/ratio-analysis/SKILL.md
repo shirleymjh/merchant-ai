@@ -2,11 +2,22 @@
 name: ratio-analysis
 description: Use when the answer depends on a derived ratio, percentage, or population subset calculation. The skill must expose numerator, denominator, formula, and coverage gaps.
 title: 派生指标分析
+lifecyclePhase: post_query_analysis
+requiresVerifiedEvidence: true
+outputContract: verified_analysis_v1
 executionMode: structured_renderer
 renderer: verified_evidence
 ---
 
 # Ratio Analysis Skill
+
+## Runtime Boundary
+
+- Run only after a Grounded Contract has executed and EvidenceVerifier passed.
+- Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
+- Never replace or extend a governed metric formula.
+- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
+  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
 
 ## Activation Contract
 

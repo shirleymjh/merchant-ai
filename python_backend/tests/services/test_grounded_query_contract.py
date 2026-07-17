@@ -63,6 +63,8 @@ def metric_read(
     source_columns: list[str],
     unit: str = "单",
     calculation_semantics: dict[str, object] | None = None,
+    selection_policy: str = "period_window",
+    applicable_time_grain: str = "period",
 ) -> dict[str, object]:
     return core_read(
         "semantic:%s:%s:metric:%s" % (topic, table, metric_key),
@@ -80,11 +82,11 @@ def metric_read(
                 "sourceColumns": source_columns,
                 "unit": unit,
                 "metricGrain": "merchant_day_summary",
-                "applicableTimeGrain": "period",
+                "applicableTimeGrain": applicable_time_grain,
                 "aggregationPolicy": "period_rollup",
                 "timeColumn": "pt",
                 "timeSemantics": {
-                    "selectionPolicy": "period_window",
+                    "selectionPolicy": selection_policy,
                     "asOfPolicy": "latest_available_partition",
                     "missingDataPolicy": "disclose_unknown",
                     "zeroValuePolicy": "preserve_observed_zero",
@@ -589,7 +591,7 @@ def test_governed_field_count_distinct_compiles_without_published_metric() -> No
                 {
                     "fieldRef": buyer["refId"],
                     "aggregation": "COUNT_DISTINCT",
-                    "requestedPhrase": "买家数",
+                    "requestedPhrase": "最近30天买家数",
                 }
             ],
             "analysisMode": "metric_total",
@@ -607,6 +609,7 @@ def test_governed_field_count_distinct_compiles_without_published_metric() -> No
     assert metric.metric_key == "count_distinct_buyer_id"
     assert metric.formula == "COUNT(DISTINCT `buyer_id`)"
     assert metric.source_columns == ["buyer_id"]
+    assert metric.requested_phrase == "买家数"
     assert set(contract.evidence_refs) == {str(detail["refId"]), str(buyer["refId"])}
 
     pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
@@ -747,6 +750,8 @@ def test_non_composable_daily_metric_remains_valid_at_native_trend_grain() -> No
             "nativeGrainAnalysisModes": ["TREND", "TIME_SERIES"],
             "forbiddenAggregations": ["SUM"],
         },
+        selection_policy="per_time_grain",
+        applicable_time_grain="day",
     )
     time_dimension = column_read(topic, table, "pt", "日期", ["日期", "时间"], role="TIME")
 
@@ -1065,3 +1070,102 @@ def test_build_from_refs_accepts_exact_field_ref_for_count_distinct() -> None:
     assert contract.evidence_refs == [detail_ref, buyer_ref]
     assert contract.metrics[0].source_field_ref_id == buyer_ref
     assert contract.metrics[0].formula == "COUNT(DISTINCT `buyer_id`)"
+
+
+def test_mixed_metric_time_policies_require_revised_bindings_before_compile() -> None:
+    topic = "经营画像"
+    table = "ads_merchant_profile"
+    detail = table_detail(topic, table)
+    period_metric = metric_read(
+        topic,
+        table,
+        "refund_rate_by_pay_order",
+        "周期退款率",
+        ["退款率"],
+        "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)",
+        ["return_cnt_1d", "pay_order_cnt_1d"],
+        unit="%",
+    )
+    daily_metric = metric_read(
+        topic,
+        table,
+        "refund_rate_1d",
+        "每日退款率",
+        ["每日退款率"],
+        "MAX(refund_rate_1d)",
+        ["refund_rate_1d"],
+        unit="%",
+        selection_policy="per_time_grain",
+        applicable_time_grain="day",
+    )
+    time_dimension = column_read(topic, table, "pt", "业务日期", ["日期"], role="TIME")
+
+    contract = GroundedQueryContractBuilder().build(
+        "最近30天退款率为什么高",
+        [topic],
+        [detail, period_metric, daily_metric, time_dimension],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [period_metric["refId"], daily_metric["refId"]],
+            "dimensionRefs": [time_dimension["refId"]],
+            "groupByRef": time_dimension["refId"],
+            "analysisMode": "trend",
+            "timeExpression": "最近30天",
+        },
+        now=datetime(2026, 7, 17, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.status == "REVISE_BINDINGS"
+    codes = {gap.code for gap in contract.unresolved_gaps}
+    assert "INCOMPATIBLE_METRIC_TIME_POLICIES" in codes
+    assert "METRIC_TIME_GRAIN_MISMATCH" in codes
+    mixed_gap = next(
+        gap
+        for gap in contract.unresolved_gaps
+        if gap.code == "INCOMPATIBLE_METRIC_TIME_POLICIES"
+    )
+    assert mixed_gap.required_capability == {
+        "singleTimeSelectionPolicy": True,
+        "availableTimeSelectionPolicies": ["per_time_grain", "period_window"],
+        "splitExecutionRequired": True,
+    }
+
+
+def test_multi_day_per_time_grain_metric_requires_time_grouping() -> None:
+    topic = "经营画像"
+    table = "ads_merchant_profile"
+    detail = table_detail(topic, table)
+    daily_metric = metric_read(
+        topic,
+        table,
+        "refund_rate_1d",
+        "每日退款率",
+        ["每日退款率"],
+        "MAX(refund_rate_1d)",
+        ["refund_rate_1d"],
+        unit="%",
+        selection_policy="per_time_grain",
+        applicable_time_grain="day",
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "最近30天每日退款率",
+        [topic],
+        [detail, daily_metric],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [daily_metric["refId"]],
+            "analysisMode": "metric_total",
+            "timeExpression": "最近30天",
+        },
+        now=datetime(2026, 7, 17, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.status == "REVISE_BINDINGS"
+    gap = next(
+        gap
+        for gap in contract.unresolved_gaps
+        if gap.code == "METRIC_TIME_GRAIN_MISMATCH"
+    )
+    assert gap.required_capability["timeSelectionPolicy"] == "period_window"
+    assert gap.resolution == "REVISE_BINDINGS"

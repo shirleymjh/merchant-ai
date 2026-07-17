@@ -2,11 +2,22 @@
 name: gmv-drop-diagnosis
 description: Use when a merchant asks why GMV, sales amount, paid orders, or order volume dropped or moved abnormally. The skill is a fixed merchant-operation SOP and must only use verified evidence rows.
 title: 指标下降诊断
+lifecyclePhase: post_query_analysis
+requiresVerifiedEvidence: true
+outputContract: verified_analysis_v1
 executionMode: structured_renderer
 renderer: verified_evidence
 ---
 
 # GMV Drop Diagnosis Skill
+
+## Runtime Boundary
+
+- Run only after a Grounded Contract has executed and EvidenceVerifier passed.
+- Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
+- Never replace or extend a governed metric formula.
+- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
+  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
 
 This skill turns verified merchant BI evidence into a constrained diagnosis for
 GMV, sales amount, paid orders, or order volume decline.

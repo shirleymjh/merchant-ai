@@ -2,11 +2,22 @@
 name: rule-compliance
 description: Use when a merchant BI answer combines platform rules or policy guidance with measured evidence. The skill must keep recalled rule evidence separate from SQL facts.
 title: 规则与数据核对
+lifecyclePhase: post_query_analysis
+requiresVerifiedEvidence: true
+outputContract: verified_analysis_v1
 executionMode: structured_renderer
 renderer: verified_evidence
 ---
 
 # Rule Compliance Skill
+
+## Runtime Boundary
+
+- Run only after a Grounded Contract has executed and EvidenceVerifier passed.
+- Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
+- Never replace or extend a governed metric formula.
+- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
+  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
 
 ## Activation Contract
 

@@ -116,6 +116,7 @@ class GroundedApplicationRuntime:
                 user_scope=user_scope,
                 thread_id=actual_thread_id,
                 run_id=actual_run_id,
+                listener=listener,
             )
         except Exception as exc:
             _emit(
@@ -276,13 +277,27 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         verifier=EvidenceVerifier(),
         answer_composer=answer_service,
     )
+    deep_agent_timeout_seconds = _deep_agent_timeout_seconds(settings)
     core = GroundedDeepAgentRuntime(
         kernel,
-        lead_model=LlmClient(settings),
+        lead_model=LlmClient(settings).chat_model(
+            timeout_seconds=deep_agent_timeout_seconds
+        ),
+        isolated_subagent_model=LlmClient(
+            settings,
+            model_name=str(
+                settings.llm_balanced_model
+                or settings.llm_fast_model
+                or settings.openai_model
+            ),
+        ).chat_model(
+            timeout_seconds=deep_agent_timeout_seconds
+        ),
         semantic_catalog=semantic_catalog,
         checkpointer=checkpoint_manager.saver(),
         checkpoint_config_factory=checkpoint_manager.config_for_deep_agent,
         skill_root=str(settings.resources_root / "runtime" / "agent_skills"),
+        skill_run_root=str(settings.resolved_workspace_path / "skill_runs"),
     )
     return GroundedApplicationRuntime(
         settings=settings,
@@ -307,6 +322,23 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
             ),
         ),
         checkpoint_manager=checkpoint_manager,
+    )
+
+
+def _deep_agent_timeout_seconds(settings: Settings) -> int:
+    """Return one timeout budget for both Core and isolated LLM turns.
+
+    DeepAgent model turns include filesystem and Skill middleware context and
+    therefore must not inherit the short single-shot service timeout. Keeping
+    Core and isolated subagents on the same budget also prevents the parent
+    from timing out before an isolated Skill can start.
+    """
+
+    return max(
+        60,
+        int(settings.llm_request_timeout_seconds or 0),
+        int(settings.llm_lead_timeout_seconds or 0),
+        int(settings.llm_analysis_timeout_seconds or 0),
     )
 
 

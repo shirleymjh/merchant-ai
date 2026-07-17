@@ -828,3 +828,67 @@ def test_golden_answer_score_honors_runtime_claim_verification():
     assert recovered["passed"] is True
     assert recovered["details"]["claimFallbackUsed"] is True
     assert recovered["details"]["rejectedClaimCount"] == 1
+
+
+def test_skill_style_claims_accept_scope_formula_list_number_and_negated_gap():
+    question = "最近30天退款率为什么高？"
+    metric_ref = "semantic:经营画像:ads_merchant_profile:metric:refund_rate_by_pay_order"
+    formula = "SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.METRIC,
+                plan_task_id="refund_rate",
+                preferred_table="ads_merchant_profile",
+                metric_name="refund_rate_by_pay_order",
+                metric_column="refund_rate_by_pay_order",
+                metric_specs=[
+                    {
+                        "metricName": "refund_rate_by_pay_order",
+                        "displayName": "退款率",
+                        "metricFormula": formula,
+                        "sourceColumns": ["return_cnt_1d", "pay_order_cnt_1d"],
+                        "semanticRefId": metric_ref,
+                        "ownerTable": "ads_merchant_profile",
+                    }
+                ],
+                metric_resolution={
+                    "metricKey": "refund_rate_by_pay_order",
+                    "displayName": "退款率",
+                    "sourceColumns": ["return_cnt_1d", "pay_order_cnt_1d"],
+                },
+            )
+        ]
+    )
+    bundle = QueryBundle(
+        tables=["ads_merchant_profile"],
+        rows=[{"refund_rate_by_pay_order": 0.2295081967213115}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="refund_rate", success=True, query_bundle=bundle)
+        ],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+    answer = """基于最近30天（2026-06-18 至 2026-07-17）merchant_id=100 的已验证结果：
+1. 退款率为 22.95%。
+口径：`SUM(return_cnt_1d) / NULLIF(SUM(pay_order_cnt_1d), 0)`。
+不能确认退款率是否上升，因为缺少上一周期基准证据。"""
+
+    verification = AnswerClaimVerifier().verify(
+        question,
+        plan,
+        run,
+        answer,
+        support_context=(
+            "最近30天 2026-06-18 至 2026-07-17 merchant_id=100"
+        ),
+    )
+
+    assert verification.passed is True, [
+        claim.model_dump(by_alias=True) for claim in verification.unsupported_claims
+    ]

@@ -121,3 +121,27 @@ def test_facade_exposes_neutral_services_without_legacy_execution_fields() -> No
     assert hasattr(outer, "services")
     for forbidden in ("planner", "node_worker", "asset_builder", "graph", "checkpoint_manager"):
         assert not hasattr(outer, forbidden)
+
+
+def test_deep_agent_timeout_has_shared_sixty_second_floor() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "llm_request_timeout_seconds": 12,
+            "llm_lead_timeout_seconds": 20,
+            "llm_analysis_timeout_seconds": 30,
+        }
+    )
+
+    assert runtime_factory._deep_agent_timeout_seconds(settings) == 60
+
+
+def test_deep_agent_timeout_honors_larger_configured_budget() -> None:
+    settings = get_settings().model_copy(
+        update={
+            "llm_request_timeout_seconds": 12,
+            "llm_lead_timeout_seconds": 75,
+            "llm_analysis_timeout_seconds": 30,
+        }
+    )
+
+    assert runtime_factory._deep_agent_timeout_seconds(settings) == 75
