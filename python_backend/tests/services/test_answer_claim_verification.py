@@ -39,6 +39,27 @@ class ClaimAnswerLlm:
         return self.answer
 
 
+def test_mandatory_skeleton_does_not_duplicate_a_ranking_already_contained_in_it():
+    service = object.__new__(AnswerComposeService)
+    ranking = """当前查询范围内，按工单量排序如下：
+
+| 商品 | 工单量 |
+| --- | --- |
+| spu_1 | 3 |"""
+    skeleton = ranking + "\n\n说明：\n- 数据截至 2026-07-11。"
+
+    answer = service._ensure_mandatory_answer_skeleton(
+        ranking,
+        skeleton,
+        "最近30天工单量最多的商品",
+        QueryPlan(),
+        None,
+    )
+
+    assert answer == skeleton
+    assert answer.count("当前查询范围内") == 1
+
+
 def detail_plan():
     return QueryPlan(
         intents=[

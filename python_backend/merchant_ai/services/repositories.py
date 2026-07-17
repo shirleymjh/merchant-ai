@@ -468,6 +468,31 @@ class MerchantService:
                 "timestamp": datetime.now().isoformat(),
             }
             return MerchantInfo(merchant_id=target, merchant_name="yshopping商家%s" % target)
+        live_schema_provider = getattr(self.doris_repository, "show_full_columns", None)
+        if callable(live_schema_provider):
+            try:
+                live_rows = live_schema_provider(table)
+                live_columns = {
+                    str(row.get("Field") or row.get("columnName") or row.get("name") or "")
+                    for row in live_rows or []
+                    if isinstance(row, dict)
+                }
+            except Exception:
+                live_columns = set()
+            if live_columns:
+                if lookup_column not in live_columns:
+                    self.last_degraded_reason = {
+                        "component": "merchant_service",
+                        "operation": "current_merchant",
+                        "errorType": "PROFILE_LOOKUP_COLUMN_DRIFT",
+                        "message": "principal profile lookup column is absent from the live schema",
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    return MerchantInfo(merchant_id=target, merchant_name="yshopping商家%s" % target)
+                id_column = id_column if id_column in live_columns else lookup_column
+                display_columns = [column for column in display_columns if column in live_columns]
+                context_columns = [column for column in context_columns if column in live_columns]
+                as_of_column = as_of_column if as_of_column in live_columns else ""
         try:
             selected_columns: List[str] = []
             for column in [id_column, *display_columns, *context_columns]:

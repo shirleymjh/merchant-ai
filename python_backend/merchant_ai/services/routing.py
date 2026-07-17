@@ -1814,6 +1814,7 @@ class TopicRouterService:
         context_topics: Optional[List[QuestionCategory]] = None,
         context_locked: bool = False,
     ) -> TopicRoutingDecision:
+        selection_evidence = self.selection_evidence(question, keywords)
         inherited_topics = dedupe_topics(list(context_topics or []))
         if not inherited_topics and context_topic:
             for item in re.split(r"[、,，|/]", context_topic):
@@ -1847,6 +1848,8 @@ class TopicRouterService:
                 candidate_topics=inherited_topics,
                 confidence=0.82 if context_locked else 0.62,
                 routing_mode="explicit_topic_scope" if context_locked else "inferred_continuation",
+                selection_mode="automatic",
+                selection_evidence=selection_evidence,
                 reason=(
                     "继承用户明确锁定的 Topic 边界；问题中的其他 Topic 信号不会静默扩域：%s"
                     % ",".join(str(item.value) for item in outside_topics)
@@ -1863,10 +1866,35 @@ class TopicRouterService:
                 primary_topic=QuestionCategory.UNKNOWN,
                 clarification_required=False,
                 routing_mode="open_discovery",
+                selection_mode="automatic_discovery",
+                selection_evidence=selection_evidence,
                 reason="未解析出资产 Topic；保留开放范围进入全局语义召回，不猜测业务分类",
             )
         top_score = max(scores.get(category, 0) for category in candidates)
         confidence = min(0.95, 0.45 + 0.08 * len(candidates) + 0.08 * top_score)
+        if len(candidates) > 1:
+            first = candidates[0]
+            second_score = float(scores.get(candidates[1], 0.0) or 0.0)
+            first_score = float(scores.get(first, 0.0) or 0.0)
+            if first_score >= 2.5 and (
+                first_score - second_score >= 2.0
+                or first_score >= max(1.0, second_score) * 1.8
+            ):
+                return TopicRoutingDecision(
+                    primary_topic=first,
+                    candidate_topics=[first],
+                    dimension_topics=[],
+                    confidence=confidence,
+                    clarification_required=False,
+                    routing_mode="seed_topic",
+                    selection_mode="automatic",
+                    selection_evidence=selection_evidence,
+                    reason=(
+                        self._selection_reason(selection_evidence)
+                        or "最高分 Topic 明显领先，先作为 Seed Topic；其余弱信号只保留在 Topic Index，"
+                        "不在初始召回阶段自动扩成多 Topic workspace"
+                    ),
+                )
         primary_topic = route_primary_topic(candidates)
         return TopicRoutingDecision(
             primary_topic=primary_topic,
@@ -1874,16 +1902,145 @@ class TopicRouterService:
             dimension_topics=[] if primary_topic == QuestionCategory.UNKNOWN else candidates[1:],
             confidence=confidence,
             clarification_required=False,
+            selection_mode="automatic",
+            selection_evidence=selection_evidence,
             reason=(
-                "按显式业务词选择候选 topic；多 topic 时 primaryTopic 保持 UNKNOWN，"
+                self._selection_reason(selection_evidence)
+                or "按显式业务词选择候选 topic；多 topic 时 primaryTopic 保持 UNKNOWN，"
                 "不表示 anchor，避免把召回范围误当主 anchor"
                 if primary_topic == QuestionCategory.UNKNOWN
-                else "按显式业务词选择 topic；primaryTopic 仅兼容字段，不表示 anchor"
+                else self._selection_reason(selection_evidence)
+                or "按显式业务词选择 topic；primaryTopic 仅兼容字段，不表示 anchor"
             ),
         )
 
     def _explicit_topics(self, scores: Dict[QuestionCategory, float]) -> List[QuestionCategory]:
         return [category for category in topic_domain_order(scores) if scores.get(category, 0) > 0]
+
+    def selection_evidence(
+        self,
+        question: str,
+        keywords: Optional[ExtractedKeywords],
+    ) -> Dict[str, Any]:
+        """Build an auditable Topic decision without exposing model chain-of-thought.
+
+        ``servingTopics`` describe where a governed metric can be queried now;
+        ``businessTopics`` describe the metric's declared detail/business owner.
+        Keeping the two separate prevents a profile serving table from silently
+        redefining the user's business intent.
+        """
+
+        normalized = normalize_keyword_text(question or "")
+        detail_requested = bool(
+            (keywords and (keywords.dimension_keywords or keywords.ranking_keywords))
+            or re.search(r"(?:为什么|为何|原因|归因|明细|逐笔|按.+(?:分组|拆分|排行|排名))", normalized)
+        )
+        shape = "detail_or_breakdown" if detail_requested else "summary_or_total"
+        metric_evidence: List[Dict[str, Any]] = []
+        serving_topics: List[str] = []
+        business_topics: List[str] = []
+        serving_tables: List[str] = []
+        seen: Set[tuple[str, str, str]] = set()
+
+        for mention in list(getattr(keywords, "mentions", None) or []):
+            if mention.kind != "metric" or not mention.canonical_key or not mention.owner_table:
+                continue
+            topic_names = self.topic_assets.topic_names_for_categories([mention.topic])
+            serving_topic = str((topic_names or [keyword_topic_value(mention.topic)])[0] or "")
+            identity = (serving_topic, str(mention.owner_table), str(mention.canonical_key))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            metric = {}
+            try:
+                metric = next(
+                    (
+                        item
+                        for item in self.topic_assets.load_table_metrics(serving_topic, mention.owner_table)
+                        if str(item.get("canonicalMetricKey") or item.get("metricKey") or "")
+                        == str(mention.canonical_key)
+                    ),
+                    {},
+                )
+            except Exception:
+                metric = {}
+            detail_ref = str(
+                metric.get("detailMetricRef")
+                or metric.get("drilldownMetricRef")
+                or ""
+            ).strip()
+            detail_identity = semantic_metric_reference_identity(detail_ref)
+            declared_business_topics: List[str] = []
+            for value in [metric.get("ownerTopic"), detail_identity[0] if detail_identity else ""]:
+                topic = str(value or "").strip()
+                if topic and topic not in declared_business_topics:
+                    declared_business_topics.append(topic)
+                if topic and topic not in business_topics:
+                    business_topics.append(topic)
+            if not declared_business_topics and serving_topic:
+                declared_business_topics.append(serving_topic)
+                if serving_topic not in business_topics:
+                    business_topics.append(serving_topic)
+            if serving_topic and serving_topic not in serving_topics:
+                serving_topics.append(serving_topic)
+            if mention.owner_table not in serving_tables:
+                serving_tables.append(mention.owner_table)
+            metric_evidence.append(
+                {
+                    "phrase": mention.phrase,
+                    "metricKey": mention.canonical_key,
+                    "servingTopic": serving_topic,
+                    "servingTable": mention.owner_table,
+                    "businessTopics": declared_business_topics,
+                    "detailMetricRef": detail_ref,
+                    "metricIntent": str(metric.get("metricIntent") or ""),
+                    "metricGrain": str(metric.get("metricGrain") or ""),
+                    "applicableTimeGrain": str(metric.get("applicableTimeGrain") or ""),
+                    "aggregationPolicy": str(metric.get("aggregationPolicy") or ""),
+                }
+            )
+
+        same_table_summary = bool(
+            shape == "summary_or_total"
+            and metric_evidence
+            and len(serving_topics) == 1
+            and len(serving_tables) == 1
+        )
+        return {
+            "selectionMode": "automatic",
+            "queryShape": shape,
+            "servingTopics": serving_topics,
+            "businessTopics": business_topics,
+            "servingTables": serving_tables,
+            "sameTableSummaryCandidate": same_table_summary,
+            "matchedMetrics": metric_evidence[:12],
+            "policy": (
+                "summary queries may seed a governed aggregate workspace; "
+                "breakdown/ranking/detail queries prefer declared detail lineage"
+            ),
+        }
+
+    @staticmethod
+    def _selection_reason(evidence: Dict[str, Any]) -> str:
+        metrics = list(evidence.get("matchedMetrics") or [])
+        if not metrics:
+            return ""
+        business_topics = [str(item) for item in evidence.get("businessTopics") or [] if str(item)]
+        serving_topics = [str(item) for item in evidence.get("servingTopics") or [] if str(item)]
+        tables = [str(item) for item in evidence.get("servingTables") or [] if str(item)]
+        if evidence.get("sameTableSummaryCandidate") and serving_topics and tables:
+            return (
+                "自动 Topic 选择：问题是无明细维度的汇总查询，匹配指标可由同一张已治理汇总表 "
+                f"{tables[0]} 提供，因此以 {serving_topics[0]} 作为取数 Seed；"
+                f"指标业务归属仍保留为 {('、'.join(business_topics) or serving_topics[0])}，"
+                "如后续要求排行、拆分或明细则沿 detailMetricRef 切换工作区"
+            )
+        if evidence.get("queryShape") == "detail_or_breakdown" and business_topics:
+            return (
+                "自动 Topic 选择：问题包含明细、维度或排行要求，优先按指标声明的 detailMetricRef "
+                f"进入业务工作区 {('、'.join(business_topics))}，而不是停留在汇总画像表"
+            )
+        return "自动 Topic 选择：根据已发布指标、表能力、查询粒度和明细 lineage 选择候选工作区"
 
 
 def route_primary_topic(candidates: List[QuestionCategory]) -> QuestionCategory:

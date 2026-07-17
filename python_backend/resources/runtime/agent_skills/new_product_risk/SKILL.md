@@ -1,5 +1,5 @@
 ---
-name: new_product_risk
+name: new-product-risk
 description: Use when verified evidence combines product publish or audit lifecycle with order, refund, compensation, or ticket evidence to judge risk for recently published or newly active products.
 title: 风险分析
 executionMode: structured_renderer
@@ -10,9 +10,9 @@ renderer: verified_evidence
 
 ## Activation Contract
 
-Use this skill when the QueryGraph includes goods/product lifecycle evidence
-and at least one after-sales or performance metric, and structured
-understanding asks for risk, diagnosis, prioritization, or explanation.
+Use this skill when the Grounded Contract and verified evidence include
+goods/product lifecycle evidence and at least one after-sales or performance
+metric, and the user asks for risk, diagnosis, prioritization, or explanation.
 
 ## Evidence Rules
 
@@ -23,7 +23,7 @@ understanding asks for risk, diagnosis, prioritization, or explanation.
   product risk.
 - Every high-risk label must cite order/refund/compensation/ticket evidence.
 
-## Workflow
+## Procedure
 
 1. Identify products with lifecycle evidence.
 2. Compare performance and after-sales indicators.

@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from merchant_ai.config import Settings, get_settings
-from merchant_ai.graph.workflow import create_workflow
+from merchant_ai.services.runtime_factory import create_runtime
 from merchant_ai.models import (
     ChatRequest,
     FeedbackRequest,
@@ -59,7 +59,7 @@ from merchant_ai.services.skill_drafts import SkillDraftService
 from merchant_ai.services.skill_evaluation import SkillEvaluationService
 
 settings: Settings
-workflow: Any
+runtime: Any
 run_manager: AgentRunManager
 stream_service: AgentRunStreamService
 async_run_service: AgentAsyncRunService
@@ -81,7 +81,7 @@ attachment_store: AttachmentStore
 
 def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     global settings
-    global workflow
+    global runtime
     global run_manager
     global stream_service
     global async_run_service
@@ -101,33 +101,34 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     global attachment_store
 
     settings = runtime_settings or get_settings()
-    workflow = create_workflow(settings)
+    runtime = create_runtime(settings)
     run_manager = AgentRunManager(settings)
-    stream_service = AgentRunStreamService(run_manager, workflow.run, settings.merchant_id)
+    stream_service = AgentRunStreamService(run_manager, runtime.run, settings.merchant_id)
     async_run_service = AgentAsyncRunService(
         run_manager,
-        workflow.run,
+        runtime.run,
         settings.merchant_id,
         max_workers=settings.max_concurrent_sub_agents,
     )
-    topic_assets = workflow.recall_service.topic_assets
-    doris_repository = workflow.node_worker.doris_repository
+    services = runtime.services
+    topic_assets = services.topic_assets
+    doris_repository = services.doris_repository
     daily_report_service = DailyReportService(doris_repository, settings.merchant_id, topic_assets)
-    feedback_service = FeedbackService(workflow.answer_repository, workflow.pending_store, workflow.memory_store)
-    memory_management_service = MemoryManagementService(settings, workflow.memory_store)
+    feedback_service = FeedbackService(
+        services.answer_repository,
+        services.pending_store,
+        services.memory_store,
+    )
+    memory_management_service = MemoryManagementService(settings, services.memory_store)
     skill_draft_service = SkillDraftService(settings)
-    skill_evaluation_service = SkillEvaluationService(settings, workflow.answer_service)
+    skill_evaluation_service = SkillEvaluationService(settings, services.answer_service)
     golden_evaluation_service = GoldenEvaluationService(settings)
     topic_builder_workflow = TopicBuilderWorkflow(settings, doris_repository, topic_assets)
     semantic_governance = SemanticAssetGovernanceService(settings, doris_repository, topic_assets)
     recall_index_manager = RecallIndexManager(
         settings,
-        workflow.recall_service,
-        cache_clearers=[
-            workflow.asset_builder.clear_cache,
-            workflow.node_worker.doris_repository.clear_cache,
-            workflow.keyword_service.reload_semantic_lexicon,
-        ],
+        services.recall_service,
+        cache_clearers=list(services.recall_cache_clearers),
     )
     semantic_publish_coordinator = SemanticPublishCoordinator(
         settings,
@@ -137,7 +138,7 @@ def _init_services(runtime_settings: Optional[Settings] = None) -> None:
     )
     memory_governance_service = MemoryGovernanceService(
         settings,
-        workflow.memory_store,
+        services.memory_store,
         topic_assets,
         semantic_governance,
         doris_repository,
@@ -277,7 +278,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
         run_manager.append_event(run.run_id, thread.thread_id, event_type, node, payload)
 
     try:
-        response = await workflow.run_async(
+        response = await runtime.run_async(
             request.message,
             merchant_id,
             request.context,
@@ -401,45 +402,14 @@ def runs_dashboard(
 
 
 def _runtime_trace() -> Dict[str, Any]:
-    traces: Dict[str, Any] = {}
-    for name, owner in [("planner", workflow.planner), ("node", workflow.node_worker)]:
-        service = getattr(owner, "tool_runtime_service", None)
-        if service is not None:
-            traces[name] = service.trace()
-    metrics = []
-    alerts = []
-    events = []
-    rate_limits: Dict[str, Any] = {}
-    load_balancer: Dict[str, Any] = {}
-    for name, trace in traces.items():
-        for item in trace.get("metrics", {}).get("tools", []):
-            next_item = dict(item)
-            next_item["runtime"] = name
-            metrics.append(next_item)
-        alerts.extend(trace.get("alerts", []))
-        for event in trace.get("events", []):
-            next_event = dict(event)
-            next_event["runtime"] = name
-            events.append(next_event)
-        rate_limits[name] = trace.get("rateLimits", {})
-        load_balancer[name] = trace.get("loadBalancer", {})
+    trace = runtime.runtime_trace()
     return {
-        "metrics": {"tools": metrics},
-        "alerts": alerts,
-        "events": events[-200:],
-        "rateLimits": rate_limits,
-        "loadBalancer": load_balancer,
-        "degraded": {
-            "answerRepository": workflow.answer_repository.trace()
-            if hasattr(workflow.answer_repository, "trace")
-            else {},
-            "merchantService": workflow.merchant_service.trace()
-            if hasattr(workflow.merchant_service, "trace")
-            else {},
-            "doris": workflow.node_worker.doris_repository.cache_trace()
-            if hasattr(workflow.node_worker.doris_repository, "cache_trace")
-            else {},
-        },
+        "metrics": trace.get("metrics") or {"tools": []},
+        "alerts": trace.get("alerts") or [],
+        "events": trace.get("events") or [],
+        "rateLimits": trace.get("rateLimits") or {},
+        "loadBalancer": trace.get("loadBalancer") or {},
+        "degraded": trace.get("degraded") or {},
         "config": settings.grouped_summary(),
     }
 
@@ -529,7 +499,7 @@ def get_run_checkpoint(
 ) -> Dict[str, Any]:
     run = require_thread_run_access(thread_id, run_id)
     try:
-        checkpoint = workflow.checkpoint_state_summary(thread_id, run_id)
+        checkpoint = runtime.checkpoint_state_summary(thread_id, run_id)
     except Exception as exc:
         checkpoint = {"checkpointRef": run.checkpoint_ref, "error": str(exc)[:500], "hasValues": False}
     return {"success": True, "runId": run_id, "threadId": thread_id, "checkpoint": jsonable_encoder(checkpoint, by_alias=True)}
@@ -784,20 +754,20 @@ def install_market_skill(skill_name: str, payload: Dict[str, Any], _auth: None =
 @router.post("/api/ops/golden-evaluations")
 def evaluate_golden_cases(request: GoldenEvaluationRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     if bool(request.partition_date_anchor_enabled) == bool(settings.agent_partition_date_anchor_enabled):
-        return golden_evaluation_service.evaluate(request, workflow.run, query_executor=doris_repository.query)
+        return golden_evaluation_service.evaluate(request, runtime.run, query_executor=doris_repository.query)
     evaluation_settings = settings.model_copy(
         update={"agent_partition_date_anchor_enabled": bool(request.partition_date_anchor_enabled)}
     )
-    evaluation_workflow = create_workflow(evaluation_settings)
+    evaluation_runtime = create_runtime(evaluation_settings)
     evaluation_service = GoldenEvaluationService(evaluation_settings)
     try:
         return evaluation_service.evaluate(
             request,
-            evaluation_workflow.run,
-            query_executor=evaluation_workflow.node_worker.doris_repository.query,
+            evaluation_runtime.run,
+            query_executor=evaluation_runtime.services.doris_repository.query,
         )
     finally:
-        evaluation_workflow.checkpoint_manager.close()
+        evaluation_runtime.close()
 
 
 @router.get("/api/daily-report")
@@ -810,7 +780,10 @@ def get_merchant_profile(merchant_id: str, include_expired: bool = Query(default
     effective_merchant_id = require_merchant_access(merchant_id)
     return {
         "success": True,
-        "profile": workflow.merchant_profile_store.get_profile(effective_merchant_id, include_expired=include_expired),
+        "profile": runtime.services.merchant_profile_store.get_profile(
+            effective_merchant_id,
+            include_expired=include_expired,
+        ),
     }
 
 
@@ -822,7 +795,12 @@ def update_merchant_profile(
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
     effective_merchant_id = require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
-    profile = workflow.merchant_profile_store.upsert_profile(effective_merchant_id, patch, reviewer=reviewer, review_status="reviewed")
+    profile = runtime.services.merchant_profile_store.upsert_profile(
+        effective_merchant_id,
+        patch,
+        reviewer=reviewer,
+        review_status="reviewed",
+    )
     return {"success": True, "profile": profile}
 
 
@@ -835,13 +813,18 @@ def review_merchant_profile(
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
     effective_merchant_id = require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
-    profile = workflow.merchant_profile_store.review_profile(effective_merchant_id, approved=approved, reviewer=reviewer, note=note)
+    profile = runtime.services.merchant_profile_store.review_profile(
+        effective_merchant_id,
+        approved=approved,
+        reviewer=reviewer,
+        note=note,
+    )
     return {"success": True, "profile": profile}
 
 
 @router.get("/api/ops/access-control/policy")
 def get_access_control_policy(_auth: None = OpsAuth) -> Dict[str, Any]:
-    service = workflow.node_worker.access_control
+    service = runtime.services.access_control
     return {
         "success": True,
         "path": str(service.policy_path),
@@ -851,7 +834,7 @@ def get_access_control_policy(_auth: None = OpsAuth) -> Dict[str, Any]:
 
 @router.put("/api/ops/access-control/policy")
 def update_access_control_policy(policy: Dict[str, Any], _auth: None = OpsAuth) -> Dict[str, Any]:
-    service = workflow.node_worker.access_control
+    service = runtime.services.access_control
     service.policy_path.parent.mkdir(parents=True, exist_ok=True)
     service.policy_path.write_text(json.dumps(policy or {}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return {"success": True, "path": str(service.policy_path), "policy": service._load_policy()}
@@ -859,7 +842,7 @@ def update_access_control_policy(policy: Dict[str, Any], _auth: None = OpsAuth) 
 
 @router.get("/api/ops/access-control/audit")
 def get_access_control_audit(limit: int = Query(default=50, ge=1, le=500), _auth: None = OpsAuth) -> Dict[str, Any]:
-    service = workflow.node_worker.access_control
+    service = runtime.services.access_control
     return {"success": True, **service.audit_summary(limit=limit)}
 
 

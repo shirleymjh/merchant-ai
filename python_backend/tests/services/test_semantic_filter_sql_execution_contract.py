@@ -16,7 +16,7 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.evidence import semantic_filter_evidence_gaps
 from merchant_ai.services.query import (
-    NodePlanCritic,
+    NodeExecutionContractValidator,
     NodeWorkerExecutor,
     build_semantic_filter_verification_proof,
     compile_semantic_filter_sql,
@@ -250,7 +250,7 @@ def test_or_across_where_and_having_fails_closed_without_rewriting_logic():
     )
 
     compiled = compile_semantic_filter_sql(contract)
-    critique = NodePlanCritic().review(contract)
+    critique = NodeExecutionContractValidator().review(contract)
 
     assert compiled.code == "SEMANTIC_FILTER_MIXED_BOOLEAN_SCOPE_UNSUPPORTED"
     assert critique.valid is False
@@ -262,7 +262,7 @@ def test_obligation_drift_is_rejected_before_sql_execution():
     contract = contract_for([node], "status")
     contract.semantic_filter_obligations[0].resolved_values = ["refunded"]
 
-    critique = NodePlanCritic().review(contract)
+    critique = NodeExecutionContractValidator().review(contract)
 
     assert critique.valid is False
     assert any(item["code"] == "SEMANTIC_FILTER_CONTRACT_MISMATCH" for item in critique.issues)

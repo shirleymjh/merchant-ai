@@ -28,7 +28,7 @@ def contract_gaps_from_task_results(task_results: List[AgentTaskResult]) -> List
                 reason=critique.message,
                 severity="error",
                 disclosure_required=True,
-                source="node_contract_critic",
+                source="execution_contract_validator",
                 answer_instruction="当前 node plan contract 与执行要求不一致，应先修 QueryGraph，不要把它解释成无数据。",
             )
         )

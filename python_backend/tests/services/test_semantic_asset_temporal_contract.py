@@ -1,7 +1,11 @@
 import json
 
 from merchant_ai.config import get_settings
-from merchant_ai.services.assets import TopicAssetService, validate_semantic_asset
+from merchant_ai.services.assets import (
+    TopicAssetService,
+    semantic_asset_builder_tool,
+    validate_semantic_asset,
+)
 
 
 def validation_codes(asset: dict) -> set[str]:
@@ -88,6 +92,89 @@ def test_ratio_metric_requires_an_explicit_rollup_contract() -> None:
     }
 
     assert "RATIO_AGGREGATION_POLICY_UNDECLARED" in validation_codes(asset)
+
+
+def test_semantic_builder_protocol_requires_metric_calculation_semantics() -> None:
+    schema = semantic_asset_builder_tool().openai_schema()["function"]["parameters"]
+    metric_schema = schema["properties"]["metrics"]["items"]
+    column_schema = schema["properties"]["semanticColumns"]["items"]
+
+    assert "calculationSemantics" in metric_schema["required"]
+    assert "calculationSemantics" in metric_schema["properties"]
+    assert "calculationSemantics" in column_schema["properties"]
+
+
+def test_non_composable_semantics_requires_native_window_and_alternative() -> None:
+    asset = {
+        "tableName": "daily_profile",
+        "timeColumn": "event_day",
+        "schemaColumns": [
+            {"columnName": "daily_unique"},
+            {"columnName": "event_day"},
+        ],
+        "metrics": [
+            {
+                "metricKey": "daily_unique",
+                "formula": "SUM(daily_unique)",
+                "sourceColumns": ["daily_unique"],
+                "aggregationPolicy": "period_rollup",
+                "metricGrain": "tenant_day",
+                "applicableTimeGrain": "period",
+                "timeSemantics": {
+                    "selectionPolicy": "period_window",
+                    "asOfPolicy": "latest_available_partition",
+                    "missingDataPolicy": "disclose_unknown",
+                    "zeroValuePolicy": "preserve_observed_zero",
+                },
+                "calculationSemantics": {
+                    "timeRollupPolicy": "NOT_COMPOSABLE",
+                },
+            }
+        ],
+    }
+
+    result = validate_semantic_asset(asset, [])
+    errors = {str(item.get("code") or "") for item in result["errors"]}
+    warnings = {str(item.get("code") or "") for item in result["warnings"]}
+
+    assert "NON_COMPOSABLE_NATIVE_WINDOW_REQUIRED" in errors
+    assert "NON_COMPOSABLE_ALTERNATIVE_UNDECLARED" in warnings
+
+
+def test_weighted_average_semantics_requires_governed_components_and_weight() -> None:
+    asset = {
+        "tableName": "daily_profile",
+        "timeColumn": "event_day",
+        "schemaColumns": [
+            {"columnName": "value_sum"},
+            {"columnName": "event_day"},
+        ],
+        "metrics": [
+            {
+                "metricKey": "weighted_value",
+                "formula": "SUM(value_sum)",
+                "sourceColumns": ["value_sum"],
+                "aggregationPolicy": "period_recompute",
+                "metricGrain": "tenant_day",
+                "applicableTimeGrain": "period",
+                "timeSemantics": {
+                    "selectionPolicy": "period_window",
+                    "asOfPolicy": "latest_available_partition",
+                    "missingDataPolicy": "disclose_unknown",
+                    "zeroValuePolicy": "preserve_observed_zero",
+                },
+                "calculationSemantics": {
+                    "timeRollupPolicy": "WEIGHTED_AVERAGE",
+                    "requiredComponents": ["value_sum", "weight_sum"],
+                },
+            }
+        ],
+    }
+
+    errors = validation_codes(asset)
+
+    assert "WEIGHTED_AVERAGE_WEIGHT_UNDECLARED" in errors
+    assert "CALCULATION_COMPONENT_REF_MISSING" in errors
 
 
 def test_every_metric_requires_a_supported_aggregation_policy() -> None:

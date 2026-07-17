@@ -554,7 +554,13 @@ class V2AgentPolicy:
         if self.has_rule_recall_ready(state) or self.has_rule_answer_plan(state):
             eligible.add("answer_rule")
 
-        assets_ready = bool(state.get("planning_assets_compacted"))
+        # DeepAgent's grounded path never runs the legacy compact_assets node.
+        # Its minimal execution view becomes ready only after the explicit
+        # GroundedQueryContract has been deterministically compiled.
+        assets_ready = bool(
+            state.get("planning_assets_compacted")
+            or state.get("grounded_query_compiled")
+        )
         if state.get("data_discovered") and not assets_ready:
             eligible.add("compact_assets")
 

@@ -848,7 +848,7 @@ class NodeAgent:
     TOOL_REGISTRY = {
         "inspect_schema": "inspect asset/live schema available for this node",
         "resolve_columns": "resolve required columns and output keys",
-        "contract_critic": "check whether node plan contract is executable before SQL draft",
+        "execution_contract_validation": "validate the grounded node execution contract before SQL draft",
         "check_freshness": "check the declared time column and fallback risk",
         "choose_sql_strategy": "choose plan-bound LLM SQL or structured fallback",
         "draft_structured_sql": "draft safe one-table structured SQL",
@@ -879,7 +879,13 @@ class NodeAgent:
 
     def tool_chain_for_intent(self, intent: QuestionIntent, context: NodeExecutionContext) -> NodeAgentContext:
         task_kind = self._task_kind(intent)
-        tools = ["inspect_schema", "resolve_columns", "contract_critic", "check_freshness", "choose_sql_strategy"]
+        tools = [
+            "inspect_schema",
+            "resolve_columns",
+            "execution_contract_validation",
+            "check_freshness",
+            "choose_sql_strategy",
+        ]
         if intent.sql_strategy == "structured_first":
             tools.append("draft_structured_sql")
             if self.worker.llm.configured:
@@ -931,8 +937,8 @@ class NodeAgent:
         return str(intent.answer_mode or "QUERY")
 
 
-class NodePlanCritic:
-    """Lightweight execution gate for a single node plan contract."""
+class NodeExecutionContractValidator:
+    """Deterministic execution gate; it has no planning or repair authority."""
 
     def review(self, contract: NodePlanContract) -> NodePlanCritiqueResult:
         issues: List[Dict[str, Any]] = []
@@ -1114,7 +1120,7 @@ class NodeWorkerExecutor:
             if bool(settings.distributed_subagents_enabled)
             else None
         )
-        self.node_plan_critic = NodePlanCritic()
+        self.node_contract_validator = NodeExecutionContractValidator()
         self.access_control = AccessControlService(settings)
 
     def with_artifact_root(self, root: str) -> None:
@@ -2346,14 +2352,14 @@ class NodeWorkerExecutor:
         self._record_schema_tools(tool_traces, intent, asset_pack)
         contract = self._node_plan_contract(intent, asset_pack, context)
         critique_started = time.perf_counter()
-        critique = self.node_plan_critic.review(contract)
+        critique = self.node_contract_validator.review(contract)
         critique_duration_ms = int((time.perf_counter() - critique_started) * 1000)
         node_task_profile.contract_status = "passed" if critique.valid else "failed"
         node_task_profile.contract_critique_reason = critique.message or critique.code
         record_tool(
             tool_traces,
             intent,
-            "contract_critic",
+            "execution_contract_validation",
             "success" if critique.valid else "failed",
             contract.preferred_table,
             critique.message or "contract passed",
@@ -2373,7 +2379,14 @@ class NodeWorkerExecutor:
                 reason="node plan contract failed; skip freshness and SQL execution",
             )
             message = "%s：%s" % (critique.code or "PLAN_CONTRACT_MISMATCH", critique.message)
-            trace.append(ReActStep(round=1, reason=message, action="contract_critic.failed", observation=intent.preferred_table))
+            trace.append(
+                ReActStep(
+                    round=1,
+                    reason=message,
+                    action="execution_contract_validation.failed",
+                    observation=intent.preferred_table,
+                )
+            )
             record_tool(tool_traces, intent, "check_freshness", "SKIPPED", intent.preferred_table, freshness.reason)
             record_tool(tool_traces, intent, "summarize_node_result", "failed", "node plan contract", message, critique.code)
             return AgentTaskResult(
@@ -4812,12 +4825,19 @@ class NodeWorkerExecutor:
         return group_columns[:6]
 
     def _structured_context_columns(self, intent: QuestionIntent, columns: set, group_columns: List[str], contract: NodePlanContract) -> List[str]:
-        if intent.task_role != TaskRole.DEPENDENT:
+        label_columns = [
+            str(item)
+            for item in (intent.metric_resolution or {}).get("labelColumns")
+            or (intent.metric_resolution or {}).get("label_columns")
+            or []
+            if str(item)
+        ]
+        if intent.task_role != TaskRole.DEPENDENT and not label_columns:
             return []
         visible_columns = set(contract.visible_columns or [])
         blocked = set(group_columns) | {intent.metric_column}
         context_columns: List[str] = []
-        for column in intent.output_keys:
+        for column in [*label_columns, *intent.output_keys]:
             if column in blocked or column not in columns or column not in visible_columns or column in context_columns:
                 continue
             context_columns.append(column)
@@ -9095,6 +9115,15 @@ def aggregate_group_key_allowed(intent: QuestionIntent, column: str) -> bool:
     group_by = intent.group_by_column or ""
     if column == group_by:
         return True
+    label_columns = {
+        str(item)
+        for item in (intent.metric_resolution or {}).get("labelColumns")
+        or (intent.metric_resolution or {}).get("label_columns")
+        or []
+        if str(item)
+    }
+    if column in label_columns:
+        return False
     metric_columns = {intent.metric_column}
     for spec in metric_specs_for_intent(intent, intent.preferred_table):
         metric_columns.update(str(item) for item in spec.get("sourceColumns") or [])

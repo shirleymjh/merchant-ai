@@ -7207,6 +7207,63 @@ def test_retrieve_knowledge_expands_candidate_topics_when_workspace_recall_has_g
     assert state["query_graph_supplemental_retrieve_count"] == 0
 
 
+def test_core_targeted_recall_never_expands_topic_from_pending_request():
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    question = "最近7天订单和退款情况"
+    state = workflow._initial_state(
+        question,
+        "100",
+        ChatContext(),
+        None,
+        "test_thread_core_strict_recall",
+        "test_run_core_strict_recall",
+    )
+    keywords = workflow.keyword_service.extract(question)
+    slots = workflow.route_slot_extractor.extract(question, keywords)
+    state["extracted_keywords"] = keywords
+    state["route_slots"] = slots
+    state["routing_decision"] = RoutingDecision(route=QuestionRoute.BUSINESS)
+    decision = TopicRoutingDecision(
+        primary_topic=QuestionCategory.TRADE,
+        candidate_topics=[QuestionCategory.TRADE],
+        confidence=0.82,
+    )
+    workflow.apply_topic_workspace_policy(state, decision, slots)
+    state["topic_routing_decision"] = decision
+    state["topic_routed"] = True
+    state["memory_recalled"] = True
+    state["_core_targeted_topic_recall"] = True
+    state["pending_knowledge_requests"] = [
+        KnowledgeRequest(
+            type=KnowledgeRequestType.METRIC,
+            query="退款金额语义指标",
+            reason="Core needs one missing semantic ref",
+        )
+    ]
+    workflow.load_skill_policies_for_retrieval = lambda _state: []
+
+    class CaptureRetriever:
+        backend_name = "capture"
+
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, request):
+            self.calls.append(list(request.topic_categories or []))
+            return KnowledgeBundle(backend="capture", recall_bundle=RecallBundle())
+
+    retriever = CaptureRetriever()
+    workflow.knowledge_retriever = retriever
+
+    state = workflow.retrieve_knowledge(state)
+
+    assert retriever.calls
+    assert all(call == [QuestionCategory.TRADE] for call in retriever.calls)
+    expansion = state["knowledge_recall_coverage"]["topicExpansion"]
+    assert expansion["expandedTopics"] == []
+    assert QuestionCategory.REFUND.value not in state.get("knowledge_expanded_topics", [])
+
+
 def test_retrieve_knowledge_coverage_ignores_old_recall_bundle_for_topic_expansion():
     workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
     question = "最近7天订单和退款情况"
@@ -16815,7 +16872,7 @@ def test_asset_builder_caches_live_schema_lookup():
     assert repo.calls == 1
 
 
-def test_node_contract_critic_blocks_missing_metric_before_llm_sql():
+def test_execution_contract_validator_blocks_missing_metric_before_llm_sql():
     settings = get_settings()
     llm = GoodPlanBoundSqlLlm()
     worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
@@ -16841,7 +16898,7 @@ def test_node_contract_critic_blocks_missing_metric_before_llm_sql():
     assert llm.calls == 0
 
 
-def test_node_contract_critic_blocks_dependent_without_upstream_entity():
+def test_execution_contract_validator_blocks_dependent_without_upstream_entity():
     settings = get_settings()
     llm = GoodPlanBoundSqlLlm()
     worker = NodeWorkerExecutor(llm, FakeDoris(), SqlValidationService(), settings)
@@ -19769,7 +19826,7 @@ def test_node_plan_contract_blocks_restricted_output_columns():
     )
 
     contract = worker._node_plan_contract(intent, pack, NodeExecutionContext(merchant_id="100"))
-    critique = worker.node_plan_critic.review(contract)
+    critique = worker.node_contract_validator.review(contract)
 
     assert "buyer_phone" in contract.allowed_columns
     assert "buyer_phone" not in contract.visible_columns

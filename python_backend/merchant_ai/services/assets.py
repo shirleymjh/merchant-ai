@@ -4,9 +4,10 @@ import json
 import hashlib
 import re
 import shutil
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
@@ -81,6 +82,41 @@ SUPPORTED_METRIC_ZERO_VALUE_POLICIES = frozenset(
         "treat_as_missing",
         "not_applicable",
         "undeclared",
+    }
+)
+
+SUPPORTED_CALCULATION_TIME_ROLLUP_POLICIES = frozenset(
+    {
+        "ADDITIVE",
+        "NOT_COMPOSABLE",
+        "RECOMPUTE_FROM_DETAIL",
+        "LAST_VALUE",
+        "RATIO_OF_SUMS",
+        "WEIGHTED_AVERAGE",
+    }
+)
+
+SUPPORTED_CALCULATION_WINDOW_POLICIES = frozenset(
+    {
+        "ANY",
+        "EXACT_ONLY",
+        "NATIVE_GRAIN_ONLY",
+    }
+)
+
+SUPPORTED_CALCULATION_AGGREGATIONS = frozenset(
+    {
+        "SUM",
+        "COUNT",
+        "COUNT_DISTINCT",
+        "AVG",
+        "MIN",
+        "MAX",
+        "MAX_BY",
+        "MIN_BY",
+        "NDV",
+        "RATIO",
+        "EXPRESSION",
     }
 )
 
@@ -767,6 +803,7 @@ class SemanticCatalogService:
     """
 
     MANIFEST_KIND = "TOPIC_MANIFEST"
+    TOPIC_INDEX_KIND = "TOPIC_INDEX"
     TABLE_KIND = "TABLE_ASSET"
     METRIC_KIND = "METRIC"
     RELATIONSHIP_KIND = "RELATIONSHIPS"
@@ -824,10 +861,46 @@ class SemanticCatalogService:
         refs.sort(key=lambda item: score_document(terms, item["searchText"]) if terms else 0.0, reverse=True)
         return [self._public_ref(item) for item in refs[: max(1, limit)]]
 
-    def read(self, ref_id: str = "", path: str = "", max_chars: int = 20_000, offset: int = 0) -> Dict[str, Any]:
-        ref = self._resolve_ref(ref_id, path)
+    def read(
+        self,
+        ref_id: str = "",
+        path: str = "",
+        max_chars: int = 20_000,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        wanted_ref = str(ref_id or "").strip()
+        wanted_path = normalize_semantic_path(path)
+        if wanted_ref and wanted_path:
+            ref_by_id = self._resolve_ref(wanted_ref, "")
+            ref_by_path = self._resolve_ref("", wanted_path)
+            if (
+                not ref_by_id
+                or not ref_by_path
+                or str(ref_by_id.get("refId") or "") != str(ref_by_path.get("refId") or "")
+                or str(ref_by_id.get("path") or "") != str(ref_by_path.get("path") or "")
+            ):
+                return {
+                    "success": False,
+                    "error": "SEMANTIC_REF_PATH_CONFLICT",
+                    "refId": wanted_ref,
+                    "path": wanted_path,
+                }
+            ref = ref_by_id
+        else:
+            ref = self._resolve_ref(wanted_ref, wanted_path)
         if not ref:
             return {"success": False, "error": "SEMANTIC_REF_NOT_FOUND", "refId": ref_id, "path": path}
+        if (
+            str(ref.get("kind") or "").upper() == self.TABLE_KIND
+            or str(ref.get("path") or "").endswith("/asset.json")
+        ):
+            return {
+                "success": False,
+                "error": "FULL_TABLE_ASSET_DENIED",
+                "refId": str(ref.get("refId") or ref_id),
+                "path": str(ref.get("path") or path),
+                "instruction": "Read the table detail.json and then only required child refs.",
+            }
         content = ref["content"]
         start = max(0, offset)
         end = min(len(content), start + max(1, max_chars))
@@ -851,12 +924,14 @@ class SemanticCatalogService:
         topic_categories: Iterable[QuestionCategory] | None = None,
         topic: str = "",
         limit: int = 20,
+        path: str = "",
     ) -> List[Dict[str, Any]]:
         terms = question_match_terms(query)
         if not terms:
             return []
         hits: List[Dict[str, Any]] = []
-        for ref in self._all_refs(topic_categories, topic):
+        refs = self._grep_refs_for_path(path) if normalize_semantic_path(path) else self._all_refs(topic_categories, topic)
+        for ref in refs:
             score = score_document(terms, ref["searchText"] + "\n" + ref["content"])
             if score <= 0:
                 continue
@@ -869,6 +944,69 @@ class SemanticCatalogService:
             )
         hits.sort(key=lambda item: item["score"], reverse=True)
         return hits[: max(1, limit)]
+
+    def _grep_refs_for_path(self, path: str) -> List[Dict[str, Any]]:
+        """Resolve a bounded filesystem subtree for targeted semantic grep.
+
+        Topic-wide grep remains index-only so a broad search cannot materialize
+        every table asset.  Once Core chooses a table or section, grep may
+        inspect that bounded subtree and returns exact/index paths which still
+        require a subsequent trusted read_file call before binding.
+        """
+
+        normalized = normalize_semantic_path(path).rstrip("/")
+        exact = self._resolve_ref("", normalized)
+        if exact:
+            return [exact]
+
+        section_match = re.fullmatch(
+            r"topics/([^/]+)/tables/([^/]+)/(metrics|columns|terms|rules)",
+            normalized,
+        )
+        if section_match:
+            topic, table, section = section_match.groups()
+            section_ref = self.table_section_ref(topic, table, section)
+            if not section_ref:
+                return []
+            try:
+                payload = json.loads(section_ref.get("content") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            refs: List[Dict[str, Any]] = []
+            for item in payload.get("entries") or []:
+                if not isinstance(item, dict):
+                    continue
+                entry = self.table_entry_ref(topic, table, section, str(item.get("key") or ""))
+                if entry:
+                    refs.append(entry)
+            return refs
+
+        table_match = re.fullmatch(r"topics/([^/]+)/tables/([^/]+)", normalized)
+        if table_match:
+            topic, table = table_match.groups()
+            if not self._manifest_item(topic, table):
+                return []
+            refs = [self.table_detail_ref(topic, table)]
+            refs.extend(
+                ref
+                for section in self.TABLE_SECTION_FIELDS
+                if (ref := self.table_section_ref(topic, table, section)) is not None
+            )
+            return refs
+
+        tables_match = re.fullmatch(r"topics/([^/]+)/tables", normalized)
+        if tables_match:
+            topic = tables_match.group(1)
+            return [
+                self.table_detail_ref(topic, str(item.get("tableName") or ""), item)
+                for item in self.topic_assets.load_manifest(topic)
+                if isinstance(item, dict) and str(item.get("tableName") or "")
+            ]
+
+        topic_match = re.fullmatch(r"topics/([^/]+)", normalized)
+        if topic_match:
+            return self._all_refs(topic=topic_match.group(1))
+        return []
 
     def write_proposal(self, topic: str, table: str, file_name: str, content: str) -> Dict[str, Any]:
         safe_name = sanitize_semantic_file_name(file_name or "proposal.md")
@@ -893,46 +1031,81 @@ class SemanticCatalogService:
         limit: int = 12,
     ) -> Dict[str, Any]:
         refs: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
         table_filter = {str(table) for table in allowed_tables or [] if table}
         relationship_topic_filter = {str(topic) for topic in allowed_relationship_topics or [] if topic}
         for item in source_refs.values():
             metadata = item.metadata or {}
             semantic_path = str(metadata.get("semanticPath") or "")
             ref_id = str(metadata.get("semanticRefId") or item.doc_id or "")
+            kind = str(metadata.get("semanticKind") or item.source_type or "").upper()
+            topic = str(item.topic or metadata.get("topic") or "")
+            table = str(item.table or metadata.get("tableName") or "")
+            if str(item.source_type or "").upper() == "GOVERNED_RULE":
+                continue
+            if kind in {"TABLE_ASSET", "SEMANTIC_TABLE_ASSET"} and topic and table:
+                ref_id = semantic_table_detail_ref_id(topic, table)
+                semantic_path = semantic_table_detail_path(topic, table)
+            elif kind in {"METRIC", "SEMANTIC_METRIC"} and topic and table and ":metric:" in ref_id:
+                semantic_path = semantic_metric_path(topic, table, ref_id.split(":metric:", 1)[1])
+            elif kind in {"RELATIONSHIP", "RELATIONSHIPS", "SEMANTIC_RELATIONSHIP"} and topic:
+                ref_id = semantic_relationship_ref_id(topic)
+                semantic_path = semantic_relationship_path(topic)
             if not semantic_path or not ref_id.startswith("semantic:"):
                 continue
-            if item.table and table_filter and item.table not in table_filter:
+            resolved_by_ref = self._resolve_ref(ref_id, "")
+            resolved_by_path = self._resolve_ref("", semantic_path)
+            if not resolved_by_ref or not resolved_by_path:
                 continue
-            if not item.table and item.source_type == "SEMANTIC_RELATIONSHIP" and relationship_topic_filter and item.topic not in relationship_topic_filter:
+            if (
+                str(resolved_by_ref.get("refId") or "") != str(resolved_by_path.get("refId") or "")
+                or str(resolved_by_ref.get("path") or "") != str(resolved_by_path.get("path") or "")
+            ):
                 continue
+            resolved = resolved_by_ref
+            resolved_table = str(resolved.get("table") or table)
+            resolved_topic = str(resolved.get("topic") or topic)
+            if resolved_table and table_filter and resolved_table not in table_filter:
+                continue
+            if not resolved_table and relationship_topic_filter and resolved_topic not in relationship_topic_filter:
+                continue
+            identity = (str(resolved.get("refId") or ""), str(resolved.get("path") or ""))
+            if identity in seen:
+                continue
+            seen.add(identity)
             refs.append(
                 add_context_uri({
-                    "refId": ref_id,
-                    "path": semantic_path,
-                    "kind": metadata.get("semanticKind") or item.source_type,
-                    "topic": item.topic,
-                    "table": item.table,
+                    "refId": identity[0],
+                    "path": identity[1],
+                    "kind": str(resolved.get("kind") or kind),
+                    "topic": resolved_topic,
+                    "table": resolved_table,
                     "title": item.title,
-                    "estimatedChars": metadata.get("estimatedChars", len(item.content or "")),
-                    "offloadRecommended": bool(metadata.get("offloadRecommended")),
-                }, ref_id=ref_id, topic=item.topic, table=item.table, kind=str(metadata.get("semanticKind") or item.source_type), path=semantic_path)
+                    "estimatedChars": int(resolved.get("estimatedChars") or metadata.get("estimatedChars") or len(item.content or "")),
+                    "offloadRecommended": bool(resolved.get("offloadRecommended") or metadata.get("offloadRecommended")),
+                }, ref_id=identity[0], topic=resolved_topic, table=resolved_table, kind=str(resolved.get("kind") or kind), path=identity[1])
             )
         return {
             "mode": "filesystem_as_context",
             "uriScheme": "merchant://",
-            "policy": "start from topic manifests; read/grep only table, metric, relationship, or rule files needed for the current step; offload large files by path",
+            "policy": "start from topic manifests and table detail files; open section indexes and exact entries only as needed; full assets remain an optional fallback",
             "layers": {
                 "L0": "topic/table/metric summaries for routing and quick relevance checks",
                 "L1": "table, metric, relationship and rule overviews for planning and rerank",
                 "L2": "full schema, metric formulas, rules, rows or artifacts loaded only on demand",
             },
             "progressiveDisclosure": [
-                "1. topic manifest: available tables, high-level metrics and rule summaries",
-                "2. table asset: fields, metric formulas, keys, partition and merchant filters",
-                "3. relationship/rule files: only when graph edges, formulas or business policy evidence is missing",
+                "1. topic manifest: available tables and business summaries",
+                "2. table detail: grain, time/scope columns and child section coordinates",
+                "3. section index then exact metric/column/rule entry; relationships only when an edge is needed",
                 "4. workspace artifacts: read query graphs, SQL, rows or evidence reports by path when needed",
             ],
-            "roots": ["topics/<topic>/manifest.json", "topics/<topic>/tables/<table>/asset.json", "topics/<topic>/relationships.json"],
+            "roots": [
+                "topics/<topic>/manifest.json",
+                "topics/<topic>/tables/<table>/detail.json",
+                "topics/<topic>/tables/<table>/<section>/index.json",
+                "topics/<topic>/relationships.json",
+            ],
             "refs": refs[:limit],
         }
 
@@ -976,6 +1149,66 @@ class SemanticCatalogService:
             "content": content,
             "searchText": "\n".join(search_parts),
         }, ref_id=semantic_manifest_ref_id(topic), topic=topic, kind=self.MANIFEST_KIND, path=semantic_manifest_path(topic))
+
+    def topic_index_ref(self) -> Dict[str, Any]:
+        """Expose a thin global Topic directory without loading table assets."""
+
+        topics: List[Dict[str, Any]] = []
+        search_parts: List[str] = []
+        for topic in self.topic_assets.all_topic_names():
+            contract = self.topic_assets.load_topic_contract(topic)
+            summaries = dedupe_strings(
+                [
+                    str(item.get("businessSummary") or "").strip()
+                    for item in self.topic_assets.load_manifest(topic)
+                    if isinstance(item, dict) and str(item.get("businessSummary") or "").strip()
+                ]
+            )
+            item = {
+                "topic": topic,
+                "displayName": str(contract.get("displayName") or topic),
+                "aliases": [str(value) for value in contract.get("aliases") or []],
+                "description": "；".join(summaries[:3]),
+                "manifestRefId": semantic_manifest_ref_id(topic),
+                "manifestPath": semantic_manifest_path(topic),
+            }
+            topics.append(item)
+            search_parts.extend(
+                [
+                    topic,
+                    item["displayName"],
+                    *item["aliases"],
+                    item["description"],
+                ]
+            )
+        payload = {
+            "layer": "topic_index",
+            "policy": (
+                "Use this index only when the seed Topic does not cover the question. "
+                "Read one candidate manifest before searching or opening files in that Topic."
+            ),
+            "topics": topics,
+        }
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        return add_context_uri(
+            {
+                "refId": "semantic:topics:index",
+                "kind": self.TOPIC_INDEX_KIND,
+                "topic": "",
+                "table": "",
+                "path": "topics/index.json",
+                "title": "Topic Index",
+                "summary": "%d published Topics" % len(topics),
+                "layers": {"topics": len(topics), "layer": "topic_index"},
+                "estimatedChars": len(content),
+                "offloadRecommended": False,
+                "content": content,
+                "searchText": "\n".join(search_parts),
+            },
+            ref_id="semantic:topics:index",
+            kind=self.TOPIC_INDEX_KIND,
+            path="topics/index.json",
+        )
 
     def table_detail_ref(
         self,
@@ -1066,10 +1299,11 @@ class SemanticCatalogService:
             payload = {"topic": topic, "tableName": table, "section": section_name, field: values}
         else:
             entries = []
+            entry_keys = semantic_table_entry_keys(section_name, values)
             for index, value in enumerate(values):
                 if not isinstance(value, dict):
                     continue
-                key = semantic_table_entry_key(section_name, value, index)
+                key = entry_keys[index]
                 entries.append(
                     {
                         "key": key,
@@ -1123,11 +1357,12 @@ class SemanticCatalogService:
             return None
         asset = self.topic_assets.load_table_asset(topic, table)
         values = asset.get(field) if isinstance(asset.get(field), list) else []
+        entry_keys = semantic_table_entry_keys(section_name, values)
         selected: Dict[str, Any] | None = None
         for index, value in enumerate(values):
             if not isinstance(value, dict):
                 continue
-            if semantic_table_entry_key(section_name, value, index) == entry_key:
+            if entry_keys[index] == entry_key:
                 selected = value
                 break
         if selected is None:
@@ -1220,12 +1455,10 @@ class SemanticCatalogService:
     ) -> Dict[str, Any] | None:
         """Expose one published metric as an addressable virtual semantic file.
 
-        Metric documents indexed for retrieval already publish
-        ``semantic:<topic>:<table>:metric:<key>`` refs.  The filesystem reader
-        must resolve that same identity without loading the whole table asset
-        into a Planner prompt.  The underlying source remains the table's
-        canonical ``asset.json``; the ``#metric:`` fragment is a read-only
-        projection of one metric definition.
+        Metric documents indexed for retrieval publish both a stable semantic
+        ref and a real virtual file under ``metrics/<key>.json``.  The source
+        remains the governed table asset, but callers never need a fragment
+        path or the full asset to read one definition.
         """
 
         asset = self.topic_assets.load_table_asset(topic, table)
@@ -1308,26 +1541,38 @@ class SemanticCatalogService:
     def _resolve_ref(self, ref_id: str, path: str) -> Dict[str, Any] | None:
         wanted_ref = ref_id.strip()
         wanted_path = normalize_semantic_path(path)
-        metric_identity = parse_semantic_metric_identity(wanted_ref, wanted_path)
-        if metric_identity:
-            return self.metric_ref(*metric_identity)
-        entry_identity = parse_semantic_table_entry_identity(wanted_ref, wanted_path)
-        if entry_identity:
-            return self.table_entry_ref(*entry_identity)
+        if wanted_ref == "semantic:topics:index" or wanted_path == "topics/index.json":
+            return self.topic_index_ref()
+        # Resolve directory/index files before exact entries.  Otherwise paths
+        # such as ``metrics/index.json`` and ``columns/index.json`` are
+        # accidentally parsed as an exact entry whose key is literally
+        # ``index``.  That failed lookup used to return None immediately and
+        # made an ls-advertised path unreadable through read_file.
         direct = parse_semantic_file_identity(wanted_ref, wanted_path)
         if direct:
             kind, topic, table, section = direct
             if kind == "manifest":
-                return self.manifest_ref(topic)
+                return self.manifest_ref(topic) if topic in self.topic_assets.all_topic_names() else None
             if kind == "relationships":
-                relationships = self.topic_assets.load_relationships(topic)
-                return self.relationship_ref(topic, relationships) if relationships else None
+                if topic not in self.topic_assets.all_topic_names():
+                    return None
+                return self.relationship_ref(topic, self.topic_assets.load_relationships(topic))
             if kind == "detail":
-                return self.table_detail_ref(topic, table)
+                return self.table_detail_ref(topic, table) if self._manifest_item(topic, table) else None
             if kind == "asset":
                 return self.table_ref(topic, table) if self._manifest_item(topic, table) else None
             if kind == "section":
                 return self.table_section_ref(topic, table, section)
+        metric_identity = parse_semantic_metric_identity(wanted_ref, wanted_path)
+        if metric_identity:
+            metric_ref = self.metric_ref(*metric_identity)
+            if metric_ref:
+                return metric_ref
+        entry_identity = parse_semantic_table_entry_identity(wanted_ref, wanted_path)
+        if entry_identity:
+            entry_ref = self.table_entry_ref(*entry_identity)
+            if entry_ref:
+                return entry_ref
         for ref in self._all_refs():
             if wanted_ref and ref["refId"] == wanted_ref:
                 return ref
@@ -1425,31 +1670,6 @@ class SemanticCatalogService:
             topic=topic,
             table=table,
             kind=self.TABLE_SECTION_KINDS[section],
-            path=path,
-        )
-
-    def _asset_public_ref(self, topic: str, table: str, manifest_item: Dict[str, Any]) -> Dict[str, Any]:
-        ref_id = semantic_table_ref_id(topic, table)
-        path = semantic_table_path(topic, table)
-        return add_context_uri(
-            {
-                "refId": ref_id,
-                "kind": self.TABLE_KIND,
-                "topic": topic,
-                "table": table,
-                "path": path,
-                "title": "%s/%s/full_asset" % (topic, table),
-                "summary": "full governed asset; prefer section files",
-                "layers": {"section": "full_asset"},
-                "estimatedChars": 0,
-                "offloadRecommended": True,
-                "content": "",
-                "searchText": "%s %s %s" % (topic, table, manifest_item.get("tableComment") or ""),
-            },
-            ref_id=ref_id,
-            topic=topic,
-            table=table,
-            kind=self.TABLE_KIND,
             path=path,
         )
 
@@ -1733,12 +1953,12 @@ class HybridRecallService:
                 for chunk_index, chunk in enumerate(chunks):
                     docs.append(
                         RecallItem(
-                            doc_id="%s#chunk-%04d" % (path, chunk_index),
+                            doc_id="semantic:rules:%s:chunk:%04d" % (path.stem, chunk_index),
                             title="%s / %s" % (path.stem, chunk["headingText"]),
                             content=chunk["content"],
                             source_type="GOVERNED_RULE",
                             metadata={
-                                "sourcePath": str(path),
+                                "sourcePath": "rules/%s" % path.name,
                                 "semanticPath": "rules/%s" % path.name,
                                 "headingPath": chunk["headingPath"],
                                 "headingText": chunk["headingText"],
@@ -1758,18 +1978,18 @@ class HybridRecallService:
             for manifest_item in self.topic_assets.load_manifest(topic):
                 table = str(manifest_item.get("tableName") or "")
                 asset = self.topic_assets.load_table_asset(topic, table)
-                ref = self.semantic_catalog.table_ref(topic, table, asset)
+                ref = self.semantic_catalog.table_detail_ref(topic, table, manifest_item)
                 docs.append(
                     RecallItem(
                         doc_id=ref["refId"],
-                        title="%s/%s semantic asset" % (topic, table),
+                        title="%s/%s table candidate" % (topic, table),
                         content=compact_semantic_asset_for_recall(asset),
                         source_type="SEMANTIC_TABLE_ASSET",
                         topic=topic,
                         table=table,
                         answer_mode=",".join(manifest_item.get("preferredFor") or []),
                         metadata={
-                            "semanticSource": "asset.json",
+                            "semanticSource": "topic_manifest",
                             "semanticKind": ref["kind"],
                             "semanticRefId": ref["refId"],
                             "semanticPath": ref["path"],
@@ -1797,7 +2017,7 @@ class HybridRecallService:
                     if not metric_key:
                         continue
                     semantic_ref_id = "semantic:%s:%s:metric:%s" % (topic, table, metric_key)
-                    semantic_path = "%s#metric:%s" % (semantic_table_path(topic, table), metric_key)
+                    semantic_path = semantic_metric_path(topic, table, metric_key)
                     docs.append(
                         RecallItem(
                             doc_id=semantic_ref_id,
@@ -1890,9 +2110,18 @@ class HybridRecallService:
                             table=left,
                             metadata={
                                 "semanticSource": "relationships.json",
-                                "semanticKind": "RELATIONSHIP",
-                                "semanticRefId": rel_ref_id,
-                                "merchantUri": merchant_uri_for_semantic_ref(rel_ref_id, topic=topic, table=left, kind="RELATIONSHIP", key=rel_name),
+                                # The grounded contract consumes the governed
+                                # Topic relationship file.  The individual hit
+                                # remains a retrieval document, but its browse
+                                # coordinate must be a real readable file.
+                                "semanticKind": self.semantic_catalog.RELATIONSHIP_KIND,
+                                "semanticRefId": semantic_relationship_ref_id(topic),
+                                "semanticPath": semantic_relationship_path(topic),
+                                "merchantUri": merchant_uri_for_semantic_ref(
+                                    semantic_relationship_ref_id(topic),
+                                    topic=topic,
+                                    kind=self.semantic_catalog.RELATIONSHIP_KIND,
+                                ),
                                 "contextLayer": "L1",
                                 "relationshipId": rel_name,
                                 "leftTable": left,
@@ -4689,8 +4918,40 @@ def semantic_table_entry_key(section: str, value: Dict[str, Any], index: int) ->
         "rules": ["ruleKey", "ruleId", "id", "title"],
     }.get(section, ["key", "name"])
     raw = next((str(value.get(key) or "").strip() for key in candidates if str(value.get(key) or "").strip()), "")
-    safe = sanitize_semantic_file_name(raw or "%s-%d" % (section.rstrip("s"), index + 1))
-    return "%s-%d" % (safe[:80], index + 1) if section in {"terms", "rules"} else safe[:120]
+    if raw:
+        return sanitize_semantic_file_name(raw)[:120]
+    digest = hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return "%s-%s" % (section.rstrip("s"), digest)
+
+
+def semantic_table_entry_keys(section: str, values: Sequence[Any]) -> List[str]:
+    """Create stable entry keys and fail closed on true identity collisions."""
+
+    bases = [
+        semantic_table_entry_key(section, value, index) if isinstance(value, dict) else ""
+        for index, value in enumerate(values)
+    ]
+    counts = Counter(base for base in bases if base)
+    keys: List[str] = []
+    seen: Set[str] = set()
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            keys.append("")
+            continue
+        base = bases[index]
+        key = base
+        if counts[base] > 1:
+            digest = hashlib.sha256(
+                json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:10]
+            key = "%s-%s" % (base[:109], digest)
+        if key in seen:
+            raise ValueError("SEMANTIC_ENTRY_KEY_COLLISION: %s/%s" % (section, key))
+        seen.add(key)
+        keys.append(key)
+    return keys
 
 
 def semantic_table_entry_title(section: str, value: Dict[str, Any], fallback: str) -> str:
@@ -4716,13 +4977,8 @@ def parse_semantic_metric_identity(ref_id: str, path: str) -> Tuple[str, str, st
         normalize_semantic_path(path),
     )
     if path_match:
-        return tuple(str(item) for item in path_match.groups())
-    legacy_path_match = re.fullmatch(
-        r"topics/([^/]+)/tables/([^/]+)/asset\.json#metric:(.+)",
-        normalize_semantic_path(path),
-    )
-    if legacy_path_match:
-        return tuple(str(item) for item in legacy_path_match.groups())
+        identity = tuple(str(item) for item in path_match.groups())
+        return identity if identity[-1] != "index" else None
     return None
 
 
@@ -4737,7 +4993,7 @@ def parse_semantic_table_entry_identity(ref_id: str, path: str) -> Tuple[str, st
     path_match = re.fullmatch(r"topics/([^/]+)/tables/([^/]+)/(columns|terms|rules)/([^/]+)\.json", wanted_path)
     if path_match:
         topic, table, section, key = path_match.groups()
-        return topic, table, section, key
+        return (topic, table, section, key) if key != "index" else None
     return None
 
 
@@ -5877,6 +6133,10 @@ class TopicBuilderWorkflow:
             "指标必须引用真实存在的 sourceColumns；派生指标可以引用其他 metricKey。"
             "每个指标必须声明 aggregationPolicy、metricGrain、applicableTimeGrain 和 timeSemantics；"
             "timeSemantics 必须分别声明 asOfPolicy、missingDataPolicy 和 zeroValuePolicy。"
+            "每个指标还必须声明 calculationSemantics，说明 nativeTimeGrain/nativeWindowDays、"
+            "windowPolicy、timeRollupPolicy、允许或禁止的聚合、所需组件/权重，以及不适用时的"
+            "alternativeCapability。比率、平均、快照、去重计数和固定窗口必须根据业务知识声明，"
+            "不得从指标名或字段名猜测。可派生度量的字段可声明 allowedAggregations 和 derivableMeasures。"
             "不得把数据缺失默认解释为业务为 0；没有可核验证据时使用 undeclared，不要猜测。"
             "如果字段疑似手机号、邮箱、身份证、地址等敏感信息，请补充 visibilityPolicy 和 maskingPolicy；"
             "如果表有明确租户过滤列，请补充 rowAccessPolicy。"
@@ -6245,6 +6505,81 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
         "required": ["visibilityPolicy", "maskingPolicy"],
         "additionalProperties": False,
     }
+    alternative_capability_schema = {
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string"},
+            "entityRole": {"type": "string"},
+            "requiredFieldRole": {"type": "string"},
+            "requiredTableGrain": {"type": "string"},
+            "timeRollupPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CALCULATION_TIME_ROLLUP_POLICIES),
+            },
+            "windowPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CALCULATION_WINDOW_POLICIES),
+            },
+            "requiredComponents": {"type": "array", "items": {"type": "string"}},
+            "requiredWeightRef": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    derivable_measure_schema = {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CALCULATION_AGGREGATIONS),
+            },
+            "resultSemanticType": {"type": "string"},
+            "unit": {"type": "string"},
+        },
+        "required": ["operation"],
+        "additionalProperties": False,
+    }
+    calculation_semantics_schema = {
+        "type": "object",
+        "properties": {
+            "semanticValueType": {"type": "string"},
+            "semanticEntityRole": {"type": "string"},
+            "nativeTimeGrain": {"type": "string"},
+            "nativeWindowDays": {"type": "integer", "minimum": 0},
+            "windowPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CALCULATION_WINDOW_POLICIES),
+            },
+            "timeRollupPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CALCULATION_TIME_ROLLUP_POLICIES),
+            },
+            "derivedMeasureTimeRollupPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_CALCULATION_TIME_ROLLUP_POLICIES),
+            },
+            "nativeGrainAnalysisModes": {"type": "array", "items": {"type": "string"}},
+            "allowedAggregations": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(SUPPORTED_CALCULATION_AGGREGATIONS)},
+            },
+            "forbiddenAggregations": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(SUPPORTED_CALCULATION_AGGREGATIONS)},
+            },
+            "requiredComponents": {"type": "array", "items": {"type": "string"}},
+            "requiredWeightRef": {"type": "string"},
+            "allowedTableGrains": {"type": "array", "items": {"type": "string"}},
+            "enforceAggregationAtNativeGrain": {"type": "boolean"},
+            "violationMessage": {"type": "string"},
+            "resolution": {
+                "type": "string",
+                "enum": ["RESELECT_TABLE", "RESELECT_METRIC", "ASK_HUMAN"],
+            },
+            "alternativeCapability": alternative_capability_schema,
+            "derivableMeasures": {"type": "array", "items": derivable_measure_schema},
+        },
+        "additionalProperties": False,
+    }
     semantic_column_schema = {
         "type": "object",
         "properties": {
@@ -6276,6 +6611,7 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "displayScenarios": {"type": "array", "items": {"type": "string"}},
             "visibilityPolicy": visibility_policy_schema,
             "maskingPolicy": masking_policy_schema,
+            "calculationSemantics": calculation_semantics_schema,
         },
         "required": ["columnName", "businessName", "role"],
         "additionalProperties": False,
@@ -6321,6 +6657,7 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
                 "required": ["selectionPolicy", "asOfPolicy", "missingDataPolicy", "zeroValuePolicy"],
                 "additionalProperties": False,
             },
+            "calculationSemantics": calculation_semantics_schema,
             "requiredFilters": {"type": "array", "items": {"type": "string"}},
             "conflictsWith": {"type": "array", "items": {"type": "string"}},
             "clarificationQuestion": {"type": "string"},
@@ -6343,6 +6680,7 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
             "metricGrain",
             "applicableTimeGrain",
             "timeSemantics",
+            "calculationSemantics",
         ],
         "additionalProperties": False,
     }
@@ -6842,6 +7180,121 @@ class SemanticAssetGovernanceService:
         return payload if isinstance(payload, dict) else {}
 
 
+def validate_calculation_semantics(
+    raw: Any,
+    owner_kind: str,
+    owner_key: str,
+    source_refs: Sequence[str] | None = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    errors: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    identity = {"ownerKind": owner_kind, "ownerKey": owner_key}
+    if raw is None:
+        warnings.append({"code": "CALCULATION_SEMANTICS_UNDECLARED", **identity})
+        return {"errors": errors, "warnings": warnings}
+    if not isinstance(raw, dict):
+        errors.append({"code": "CALCULATION_SEMANTICS_INVALID", **identity})
+        return {"errors": errors, "warnings": warnings}
+
+    rollup_policy = str(raw.get("timeRollupPolicy") or "").strip().upper()
+    derived_rollup_policy = str(raw.get("derivedMeasureTimeRollupPolicy") or "").strip().upper()
+    window_policy = str(raw.get("windowPolicy") or "").strip().upper()
+    if rollup_policy and rollup_policy not in SUPPORTED_CALCULATION_TIME_ROLLUP_POLICIES:
+        errors.append({"code": "CALCULATION_TIME_ROLLUP_POLICY_INVALID", "value": rollup_policy, **identity})
+    if derived_rollup_policy and derived_rollup_policy not in SUPPORTED_CALCULATION_TIME_ROLLUP_POLICIES:
+        errors.append({"code": "DERIVED_MEASURE_ROLLUP_POLICY_INVALID", "value": derived_rollup_policy, **identity})
+    if window_policy and window_policy not in SUPPORTED_CALCULATION_WINDOW_POLICIES:
+        errors.append({"code": "CALCULATION_WINDOW_POLICY_INVALID", "value": window_policy, **identity})
+
+    try:
+        native_window_days = int(raw.get("nativeWindowDays") or 0)
+    except (TypeError, ValueError):
+        native_window_days = -1
+    if native_window_days < 0:
+        errors.append({"code": "CALCULATION_NATIVE_WINDOW_INVALID", **identity})
+    if window_policy in {"EXACT_ONLY", "NATIVE_GRAIN_ONLY"} and native_window_days <= 0:
+        errors.append({"code": "CALCULATION_NATIVE_WINDOW_REQUIRED", **identity})
+    if rollup_policy == "NOT_COMPOSABLE" and native_window_days <= 0:
+        errors.append({"code": "NON_COMPOSABLE_NATIVE_WINDOW_REQUIRED", **identity})
+    if rollup_policy == "NOT_COMPOSABLE" and not isinstance(raw.get("alternativeCapability"), dict):
+        warnings.append({"code": "NON_COMPOSABLE_ALTERNATIVE_UNDECLARED", **identity})
+
+    allowed = {
+        str(item or "").strip().upper()
+        for item in raw.get("allowedAggregations") or []
+        if str(item or "").strip()
+    }
+    forbidden = {
+        str(item or "").strip().upper()
+        for item in raw.get("forbiddenAggregations") or []
+        if str(item or "").strip()
+    }
+    invalid_aggregations = sorted(
+        (allowed | forbidden) - set(SUPPORTED_CALCULATION_AGGREGATIONS)
+    )
+    if invalid_aggregations:
+        errors.append(
+            {
+                "code": "CALCULATION_AGGREGATION_INVALID",
+                "aggregations": invalid_aggregations,
+                **identity,
+            }
+        )
+    overlap = sorted(allowed & forbidden)
+    if overlap:
+        errors.append(
+            {
+                "code": "CALCULATION_AGGREGATION_CONFLICT",
+                "aggregations": overlap,
+                **identity,
+            }
+        )
+
+    required_components = [
+        str(item or "").strip()
+        for item in raw.get("requiredComponents") or []
+        if str(item or "").strip()
+    ]
+    required_weight = str(raw.get("requiredWeightRef") or "").strip()
+    if rollup_policy == "WEIGHTED_AVERAGE" and not required_weight:
+        errors.append({"code": "WEIGHTED_AVERAGE_WEIGHT_UNDECLARED", **identity})
+    if rollup_policy in {"WEIGHTED_AVERAGE", "RATIO_OF_SUMS"} and len(required_components) < 2:
+        errors.append({"code": "COMPOSITE_ROLLUP_COMPONENTS_UNDECLARED", **identity})
+    available_refs = {str(item) for item in source_refs or [] if str(item)}
+    missing_components = sorted(set(required_components) - available_refs)
+    if available_refs and missing_components:
+        errors.append(
+            {
+                "code": "CALCULATION_COMPONENT_REF_MISSING",
+                "components": missing_components,
+                **identity,
+            }
+        )
+    if required_weight and available_refs and required_weight not in available_refs:
+        errors.append(
+            {
+                "code": "CALCULATION_WEIGHT_REF_MISSING",
+                "weightRef": required_weight,
+                **identity,
+            }
+        )
+
+    for item in raw.get("derivableMeasures") or []:
+        if not isinstance(item, dict):
+            errors.append({"code": "DERIVABLE_MEASURE_INVALID", **identity})
+            continue
+        operation = str(item.get("operation") or "").strip().upper()
+        if operation not in SUPPORTED_CALCULATION_AGGREGATIONS:
+            errors.append(
+                {
+                    "code": "DERIVABLE_MEASURE_OPERATION_INVALID",
+                    "operation": operation or "UNDECLARED",
+                    **identity,
+                }
+            )
+    return {"errors": errors, "warnings": warnings}
+
+
 def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str, Any]]) -> Dict[str, Any]:
     table = str(asset.get("tableName") or "")
     schema = schema_columns(asset)
@@ -6956,6 +7409,21 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_ALLOWED_ROLES", "column": column_name})
         if visibility.get("level") == "restricted" and masking.get("strategy") == "none":
             warnings.append({"code": "RESTRICTED_COLUMN_WITHOUT_MASKING", "column": column_name})
+        raw_calculation_semantics = field.get("calculationSemantics")
+        if raw_calculation_semantics is not None or semantic_role in {
+            "KEY",
+            "ENTITY",
+            "ENTITY_KEY",
+            "PRIMARY_KEY",
+            "IDENTIFIER",
+        }:
+            calculation_validation = validate_calculation_semantics(
+                raw_calculation_semantics,
+                "COLUMN",
+                column_name,
+            )
+            errors.extend(calculation_validation["errors"])
+            warnings.extend(calculation_validation["warnings"])
         enum_metadata = field.get("enumMetadata") if isinstance(field.get("enumMetadata"), dict) else {}
         if (
             populated_semantic_enum_fields(field)
@@ -7011,6 +7479,14 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         ratio_metric = metric_type == "RATIO" or "/" in formula
         metric_grain = str(metric.get("metricGrain") or "").strip().lower()
         applicable_time_grain = str(metric.get("applicableTimeGrain") or "").strip().lower()
+        calculation_validation = validate_calculation_semantics(
+            metric.get("calculationSemantics"),
+            "METRIC",
+            metric_key,
+            semantic_metric_source_columns(metric),
+        )
+        errors.extend(calculation_validation["errors"])
+        warnings.extend(calculation_validation["warnings"])
         if not metric_grain:
             errors.append({"code": "METRIC_GRAIN_UNDECLARED", "metricKey": metric_key})
         if not applicable_time_grain:

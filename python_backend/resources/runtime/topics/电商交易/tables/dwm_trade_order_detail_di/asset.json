@@ -2124,6 +2124,20 @@
         "买家ID",
         "buyer_id"
       ],
+      "calculationSemantics": {
+        "semanticEntityRole": "BUYER",
+        "allowedAggregations": [
+          "COUNT",
+          "COUNT_DISTINCT"
+        ],
+        "derivedMeasureTimeRollupPolicy": "RECOMPUTE_FROM_DETAIL",
+        "derivableMeasures": [
+          {
+            "operation": "COUNT_DISTINCT",
+            "resultSemanticType": "PERIOD_DISTINCT_COUNT"
+          }
+        ]
+      },
       "enumValues": [],
       "metricFormula": "",
       "confidence": 0.78,

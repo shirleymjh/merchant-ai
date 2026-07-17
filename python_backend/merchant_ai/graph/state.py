@@ -99,6 +99,8 @@ class AgentState(TypedDict, total=False):
     routing_decision: RoutingDecision
     topic_routing_decision: TopicRoutingDecision
     topic_workspace: Dict[str, Any]
+    semantic_workspace_opened_topics: List[str]
+    semantic_topic_index_read: bool
     analysis_scope: Dict[str, Any]
     knowledge_refresh: Dict[str, Any]
     route_slots: RouteSlots
@@ -119,6 +121,8 @@ class AgentState(TypedDict, total=False):
     extracted_keywords: Any
     plan: QueryPlan
     recall_bundle: RecallBundle
+    initial_topic_recall_completed: bool
+    initial_topic_recall_trace: Dict[str, Any]
     knowledge_bundle: KnowledgeBundle
     recall_rounds: List[Any]
     knowledge_request_lineage: Dict[str, Any]
@@ -131,6 +135,19 @@ class AgentState(TypedDict, total=False):
     fast_metric_completed: bool
     fast_metric_response: Any
     planning_asset_pack: PlanningAssetPack
+    planning_authority: str
+    legacy_planning_disabled: bool
+    grounded_query_contract: Any
+    grounded_query_contract_attempt: Any
+    grounded_asset_pack: PlanningAssetPack
+    grounded_contract_validation: Dict[str, Any]
+    grounded_contract_ready: bool
+    grounded_rejected_bindings: List[Dict[str, Any]]
+    grounded_query_compiled: bool
+    grounded_compile_trace: Dict[str, Any]
+    grounded_compile_reason: str
+    grounded_runtime_failure: Dict[str, Any]
+    semantic_evidence_ledger: List[Dict[str, Any]]
     query_graph_validation_result: GraphValidationResult
     pending_knowledge_requests: List[KnowledgeRequest]
     knowledge_request_attempts: Dict[str, int]
@@ -355,6 +372,8 @@ class AgentState(TypedDict, total=False):
     _skill_middleware_loaded: List[str]
     _summarized_stages: List[str]
     _next_action: str
+    _initial_topic_recall: bool
+    _core_targeted_topic_recall: bool
 
 
 def emit(state: AgentState, event_type: str, node: str, payload: Dict[str, Any]) -> None:

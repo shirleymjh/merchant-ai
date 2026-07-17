@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from merchant_ai.config import get_settings
-from merchant_ai.graph.workflow import MerchantQaWorkflow
+from merchant_ai.graph.workflow import MerchantQaWorkflow, business_scope_examples
 from merchant_ai.models import ChatContext, QuestionCategory, RouteSlots, TopicRoutingDecision
 from merchant_ai.services.assets import TopicAssetService
 from merchant_ai.services.deep_agent_runtime import DeepAgentWorkflowAdapter, _DianaLeadSession, _ResultSink
@@ -90,7 +90,7 @@ def test_strong_current_signal_can_replace_an_inferred_historical_workspace(topi
 @pytest.mark.parametrize(
     ("question", "expected_policy", "expected_isolated"),
     [
-        ("看看最近 7 天订单情况", "on_gap_or_tool_request", False),
+        ("看看最近 7 天订单情况", "filesystem_manifest_browse", False),
         ("只看交易订单，不要扩展其他业务域", "user_locked", True),
     ],
 )
@@ -173,5 +173,69 @@ def test_profile_metric_stays_queryable_but_causal_question_discovers_detail_l0(
     causal_keywords = topic_runtime.keywords.extract(causal_question)
     causal_decision = topic_runtime.router.route(causal_question, causal_keywords)
 
-    assert causal_decision.recall_topics()[0] == QuestionCategory("CS_TICKET")
-    assert QuestionCategory("经营画像") in causal_decision.recall_topics()
+    assert causal_decision.recall_topics() == [QuestionCategory("CS_TICKET")]
+    assert QuestionCategory("经营画像") in causal_keywords.topic_scores
+
+
+def test_order_and_refund_summary_keeps_business_owners_separate_from_serving_topic(
+    topic_runtime,
+) -> None:
+    """Topic is an automatic serving decision, not a merchant-facing category choice."""
+
+    question = "只查询最近30天的订单数和退款总额"
+    keywords = topic_runtime.keywords.extract(question)
+    decision = topic_runtime.router.route(question, keywords)
+
+    assert decision.selection_mode == "automatic"
+    assert decision.recall_topics() == [QuestionCategory("经营画像")]
+    assert decision.selection_evidence["queryShape"] == "summary_or_total"
+    assert decision.selection_evidence["sameTableSummaryCandidate"] is True
+    assert decision.selection_evidence["servingTopics"] == ["经营画像"]
+    assert decision.selection_evidence["servingTables"] == ["ads_merchant_profile"]
+    assert decision.selection_evidence["businessTopics"] == ["电商交易", "电商退货"]
+    assert {
+        item["metricKey"] for item in decision.selection_evidence["matchedMetrics"]
+    } == {"order_cnt_1d", "refund_amt_1d"}
+    assert "同一张已治理汇总表" in decision.reason
+    assert "业务归属仍保留为 电商交易、电商退货" in decision.reason
+
+
+def test_business_clarification_never_asks_merchant_to_choose_internal_topic() -> None:
+    harness = SimpleNamespace()
+
+    scope_prompt = MerchantQaWorkflow.build_scope_clarification_prompt(harness, {})
+    ambiguous_prompt = MerchantQaWorkflow.build_topic_clarification_prompt(harness, {})
+
+    assert "系统自动选择" in scope_prompt
+    assert "系统自动选择" in ambiguous_prompt
+    assert "请从已发布 Topic" not in ambiguous_prompt
+    assert business_scope_examples() == [
+        "最近30天的订单数和退款总额",
+        "最近7天按商品看的退款金额",
+        "查询某个订单或退款单的明细",
+    ]
+
+
+def test_core_observation_exposes_auditable_automatic_topic_selection(topic_runtime) -> None:
+    question = "只查询最近30天的订单数和退款总额"
+    keywords = topic_runtime.keywords.extract(question)
+    decision = topic_runtime.router.route(question, keywords)
+    adapter = object.__new__(DeepAgentWorkflowAdapter)
+    adapter.domain_workflow = SimpleNamespace(policy=SimpleNamespace(max_main_actions=16))
+    adapter.semantic_catalog = SimpleNamespace(topic_assets=topic_runtime.assets)
+    session = _DianaLeadSession(
+        state={
+            "react_round": 0,
+            "topic_workspace": {"mode": "topic_workspace", "topics": ["经营画像"]},
+            "topic_routing_decision": decision,
+        },
+        sink=_ResultSink(),
+        available_actions=(),
+    )
+
+    payload = adapter._turn_payload(session)
+
+    assert payload["topicSelection"]["userChoiceRequired"] is False
+    assert payload["topicSelection"]["businessTopics"] == ["电商交易", "电商退货"]
+    assert payload["topicSelection"]["servingTopics"] == ["经营画像"]
+    assert payload["topicSelection"]["sameTableSummaryCandidate"] is True

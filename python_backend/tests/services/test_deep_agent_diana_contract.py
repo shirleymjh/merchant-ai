@@ -25,12 +25,30 @@ class _SemanticCatalogStub:
     def read(self, path: str, max_chars: int, offset: int) -> dict[str, Any]:
         del max_chars, offset
         self.read_calls.append(path)
+        if path.strip("/") == "topics/index.json":
+            return {
+                "success": True,
+                "refId": "semantic:topics:index",
+                "path": "topics/index.json",
+                "kind": "TOPIC_INDEX",
+                "topic": "",
+                "content": '{"topics":[{"topic":"FINANCE","manifestPath":"topics/FINANCE/manifest.json"}]}\n',
+            }
         parts = [part for part in path.strip("/").split("/") if part]
         topic = parts[1] if len(parts) >= 2 and parts[0] == "topics" else ""
         return {
             "success": True,
+            "refId": f"semantic:{topic}:manifest",
+            "path": path.strip("/"),
+            "kind": "TOPIC_MANIFEST",
             "topic": topic,
             "content": '{"kind":"manifest"}\n',
+        }
+
+    @staticmethod
+    def topic_index_ref() -> dict[str, Any]:
+        return {
+            "content": '{"topics":[{"topic":"FINANCE","manifestPath":"topics/FINANCE/manifest.json"}]}\n'
         }
 
     def ls(self, path: str, limit: int) -> list[dict[str, Any]]:
@@ -38,8 +56,8 @@ class _SemanticCatalogStub:
         self.ls_calls.append(path)
         return [{"path": f"{path.strip('/')}/manifest.json", "estimatedChars": 32}]
 
-    def grep(self, query: str, topic: str, limit: int) -> list[dict[str, Any]]:
-        del limit
+    def grep(self, query: str, topic: str, limit: int, path: str = "") -> list[dict[str, Any]]:
+        del limit, path
         self.grep_calls.append((query, topic))
         return [
             {
@@ -289,7 +307,7 @@ def test_deepagent_owns_short_term_context_but_not_governed_merchant_memory(
     )
 
 
-def test_semantic_backend_requires_topic_and_confines_all_reads_to_active_topic() -> None:
+def test_semantic_backend_uses_topic_index_and_opened_manifests_to_grow_workspace() -> None:
     catalog = _SemanticCatalogStub()
     backend = ReadOnlySemanticBackend(catalog)
 
@@ -304,22 +322,57 @@ def test_semantic_backend_requires_topic_and_confines_all_reads_to_active_topic(
     with backend.scope_to_state(state):
         topic_listing = backend.ls("/topics")
         assert topic_listing.error is None
-        assert [entry["path"] for entry in topic_listing.entries or []] == ["/topics/SALES/"]
+        assert [entry["path"] for entry in topic_listing.entries or []] == [
+            "/topics/index.json",
+            "/topics/SALES/",
+        ]
+
+        index_read = backend.read("/topics/index.json")
+        assert index_read.error is None
 
         active_read = backend.read("/topics/SALES/manifest.json")
         assert active_read.error is None
         assert active_read.file_data and "manifest" in active_read.file_data["content"]
 
-        denied_read = backend.read("/topics/FINANCE/manifest.json")
-        denied_ls = backend.ls("/topics/FINANCE")
-        denied_grep = backend.grep("revenue", "/topics/FINANCE")
-        assert "TOPIC_SCOPE_DENIED" in (denied_read.error or "")
-        assert "TOPIC_SCOPE_DENIED" in (denied_ls.error or "")
-        assert "TOPIC_SCOPE_DENIED" in (denied_grep.error or "")
+        opened_read = backend.read("/topics/FINANCE/manifest.json")
+        opened_ls = backend.ls("/topics/FINANCE")
+        opened_grep = backend.grep("revenue", "/topics/FINANCE")
+        assert opened_read.error is None
+        assert opened_ls.error is None
+        assert opened_grep.error is None
+        assert state["semantic_workspace_opened_topics"] == ["FINANCE"]
+        assert state["topic_workspace"]["effectiveTopics"] == ["SALES", "FINANCE"]
 
-    assert catalog.read_calls == ["topics/SALES/manifest.json"]
+    assert catalog.read_calls == [
+        "topics/index.json",
+        "topics/SALES/manifest.json",
+        "topics/FINANCE/manifest.json",
+    ]
     assert catalog.ls_calls == []
-    assert catalog.grep_calls == []
+    assert catalog.grep_calls == [("revenue", "FINANCE")]
+
+
+def test_semantic_backend_canonicalizes_alias_paths_and_honors_user_topic_lock() -> None:
+    catalog = _SemanticCatalogStub()
+    backend = ReadOnlySemanticBackend(catalog)
+    state = {
+        "topic_workspace": {
+            "mode": "explicit_topic_scope",
+            "topics": ["SALES"],
+            "isolated": True,
+            "expansionPolicy": "user_locked",
+        }
+    }
+
+    with backend.scope_to_state(state):
+        denied_before_index = backend.read("runtime/topics/FINANCE/manifest.json")
+        assert "TOPIC_SCOPE_LOCKED" in (denied_before_index.error or "")
+        assert backend.read("resources/runtime/topics/index.json").error is None
+        denied_after_index = backend.read("resources/runtime/topics/FINANCE/manifest.json")
+
+    assert "TOPIC_SCOPE_LOCKED" in (denied_after_index.error or "")
+    assert state.get("semantic_workspace_opened_topics") in (None, [])
+    assert catalog.read_calls == ["topics/index.json"]
 
 
 def test_deepagent_tool_schemas_never_expose_runtime_or_trusted_session() -> None:
@@ -417,7 +470,8 @@ def test_only_successful_core_read_file_calls_enter_trusted_semantic_evidence() 
     assert len(evidence["contentHash"]) == 64
     assert evidence["offset"] == 0
     assert evidence["limit"] == 20
-    assert catalog.ls_calls == ["topics/SALES"]
+    assert evidence["contentComplete"] is True
+    assert catalog.ls_calls == []
     assert catalog.grep_calls == [("orders", "SALES")]
     assert catalog.read_calls == [
         "topics/SALES/tables/fact_order/detail.json",
@@ -456,7 +510,7 @@ def test_plan_graph_rejects_until_core_reads_table_detail_and_exact_definition()
     assert session.state["core_semantic_evidence"] == session.core_semantic_evidence
     assert session.state["core_managed_filesystem"] is True
     assert rejected["coreSemanticEvidence"]["readCount"] == 1
-    assert rejected["coreSemanticEvidence"]["planGraphReady"] is False
+    assert rejected["coreSemanticEvidence"]["contractProposalReady"] is False
     assert "contentSnippet" not in rejected["coreSemanticEvidence"]["refs"][0]
 
     with backend.scope_to_session(session):
@@ -468,8 +522,8 @@ def test_plan_graph_rejects_until_core_reads_table_detail_and_exact_definition()
     assert domain.handler_calls == 1
     assert session.state["plan_graph_handler_called"] is True
     assert len(session.state["core_semantic_evidence"]) == 2
-    assert completed["coreSemanticEvidence"]["planGraphReady"] is True
-    assert completed["coreSemanticEvidence"]["missingForPlanGraph"] == []
+    assert completed["coreSemanticEvidence"]["contractProposalReady"] is True
+    assert completed["coreSemanticEvidence"]["missingForContractProposal"] == []
     assert session.state["lead_decisions"][-1].source == "deepagent_core_react"
 
 

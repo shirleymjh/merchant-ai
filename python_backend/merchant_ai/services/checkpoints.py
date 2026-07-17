@@ -81,25 +81,25 @@ class CheckpointManager:
 
         Domain graph checkpoints remain isolated per run under ``thread:run``
         with the legacy empty namespace. The outer agent instead reuses the
-        real API conversation thread across runs and declares a dedicated
-        namespace, so its messages and StateBackend files can be resumed without
-        colliding with domain state. LangGraph root graphs may normalize a
-        non-empty namespace to ``""``; physical namespace nesting therefore
-        requires invoking the Deep Agent as a subgraph. Isolation does not rely
-        on that behavior because the domain key is independently run-scoped.
+        real API conversation thread across runs. A root LangGraph must use the
+        empty physical checkpoint namespace: passing ``checkpoint_ns=deepagent``
+        makes ``get_state`` interpret it as a subgraph path and fail with
+        ``Subgraph deepagent not found``. Logical ownership is retained in
+        metadata while collision safety comes from the conversation key versus
+        the legacy domain graph's independently run-scoped key.
         """
 
         checkpoint_thread_id = thread_id or "thread"
         return {
             "configurable": {
                 "thread_id": checkpoint_thread_id,
-                "checkpoint_ns": DEEP_AGENT_CHECKPOINT_NAMESPACE,
             },
             "metadata": {
                 "thread_id": thread_id,
                 "run_id": run_id,
                 "checkpoint_thread_id": checkpoint_thread_id,
-                "checkpoint_namespace": DEEP_AGENT_CHECKPOINT_NAMESPACE,
+                "checkpoint_namespace": "",
+                "logical_checkpoint_namespace": DEEP_AGENT_CHECKPOINT_NAMESPACE,
             },
             "recursion_limit": 80,
         }
@@ -126,7 +126,8 @@ class CheckpointManager:
             "threadId": thread_id,
             "runId": run_id,
             "checkpointThreadId": checkpoint_thread_id,
-            "checkpointNamespace": DEEP_AGENT_CHECKPOINT_NAMESPACE,
+            "checkpointNamespace": "",
+            "logicalCheckpointNamespace": DEEP_AGENT_CHECKPOINT_NAMESPACE,
             "storage": self.storage_ref(),
             "resumable": (self.backend or "sqlite") != "memory",
             "purpose": "deep_agent_conversation_checkpoint",

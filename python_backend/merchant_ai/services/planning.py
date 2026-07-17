@@ -17835,6 +17835,13 @@ def add_metric_contract_columns(
         value = str(column or "")
         if value in physical_columns:
             target.add(value)
+    # GroundedQueryContract may explicitly bind descriptive label columns for
+    # an entity key (for example spu_id grouped with MAX(spu_name)).  These are
+    # produced by a governed aggregate projection, not arbitrary output fields.
+    for column in contract.get("labelColumns") or contract.get("label_columns") or []:
+        value = str(column or "")
+        if value in physical_columns:
+            target.add(value)
     formula = str(contract.get("metricFormula") or contract.get("metric_formula") or contract.get("formula") or "")
     target.update(metric_formula_columns(formula, physical_columns))
 

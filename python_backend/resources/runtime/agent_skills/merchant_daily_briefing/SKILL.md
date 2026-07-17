@@ -1,5 +1,5 @@
 ---
-name: merchant_daily_briefing
+name: merchant-daily-briefing
 description: Use when a merchant asks for a daily/weekly operating briefing, store health summary, or what to prioritize today. The skill summarizes verified business signals into action priorities.
 title: 经营简报
 executionMode: structured_renderer
@@ -13,8 +13,8 @@ briefing.
 
 ## Activation Contract
 
-Use this skill only when the Planner-produced `questionUnderstanding` declares
-a reusable or fixed analysis workflow and the question asks for a store health
+Use this skill only when the Core has sufficient verified evidence and the
+question asks for a store health
 summary, daily report, weekly report, operating briefing, or priority list.
 
 Do not use it for a single metric lookup unless the user asks for diagnosis or
@@ -28,7 +28,7 @@ prioritization.
 - Separate facts, risks, and suggested actions.
 - Every priority must be tied to a data row or an explicit evidence gap.
 
-## Workflow
+## Procedure
 
 1. Summarize trade, refund/after-sales, customer service/compensation, product,
    and fulfillment signals that are present in the evidence.

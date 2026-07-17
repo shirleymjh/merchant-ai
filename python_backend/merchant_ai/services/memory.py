@@ -2153,7 +2153,7 @@ class KnowledgeSuggestionGovernanceService:
         require_index_change: bool,
     ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
         def verify(context: Dict[str, Any]) -> Dict[str, Any]:
-            from merchant_ai.services.assets import semantic_metric_ref_id, semantic_table_ref_id
+            from merchant_ai.services.assets import semantic_metric_ref_id, semantic_table_detail_ref_id
             from merchant_ai.services.recall_index import manifest_ref_for_recall_item
 
             filesystem_readback = topic_assets.verify_published_suggestion(topic, table_name, suggestion_id)
@@ -2174,7 +2174,7 @@ class KnowledgeSuggestionGovernanceService:
                 if kind == "metrics" and metric_key:
                     expected_refs.append(semantic_metric_ref_id(topic, table_name, metric_key))
                 else:
-                    expected_refs.append(semantic_table_ref_id(topic, table_name))
+                    expected_refs.append(semantic_table_detail_ref_id(topic, table_name))
             expected_refs = list(dict.fromkeys(expected_refs))
             candidate_refs: List[str] = []
             candidate_manifest_refs: Dict[str, str] = {}

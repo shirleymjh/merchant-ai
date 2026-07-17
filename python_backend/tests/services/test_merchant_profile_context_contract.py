@@ -63,6 +63,54 @@ def test_principal_profile_projects_only_declared_stable_context_columns():
     assert "999" not in rendered
 
 
+def test_principal_profile_drops_declared_columns_missing_from_live_schema():
+    class Repository:
+        def __init__(self):
+            self.calls = []
+
+        @staticmethod
+        def show_full_columns(_table):
+            return [
+                {"Field": "principal_key"},
+                {"Field": "display_value"},
+                {"Field": "merchant_type_name"},
+            ]
+
+        def query(self, sql, params):
+            self.calls.append((sql, params))
+            return [
+                {
+                    "principal_key": "p-1",
+                    "display_value": "Profile Alpha",
+                    "merchant_type_name": "企业商户",
+                }
+            ]
+
+    repository = Repository()
+    service = MerchantService(
+        get_settings(),
+        repository,
+        {
+            "table": "table_alpha",
+            "lookupColumn": "principal_key",
+            "idColumn": "principal_key",
+            "displayColumns": ["display_value"],
+            "contextColumns": ["merchant_type_name", "removed_column"],
+        },
+    )
+
+    merchant = service.current_merchant("p-1")
+
+    assert repository.calls == [
+        (
+            "SELECT `principal_key`, `display_value`, `merchant_type_name` "
+            "FROM `table_alpha` WHERE `principal_key` = %s LIMIT 1",
+            ["p-1"],
+        )
+    ]
+    assert merchant.rows == {"merchant_type_name": "企业商户"}
+
+
 def test_principal_profile_binding_rejects_unsafe_context_column(tmp_path):
     asset_path = tmp_path / "身份信息" / "tables" / "dim_profile" / "asset.json"
     asset_path.parent.mkdir(parents=True)

@@ -1,5 +1,5 @@
 ---
-name: risk_analysis
+name: risk-analysis
 description: Use when verified BI evidence must rank or explain merchant operational risk across products, orders, refunds, compensation, tickets, coupons, or fulfillment. The skill must only use verified evidence rows and must separate observed facts from risk hypotheses.
 title: 风险分析
 executionMode: structured_renderer
@@ -10,13 +10,11 @@ renderer: verified_evidence
 
 ## Activation Contract
 
-Use this skill when `questionUnderstanding.analysisIntent` is `risk_ranking`,
-`diagnosis`, or `anomaly_check`, and the answer needs a prioritized risk view
-across two or more BI evidence domains.
+Use this skill when the Grounded Contract and verified evidence require risk
+ranking, diagnosis, or anomaly analysis across two or more BI evidence domains.
 
-Do not activate from raw question keywords alone. The Answer agent must select
-this skill from structured understanding, planned metrics, verified evidence,
-and evidence gaps.
+Do not activate from raw question keywords alone. The Core must select this
+skill from grounded bindings, verified evidence, and evidence gaps.
 
 ## Evidence Rules
 
@@ -27,7 +25,7 @@ and evidence gaps.
 - If an important evidence branch failed or returned zero rows, keep it as a
   caveat rather than treating it as low risk.
 
-## Workflow
+## Procedure
 
 1. Identify risk dimensions available in evidence: volume, amount, rate,
    compensation, tickets, coupon spend, fulfillment, product lifecycle.

@@ -1,5 +1,5 @@
 ---
-name: bi_trend_attribution
+name: bi-trend-attribution
 description: Use when a merchant BI question asks whether a metric trend is normal, why a business metric changed, whether multiple KPI time series move together, or which measured drivers explain risk. The skill must only use verified SQL evidence rows and must attach every conclusion to data.
 title: BI 趋势与归因
 executionMode: python_script
@@ -10,11 +10,11 @@ script: scripts/profile_timeseries.py
 
 This skill turns verified BI evidence into a constrained analysis answer. It is
 for trend checks, anomaly checks, attribution, risk explanation, and "what
-should I prioritize" questions after QueryGraph execution has produced evidence.
+should I prioritize" questions after Grounded execution has produced verified evidence.
 
 ## Activation Contract
 
-Use this skill only when the Planner-produced `questionUnderstanding` declares:
+Use this skill only when the Core has a grounded analysis request and verified evidence declares:
 
 - `analysisIntent` is `trend_check`, `anomaly_check`, `diagnosis`, or `comparison`, or
 - `requiresExplanation` is true and the required evidence intents describe trend, anomaly, diagnosis, attribution, or comparison evidence.
@@ -23,8 +23,8 @@ Do not use this skill for plain entity ranking / lookup questions such as "top
 products and show refund amount / publish time". Those should be answered as
 ranked evidence tables unless a separate analysis skill is selected.
 
-Do not activate from raw question keywords. The Lead/Answer agent should decide
-from structured question understanding.
+Do not activate from raw question keywords. The Core should decide from the
+Grounded Contract, verified evidence, and evidence gaps.
 
 ## Evidence Rules
 
@@ -36,7 +36,7 @@ from structured question understanding.
 - If all available evidence is flat or sparse, state that the data does not
   support a strong anomaly conclusion.
 
-## Workflow
+## Procedure
 
 1. Judge change direction and magnitude from the available time series.
 2. Locate the concentration of change by metric/date/entity when such columns
@@ -55,5 +55,5 @@ python scripts/profile_timeseries.py --input <skill-input.json> --output <skill-
 ```
 
 The script returns a structured profile with `findings`, `metrics`, `caveats`,
-and `answerMarkdown`. The Answer agent may use `answerMarkdown` directly when
+and `answerMarkdown`. The Core may use `answerMarkdown` directly when
 LLM answer synthesis is slow or unavailable.

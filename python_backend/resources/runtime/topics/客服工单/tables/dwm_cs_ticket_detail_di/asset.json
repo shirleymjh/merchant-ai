@@ -1689,7 +1689,22 @@
       "enumValues": [],
       "metricFormula": "",
       "confidence": 0.78,
-      "evidence": "schema comment=商品id"
+      "evidence": "schema comment=商品id",
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_PRODUCT_GROUP_KEY"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_PRODUCT_GROUP_KEY"
+      },
+      "defaultVisible": true,
+      "displayPriority": 10,
+      "displayScenarios": [
+        "group_agg",
+        "topn"
+      ]
     },
     {
       "columnName": "is_reminder",
@@ -2407,7 +2422,22 @@
       "enumValues": [],
       "metricFormula": "",
       "confidence": 0.78,
-      "evidence": "schema comment=spu名称"
+      "evidence": "schema comment=spu名称",
+      "visibilityPolicy": {
+        "level": "public",
+        "allowedRoles": [],
+        "reason": "PUBLISHED_PRODUCT_LABEL"
+      },
+      "maskingPolicy": {
+        "strategy": "none",
+        "reason": "PUBLISHED_PRODUCT_LABEL"
+      },
+      "defaultVisible": true,
+      "displayPriority": 20,
+      "displayScenarios": [
+        "group_agg",
+        "topn"
+      ]
     },
     {
       "columnName": "level1_category_code",

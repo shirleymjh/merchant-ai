@@ -1,5 +1,5 @@
 ---
-name: gmv_drop_diagnosis
+name: gmv-drop-diagnosis
 description: Use when a merchant asks why GMV, sales amount, paid orders, or order volume dropped or moved abnormally. The skill is a fixed merchant-operation SOP and must only use verified evidence rows.
 title: 指标下降诊断
 executionMode: structured_renderer
@@ -13,8 +13,8 @@ GMV, sales amount, paid orders, or order volume decline.
 
 ## Activation Contract
 
-Use this skill only when the Planner-produced `questionUnderstanding` declares
-a reusable or fixed analysis workflow and the question asks for trend,
+Use this skill only when the Core has a Grounded Contract plus verified evidence
+and the question asks for trend,
 anomaly, diagnosis, comparison, or attribution around GMV, sales amount, or
 orders.
 
@@ -29,7 +29,7 @@ Do not use it for plain count lookups, product lists, or refund-only questions.
 - If the evidence only shows the metric changed, say that the cause still needs
   product/channel/date breakdown evidence.
 
-## Workflow
+## Procedure
 
 1. Judge the direction and magnitude of GMV/order change.
 2. Locate whether the change is concentrated by date, product, category,

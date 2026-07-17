@@ -1,5 +1,5 @@
 ---
-name: ratio_analysis
+name: ratio-analysis
 description: Use when the answer depends on a derived ratio, percentage, or population subset calculation. The skill must expose numerator, denominator, formula, and coverage gaps.
 title: 派生指标分析
 executionMode: structured_renderer
@@ -10,9 +10,8 @@ renderer: verified_evidence
 
 ## Activation Contract
 
-Use this skill when a QueryGraph has a derived ratio/percentage metric, or
-`questionUnderstanding.calculationIntents` contains a ratio, percentage, share,
-or占比 style calculation.
+Use this skill when the Grounded Contract and verified evidence contain a
+derived ratio/percentage metric, share, or 占比 calculation.
 
 ## Evidence Rules
 
@@ -21,7 +20,7 @@ or占比 style calculation.
 - If the base population is scope-constrained, state the scope source.
 - If the numerator and denominator use different grains, call out that caveat.
 
-## Workflow
+## Procedure
 
 1. Identify base population and event/subset population.
 2. Report numerator evidence, denominator evidence, and formula.

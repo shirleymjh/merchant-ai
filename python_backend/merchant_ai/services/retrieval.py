@@ -20,7 +20,12 @@ from merchant_ai.models import (
     RetrievalIssue,
     category_display,
 )
-from merchant_ai.services.assets import HybridRecallService, TopicAssetService, compact_metric_for_recall
+from merchant_ai.services.assets import (
+    HybridRecallService,
+    TopicAssetService,
+    compact_metric_for_recall,
+    semantic_metric_path,
+)
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.semantic_request import semantic_request_cache_key
 from merchant_ai.services.time_semantics import resolve_time_range
@@ -63,7 +68,11 @@ class HybridKnowledgeRetrievalService:
             request.merchant_id,
             request.topic_categories,
         )
-        if request.topic_categories and not request.knowledge_request:
+        if (
+            request.topic_categories
+            and not request.knowledge_request
+            and not request.strict_topic_scope
+        ):
             broad_bundle = self.recall_service.recall(
                 rewritten_query,
                 ExtractedKeywords(keywords=request.keywords),
@@ -739,7 +748,7 @@ class EsKnowledgeRetrievalService:
                 "semanticSource": "metrics",
                 "semanticKind": "METRIC",
                 "semanticRefId": semantic_ref_id,
-                "semanticPath": "topics/%s/tables/%s/asset.json#metric:%s" % (topic, table, metric_key),
+                "semanticPath": semantic_metric_path(topic, table, metric_key),
                 "metricKey": metric_key,
                 "tableName": table,
                 "topic": topic,

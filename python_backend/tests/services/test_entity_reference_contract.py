@@ -26,7 +26,7 @@ from merchant_ai.services.planning import (
     resolve_entity_reference,
 )
 from merchant_ai.services.query import (
-    NodePlanCritic,
+    NodeExecutionContractValidator,
     build_entity_filter_verification_proof,
     entity_filter_result_contract_error,
     sql_has_entity_filter_predicate,
@@ -448,12 +448,12 @@ def bound_entity_contract(
 def test_node_critic_rejects_dropped_or_changed_entity_filter() -> None:
     contract = bound_entity_contract()
 
-    assert NodePlanCritic().review(contract).valid
+    assert NodeExecutionContractValidator().review(contract).valid
 
-    dropped = NodePlanCritic().review(
+    dropped = NodeExecutionContractValidator().review(
         contract.model_copy(update={"filter_column": "", "filter_values": []})
     )
-    changed = NodePlanCritic().review(
+    changed = NodeExecutionContractValidator().review(
         contract.model_copy(update={"filter_values": ["OTHER-9"]})
     )
 
@@ -570,7 +570,7 @@ def test_node_critic_rejects_entity_values_over_runtime_contract_limit() -> None
         update={"filter_value_limit": 2}
     )
 
-    critique = NodePlanCritic().review(contract)
+    critique = NodeExecutionContractValidator().review(contract)
 
     assert not critique.valid
     assert "ENTITY_FILTER_VALUE_LIMIT_EXCEEDED" in {

@@ -1,5 +1,5 @@
 ---
-name: rule_compliance
+name: rule-compliance
 description: Use when a merchant BI answer combines platform rules or policy guidance with measured evidence. The skill must keep recalled rule evidence separate from SQL facts.
 title: 规则与数据核对
 executionMode: structured_renderer
@@ -10,11 +10,11 @@ renderer: verified_evidence
 
 ## Activation Contract
 
-Use this skill when `plan_requires_rule_evidence(plan)` is true and verified
-data evidence is also present.
+Use this skill when the Grounded session contains governed rule evidence and
+verified data evidence.
 
-Rule-only questions should use the RuleAnswerAgent path. This skill is for
-rule + data or rule + data + analysis answers.
+Rule-only questions can be answered directly from governed rule evidence. This
+skill is for rule + data or rule + data + analysis answers.
 
 ## Evidence Rules
 
@@ -25,7 +25,7 @@ rule + data or rule + data + analysis answers.
 - If the rule evidence is partial, say that the compliance conclusion is
   limited by the recalled rule coverage.
 
-## Workflow
+## Procedure
 
 1. Summarize applicable rule evidence.
 2. Summarize measured data evidence.

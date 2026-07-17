@@ -230,7 +230,7 @@ def recovery_action_for(tool_name: str, error_type: str, tool_kind: str = "") ->
             tool_kind=kind,
             action="repair_tool_handler_or_degrade",
             retryable=False,
-            fallback_tools=["contract_critic", "answer_with_gap"],
+            fallback_tools=["execution_contract_validation", "answer_with_gap"],
             message="工具返回结果不满足注册契约，高风险工具已 fail closed。",
         )
     if error == "MEM_ALLOC_FAILED":

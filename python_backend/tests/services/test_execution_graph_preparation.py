@@ -626,7 +626,7 @@ def test_late_realtime_selection_fails_closed_instead_of_executing_a_new_table()
         SqlValidationService(),
         get_settings(),
     )
-    worker.node_plan_critic = AlwaysValidNodeCritic()
+    worker.node_contract_validator = AlwaysValidNodeCritic()
     logical_preparation = prepare_execution_graph(
         question,
         plan,

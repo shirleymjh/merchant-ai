@@ -586,6 +586,8 @@ class TopicRoutingDecision(APIModel):
     routing_mode: str = "open"
     workspace_topics: List[QuestionCategory] = Field(default_factory=list)
     scope_disclosure_required: bool = False
+    selection_mode: str = "automatic"
+    selection_evidence: Dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
 
     def recall_topics(self) -> List[QuestionCategory]:
@@ -772,6 +774,9 @@ class KnowledgeRetrievalRequest(APIModel):
     intent_kind: str = ""
     complexity: str = ""
     round: int = 0
+    # Initial Topic bootstrap must remain inside the selected workspace.  Broad
+    # or cross-Topic recall is permitted only for an explicit supplemental gap.
+    strict_topic_scope: bool = False
 
 
 class RetrievalIssue(APIModel):

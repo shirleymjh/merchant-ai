@@ -141,6 +141,15 @@ from merchant_ai.services.context_assembly import (
 )
 from merchant_ai.services.context_filesystem import add_context_uri, context_lineage_record, merchant_uri_for_artifact, merchant_uri_for_semantic_ref
 from merchant_ai.services.evidence import EvidenceVerifier
+from merchant_ai.services.grounded_query_contract import (
+    GroundedContractGap,
+    GroundedQueryContract,
+    GroundedQueryContractBuilder,
+    GroundedQueryContractValidator,
+    compile_grounded_query as compile_grounded_query_contract,
+    materialize_grounded_asset_pack,
+    merge_grounded_rejected_bindings,
+)
 from merchant_ai.services.latency import LatencyOptimizer
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.llm_recovery import (
@@ -373,6 +382,8 @@ class MerchantQaWorkflow:
             routing_decision=RoutingDecision(),
             topic_routing_decision=TopicRoutingDecision(),
             topic_workspace={},
+            semantic_workspace_opened_topics=[],
+            semantic_topic_index_read=False,
             analysis_scope={},
             knowledge_refresh={},
             route_slots=RouteSlots(),
@@ -390,10 +401,25 @@ class MerchantQaWorkflow:
             fast_metric_response=None,
             plan=QueryPlan(),
             recall_bundle=RecallBundle(),
+            initial_topic_recall_completed=False,
+            initial_topic_recall_trace={},
             knowledge_bundle=KnowledgeBundle(),
             recall_rounds=[],
             intent_signals=IntentSignals(),
             planning_asset_pack=PlanningAssetPack(),
+            planning_authority="legacy_question_understanding",
+            legacy_planning_disabled=False,
+            grounded_query_contract=None,
+            grounded_query_contract_attempt=None,
+            grounded_asset_pack=PlanningAssetPack(),
+            grounded_contract_validation={},
+            grounded_contract_ready=False,
+            grounded_rejected_bindings=[],
+            grounded_query_compiled=False,
+            grounded_compile_trace={},
+            grounded_compile_reason="",
+            grounded_runtime_failure={},
+            semantic_evidence_ledger=[],
             query_graph_validation_result=GraphValidationResult(),
             pending_knowledge_requests=[],
             knowledge_request_attempts={},
@@ -893,7 +919,7 @@ class MerchantQaWorkflow:
                 stage = "UNSUPPORTED_OPERATION"
             else:
                 clarification = understanding.clarification_question or self.build_scope_clarification_prompt(state)
-                options = business_scope_options(self.recall_service.topic_assets)
+                options = business_scope_examples()
                 clarification_type = "business_scope"
                 stage = "BUSINESS_SCOPE"
             self.request_human_clarification(state, clarification, stage, clarification_type, options)
@@ -2609,6 +2635,8 @@ class MerchantQaWorkflow:
                 "stage": "topic_router",
                 "candidateTopics": [enum_value(item) for item in decision.candidate_topics],
                 "confidence": decision.confidence,
+                "selectionMode": decision.selection_mode,
+                "selectionEvidence": dict(decision.selection_evidence or {}),
                 "reason": decision.reason,
             }
         )
@@ -2664,7 +2692,7 @@ class MerchantQaWorkflow:
                 self.build_topic_clarification_prompt(state),
                 "BUSINESS_SCOPE",
                 "topic_required",
-                business_scope_options(self.recall_service.topic_assets),
+                business_scope_examples(),
             )
         else:
             diagnostic_topics = self.apply_open_diagnostic_policy(state, decision)
@@ -2761,8 +2789,8 @@ class MerchantQaWorkflow:
             topic_role = "explicit_boundary"
             expansion_policy = "user_locked"
         elif mode == "topic_workspace":
-            topic_role = "topic_boundary"
-            expansion_policy = "on_gap_or_tool_request"
+            topic_role = "seed_workspace"
+            expansion_policy = "filesystem_manifest_browse"
         elif mode == "open_discovery":
             topic_role = "discovery_seed"
             expansion_policy = "coverage_and_relationship_driven"
@@ -2781,6 +2809,8 @@ class MerchantQaWorkflow:
             "expansionPolicy": expansion_policy,
             "scopeDisclosureRequired": decision.scope_disclosure_required,
             "knowledgeRefreshPolicy": "refresh_each_business_turn",
+            "openedTopics": [],
+            "effectiveTopics": topic_names,
         }
         state["topic_workspace"] = workspace
         state["analysis_scope"] = {
@@ -2788,7 +2818,7 @@ class MerchantQaWorkflow:
             "riskLevel": str(route_slots.risk_level or "normal"),
             "timeWindow": route_slots.time_window.model_dump(by_alias=True),
             "objectRefs": [item.model_dump(by_alias=True) for item in route_slots.object_refs],
-            "displayText": "当前 Topic 边界：%s；仅在证据缺口或工具请求时补充关联 Topic"
+            "displayText": "当前 Seed Topic：%s；覆盖不足时先浏览全局 Topic Index，再读取候选 manifest"
             % (" + ".join(topic_names) if topic_names else "待确认"),
         }
         state.setdefault("route_decision_trace", []).append({"stage": "topic_workspace", **workspace})
@@ -3322,6 +3352,8 @@ class MerchantQaWorkflow:
             "status": "skipped",
             "reason": "deterministic_route_confident",
             "allowedTopics": [enum_value(item) for item in decision.recall_topics()],
+            "selectionMode": decision.selection_mode,
+            "selectionEvidence": dict(decision.selection_evidence or {}),
         }
         if mode in {"off", "false", "0", "disabled"}:
             trace["reason"] = "route_llm_disabled"
@@ -3347,7 +3379,13 @@ class MerchantQaWorkflow:
             "question": state.get("question", ""),
             "routeSlots": route_slots.model_dump(by_alias=True),
             "allowedTopics": allowed,
-            "instruction": "只允许从 allowedTopics 中保留或删除 topic，不允许新增未知 topic。返回 JSON: {topics:[], confidence:0-1, reason:''}",
+            "selectionEvidence": dict(decision.selection_evidence or {}),
+            "instruction": (
+                "Topic 是内部取数工作区，不让商家选择。只允许从 allowedTopics 中保留或删除 topic，"
+                "不允许新增未知 topic；区分业务归属 businessTopics 与实际 servingTopics，"
+                "根据查询粒度、指标能力和 detailMetricRef 选择。返回 JSON: "
+                "{topics:[], confidence:0-1, reason:''}"
+            ),
         }
         try:
             payload = llm.json_chat(
@@ -3382,6 +3420,12 @@ class MerchantQaWorkflow:
         decision.primary_topic = route_primary_topic(categories)
         decision.dimension_topics = [] if decision.primary_topic == QuestionCategory.UNKNOWN else categories[1:]
         decision.confidence = float((payload or {}).get("confidence") or decision.confidence or route_slots.route_confidence or 0.0)
+        decision.selection_mode = "automatic_model_confirmed"
+        decision.selection_evidence = {
+            **dict(decision.selection_evidence or {}),
+            "modelSelectedTopics": topics,
+            "modelReason": str((payload or {}).get("reason") or ""),
+        }
         decision.reason = "受限 route LLM 确认；多 topic 时 primaryTopic 保持 UNKNOWN，不表示 anchor。%s" % str(
             (payload or {}).get("reason") or ""
         )
@@ -3407,15 +3451,15 @@ class MerchantQaWorkflow:
         max_candidates = int(getattr(self.settings, "route_topic_max_candidates", 4) or 4)
         mixed_min_confidence = float(getattr(self.settings, "route_mixed_rule_data_min_confidence", 0.75) or 0.75)
         if not business_topics and confidence < min_confidence:
-            return "业务域低置信且没有明确候选 Topic，先确认分析范围"
+            return "业务意图低置信且没有明确指标或对象，先让用户补充业务目标；不要求用户选择内部 Topic"
         if confidence < min_confidence and ("NO_EXPLICIT_TOPIC" in route_slots.route_warnings or not route_slots.object_refs):
-            return "Topic 低置信，缺少明确对象或业务关键词，先确认分析范围"
+            return "缺少明确对象或业务关键词，先确认要看的指标、对象或时间范围；Topic 仍由系统自动选择"
         if len(business_topics) > max_candidates and confidence < 0.82:
-            return "候选 Topic 过多且未形成稳定主域，先确认优先业务范围"
+            return "候选工作区过多，先确认优先看的业务指标或对象；不向用户暴露内部 Topic 选择"
         if route_slots.risk_level == "rule_sensitive" and data_topics and confidence < mixed_min_confidence:
             return "规则问题和数据分析域混在一起且置信度不足，先确认是查规则还是查经营数据"
         if "BROAD_TOPIC_SET" in route_slots.route_warnings and confidence < mixed_min_confidence:
-            return "路由命中范围过宽，先确认要看的业务域"
+            return "路由命中范围过宽，先确认要看的指标或对象"
         return ""
 
     def load_skill_policies_for_retrieval(self, state: AgentState) -> List[str]:
@@ -3427,7 +3471,16 @@ class MerchantQaWorkflow:
     def retrieve_knowledge(self, state: AgentState) -> AgentState:
         started = now_ms()
         step = self.start_run_step(state, "retrieve_knowledge", "KnowledgeAgent", "RETRIEVE_KNOWLEDGE", input_summary=state.get("question", ""))
-        increment_round(state)
+        # The first Topic-scoped recall is context bootstrap, not a business
+        # planning action chosen by the Core.  It runs immediately after Topic
+        # selection so the first Core observation can contain both the full L0
+        # table manifest and thin retrieval hints.  Supplemental recalls remain
+        # normal ReAct actions and therefore consume a round.
+        initial_topic_recall = bool(state.get("_initial_topic_recall"))
+        core_targeted_topic_recall = bool(state.get("_core_targeted_topic_recall"))
+        strict_topic_recall = initial_topic_recall or core_targeted_topic_recall
+        if not initial_topic_recall:
+            increment_round(state)
         self.configure_artifact_roots(state)
         state["query_graph_retrieve_count"] = int(state.get("query_graph_retrieve_count") or 0) + 1
         emit(state, "node.started", "RETRIEVE_KNOWLEDGE", {})
@@ -3457,9 +3510,14 @@ class MerchantQaWorkflow:
         base_topics = self._effective_topic_categories(state)
         fast_understanding = state.get("fast_understanding") or FastUnderstandingResult()
         query_scopes: List[tuple[str, List[QuestionCategory], Optional[KnowledgeRequest]]] = [(state["question"], base_topics, None)]
-        route_query = self.route_recall_query(state)
-        if route_query and route_query != state["question"]:
-            query_scopes.insert(0, (route_query, base_topics, None))
+        # Initial retrieval must preserve the complete user question.  Keyword
+        # slots and fast-understanding phrases are advisory signals only; using
+        # them to rewrite the first query would give them planning authority and
+        # can expand a narrow Topic merely because one word matched elsewhere.
+        if not initial_topic_recall:
+            route_query = self.route_recall_query(state)
+            if route_query and route_query != state["question"]:
+                query_scopes.insert(0, (route_query, base_topics, None))
         merged = state.get("recall_bundle") or RecallBundle()
         all_items = {item.doc_id: item for item in merged.items}
         existing_refs = set(all_items)
@@ -3497,6 +3555,7 @@ class MerchantQaWorkflow:
                     intent_kind=fast_understanding.intent_kind,
                     complexity=fast_understanding.complexity,
                     round=int(state.get("query_graph_retrieve_count") or 0),
+                    strict_topic_scope=strict_topic_recall,
                 )
                 retriever_backend = str(getattr(self.knowledge_retriever, "backend_name", "knowledge") or "knowledge")
                 try:
@@ -3562,7 +3621,11 @@ class MerchantQaWorkflow:
         pending_scopes = [
             (
                 request.query,
-                self._knowledge_request_topics(request, base_topics),
+                (
+                    base_topics
+                    if strict_topic_recall
+                    else self._knowledge_request_topics(request, base_topics)
+                ),
                 request.model_copy(update={"request_key": knowledge_request_key(request)}),
             )
             for request in active_pending_requests
@@ -3570,7 +3633,16 @@ class MerchantQaWorkflow:
         ]
         if pending_scopes:
             run_recall_scopes(pending_scopes, "pending_knowledge_request")
-        expansion_topics = self.knowledge_recall_expansion_topics(state, base_topics, active_pending_requests)
+        # A pending knowledge request describes a missing fact inside the
+        # current workspace; it is not authority to widen the Topic boundary.
+        # DeepAgent supplemental recall therefore remains strict just like the
+        # automatic first recall. Cross-Topic expansion must be represented by
+        # a separate, explicit routing/relationship decision.
+        expansion_topics = (
+            []
+            if strict_topic_recall
+            else self.knowledge_recall_expansion_topics(state, base_topics, active_pending_requests)
+        )
         coverage_reason = self.knowledge_recall_coverage_gap_reason(
             state,
             list((stage_items.get("topic_workspace") or {}).values()),
@@ -3659,6 +3731,15 @@ class MerchantQaWorkflow:
             top_score=items[0].fusion_score if items else 0.0,
             merged_context="\n\n".join("召回片段 [%s] %s\n%s" % (item.source_type, item.title, item.content[:1200]) for item in items),
         )
+        if initial_topic_recall:
+            state["initial_topic_recall_completed"] = True
+            state["initial_topic_recall_trace"] = {
+                "query": state.get("question", ""),
+                "topics": [enum_value(item) for item in base_topics],
+                "itemCount": len(items),
+                "topicExpansion": False,
+                "role": "navigation_candidates_before_core_table_selection",
+            }
         retrieval_issues = dedupe_retrieval_issues(
             [
                 issue
@@ -3720,13 +3801,28 @@ class MerchantQaWorkflow:
             if state["rule_recall_context"]:
                 add_step(state, "Rule Recall：命中平台规则知识，作为后续 Answer 证据，不短路 BI QueryGraph")
         state["intent_signals"] = self.build_intent_signals(state)
-        state["planning_assets_compacted"] = False
-        invalidate_graph_validation(state)
-        state["query_graph_reflected"] = False
-        if was_data_discovered or had_pending_requests:
-            self.invalidate_execution_outputs(state, "知识召回已更新")
+        grounded_authority = str(state.get("planning_authority") or "") == "grounded_query_contract"
+        if grounded_authority:
+            # Grounded-mode recall is navigation only.  It may add thin search
+            # candidates, but it has no authority to invalidate an immutable
+            # READY Contract, its direct QueryGraph, or verified execution
+            # artifacts.  A replacement becomes authoritative only through a
+            # successful transactional Contract commit and direct compilation.
+            state["grounded_recall_navigation_only"] = True
+            add_step(
+                state,
+                "Grounded Recall：仅更新导航候选，未修改 READY Contract、QueryGraph 或执行证据",
+            )
+        else:
+            state["planning_assets_compacted"] = False
+            invalidate_graph_validation(state)
+            state["query_graph_reflected"] = False
+            if was_data_discovered or had_pending_requests:
+                self.invalidate_execution_outputs(state, "知识召回已更新")
         self.planner.artifact_store.write_json("recall", "recall_bundle.json", state["recall_bundle"].model_dump(by_alias=True), preview_chars=0)
-        if had_pending_requests and resume_repair_after_retrieval:
+        if grounded_authority:
+            pass
+        elif had_pending_requests and resume_repair_after_retrieval:
             consumed_request_keys = {
                 knowledge_request_key(request)
                 for request in active_pending_requests
@@ -3847,8 +3943,10 @@ class MerchantQaWorkflow:
         bundle = RecallBundle(items=items, top_score=top_score)
         if not bundle.has_strong_match():
             return "weak_recall_match"
-        if had_pending_requests:
-            return "pending_knowledge_topic_expansion"
+        # A pending request is a semantic need, not permission to widen the
+        # Topic workspace. Expansion, where legacy callers still support it,
+        # must be justified by actual coverage failure rather than request
+        # existence alone.
         slot_topics = self._merge_topic_categories(
             [candidate.topic for candidate in (state.get("route_slots") or RouteSlots()).topic_candidates],
             [],
@@ -4235,6 +4333,371 @@ class MerchantQaWorkflow:
             artifact_paths=[str(Path(state["thread_data"].outputs_path) / "artifacts" / "planner" / "planning_asset_pack.json")],
         )
         emit(state, "node.completed", "COMPACT_ASSETS", {"tables": pack.known_tables()[:12]})
+        return state
+
+    def commit_grounded_query_contract(
+        self,
+        state: AgentState,
+        binding_hints: Dict[str, Any],
+    ) -> AgentState:
+        """Seal Core-selected semantic refs into the only planning authority.
+
+        The Core must have read every selected ref through the Topic-scoped
+        filesystem.  Recall candidates and L0 summaries remain navigation
+        evidence and cannot become executable bindings by appearing in the
+        request payload alone.
+        """
+
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "commit_grounded_query_contract",
+            "CoreAgent",
+            "COMMIT_GROUNDED_QUERY_CONTRACT",
+            input_summary=str(binding_hints)[:1000],
+        )
+        increment_round(state)
+        self.configure_artifact_roots(state)
+        previous_contract_value = state.get("grounded_query_contract")
+        try:
+            previous_contract = (
+                previous_contract_value
+                if isinstance(previous_contract_value, GroundedQueryContract)
+                else GroundedQueryContract.model_validate(previous_contract_value)
+                if previous_contract_value
+                else None
+            )
+        except Exception:
+            previous_contract = None
+        previous_ready = bool(previous_contract and previous_contract.ready)
+
+        topics = list(
+            dict.fromkeys(
+                str(item).strip()
+                for item in [
+                    *list((state.get("topic_workspace") or {}).get("topics") or []),
+                    *list(state.get("semantic_workspace_opened_topics") or []),
+                ]
+                if str(item).strip()
+            )
+        )
+        contract = GroundedQueryContractBuilder().build(
+            question=str(state.get("question") or ""),
+            topics=topics,
+            core_semantic_evidence=list(state.get("core_semantic_evidence") or []),
+            binding_hints=binding_hints,
+            timezone_name=str(self.settings.business_timezone or "Asia/Shanghai"),
+        )
+        prior_rejections = merge_grounded_rejected_bindings(
+            state.get("grounded_rejected_bindings") or [],
+            [],
+        )
+        prior_fingerprints = {item.fingerprint for item in prior_rejections}
+        reused_rejections = [
+            item
+            for item in contract.rejected_bindings
+            if item.fingerprint in prior_fingerprints
+        ]
+        merged_rejections = merge_grounded_rejected_bindings(
+            prior_rejections,
+            contract.rejected_bindings,
+        )
+        if reused_rejections:
+            reused_gaps = [
+                GroundedContractGap(
+                    code="REJECTED_BINDING_REUSED",
+                    message=(
+                        "Rejected table %s was selected again for the same capability; "
+                        "return to the manifest and widen filesystem search"
+                    )
+                    % item.table,
+                    topic=item.topic,
+                    table=item.table,
+                    resolution="EXPAND_SEARCH_SCOPE",
+                    search_scope="READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX",
+                    required_capability=dict(item.required_capability),
+                    rejected_ref_ids=list(item.ref_ids),
+                )
+                for item in reused_rejections
+            ]
+            contract = contract.model_copy(
+                update={
+                    "status": "REVISE_BINDINGS",
+                    "unresolved_gaps": [*contract.unresolved_gaps, *reused_gaps],
+                }
+            )
+        contract = contract.model_copy(update={"rejected_bindings": merged_rejections})
+        state["grounded_rejected_bindings"] = [
+            item.model_dump(by_alias=True)
+            for item in merged_rejections
+        ]
+        validation = GroundedQueryContractValidator().validate(contract)
+        candidate_ready = bool(contract.ready and validation.valid)
+        state["grounded_query_contract_attempt"] = contract
+        state["grounded_contract_attempt_validation"] = validation.model_dump(by_alias=True)
+
+        previous_payload = (
+            previous_contract.model_dump(by_alias=True)
+            if previous_contract is not None
+            else {}
+        )
+        candidate_payload = contract.model_dump(by_alias=True)
+        same_as_previous = bool(
+            previous_payload
+            and hashlib.sha256(
+                json.dumps(previous_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            == hashlib.sha256(
+                json.dumps(candidate_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+        )
+        # A malformed/partial proposal must never destroy the last READY
+        # authority.  READY replacements and semantic REVISE_BINDINGS results
+        # are authoritative; an UNRESOLVED proposal is merely an attempt until
+        # it becomes complete.
+        accepted = bool(
+            not previous_ready
+            or candidate_ready
+            or contract.status == "REVISE_BINDINGS"
+        )
+        if accepted:
+            if not same_as_previous:
+                self.invalidate_execution_outputs(state, "GroundedQueryContract 原子替换")
+                invalidate_graph_validation(state)
+                state["plan"] = QueryPlan()
+                state["grounded_query_compiled"] = False
+                state["planning_asset_pack"] = PlanningAssetPack()
+                state["planning_assets_compacted"] = False
+            state["grounded_query_contract"] = contract
+            state["grounded_contract_validation"] = validation.model_dump(by_alias=True)
+            state["grounded_contract_ready"] = candidate_ready
+            if candidate_ready:
+                state["grounded_asset_pack"] = materialize_grounded_asset_pack(
+                    contract,
+                    self.asset_builder.topic_assets,
+                )
+            else:
+                state["grounded_asset_pack"] = PlanningAssetPack()
+        else:
+            state["grounded_contract_ready"] = previous_ready
+            add_step(
+                state,
+                "Core Grounding：候选 Contract 未完成，保留上一份 READY Contract 与 QueryGraph",
+            )
+        if any(gap.code == "TIME_RANGE_REQUIRED" for gap in contract.unresolved_gaps):
+            self.request_human_clarification(
+                state,
+                "这类查询需要明确时间范围，请问要查询最近多久？",
+                "QUERY_PLAN",
+                "time_window",
+                ["最近7天", "最近30天", "最近90天"],
+            )
+            add_step(state, "Core Grounding：用户未提供时间范围，转入 ask_human，未编译或执行 SQL")
+        self.planner.artifact_store.write_json(
+            "planner",
+            "grounded_query_contract_attempt.json",
+            candidate_payload,
+            preview_chars=0,
+        )
+        if accepted:
+            self.planner.artifact_store.write_json(
+                "planner",
+                "grounded_query_contract.json",
+                candidate_payload,
+                preview_chars=0,
+            )
+        add_step(
+            state,
+            "Core Grounding：Contract candidate status=%s accepted=%s tables=%d metrics=%d dimensions=%d gaps=%d"
+            % (
+                contract.status,
+                accepted,
+                len(contract.tables),
+                len(contract.metrics),
+                len(contract.dimensions),
+                len(contract.unresolved_gaps),
+            ),
+        )
+        self.record_span(
+            state,
+            "semantic_tool",
+            "commit_grounded_query_contract",
+            started,
+            status="success" if candidate_ready else "gap",
+            error_code=(
+                ""
+                if candidate_ready
+                else ",".join(gap.code for gap in contract.unresolved_gaps[:4])
+            ),
+            metadata={
+                "status": contract.status,
+                "accepted": accepted,
+                "evidenceRefs": list(contract.evidence_refs),
+                "gaps": [gap.model_dump(by_alias=True) for gap in contract.unresolved_gaps[:12]],
+            },
+        )
+        self.finish_run_step(
+            state,
+            step,
+            "success" if candidate_ready else "gap",
+            output_summary="status=%s evidence=%d gaps=%d"
+            % (contract.status, len(contract.evidence_refs), len(contract.unresolved_gaps)),
+        )
+        emit(
+            state,
+            "node.completed",
+            "COMMIT_GROUNDED_QUERY_CONTRACT",
+            {
+                "status": contract.status,
+                "ready": candidate_ready,
+                "accepted": accepted,
+                "activeReady": state["grounded_contract_ready"],
+                "gaps": len(contract.unresolved_gaps),
+            },
+        )
+        return state
+
+    def compile_grounded_query(self, state: AgentState) -> AgentState:
+        """Compile QueryGraph deterministically from GroundedQueryContract."""
+
+        started = now_ms()
+        step = self.start_run_step(
+            state,
+            "compile_grounded_query",
+            "QueryGraphCompiler",
+            "COMPILE_GROUNDED_QUERY",
+            input_summary=str(state.get("grounded_compile_reason") or "")[:500],
+        )
+        increment_round(state)
+        self.configure_artifact_roots(state)
+        self.invalidate_execution_outputs(state, "GroundedQueryContract 重新编译")
+        contract_value = state.get("grounded_query_contract")
+        try:
+            contract = (
+                contract_value
+                if isinstance(contract_value, GroundedQueryContract)
+                else GroundedQueryContract.model_validate(contract_value or {})
+            )
+        except Exception as exc:
+            contract = None
+            validation = GraphValidationResult(
+                valid=False,
+                repairable=False,
+                gaps=[
+                    GraphValidationGap(
+                        code="GROUNDED_CONTRACT_INVALID",
+                        reason="GroundedQueryContract could not be parsed: %s" % str(exc)[:240],
+                    )
+                ],
+            )
+            record_graph_validation(state, validation)
+        else:
+            validation = None
+
+        if contract is None or not contract.ready:
+            if validation is None:
+                validation = GraphValidationResult(
+                    valid=False,
+                    repairable=False,
+                    gaps=[
+                        GraphValidationGap(
+                            code="GROUNDED_CONTRACT_UNRESOLVED",
+                            reason="GroundedQueryContract has blocking semantic gaps",
+                        )
+                    ],
+                )
+                record_graph_validation(state, validation)
+            state["grounded_query_compiled"] = False
+            state["grounded_compile_trace"] = {
+                "status": "rejected",
+                "plannerLlmCalls": 0,
+                "reason": "contract_not_ready",
+            }
+            self.finish_run_step(
+                state,
+                step,
+                "gap",
+                output_summary="contract not ready",
+                error_code="GROUNDED_CONTRACT_UNRESOLVED",
+            )
+            emit(state, "node.completed", "COMPILE_GROUNDED_QUERY", state["grounded_compile_trace"])
+            return state
+
+        pack = state.get("grounded_asset_pack") or PlanningAssetPack()
+        if not isinstance(pack, PlanningAssetPack):
+            pack = PlanningAssetPack.model_validate(pack)
+        if pack.is_empty():
+            pack = materialize_grounded_asset_pack(contract, self.asset_builder.topic_assets)
+        try:
+            preparation = compile_grounded_query_contract(contract, pack)
+            plan = preparation.plan
+            validation = preparation.validation
+        except Exception as exc:
+            plan = QueryPlan()
+            validation = GraphValidationResult(
+                valid=False,
+                repairable=False,
+                gaps=[
+                    GraphValidationGap(
+                        code="GROUNDED_QUERY_COMPILE_FAILED",
+                        reason="Deterministic QueryGraph compiler failed: %s" % str(exc)[:240],
+                    )
+                ],
+            )
+
+        state["grounded_asset_pack"] = pack
+        # Compatibility view for the mature validator/NodeWorker only.  This
+        # pack is a projection of bound refs and is never a planning input.
+        state["planning_asset_pack"] = pack
+        state["planning_assets_compacted"] = False
+        state["plan"] = plan
+        state["query_graph_reflected"] = True
+        state["planner_reflection"] = PlannerReflectionResult()
+        state["planner_provider_error"] = ""
+        state["grounded_query_compiled"] = bool(plan.intents)
+        record_graph_validation(state, validation, plan)
+        state["last_query_graph_validation_gaps"] = [] if validation.valid else list(validation.gaps)
+        state["grounded_compile_trace"] = {
+            "status": "validated" if validation.valid else ("compiled_with_gaps" if plan.intents else "failed"),
+            "plannerLlmCalls": 0,
+            "source": "grounded_query_contract",
+            "logicalIntentCount": len(plan.intents),
+            "validationGaps": [gap.model_dump(by_alias=True) for gap in validation.gaps[:12]],
+        }
+        self.planner.artifact_store.write_json(
+            "planner",
+            "query_graph.json",
+            plan.model_dump(by_alias=True),
+            preview_chars=0,
+        )
+        self.planner.artifact_store.write_json(
+            "planner",
+            "grounded_execution_asset_pack.json",
+            pack.model_dump(by_alias=True),
+            preview_chars=0,
+        )
+        add_step(
+            state,
+            "QueryGraph Compiler：从 GroundedQueryContract 确定性编译，nodes=%d valid=%s PlannerLLM=0"
+            % (len(plan.intents), validation.valid),
+        )
+        self.record_span(
+            state,
+            "planner",
+            "compile_grounded_query",
+            started,
+            status="success" if validation.valid else "failed",
+            error_code="" if validation.valid else ",".join(gap.code for gap in validation.gaps[:4]),
+            metadata=state["grounded_compile_trace"],
+        )
+        self.finish_run_step(
+            state,
+            step,
+            "success" if validation.valid else "gap",
+            output_summary="nodes=%d valid=%s" % (len(plan.intents), validation.valid),
+            error_code="" if validation.valid else ",".join(gap.code for gap in validation.gaps[:4]),
+        )
+        emit(state, "node.completed", "COMPILE_GROUNDED_QUERY", state["grounded_compile_trace"])
         return state
 
     def query_metric_ambiguity(self, pack: PlanningAssetPack, question: str) -> Dict[str, Any]:
@@ -6707,7 +7170,7 @@ class MerchantQaWorkflow:
                 self.build_scope_clarification_prompt(state),
                 "BUSINESS_SCOPE",
                 "business_scope",
-                business_scope_options(self.recall_service.topic_assets),
+                business_scope_examples(),
             )
             return self.human_in_loop(state)
         else:
@@ -9023,23 +9486,12 @@ class MerchantQaWorkflow:
         return state
 
     def build_scope_clarification_prompt(self, state: AgentState) -> str:
-        topic_names = [
-            str(item.get("displayName") or item.get("topic") or "")
-            for item in self.recall_service.topic_assets.topic_contracts()
-            if str(item.get("categoryId") or "") != str(QuestionCategory.UNKNOWN)
-        ][:5]
-        suffix = "，也可以直接指定 Topic：%s" % "、".join(topic_names) if topic_names else ""
-        return "你想看哪个范围？可以指定时间范围和业务 Topic%s。" % suffix
+        del state
+        return "请补充你想看的业务指标或对象，以及时间范围；内部 Topic 会由系统自动选择。"
 
     def build_topic_clarification_prompt(self, state: AgentState) -> str:
-        topic_names = [
-            str(item.get("displayName") or item.get("topic") or "")
-            for item in self.recall_service.topic_assets.topic_contracts()
-            if str(item.get("categoryId") or "") != str(QuestionCategory.UNKNOWN)
-        ][:6]
-        return "这个问题可能涉及多个业务域。请从已发布 Topic 中指定优先范围：%s。" % (
-            "、".join(topic_names) if topic_names else "请补充业务范围"
-        )
+        del state
+        return "这个问题的业务目标还不够明确。请补充要看的指标、业务对象或分析维度；内部 Topic 由系统自动选择。"
 
     def bootstrap_asset_diagnostic_state(self, state: AgentState) -> None:
         profile = diagnostic_profile_for_question(
@@ -9180,7 +9632,12 @@ class MerchantQaWorkflow:
     def _effective_topic_categories(self, state: AgentState) -> List[QuestionCategory]:
         base = state["topic_routing_decision"].recall_topics()
         expanded = state.get("knowledge_expanded_topics") or []
-        return self._merge_topic_categories(base, expanded)
+        opened: List[QuestionCategory] = []
+        for topic_name in state.get("semantic_workspace_opened_topics") or []:
+            category = self.recall_service.topic_assets.resolve_topic_category(topic_name)
+            if category != QuestionCategory.UNKNOWN and category not in opened:
+                opened.append(category)
+        return self._merge_topic_categories(self._merge_topic_categories(base, expanded), opened)
 
     def _knowledge_request_topics(self, request: KnowledgeRequest, base_topics: List[QuestionCategory]) -> List[QuestionCategory]:
         text = "%s %s" % (request.query or "", request.reason or "")
@@ -9266,6 +9723,16 @@ def business_scope_options(topic_assets: Any = None) -> List[str]:
         if str(item.get("categoryId") or "") != str(QuestionCategory.UNKNOWN)
     ]
     return dedupe_texts(options)[:6]
+
+
+def business_scope_examples() -> List[str]:
+    """User-facing clarification examples; never expose internal Topic names."""
+
+    return [
+        "最近30天的订单数和退款总额",
+        "最近7天按商品看的退款金额",
+        "查询某个订单或退款单的明细",
+    ]
 
 
 def topic_clarification_contract(topic_assets: Any, clarification_type: str) -> Dict[str, Any]:

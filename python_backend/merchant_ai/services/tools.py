@@ -118,7 +118,11 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
             permission = "agent.semantic.propose"
             output_required = ["path"]
             fail_closed = True
-    elif tool_name.startswith("draft_") or tool_name in {"repair_sql", "summarize_node_result", "contract_critic"}:
+    elif tool_name.startswith("draft_") or tool_name in {
+        "repair_sql",
+        "summarize_node_result",
+        "execution_contract_validation",
+    }:
         side_effect = "none"
         permission = "agent.reasoning"
         cache_policy = "disabled"
@@ -145,7 +149,7 @@ def tool_registry_from_descriptions(tool_registry: Mapping[str, str]) -> ToolReg
 RUNTIME_NODE_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "inspect_schema": "inspect asset/live schema available for this node",
     "resolve_columns": "resolve required columns and output keys",
-    "contract_critic": "check whether node plan contract is executable before SQL draft",
+    "execution_contract_validation": "validate the grounded node execution contract before SQL draft",
     "check_freshness": "check the semantic contract's declared time column and fallback risk",
     "choose_sql_strategy": "choose plan-bound LLM SQL or structured fallback",
     "draft_structured_sql": "draft safe one-table structured SQL",

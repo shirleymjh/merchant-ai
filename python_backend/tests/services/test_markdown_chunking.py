@@ -73,5 +73,6 @@ def test_hybrid_recall_builds_one_rule_document_per_markdown_chunk(tmp_path):
     assert len(docs) == 2
     assert all(doc.source_type == "GOVERNED_RULE" for doc in docs)
     assert docs[0].metadata["chunkStrategy"] == "langchain_markdown_header_recursive"
-    assert docs[0].doc_id.endswith("#chunk-0000")
+    assert docs[0].doc_id == "semantic:rules:rule:chunk:0000"
+    assert docs[0].metadata["sourcePath"] == "rules/rule.md"
     assert docs[1].metadata["headingPath"] == ["平台规则", "发货"]

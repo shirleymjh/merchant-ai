@@ -301,7 +301,7 @@ def test_contract_gaps_keep_repairable_issue_evidence():
 
     assert gaps[0].code == "MISSING_METRIC_COLUMN"
     assert gaps[0].evidence == "order_gmv_amt_1d"
-    assert gaps[0].source == "node_contract_critic"
+    assert gaps[0].source == "execution_contract_validator"
 
 
 def test_tenant_scope_requires_backend_bound_merchant_parameter():

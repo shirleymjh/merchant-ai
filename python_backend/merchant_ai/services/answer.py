@@ -627,6 +627,10 @@ class AnswerComposeService:
             return skeleton
         if not answer:
             return skeleton
+        compact_answer = re.sub(r"\s+", "", answer)
+        compact_skeleton = re.sub(r"\s+", "", skeleton)
+        if compact_answer and compact_answer in compact_skeleton:
+            return skeleton
         answer = self._ensure_multi_trend_answer_coverage(answer, question, plan, run_result)
         answer = self._ensure_multi_metric_summary_coverage(answer, question, plan, run_result)
         coverage = answer_requirement_coverage(question, plan, run_result)
@@ -5862,7 +5866,9 @@ def answer_skill_headers(root: Path) -> List[Dict[str, Any]]:
     for skill_file in sorted(root.glob("*/SKILL.md")):
         meta = load_skill_frontmatter(skill_file)
         body = skill_file.read_text(encoding="utf-8")
-        name = str(meta.get("name") or skill_file.parent.name)
+        # Legacy answer-skill identities are directory-based.  Agent Skills
+        # frontmatter uses spec-compliant hyphenated names for Deep Agents.
+        name = str(skill_file.parent.name or meta.get("name") or "")
         if not name:
             continue
         when_to_use = _skill_header_field(meta, body, "whenToUse", "Activation Contract", 700)

@@ -1,5 +1,5 @@
 ---
-name: refund_rate_diagnosis
+name: refund-rate-diagnosis
 description: Use when a merchant asks why refund rate, refund amount, after-sales, or return pressure rose. The skill follows a fixed refund diagnosis SOP and must disclose numerator/denominator evidence.
 title: 指标变化诊断
 executionMode: structured_renderer
@@ -13,8 +13,8 @@ after-sales diagnosis.
 
 ## Activation Contract
 
-Use this skill only when the Planner-produced `questionUnderstanding` declares
-a reusable or fixed analysis workflow and the question asks for refund-rate,
+Use this skill only when the Core has a Grounded Contract plus verified evidence
+and the question asks for refund-rate,
 refund amount, return, after-sales, or refund anomaly diagnosis.
 
 Do not use it for platform rule-only questions or plain refund detail lookup.
@@ -29,7 +29,7 @@ Do not use it for platform rule-only questions or plain refund detail lookup.
 - If product, reason, ticket, or compensation evidence is missing, present it as
   a follow-up gap rather than a cause.
 
-## Workflow
+## Procedure
 
 1. Confirm whether refund rate, refund count, or refund amount changed.
 2. Check whether the movement is driven by numerator growth, denominator drop,

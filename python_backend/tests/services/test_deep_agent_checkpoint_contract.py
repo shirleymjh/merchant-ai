@@ -30,14 +30,13 @@ def test_deep_agent_checkpoint_uses_durable_conversation_scope_without_domain_co
         next_domain_config = manager.config_for_run(thread_id, next_run_id)
 
         assert saver is manager.saver()
-        # This verifies the public addressing contract. LangGraph root graphs
-        # currently normalize non-empty checkpoint_ns values; physical namespace
-        # nesting requires a subgraph. Collision safety here primarily comes from
-        # the real conversation key versus the domain's run-scoped key.
-        assert deep_config["configurable"] == {
-            "thread_id": thread_id,
-            "checkpoint_ns": DEEP_AGENT_CHECKPOINT_NAMESPACE,
-        }
+        # A root DeepAgent graph uses the empty physical namespace.  Supplying
+        # checkpoint_ns="deepagent" makes get_state treat it as a missing
+        # subgraph. Logical ownership remains explicit in metadata/ref output.
+        assert deep_config["configurable"] == {"thread_id": thread_id}
+        assert deep_config["metadata"]["logical_checkpoint_namespace"] == (
+            DEEP_AGENT_CHECKPOINT_NAMESPACE
+        )
         assert domain_config["configurable"]["thread_id"] == "%s:%s" % (thread_id, first_run_id)
         assert domain_config["configurable"].get("checkpoint_ns", "") == ""
         assert deep_config["configurable"] != domain_config["configurable"]
@@ -47,7 +46,8 @@ def test_deep_agent_checkpoint_uses_durable_conversation_scope_without_domain_co
 
         deep_ref = manager.deep_agent_ref(thread_id, next_run_id)
         assert deep_ref["checkpointThreadId"] == thread_id
-        assert deep_ref["checkpointNamespace"] == DEEP_AGENT_CHECKPOINT_NAMESPACE
+        assert deep_ref["checkpointNamespace"] == ""
+        assert deep_ref["logicalCheckpointNamespace"] == DEEP_AGENT_CHECKPOINT_NAMESPACE
         assert deep_ref["resumable"] is True
         assert deep_ref["purpose"] == "deep_agent_conversation_checkpoint"
         assert deep_ref["storage"] == str(tmp_path / "checkpoints" / "agent.sqlite")
@@ -70,7 +70,8 @@ def test_deep_agent_memory_checkpoint_ref_is_not_durable(tmp_path):
     ref = manager.deep_agent_ref("thread_" + "b" * 32, "run_" + "3" * 32)
 
     assert ref["backend"] == "memory"
-    assert ref["checkpointNamespace"] == DEEP_AGENT_CHECKPOINT_NAMESPACE
+    assert ref["checkpointNamespace"] == ""
+    assert ref["logicalCheckpointNamespace"] == DEEP_AGENT_CHECKPOINT_NAMESPACE
     assert ref["resumable"] is False
 
 

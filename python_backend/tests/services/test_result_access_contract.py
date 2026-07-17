@@ -138,7 +138,7 @@ def test_result_role_policy_authorizes_aggregate_without_exposing_raw_detail():
     assert "measure_value" in aggregate_contract.visible_columns
     assert "private_note" not in aggregate_contract.visible_columns
     assert "tenant_key" not in aggregate_contract.visible_columns
-    assert worker.node_plan_critic.review(aggregate_contract).valid
+    assert worker.node_contract_validator.review(aggregate_contract).valid
 
     detail = aggregate.model_copy(
         update={
@@ -157,7 +157,7 @@ def test_result_role_policy_authorizes_aggregate_without_exposing_raw_detail():
         NodeExecutionContext(merchant_id="tenant-1"),
     )
     assert "measure_value" not in detail_contract.visible_columns
-    assert not worker.node_plan_critic.review(detail_contract).valid
+    assert not worker.node_contract_validator.review(detail_contract).valid
 
 
 def test_generic_output_keys_require_explicit_display_and_access_contracts():
@@ -207,7 +207,7 @@ def test_published_metric_sources_are_internal_computation_not_display_evidence(
         pack,
         NodeExecutionContext(merchant_id="tenant-1"),
     )
-    critique = worker.node_plan_critic.review(contract)
+    critique = worker.node_contract_validator.review(contract)
 
     assert "measure_value" in contract.internal_only_columns
     assert "private_note" in contract.internal_only_columns

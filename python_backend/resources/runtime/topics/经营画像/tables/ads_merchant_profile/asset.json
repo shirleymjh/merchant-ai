@@ -2867,7 +2867,7 @@
       "metricKey": "order_user_cnt_1d",
       "businessName": "下单用户日汇总量",
       "formula": "SUM(order_user_cnt_1d)",
-      "unit": "单",
+      "unit": "人",
       "description": "下单用户量-最近1天",
       "sourceColumns": [
         "order_user_cnt_1d"
@@ -2886,6 +2886,29 @@
       "metricGrain": "merchant_day_summary",
       "metricIntent": "store_summary",
       "aggregationPolicy": "period_rollup",
+      "calculationSemantics": {
+        "semanticValueType": "DISTINCT_COUNT",
+        "nativeTimeGrain": "DAY",
+        "nativeWindowDays": 1,
+        "timeRollupPolicy": "NOT_COMPOSABLE",
+        "nativeGrainAnalysisModes": [
+          "DAILY_TREND",
+          "TIME_SERIES",
+          "TREND"
+        ],
+        "forbiddenAggregations": [
+          "SUM"
+        ],
+        "violationMessage": "该指标是单日去重用户数，不能跨天求和得到周期去重用户数。",
+        "resolution": "RESELECT_TABLE",
+        "alternativeCapability": {
+          "operation": "COUNT_DISTINCT",
+          "entityRole": "BUYER",
+          "requiredFieldRole": "KEY",
+          "requiredTableGrain": "ORDER_DETAIL",
+          "timeRollupPolicy": "RECOMPUTE_FROM_DETAIL"
+        }
+      },
       "ambiguousAliases": [],
       "naturalName": "下单用户量",
       "originalBusinessName": "下单用户量",
@@ -4354,6 +4377,7 @@
         "refund_amt_1d",
         "退款金额元",
         "退款金额",
+        "退款总额",
         "退款金额元-最近1天",
         "退款额"
       ],
