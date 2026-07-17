@@ -800,6 +800,7 @@ def semantic_file_tool_definitions() -> List[AgentToolDefinition]:
             description="List semantic-layer file refs before reading large table or relationship assets.",
             parameters=object_schema(
                 {
+                    "path": string_property("optional semantic directory such as topics/<topic>/tables/<table>"),
                     "topic": string_property("optional topic id or display name from the runtime topic catalog"),
                     "query": string_property("optional search phrase for narrowing refs"),
                     "limit": integer_property("maximum refs to return", 1),

@@ -16,6 +16,7 @@ from merchant_ai.models import (
     QueryBundle,
     QueryPlan,
     QuestionIntent,
+    ResolvedTimeRange,
 )
 from merchant_ai.services.assets import PlanningAssetPackBuilder, TopicAssetService
 from merchant_ai.services.planning import QueryGraphPlanner
@@ -294,10 +295,13 @@ def test_invalid_prepared_graph_cannot_reach_node_execution() -> None:
 class StaleOfflineRepository:
     def __init__(self) -> None:
         self.sqls: list[str] = []
+        self.realtime_max = datetime.now(ZoneInfo("Australia/Melbourne")).date().isoformat()
 
     def query(self, sql, *_args, **_kwargs):
         self.sqls.append(sql)
         if "MIN(`pt`)" in sql and "MAX(`pt`)" in sql:
+            if "`merchant_realtime`" in sql:
+                return [{"min_value": self.realtime_max, "max_value": self.realtime_max}]
             return [{"min_value": "2000-01-01", "max_value": "2000-01-01"}]
         raise AssertionError("runtime graph preparation must not execute business SQL")
 
@@ -366,6 +370,11 @@ def realtime_fallback_graph() -> tuple[str, QueryPlan, PlanningAssetPack]:
                 metric_formula="SUM(order_cnt)",
                 required_evidence=["order_cnt"],
                 days=1,
+                time_range=ResolvedTimeRange(
+                    kind="rolling",
+                    days=1,
+                    anchor_policy="latest_partition",
+                ),
                 sql_strategy="structured_first",
                 metric_resolution=seal_semantic_metric_resolution(
                     {
@@ -453,6 +462,15 @@ def test_realtime_fallback_reprepares_and_binds_the_final_execution_graph() -> N
     assert prepared.execution_plan_fingerprint != original_fingerprint
     assert prepared.plan.intents[0].preferred_table == "merchant_realtime"
     assert prepared.freshness_reports[0].status == "STALE_USE_REALTIME_FALLBACK"
+    assert prepared.freshness_reports[0].table == "merchant_realtime"
+    assert prepared.freshness_reports[0].fallback_from_table == "merchant_offline"
+    assert prepared.freshness_reports[0].fallback_from_max_time_value == "2000-01-01"
+    assert prepared.freshness_reports[0].max_pt == repository.realtime_max
+    assert prepared.snapshot_alignment.status == "ALIGNED_COMPLETE"
+    assert prepared.snapshot_alignment.common_anchor_time_value == repository.realtime_max
+    assert prepared.snapshot_alignment.sources[0].table == "merchant_realtime"
+    assert prepared.snapshot_alignment.sources[0].source_max_time_value == repository.realtime_max
+    assert prepared.snapshot_alignment.sources[0].compatible is True
     assert query_graph_fingerprint(plan) == original_fingerprint
 
     result = worker.execute_plan(
@@ -466,6 +484,47 @@ def test_realtime_fallback_reprepares_and_binds_the_final_execution_graph() -> N
 
     assert worker.executed_tables == ["merchant_realtime"]
     assert result.executed_query_graph_fingerprint == prepared.execution_plan_fingerprint
+
+
+def test_stale_realtime_fallback_cannot_be_reported_as_complete_snapshot() -> None:
+    question, plan, pack = realtime_fallback_graph()
+    repository = StaleOfflineRepository()
+    repository.realtime_max = "2000-01-01"
+    worker = CapturingNodeWorker(repository)
+
+    prepared = worker.prepare_runtime_execution_graph("100", plan, pack, question)
+
+    report = prepared.freshness_reports[0]
+    assert prepared.plan.intents[0].preferred_table == "merchant_realtime"
+    assert report.table == "merchant_realtime"
+    assert report.status == "STALE_REALTIME_FALLBACK_STALE"
+    assert prepared.snapshot_alignment.status == "ALIGNMENT_INCOMPLETE"
+    assert prepared.snapshot_alignment.complete is False
+    assert prepared.snapshot_alignment.sources[0].compatible is False
+
+
+def test_failed_realtime_freshness_check_cannot_be_reported_as_complete_snapshot() -> None:
+    class FailedRealtimeFreshnessRepository(StaleOfflineRepository):
+        def query(self, sql, *_args, **_kwargs):
+            if "MIN(`pt`)" in sql and "`merchant_realtime`" in sql:
+                self.sqls.append(sql)
+                raise RuntimeError("realtime freshness unavailable")
+            return super().query(sql, *_args, **_kwargs)
+
+    question, plan, pack = realtime_fallback_graph()
+    repository = FailedRealtimeFreshnessRepository()
+    worker = CapturingNodeWorker(repository)
+
+    prepared = worker.prepare_runtime_execution_graph("100", plan, pack, question)
+
+    report = prepared.freshness_reports[0]
+    assert prepared.plan.intents[0].preferred_table == "merchant_realtime"
+    assert report.table == "merchant_realtime"
+    assert report.status == "STALE_REALTIME_FALLBACK_FRESHNESS_UNAVAILABLE"
+    assert "realtime freshness unavailable" in report.reason
+    assert prepared.snapshot_alignment.status == "ALIGNMENT_INCOMPLETE"
+    assert prepared.snapshot_alignment.complete is False
+    assert prepared.snapshot_alignment.sources[0].compatible is False
 
 
 def test_invalid_realtime_execution_graph_is_rejected_before_node_dispatch() -> None:
@@ -496,6 +555,56 @@ def test_invalid_realtime_execution_graph_is_rejected_before_node_dispatch() -> 
         )
 
     assert worker.executed_tables == []
+    assert len(repository.sqls) == 2
+
+
+def test_stale_offline_source_without_production_mapping_exposes_gap_without_guessing_table() -> None:
+    question, plan, pack = realtime_fallback_graph()
+    pack.realtime_fallbacks = []
+    validator = RecordingGraphValidator()
+    repository = StaleOfflineRepository()
+    worker = CapturingNodeWorker(repository)
+
+    prepared = worker.prepare_runtime_execution_graph(
+        "100",
+        plan,
+        pack,
+        question,
+        graph_validator=validator,
+    )
+
+    report = prepared.freshness_reports[0]
+    assert prepared.plan.intents[0].preferred_table == "merchant_offline"
+    assert prepared.runtime_fallback_task_ids == ()
+    assert report.table == "merchant_offline"
+    assert report.fallback_table == ""
+    assert report.status == "STALE_NO_REALTIME_FALLBACK_MAPPING"
+    assert "no governed production realtime fallback mapping" in report.reason
+    assert prepared.snapshot_alignment.status == "ALIGNMENT_INCOMPLETE"
+    assert prepared.snapshot_alignment.aligned is False
+    assert prepared.snapshot_alignment.complete is False
+    assert prepared.snapshot_alignment.sources[0].table == "merchant_offline"
+    assert prepared.snapshot_alignment.sources[0].compatible is False
+    assert validator.tables == [["merchant_offline"]]
+    assert len(repository.sqls) == 1
+
+
+def test_stale_metric_without_governed_realtime_metric_mapping_does_not_switch_table() -> None:
+    question, plan, pack = realtime_fallback_graph()
+    pack.realtime_fallbacks[0].metadata["metricMappings"] = []
+    repository = StaleOfflineRepository()
+    worker = CapturingNodeWorker(repository)
+
+    prepared = worker.prepare_runtime_execution_graph("100", plan, pack, question)
+
+    report = prepared.freshness_reports[0]
+    assert prepared.plan.intents[0].preferred_table == "merchant_offline"
+    assert prepared.runtime_fallback_task_ids == ()
+    assert report.fallback_table == ""
+    assert report.status == "STALE_NO_GOVERNED_REALTIME_METRIC_MAPPING"
+    assert "requested metric has no governed production realtime mapping" in report.reason
+    assert prepared.snapshot_alignment.complete is False
+    assert prepared.snapshot_alignment.sources[0].compatible is False
     assert len(repository.sqls) == 1
 
 

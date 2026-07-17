@@ -256,7 +256,7 @@ def test_failure_fallback_does_not_call_model_again_or_render_an_asset_prompt() 
     assert "planner.asset_driven_multi_metric_fallback_after_llm_failure" in plan.agent_trace
 
 
-def test_configured_planner_calls_llm_selection_path_before_any_deterministic_candidate() -> None:
+def test_configured_planner_treats_retrieval_refs_as_hints_and_owns_final_plan() -> None:
     first = metric("fact_runtime", "first_measure", "First measure", "first_value")
     second = metric("fact_runtime", "second_measure", "Second measure", "second_value")
     pack = PlanningAssetPack(
@@ -290,23 +290,33 @@ def test_configured_planner_calls_llm_selection_path_before_any_deterministic_ca
             ],
         },
     )
-    calls: list[str] = []
-
-    def llm_selection(*args, **kwargs):
-        calls.append("semantic_asset_selection_llm")
-        return selected, {"status": "SELECTED", "reason": "llm selected published refs"}
-
-    planner._semantic_asset_selection_plan = llm_selection
+    planner._semantic_asset_selection_plan = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("main Planner must not delegate final selection to Semantic Selector")
+    )
+    planner._semantic_candidate_hints = lambda *_args, **_kwargs: {
+        "authority": "advisory_only",
+        "candidateRefs": [first.source_ref_id, second.source_ref_id],
+        "provenance": "rag_and_semantic_search",
+    }
     planner._semantic_fast_path = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("configured Planner must not enter deterministic fast path first")
     )
+    captured_context: dict[str, object] = {}
+
+    def main_planner_payload(*_args, **kwargs):
+        captured_context.update(kwargs.get("planner_context") or {})
+        return ({"status": "UNDERSTOOD", "reason": "main Planner chose from manifest"}, False, None, "")
+
+    planner.understanding_extractor.initial_payload = main_planner_payload
+    planner._compile_planner_payload = lambda *_args, **_kwargs: selected
 
     plan, requests, reason = planner.plan("opaque", [], "", RecallBundle(), pack, [], [])
 
-    assert calls == ["semantic_asset_selection_llm"]
+    assert captured_context["semanticCandidateHints"]["authority"] == "advisory_only"
+    assert "semanticSelectionContract" not in captured_context
     assert plan.intents
     assert not requests
-    assert reason == "llm selected published refs"
+    assert reason == "main Planner chose from manifest"
 
 
 def test_configured_non_provider_failure_fails_closed_without_deterministic_activation() -> None:
@@ -382,7 +392,7 @@ def test_configured_provider_failure_returns_explicit_validated_recovery_candida
     assert plan.question_understanding["recoveryCandidate"]["validated"] is True
 
 
-def test_non_provider_invalid_output_recovers_from_verified_selector_handoff() -> None:
+def test_non_provider_invalid_output_does_not_promote_candidate_hints_to_recovery_contract() -> None:
     first = metric("fact_runtime", "first_measure", "First measure", "first_value")
     second = metric("fact_runtime", "second_measure", "Second measure", "second_value")
     pack = PlanningAssetPack(
@@ -408,40 +418,15 @@ def test_non_provider_invalid_output_recovers_from_verified_selector_handoff() -
         last_error = "json_parse_error: invalid planner output"
         error_events: list[object] = []
 
-    selection_payload = {
-        "status": "UNSUPPORTED",
-        "action": "unsupported",
-        "selectedRefs": [first.source_ref_id, second.source_ref_id],
-        "selectedAssets": [
-            {
-                "semanticRefId": first.source_ref_id,
-                "metricRef": first.key,
-                "ownerTable": first.table,
-                "sourcePhrase": first.title,
-                "confidence": "0.97",
-            },
-            {
-                "semanticRefId": second.source_ref_id,
-                "metricRef": second.key,
-                "ownerTable": second.table,
-                "sourcePhrase": second.title,
-                "confidence": "0.97",
-            },
-        ],
-        "queryContract": {"contractType": "requires_planner"},
-        "planningContract": {
-            "analysisIntent": "anomaly",
-            "metricPhrases": ["First measure", "Second measure"],
-            "timeWindowDays": 15,
-            "timeRange": {"kind": "rolling", "days": 15, "source": "runtime_contract"},
-        },
-        "reason": "metrics are exact; anomaly comparison requires Planner",
-    }
     planner = QueryGraphPlanner(
         InvalidModel(),
         settings=get_settings().model_copy(update={"planner_semantic_contract_compile_enabled": False}),
     )
-    planner._semantic_asset_selection_plan = lambda *args, **kwargs: (QueryPlan(), selection_payload)
+    planner._semantic_candidate_hints = lambda *_args, **_kwargs: {
+        "authority": "advisory_only",
+        "candidateRefs": [first.source_ref_id, second.source_ref_id],
+        "provenance": "rag_and_semantic_search",
+    }
     captured_context: dict[str, object] = {}
 
     def invalid_initial_payload(*args, **kwargs):
@@ -461,20 +446,17 @@ def test_non_provider_invalid_output_recovers_from_verified_selector_handoff() -
 
     plan, requests, reason = planner.plan("opaque", [], "", RecallBundle(), pack, [], [])
 
-    handoff = captured_context["semanticSelectionContract"]
-    assert isinstance(handoff, dict) and handoff["verified"] is True
-    assert handoff["selectedRefs"] == [first.source_ref_id, second.source_ref_id]
-    assert plan.intents
+    hints = captured_context["semanticCandidateHints"]
+    assert isinstance(hints, dict) and hints["authority"] == "advisory_only"
+    assert hints["candidateRefs"] == [first.source_ref_id, second.source_ref_id]
+    assert "semanticSelectionContract" not in captured_context
+    assert not plan.intents
     assert not requests
-    assert reason == "TYPED_SEMANTIC_RECOVERY_CANDIDATE"
-    assert "planner.recovery_candidate.trigger=invalid_structured_output" in plan.agent_trace
-    assert plan.question_understanding["recoveryCandidate"]["selectedRefs"] == [
-        first.source_ref_id,
-        second.source_ref_id,
-    ]
+    assert "PLANNER_INVALID_STRUCTURED_OUTPUT" in reason
+    assert "planner.recovery_candidate.not_activated=non_provider_failure" in plan.agent_trace
 
 
-def test_verified_selector_contract_compiles_without_redundant_full_planner_rounds() -> None:
+def test_candidate_refs_never_skip_main_planner_round() -> None:
     first = metric("fact_runtime", "first_measure", "First measure", "first_value")
     second = metric("fact_runtime", "second_measure", "Second measure", "second_value")
     pack = PlanningAssetPack(
@@ -500,46 +482,42 @@ def test_verified_selector_contract_compiles_without_redundant_full_planner_roun
         last_error = ""
         error_events: list[object] = []
 
-    selection_payload = {
-        "status": "UNSUPPORTED",
-        "action": "unsupported",
-        "selectedRefs": [first.source_ref_id, second.source_ref_id],
-        "selectedAssets": [
-            {
-                "semanticRefId": item.source_ref_id,
-                "metricRef": item.key,
-                "ownerTable": item.table,
-                "sourcePhrase": item.title,
-                "confidence": "0.97",
-            }
-            for item in [first, second]
-        ],
-        "queryContract": {"contractType": "requires_planner"},
-        "planningContract": {
-            "analysisIntent": "anomaly",
-            "metricPhrases": ["First measure", "Second measure"],
-            "timeWindowDays": 15,
-            "timeRange": {"kind": "rolling", "days": 15, "source": "runtime_contract"},
-        },
-        "reason": "exact metric identities already selected",
-    }
     planner = QueryGraphPlanner(ConfiguredModel())
-    planner._semantic_asset_selection_plan = lambda *args, **kwargs: (QueryPlan(), selection_payload)
-    planner.understanding_extractor.initial_payload = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("complete semantic selection contract must not re-enter the full Planner LLM")
+    planner._semantic_asset_selection_plan = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Semantic Selector must not own the main planning path")
     )
+    planner._semantic_candidate_hints = lambda *_args, **_kwargs: {
+        "authority": "advisory_only",
+        "candidateRefs": [first.source_ref_id, second.source_ref_id],
+    }
+    captured_context: dict[str, object] = {}
+
+    def main_planner_payload(*_args, **kwargs):
+        captured_context.update(kwargs.get("planner_context") or {})
+        return ({"status": "UNDERSTOOD", "reason": "main Planner completed"}, False, None, "")
+
+    expected = compile_asset_driven_multi_metric_fallback_graph(
+        "opaque",
+        pack,
+        structured_understanding={
+            "analysisIntent": "anomaly",
+            "timeWindowDays": 15,
+            "requestedMeasures": [
+                {"metricRef": item.key, "ownerTable": item.table, "semanticRefId": item.source_ref_id}
+                for item in [first, second]
+            ],
+        },
+    )
+    planner.understanding_extractor.initial_payload = main_planner_payload
+    planner._compile_planner_payload = lambda *_args, **_kwargs: expected
 
     plan, requests, reason = planner.plan("opaque", [], "", RecallBundle(), pack, [], [])
 
+    assert captured_context["semanticCandidateHints"]["authority"] == "advisory_only"
     assert plan.intents
     assert not requests
-    assert reason == "SEMANTIC_SELECTION_CONTRACT_COMPILED"
-    assert "planner.llm_call_budget=selector_only" in plan.agent_trace
-    assert plan.question_understanding["source"] == "semantic_selection_contract_compiler"
-    assert plan.question_understanding["planningCandidate"]["selectedRefs"] == [
-        first.source_ref_id,
-        second.source_ref_id,
-    ]
+    assert reason == "main Planner completed"
+    assert "planner.llm_call_budget=main_only_success" in plan.agent_trace
 
 
 def test_semantic_candidate_protocol_separates_exact_and_partial_labels_and_only_publishes_readable_refs() -> None:

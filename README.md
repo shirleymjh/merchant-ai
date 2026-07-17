@@ -1,6 +1,8 @@
 #Merchant AI
 
-商家 AI 助手示例工程，包含 Python FastAPI + LangGraph 后端、Vue 前端、Doris 查询、MySQL 问答记录、规则/记忆沉淀，以及 `Main Agent ReAct Runtime + QueryGraph + NodeWorker` 的 Agent Harness 问答流程。
+商家 AI 助手示例工程，采用 Diana 式 `Deep Agent Lead Runtime + FileSystem-as-Context + QueryGraph + NodeWorker` 架构，包含 Python FastAPI 后端、Vue 前端、Doris 查询、MySQL 问答记录以及规则/记忆沉淀。
+
+运行时基线为 **Python 3.11/3.12 + Deep Agents 0.6.12 + LangChain 1.x + LangGraph 1.x**。Python 3.9 和 LangChain 0.3 环境不再受支持；启动脚本检测到旧 `.venv` 时会保留旧目录，并自动使用 `.venv-deepagent`。
 
 ## 模块
 
@@ -9,6 +11,16 @@
 - `python_backend/resources/runtime/rules`: 经过治理的平台规则文档，按标题和语义段落建立召回索引。
 - `python_backend/resources/sql`: MySQL 初始化 SQL。
 - `python_backend/resources/runtime/topics`: Topic 资产、语义层、relationship 和 QueryGraph 规划资产。
+
+## DeepAgent 与 Diana 的边界
+
+- DeepAgent Core 是唯一主 ReAct 循环，默认最多 16 个受治理动作；Planner 不是 subagent，也没有隐藏文件工具循环。
+- Topic 由当前商家问题自动发现。Core 首先只看到跨候选 Topic 的 L0 表清单和业务摘要，再自行用 `ls/read_file/grep` 读取表详情、指标/字段/schema、关系与业务规则。
+- 只有成功 `read_file` 的精确内容进入 Planner 可信证据账本；`ls/grep` 和 RAG 排名只用于导航，不能直接授权指标口径或物理字段。
+- DeepAgent 托管短期消息上下文、checkpoint、自动摘要、state filesystem 和超过 20k token 的 tool result offload。
+- Diana domain 生成的 QueryGraph、SQL/result 与证据中间产物以只读 `/artifacts` 挂载给 DeepAgent，Core 可按需继续 `ls/read_file/grep`，不会把整份结果重新注入 prompt。
+- 商家个人 memory（偏好、习惯、近期关注）继续由 Diana 的租户隔离/TTL/冲突/反馈机制自动沉淀和按题召回；低可信内容只会被自动隔离，敏感标识拒绝落库，不会创建人审队列。共享指标口径、规则与术语才走独立的 knowledge 确认/审核/发布流程；私有或未标 scope 的候选禁止进入共享发布链路。两者都不使用全量常驻、可直接编辑的 `AGENTS.md` 代替。
+- 执行产生零行、SQL 错误、新鲜度或 snapshot 缺口时，Core 会看到结构化 observation，并可在预算内补读、换表、重新规划和重试；空结果不会被解释为业务为 0。
 
 ## 关键环境变量
 
@@ -52,9 +64,10 @@ bash scripts/start_python_backend.sh
 
 ```bash
 cd python_backend
-python3 -m venv .venv
-source .venv/bin/activate
+python3.11 -m venv .venv-deepagent
+source .venv-deepagent/bin/activate
 pip install -e .
+python -m merchant_ai.runtime_compat
 uvicorn app.main:app --host 0.0.0.0 --port 8088 --reload
 ```
 
@@ -66,7 +79,7 @@ npm install
 npm run dev
 ```
 
-Python 版复用 `python_backend/resources` 和现有 Doris/MySQL 环境变量；核心问答流程由 LangGraph `StateGraph` 编排 V2 Main Agent ReAct / QueryGraph / NodeWorker 节点。
+Python 版复用 `python_backend/resources` 和现有 Doris/MySQL 环境变量；DeepAgent 负责 Core ReAct 与上下文承载，现有 LangGraph domain kernel 作为受治理工具执行 QueryGraph、NodeWorker、证据和回答动作。
 
 ## ES Recall
 

@@ -302,6 +302,7 @@ def test_direct_publish_materializes_active_asset_and_registers_new_table_withou
         {
             "tableName": table,
             "tableComment": "new fact",
+            "businessSummary": "new fact",
             "dataGrain": "",
             "timeColumn": "event_day",
             "merchantFilterColumn": "tenant_id",

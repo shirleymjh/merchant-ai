@@ -2,6 +2,7 @@
   {
     "tableName": "dwm_goods_detail_df",
     "tableComment": "dwm-商品系统-商品上新全流程-全量表",
+    "businessSummary": "商品上新全流程表，覆盖申请、审核、拒绝或通过、上架、类目、价格和创建时间等商品属性；不承载交易、退款或工单事实。",
     "dataGrain": "商品/SPU 全流程快照粒度",
     "timeColumn": "pt",
     "merchantFilterColumn": "seller_id",

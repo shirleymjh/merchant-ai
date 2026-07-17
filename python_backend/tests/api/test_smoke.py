@@ -33,14 +33,10 @@ def test_query_graph_smoke_contract():
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["debugTrace"]["harness"]["mode"] == "harness"
+    assert body["debugTrace"]["harness"]["mode"] == "deepagent"
     assert body["debugTrace"]["planningAssetPack"]["skills"]
     agent_trace = body["debugTrace"]["agentTrace"]
     assert agent_trace
-    if any("planner.no_llm_configured" in item for item in agent_trace):
-        assert body["debugTrace"]["queryGraphValidation"]["gaps"]
-        assert not body["debugTrace"]["taskResults"]
-        assert not body["debugTrace"]["planIntents"]
     assert "PY_FALLBACK:EXPLICIT_ORDER_LOOKUP" not in str(body["debugTrace"])
     assert (
         body["debugTrace"].get("planIntents")

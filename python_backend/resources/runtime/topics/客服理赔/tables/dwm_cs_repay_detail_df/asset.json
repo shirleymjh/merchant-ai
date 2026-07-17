@@ -3,6 +3,7 @@
   "questionCategory": "COMPENSATION",
   "tableName": "dwm_cs_repay_detail_df",
   "tableComment": "dwm-客服域-理赔全流程表-全量表",
+  "businessSummary": "客服理赔全流程记录表，覆盖赔付申请、赔付原因、审批、到账状态和服务处理过程，可分析理赔对象与进度。",
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",

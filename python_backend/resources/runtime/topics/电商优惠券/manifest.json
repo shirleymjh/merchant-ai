@@ -2,6 +2,7 @@
   {
     "tableName": "dwm_coupon_detail_di",
     "tableComment": "dwm-优惠券域-明细表-增量表",
+    "businessSummary": "优惠券与津贴业务明细表，覆盖发放、领取、退回、使用及优惠金额等信息，可按券或活动相关属性分析。",
     "dataGrain": "优惠券/津贴明细粒度",
     "timeColumn": "pt",
     "merchantFilterColumn": "seller_id",

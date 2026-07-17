@@ -3,7 +3,7 @@ import json
 from merchant_ai.config import get_settings
 from merchant_ai.models import ExtractedKeywords, QuestionCategory
 from merchant_ai.services.assets import HybridRecallService, TopicAssetService, semantic_candidate_source_hash
-from merchant_ai.services.memory import MemoryKnowledgeGovernanceService, StructuredMemoryStore
+from merchant_ai.services.memory import KnowledgeSuggestionGovernanceService, StructuredMemoryStore
 from merchant_ai.services.recall_index import RecallIndexManager
 from merchant_ai.services.semantic_publish import SemanticPublishCoordinator
 
@@ -125,15 +125,20 @@ def _setup_runtime(tmp_path, asset_type=TopicAssetService, post_publishable=True
             "suggestionId": "ks_open_rule",
             "suggestionType": "business_rule",
             "status": "approved",
+            "scopeType": "platform",
             "topic": topic,
             "metricName": "异常成交规则",
             "sourceTable": table,
-            "payload": {"correctionText": "异常成交需要人工复核。", "alwaysApply": True},
+            "payload": {
+                "correctionText": "异常成交需要人工复核。",
+                "alwaysApply": True,
+                "proposedScope": "platform",
+            },
             "createdAt": "2026-07-01T00:00:00",
         }
     ]
     store.save("seller_100", memory)
-    service = MemoryKnowledgeGovernanceService(
+    service = KnowledgeSuggestionGovernanceService(
         settings,
         memory_store=store,
         topic_assets=topic_assets,

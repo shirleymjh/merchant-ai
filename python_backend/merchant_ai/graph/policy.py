@@ -32,6 +32,30 @@ REPAIRABLE_QUERY_GRAPH_GAP_CODES = {
     "AGGREGATE_OUTPUT_CONTRACT_MISMATCH",
     "GROUP_BY_CONTRACT_MISMATCH",
 }
+RECOVERABLE_EXECUTION_EVIDENCE_GAP_CODES = {
+    "EXECUTION_OPERATIONAL_FAILURE",
+    "MEM_ALLOC_FAILED",
+    "SQL_EXECUTION_FAILED",
+    "TIMEOUT",
+    "UNKNOWN_COLUMN",
+    "UPSTREAM_SQL_FAILED",
+    "UPSTREAM_ZERO_ROWS",
+    "ZERO_ROWS",
+}
+RECOVERABLE_EVIDENCE_ACTION_TOKENS = {
+    "align_",
+    "repair_",
+    "restore_",
+    "retry_",
+    "rerun_",
+    "supplement_",
+}
+RECOVERABLE_FRESHNESS_STATUSES = {
+    "CHECK_FAILED",
+    "NO_TIME_COLUMN",
+    "STALE_REQUIRES_GRAPH_REPREPARATION",
+    "ZERO_ROWS",
+}
 
 
 class AgentActionRegistry:
@@ -112,7 +136,10 @@ class AgentActionRegistry:
                 id="plan_graph",
                 node="plan_query_graph",
                 agent="PlannerAgent",
-                description="build QueryGraph",
+                description=(
+                    "compile QueryGraph from exact semantic evidence already read by the Core Agent; "
+                    "Planner has no hidden filesystem loop"
+                ),
                 required_state_flags=["planning_assets_compacted"],
                 expected_state_keys=["plan.intents"],
             ),
@@ -209,7 +236,10 @@ class AgentActionRegistry:
                 id="delegate_subagent",
                 node="delegate_subagent",
                 agent="LeadAgent",
-                description="delegate bounded document, Python, hypothesis, Skill or query work to isolated Sub-Agents",
+                description=(
+                    "dispatch a runtime-governed document/Python/query/Skill worker; use DeepAgent task, not this "
+                    "action, for ordinary read-only context isolation"
+                ),
                 expected_state_flags=["subagent_delegation_completed"],
             ),
             AgentAction(
@@ -529,16 +559,19 @@ class V2AgentPolicy:
             eligible.add("compact_assets")
 
         if assets_ready:
-            if not state.get("query_metric_attempted") and self.query_metric_candidate(state):
-                eligible.add("query_metric")
-
             if not has_plan:
                 if state.get("planner_provider_error"):
                     if not self.graph_validation_attempted(state):
                         eligible.add("validate_graph")
                     else:
                         eligible.add("answer_data")
-                elif int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions:
+                elif (
+                    int(state.get("query_graph_plan_attempts") or 0) < self.max_plan_actions
+                    or (
+                        bool(state.get("core_managed_filesystem"))
+                        and self.can_reunderstand(state)
+                    )
+                ):
                     eligible.add("plan_graph")
                     if self.can_retrieve_supplemental(state):
                         eligible.add("retrieve_knowledge")
@@ -591,6 +624,19 @@ class V2AgentPolicy:
             eligible.add("repair_sql")
         if has_tasks and not self.evidence_verification_attempted(state):
             eligible.add("verify_evidence")
+
+        # Execution observations may reveal that the current QueryGraph chose
+        # the wrong source/window even when SQL itself completed. Re-open the
+        # governed Planner (and optional semantic retrieval) instead of forcing
+        # the Lead to turn a recoverable zero-row/freshness/SQL gap directly
+        # into an answer. The Planner remains bounded by can_reunderstand(), and
+        # every replacement graph must still pass reflection/validation before
+        # another SQL execution action becomes eligible.
+        if assets_ready and self.execution_recovery_needed(state):
+            if self.can_reunderstand(state) and not state.get("planner_provider_error"):
+                eligible.add("plan_graph")
+            if knowledge_can_progress:
+                eligible.add("retrieve_knowledge")
 
         if self.has_graph_repairable_execution_gap(state):
             if self.graph_repair_attempt_count(state) < self.max_graph_repair_actions:
@@ -882,6 +928,63 @@ class V2AgentPolicy:
         if not run_result:
             return False
         return any(result.query_bundle.failed for result in run_result.task_results)
+
+    def has_successful_zero_row(self, state: AgentState) -> bool:
+        run_result = state.get("agent_run_result")
+        if not run_result:
+            return False
+        return any(
+            bool(result.success)
+            and not bool(result.query_bundle.failed)
+            and int(result.query_bundle.effective_row_count()) == 0
+            for result in run_result.task_results
+        )
+
+    def has_incomplete_freshness_or_snapshot(self, state: AgentState) -> bool:
+        run_result = state.get("agent_run_result")
+        reports = list(getattr(run_result, "freshness_reports", None) or state.get("freshness_reports") or [])
+        for report in reports:
+            status = str(getattr(report, "status", "") or "").upper()
+            if status in RECOVERABLE_FRESHNESS_STATUSES:
+                return True
+            if status.startswith("STALE_") and status != "STALE_USE_REALTIME_FALLBACK":
+                return True
+            if getattr(report, "coverage_complete", True) is False:
+                return True
+        alignment = getattr(run_result, "snapshot_alignment", None) if run_result else None
+        alignment_status = str(getattr(alignment, "status", "") or "").upper()
+        if alignment_status and alignment_status != "NOT_APPLICABLE":
+            return not bool(getattr(alignment, "aligned", False) and getattr(alignment, "complete", False))
+        return False
+
+    def has_recoverable_evidence_gap(self, state: AgentState) -> bool:
+        run_result = state.get("agent_run_result")
+        if not run_result:
+            return False
+        gaps = list(getattr(run_result, "evidence_gaps", None) or [])
+        verified = getattr(run_result, "verified_evidence", None)
+        gaps.extend(getattr(verified, "gaps", None) or [])
+        for gap in gaps:
+            code = str(getattr(gap, "code", "") or getattr(gap, "gap_code", "") or "").upper()
+            # Dependency/graph-contract gaps already have the narrower
+            # repair_graph action and its own budget. Do not widen those into
+            # a second competing recovery path.
+            if code in REPAIRABLE_QUERY_GRAPH_GAP_CODES:
+                continue
+            if code in RECOVERABLE_EXECUTION_EVIDENCE_GAP_CODES or code.startswith("SNAPSHOT_"):
+                return True
+            suggested_action = str(getattr(gap, "suggested_action", "") or "").lower()
+            if any(token in suggested_action for token in RECOVERABLE_EVIDENCE_ACTION_TOKENS):
+                return True
+        return False
+
+    def execution_recovery_needed(self, state: AgentState) -> bool:
+        return bool(
+            self.has_sql_failure(state)
+            or self.has_successful_zero_row(state)
+            or self.has_incomplete_freshness_or_snapshot(state)
+            or self.has_recoverable_evidence_gap(state)
+        )
 
     def analysis_skill_needed(self, state: AgentState) -> bool:
         if self.planner_degraded_fail_fast(state):

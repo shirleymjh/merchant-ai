@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from merchant_ai.config import get_settings
 from merchant_ai.models import (
     AnswerMode,
     IntentType,
@@ -7,20 +8,25 @@ from merchant_ai.models import (
     PlanningAssetEntry,
     PlanningAssetPack,
     QuestionIntent,
+    QueryPlan,
     RecallBundle,
     RecallItem,
 )
 from merchant_ai.services.assets import (
     PlanningAssetPackBuilder,
+    TopicAssetService,
     planning_gaps_from_asset_traces,
 )
 from merchant_ai.services.planning import (
     QueryGraphPlanner,
     QueryGraphValidator,
     compact_asset_planning_contract,
+    compact_knowledge_request_gaps,
 )
 from merchant_ai.services.routing import (
     KeywordExtractService,
+    RouteSlotExtractor,
+    TopicRouterService,
     planning_hints_from_extracted_keywords,
 )
 
@@ -185,7 +191,7 @@ def test_exact_summary_seed_keeps_recalled_relationship_and_uses_dimension_closu
     tables, traces = builder._targeted_seed_tables(
         "目标金额最高的前7个分析对象",
         recalled_fact_dimension_relationship(),
-        ["summary_topic"],
+        ["summary_topic", "fact_topic", "dimension_topic"],
         table_topic,
         planning_hints=generic_hints(),
         all_relationships=generic_relationships(),
@@ -220,7 +226,41 @@ def test_simple_exact_metric_without_dimension_does_not_expand_relationships() -
     assert not any(item.startswith("dimension_relationship_path:") for item in traces)
 
 
-def test_missing_dimension_path_becomes_typed_relationship_request_before_any_plan() -> None:
+def test_precise_rag_hit_cannot_enlarge_topic_manifest_boundary() -> None:
+    builder = generic_builder()
+    table_topic = {
+        "rollup_measure": "summary_topic",
+        "event_fact": "fact_topic",
+        "dim_subject": "dimension_topic",
+    }
+    outside_topic_hit = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="semantic:fact_topic:event_fact:metric:measure_value",
+                source_type="SEMANTIC_METRIC",
+                topic="fact_topic",
+                table="event_fact",
+                metadata={
+                    "semanticKind": "METRIC",
+                    "metricKey": "measure_value",
+                    "tableName": "event_fact",
+                },
+            )
+        ]
+    )
+
+    tables, traces = builder._targeted_seed_tables(
+        "一个不包含已发布指标别名的问题",
+        outside_topic_hit,
+        ["summary_topic"],
+        table_topic,
+    )
+
+    assert tables == set()
+    assert "topic_manifest_boundary_rejected:event_fact" in traces
+
+
+def test_missing_dimension_path_is_attached_to_planner_graph_as_typed_relationship_request() -> None:
     builder = generic_builder()
     table_topic = {
         "rollup_measure": "summary_topic",
@@ -230,7 +270,7 @@ def test_missing_dimension_path_becomes_typed_relationship_request_before_any_pl
     tables, traces = builder._targeted_seed_tables(
         "目标金额最高的前7个分析对象",
         RecallBundle(),
-        ["summary_topic"],
+        ["summary_topic", "fact_topic", "dimension_topic"],
         table_topic,
         planning_hints=generic_hints(),
         all_relationships=generic_relationships()[:1],
@@ -243,16 +283,37 @@ def test_missing_dimension_path_becomes_typed_relationship_request_before_any_pl
     assert gap["targetOwner"] == "dim_subject"
     assert gap["requiredSemantics"] == ["join_path", "canonical_entity", "cardinality", "fanout_policy"]
 
-    class NeverCalledLlm:
+    class ConfiguredLlm:
         configured = True
         last_error = ""
         error_events = []
 
-        def json_chat(self, *_args, **_kwargs):
-            raise AssertionError("pre-plan relationship obligations must bypass the LLM")
-
     pack = PlanningAssetPack(metric_compaction={"knowledgeRequestGaps": [gap]})
-    plan, requests, reason = QueryGraphPlanner(NeverCalledLlm()).plan(
+    planner = QueryGraphPlanner(ConfiguredLlm())
+    planner_calls: list[str] = []
+    staged_plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                intent_type=IntentType.VALID,
+                answer_mode=AnswerMode.GROUP_AGG,
+                plan_task_id="rank_subjects",
+                preferred_table="event_fact",
+            )
+        ]
+    )
+
+    planner._semantic_asset_selection_plan = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Semantic Selector must not produce the staged graph")
+    )
+    planner._semantic_candidate_hints = lambda *_args, **_kwargs: {}
+
+    def main_planner_payload(*_args, **_kwargs):
+        planner_calls.append("main_planner")
+        return ({"status": "UNDERSTOOD", "reason": "staged graph planned"}, False, None, "")
+
+    planner.understanding_extractor.initial_payload = main_planner_payload
+    planner._compile_planner_payload = lambda *_args, **_kwargs: staged_plan
+    plan, requests, reason = planner.plan(
         "目标金额最高的前7个分析对象",
         [],
         "",
@@ -261,10 +322,43 @@ def test_missing_dimension_path_becomes_typed_relationship_request_before_any_pl
         [],
         [],
     )
-    assert reason == "RELATIONSHIP_PATH_REQUIRED"
-    assert not plan.intents
+    assert planner_calls == ["main_planner"]
+    assert reason == "staged graph planned"
+    assert plan.intents and plan.intents[0].plan_task_id == "rank_subjects"
     assert requests and all(str(item.type) == "RELATIONSHIP" for item in requests)
+    assert plan.knowledge_requests == requests
     assert requests[0].request_key.startswith("asset_relationship:")
+    assert "planner.relationship_obligations=attached" in plan.agent_trace
+    validation = QueryGraphValidator().validate(
+        "目标金额最高的前7个分析对象", plan, pack
+    )
+    assert not validation.valid
+    assert "PENDING_KNOWLEDGE_REQUEST" in {item.code for item in validation.gaps}
+    assert plan.intents and plan.intents[0].plan_task_id == "rank_subjects"
+
+
+def test_compact_relationship_gap_keeps_executable_obligation_fields() -> None:
+    gap = {
+        "code": "RELATIONSHIP_PATH_REQUIRED",
+        "requestKey": "relationship:measure:subject",
+        "type": "RELATIONSHIP",
+        "query": "find a governed path",
+        "reason": "dimension owner differs from metric owner",
+        "metricRefs": ["measure_value"],
+        "dimensionRefs": ["subject_id"],
+        "relationshipRefs": ["event_to_subject"],
+        "dimensionPhrase": "分析对象",
+        "sourceOwner": "event_fact",
+        "sourceOwners": ["event_fact"],
+        "targetOwner": "dim_subject",
+        "requiredSemantics": ["join_path", "cardinality", "fanout_policy"],
+    }
+
+    compacted = compact_knowledge_request_gaps(
+        PlanningAssetPack(metric_compaction={"knowledgeRequestGaps": [gap]})
+    )
+
+    assert compacted == [gap]
 
 
 def test_cross_table_dependency_without_relationship_is_fail_closed() -> None:
@@ -317,3 +411,60 @@ def test_structured_ranking_contract_keeps_dimension_limit_order_and_anchor() ->
     assert contract["ranking"]["limit"] == 10
     assert contract["ranking"]["order"] == "desc"
     assert contract["ranking"]["anchorMetricPhrase"] == "退款金额"
+
+
+def test_topic_route_broadens_through_asset_declared_detail_metric_lineage() -> None:
+    assets = TopicAssetService(get_settings())
+    question = "最近30天工单量最高的商品，查看他的商品发布时间"
+    keywords = KeywordExtractService(assets).extract(question)
+    slots = RouteSlotExtractor(assets).extract(question, keywords)
+    decision = TopicRouterService(assets).route(question, keywords, route_slots=slots)
+
+    mentions = {
+        (item.kind, item.canonical_key, item.owner_table, str(item.topic), item.source)
+        for item in keywords.mentions
+    }
+    assert (
+        "metric",
+        "cs_ticket_cnt_1d",
+        "ads_merchant_profile",
+        str(assets.resolve_topic_category("经营画像")),
+        "semantic_metric",
+    ) in mentions
+    assert (
+        "lineage",
+        "ticket_cnt",
+        "dwm_cs_ticket_detail_di",
+        str(assets.resolve_topic_category("客服工单")),
+        "semantic_metric_detail_ref",
+    ) in mentions
+    assert assets.resolve_topic_category("客服工单") in decision.candidate_topics
+    assert assets.resolve_topic_category("商品管理") in decision.candidate_topics
+    assert keywords.ambiguous_metric_keywords == []
+
+    pack = PlanningAssetPackBuilder(assets).compact(
+        question,
+        RecallBundle(),
+        decision.candidate_topics,
+        planning_hints=planning_hints_from_extracted_keywords(question, keywords),
+    )
+    # Progressive disclosure keeps executable table details out of the initial
+    # pack.  Route coverage is represented by the stable L0 manifest until the
+    # Core Agent chooses and semantic_read loads exact table details.
+    manifest_tables = {
+        str(item.get("table") or "")
+        for item in (pack.table_manifest or {}).get("tables") or []
+    }
+    assert {"dwm_cs_ticket_detail_di", "dwm_goods_detail_df"} <= manifest_tables
+    assert {"dwm_cs_ticket_detail_di", "dwm_goods_detail_df"} <= set(pack.known_tables())
+    assert {item.key for item in pack.metrics} >= {"ticket_cnt"}
+
+
+def test_metric_label_span_does_not_become_a_false_grouping_dimension() -> None:
+    assets = TopicAssetService(get_settings())
+    question = "最近30天商品申请量、审核拒绝量、质检不通过量和假货鉴定量有什么变化？"
+    keywords = KeywordExtractService(assets).extract(question)
+
+    assert keywords.dimension_keywords == []
+    assert not [item for item in keywords.mentions if item.kind == "lineage"]
+    assert set(keywords.topic_scores) == {str(assets.resolve_topic_category("经营画像"))}

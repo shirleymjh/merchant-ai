@@ -2,6 +2,7 @@
   {
     "tableName": "dwm_trade_order_detail_di",
     "tableComment": "dwm-交易域-订单域-明细宽表-增量表",
+    "businessSummary": "订单交易明细宽表，包含订单、子订单、商品、支付、订单状态和发货履约等交易过程信息，可按商品或订单属性分析交易。",
     "dataGrain": "订单/子订单明细粒度",
     "timeColumn": "pt",
     "merchantFilterColumn": "seller_id",

@@ -70,6 +70,12 @@ def test_merchant_lookup_uses_semantic_binding_without_compiled_table_or_column_
 
     merchant = service.current_merchant("p-1")
 
-    assert repository.calls == [("SELECT * FROM `table_alpha` WHERE `principal_key` = %s LIMIT 1", ["p-1"])]
+    assert repository.calls == [
+        (
+            "SELECT `principal_key`, `display_value` FROM `table_alpha` "
+            "WHERE `principal_key` = %s LIMIT 1",
+            ["p-1"],
+        )
+    ]
     assert merchant.merchant_id == "p-1"
     assert merchant.merchant_name == "Profile Alpha"

@@ -188,8 +188,15 @@ def test_noop_repair_preserves_full_critic_input_and_projects_exhaustion(tmp_pat
     observation = workflow.main_agent_observation(state)
     assert observation["plannerReflection"]["passed"] is False
     assert observation["plannerRepairRequests"][0]["knowledgeRequests"][0]["query"] == "read the governed metric contract"
+    assert {
+        gap["code"] for gap in observation["plannerRepairInput"]["repairGaps"]
+    } >= {"DETAIL_EVIDENCE_NOT_PLANNED"}
     assert observation["queryGraphRepairDelta"]["status"] == "no_progress"
     assert observation["queryGraphRepairDelta"]["exhausted"] is True
+
+    decision_context = workflow.build_lead_decision_context(state, observation)
+    assert decision_context["plannerRepair"]["input"] == observation["plannerRepairInput"]
+    assert decision_context["plannerRepair"]["delta"]["exhausted"] is True
 
 
 def test_executable_graph_change_is_pending_and_preserves_critic_until_revalidation(tmp_path, monkeypatch):
@@ -420,6 +427,28 @@ def test_repair_exception_becomes_blocking_gap_and_preserves_critic_input(tmp_pa
         for gap in state["agent_run_result"].evidence_gaps
     )
 
+    observation = workflow.main_agent_observation(state)
+    original_repair_gap_codes = {
+        gap["code"] for gap in observation["plannerRepairInput"]["repairGaps"]
+    }
+    repair_delta_gap_codes = {
+        gap["code"] for gap in observation["queryGraphRepairDelta"]["repairGaps"]
+    }
+    assert original_repair_gap_codes >= {"DETAIL_EVIDENCE_NOT_PLANNED"}
+    assert repair_delta_gap_codes >= {
+        "QUERY_GRAPH_REPAIR_FAILED",
+        "DETAIL_EVIDENCE_NOT_PLANNED",
+    }
+    decision_context = workflow.build_lead_decision_context(state, observation)
+    assert {
+        gap["code"]
+        for gap in decision_context["plannerRepair"]["input"]["repairGaps"]
+    } >= {"DETAIL_EVIDENCE_NOT_PLANNED"}
+    assert {
+        gap["code"]
+        for gap in decision_context["plannerRepair"]["delta"]["repairGaps"]
+    } >= {"QUERY_GRAPH_REPAIR_FAILED", "DETAIL_EVIDENCE_NOT_PLANNED"}
+
 
 def test_critic_exception_becomes_blocking_gap_instead_of_breaking_run(tmp_path, monkeypatch):
     workflow, state = _repair_state(tmp_path, rounds=2)
@@ -438,6 +467,14 @@ def test_critic_exception_becomes_blocking_gap_instead_of_breaking_run(tmp_path,
     assert any(
         gap.code == "PLANNER_CRITIC_FAILED"
         for gap in state["agent_run_result"].evidence_gaps
+    )
+
+    observation = workflow.main_agent_observation(state)
+    assert observation["plannerRepairInput"]["repairGaps"][0]["code"] == "PLANNER_CRITIC_FAILED"
+    decision_context = workflow.build_lead_decision_context(state, observation)
+    assert (
+        decision_context["plannerRepair"]["input"]["repairGaps"][0]["code"]
+        == "PLANNER_CRITIC_FAILED"
     )
 
 

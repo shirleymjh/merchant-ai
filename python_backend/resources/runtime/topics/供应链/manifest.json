@@ -2,6 +2,7 @@
   {
     "tableName": "dwm_scm_detail_di",
     "tableComment": "dwm-供应链域-全流程明细表-增量表",
+    "businessSummary": "供应链全流程明细表，覆盖入库、质检、鉴定、出库、履约和发货超时等过程信息，可分析供应链处理状态。",
     "dataGrain": "商品/SPU 全流程快照粒度",
     "timeColumn": "pt",
     "merchantFilterColumn": "merchant_id",

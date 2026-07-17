@@ -108,6 +108,16 @@ class LlmClient:
             return None
         return model
 
+    def chat_model(self, timeout_seconds: Optional[int] = None):
+        """Return the LangChain BaseChatModel used by an outer agent harness.
+
+        Domain services keep using the bounded ``chat``/``tool_chat`` methods;
+        Deep Agents needs the provider model itself so it can own the lead
+        tool-calling loop and its middleware stack.
+        """
+
+        return self._chat_model(timeout_seconds)
+
     def _temperature(self) -> float:
         """Use the provider-supported deterministic setting when available."""
 

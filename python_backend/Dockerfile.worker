@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -8,5 +8,6 @@ COPY pyproject.toml README.md ./
 COPY merchant_ai ./merchant_ai
 COPY resources ./resources
 RUN pip install --no-cache-dir ".[distributed]"
+RUN python -m merchant_ai.runtime_compat
 
 CMD ["python", "-m", "merchant_ai.worker"]

@@ -2,6 +2,7 @@
   {
     "tableName": "ads_merchant_profile",
     "tableComment": "",
+    "businessSummary": "商家经营概览快照表，覆盖交易、售后、客服、履约和商品等多域汇总信息；适合商家级概览与趋势，不提供商品、工单等明细维度。",
     "dataGrain": "商家-日期粒度经营指标画像",
     "timeColumn": "pt",
     "merchantFilterColumn": "merchant_id",

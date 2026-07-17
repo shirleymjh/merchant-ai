@@ -648,6 +648,7 @@ class ThreadContextService:
             "previousQuestion": summary.get("question", ""),
             "previousAnswerPreview": str(summary.get("answerPreview") or "")[:500],
             "previousSummary": summary.get("summary", ""),
+            "topicWorkspace": dict(summary.get("topicWorkspace") or summary.get("topic_workspace") or {}),
             "previousArtifacts": list(summary.get("artifacts") or [])[:20],
             "reusableEntitySets": list(summary.get("reusableEntitySets") or summary.get("reusable_entity_sets") or [])[:12],
             "restoredAt": datetime.now().isoformat(),
@@ -805,6 +806,16 @@ def append_thread_context_summary(existing: str, context: Dict[str, Any]) -> str
         lines.append("- previousAnswerPreview=%s" % str(context.get("previousAnswerPreview"))[:300])
     if context.get("previousSummary"):
         lines.append("- previousSummary=%s" % str(context.get("previousSummary"))[:600])
+    topic_workspace = context.get("topicWorkspace") or {}
+    if topic_workspace.get("topics") or topic_workspace.get("topicIds"):
+        lines.append(
+            "- topicWorkspace topics=%s topicIds=%s mode=%s"
+            % (
+                list(topic_workspace.get("topics") or []),
+                list(topic_workspace.get("topicIds") or []),
+                str(topic_workspace.get("mode") or ""),
+            )
+        )
     for entity in context.get("reusableEntitySets", [])[:6]:
         lines.append(
             "- reusableEntitySet task=%s key=%s count=%s preview=%s"

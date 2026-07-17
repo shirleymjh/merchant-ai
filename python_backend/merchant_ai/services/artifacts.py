@@ -8,17 +8,25 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from merchant_ai.config import Settings
-from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
+from merchant_ai.services.context_filesystem import (
+    ContextPathOutsideRootError,
+    context_path_is_within_root,
+    merchant_uri_for_artifact,
+    resolve_context_path,
+)
 
 
 class WorkspaceArtifactStore:
     """Filesystem-backed context store for agent intermediate artifacts."""
 
+    PATH_OUTSIDE_ROOT = "ARTIFACT_PATH_OUTSIDE_ROOT"
+
     def __init__(self, settings: Settings, root: Path | str | None = None):
         self.settings = settings
-        self._default_root = Path(root) if root else settings.resolved_workspace_path / "artifacts"
+        default_root = Path(root) if root else settings.resolved_workspace_path / "artifacts"
+        default_root.mkdir(parents=True, exist_ok=True)
+        self._default_root = default_root.resolve()
         self._context_root: ContextVar[Path | None] = ContextVar("workspace_artifact_root_%x" % id(self), default=None)
-        self.root.mkdir(parents=True, exist_ok=True)
 
     @property
     def root(self) -> Path:
@@ -27,7 +35,7 @@ class WorkspaceArtifactStore:
     def set_context_root(self, root: Path | str) -> None:
         target = Path(root)
         target.mkdir(parents=True, exist_ok=True)
-        self._context_root.set(target)
+        self._context_root.set(target.resolve())
 
     def with_root(self, root: Path | str) -> "WorkspaceArtifactStore":
         return WorkspaceArtifactStore(self.settings, root)
@@ -37,14 +45,31 @@ class WorkspaceArtifactStore:
         return self.write_text(namespace, name if name.endswith(".json") else "%s.json" % name, text, preview_chars=preview_chars)
 
     def write_text(self, namespace: str, name: str, content: str, preview_chars: int | None = None) -> Dict[str, Any]:
-        target_dir = self.root / sanitize_path_part(namespace or "misc")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / sanitize_file_name(name or "artifact.txt")
+        relative_path = Path(sanitize_path_part(namespace or "misc")) / sanitize_file_name(name or "artifact.txt")
+        try:
+            target_dir = self._resolve(str(relative_path.parent))
+            target = self._resolve(str(relative_path))
+        except ContextPathOutsideRootError:
+            return self._path_error(str(relative_path))
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return {"success": False, "error": "ARTIFACT_WRITE_FAILED", "path": str(relative_path)}
+        # Re-resolve after directory creation so an existing symlinked parent is
+        # checked immediately before the write.
+        try:
+            target = self._resolve(str(relative_path))
+        except ContextPathOutsideRootError:
+            return self._path_error(str(relative_path))
         text = str(content or "")
-        target.write_text(text, encoding="utf-8")
+        try:
+            target.write_text(text, encoding="utf-8")
+        except OSError:
+            return {"success": False, "error": "ARTIFACT_WRITE_FAILED", "path": str(relative_path)}
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         preview_limit = max(0, int(preview_chars if preview_chars is not None else self.settings.context_file_inline_max_chars))
         return {
+            "success": True,
             "path": str(target),
             "relativePath": str(target.relative_to(self.root)),
             "merchantUri": merchant_uri_for_artifact(str(target.relative_to(self.root)), namespace=namespace or "misc"),
@@ -56,10 +81,16 @@ class WorkspaceArtifactStore:
         }
 
     def read(self, path: str, offset: int = 0, max_chars: int | None = None) -> Dict[str, Any]:
-        target = self._resolve(path)
+        try:
+            target = self._resolve(path)
+        except ContextPathOutsideRootError:
+            return self._path_error(path)
         if not target.exists() or not target.is_file():
             return {"success": False, "error": "ARTIFACT_NOT_FOUND", "path": path}
-        text = target.read_text(encoding="utf-8")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except OSError:
+            return {"success": False, "error": "ARTIFACT_READ_FAILED", "path": path}
         start = max(0, int(offset or 0))
         limit = max(1, int(max_chars or self.settings.context_file_inline_max_chars))
         end = min(len(text), start + limit)
@@ -80,7 +111,11 @@ class WorkspaceArtifactStore:
         if not terms:
             return []
         hits: List[Dict[str, Any]] = []
-        for path in sorted(self.root.rglob("*")):
+        for discovered_path in sorted(self.root.rglob("*")):
+            try:
+                path = self._resolve(str(discovered_path))
+            except ContextPathOutsideRootError:
+                continue
             if not path.is_file():
                 continue
             try:
@@ -104,11 +139,18 @@ class WorkspaceArtifactStore:
         return hits[: max(1, int(limit or 20))]
 
     def ls(self, namespace: str = "", limit: int = 100) -> List[Dict[str, Any]]:
-        root = self.root / sanitize_path_part(namespace) if namespace else self.root
+        try:
+            root = self._resolve(sanitize_path_part(namespace)) if namespace else self._resolve("")
+        except ContextPathOutsideRootError:
+            return []
         if not root.exists():
             return []
         items: List[Dict[str, Any]] = []
-        for path in sorted(root.rglob("*")):
+        for discovered_path in sorted(root.rglob("*")):
+            try:
+                path = self._resolve(str(discovered_path))
+            except ContextPathOutsideRootError:
+                continue
             if not path.is_file():
                 continue
             items.append(
@@ -124,17 +166,13 @@ class WorkspaceArtifactStore:
         return items
 
     def _resolve(self, path: str) -> Path:
-        target = Path(path)
-        if target.is_absolute():
-            return target
-        return self.root / path
+        return resolve_context_path(self.root, path)
 
     def _is_under_root(self, path: Path) -> bool:
-        try:
-            path.relative_to(self.root)
-            return True
-        except ValueError:
-            return False
+        return context_path_is_within_root(self.root, path)
+
+    def _path_error(self, path: str) -> Dict[str, Any]:
+        return {"success": False, "error": self.PATH_OUTSIDE_ROOT, "path": str(path or "")}
 
 
 def offload_rows_if_needed(

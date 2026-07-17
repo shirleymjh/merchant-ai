@@ -44,8 +44,18 @@ MAX_PREFERENCES = 160
 MAX_FACTS = 120
 MAX_KNOWLEDGE_SUGGESTIONS = 160
 HABIT_CORE_PROMOTION_HIT_COUNT = 2
-APPROVED_MEMORY_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
-PENDING_MEMORY_STATUSES = {"candidate", "pending", "review_required", "needs_review"}
+USABLE_MEMORY_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
+# Personal memory is never sent through the knowledge-review lifecycle.  New
+# writes use ``quarantined`` when an automatic privacy/trust gate prevents
+# recall.  The older review-flavoured values remain read-compatible so an
+# upgrade cannot accidentally activate historical low-trust records.
+QUARANTINED_MEMORY_STATUSES = {
+    "quarantined",
+    "candidate",
+    "pending",
+    "review_required",
+    "needs_review",
+}
 INACTIVE_MEMORY_STATUSES = {"deleted", "disabled", "inactive", "rejected", "archived", "expired", "superseded"}
 STRONG_CONSTRAINT_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
 EXPLICIT_HABIT_TERMS = {
@@ -162,7 +172,11 @@ class MemoryStore:
 
 
 class MemoryWriteGate:
-    """Govern long-term memory writes before they mutate the store."""
+    """Apply automatic privacy/trust gates before personal-memory writes.
+
+    This gate does not create a human-review task.  Human confirmation and
+    review belong exclusively to the separate knowledge-suggestion lifecycle.
+    """
 
     SENSITIVE_PATTERNS = [
         re.compile(r"\b\d{15,19}\b"),
@@ -178,7 +192,7 @@ class MemoryWriteGate:
         scope = event.get("scope") if isinstance(event.get("scope"), dict) else {}
         reasons: List[str] = []
         action = "write"
-        review_status = "auto"
+        gate_status = "auto"
         if not question.strip():
             action = "reject"
             reasons.append("empty_question")
@@ -192,16 +206,19 @@ class MemoryWriteGate:
         if evidence_checked and memory_type in {"query_event", "business_focus"} and (
             bool(event.get("answerWithGap")) or event.get("answerVerified") is False
         ):
-            action = "review" if action != "reject" else action
-            review_status = "evidence_gap"
+            action = "quarantine" if action != "reject" else action
+            gate_status = "evidence_gap"
             reasons.append("answer_not_fully_verified")
         if memory_type in {"business_fact", "correction"} and confidence < 0.7:
-            action = "review"
-            review_status = "review_required"
-            reasons.append("strong_memory_requires_review")
+            action = "quarantine"
+            gate_status = "low_trust"
+            reasons.append("low_trust_memory_quarantined")
         if any(pattern.search(question) or pattern.search(answer_preview) for pattern in self.SENSITIVE_PATTERNS):
-            action = "review" if action != "reject" else action
-            review_status = "review_required"
+            # Do not persist raw sensitive identifiers into a queue for a
+            # person to inspect.  Rejecting the memory write is the safe
+            # automatic outcome; the answer itself is unaffected.
+            action = "reject"
+            gate_status = "privacy_rejected"
             reasons.append("possible_sensitive_identifier")
         if len(question) < 4 and memory_type == "query_event":
             action = "reject"
@@ -209,7 +226,11 @@ class MemoryWriteGate:
         return {
             "action": action,
             "allowed": action != "reject",
-            "reviewStatus": review_status,
+            # Keep the serialized key for backward compatibility with stored
+            # records, but its value now describes an automatic gate only.
+            "reviewStatus": gate_status,
+            "gateStatus": gate_status,
+            "humanReviewRequired": False,
             "reasons": reasons or ["policy_passed"],
             "confidence": confidence,
             "sourceEventId": str(event.get("eventId") or event.get("event_id") or ""),
@@ -220,8 +241,8 @@ class MemoryWriteGate:
         event["writePolicy"] = policy
         event["sourceEventId"] = event.get("sourceEventId") or event.get("eventId") or ""
         event["reviewStatus"] = policy["reviewStatus"]
-        if policy["action"] == "review":
-            event["status"] = "review_required"
+        if policy["action"] == "quarantine":
+            event["status"] = "quarantined"
         return event
 
 
@@ -236,10 +257,11 @@ def canceled_memory_update(memory: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class KnowledgeCuratorService:
-    """Use a bounded LLM call to turn a completed turn into reviewable knowledge."""
+    """Classify user-authored assertions into personal Memory or Knowledge."""
 
     PLATFORM_KINDS = {"metric_definition", "platform_rule", "platform_correction"}
-    ALLOWED_KINDS = PLATFORM_KINDS | {"merchant_preference", "merchant_rule", "merchant_fact"}
+    PERSONAL_MEMORY_KINDS = {"personal_preference", "merchant_preference"}
+    ALLOWED_KINDS = PLATFORM_KINDS | PERSONAL_MEMORY_KINDS | {"merchant_rule", "merchant_fact"}
 
     def __init__(self, settings: Settings, llm: Optional[Any] = None):
         self.settings = settings
@@ -296,13 +318,15 @@ class KnowledgeCuratorService:
             },
         }
         system_prompt = (
-            "你是得物商家经营平台的 Knowledge Curator。判断本轮用户对话是否包含值得跨会话复用的明确知识，"
-            "例如本店长期偏好、本店内部经营规则、用户明确补充的业务事实、平台指标口径质疑或平台规则纠正。"
+            "你是得物商家经营平台的 Personalization / Knowledge Curator。判断本轮用户对话是否包含值得跨会话复用的明确内容，"
+            "个人关注、表达/展示偏好使用 personal_preference；可供商家团队复用的内部规则/事实使用 merchant_rule/merchant_fact；"
+            "平台指标口径或公共规则使用 metric_definition/platform_rule/platform_correction。"
             "只允许从 userMessages 提取，assistantAnswer 仅用于理解上下文，绝不能作为知识来源。"
             "闲聊、临时查询条件、一次性分析请求、模型自己的推断、未经用户明确表达的结论都不得提取。"
             "每条候选必须给出 userMessages 中逐字出现的 evidenceQuote；无法提供原文证据则不要提取。"
-            "本店偏好/内部规则使用 merchant scope；指标定义、官方平台规则及其纠正必须使用 platform scope。"
-            "内容要改写成简短、可独立复用的陈述，不要直接写入知识库，只输出待确认候选。"
+            "personal_preference 使用 personal scope，并进入自动 Memory 门禁；商家规则使用 merchant scope；"
+            "指标定义、官方平台规则及其纠正必须使用 platform scope。"
+            "只有 merchant/platform Knowledge 需要确认或审核，个人 Memory 不进入人工审核队列。"
         )
         try:
             payload = self.llm.tool_json_chat(
@@ -332,6 +356,7 @@ class KnowledgeCuratorService:
         min_confidence = float(getattr(self.settings, "memory_curator_min_confidence", 0.72) or 0.72)
         max_candidates = max(1, int(getattr(self.settings, "memory_curator_max_candidates", 3) or 3))
         suggestions: List[Dict[str, Any]] = []
+        personal_memory_candidates: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
         for raw in (payload.get("candidates") or [])[: max_candidates * 2]:
             suggestion = curator_candidate_to_suggestion(
@@ -343,6 +368,14 @@ class KnowledgeCuratorService:
             if not suggestion:
                 trace["rejectedCount"] = int(trace["rejectedCount"]) + 1
                 continue
+            payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+            if str(payload.get("knowledgeKind") or "") in self.PERSONAL_MEMORY_KINDS:
+                preference = personal_memory_preference_from_curator_suggestion(suggestion, event)
+                if preference:
+                    personal_memory_candidates.append(preference)
+                else:
+                    trace["rejectedCount"] = int(trace["rejectedCount"]) + 1
+                continue
             suggestion_id = str(suggestion.get("suggestionId") or "")
             if suggestion_id in seen_ids:
                 trace["rejectedCount"] = int(trace["rejectedCount"]) + 1
@@ -352,6 +385,8 @@ class KnowledgeCuratorService:
             if len(suggestions) >= max_candidates:
                 break
         trace["candidateCount"] = len(suggestions)
+        trace["personalMemoryCandidateCount"] = len(personal_memory_candidates)
+        trace["personalMemoryCandidates"] = personal_memory_candidates
         return suggestions, trace
 
 
@@ -398,14 +433,26 @@ class MemoryIngestionService:
         event = self.write_gate.apply(event, merchant_id)
         write_policy = event.get("writePolicy") or {}
         curated_suggestions, curator_trace = self.curator.extract(state, event)
+        personal_memory_candidates = [
+            item
+            for item in (curator_trace.pop("personalMemoryCandidates", []) or [])
+            if isinstance(item, dict)
+        ]
+        if personal_memory_candidates:
+            curator_trace["personalMemoryCandidateIds"] = [
+                str(item.get("preferenceId") or "")
+                for item in personal_memory_candidates
+                if item.get("preferenceId")
+            ]
         if cancel_check and cancel_check():
             return canceled_memory_update(memory)
         curator_authoritative = bool(curator_trace.get("authoritative"))
-        if curator_authoritative and event.get("memoryType") in {"correction", "metric_dispute"}:
-            # The curator is the semantic judge. Until a merchant/platform action
-            # confirms the candidate, rule markers must not create stable facts.
-            event["status"] = "candidate"
-            event["reviewStatus"] = "model_candidate"
+        if event.get("memoryType") in {"correction", "metric_dispute"}:
+            # A correction to a metric/rule is a source signal for Knowledge,
+            # not personal Memory.  Keep the interaction only as an isolated
+            # trace record until the separate Knowledge proposal is confirmed.
+            event["status"] = "quarantined"
+            event["reviewStatus"] = "knowledge_candidate_source"
         ingestion_trace = {
             "eventId": event.get("eventId"),
             "memoryType": event.get("memoryType"),
@@ -436,18 +483,21 @@ class MemoryIngestionService:
         memory["events"] = events[-MAX_EVENTS:]
         preference_updates = (
             0
-            if event.get("memoryType") == "metric_dispute"
-            or write_policy.get("action") == "review"
-            or (curator_authoritative and event.get("memoryType") == "correction")
+            if event.get("memoryType") in {"correction", "metric_dispute"}
+            or write_policy.get("action") == "quarantine"
             else upsert_habit_preferences(memory, event)
         )
+        if (
+            personal_memory_candidates
+            and event.get("memoryType") not in {"correction", "metric_dispute"}
+            and write_policy.get("action") != "quarantine"
+        ):
+            preferences = [item for item in memory.get("preferences") or [] if isinstance(item, dict)]
+            for preference in personal_memory_candidates:
+                preferences, did_update = upsert_preference(preferences, preference)
+                preference_updates += int(did_update)
+            memory["preferences"] = preferences[-MAX_PREFERENCES:]
         ingestion_trace["preferenceUpdates"] = preference_updates
-        if event.get("memoryType") == "correction" and not curator_authoritative:
-            fact = correction_fact_from_event(event)
-            memory["facts"] = upsert_fact(memory.get("facts") or [], fact)
-            conflict = resolve_memory_conflicts(memory, event)
-            if conflict:
-                ingestion_trace["conflict"] = conflict.model_dump(by_alias=True)
         suggestions = curated_suggestions
         if not curator_authoritative:
             fallback_suggestion = knowledge_suggestion_from_event(event)
@@ -498,7 +548,7 @@ class MemoryIngestionService:
         memory["events"] = events[-MAX_EVENTS:]
         if bool(disliked):
             reduce_related_memory(memory, event, reason="negative feedback")
-        elif write_policy.get("action") != "review":
+        elif write_policy.get("action") != "quarantine":
             upsert_habit_preferences(memory, event)
         memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
         memory["memoryIngestionTrace"] = {
@@ -1494,7 +1544,7 @@ class KnowledgeConflictService:
                 status = str(item.get("status") or "").lower()
                 if group == "knowledgeSuggestions" and status not in {"merchant_active", "approved", "published", "indexed"}:
                     continue
-                if group != "knowledgeSuggestions" and status in INACTIVE_MEMORY_STATUSES | PENDING_MEMORY_STATUSES:
+                if group != "knowledgeSuggestions" and status in INACTIVE_MEMORY_STATUSES | QUARANTINED_MEMORY_STATUSES:
                     continue
                 candidate_text = memory_knowledge_text(item)
                 if candidate_text:
@@ -1603,8 +1653,12 @@ class KnowledgeConflictService:
             return []
 
 
-class MemoryKnowledgeGovernanceService:
-    """Govern knowledge suggestions before they can become published semantic assets."""
+class KnowledgeSuggestionGovernanceService:
+    """Govern Knowledge proposals before they become semantic assets.
+
+    This lifecycle is deliberately separate from automatic personal Memory
+    writes, even when a legacy storage adapter persists both record families.
+    """
 
     def __init__(
         self,
@@ -1628,6 +1682,9 @@ class MemoryKnowledgeGovernanceService:
         suggestion = find_knowledge_suggestion(memory, suggestion_id)
         if not suggestion:
             return {"success": False, "status": "NOT_FOUND", "merchantId": merchant_id, "suggestionId": suggestion_id}
+        scope_failure = shared_knowledge_scope_failure(merchant_id, suggestion_id, suggestion, "review")
+        if scope_failure:
+            return scope_failure
         action = str(getattr(request, "action", "") or "review").strip().lower()
         now = datetime.now().isoformat()
         approved = bool(getattr(request, "approved", False))
@@ -1645,12 +1702,6 @@ class MemoryKnowledgeGovernanceService:
         suggestion["reviewedAt"] = now
         suggestion["updatedAt"] = now
         memory["knowledgeSuggestions"] = replace_knowledge_suggestion(memory.get("knowledgeSuggestions") or [], suggestion)
-        promoted_fact = {}
-        if knowledge_suggestion_status(suggestion) == "approved" and knowledge_suggestion_proposed_scope(suggestion) != "platform":
-            promoted_fact = confirmed_fact_from_knowledge_suggestion(suggestion, merchant_id, reviewer=str(getattr(request, "reviewer", "") or ""))
-            if promoted_fact:
-                memory["facts"] = upsert_fact(memory.get("facts") or [], promoted_fact)
-                memory["coreMemoryProfile"] = build_core_memory_profile(memory)
         saved = self.memory_store.save(merchant_id, memory)
         result = {
             "success": True,
@@ -1659,8 +1710,6 @@ class MemoryKnowledgeGovernanceService:
             "suggestionId": suggestion_id,
             "suggestion": find_knowledge_suggestion(saved, suggestion_id),
         }
-        if promoted_fact:
-            result["promotedMemoryFact"] = promoted_fact
         return result
 
     def apply_merchant_action(
@@ -1692,6 +1741,15 @@ class MemoryKnowledgeGovernanceService:
         if not suggestion:
             return {"success": False, "status": "NOT_FOUND", "merchantId": merchant_id, "suggestionId": suggestion_id}
         current_status = knowledge_suggestion_status(suggestion)
+        proposed_scope = knowledge_suggestion_proposed_scope(suggestion)
+        if proposed_scope == "legacy_unclassified" and selected_action != "skip":
+            return {
+                "success": False,
+                "status": "KNOWLEDGE_SCOPE_CLASSIFICATION_REQUIRED",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "allowedActions": ["dismiss"],
+            }
         terminal_by_action = {
             "accept": "merchant_active",
             "suggest": "platform_suggested",
@@ -1709,7 +1767,6 @@ class MemoryKnowledgeGovernanceService:
                 "suggestion": suggestion,
             }
         payload = dict(suggestion.get("payload") or {})
-        proposed_scope = knowledge_suggestion_proposed_scope(suggestion)
         if selected_action == "accept" and proposed_scope == "platform":
             return {
                 "success": False,
@@ -1839,6 +1896,9 @@ class MemoryKnowledgeGovernanceService:
         suggestion = find_knowledge_suggestion(memory, suggestion_id)
         if not suggestion:
             return {"success": False, "status": "NOT_FOUND", "merchantId": merchant_id, "suggestionId": suggestion_id}
+        scope_failure = shared_knowledge_scope_failure(merchant_id, suggestion_id, suggestion, "publish")
+        if scope_failure:
+            return scope_failure
         if knowledge_suggestion_status(suggestion) not in {"approved", "publish_requested", "published", "indexed"}:
             return {
                 "success": False,
@@ -2218,6 +2278,9 @@ class MemoryKnowledgeGovernanceService:
         suggestion = find_knowledge_suggestion(memory, suggestion_id)
         if not suggestion:
             return {"success": False, "status": "NOT_FOUND", "merchantId": merchant_id, "suggestionId": suggestion_id}
+        scope_failure = shared_knowledge_scope_failure(merchant_id, suggestion_id, suggestion, "request_publish")
+        if scope_failure:
+            return scope_failure
         if knowledge_suggestion_status(suggestion) not in {"approved", "publish_requested", "published", "indexed"}:
             return {
                 "success": False,
@@ -2252,6 +2315,9 @@ class MemoryKnowledgeGovernanceService:
         suggestion = find_knowledge_suggestion(memory, suggestion_id)
         if not suggestion:
             return {"success": False, "status": "NOT_FOUND", "merchantId": merchant_id, "suggestionId": suggestion_id}
+        scope_failure = shared_knowledge_scope_failure(merchant_id, suggestion_id, suggestion, "mark_indexed")
+        if scope_failure:
+            return scope_failure
         if knowledge_suggestion_status(suggestion) not in {"published", "indexed"}:
             return {
                 "success": False,
@@ -2282,10 +2348,13 @@ class MemoryKnowledgeGovernanceService:
         auto_index: bool = True,
     ) -> Dict[str, Any]:
         memory = self.memory_store.load(merchant_id)
-        queued = [
+        publish_requested = [
             dict(item)
             for item in memory.get("knowledgeSuggestions") or []
             if isinstance(item, dict) and knowledge_suggestion_status(item) == "publish_requested"
+        ]
+        queued = [
+            item for item in publish_requested if knowledge_suggestion_proposed_scope(item) == "platform"
         ][: max(1, int(limit or 10))]
         results: List[Dict[str, Any]] = []
         for suggestion in queued:
@@ -2307,6 +2376,7 @@ class MemoryKnowledgeGovernanceService:
             "success": True,
             "merchantId": merchant_id,
             "queuedCount": len(queued),
+            "skippedScopeCount": len(publish_requested) - len(queued),
             "processedCount": len(results),
             "results": results,
         }
@@ -2574,8 +2644,12 @@ class MemoryManagementService:
         }
 
 
-class MemoryGovernanceService(MemoryKnowledgeGovernanceService):
-    """Alias that represents the broader memory governance boundary."""
+class MemoryKnowledgeGovernanceService(KnowledgeSuggestionGovernanceService):
+    """Backward-compatible import alias; use KnowledgeSuggestionGovernanceService."""
+
+
+class MemoryGovernanceService(KnowledgeSuggestionGovernanceService):
+    """Backward-compatible API composition alias for knowledge endpoints."""
 
 
 class MemoryHotCache:
@@ -2853,21 +2927,32 @@ def memory_item_counts(memory: Dict[str, Any]) -> Dict[str, Any]:
     total = 0
     active = 0
     inactive = 0
+    quarantined = 0
     expired = 0
     for group, _, item, _ in list_memory_items(memory):
-        bucket = groups.setdefault(group, {"total": 0, "active": 0, "inactive": 0, "expired": 0})
+        bucket = groups.setdefault(group, {"total": 0, "active": 0, "quarantined": 0, "inactive": 0, "expired": 0})
         bucket["total"] += 1
         total += 1
         if is_memory_expired(item):
             bucket["expired"] += 1
             expired += 1
-        if memory_is_inactive(item):
+        if memory_is_quarantined(item):
+            bucket["quarantined"] += 1
+            quarantined += 1
+        elif memory_is_inactive(item):
             bucket["inactive"] += 1
             inactive += 1
         elif not is_memory_expired(item):
             bucket["active"] += 1
             active += 1
-    return {"total": total, "active": active, "inactive": inactive, "expired": expired, "groups": groups}
+    return {
+        "total": total,
+        "active": active,
+        "quarantined": quarantined,
+        "inactive": inactive,
+        "expired": expired,
+        "groups": groups,
+    }
 
 
 def filter_memory_items(memory: Dict[str, Any], active_only: bool = False) -> Dict[str, Any]:
@@ -2878,7 +2963,10 @@ def filter_memory_items(memory: Dict[str, Any], active_only: bool = False) -> Di
         payload[group] = [
             item
             for item in payload.get(group) or []
-            if isinstance(item, dict) and not memory_is_inactive(item) and not is_memory_expired(item)
+            if isinstance(item, dict)
+            and not memory_is_quarantined(item)
+            and not memory_is_inactive(item)
+            and not is_memory_expired(item)
         ]
     payload["recentFocus"] = aggregate_recent_focus(payload.get("events") or [], payload.get("preferences") or [])
     payload["coreMemoryProfile"] = build_core_memory_profile(payload)
@@ -2898,7 +2986,7 @@ def memory_patch_payload(patch: Any) -> Dict[str, Any]:
 def patch_memory_item(item: Dict[str, Any], patch: Dict[str, Any]) -> None:
     status = str(patch.get("status") or "").strip().lower()
     if status:
-        allowed = APPROVED_MEMORY_STATUSES | PENDING_MEMORY_STATUSES | INACTIVE_MEMORY_STATUSES
+        allowed = {"active", "quarantined", "disabled", "deleted", "inactive", "archived", "expired", "superseded"}
         if status not in allowed:
             raise ValueError("unsupported memory status: %s" % status)
         item["status"] = "active" if status == "" else status
@@ -3710,16 +3798,34 @@ def memory_status(item: Dict[str, Any]) -> str:
     return status.lower() if status else "active"
 
 
+def memory_is_quarantined(item: Dict[str, Any]) -> bool:
+    return memory_status(item) in QUARANTINED_MEMORY_STATUSES
+
+
 def memory_is_pending(item: Dict[str, Any]) -> bool:
-    return memory_status(item) in PENDING_MEMORY_STATUSES
+    """Backward-compatible name for historical callers.
+
+    Personal-memory records in this state are automatically quarantined; they
+    are not waiting in a human knowledge-review queue.
+    """
+
+    return memory_is_quarantined(item)
 
 
 def memory_is_inactive(item: Dict[str, Any]) -> bool:
     return memory_status(item) in INACTIVE_MEMORY_STATUSES
 
 
+def memory_is_usable(item: Dict[str, Any]) -> bool:
+    # approved/reviewed/published/indexed are legacy personal-memory values.
+    # They remain usable on read, but new writes use active/quarantined only.
+    return memory_status(item) in USABLE_MEMORY_STATUSES
+
+
 def memory_is_approved(item: Dict[str, Any]) -> bool:
-    return memory_status(item) in APPROVED_MEMORY_STATUSES
+    """Backward-compatible alias for pre-split callers."""
+
+    return memory_is_usable(item)
 
 
 def memory_item_can_drive_recent_focus(item: Any) -> bool:
@@ -3797,12 +3903,12 @@ def memory_scope_from_state(
 
 def default_memory_status(memory_type: str, source: str = "") -> str:
     normalized = str(memory_type or "")
-    if normalized == "metric_dispute":
-        return "active"
+    if normalized in {"metric_dispute", "correction"}:
+        # These are inputs to the Knowledge proposal flow, never active
+        # personal-memory constraints before confirmation/publication.
+        return "quarantined"
     if normalized == "past_case":
-        return "approved"
-    if normalized == "correction":
-        return "approved"
+        return "active"
     if str(source or "") == "feedback":
         return "approved"
     return "active"
@@ -3965,7 +4071,7 @@ def build_core_memory_profile(memory: Dict[str, Any]) -> Dict[str, Any]:
 def memory_item_can_drive_core_profile(item: Any) -> bool:
     return (
         isinstance(item, dict)
-        and memory_is_approved(item)
+        and memory_is_usable(item)
         and not memory_is_inactive(item)
         and not is_memory_expired(item)
         and float(item.get("confidence") or 0.0) > 0.05
@@ -4097,12 +4203,47 @@ def normalize_merchant_knowledge_action(action: Any) -> str:
 
 def knowledge_suggestion_proposed_scope(item: Dict[str, Any]) -> str:
     payload = (item or {}).get("payload") if isinstance((item or {}).get("payload"), dict) else {}
-    value = str((item or {}).get("scopeType") or payload.get("proposedScope") or payload.get("scopeType") or "merchant").strip().lower()
-    return "platform" if value == "platform" else "merchant"
+    value = str((item or {}).get("scopeType") or payload.get("proposedScope") or payload.get("scopeType") or "").strip().lower()
+    if value in {"platform", "shared", "organization", "organisation"}:
+        return "platform"
+    if value in {"merchant", "personal", "private", "user"}:
+        return "merchant"
+    # Missing scope in old data is not safe to guess.  It can be classified by
+    # a migration/admin action, but cannot become private truth or be published
+    # to the shared semantic layer in the meantime.
+    return "legacy_unclassified"
+
+
+def shared_knowledge_scope_failure(
+    merchant_id: str,
+    suggestion_id: str,
+    suggestion: Dict[str, Any],
+    operation: str,
+) -> Dict[str, Any]:
+    scope = knowledge_suggestion_proposed_scope(suggestion)
+    if scope == "platform":
+        return {}
+    return {
+        "success": False,
+        "status": (
+            "PRIVATE_MEMORY_NOT_PUBLISHABLE"
+            if scope == "merchant"
+            else "KNOWLEDGE_SCOPE_CLASSIFICATION_REQUIRED"
+        ),
+        "merchantId": merchant_id,
+        "suggestionId": suggestion_id,
+        "scopeType": scope,
+        "operation": operation,
+    }
 
 
 def knowledge_suggestion_publishable(item: Dict[str, Any]) -> bool:
-    return knowledge_suggestion_status(item) in {"approved", "publish_requested", "published", "indexed"}
+    return knowledge_suggestion_proposed_scope(item) == "platform" and knowledge_suggestion_status(item) in {
+        "approved",
+        "publish_requested",
+        "published",
+        "indexed",
+    }
 
 
 def normalize_memory(payload: Dict[str, Any], merchant_id: str) -> Dict[str, Any]:
@@ -4495,7 +4636,7 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="case_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type="past_case",
-        memory_tier=default_memory_tier("past_case", "approved" if case_success else "review_required", 0.72 if case_success else 0.62),
+        memory_tier="retrieval",
         memory_class=default_memory_class("past_case"),
         question=str(state.get("question") or "")[:1000],
         answer_preview=str(state.get("answer") or "")[:500],
@@ -4506,7 +4647,7 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
         confidence=0.72 if case_payload["caseStatus"] == "success" else 0.62,
         source="query_graph_run",
         scope=memory_scope_from_terms(str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""), topics, metrics),
-        status="approved" if case_success else "review_required",
+        status="active",
         retention_days=default_retention_days("past_case"),
         visibility=default_memory_visibility("past_case"),
         allowed_roles=default_memory_allowed_roles("past_case"),
@@ -4552,7 +4693,7 @@ def procedure_event_from_state(state: AgentState) -> Dict[str, Any]:
     event = MemoryEvent(
         event_id="proc_%s" % datetime.now().strftime("%Y%m%d%H%M%S%f"),
         memory_type="procedure",
-        memory_tier=default_memory_tier("procedure", "approved" if payload["reviewed"] else "review_required", 0.68 if payload["reviewed"] else 0.6),
+        memory_tier="retrieval",
         memory_class=default_memory_class("procedure"),
         question=str(state.get("question") or "")[:1000],
         answer_preview=summary[:500],
@@ -4563,7 +4704,7 @@ def procedure_event_from_state(state: AgentState) -> Dict[str, Any]:
         confidence=0.68 if payload["reviewed"] else 0.6,
         source="planner_repair",
         scope=memory_scope_from_terms(str(state.get("requested_merchant_id") or getattr(state.get("merchant"), "merchant_id", "") or ""), topics, metrics),
-        status="approved" if payload["reviewed"] else "review_required",
+        status="active",
         retention_days=default_retention_days("procedure"),
         visibility=default_memory_visibility("procedure"),
         allowed_roles=default_memory_allowed_roles("procedure"),
@@ -4616,8 +4757,8 @@ def knowledge_curator_tool_schema() -> Dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": "extract_merchant_knowledge_candidates",
-            "description": "Extract reviewable merchant or platform knowledge candidates from user-authored conversation text.",
+            "name": "classify_personal_memory_and_knowledge",
+            "description": "Classify user-authored text into auto-gated personal memory or reviewable merchant/platform knowledge.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -4633,7 +4774,7 @@ def knowledge_curator_tool_schema() -> Dict[str, Any]:
                                 "kind": {
                                     "type": "string",
                                     "enum": [
-                                        "merchant_preference",
+                                        "personal_preference",
                                         "merchant_rule",
                                         "merchant_fact",
                                         "metric_definition",
@@ -4641,7 +4782,7 @@ def knowledge_curator_tool_schema() -> Dict[str, Any]:
                                         "platform_correction",
                                     ],
                                 },
-                                "scope": {"type": "string", "enum": ["merchant", "platform"]},
+                                "scope": {"type": "string", "enum": ["personal", "merchant", "platform"]},
                                 "title": {"type": "string"},
                                 "content": {"type": "string"},
                                 "evidenceQuote": {"type": "string"},
@@ -4882,7 +5023,8 @@ def curator_candidate_to_suggestion(
         "metric_definition": "metric_definition_dispute",
         "platform_rule": "knowledge_rule",
         "platform_correction": "knowledge_rule_correction",
-        "merchant_preference": "merchant_preference",
+        "personal_preference": "personal_preference",
+        "merchant_preference": "personal_preference",
         "merchant_rule": "merchant_rule",
         "merchant_fact": "merchant_fact",
     }[kind]
@@ -4912,13 +5054,58 @@ def curator_candidate_to_suggestion(
             "governance": (
                 "platform review required before public publish"
                 if scope_type == "platform"
-                else "candidate only; merchant confirmation required before long-term memory activation"
+                else "candidate only; merchant confirmation required before merchant-knowledge activation"
             ),
         },
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),
     )
     return suggestion.model_dump(by_alias=True)
+
+
+def personal_memory_preference_from_curator_suggestion(
+    suggestion: Dict[str, Any],
+    event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert an explicitly user-authored personal preference into Memory."""
+
+    payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+    content = str(payload.get("correctionText") or "").strip()[:1000]
+    if not content:
+        return {}
+    confidence = max(0.0, min(1.0, float(payload.get("confidence") or event.get("confidence") or 0.55)))
+    scope = memory_scope_payload(event)
+    scope_suffix = memory_principal_scope_suffix({"scope": scope})
+    preference_id = scoped_memory_id(
+        "pref_personal_%s" % stable_slug(content[:120]),
+        scope_suffix,
+    )
+    return MemoryPreference(
+        preference_id=preference_id,
+        memory_type="user_preference",
+        memory_tier="core" if confidence >= 0.8 or habit_text_is_explicit(event) else "retrieval",
+        memory_class=default_memory_class("user_preference"),
+        key="personal:%s" % stable_slug(content[:80]),
+        value=content,
+        topics=unique_strings(event.get("topics") or [])[:8],
+        metrics=unique_strings(event.get("metrics") or [])[:12],
+        confidence=confidence,
+        source="llm_personal_memory_curator",
+        scope=scope,
+        status="active",
+        retention_days=default_retention_days("preference"),
+        visibility=default_memory_visibility("preference"),
+        allowed_roles=default_memory_allowed_roles("preference"),
+        evidence_refs=unique_strings(event.get("evidenceRefs") or [])[:12],
+        review_status="auto",
+        write_policy={
+            "action": "write",
+            "gateStatus": "auto",
+            "humanReviewRequired": False,
+            "sourceEventId": str(event.get("eventId") or ""),
+        },
+        created_at=datetime.now().isoformat(),
+    ).model_dump(by_alias=True)
 
 
 def metric_definition_preference(
@@ -4957,17 +5144,23 @@ def metric_definition_preference(
         topics=unique_strings([topic]),
         metrics=unique_strings([metric_key, display_name]),
         confidence=0.92,
-        source="merchant_metric_definition_confirm",
+        source="merchant_metric_definition_preference",
         hit_count=1,
         scope=memory_scope_from_terms("", unique_strings([topic]), unique_strings([metric_key, display_name])),
-        status="approved",
+        status="active",
         retention_days=default_retention_days("user_preference"),
         visibility=default_memory_visibility("user_preference"),
         allowed_roles=default_memory_allowed_roles("user_preference"),
-        approved_by=reviewer,
+        approved_by="",
         evidence_refs=unique_strings([semantic_ref]),
-        review_status="merchant_confirmed",
-        write_policy={"action": "merchant_preference", "semanticLayerMutation": False},
+        review_status="auto",
+        write_policy={
+            "action": "write",
+            "gateStatus": "explicit_user_preference",
+            "humanReviewRequired": False,
+            "actor": reviewer,
+            "semanticLayerMutation": False,
+        },
         payload=payload,
         created_at=datetime.now().isoformat(),
     )
@@ -5610,9 +5803,9 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
                 continue
             expired = is_memory_expired(item)
             invalid = float(item.get("confidence") or 0) <= 0.05
-            pending = memory_is_pending(item)
+            quarantined = memory_is_quarantined(item)
             inactive = memory_is_inactive(item)
-            if expired or invalid or pending or inactive:
+            if expired or invalid or quarantined or inactive:
                 reason = (
                     "expired"
                     if expired
@@ -5620,8 +5813,8 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
                         "low_confidence"
                         if invalid
                         else (
-                            "pending_governance"
-                            if pending
+                            "memory_quarantined"
+                            if quarantined
                             else ("deleted" if memory_status(item) == "deleted" else "inactive")
                         )
                     )
@@ -5811,7 +6004,7 @@ def allocate_injection(
     events = payloads_for(usable, {"query_event", "business_focus", "negative_feedback", "feedback"}, max_items=6, selected_ids=selected_ids)
     past_cases = payloads_for(usable, {"past_case"}, max_items=3, selected_ids=selected_ids)
     procedures = payloads_for(usable, {"procedure"}, max_items=3, selected_ids=selected_ids)
-    candidate_memories = candidate_payloads_for(candidates, max_items=4)
+    quarantined_memories = quarantined_payloads_for(candidates, max_items=4)
     core_memory = compact_core_memory_profile(memory.get("coreMemoryProfile") or build_core_memory_profile(memory))
     selected = {
         "merchantId": merchant_id,
@@ -5824,7 +6017,9 @@ def allocate_injection(
         "relevantEvents": events,
         "relevantPastCases": past_cases,
         "relevantProcedures": procedures,
-        "candidateMemories": candidate_memories,
+        # Audit-only diagnostics. These records are not queued for human
+        # review and are removed before model/answer context assembly.
+        "quarantinedMemories": quarantined_memories,
         "preferences": preferences,
         "facts": facts,
         "source": source,
@@ -5833,8 +6028,8 @@ def allocate_injection(
     while memory_injection_tokens(selected) > budget and events:
         events.pop()
         truncated = True
-    while memory_injection_tokens(selected) > budget and candidate_memories:
-        candidate_memories.pop()
+    while memory_injection_tokens(selected) > budget and quarantined_memories:
+        quarantined_memories.pop()
         truncated = True
     while memory_injection_tokens(selected) > budget and preferences and pop_low_priority_payload(preferences, min_items=1):
         truncated = True
@@ -5881,7 +6076,7 @@ def allocate_injection(
         budget_used_chars=memory_injection_chars(selected),
         truncated=truncated,
         selected_ids=selected_ids,
-        candidate_ids=[str(item.get("id") or "") for item in candidate_memories if item.get("id")],
+        candidate_ids=[str(item.get("id") or "") for item in quarantined_memories if item.get("id")],
         core_memory_count=len(core_selected_ids),
         retrieval_memory_count=len([memory_id for memory_id in selected_ids if memory_id not in set(core_selected_ids)]),
         core_selected_ids=unique_strings(core_selected_ids),
@@ -5920,18 +6115,18 @@ def payloads_for(
     return payloads
 
 
-def candidate_payloads_for(candidates: List[MemoryRetrievalCandidate], max_items: int) -> List[Dict[str, Any]]:
+def quarantined_payloads_for(candidates: List[MemoryRetrievalCandidate], max_items: int) -> List[Dict[str, Any]]:
     payloads: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for candidate in candidates:
-        if candidate.filter_reason != "pending_governance":
+        if candidate.filter_reason not in {"memory_quarantined", "pending_governance"}:
             continue
         if candidate.memory_id in seen:
             continue
         payload = dict(candidate.payload)
         payload["score"] = candidate.score
         payload["hitReasons"] = list(candidate.reasons or [])
-        payload["candidateReason"] = "pending memory; use only as review signal, not semantic truth"
+        payload["quarantineReason"] = "automatic memory quarantine; not recalled, not semantic truth, and no human review is queued"
         payloads.append(payload)
         seen.add(candidate.memory_id)
         if len(payloads) >= max_items:
@@ -6306,7 +6501,7 @@ def aggregate_recent_focus(events: Iterable[Dict[str, Any]], preferences: Iterab
     days_counter: Counter[int] = Counter()
     for event in list(events)[-120:]:
         status = memory_status(event)
-        if status in INACTIVE_MEMORY_STATUSES | PENDING_MEMORY_STATUSES:
+        if status in INACTIVE_MEMORY_STATUSES | QUARANTINED_MEMORY_STATUSES:
             continue
         if event.get("answerEvidenceChecked") and event.get("answerVerified") is False:
             continue
@@ -6319,7 +6514,7 @@ def aggregate_recent_focus(events: Iterable[Dict[str, Any]], preferences: Iterab
             days_counter[days] += weight
     for pref in preferences:
         status = memory_status(pref)
-        if status in INACTIVE_MEMORY_STATUSES | PENDING_MEMORY_STATUSES:
+        if status in INACTIVE_MEMORY_STATUSES | QUARANTINED_MEMORY_STATUSES:
             continue
         weight = weighted_memory_value(pref) * 0.7
         for topic in unique_strings(pref.get("topics") or []):

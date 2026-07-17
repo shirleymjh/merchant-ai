@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from merchant_ai.config import get_settings
+from merchant_ai.config import Settings, get_settings
 from merchant_ai.models import PlanningAssetEntry, PlanningAssetPack
-from merchant_ai.services.planning import QueryGraphPlanner
+from merchant_ai.services.planning import (
+    QueryGraphPlanner,
+    compact_semantic_candidate_hints_for_prompt,
+    filesystem_workspace_index_catalog,
+)
 from merchant_ai.services.planning_tooling import compact_tool_result_for_prompt
 
 
@@ -59,6 +63,37 @@ def planner_pack(metric_count: int = 36) -> PlanningAssetPack:
         for index in range(metric_count)
     ]
     return PlanningAssetPack(
+        table_manifest={
+            "mode": "stable_topic_table_manifest",
+            "questionIndependent": True,
+            "topics": [
+                {
+                    "topic": f"DOMAIN_{index}",
+                    "topicId": f"DOMAIN_{index}",
+                    "manifestRefId": f"semantic:DOMAIN_{index}:manifest",
+                    "path": f"topics/DOMAIN_{index}/manifest.json",
+                    "tables": [
+                        {
+                            "topic": f"DOMAIN_{index}",
+                            "table": f"fact_{index}",
+                            "sourceRefId": f"semantic:DOMAIN_{index}:fact_{index}:asset",
+                            "path": f"topics/DOMAIN_{index}/tables/fact_{index}/asset.json",
+                        }
+                    ],
+                }
+                for index in range(3)
+            ],
+            "tables": [
+                {
+                    "topic": f"DOMAIN_{index}",
+                    "table": f"fact_{index}",
+                    "sourceRefId": f"semantic:DOMAIN_{index}:fact_{index}:asset",
+                    "path": f"topics/DOMAIN_{index}/tables/fact_{index}/asset.json",
+                }
+                for index in range(3)
+            ],
+            "tableCount": 3,
+        },
         tables=tables,
         metrics=metrics,
         metric_compaction={
@@ -116,6 +151,48 @@ def nested_keys(value: Any) -> set[str]:
     return keys
 
 
+def test_topic_table_manifest_is_stable_when_rag_candidates_change() -> None:
+    table_manifest = {
+        "mode": "stable_topic_table_manifest",
+        "questionIndependent": True,
+        "topics": [
+            {
+                "topic": "DOMAIN",
+                "topicId": "DOMAIN",
+                "manifestRefId": "semantic:DOMAIN:manifest",
+                "tables": [
+                    {"topic": "DOMAIN", "table": "fact_a", "sourceRefId": "semantic:DOMAIN:fact_a:asset"},
+                    {"topic": "DOMAIN", "table": "fact_b", "sourceRefId": "semantic:DOMAIN:fact_b:asset"},
+                ],
+            }
+        ],
+        "tables": [
+            {"topic": "DOMAIN", "table": "fact_a", "sourceRefId": "semantic:DOMAIN:fact_a:asset"},
+            {"topic": "DOMAIN", "table": "fact_b", "sourceRefId": "semantic:DOMAIN:fact_b:asset"},
+        ],
+        "tableCount": 2,
+    }
+    first = PlanningAssetPack(
+        table_manifest=table_manifest,
+        tables=[PlanningAssetEntry(key="fact_a", table="fact_a", topic="DOMAIN", source_ref_id="rag:a")],
+    )
+    second = PlanningAssetPack(
+        table_manifest=table_manifest,
+        tables=[PlanningAssetEntry(key="fact_b", table="fact_b", topic="DOMAIN", source_ref_id="rag:b")],
+    )
+
+    first_catalog = filesystem_workspace_index_catalog(first, "question one")
+    second_catalog = filesystem_workspace_index_catalog(second, "unrelated question two")
+
+    assert first_catalog["tableManifest"] == second_catalog["tableManifest"]
+    assert [item["table"] for item in first_catalog["tableManifest"]["tables"]] == ["fact_a", "fact_b"]
+    assert not {"tables", "candidateMetrics", "relationships"}.intersection(first_catalog)
+    assert all(
+        set(item) == {"topic", "table", "title", "detailRefId", "detailPath"}
+        for item in first_catalog["tableManifest"]["tables"]
+    )
+
+
 def test_planner_l0_prompt_is_bounded_and_does_not_inline_asset_details() -> None:
     class CaptureModel:
         configured = True
@@ -145,6 +222,8 @@ def test_planner_l0_prompt_is_bounded_and_does_not_inline_asset_details() -> Non
     user_payload = json.loads(model.calls[0][1])
     catalog = user_payload["semanticCatalog"]
     assert catalog["mode"] == "filesystem_workspace_index"
+    assert catalog["tableManifest"]["questionIndependent"] is True
+    assert [item["table"] for item in catalog["tableManifest"]["tables"]] == ["fact_0", "fact_1", "fact_2"]
     assert not nested_keys(catalog).intersection(
         {"formula", "sourceColumns", "columns", "aliases", "keyColumns", "joinKeys", "schema"}
     )
@@ -152,22 +231,196 @@ def test_planner_l0_prompt_is_bounded_and_does_not_inline_asset_details() -> Non
     assert "FULL_SCHEMA_MUST_NOT_ENTER_L0" not in serialized
     assert "FULL_METRIC_DETAIL_MUST_NOT_ENTER_L0" not in serialized
     assert user_payload["planningContract"]["timeWindowDays"] == 11
-    assert catalog["candidateBudget"]["availableMetrics"] == 36
+    assert set(catalog["candidateBudget"]) == {"availableTables"}
+    assert catalog["candidateBudget"]["availableTables"] == 3
+    assert not {"tables", "candidateMetrics", "relationships"}.intersection(catalog)
+    assert all(
+        set(item) == {"topic", "table", "title", "detailRefId", "detailPath"}
+        for item in catalog["tableManifest"]["tables"]
+    )
 
 
-def test_planner_l0_candidate_refs_do_not_change_with_question_wording() -> None:
+def test_planner_l0_table_detail_refs_do_not_change_with_question_wording() -> None:
     planner = QueryGraphPlanner(type("NoModel", (), {"configured": False})())
     pack = planner_pack()
     first = planner._understanding_payload("completely unrelated wording A", pack, [], [], False, False, None)
     second = planner._understanding_payload("completely unrelated wording B", pack, [], [], False, False, None)
 
-    first_refs = [item["sourceRefId"] for item in first["semanticCatalog"]["candidateMetrics"]]
-    second_refs = [item["sourceRefId"] for item in second["semanticCatalog"]["candidateMetrics"]]
+    first_tables = first["semanticCatalog"]["tableManifest"]["tables"]
+    second_tables = second["semanticCatalog"]["tableManifest"]["tables"]
+    first_refs = [item["detailRefId"] for item in first_tables]
+    second_refs = [item["detailRefId"] for item in second_tables]
     assert first_refs == second_refs
     assert first_refs[:2] == [
-        "semantic:DOMAIN_0:fact_0:metric:measure_0",
-        "semantic:DOMAIN_1:fact_1:metric:measure_1",
+        "semantic:DOMAIN_0:fact_0:detail",
+        "semantic:DOMAIN_1:fact_1:detail",
     ]
+    assert all(set(item) == {"topic", "table", "title", "detailRefId", "detailPath"} for item in first_tables)
+
+
+def test_deepagent_core_owns_semantic_tools_and_planner_only_consumes_read_ledger() -> None:
+    detail_ref = "semantic:DOMAIN_0:fact_0:detail"
+    metric_ref = "semantic:DOMAIN_0:fact_0:metric:measure_0"
+    schema_ref = "semantic:DOMAIN_0:fact_0:schema"
+
+    class CoreManagedModel:
+        configured = True
+        last_error = ""
+        error_events: list[object] = []
+
+        def __init__(self) -> None:
+            self.tool_json_calls: list[tuple[str, dict[str, Any]]] = []
+            self.tool_chat_calls = 0
+
+        def tool_chat(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            del args, kwargs
+            self.tool_chat_calls += 1
+            raise AssertionError("core-managed Planner must not start a semantic tool loop")
+
+        def tool_json_chat(self, system_prompt, user_prompt, tool_schema, fallback=None, **kwargs):
+            del tool_schema, fallback, kwargs
+            self.tool_json_calls.append((system_prompt, json.loads(user_prompt)))
+            return {
+                "status": "UNDERSTOOD",
+                "reason": "compiled only from Core-read evidence",
+                "questionUnderstanding": {
+                    "analysisGrain": "metric",
+                    "analysisIntent": "none",
+                    "requiresExplanation": False,
+                    "requiredEvidenceIntents": [],
+                    "anchorMetric": {
+                        "metricRef": "measure_0",
+                        "sourcePhrase": "Requested zero",
+                        "ownerTable": "fact_0",
+                        "objectiveType": "metric_total",
+                        "groupByColumn": "event_day",
+                        "order": "desc",
+                        "limit": 1,
+                    },
+                    "supportMetrics": [],
+                    "metricCandidateDecisions": [],
+                    "calculationIntents": [],
+                    "scopeConstraints": [],
+                    "filters": [],
+                    "semanticQuery": empty_semantic_query(),
+                    "timeWindowDays": 11,
+                },
+            }
+
+    evidence = [
+        {
+            "refId": detail_ref,
+            "path": "topics/DOMAIN_0/tables/fact_0/detail.json",
+            "kind": "TABLE_DETAIL",
+            "topic": "DOMAIN_0",
+            "table": "fact_0",
+            "contentSnippet": '{"tableName":"fact_0"}',
+            "contentHash": "detail-hash",
+        },
+        {
+            "refId": metric_ref,
+            "path": "topics/DOMAIN_0/tables/fact_0/metrics/measure_0.json",
+            "kind": "METRIC",
+            "topic": "DOMAIN_0",
+            "table": "fact_0",
+            "contentSnippet": '{"metricKey":"measure_0","formula":"SUM(value_0)"}',
+            "contentHash": "metric-hash",
+        },
+        {
+            "refId": schema_ref,
+            "path": "topics/DOMAIN_0/tables/fact_0/schema.json",
+            "kind": "SCHEMA",
+            "topic": "DOMAIN_0",
+            "table": "fact_0",
+            "contentSnippet": '{"columns":[{"columnName":"event_day"}]}',
+            "contentHash": "schema-hash",
+        },
+    ]
+    model = CoreManagedModel()
+    planner = QueryGraphPlanner(
+        model,
+        semantic_catalog=object(),
+        settings=get_settings().model_copy(
+            update={"agent_planner_tool_rounds": 12, "agent_planner_prompt_budget_chars": 20_000}
+        ),
+    )
+    planner_context = {
+        "coreManagedFilesystem": True,
+        "coreSemanticEvidence": evidence,
+    }
+
+    assert planner._initial_semantic_tool_entry("opaque", planner_pack(), [], planner_context) == ""
+    payload = planner._llm_understand(
+        "Requested zero",
+        planner_pack(),
+        [],
+        [],
+        planner_context=planner_context,
+        use_tool_loop=False,
+    )
+
+    assert payload["status"] == "UNDERSTOOD"
+    assert model.tool_chat_calls == 0
+    assert len(model.tool_json_calls) == 1
+    system_prompt, user_payload = model.tool_json_calls[0]
+    assert "core_managed_filesystem" in system_prompt
+    assert user_payload["filesystemAuthority"]["owner"] == "DeepAgent Core"
+    assert user_payload["filesystemAuthority"]["hiddenPlannerToolLoop"] == "disabled"
+    assert [item["refId"] for item in user_payload["coreSemanticEvidence"]] == [
+        detail_ref,
+        metric_ref,
+        schema_ref,
+    ]
+    assert "filesystemContextPolicy" not in user_payload
+
+
+def test_hidden_planner_file_tool_loop_is_disabled_by_default() -> None:
+    assert Settings.model_fields["agent_planner_tool_rounds"].default == 0
+    assert Settings.model_fields["planner_filesystem_context_mode"].default == "off"
+
+    # Older dependency-injection stubs may not expose the new flag. Missing
+    # configuration must not silently restore the pre-DeepAgent tool loop.
+    planner = object.__new__(QueryGraphPlanner)
+    planner.settings = type("LegacySettings", (), {})()
+    assert planner._filesystem_context_mode() == "off"
+
+
+def test_core_read_evidence_gate_requires_exact_metric_and_grouping_schema() -> None:
+    planner = QueryGraphPlanner(type("NoModel", (), {"configured": False})())
+    understanding = {
+        "anchorMetric": {
+            "metricRef": "measure_0",
+            "ownerTable": "fact_0",
+            "groupByColumn": "event_day",
+        },
+        "supportMetrics": [],
+        "scopeConstraints": [],
+        "semanticQuery": empty_semantic_query(),
+    }
+    detail_only = {
+        "coreManagedFilesystem": True,
+        "coreSemanticEvidence": [
+            {
+                "refId": "semantic:DOMAIN_0:fact_0:detail",
+                "kind": "TABLE_DETAIL",
+            }
+        ],
+    }
+
+    errors = planner._core_semantic_evidence_errors(understanding, detail_only)
+
+    assert "read exact metric definition for fact_0.measure_0" in errors
+    assert "read exact column or schema for fact_0.event_day" in errors
+
+    complete = {
+        "coreManagedFilesystem": True,
+        "coreSemanticEvidence": [
+            *detail_only["coreSemanticEvidence"],
+            {"refId": "semantic:DOMAIN_0:fact_0:metric:measure_0", "kind": "METRIC"},
+            {"refId": "semantic:DOMAIN_0:fact_0:schema", "kind": "SCHEMA"},
+        ],
+    }
+    assert planner._core_semantic_evidence_errors(understanding, complete) == []
 
 
 def test_planner_prompt_budget_fails_closed_without_calling_model() -> None:
@@ -188,6 +441,101 @@ def test_planner_prompt_budget_fails_closed_without_calling_model() -> None:
     assert payload["_plannerContextOverBudget"] is True
     assert payload["_promptStats"]["budgetPolicy"] == "fail_closed"
     assert payload["status"] == "NEED_MORE_KNOWLEDGE"
+
+
+def test_semantic_candidate_prompt_hints_keep_refs_without_copying_asset_definitions() -> None:
+    hints = {
+        "authority": "advisory_only",
+        "candidateRefs": [f"semantic:DOMAIN:fact:metric:measure_{index}" for index in range(14)],
+        "metricPhrases": ["Requested measure"],
+        "provenance": "rag_and_semantic_search",
+        "policy": "LONG_POLICY" * 500,
+        "candidates": [
+            {
+                "id": f"M{index}",
+                "ref": f"semantic:DOMAIN:fact:metric:measure_{index}",
+                "kind": "METRIC",
+                "name": f"Measure {index}",
+                "metricKey": f"measure_{index}",
+                "table": "fact",
+                "topic": "DOMAIN",
+                "matched": "Requested measure",
+                "matchType": "partial_label",
+                "confidence": 0.8,
+                "readableRefs": [
+                    {
+                        "ref": f"semantic:DOMAIN:fact:metric:measure_{index}",
+                        "type": "metric",
+                        "label": f"Measure {index}",
+                    }
+                ],
+                "aliases": ["OVERSIZED_ALIAS" * 300],
+                "description": "OVERSIZED_DESCRIPTION" * 300,
+                "temporalVariants": [{"oversized": "OVERSIZED_TEMPORAL" * 300}],
+                "selectionGuidance": "OVERSIZED_GUIDANCE" * 300,
+            }
+            for index in range(14)
+        ],
+    }
+
+    compact = compact_semantic_candidate_hints_for_prompt(hints, budget_level=1)
+
+    assert compact["candidateRefs"] == hints["candidateRefs"]
+    assert "candidates" not in compact
+    serialized = json.dumps(compact, ensure_ascii=False)
+    assert "OVERSIZED_" not in serialized
+    assert compact["policy"] == "search_coordinates_only; choose from tableManifest after semantic_read"
+
+    uncompressed_index = compact_semantic_candidate_hints_for_prompt(hints, budget_level=0)
+    assert len(uncompressed_index["candidates"]) == 14
+    assert "OVERSIZED_" not in json.dumps(uncompressed_index, ensure_ascii=False)
+
+
+def test_tool_loop_prompt_compacts_advisory_candidates_under_total_budget() -> None:
+    class NoProviderModel:
+        configured = True
+        last_error = ""
+        error_events: list[object] = []
+
+    settings = get_settings().model_copy(update={"agent_planner_prompt_budget_chars": 30_000})
+    planner = QueryGraphPlanner(NoProviderModel(), settings=settings)
+    hints = {
+        "authority": "advisory_only",
+        "candidateRefs": [f"semantic:DOMAIN:fact_0:metric:measure_{index}" for index in range(14)],
+        "metricPhrases": ["Requested measure"],
+        "provenance": "rag_and_semantic_search",
+        "candidates": [
+            {
+                "id": f"M{index}",
+                "ref": f"semantic:DOMAIN:fact_0:metric:measure_{index}",
+                "kind": "METRIC",
+                "name": f"Measure {index}",
+                "metricKey": f"measure_{index}",
+                "table": "fact_0",
+                "topic": "DOMAIN",
+                "matched": "Requested measure",
+                "matchType": "partial_label",
+                "confidence": 0.8,
+                "aliases": ["LARGE_ALIAS" * 500],
+                "description": "LARGE_DESCRIPTION" * 500,
+            }
+            for index in range(14)
+        ],
+    }
+
+    payload = planner._llm_understand(
+        "Requested measure by subject",
+        planner_pack(),
+        [],
+        [],
+        planner_context={"semanticCandidateHints": hints},
+        use_tool_loop=True,
+        filesystem_context_entry="adaptive",
+    )
+
+    assert payload.get("_plannerContextOverBudget") is not True
+    assert payload["_promptStats"]["totalChars"] <= settings.agent_planner_prompt_budget_chars
+    assert payload["_promptStats"]["toolSchemaChars"] > 0
 
 
 def test_metric_tool_compaction_never_drops_the_execution_contract() -> None:
@@ -233,14 +581,37 @@ def test_metric_tool_compaction_never_drops_the_execution_contract() -> None:
 
 
 def test_adaptive_planner_reads_exact_ref_before_emitting_understanding() -> None:
+    detail_ref = "semantic:DOMAIN_0:fact_0:detail"
     selected_ref = "semantic:DOMAIN_0:fact_0:metric:measure_0"
+    schema_ref = "semantic:DOMAIN_0:fact_0:schema"
 
     class SemanticCatalog:
         def read(self, ref_id="", path="", max_chars=0, offset=0):
-            assert ref_id == selected_ref
+            assert ref_id in {detail_ref, selected_ref, schema_ref}
+            if ref_id == detail_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "TABLE_DETAIL",
+                    "content": json.dumps(
+                        {
+                            "table": "fact_0",
+                            "metricsRefId": "semantic:DOMAIN_0:fact_0:metrics",
+                            "schemaRefId": schema_ref,
+                        }
+                    ),
+                }
+            if ref_id == schema_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "SCHEMA",
+                    "content": '{"columns":[{"name":"event_day","type":"date"}]}',
+                }
             return {
                 "success": True,
                 "refId": ref_id,
+                "kind": "METRIC",
                 "content": '{"metricKey":"measure_0","formula":"SUM(value_0)"}',
             }
 
@@ -281,9 +652,31 @@ def test_adaptive_planner_reads_exact_ref_before_emitting_understanding() -> Non
                     "content": "",
                     "toolCalls": [
                         {
+                            "id": "read_selected_table_detail",
+                            "name": "semantic_read",
+                            "args": {"refId": detail_ref, "maxChars": 1000},
+                        }
+                    ],
+                }
+            if len(self.payloads) == 3:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
                             "id": "read_selected_metric",
                             "name": "semantic_read",
                             "args": {"refId": selected_ref, "maxChars": 1000},
+                        }
+                    ],
+                }
+            if len(self.payloads) == 4:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "read_selected_schema",
+                            "name": "semantic_read",
+                            "args": {"refId": schema_ref, "maxChars": 1000},
                         }
                     ],
                 }
@@ -320,7 +713,7 @@ def test_adaptive_planner_reads_exact_ref_before_emitting_understanding() -> Non
     settings = get_settings().model_copy(
         update={
             "agent_planner_prompt_budget_chars": 20000,
-            "agent_planner_tool_rounds": 3,
+            "agent_planner_tool_rounds": 5,
             "agent_deferred_tool_schema_enabled": True,
         }
     )
@@ -335,15 +728,195 @@ def test_adaptive_planner_reads_exact_ref_before_emitting_understanding() -> Non
         filesystem_context_entry="adaptive",
     )
 
-    assert payload["status"] == "UNDERSTOOD"
-    assert selected_ref in payload["_plannerLoadedRefs"]
+    assert payload["status"] == "UNDERSTOOD", (
+        payload.get("reason"), payload.get("_promptStats"), len(model.payloads),
+        model.payloads[-1].get("plannerToolResults") if model.payloads else [],
+    )
+    assert set(payload["_plannerLoadedRefs"]) == {detail_ref, selected_ref, schema_ref}
+    assert set(payload["_plannerSemanticReadRefs"]) == {detail_ref, selected_ref, schema_ref}
     assert model.payloads[0]["filesystemContextPolicy"]["mustReadBeforeEmit"] is True
     assert "formula" not in nested_keys(model.payloads[0]["semanticCatalog"])
     assert any(
         "SUM(value_0)" in json.dumps(item, ensure_ascii=False)
-        for item in model.payloads[2]["plannerToolResults"]
+        for item in model.payloads[-1]["plannerToolResults"]
     ), model.prompt_sizes
     assert max(model.prompt_sizes) <= settings.agent_planner_prompt_budget_chars
+
+
+def test_manifest_read_alone_cannot_authorize_final_table_selection() -> None:
+    manifest_ref = "semantic:DOMAIN_0:manifest"
+    detail_ref = "semantic:DOMAIN_0:fact_0:detail"
+    metric_ref = "semantic:DOMAIN_0:fact_0:metric:measure_0"
+    schema_ref = "semantic:DOMAIN_0:fact_0:schema"
+
+    class SemanticCatalog:
+        def read(self, ref_id="", path="", max_chars=0, offset=0):
+            if ref_id == manifest_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "TOPIC_MANIFEST",
+                    "content": '{"tables":[{"tableName":"fact_0"}]}',
+                }
+            if ref_id == detail_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "TABLE_DETAIL",
+                    "content": json.dumps(
+                        {
+                            "table": "fact_0",
+                            "metricsRefId": "semantic:DOMAIN_0:fact_0:metrics",
+                            "schemaRefId": schema_ref,
+                        }
+                    ),
+                }
+            if ref_id == schema_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "SCHEMA",
+                    "content": '{"columns":[{"name":"event_day","type":"date"}]}',
+                }
+            assert ref_id == metric_ref
+            return {
+                "success": True,
+                "refId": ref_id,
+                "kind": "METRIC",
+                "content": '{"metricKey":"measure_0","formula":"SUM(value_0)"}',
+            }
+
+        def ls(self, **kwargs):
+            return []
+
+        def grep(self, **kwargs):
+            return []
+
+    class ManifestThenMetricModel:
+        configured = True
+        last_error = ""
+        error_events: list[object] = []
+
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, Any]] = []
+
+        def tool_chat(self, system_prompt, user_prompt, tools, fallback=None, **kwargs):
+            payload = json.loads(user_prompt)
+            self.payloads.append(payload)
+            round_number = len(self.payloads)
+            if round_number == 1:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "load_read_schema",
+                            "name": "load_tool_schemas",
+                            "args": {"toolNames": ["semantic_read"]},
+                        }
+                    ],
+                }
+            if round_number == 2:
+                return {
+                    "content": "",
+                    "toolCalls": [{"id": "read_manifest", "name": "semantic_read", "args": {"refId": manifest_ref}}],
+                }
+            if round_number == 3:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "emit_too_early",
+                            "name": "emit_question_understanding",
+                            "args": {
+                                "status": "UNDERSTOOD",
+                                "questionUnderstanding": {
+                                    "analysisGrain": "metric",
+                                    "analysisIntent": "none",
+                                    "requiresExplanation": False,
+                                    "requiredEvidenceIntents": [],
+                                    "rankingObjective": {},
+                                    "requestedMeasures": [],
+                                    "filters": [],
+                                    "semanticQuery": empty_semantic_query(),
+                                    "timeWindowDays": 7,
+                                },
+                            },
+                        }
+                    ],
+                }
+            if round_number == 4:
+                assert any(
+                    item.get("errorType") == "SEMANTIC_EVIDENCE_READ_REQUIRED"
+                    for item in payload.get("plannerToolResults") or []
+                )
+                return {
+                    "content": "",
+                    "toolCalls": [{"id": "read_detail", "name": "semantic_read", "args": {"refId": detail_ref}}],
+                }
+            if round_number == 5:
+                return {
+                    "content": "",
+                    "toolCalls": [{"id": "read_metric", "name": "semantic_read", "args": {"refId": metric_ref}}],
+                }
+            if round_number == 6:
+                return {
+                    "content": "",
+                    "toolCalls": [{"id": "read_schema", "name": "semantic_read", "args": {"refId": schema_ref}}],
+                }
+            return {
+                "content": "",
+                "toolCalls": [
+                    {
+                        "id": "emit_after_detail",
+                        "name": "emit_question_understanding",
+                        "args": {
+                            "status": "UNDERSTOOD",
+                            "questionUnderstanding": {
+                                "analysisGrain": "metric",
+                                "analysisIntent": "none",
+                                "requiresExplanation": False,
+                                "requiredEvidenceIntents": [],
+                                "rankingObjective": {
+                                    "metricRef": "measure_0",
+                                    "ownerTable": "fact_0",
+                                    "sourcePhrase": "Requested zero",
+                                    "resultMode": "metric",
+                                },
+                                "requestedMeasures": [],
+                                "filters": [],
+                                "semanticQuery": empty_semantic_query(),
+                                "timeWindowDays": 7,
+                            },
+                        },
+                    }
+                ],
+            }
+
+    settings = get_settings().model_copy(
+        update={
+            "agent_planner_prompt_budget_chars": 20_000,
+            "agent_planner_tool_rounds": 7,
+            "agent_deferred_tool_schema_enabled": True,
+        }
+    )
+    model = ManifestThenMetricModel()
+    planner = QueryGraphPlanner(model, semantic_catalog=SemanticCatalog(), settings=settings)
+
+    payload = planner._llm_understand(
+        "opaque",
+        planner_pack(),
+        [],
+        [],
+        use_tool_loop=True,
+        filesystem_context_entry="adaptive",
+    )
+
+    assert payload["status"] == "UNDERSTOOD", (
+        payload.get("reason"), payload.get("_promptStats"), len(model.payloads),
+        model.payloads[-1].get("plannerToolResults") if model.payloads else [],
+    )
+    assert set(payload["_plannerSemanticReadRefs"]) == {manifest_ref, detail_ref, metric_ref, schema_ref}
+    assert set(payload["_plannerSemanticDetailReadRefs"]) == {detail_ref, metric_ref, schema_ref}
 
 
 def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -> None:
@@ -351,9 +924,38 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
         f"semantic:DOMAIN_{index % 3}:fact_{index % 3}:metric:measure_{index}"
         for index in range(5)
     ]
+    detail_refs = [f"semantic:DOMAIN_{index}:fact_{index}:detail" for index in range(3)]
+    schema_refs = [f"semantic:DOMAIN_{index}:fact_{index}:schema" for index in range(3)]
 
     class SemanticCatalog:
         def read(self, ref_id="", path="", max_chars=0, offset=0):
+            if ref_id in detail_refs:
+                table_index = int(ref_id.split(":", 3)[2].rsplit("_", 1)[-1])
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "TABLE_DETAIL",
+                    "topic": f"DOMAIN_{table_index}",
+                    "table": f"fact_{table_index}",
+                    "content": json.dumps(
+                        {
+                            "table": f"fact_{table_index}",
+                            "metricsRefId": f"semantic:DOMAIN_{table_index}:fact_{table_index}:metrics",
+                            "schemaRefId": f"semantic:DOMAIN_{table_index}:fact_{table_index}:schema",
+                        }
+                    ),
+                }
+            if ref_id in schema_refs:
+                table_index = int(ref_id.split(":", 3)[2].rsplit("_", 1)[-1])
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "SCHEMA",
+                    "topic": f"DOMAIN_{table_index}",
+                    "table": f"fact_{table_index}",
+                    "content": '{"columns":[{"name":"event_day","type":"date"}]}',
+                }
+            assert ref_id in selected_refs
             index = int(ref_id.rsplit("measure_", 1)[-1])
             table_index = index % 3
             return {
@@ -416,15 +1018,40 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
                     "content": "",
                     "toolCalls": [
                         {
-                            "id": f"read_{index}",
+                            "id": f"read_detail_{index}",
+                            "name": "semantic_read",
+                            "args": {"refId": ref_id, "maxChars": 20_000},
+                        }
+                        for index, ref_id in enumerate(detail_refs)
+                    ],
+                }
+            if len(self.payloads) == 3:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": f"read_metric_{index}",
                             "name": "semantic_read",
                             "args": {"refId": ref_id, "maxChars": 20_000},
                         }
                         for index, ref_id in enumerate(selected_refs)
                     ],
                 }
+            if len(self.payloads) == 4:
+                results = payload["plannerToolResults"]
+                assert "MUST_BE_COMPACTED" not in json.dumps(results, ensure_ascii=False)
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": f"read_schema_{index}",
+                            "name": "semantic_read",
+                            "args": {"refId": ref_id, "maxChars": 20_000},
+                        }
+                        for index, ref_id in enumerate(schema_refs)
+                    ],
+                }
             results = payload["plannerToolResults"]
-            assert {str((item.get("result") or {}).get("refId") or "") for item in results} == set(selected_refs)
             assert "MUST_BE_COMPACTED" not in json.dumps(results, ensure_ascii=False)
             return {
                 "content": "",
@@ -468,8 +1095,9 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
     settings = get_settings().model_copy(
         update={
             "agent_planner_prompt_budget_chars": 20_000,
-            "agent_planner_tool_rounds": 3,
+            "agent_planner_tool_rounds": 5,
             "agent_deferred_tool_schema_enabled": True,
+            "tool_rate_limit_enabled": False,
         }
     )
     model = MultiReadModel()
@@ -484,17 +1112,54 @@ def test_active_planner_round_keeps_multiple_exact_metric_reads_under_budget() -
         filesystem_context_entry="adaptive",
     )
 
-    assert payload["status"] == "UNDERSTOOD"
-    assert set(payload["_plannerLoadedRefs"]) == set(selected_refs)
+    assert payload["status"] == "UNDERSTOOD", (
+        payload.get("reason"),
+        payload.get("_plannerSemanticReadRefs"),
+        [
+            item
+            for item in payload.get("_plannerToolResults") or []
+            if item.get("errorType") == "SEMANTIC_EVIDENCE_READ_REQUIRED"
+        ],
+    )
+    expected_read_refs = set(detail_refs + selected_refs + schema_refs)
+    assert set(payload["_plannerLoadedRefs"]) == expected_read_refs
+    assert set(payload["_plannerSemanticReadRefs"]) == expected_read_refs
     assert max(model.prompt_sizes) <= settings.agent_planner_prompt_budget_chars
     assert payload["_promptStats"]["toolRounds"][-1]["compaction"] == "active_semantic_results"
 
 
 def test_terminal_planner_round_forces_validated_emit_and_retries_invalid_structure() -> None:
+    detail_ref = "semantic:DOMAIN_0:fact_0:detail"
     selected_ref = "semantic:DOMAIN_0:fact_0:metric:measure_0"
+    schema_ref = "semantic:DOMAIN_0:fact_0:schema"
 
     class SemanticCatalog:
         def read(self, ref_id="", path="", max_chars=0, offset=0):
+            if ref_id == detail_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "TABLE_DETAIL",
+                    "topic": "DOMAIN_0",
+                    "table": "fact_0",
+                    "content": json.dumps(
+                        {
+                            "table": "fact_0",
+                            "metricsRefId": "semantic:DOMAIN_0:fact_0:metrics",
+                            "schemaRefId": schema_ref,
+                        }
+                    ),
+                }
+            if ref_id == schema_ref:
+                return {
+                    "success": True,
+                    "refId": ref_id,
+                    "kind": "SCHEMA",
+                    "topic": "DOMAIN_0",
+                    "table": "fact_0",
+                    "content": '{"columns":[{"name":"event_day","type":"date"}]}',
+                }
+            assert ref_id == selected_ref
             return {
                 "success": True,
                 "refId": ref_id,
@@ -548,13 +1213,35 @@ def test_terminal_planner_round_forces_validated_emit_and_retries_invalid_struct
                     "content": "",
                     "toolCalls": [
                         {
+                            "id": "read_selected_detail",
+                            "name": "semantic_read",
+                            "args": {"refId": detail_ref, "maxChars": 1000},
+                        }
+                    ],
+                }
+            if round_number == 3:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
                             "id": "read_selected_metric",
                             "name": "semantic_read",
                             "args": {"refId": selected_ref, "maxChars": 1000},
                         }
                     ],
                 }
-            if round_number == 3:
+            if round_number == 4:
+                return {
+                    "content": "",
+                    "toolCalls": [
+                        {
+                            "id": "read_selected_schema",
+                            "name": "semantic_read",
+                            "args": {"refId": schema_ref, "maxChars": 1000},
+                        }
+                    ],
+                }
+            if round_number == 5:
                 return {
                     "content": "",
                     "toolCalls": [
@@ -597,7 +1284,7 @@ def test_terminal_planner_round_forces_validated_emit_and_retries_invalid_struct
     settings = get_settings().model_copy(
         update={
             "agent_planner_prompt_budget_chars": 20_000,
-            "agent_planner_tool_rounds": 3,
+            "agent_planner_tool_rounds": 5,
             "agent_planner_invalid_output_retries": 1,
             "agent_deferred_tool_schema_enabled": True,
         }
@@ -617,7 +1304,14 @@ def test_terminal_planner_round_forces_validated_emit_and_retries_invalid_struct
     assert payload["status"] == "UNDERSTOOD"
     assert payload["questionUnderstanding"]["rankingObjective"]["metricRef"] == "measure_0"
     assert len(payload["_plannerInvalidOutputAttempts"]) == 1
-    assert model.tool_choices == ["", "", "emit_question_understanding", "emit_question_understanding"]
+    assert model.tool_choices == [
+        "",
+        "",
+        "",
+        "",
+        "emit_question_understanding",
+        "emit_question_understanding",
+    ]
     assert any(
         item.get("errorType") == "INVALID_STRUCTURED_OUTPUT"
         for item in model.payloads[-1]["plannerToolResults"]

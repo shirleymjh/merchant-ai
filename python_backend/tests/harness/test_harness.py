@@ -4395,6 +4395,50 @@ def test_topic_router_inherits_multiple_context_topics_without_joining_them():
     assert decision.primary_topic == QuestionCategory.UNKNOWN
 
 
+def test_topic_router_does_not_silently_replace_session_boundary_with_question_signal():
+    decision = TopicRouterService().route(
+        "最近30天退款金额是多少",
+        KeywordExtractService().extract("最近30天退款金额是多少"),
+        context_topics=[QuestionCategory.TRADE],
+    )
+
+    assert decision.recall_topics() == [QuestionCategory.TRADE]
+    assert decision.routing_mode == "topic_workspace"
+    assert "不静默替换会话工作区" in decision.reason
+
+
+def test_session_topic_boundary_can_be_restored_from_server_thread_summary():
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    state = workflow._initial_state("那最近7天呢", "100", ChatContext(), None, "topic_thread", "topic_run")
+    state["thread_context"] = {
+        "restored": True,
+        "topicWorkspace": {
+            "topics": ["客服工单"],
+            "topicIds": [QuestionCategory.SERVICE.value],
+            "mode": "topic_workspace",
+        },
+    }
+
+    assert workflow.session_topic_categories(state) == [QuestionCategory.SERVICE]
+
+
+def test_response_context_persists_topic_workspace_instead_of_plan_categories():
+    workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
+    state = {
+        "response_context": ChatContext(topic="经营画像", topics=[]),
+        "topic_workspace": {
+            "topics": ["客服工单"],
+            "topicIds": [QuestionCategory.SERVICE.value],
+        },
+        "topic_routing_decision": TopicRoutingDecision(),
+    }
+
+    workflow.synchronize_response_topic_context(state)
+
+    assert state["response_context"].topic == "客服工单"
+    assert state["response_context"].topics == [QuestionCategory.SERVICE]
+
+
 def test_legacy_fast_metric_direct_tool_preserves_response_sections(monkeypatch):
     workflow = create_workflow(get_settings().model_copy(update={"lead_action_llm_mode": "off"}))
     state = workflow._initial_state("最近7天总GMV趋势", "100", ChatContext(), None, "fast_thread", "fast_run")
@@ -4470,7 +4514,7 @@ def test_fast_metric_definition_path_uses_semantic_lineage_without_persisting(mo
     assert response.context.data_catalog == "ads_merchant_profile"
 
 
-def test_lead_policy_routes_single_metric_to_retrieve_then_query_metric():
+def test_lead_policy_routes_single_metric_to_retrieve_then_main_planner():
     policy = V2AgentPolicy(get_settings())
     state = {
         "question": "最近7天GMV是多少",
@@ -4508,7 +4552,8 @@ def test_lead_policy_routes_single_metric_to_retrieve_then_query_metric():
     decision = policy.decide(state)
 
     assert decision.selected_action == "lead_arbitrate"
-    assert {"query_metric", "plan_graph"} <= set(decision.available_actions)
+    assert "plan_graph" in decision.available_actions
+    assert "query_metric" not in decision.available_actions
 
 
 def test_query_metric_tool_prepares_validated_graph_and_returns_to_lead(monkeypatch, tmp_path):
@@ -10127,6 +10172,11 @@ def test_publish_thread_summary_includes_artifacts_and_reusable_entity_sets(tmp_
     (outputs / "trace_replay.json").write_text("{}", encoding="utf-8")
     state["answer"] = "已基于 spu_1、spu_2 查询下单量。"
     state["summary_context"] = "上轮商品集合可复用。"
+    state["topic_workspace"] = {
+        "mode": "topic_workspace",
+        "topics": ["客服工单"],
+        "topicIds": [QuestionCategory.SERVICE.value],
+    }
     state["agent_run_result"] = AgentRunResult(
         task_results=[
             AgentTaskResult(
@@ -10149,6 +10199,7 @@ def test_publish_thread_summary_includes_artifacts_and_reusable_entity_sets(tmp_
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
     assert payload["reusableEntitySets"][0]["joinKey"] == "spu_id"
     assert payload["reusableEntitySets"][0]["valuesPreview"] == ["spu_1", "spu_2"]
+    assert payload["topicWorkspace"]["topicIds"] == [QuestionCategory.SERVICE.value]
     assert any(item.get("relativePath") == "trace_replay.json" for item in payload["artifacts"])
 
 

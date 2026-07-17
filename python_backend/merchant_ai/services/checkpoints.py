@@ -10,6 +10,9 @@ from merchant_ai.config import Settings
 from merchant_ai.services.langgraph_compat import MemorySaver, postgres_saver_class, sqlite_saver_class
 
 
+DEEP_AGENT_CHECKPOINT_NAMESPACE = "deepagent"
+
+
 class CheckpointManager:
     """Owns the LangGraph checkpointer lifecycle and run-level checkpoint refs."""
 
@@ -73,6 +76,34 @@ class CheckpointManager:
             "recursion_limit": 80,
         }
 
+    def config_for_deep_agent(self, thread_id: str, run_id: str = "") -> Dict[str, Any]:
+        """Address the outer Deep Agent by its durable conversation identity.
+
+        Domain graph checkpoints remain isolated per run under ``thread:run``
+        with the legacy empty namespace. The outer agent instead reuses the
+        real API conversation thread across runs and declares a dedicated
+        namespace, so its messages and StateBackend files can be resumed without
+        colliding with domain state. LangGraph root graphs may normalize a
+        non-empty namespace to ``""``; physical namespace nesting therefore
+        requires invoking the Deep Agent as a subgraph. Isolation does not rely
+        on that behavior because the domain key is independently run-scoped.
+        """
+
+        checkpoint_thread_id = thread_id or "thread"
+        return {
+            "configurable": {
+                "thread_id": checkpoint_thread_id,
+                "checkpoint_ns": DEEP_AGENT_CHECKPOINT_NAMESPACE,
+            },
+            "metadata": {
+                "thread_id": thread_id,
+                "run_id": run_id,
+                "checkpoint_thread_id": checkpoint_thread_id,
+                "checkpoint_namespace": DEEP_AGENT_CHECKPOINT_NAMESPACE,
+            },
+            "recursion_limit": 80,
+        }
+
     def run_ref(self, thread_id: str, run_id: str) -> Dict[str, Any]:
         checkpoint_thread_id = self.thread_id_for_run(thread_id, run_id)
         return {
@@ -84,6 +115,21 @@ class CheckpointManager:
             "storage": self.storage_ref(),
             "resumable": False,
             "purpose": "diagnostic_checkpoint_only",
+        }
+
+    def deep_agent_ref(self, thread_id: str, run_id: str = "") -> Dict[str, Any]:
+        """Describe the durable outer-agent checkpoint used for a conversation."""
+
+        checkpoint_thread_id = thread_id or "thread"
+        return {
+            "backend": self.backend or "sqlite",
+            "threadId": thread_id,
+            "runId": run_id,
+            "checkpointThreadId": checkpoint_thread_id,
+            "checkpointNamespace": DEEP_AGENT_CHECKPOINT_NAMESPACE,
+            "storage": self.storage_ref(),
+            "resumable": (self.backend or "sqlite") != "memory",
+            "purpose": "deep_agent_conversation_checkpoint",
         }
 
     def storage_ref(self) -> str:
@@ -131,13 +177,19 @@ def checkpoint_ref_for_run(settings: Settings, thread_id: str, run_id: str) -> D
 
 
 def prune_completed_sqlite_checkpoints(settings: Settings) -> int:
-    """Bound local checkpoint growth while retaining active and recent completed runs."""
+    """Bound local checkpoint growth without breaking resumable conversations.
+
+    The domain graph is addressed by ``thread_id:run_id`` while the outer Deep
+    Agent is addressed by the durable conversation ``thread_id``. Retention
+    therefore has to keep both keys for every active run and every completed run
+    inside the configured retention window.
+    """
     backend = (settings.agent_checkpointer_backend or "sqlite").strip().lower()
     path = settings.resolved_checkpointer_sqlite_path
     if backend not in {"", "sqlite"} or not path.exists():
         return 0
     runs_dir = settings.resolved_workspace_path / "run_events" / "runs"
-    completed: list[tuple[str, str]] = []
+    completed: list[tuple[str, str, str]] = []
     retained_thread_ids: set[str] = set()
     for run_path in runs_dir.glob("run_*.json"):
         try:
@@ -152,11 +204,14 @@ def prune_completed_sqlite_checkpoints(settings: Settings) -> int:
         status = str(payload.get("status") or "")
         updated_at = str(payload.get("updatedAt") or payload.get("updated_at") or "")
         if status == "COMPLETED":
-            completed.append((updated_at, checkpoint_thread_id))
+            completed.append((updated_at, checkpoint_thread_id, thread_id))
         else:
             retained_thread_ids.add(checkpoint_thread_id)
+            retained_thread_ids.add(thread_id)
     limit = max(0, int(settings.agent_completed_checkpoint_limit or 0))
-    retained_thread_ids.update(item[1] for item in sorted(completed, reverse=True)[:limit])
+    for _, checkpoint_thread_id, conversation_thread_id in sorted(completed, reverse=True)[:limit]:
+        retained_thread_ids.add(checkpoint_thread_id)
+        retained_thread_ids.add(conversation_thread_id)
     connection = sqlite3.connect(str(path), timeout=5)
     try:
         try:

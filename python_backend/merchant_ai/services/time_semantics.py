@@ -6,7 +6,14 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from merchant_ai.models import AnswerMode, QueryPlan, ResolvedTimeRange, RouteLexicalSpan, RouteSpanType
+from merchant_ai.models import (
+    AnswerMode,
+    GraphValidationGap,
+    QueryPlan,
+    ResolvedTimeRange,
+    RouteLexicalSpan,
+    RouteSpanType,
+)
 
 
 CALENDAR_ANCHOR_POLICY = "calendar"
@@ -16,7 +23,9 @@ COMPARISON_MARKER_PATTERN = re.compile(r"相比|对比|比较|变化|环比|较|
 DAILY_GRAIN_PATTERN = re.compile(r"每天|每日|按天|逐日|日趋势|每天的|按日|走势|趋势")
 TIME_SERIES_ANALYSIS_PATTERN = re.compile(r"波动|同步上升|同步下降|持续上升|持续下降|上升|下降|增长|减少|变化|异常|走势|趋势")
 TEMPORAL_QUANTITY_SPAN_PATTERN = re.compile(
-    r"(?:(?P<prefix>最近|近|过去|前)\s*)?(?P<value>\d+)\s*(?P<unit>个月|星期|礼拜|天|日|周|月)"
+    r"(?:(?P<prefix>最近|近|过去|前)\s*)?"
+    r"(?P<value>\d+|[零〇一二两三四五六七八九十百]+)\s*"
+    r"(?P<unit>个月|星期|礼拜|天|日|周|月)"
 )
 TEMPORAL_NAMED_SPAN_PATTERN = re.compile(
     r"(?P<day>昨天|昨日|今天|今日)|(?P<week>上周|本周|这周)|(?P<month>上个月|本月)"
@@ -29,6 +38,22 @@ TEMPORAL_UNIT_ALIASES = {
     "礼拜": "week",
     "月": "month",
     "个月": "month",
+}
+COORDINATED_TIME_WINDOW_SEPARATOR_PATTERN = re.compile(r"^[\s,，、和与及跟同以及还有]+$")
+COMPARISON_TIME_WINDOW_SEPARATOR_PATTERN = re.compile(r"^[\s,，、比较相比对比和与]+$")
+CHINESE_TEMPORAL_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
 }
 
 
@@ -44,6 +69,9 @@ def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
     spans: list[RouteLexicalSpan] = []
     for match in TEMPORAL_QUANTITY_SPAN_PATTERN.finditer(value):
         prefix = str(match.group("prefix") or "")
+        quantity = parse_temporal_quantity(match.group("value"))
+        if quantity <= 0:
+            continue
         spans.append(
             RouteLexicalSpan(
                 span_type=RouteSpanType.TEMPORAL,
@@ -51,7 +79,7 @@ def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
                 end=match.end(),
                 text=match.group(0),
                 source="quantity_window",
-                value=int(match.group("value")),
+                value=quantity,
                 unit=TEMPORAL_UNIT_ALIASES.get(str(match.group("unit") or ""), ""),
                 role="previous_period" if prefix == "前" else "primary",
             )
@@ -77,6 +105,30 @@ def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
             continue
         accepted.append(candidate)
     return accepted
+
+
+def parse_temporal_quantity(value: object) -> int:
+    """Parse Arabic or small Chinese quantities used in relative windows."""
+
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    if any(character not in {*CHINESE_TEMPORAL_DIGITS, "十", "百"} for character in text):
+        return 0
+    total = 0
+    section = 0
+    digit = 0
+    for character in text:
+        if character in CHINESE_TEMPORAL_DIGITS:
+            digit = CHINESE_TEMPORAL_DIGITS[character]
+            continue
+        unit = 10 if character == "十" else 100
+        section += (digit or 1) * unit
+        digit = 0
+    total = section + digit
+    return total if total > 0 else 0
 
 
 def rolling_span_start(anchor: date, span: RouteLexicalSpan) -> date:
@@ -162,28 +214,172 @@ def resolve_time_window_contract(
     """
 
     text = str(question or "")
-    primary = resolve_time_range(text, timezone_name, now=now, default_days=default_days)
+    explicit_windows, window_relation = resolve_coordinated_time_windows(
+        text,
+        timezone_name,
+        now=now,
+    )
+    primary = (
+        explicit_windows[0]
+        if explicit_windows
+        else resolve_time_range(text, timezone_name, now=now, default_days=default_days)
+    )
     primary.window_role = "primary"
-    comparison = resolve_comparison_time_range(text, primary, timezone_name, now=now)
+    if len(explicit_windows) >= 2:
+        comparison = explicit_windows[1]
+        comparison.window_role = "comparison"
+        comparison.comparison_type = "explicit_multi_window"
+    else:
+        comparison = resolve_comparison_time_range(text, primary, timezone_name, now=now)
     grain = resolve_time_grain(text, comparison)
+    windows = [primary.model_dump(by_alias=True)]
+    if comparison:
+        windows.append(comparison.model_dump(by_alias=True))
+    if len(explicit_windows) > 2:
+        for index, window in enumerate(explicit_windows[2:], start=2):
+            window.window_role = "comparison_%d" % index
+            window.comparison_type = "explicit_multi_window"
+            windows.append(window.model_dump(by_alias=True))
     contract: Dict[str, Any] = {
         "primary": primary.model_dump(by_alias=True),
         "comparison": comparison.model_dump(by_alias=True) if comparison else {},
+        "windows": windows,
         "grain": grain,
         "requiresComparison": bool(comparison),
+        "requiresMultipleWindows": len(windows) > 1,
         "comparisonType": comparison.comparison_type if comparison else "",
+        "windowRelation": window_relation or ("comparison" if comparison else "single"),
         "source": "time_window_tool",
         "trace": time_window_contract_trace(text, primary, comparison, grain),
     }
+    if len(windows) > 1:
+        contract["trace"].append(
+            "explicit_windows=%d:relation=%s" % (len(windows), contract["windowRelation"])
+        )
+    if len(explicit_windows) > 2:
+        contract.setdefault("ambiguities", []).append(
+            {
+                "code": "MULTI_WINDOW_EXECUTION_LIMIT",
+                "message": "当前 QueryGraph 只支持两个显式窗口；其余窗口已保留并将在校验阶段阻止不完整执行。",
+                "windowCount": len(explicit_windows),
+            }
+        )
     if ambiguous_recent_month(text):
-        contract["ambiguities"] = [
+        contract.setdefault("ambiguities", []).append(
             {
                 "code": "RECENT_MONTH_AMBIGUOUS",
                 "message": "最近N个月可按滚动日历月或完整自然月理解；当前按以锚点结束的滚动日历月处理。",
                 "default": "rolling_calendar_months",
             }
-        ]
+        )
     return contract
+
+
+def resolve_coordinated_time_windows(
+    text: str,
+    timezone_name: str,
+    now: Optional[datetime] = None,
+) -> tuple[list[ResolvedTimeRange], str]:
+    """Resolve two adjacent, explicitly coordinated windows in mention order.
+
+    The normal scalar resolver intentionally remains backward compatible. This
+    helper recognizes only structurally clear expressions such as
+    ``近三天和今天`` or ``今天比昨天``. It does not cross-product windows that
+    are separated by metric/object text (for example ``今天订单和近七天退款``).
+    """
+
+    value = str(text or "")
+    spans = [span for span in extract_temporal_lexical_spans(value) if span.role == "primary"]
+    resolved: list[tuple[RouteLexicalSpan, ResolvedTimeRange]] = []
+    for span in spans:
+        window = resolved_time_range_for_span(span, timezone_name, now=now)
+        if window is not None:
+            resolved.append((span, window))
+    if len(resolved) < 2:
+        return [], ""
+    coordinated = all(
+        bool(
+            COORDINATED_TIME_WINDOW_SEPARATOR_PATTERN.fullmatch(
+                value[current[0].end : following[0].start]
+            )
+        )
+        for current, following in zip(resolved, resolved[1:])
+    )
+    explicit_comparison = bool(COMPARISON_MARKER_PATTERN.search(value)) and all(
+        bool(
+            COMPARISON_TIME_WINDOW_SEPARATOR_PATTERN.fullmatch(
+                value[current[0].end : following[0].start]
+            )
+        )
+        for current, following in zip(resolved, resolved[1:])
+    )
+    if not coordinated and not explicit_comparison:
+        return [], ""
+    windows: list[ResolvedTimeRange] = []
+    seen: set[tuple[str, str, str]] = set()
+    for _, window in resolved:
+        identity = (window.kind, window.start_date, window.end_date)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        windows.append(window)
+    if len(windows) < 2:
+        return [], ""
+    relation = "explicit_comparison" if explicit_comparison else "explicit_conjunction"
+    return windows, relation
+
+
+def resolved_time_range_for_span(
+    span: RouteLexicalSpan,
+    timezone_name: str,
+    now: Optional[datetime] = None,
+) -> Optional[ResolvedTimeRange]:
+    today = local_today(timezone_name, now)
+    label = str(span.text or "").strip()
+    if span.source == "quantity_window":
+        if span.role != "primary":
+            return None
+        return resolved_range(
+            "rolling",
+            rolling_span_start(today, span),
+            today,
+            timezone_name,
+            label,
+            "relative_%s_quantity" % str(span.unit or ""),
+        )
+    if span.source != "named_calendar_window":
+        return None
+    if label in {"今天", "今日"}:
+        return resolved_range("exact_date", today, today, timezone_name, label, "relative_today")
+    if label in {"昨天", "昨日"}:
+        target = today - timedelta(days=1)
+        return resolved_range("exact_date", target, target, timezone_name, label, "relative_yesterday")
+    if label in {"本周", "这周"}:
+        start = today - timedelta(days=today.weekday())
+        return resolved_range("calendar_week", start, today, timezone_name, label, "calendar_current_week")
+    if label == "上周":
+        end = today - timedelta(days=today.weekday() + 1)
+        return resolved_range("calendar_week", end - timedelta(days=6), end, timezone_name, label, "calendar_previous_week")
+    if label == "本月":
+        return resolved_range(
+            "calendar_month",
+            today.replace(day=1),
+            today,
+            timezone_name,
+            label,
+            "calendar_current_month",
+        )
+    if label == "上个月":
+        end = today.replace(day=1) - timedelta(days=1)
+        return resolved_range(
+            "calendar_month",
+            end.replace(day=1),
+            end,
+            timezone_name,
+            label,
+            "calendar_previous_month",
+        )
+    return None
 
 
 def has_explicit_time_expression(question: str) -> bool:
@@ -347,7 +543,12 @@ def time_window_contract_trace(
     return trace
 
 
-def apply_time_range_to_plan(plan: QueryPlan, time_range: ResolvedTimeRange) -> QueryPlan:
+def apply_time_range_to_plan(
+    plan: QueryPlan,
+    time_range: ResolvedTimeRange,
+    *,
+    force: bool = False,
+) -> QueryPlan:
     if not plan.intents:
         return plan
     lookup_policy = plan_entity_lookup_time_policy(plan)
@@ -382,7 +583,11 @@ def apply_time_range_to_plan(plan: QueryPlan, time_range: ResolvedTimeRange) -> 
     intents = []
     for intent in plan.intents:
         current = intent.time_range
-        resolved = current if current and current.start_date and current.end_date else time_range
+        resolved = (
+            current
+            if not force and current and current.start_date and current.end_date
+            else time_range
+        )
         intents.append(intent.model_copy(update={"time_range": resolved, "days": resolved.days or intent.days}))
     understanding = dict(plan.question_understanding or {})
     understanding["timeRange"] = time_range.model_dump(by_alias=True)
@@ -458,7 +663,11 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
                 "entity_lookup_policy=bounded_default:%d" % policy_days,
             ]
     primary.window_role = "primary"
-    plan = apply_time_range_to_plan(plan, primary)
+    plan = apply_time_range_to_plan(
+        plan,
+        primary,
+        force=bool(contract.get("requiresMultipleWindows")),
+    )
     understanding = dict(plan.question_understanding or {})
     understanding["timeWindowContract"] = contract
     if contract.get("grain") == "day":
@@ -477,6 +686,53 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
         understanding["timeWindowContract"] = contract
         understanding["analysisIntent"] = "comparison"
     return plan.model_copy(update={"question_understanding": understanding})
+
+
+def time_window_contract_validation_gaps(plan: QueryPlan) -> list[GraphValidationGap]:
+    """Fail closed when a sealed multi-window contract loses a window.
+
+    QueryGraph nodes carry the executable window, while
+    ``questionUnderstanding.timeWindowContract.windows`` is the immutable user
+    obligation. Validation compares exact logical bounds so a plan cannot answer
+    only ``今天`` after the user requested ``近三天和今天``.
+    """
+
+    understanding = dict(plan.question_understanding or {})
+    contract = understanding.get("timeWindowContract") or understanding.get("time_window_contract") or {}
+    if not isinstance(contract, dict) or not contract.get("requiresMultipleWindows"):
+        return []
+    expected_windows = [item for item in contract.get("windows") or [] if isinstance(item, dict)]
+    if len(expected_windows) < 2:
+        return [
+            GraphValidationGap(
+                code="INVALID_TIME_WINDOW_CONTRACT",
+                reason="multi-window contract must retain at least two structured windows",
+            )
+        ]
+    actual = {
+        (
+            str(intent.time_range.window_role or ""),
+            str(intent.time_range.start_date or ""),
+            str(intent.time_range.end_date or ""),
+        )
+        for intent in plan.intents
+        if intent.time_range.start_date and intent.time_range.end_date
+    }
+    gaps: list[GraphValidationGap] = []
+    for index, window in enumerate(expected_windows):
+        role = str(window.get("windowRole") or ("primary" if index == 0 else "comparison"))
+        start = str(window.get("startDate") or "")
+        end = str(window.get("endDate") or "")
+        if start and end and (role, start, end) in actual:
+            continue
+        gaps.append(
+            GraphValidationGap(
+                code="TIME_WINDOW_NOT_PLANNED",
+                evidence="%s:%s..%s" % (str(window.get("label") or role), start, end),
+                reason="QueryGraph does not cover every window in the sealed multi-window contract",
+            )
+        )
+    return gaps
 
 
 def apply_period_grain_to_plan(plan: QueryPlan, time_contract: Dict[str, Any]) -> QueryPlan:

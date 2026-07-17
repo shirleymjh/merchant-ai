@@ -3,6 +3,7 @@
   "questionCategory": "UNKNOWN",
   "tableName": "ads_merchant_profile",
   "tableComment": "",
+  "businessSummary": "商家经营概览快照表，覆盖交易、售后、客服、履约和商品等多域汇总信息；适合商家级概览与趋势，不提供商品、工单等明细维度。",
   "dataGrain": "商家-日期粒度经营指标画像",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
@@ -64,32 +65,38 @@
       {
         "metricRef": "order_gmv_amt_1d",
         "displayName": "昨日总GMV金额",
-        "role": "gmv"
+        "role": "gmv",
+        "ownerTopic": "电商交易"
       },
       {
         "metricRef": "order_user_cnt_1d",
         "displayName": "昨日下单用户量",
-        "role": "order_users"
+        "role": "order_users",
+        "ownerTopic": "电商交易"
       },
       {
         "metricRef": "order_cnt_1d",
         "displayName": "昨日总订单量",
-        "role": "orders"
+        "role": "orders",
+        "ownerTopic": "电商交易"
       },
       {
         "metricRef": "trade_success_order_cnt_1d",
         "displayName": "昨日交易成功订单量",
-        "role": "successful_orders"
+        "role": "successful_orders",
+        "ownerTopic": "电商交易"
       },
       {
         "metricRef": "return_cnt_1d",
         "displayName": "昨日退货量",
-        "role": "returns"
+        "role": "returns",
+        "ownerTopic": "电商退货"
       },
       {
         "metricRef": "refund_amt_1d",
         "displayName": "昨日退款金额",
-        "role": "refund_amount"
+        "role": "refund_amount",
+        "ownerTopic": "电商退货"
       }
     ],
     "alerts": [

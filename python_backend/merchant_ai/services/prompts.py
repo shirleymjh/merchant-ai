@@ -212,11 +212,15 @@ def default_prompt_registry() -> PromptRegistry:
     registry.register_section(
         PromptSectionSpec(
             section_id="planner.semantic_boundary",
-            version="v1",
+            version="v2",
             title="规划语义边界",
             content=(
-                "规划阶段只做问题结构理解、语义资产选择、查询图和证据需求声明。"
-                "不直接写 SQL，不根据记忆或字段名猜指标口径；指标、字段、关系以语义层为准。"
+                "Planner 是 Core Agent 调用的受治理 QueryGraph 编译工具，不是 subagent，也不是第二个 ReAct Agent。"
+                "Core Agent 拥有动作与文件工具的选择权；Planner 只做问题结构理解、已读语义证据校验、查询图和证据需求声明。"
+                "当 runtime-section 声明 core_managed_filesystem 时，只能消费 Core 已读取的 coreSemanticEvidence，"
+                "不得自行调用 ls、grep、read 或扩展到未读 ref；证据不足必须返回 NEED_MORE_KNOWLEDGE。"
+                "仅显式 legacy runtime-section 可以授权旧 semantic tool loop。"
+                "Planner 不直接写 SQL，不根据记忆、L0 摘要、表名或字段名猜指标口径；指标、字段、关系以精确语义定义为准。"
             ),
         )
     )
@@ -277,18 +281,25 @@ def default_prompt_registry() -> PromptRegistry:
     registry.register(
         PromptTemplateSpec(
             prompt_id="planner.question_understanding",
-            version="v1",
+            version="v2",
             agent="PlannerAgent",
             description="Understand a BI question into semantic-layer bounded questionUnderstanding.",
             section_ids=["common.stable_boundary", "planner.semantic_boundary", "common.artifact_references"],
             template=(
-                "你是商家 BI 问题理解器。只输出 JSON。\n"
-                "你的任务不是生成 SQL，也不是自由选表，而是从用户问题中识别 analysisGrain、anchorMetric、supportMetrics、scopeConstraints、filters、timeWindowDays。\n"
+                "你是商家 BI 的 QueryGraph Planner。只通过 emit_question_understanding 输出结构化结果，不输出 SQL、QueryGraph 文本或解释长文。\n"
+                "你不是 Core Agent，也不是 subagent；文件工具权限严格服从本次 runtime-section。{filesystem_authority_instruction}\n"
+                "你必须依据本次已授权的精确语义读取证据，独立验证哪些已读表能同时覆盖用户要求的事实、维度、过滤与时间语义，"
+                "再识别 analysisGrain、anchorMetric、supportMetrics、scopeConstraints、filters、timeWindowDays。候选排序和 L0 摘要都不是最终选表结论。\n"
+                "画像汇总表只是可选的聚合资产：简单汇总可直接使用；排行、拆分、明细或原因分析可以直接选择已读的明细事实表，"
+                "不得强制先查画像再沿 detailMetricRef 下钻。\n"
+                "已授权精确读取证据中未出现的指标定义、字段、schema、关系或规则一律视为未读；缺少关键证据时返回 NEED_MORE_KNOWLEDGE，"
+                "在 knowledgeRequests 中说明 Core 下一步应补读的 TABLE/FIELD/METRIC/RELATIONSHIP/BUSINESS_RULE，不得猜测或静默丢失条件。\n"
                 "同时必须声明 analysisIntent、requiresExplanation、requiredEvidenceIntents：简单查询/排行用 none/false/[]；需要诊断、原因解释、异常判断、风险判断、经营总结时，由你声明所需证据意图。\n"
                 "只要 analysisIntent 不是 none，requiredEvidenceIntents 必须至少 1 条；comparison/trend_check/anomaly_check/risk_ranking/overview/diagnosis 都不能返回空 evidence intents。\n"
                 "不要依赖代码关键词补规则；如果需要解释型证据，把证据需求写进 requiredEvidenceIntents，再由语义层编译和 Critic 校验。\n"
-                "metricRef 必须来自 semanticCatalog.candidateMetrics.key；ownerTable 必须使用对应 metric 的 table。\n"
-                "如果 semanticCatalog.tables 为空但 candidateMetrics 非空，这是轻量指标候选模式，不代表缺少业务知识；先基于 candidateMetrics 输出 questionUnderstanding，字段、关系或完整口径细节需要时再 semantic_read 精确读取。\n"
+                "metricRef 必须来自精确 METRIC 读取证据中的 metricKey；ownerTable 必须等于该定义的 table。\n"
+                "groupBy、过滤、选择字段必须来自已读 COLUMN 定义或已读 SCHEMA；跨表依赖必须来自已读 RELATIONSHIPS。"
+                "只读过 manifest、table detail 或 section index 只能用于导航，不能授权具体绑定。\n"
                 "Metric candidate selection：同一用户指标 phrase 下多个同名/近义候选默认互斥；先看 title/tableKind/grainHint/formula/description，在 metricCandidateDecisions 中 selected_one 或 need_clarification。除非用户明确要求口径对账/差异排查，不要同时查询多个同名候选；rejectedCandidateIds 不能进入 anchorMetric/supportMetrics/QueryGraph。\n"
                 "通用候选规则：整体汇总请求选择 metadata 标注为汇总粒度的候选；明细请求选择明细粒度候选；用户未要求口径对账时，同一 sourcePhrase 只能 selected_one，不要双查互斥口径；多个候选都合理时 need_clarification。\n"
                 "如果输入包含 knowledgeRequestGaps，表示这些补知识请求已经失败或无新增证据；不要重复请求同一个知识，必须基于现有 semanticCatalog 规划可回答部分，或把不支持部分留成结构化缺口。\n"

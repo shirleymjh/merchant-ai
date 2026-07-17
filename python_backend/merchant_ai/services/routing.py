@@ -329,9 +329,28 @@ class KeywordExtractService:
     def extract(self, question: str) -> ExtractedKeywords:
         text = question or ""
         normalized = normalize_keyword_text(text)
-        topic_mentions = self._topic_mentions(normalized)
-        metric_mentions = self._metric_mentions(normalized)
         dimension_mentions = self._dimension_mentions(normalized)
+        metric_mentions = self._metric_mentions(normalized)
+        dimension_mentions = independent_dimension_mentions(normalized, dimension_mentions, metric_mentions)
+        lineage_mentions = self._metric_lineage_mentions(normalized, dimension_mentions)
+        topic_mentions = self._topic_mentions(normalized)
+        governed_phrases = {
+            (item.kind, normalize_keyword_text(item.phrase))
+            for item in [*metric_mentions, *dimension_mentions]
+            if item.phrase
+        }
+        topic_mentions = [
+            item
+            for item in topic_mentions
+            if not (
+                item.source == "semantic_topic_metric"
+                and ("metric", normalize_keyword_text(item.phrase)) in governed_phrases
+            )
+            and not (
+                item.source == "semantic_topic_dimension"
+                and ("dimension", normalize_keyword_text(item.phrase)) in governed_phrases
+            )
+        ]
         action = longest_distinct_matches(normalized, ACTION_KEYWORDS)
         lexical_spans = extract_route_lexical_spans(normalized)
         time_words = dedupe_ordered(
@@ -341,7 +360,7 @@ class KeywordExtractService:
             [span.text for span in lexical_spans if span.span_type == RouteSpanType.RANKING]
         )
         ambiguous_metrics = ambiguous_metric_phrases(metric_mentions)
-        all_mentions = dedupe_mentions([*metric_mentions, *dimension_mentions, *topic_mentions])
+        all_mentions = dedupe_mentions([*metric_mentions, *dimension_mentions, *lineage_mentions, *topic_mentions])
         negated_segments = extract_negated_segments(normalized)
         excluded_mentions = [
             item
@@ -412,7 +431,7 @@ class KeywordExtractService:
                         kind="topic",
                         topic=entry.get("category") or QuestionCategory.UNKNOWN,
                         score=float(entry.get("score") or 1.5),
-                        source="semantic_topic",
+                        source="semantic_topic_%s" % str(entry.get("source") or "contract"),
                     )
                 )
         return mentions
@@ -440,6 +459,115 @@ class KeywordExtractService:
                         )
                     )
         return mentions
+
+    def _metric_lineage_mentions(
+        self,
+        normalized: str,
+        dimension_mentions: List[KeywordMention],
+    ) -> List[KeywordMention]:
+        """Resolve a dimensional metric to its governed detail serving path.
+
+        A profile aggregate may own the fast summary metric while a detail fact
+        table owns the requested grouping dimension.  That lineage should
+        narrow discovery to the table that can answer the composed question,
+        not blindly open the profile, dimension-master, and detail Topics.
+        """
+
+        causal_detail_requested = bool(
+            re.search(r"(?:为什么|为何|原因|归因|怎么导致|异常根因)", normalized)
+        )
+        if not dimension_mentions and not causal_detail_requested:
+            return []
+        mentions: List[KeywordMention] = []
+        required_dimensions = metric_detail_grouping_dimensions(normalized, dimension_mentions)
+        for phrase in self._semantic_matcher.match(normalized):
+            for entry in self._semantic_metrics.get(normalize_keyword_text(phrase), [])[:4]:
+                target, source = self._dimension_compatible_metric_entry(
+                    entry,
+                    required_dimensions,
+                    allow_without_dimensions=causal_detail_requested,
+                )
+                if source != "semantic_metric_detail_ref":
+                    continue
+                for topic in target.get("topicCandidates") or [target.get("topic")]:
+                    mentions.append(
+                        KeywordMention(
+                            phrase=phrase,
+                            canonical_key=str(target.get("metricKey") or ""),
+                            display_name=str(target.get("businessName") or phrase),
+                            kind="lineage",
+                            topic=topic or QuestionCategory.UNKNOWN,
+                            owner_table=str(target.get("table") or ""),
+                            semantic_role="METRIC_LINEAGE",
+                            score=float(target.get("score") or 3.0),
+                            source=source,
+                        )
+                    )
+        return mentions
+
+    def _dimension_compatible_metric_entry(
+        self,
+        entry: Dict[str, Any],
+        dimension_mentions: List[KeywordMention],
+        allow_without_dimensions: bool = False,
+    ) -> tuple[Dict[str, Any], str]:
+        """Follow an asset-declared detail metric only when it covers requested dimensions.
+
+        Routing uses the published metric lineage and canonical semantic column
+        identities.  It does not infer a detail table from business words or a
+        physical table name.
+        """
+
+        if self.topic_assets is None or (not dimension_mentions and not allow_without_dimensions):
+            return entry, "semantic_metric"
+        detail_ref = str(entry.get("detailMetricRef") or entry.get("drilldownMetricRef") or "").strip()
+        identity = semantic_metric_reference_identity(detail_ref)
+        if not identity:
+            return entry, "semantic_metric"
+        target_topic, target_table, target_metric_key = identity
+        requested_by_phrase: Dict[str, Set[str]] = defaultdict(set)
+        for mention in dimension_mentions:
+            phrase = normalize_keyword_text(mention.phrase)
+            canonical_key = str(mention.canonical_key or "").strip()
+            if phrase and canonical_key:
+                requested_by_phrase[phrase].add(canonical_key)
+        if not requested_by_phrase and not allow_without_dimensions:
+            return entry, "semantic_metric"
+        try:
+            target_columns = {
+                str(item.get("columnName") or "").strip()
+                for item in self.topic_assets.load_table_semantic_columns(target_topic, target_table)
+                if isinstance(item, dict) and str(item.get("columnName") or "").strip()
+            }
+            target_metric = next(
+                (
+                    item
+                    for item in self.topic_assets.load_table_metrics(target_topic, target_table)
+                    if str(item.get("canonicalMetricKey") or item.get("metricKey") or "").strip()
+                    == target_metric_key
+                ),
+                None,
+            )
+        except Exception:
+            return entry, "semantic_metric"
+        if not target_metric or (
+            requested_by_phrase
+            and not all(keys.intersection(target_columns) for keys in requested_by_phrase.values())
+        ):
+            return entry, "semantic_metric"
+        target_category = resolve_asset_topic_category(self.topic_assets, target_topic)
+        target_topics = asset_entry_topic_categories(self.topic_assets, target_topic, target_metric)
+        return (
+            {
+                **entry,
+                "metricKey": target_metric_key,
+                "businessName": str(target_metric.get("businessName") or target_metric_key),
+                "topic": target_topics[0] if target_topics else target_category,
+                "topicCandidates": target_topics or [target_category],
+                "table": target_table,
+            },
+            "semantic_metric_detail_ref",
+        )
 
     def _dimension_mentions(self, normalized: str) -> List[KeywordMention]:
         if self._semantic_dimensions:
@@ -470,6 +598,24 @@ class KeywordExtractService:
     def _topic_scores(self, mentions: List[KeywordMention]) -> Dict[str, float]:
         scores: Dict[str, float] = defaultdict(float)
         seen: Set[tuple[str, str, str]] = set()
+        lineage_mentions = [item for item in mentions if item.kind == "lineage"]
+        lineage_phrases = {normalize_keyword_text(item.phrase) for item in lineage_mentions if item.phrase}
+        lineage_target_columns: Set[str] = set()
+        if self.topic_assets is not None:
+            for lineage in lineage_mentions:
+                topic_names = self.topic_assets.topic_names_for_categories([lineage.topic])
+                for topic_name in topic_names:
+                    try:
+                        lineage_target_columns.update(
+                            str(item.get("columnName") or "").strip()
+                            for item in self.topic_assets.load_table_semantic_columns(
+                                topic_name,
+                                lineage.owner_table,
+                            )
+                            if isinstance(item, dict) and str(item.get("columnName") or "").strip()
+                        )
+                    except Exception:
+                        continue
         for mention in mentions:
             if mention.topic == QuestionCategory.UNKNOWN:
                 continue
@@ -478,7 +624,18 @@ class KeywordExtractService:
             if identity in seen:
                 continue
             seen.add(identity)
-            scores[mention_topic] += mention.score
+            weight = 1.0
+            # detailMetricRef is a strong discovery/ranking signal, not a
+            # deterministic table-selection rule.  Keep the aggregate owner
+            # and dimension master as lower-ranked L0 candidates so the Core
+            # Agent can compare their business summaries and choose the table.
+            if mention.kind == "lineage":
+                weight = 2.0
+            elif mention.kind == "metric" and normalize_keyword_text(mention.phrase) in lineage_phrases:
+                weight = 0.4
+            elif mention.kind == "dimension" and mention.canonical_key in lineage_target_columns:
+                weight = 0.4
+            scores[mention_topic] += mention.score * weight
         return dict(scores)
 
     def _build_semantic_metric_lexicon(self, topic_assets: Any) -> Dict[str, List[Dict[str, Any]]]:
@@ -509,6 +666,12 @@ class KeywordExtractService:
                             "topicCandidates": topic_candidates or [category],
                             "table": table,
                             "score": 3.0 if phrase == normalize_keyword_text(business_name) else 2.8,
+                            "detailMetricRef": str(
+                                metric.get("detailMetricRef")
+                                or metric.get("drilldownMetricRef")
+                                or metric.get("detail_metric_ref")
+                                or ""
+                            ),
                         }
                         if not any(
                             item.get("metricKey") == metric_key
@@ -531,7 +694,11 @@ class KeywordExtractService:
                 *[str(item) for item in contract.get("aliases") or []],
             ]
             for phrase in semantic_alias_phrases(topic_phrases):
-                add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "score": 1.8})
+                add_semantic_lexicon_entry(
+                    lexicon,
+                    phrase,
+                    {"topic": topic_name, "category": category, "score": 1.8, "source": "contract"},
+                )
             for manifest_item in topic_assets.load_manifest(topic_name):
                 table = str(manifest_item.get("tableName") or "")
                 labels = [
@@ -540,7 +707,17 @@ class KeywordExtractService:
                     str(manifest_item.get("dataGrain") or ""),
                 ]
                 for phrase in semantic_alias_phrases(labels):
-                    add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "table": table, "score": 1.6})
+                    add_semantic_lexicon_entry(
+                        lexicon,
+                        phrase,
+                        {
+                            "topic": topic_name,
+                            "category": category,
+                            "table": table,
+                            "score": 1.6,
+                            "source": "manifest",
+                        },
+                    )
                 for metric in topic_assets.load_table_metrics(topic_name, table):
                     metric_topics = asset_entry_topic_categories(topic_assets, topic_name, metric)
                     labels = [
@@ -553,7 +730,13 @@ class KeywordExtractService:
                             add_semantic_lexicon_entry(
                                 lexicon,
                                 phrase,
-                                {"topic": topic_name, "category": metric_topic, "table": table, "score": 1.4},
+                                {
+                                    "topic": topic_name,
+                                    "category": metric_topic,
+                                    "table": table,
+                                    "score": 1.4,
+                                    "source": "metric",
+                                },
                             )
                 for field in topic_assets.load_table_semantic_columns(topic_name, table):
                     labels = [
@@ -562,7 +745,17 @@ class KeywordExtractService:
                         *[str(alias) for alias in field.get("aliases") or []],
                     ]
                     for phrase in semantic_alias_phrases(labels):
-                        add_semantic_lexicon_entry(lexicon, phrase, {"topic": topic_name, "category": category, "table": table, "score": 1.2})
+                        add_semantic_lexicon_entry(
+                            lexicon,
+                            phrase,
+                            {
+                                "topic": topic_name,
+                                "category": category,
+                                "table": table,
+                                "score": 1.2,
+                                "source": "dimension",
+                            },
+                        )
                 for term in topic_assets.load_table_terms(topic_name, table):
                     term_topics = asset_entry_topic_categories(topic_assets, topic_name, term)
                     labels = [
@@ -574,7 +767,13 @@ class KeywordExtractService:
                             add_semantic_lexicon_entry(
                                 lexicon,
                                 phrase,
-                                {"topic": topic_name, "category": term_topic, "table": table, "score": 1.5},
+                                {
+                                    "topic": topic_name,
+                                    "category": term_topic,
+                                    "table": table,
+                                    "score": 1.5,
+                                    "source": "term",
+                                },
                             )
         return dict(lexicon)
 
@@ -621,6 +820,55 @@ class KeywordExtractService:
 def normalize_keyword_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
     return re.sub(r"\s+", " ", text)
+
+
+def metric_detail_grouping_dimensions(
+    normalized_question: str,
+    dimension_mentions: List[KeywordMention],
+) -> List[KeywordMention]:
+    """Keep the grouping dimension as the detail-lineage requirement.
+
+    In ``工单量最高的商品，同时看商品发布时间`` the ticket fact must
+    cover ``商品`` to rank it, while ``商品发布时间`` is a separate enrichment
+    that may legitimately require the goods Topic.  Requiring every enrichment
+    on the fact table would discard a valid detail lineage altogether.
+    """
+
+    if not dimension_mentions:
+        return []
+    ranking_terms = "最高|最低|最多|最少|top\\s*\\d*|前\\s*\\d+"
+    grouping_phrases = {
+        normalize_keyword_text(item.phrase)
+        for item in dimension_mentions
+        if item.phrase
+        and (
+            re.search(
+                r"(?:%s)(?:的)?%s" % (ranking_terms, re.escape(normalize_keyword_text(item.phrase))),
+                normalized_question,
+                flags=re.IGNORECASE,
+            )
+            or re.search(
+                r"(?:按|每)%s" % re.escape(normalize_keyword_text(item.phrase)),
+                normalized_question,
+                flags=re.IGNORECASE,
+            )
+        )
+    }
+    if not grouping_phrases:
+        return dimension_mentions
+    return [
+        item
+        for item in dimension_mentions
+        if normalize_keyword_text(item.phrase) in grouping_phrases
+    ]
+
+
+def semantic_metric_reference_identity(ref_id: str) -> Optional[tuple[str, str, str]]:
+    match = re.fullmatch(r"semantic:([^:]+):([^:]+):metric:(.+)", str(ref_id or "").strip())
+    if not match:
+        return None
+    topic, table, metric_key = (str(item).strip() for item in match.groups())
+    return (topic, table, metric_key) if topic and table and metric_key else None
 
 
 class PhraseMatcher:
@@ -726,6 +974,35 @@ def phrase_spans(text: str, phrase: str) -> List[tuple[int, int]]:
         pattern = re.compile(r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(normalized_phrase), re.I)
         return [(match.start(), match.end()) for match in pattern.finditer(text)]
     return [(match.start(), match.end()) for match in re.finditer(re.escape(normalized_phrase), text)]
+
+
+def independent_dimension_mentions(
+    normalized_question: str,
+    dimensions: List[KeywordMention],
+    metrics: List[KeywordMention],
+) -> List[KeywordMention]:
+    """Drop dimension labels that occur only inside a governed metric label."""
+
+    metric_spans = [
+        span
+        for phrase in dedupe_ordered([item.phrase for item in metrics])
+        for span in phrase_spans(normalized_question, phrase)
+    ]
+    if not metric_spans:
+        return dimensions
+    independent_phrases: Set[str] = set()
+    for phrase in dedupe_ordered([item.phrase for item in dimensions]):
+        occurrences = phrase_spans(normalized_question, phrase)
+        if any(
+            not any(metric_start <= start and end <= metric_end for metric_start, metric_end in metric_spans)
+            for start, end in occurrences
+        ):
+            independent_phrases.add(normalize_keyword_text(phrase))
+    return [
+        item
+        for item in dimensions
+        if normalize_keyword_text(item.phrase) in independent_phrases
+    ]
 
 
 def longest_distinct_matches(text: str, candidates: List[str]) -> List[str]:
@@ -1566,6 +1843,7 @@ class TopicRouterService:
         context_topic: str = "",
         route_slots: Optional[RouteSlots] = None,
         context_topics: Optional[List[QuestionCategory]] = None,
+        context_locked: bool = False,
     ) -> TopicRoutingDecision:
         inherited_topics = dedupe_topics(list(context_topics or []))
         if not inherited_topics and context_topic:
@@ -1573,15 +1851,6 @@ class TopicRouterService:
                 category = resolve_asset_topic_category(self.topic_assets, item.strip())
                 if category and category not in inherited_topics:
                     inherited_topics.append(category)
-        if inherited_topics and not (keywords and keywords.topic_scores):
-            primary = route_primary_topic(inherited_topics)
-            return TopicRoutingDecision(
-                primary_topic=primary,
-                candidate_topics=inherited_topics,
-                confidence=0.82,
-                reason="继承会话 Topic 集合；多 Topic 时 primaryTopic 保持 UNKNOWN，不表示 anchor",
-            )
-
         scores: Dict[QuestionCategory, float] = {}
         if keywords is not None:
             for category_value, score in keywords.topic_scores.items():
@@ -1597,6 +1866,29 @@ class TopicRouterService:
                     continue
                 scores[category] = max(scores.get(category, 0.0), float(candidate.score or 0.0))
         candidates = self._explicit_topics(scores)
+        if inherited_topics and (context_locked or not candidates):
+            # Merchant users do not pre-select an internal Topic.  The previous
+            # inferred workspace is therefore only a continuation prior.  A
+            # genuinely user-locked scope is the sole case where it remains a
+            # hard boundary in the face of new per-turn signals.
+            outside_topics = [item for item in candidates if item not in inherited_topics]
+            primary = route_primary_topic(inherited_topics)
+            return TopicRoutingDecision(
+                primary_topic=primary,
+                candidate_topics=inherited_topics,
+                confidence=0.82 if context_locked else 0.62,
+                routing_mode="explicit_topic_scope" if context_locked else "inferred_continuation",
+                reason=(
+                    "继承用户明确锁定的 Topic 边界；问题中的其他 Topic 信号不会静默扩域：%s"
+                    % ",".join(str(item.value) for item in outside_topics)
+                    if outside_topics
+                    else (
+                        "继承用户明确锁定的 Topic 边界"
+                        if context_locked
+                        else "当前问题没有新的 Topic 证据，将上一轮推断范围作为弱延续先验"
+                    )
+                ),
+            )
         if not candidates:
             return TopicRoutingDecision(
                 primary_topic=QuestionCategory.UNKNOWN,

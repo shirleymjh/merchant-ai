@@ -3,6 +3,7 @@
   "questionCategory": "IDENTITY",
   "tableName": "dim_merchant_df",
   "tableComment": "dim-商家域-商家信息表",
+  "businessSummary": "商家主体与经营资质信息表，覆盖商家类型、入驻状态、结算、区域和发货模式等稳定属性；用于身份与资质查询。",
   "dataGrain": "商家主体/资质快照粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "merchant_id",
@@ -51,7 +52,21 @@
       "idColumn": "merchant_id",
       "displayColumns": [
         "company_name"
-      ]
+      ],
+      "contextColumns": [
+        "merchant_type_name",
+        "brand_type_name",
+        "merchant_apply_status_name",
+        "balance_type_name",
+        "company_province",
+        "company_city",
+        "currency",
+        "ship_model_name",
+        "service_version",
+        "is_unconditional_refund",
+        "is_invoice"
+      ],
+      "asOfColumn": "pt"
     }
   ],
   "status": "PUBLISHED",

@@ -969,7 +969,13 @@ class LoopGuardMiddleware(HarnessMiddleware):
             )
 
 
-class MemoryMiddleware(HarnessMiddleware):
+class MerchantMemoryRecallMiddleware(HarnessMiddleware):
+    """Recall Diana's tenant-scoped personal memory snapshot.
+
+    The explicit name avoids confusion with Deep Agents' AGENTS.md-style
+    ``MemoryMiddleware``, which is intentionally not enabled in this runtime.
+    """
+
     name = "memory"
 
     def __init__(self, settings: Settings):
@@ -1235,6 +1241,11 @@ class MemoryMiddleware(HarnessMiddleware):
             )
 
 
+# Compatibility for callers/tests that imported the old domain class name.
+# Runtime composition below uses the unambiguous name.
+MemoryMiddleware = MerchantMemoryRecallMiddleware
+
+
 class SkillMiddleware(HarnessMiddleware):
     name = "skill"
 
@@ -1393,7 +1404,7 @@ def default_middleware_registry() -> Dict[str, MiddlewareFactory]:
         "tool_output_budget": lambda settings, context_manager: ToolOutputBudgetMiddleware(settings),
         "loop_guard": lambda settings, context_manager: LoopGuardMiddleware(settings),
         "safety_finish_reason": lambda settings, context_manager: SafetyFinishReasonMiddleware(),
-        "memory": lambda settings, context_manager: MemoryMiddleware(settings),
+        "memory": lambda settings, context_manager: MerchantMemoryRecallMiddleware(settings),
         "dynamic_context": lambda settings, context_manager: DynamicContextMiddleware(settings),
         "token_usage": lambda settings, context_manager: TokenUsageMiddleware(settings),
         "context_budget": lambda settings, context_manager: ContextBudgetMiddleware(settings),

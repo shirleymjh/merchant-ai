@@ -433,10 +433,32 @@ class MerchantService:
 
     def current_merchant(self, merchant_id: str) -> MerchantInfo:
         target = merchant_id or self.settings.merchant_id
-        table = str(self.profile_binding.get("table") or "")
-        lookup_column = str(self.profile_binding.get("lookupColumn") or "")
-        id_column = str(self.profile_binding.get("idColumn") or lookup_column)
-        display_columns = [str(item) for item in self.profile_binding.get("displayColumns") or [] if str(item)]
+        try:
+            table = safe_identifier(str(self.profile_binding.get("table") or ""))
+            lookup_column = safe_identifier(str(self.profile_binding.get("lookupColumn") or ""))
+            id_column = safe_identifier(str(self.profile_binding.get("idColumn") or lookup_column))
+            display_columns = [
+                safe_identifier(str(item))
+                for item in self.profile_binding.get("displayColumns") or []
+                if str(item)
+            ]
+            context_columns = [
+                safe_identifier(str(item))
+                for item in self.profile_binding.get("contextColumns") or []
+                if str(item)
+            ]
+            as_of_column = (
+                safe_identifier(str(self.profile_binding.get("asOfColumn") or ""))
+                if self.profile_binding.get("asOfColumn")
+                else ""
+            )
+        except ValueError:
+            table = ""
+            lookup_column = ""
+            id_column = ""
+            display_columns = []
+            context_columns = []
+            as_of_column = ""
         if not table or not lookup_column:
             self.last_degraded_reason = {
                 "component": "merchant_service",
@@ -447,8 +469,15 @@ class MerchantService:
             }
             return MerchantInfo(merchant_id=target, merchant_name="yshopping商家%s" % target)
         try:
+            selected_columns: List[str] = []
+            for column in [id_column, *display_columns, *context_columns]:
+                if column and column not in selected_columns:
+                    selected_columns.append(column)
+            projection = ", ".join("`%s`" % column for column in selected_columns)
+            latest_clause = " ORDER BY `%s` DESC" % as_of_column if as_of_column else ""
             rows = self.doris_repository.query(
-                "SELECT * FROM `%s` WHERE `%s` = %%s LIMIT 1" % (table, lookup_column),
+                "SELECT %s FROM `%s` WHERE `%s` = %%s%s LIMIT 1"
+                % (projection, table, lookup_column, latest_clause),
                 [target],
             )
             if rows:
@@ -458,7 +487,11 @@ class MerchantService:
                     merchant_id=str(row.get(id_column) or target),
                     merchant_name=display_name or "yshopping商家%s" % target,
                     company_name=display_name,
-                    rows=row,
+                    # Only stable, asset-declared tags are allowed to become
+                    # always-on prompt context.  Dynamic profile metrics and
+                    # sensitive identity fields remain available through
+                    # governed, on-demand semantic reads.
+                    rows={column: row.get(column) for column in context_columns if row.get(column) is not None},
                 )
         except Exception as exc:
             self.last_degraded_reason = log_degraded("merchant_service", "current_merchant", exc)

@@ -3,6 +3,7 @@
   "questionCategory": "REFUND",
   "tableName": "dwm_trade_refund_detail_di",
   "tableComment": "dwm-交易域-退货域-明细宽表-增量表",
+  "businessSummary": "退款与售后明细宽表，包含退款单、订单、商品、退款原因、责任和处理过程信息，可按商品或售后属性分析。",
   "dataGrain": "订单/子订单明细粒度",
   "timeColumn": "pt",
   "merchantFilterColumn": "seller_id",

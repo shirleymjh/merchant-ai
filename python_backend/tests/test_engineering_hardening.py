@@ -68,11 +68,11 @@ def test_settings_exposes_grouped_config_views(tmp_path):
 
 
 def test_es_vector_recall_is_enabled_by_default():
-    settings = Settings()
-
-    assert settings.es_vector_enabled is True
-    assert settings.es_vector_field == "content_vector"
-    assert settings.embedding_model == "text-embedding-3-small"
+    # Inspect the declared default rather than the process environment; local
+    # integration runs may intentionally export YSHOPPING_ES_VECTOR_ENABLED.
+    assert Settings.model_fields["es_vector_enabled"].default is True
+    assert Settings.model_fields["es_vector_field"].default == "content_vector"
+    assert Settings.model_fields["embedding_model"].default == "text-embedding-3-small"
 
 
 def test_ops_token_protects_runtime_endpoints():
@@ -518,11 +518,11 @@ def test_context_manifest_blocks_cache_layout_and_quarantine_policy():
     assert any(item["name"] == "memory" and item["truncatedReason"] == "memoryInjection" for item in blocks)
 
 
-def test_memory_write_gate_rejects_too_short_events_and_reviews_sensitive_events():
+def test_memory_write_gate_rejects_short_and_sensitive_events_without_human_review():
     gate = MemoryWriteGate()
 
     rejected = gate.evaluate({"eventId": "e1", "memoryType": "query_event", "question": "hi", "confidence": 0.9}, "100")
-    review = gate.evaluate(
+    sensitive = gate.evaluate(
         {
             "eventId": "e2",
             "memoryType": "query_event",
@@ -536,9 +536,10 @@ def test_memory_write_gate_rejects_too_short_events_and_reviews_sensitive_events
 
     assert rejected["allowed"] is False
     assert "too_short_to_remember" in rejected["reasons"]
-    assert review["allowed"] is True
-    assert review["action"] == "review"
-    assert "possible_sensitive_identifier" in review["reasons"]
+    assert sensitive["allowed"] is False
+    assert sensitive["action"] == "reject"
+    assert sensitive["humanReviewRequired"] is False
+    assert "possible_sensitive_identifier" in sensitive["reasons"]
 
 
 def test_memory_ingestion_service_persists_write_policy_trace():

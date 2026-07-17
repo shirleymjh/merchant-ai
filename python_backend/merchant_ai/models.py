@@ -1386,6 +1386,8 @@ class FreshnessCheckResult(APIModel):
         validation_alias=AliasChoices("maxTimeValue", "max_time_value", "maxPt", "max_pt"),
     )
     fallback_table: str = ""
+    fallback_from_table: str = ""
+    fallback_from_max_time_value: str = ""
     effective_start_time_value: str = ""
     effective_end_time_value: str = ""
     execution_start_value: str = ""
@@ -1578,6 +1580,7 @@ class RelationshipEntry(APIModel):
 
 
 class PlanningAssetPack(APIModel):
+    table_manifest: Dict[str, Any] = Field(default_factory=dict)
     tables: List[PlanningAssetEntry] = Field(default_factory=list)
     fields: List[PlanningAssetEntry] = Field(default_factory=list)
     metrics: List[PlanningAssetEntry] = Field(default_factory=list)
@@ -2418,7 +2421,9 @@ class MemoryPreference(APIModel):
     allowed_roles: List[str] = Field(default_factory=list)
     approved_by: str = ""
     evidence_refs: List[str] = Field(default_factory=list)
-    review_status: str = "merchant_confirmed"
+    # Personal preferences are governed by an automatic write/privacy gate,
+    # not the shared Knowledge review workflow.
+    review_status: str = "auto"
     write_policy: Dict[str, Any] = Field(default_factory=dict)
     payload: Dict[str, Any] = Field(default_factory=dict)
     created_at: str = ""

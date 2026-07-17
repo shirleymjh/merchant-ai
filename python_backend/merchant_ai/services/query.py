@@ -225,12 +225,18 @@ def bind_runtime_snapshot_alignment(
         sample_value = str(getattr(report, "max_pt", "") or "")
         execution_start = partition_execution_value(effective_start, sample_value) if effective_start else ""
         execution_end = partition_execution_value(effective_end, sample_value) if effective_end else ""
+        report_status = str(getattr(report, "status", "") or "").upper()
+        freshness_is_bindable = not (
+            report_status.startswith("STALE_")
+            and report_status != "STALE_USE_REALTIME_FALLBACK"
+        )
         compatible = bool(
             effective_start
             and effective_end
             and report
             and report.time_column
             and report.table == intent.preferred_table
+            and freshness_is_bindable
         )
         coverage_complete = (
             source_covers_time_selection(
@@ -1169,14 +1175,16 @@ class NodeWorkerExecutor:
             report = self._check_freshness(intent, asset_pack, context)
             fallback_intent = self._maybe_realtime_fallback_intent(intent, asset_pack, report)
             if fallback_intent is not None:
-                report.status = "STALE_USE_REALTIME_FALLBACK"
-                report.fallback_table = fallback_intent.preferred_table
-                report.reason = "%s; switch_to_realtime=%s" % (
-                    report.reason or "offline table stale",
-                    fallback_intent.preferred_table,
+                realtime_report = self._check_freshness(fallback_intent, asset_pack, context)
+                report = self._bind_realtime_fallback_freshness_report(
+                    report,
+                    realtime_report,
+                    fallback_intent,
                 )
                 runtime_plan.intents[index] = fallback_intent
                 fallback_task_ids.append(intent.plan_task_id)
+            else:
+                report = self._classify_unmapped_realtime_gap(intent, asset_pack, report)
             reports.append(report)
 
         snapshot_alignment = bind_runtime_snapshot_alignment(runtime_plan, reports)
@@ -2396,13 +2404,16 @@ class NodeWorkerExecutor:
             duration_ms=freshness_duration_ms,
         )
         if freshness.status == "STALE_USE_REALTIME_FALLBACK":
+            fallback_from_table = freshness.fallback_from_table or freshness.table
+            fallback_from_max = freshness.fallback_from_max_time_value or freshness.max_pt
             record_tool(
                 tool_traces,
                 intent,
                 "select_realtime_fallback",
                 "success",
-                freshness.table,
-                "fallbackTable=%s maxPt=%s" % (intent.preferred_table, freshness.max_pt),
+                fallback_from_table,
+                "fallbackTable=%s offlineMaxPt=%s realtimeMaxPt=%s"
+                % (intent.preferred_table, fallback_from_max, freshness.max_pt),
                 "STALE_USE_REALTIME_FALLBACK",
             )
             trace.append(
@@ -2410,7 +2421,7 @@ class NodeWorkerExecutor:
                     round=2,
                     reason="离线表近实时分区滞后，切换到实时 fallback 表",
                     action="select_realtime_fallback",
-                    observation="%s -> %s" % (freshness.table, intent.preferred_table),
+                    observation="%s -> %s" % (fallback_from_table, intent.preferred_table),
                 )
             )
         else:
@@ -2471,6 +2482,7 @@ class NodeWorkerExecutor:
                     node_plan_contract=contract,
                     node_plan_critique=critique,
                 )
+            freshness = self._classify_unmapped_realtime_gap(intent, asset_pack, freshness)
         draft_tool = self._draft_tool_name(intent)
         draft_started = time.perf_counter()
         sql = self._draft_sql(intent, asset_pack, knowledge_context, context, contract)
@@ -4216,6 +4228,92 @@ class NodeWorkerExecutor:
             min_pt=min_pt,
             max_pt=max_pt,
             reason=reason,
+        )
+
+    def _bind_realtime_fallback_freshness_report(
+        self,
+        offline_report: FreshnessCheckResult,
+        realtime_report: FreshnessCheckResult,
+        fallback_intent: QuestionIntent,
+    ) -> FreshnessCheckResult:
+        """Bind freshness to the physical source selected for SQL execution.
+
+        The stale offline observation remains explicit provenance, but the
+        report's table, time column and source window must describe the
+        realtime table.  Snapshot alignment can then bind the exact source
+        that the validated runtime graph will execute.
+        """
+
+        offline_table = offline_report.table
+        offline_max = offline_report.max_pt
+        realtime_status = realtime_report.status or "NOT_CHECKED"
+        reason = append_note(
+            "offline_table=%s offline_max_time_value=%s" % (offline_table, offline_max),
+            "switch_to_realtime=%s" % fallback_intent.preferred_table,
+        )
+        reason = append_note(
+            reason,
+            "realtime_freshness_status=%s" % realtime_status,
+        )
+        reason = append_note(reason, realtime_report.reason)
+        if not realtime_report.checked or not realtime_report.max_pt:
+            bound_status = "STALE_REALTIME_FALLBACK_FRESHNESS_UNAVAILABLE"
+        elif partition_is_stale_for_near_realtime(
+            realtime_report.max_pt,
+            int(offline_report.requested_days or fallback_intent.days or 0),
+        ):
+            bound_status = "STALE_REALTIME_FALLBACK_STALE"
+        else:
+            bound_status = "STALE_USE_REALTIME_FALLBACK"
+        return realtime_report.model_copy(
+            deep=True,
+            update={
+                "task_id": offline_report.task_id or fallback_intent.plan_task_id,
+                "table": fallback_intent.preferred_table,
+                "status": bound_status,
+                "requested_days": offline_report.requested_days,
+                "fallback_table": fallback_intent.preferred_table,
+                "fallback_from_table": offline_table,
+                "fallback_from_max_time_value": offline_max,
+                "reason": reason,
+            },
+        )
+
+    def _classify_unmapped_realtime_gap(
+        self,
+        intent: QuestionIntent,
+        asset_pack: PlanningAssetPack,
+        report: FreshnessCheckResult,
+    ) -> FreshnessCheckResult:
+        """Expose a stale near-realtime source when no governed switch exists.
+
+        This deliberately leaves ``fallback_table`` empty: an undeclared or
+        metric-unmapped production table is a knowledge gap, not a table name
+        for the runtime to guess.
+        """
+
+        if (
+            not report.checked
+            or not report.max_pt
+            or not intent.preferred_table
+            or not partition_is_stale_for_near_realtime(report.max_pt, int(intent.days or 0))
+        ):
+            return report
+        fallback = realtime_fallback_for_table(asset_pack, intent.preferred_table)
+        if fallback is None:
+            status = "STALE_NO_REALTIME_FALLBACK_MAPPING"
+            gap = "offline table is stale and no governed production realtime fallback mapping is published"
+        else:
+            status = "STALE_NO_GOVERNED_REALTIME_METRIC_MAPPING"
+            gap = "offline table is stale but the requested metric has no governed production realtime mapping"
+        return report.model_copy(
+            deep=True,
+            update={
+                "status": status,
+                "fallback_table": "",
+                "reason": append_note(report.reason, gap),
+                "coverage_complete": False,
+            },
         )
 
     def _apply_partition_date_anchor(self, sql: str, intent: QuestionIntent, freshness: FreshnessCheckResult) -> tuple[str, str]:
@@ -6814,6 +6912,30 @@ def governed_realtime_metric_resolution(
         "fallbackFromTable": source_table,
         "resolutionSource": "%s+governed_realtime_fallback" % str(resolution.get("resolutionSource") or "semantic"),
     }
+    # Never carry an offline physical time column into the realtime contract.
+    # Prefer the target metric declaration, then the target table declaration;
+    # if neither exists, omit it so freshness checking fails closed instead of
+    # querying a guessed column.
+    updated.pop("timeColumn", None)
+    updated.pop("time_column", None)
+    target_time_column = str(metadata.get("timeColumn") or metadata.get("time_column") or "")
+    if not target_time_column:
+        target_table_asset = next(
+            (
+                item
+                for item in asset_pack.tables
+                if (item.table or item.key) == fallback_table
+            ),
+            None,
+        )
+        target_table_metadata = dict(getattr(target_table_asset, "metadata", None) or {})
+        target_time_column = str(
+            target_table_metadata.get("timeColumn")
+            or target_table_metadata.get("time_column")
+            or ""
+        )
+    if target_time_column:
+        updated["timeColumn"] = target_time_column
     return seal_semantic_metric_resolution(updated, force=True)
 
 

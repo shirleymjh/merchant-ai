@@ -134,7 +134,7 @@ class Settings(BaseSettings):
     skill_worker_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_SKILL_WORKER_TIMEOUT_SECONDS")
     sandbox_backend: str = Field("local", validation_alias="YSHOPPING_SANDBOX_BACKEND")
     sandbox_container_runtime: str = Field("docker", validation_alias="YSHOPPING_SANDBOX_CONTAINER_RUNTIME")
-    sandbox_container_image: str = Field("python:3.11-slim", validation_alias="YSHOPPING_SANDBOX_CONTAINER_IMAGE")
+    sandbox_container_image: str = Field("python:3.11-slim-bookworm", validation_alias="YSHOPPING_SANDBOX_CONTAINER_IMAGE")
     sandbox_container_memory: str = Field("512m", validation_alias="YSHOPPING_SANDBOX_CONTAINER_MEMORY")
     sandbox_container_cpus: float = Field(1.0, validation_alias="YSHOPPING_SANDBOX_CONTAINER_CPUS")
     skill_worker_parallel_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_PARALLEL_ENABLED")
@@ -234,7 +234,7 @@ class Settings(BaseSettings):
     alert_webhook_url: str = Field("", validation_alias="YSHOPPING_ALERT_WEBHOOK_URL")
     alert_p95_threshold_ms: int = Field(30000, validation_alias="YSHOPPING_ALERT_P95_THRESHOLD_MS")
     agent_v2_enabled: bool = Field(True, validation_alias="YSHOPPING_HARNESS_AGENT_V2_ENABLED")
-    agent_mode: str = Field("harness", validation_alias="YSHOPPING_AGENT_MODE")
+    agent_mode: str = Field("deepagent", validation_alias="YSHOPPING_AGENT_MODE")
     agent_node_timeout_seconds: int = Field(45, validation_alias="YSHOPPING_AGENT_NODE_TIMEOUT_SECONDS")
     agent_node_poll_interval_seconds: float = Field(5.0, validation_alias="YSHOPPING_AGENT_NODE_POLL_INTERVAL_SECONDS")
     agent_node_timeout_grace_seconds: int = Field(60, validation_alias="YSHOPPING_AGENT_NODE_TIMEOUT_GRACE_SECONDS")
@@ -261,7 +261,10 @@ class Settings(BaseSettings):
     agent_graph_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_GRAPH_REPAIR_ROUNDS")
     agent_lead_action_retries: int = Field(1, validation_alias="YSHOPPING_AGENT_LEAD_ACTION_RETRIES")
     agent_planner_transient_retries: int = Field(1, validation_alias="YSHOPPING_AGENT_PLANNER_TRANSIENT_RETRIES")
-    agent_planner_tool_rounds: int = Field(3, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
+    # Compatibility budget for the pre-DeepAgent hidden Planner file-tool
+    # loop. Diana's default runtime keeps this disabled: the outer Core owns
+    # ls/grep/read_file and Planner receives only the trusted read ledger.
+    agent_planner_tool_rounds: int = Field(0, validation_alias="YSHOPPING_AGENT_PLANNER_TOOL_ROUNDS")
     agent_planner_invalid_output_retries: int = Field(
         1,
         validation_alias="YSHOPPING_AGENT_PLANNER_INVALID_OUTPUT_RETRIES",
@@ -271,7 +274,7 @@ class Settings(BaseSettings):
         validation_alias="YSHOPPING_PLANNER_SEMANTIC_CONTRACT_COMPILE_ENABLED",
     )
     agent_deferred_tool_schema_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_DEFERRED_TOOL_SCHEMA_ENABLED")
-    planner_filesystem_context_mode: str = Field("auto", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
+    planner_filesystem_context_mode: str = Field("off", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
     legacy_question_planner_enabled: bool = Field(False, validation_alias="YSHOPPING_LEGACY_QUESTION_PLANNER_ENABLED")
     lead_action_llm_mode: str = Field("adaptive", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
     lead_agent_autonomous_enabled: bool = Field(True, validation_alias="YSHOPPING_LEAD_AGENT_AUTONOMOUS_ENABLED")

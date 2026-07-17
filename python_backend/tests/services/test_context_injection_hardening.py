@@ -306,6 +306,11 @@ def test_thread_summary_restore_is_identity_bound_and_skips_corrupt_newest(tmp_p
         "question": "Alice question",
         "answerPreview": "Alice answer",
         "summary": "Alice summary",
+        "topicWorkspace": {
+            "mode": "topic_workspace",
+            "topics": ["客服工单"],
+            "topicIds": ["SERVICE"],
+        },
         "publishedAt": datetime.now(timezone.utc).isoformat(),
         "artifacts": [],
     }
@@ -324,6 +329,7 @@ def test_thread_summary_restore_is_identity_bound_and_skips_corrupt_newest(tmp_p
     restored = ThreadContextService(settings).restore(state)
     assert restored["restored"] is True
     assert restored["previousRunId"] == "run_alice"
+    assert restored["topicWorkspace"]["topicIds"] == ["SERVICE"]
 
     bob_state = dict(state)
     bob_state["user_identity"] = UserIdentity(

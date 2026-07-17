@@ -102,7 +102,10 @@ class MerchantAnalysisSandbox:
             "%s:/workspace:rw" % workspace_path,
             "-w",
             "/workspace",
-            str(getattr(self.settings, "sandbox_container_image", "python:3.11-slim") or "python:3.11-slim"),
+            str(
+                getattr(self.settings, "sandbox_container_image", "python:3.11-slim-bookworm")
+                or "python:3.11-slim-bookworm"
+            ),
             "python",
             "-I",
             "/opt/skills/%s" % relative_script.as_posix(),

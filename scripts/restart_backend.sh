@@ -12,10 +12,7 @@ if [[ -n "${PID}" ]]; then
 fi
 
 cd "${ROOT_DIR}/python_backend"
-if [[ ! -d ".venv" ]]; then
-  python3 -m venv .venv
-fi
-source .venv/bin/activate
-pip install -e .
+source "${ROOT_DIR}/scripts/_python_runtime.sh"
+merchant_ai_prepare_venv "${ROOT_DIR}/python_backend"
 echo "Starting Python backend on port ${PORT}..."
-exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}" --reload
+exec "${MERCHANT_AI_VENV}/bin/python" -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT}" --reload

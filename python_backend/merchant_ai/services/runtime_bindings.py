@@ -42,7 +42,9 @@ class SemanticRuntimeBindingRegistry:
                 identifiers = [
                     str(binding.get("lookupColumn") or ""),
                     str(binding.get("idColumn") or ""),
+                    str(binding.get("asOfColumn") or ""),
                     *[str(item) for item in binding.get("displayColumns") or []],
+                    *[str(item) for item in binding.get("contextColumns") or []],
                 ]
                 if binding.get("role") and all(safe_identifier(item) for item in identifiers if item):
                     bindings.append(binding)

@@ -21,6 +21,8 @@ from merchant_ai.services.tools import question_understanding_tool
 
 
 SEMANTIC_REF = "semantic:test:fact_0:metric:measure_0"
+TABLE_DETAIL_REF = "semantic:test:fact_0:detail"
+GROUP_FIELD_REF = "semantic:test:fact_0:field:entity_id"
 
 
 class SemanticCatalog:
@@ -84,7 +86,17 @@ class ThirdRoundTransientLlm:
                         "id": "read_metric",
                         "name": "semantic_read",
                         "args": {"refId": SEMANTIC_REF, "maxChars": 1000},
-                    }
+                    },
+                    {
+                        "id": "read_owner_detail",
+                        "name": "semantic_read",
+                        "args": {"refId": TABLE_DETAIL_REF, "maxChars": 1000},
+                    },
+                    {
+                        "id": "read_group_field",
+                        "name": "semantic_read",
+                        "args": {"refId": GROUP_FIELD_REF, "maxChars": 1000},
+                    },
                 ],
             }
         if call_number == 3 or not self.recover:
@@ -180,7 +192,9 @@ def test_third_tool_round_timeout_retries_same_context_and_recovers_without_bloc
     assert llm.calls[2]["userPrompt"] == llm.calls[3]["userPrompt"]
     assert llm.calls[2]["toolChoice"] == "emit_question_understanding"
     assert any(item.get("name") == "semantic_read" for item in llm.calls[2]["payload"]["plannerToolResults"])
-    assert payload["_plannerLoadedRefs"] == [SEMANTIC_REF]
+    assert payload["_plannerLoadedRefs"] == sorted(
+        [SEMANTIC_REF, TABLE_DETAIL_REF, GROUP_FIELD_REF]
+    )
     assert payload["_plannerRecoveredAfterRetry"] is True
     attempts = payload["_plannerOperationalAttempts"]
     assert [(item["round"], item["errorCode"], item["retryScheduled"]) for item in attempts] == [
@@ -209,7 +223,9 @@ def test_repeated_tool_round_timeout_fails_closed_and_preserves_original_typed_g
 
     assert payload["_plannerFailFast"] is True
     assert len(llm.calls) == 4
-    assert payload["_plannerLoadedRefs"] == [SEMANTIC_REF]
+    assert payload["_plannerLoadedRefs"] == sorted(
+        [SEMANTIC_REF, TABLE_DETAIL_REF, GROUP_FIELD_REF]
+    )
     attempts = payload["_plannerOperationalAttempts"]
     assert [item["errorCode"] for item in attempts] == ["PLANNER_LLM_TIMEOUT", "PLANNER_LLM_TIMEOUT"]
     assert attempts[0]["retryScheduled"] is True

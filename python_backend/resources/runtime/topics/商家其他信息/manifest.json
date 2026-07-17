@@ -2,6 +2,7 @@
   {
     "tableName": "dwd_merchant_appeal_detail_df",
     "tableComment": "dwd-商家域-商家申诉表",
+    "businessSummary": "商家申诉记录表，覆盖申诉类型、申诉状态、处理过程和处罚关联信息，可分析申诉处理情况。",
     "dataGrain": "商家申诉明细粒度",
     "timeColumn": "pt",
     "merchantFilterColumn": "merchant_id",
@@ -21,6 +22,7 @@
   {
     "tableName": "dwd_merchant_deposit_recharge_df",
     "tableComment": "dwd-商家域-商家保证金充值表",
+    "businessSummary": "商家保证金充值与补缴流水表，覆盖充值状态、金额和处理时间等流水信息。",
     "dataGrain": "保证金充值流水粒度",
     "timeColumn": "pt",
     "merchantFilterColumn": "merchant_id",
