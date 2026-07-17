@@ -1039,6 +1039,12 @@
       "columnName": "spu_id",
       "businessName": "spu ID",
       "role": "KEY",
+      "canonicalEntityRef": "entity:product",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
       "description": "spu ID",
       "aliases": [
         "spu ID",

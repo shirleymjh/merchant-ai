@@ -1979,6 +1979,15 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:order",
       "comparisonPolicy": "exact",
+      "isUniqueEntityKey": true,
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "unbounded",
+        "timeRequired": false
+      },
       "description": "主订单号",
       "aliases": [
         "主订单号",
@@ -1995,6 +2004,15 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:sub_order",
       "comparisonPolicy": "exact",
+      "isUniqueEntityKey": true,
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "unbounded",
+        "timeRequired": false
+      },
       "description": "订单号",
       "aliases": [
         "订单号",
@@ -2217,6 +2235,12 @@
       "columnName": "spu_id",
       "businessName": "spuId",
       "role": "KEY",
+      "canonicalEntityRef": "entity:product",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
       "description": "spuId",
       "aliases": [
         "spuId",

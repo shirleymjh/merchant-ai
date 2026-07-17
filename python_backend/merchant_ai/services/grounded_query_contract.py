@@ -13,6 +13,8 @@ from pydantic import Field, computed_field
 from merchant_ai.models import (
     APIModel,
     AnswerMode,
+    EntityFilterObligation,
+    EntityReference,
     GraphValidationGap,
     GraphValidationResult,
     IntentType,
@@ -112,6 +114,35 @@ class GroundedDimensionBinding(APIModel):
     usage: str = "group_by"
 
 
+class GroundedSelectedFieldBinding(APIModel):
+    semantic_ref_id: str
+    topic: str
+    table: str
+    column: str
+    business_name: str = ""
+    role: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    output_alias: str = ""
+    is_unique_key: bool = False
+    entity_identity: str = ""
+    filter_operators: list[str] = Field(default_factory=list)
+    lookup_time_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class GroundedEntityFilterBinding(APIModel):
+    semantic_ref_id: str
+    topic: str
+    table: str
+    column: str
+    operator: str
+    literal_value: Any
+    requested_phrase: str = ""
+    is_unique_key: bool = False
+    entity_identity: str = ""
+    allowed_operators: list[str] = Field(default_factory=list)
+    lookup_time_policy: dict[str, Any] = Field(default_factory=dict)
+
+
 class GroundedRelationshipBinding(APIModel):
     semantic_ref_id: str
     topic: str
@@ -121,6 +152,9 @@ class GroundedRelationshipBinding(APIModel):
     join_type: str = ""
     keys: list[list[str]] = Field(default_factory=list)
     grain: str = ""
+    cardinality: str = ""
+    fanout_policy: str = ""
+    dedup_keys: list[str] = Field(default_factory=list)
     cautions: list[str] = Field(default_factory=list)
 
 
@@ -144,11 +178,25 @@ class GroundedFieldAggregationHint(APIModel):
     requested_phrase: str = ""
 
 
+class GroundedSelectedFieldHint(APIModel):
+    field_ref: str
+    output_alias: str = ""
+
+
+class GroundedEntityFilterHint(APIModel):
+    field_ref: str
+    operator: str = "EQ"
+    literal_value: Any
+    requested_phrase: str = ""
+
+
 class GroundedBindingHints(APIModel):
     table_refs: list[str] = Field(default_factory=list)
     metric_refs: list[str] = Field(default_factory=list)
     field_aggregations: list[GroundedFieldAggregationHint] = Field(default_factory=list)
     dimension_refs: list[str] = Field(default_factory=list)
+    selected_fields: list[GroundedSelectedFieldHint] = Field(default_factory=list)
+    entity_filters: list[GroundedEntityFilterHint] = Field(default_factory=list)
     group_by_ref: str = ""
     label_refs: dict[str, str] = Field(default_factory=dict)
     relationship_refs: list[str] = Field(default_factory=list)
@@ -170,6 +218,8 @@ class GroundedQueryContract(APIModel):
     tables: list[GroundedTableBinding] = Field(default_factory=list)
     metrics: list[GroundedMetricBinding] = Field(default_factory=list)
     dimensions: list[GroundedDimensionBinding] = Field(default_factory=list)
+    selected_fields: list[GroundedSelectedFieldBinding] = Field(default_factory=list)
+    entity_filters: list[GroundedEntityFilterBinding] = Field(default_factory=list)
     relationships: list[GroundedRelationshipBinding] = Field(default_factory=list)
     time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
     ranking: GroundedRankingBinding = Field(default_factory=GroundedRankingBinding)
@@ -258,6 +308,8 @@ class GroundedQueryContractBuilder:
             *hints.metric_refs,
             *(item.field_ref for item in hints.field_aggregations),
             *hints.dimension_refs,
+            *(item.field_ref for item in hints.selected_fields),
+            *(item.field_ref for item in hints.entity_filters),
             *hints.relationship_refs,
             *hints.label_refs.keys(),
             *([hints.group_by_ref] if hints.group_by_ref else []),
@@ -297,11 +349,22 @@ class GroundedQueryContractBuilder:
             hints.label_refs,
             hints.group_by_ref,
         )
+        selected_fields = self._selected_field_bindings(
+            documents,
+            hints.selected_fields,
+        )
+        entity_filters, entity_filter_gaps = self._entity_filter_bindings(
+            documents,
+            hints.entity_filters,
+        )
+        discovery_gaps.extend(entity_filter_gaps)
         ranking = self._ranking_binding(hints, metrics, dimensions)
 
         selected_tables = _dedupe(
             [binding.table for binding in metrics]
             + [binding.table for binding in dimensions]
+            + [binding.table for binding in selected_fields]
+            + [binding.table for binding in entity_filters]
             + [
                 detail.table
                 for detail in table_details.values()
@@ -317,7 +380,7 @@ class GroundedQueryContractBuilder:
             topic = next(
                 (
                     binding.topic
-                    for binding in [*metrics, *dimensions]
+                    for binding in [*metrics, *dimensions, *selected_fields, *entity_filters]
                     if binding.table == table
                 ),
                 "",
@@ -353,6 +416,8 @@ class GroundedQueryContractBuilder:
             [table.detail_ref_id for table in tables if table.detail_ref_id]
             + [metric.semantic_ref_id for metric in metrics]
             + [dimension.semantic_ref_id for dimension in dimensions]
+            + [field.semantic_ref_id for field in selected_fields]
+            + [item.semantic_ref_id for item in entity_filters]
             + [relationship.semantic_ref_id for relationship in relationships]
         )
         evidence_by_ref = {document.ref.ref_id: document.ref for document in documents}
@@ -366,14 +431,33 @@ class GroundedQueryContractBuilder:
                 hints,
                 metrics,
                 dimensions,
+                selected_fields,
+                entity_filters,
                 selected_tables,
                 ranking,
             ),
-            execution_shape=_execution_shape(metrics, dimensions, selected_tables, ranking),
-            primary_table=metrics[0].table if metrics else (selected_tables[0] if selected_tables else ""),
+            execution_shape=_execution_shape(
+                metrics,
+                dimensions,
+                selected_tables,
+                ranking,
+                selected_fields=selected_fields,
+                entity_filters=entity_filters,
+            ),
+            primary_table=(
+                entity_filters[0].table
+                if entity_filters
+                else metrics[0].table
+                if metrics
+                else selected_tables[0]
+                if selected_tables
+                else ""
+            ),
             tables=tables,
             metrics=metrics,
             dimensions=dimensions,
+            selected_fields=selected_fields,
+            entity_filters=entity_filters,
             relationships=relationships,
             time_range=time_range,
             ranking=ranking,
@@ -748,6 +832,130 @@ class GroundedQueryContractBuilder:
         return bindings
 
     @staticmethod
+    def _selected_field_bindings(
+        documents: Sequence[_EvidenceDocument],
+        selected: Sequence[GroundedSelectedFieldHint],
+    ) -> list[GroundedSelectedFieldBinding]:
+        by_ref = {
+            document.ref.ref_id: document
+            for document in documents
+            if document.ref.kind == "COLUMN"
+        }
+        bindings: list[GroundedSelectedFieldBinding] = []
+        seen: set[str] = set()
+        for hint in selected:
+            ref_id = str(hint.field_ref or "").strip()
+            if not ref_id or ref_id in seen or ref_id not in by_ref:
+                continue
+            seen.add(ref_id)
+            document = by_ref[ref_id]
+            payload = document.payload if isinstance(document.payload, dict) else {}
+            definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else {}
+            column = str(definition.get("columnName") or definition.get("Field") or "").strip()
+            table = str(payload.get("tableName") or document.ref.table or "").strip()
+            if not column or not table:
+                continue
+            semantics = _field_usage_semantics(definition)
+            bindings.append(
+                GroundedSelectedFieldBinding(
+                    semantic_ref_id=ref_id,
+                    topic=str(payload.get("topic") or document.ref.topic or ""),
+                    table=table,
+                    column=column,
+                    business_name=str(definition.get("businessName") or column),
+                    role=str(definition.get("role") or definition.get("semanticRole") or "").upper(),
+                    aliases=_dedupe(
+                        [
+                            column,
+                            str(definition.get("businessName") or ""),
+                            *[str(item) for item in definition.get("aliases") or []],
+                        ]
+                    ),
+                    output_alias=str(hint.output_alias or column).strip(),
+                    **semantics,
+                )
+            )
+        return bindings
+
+    @staticmethod
+    def _entity_filter_bindings(
+        documents: Sequence[_EvidenceDocument],
+        selected: Sequence[GroundedEntityFilterHint],
+    ) -> tuple[list[GroundedEntityFilterBinding], list[GroundedContractGap]]:
+        by_ref = {
+            document.ref.ref_id: document
+            for document in documents
+            if document.ref.kind == "COLUMN"
+        }
+        bindings: list[GroundedEntityFilterBinding] = []
+        gaps: list[GroundedContractGap] = []
+        for hint in selected:
+            ref_id = str(hint.field_ref or "").strip()
+            document = by_ref.get(ref_id)
+            if document is None:
+                continue
+            payload = document.payload if isinstance(document.payload, dict) else {}
+            definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else {}
+            column = str(definition.get("columnName") or definition.get("Field") or "").strip()
+            table = str(payload.get("tableName") or document.ref.table or "").strip()
+            operator = _normalize_entity_filter_operator(hint.operator)
+            semantics = _field_usage_semantics(definition)
+            allowed = list(semantics["filter_operators"])
+            if not operator:
+                gaps.append(
+                    _gap(
+                        "ENTITY_FILTER_OPERATOR_UNSUPPORTED",
+                        "Entity filter operator %s is not supported" % hint.operator,
+                        "COLUMN",
+                        document.ref.topic,
+                        table,
+                        hint.requested_phrase,
+                    )
+                )
+                continue
+            if not allowed or operator not in allowed:
+                gaps.append(
+                    _gap(
+                        "ENTITY_FILTER_OPERATOR_NOT_DECLARED",
+                        "Field %s does not declare %s as an allowed filter operator"
+                        % (ref_id, operator),
+                        "COLUMN",
+                        document.ref.topic,
+                        table,
+                        hint.requested_phrase,
+                    )
+                )
+                continue
+            if not column or not table or hint.literal_value is None:
+                gaps.append(
+                    _gap(
+                        "ENTITY_FILTER_BINDING_INVALID",
+                        "Entity filter requires a governed field and literal value",
+                        "COLUMN",
+                        document.ref.topic,
+                        table,
+                        hint.requested_phrase,
+                    )
+                )
+                continue
+            bindings.append(
+                GroundedEntityFilterBinding(
+                    semantic_ref_id=ref_id,
+                    topic=str(payload.get("topic") or document.ref.topic or ""),
+                    table=table,
+                    column=column,
+                    operator=operator,
+                    literal_value=hint.literal_value,
+                    requested_phrase=str(hint.requested_phrase or ""),
+                    is_unique_key=bool(semantics["is_unique_key"]),
+                    entity_identity=str(semantics["entity_identity"]),
+                    allowed_operators=allowed,
+                    lookup_time_policy=dict(semantics["lookup_time_policy"]),
+                )
+            )
+        return bindings, gaps
+
+    @staticmethod
     def _relationship_bindings(
         documents: Sequence[_EvidenceDocument],
         selected_tables: Sequence[str],
@@ -756,10 +964,13 @@ class GroundedQueryContractBuilder:
         wanted = set(selected_tables)
         selected_set = set(selected_refs)
         relationships: list[GroundedRelationshipBinding] = []
-        if len(wanted) < 2:
+        if not wanted:
             return relationships
         for document in documents:
-            if document.ref.kind != "RELATIONSHIPS" or document.ref.ref_id not in selected_set:
+            if (
+                document.ref.kind not in {"RELATIONSHIP", "RELATIONSHIPS"}
+                or document.ref.ref_id not in selected_set
+            ):
                 continue
             payload = document.payload
             raw_relationships = payload if isinstance(payload, list) else payload.get("relationships") if isinstance(payload, dict) else []
@@ -768,7 +979,7 @@ class GroundedQueryContractBuilder:
                     continue
                 left = str(raw.get("leftTable") or "")
                 right = str(raw.get("rightTable") or "")
-                if left not in wanted or right not in wanted:
+                if left not in wanted and right not in wanted:
                     continue
                 relationships.append(
                     GroundedRelationshipBinding(
@@ -784,6 +995,19 @@ class GroundedQueryContractBuilder:
                             if isinstance(pair, (list, tuple)) and len(pair) == 2
                         ],
                         grain=str(raw.get("grain") or ""),
+                        cardinality=str(raw.get("cardinality") or "").upper(),
+                        fanout_policy=str(
+                            raw.get("fanoutPolicy")
+                            or raw.get("fanout_policy")
+                            or ""
+                        ).upper(),
+                        dedup_keys=[
+                            str(item)
+                            for item in raw.get("dedupKeys")
+                            or raw.get("dedup_keys")
+                            or []
+                            if str(item or "").strip()
+                        ],
                         cautions=[str(item) for item in raw.get("cautions") or []],
                     )
                 )
@@ -998,12 +1222,36 @@ class GroundedQueryContractValidator:
             gaps.append(_gap("QUESTION_REQUIRED", "Original question is required"))
         if not contract.topics:
             gaps.append(_gap("TOPIC_REQUIRED", "At least one active Topic is required"))
-        if not contract.metrics:
+        detail_shape = contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
+        if not contract.metrics and not detail_shape:
             gaps.append(
                 _gap(
                     "METRIC_EVIDENCE_REQUIRED",
                     "No requested metric was bound from trusted Core reads",
                     "METRIC",
+                )
+            )
+        if detail_shape and contract.metrics:
+            gaps.append(
+                _gap(
+                    "DETAIL_METRIC_BINDING_FORBIDDEN",
+                    "DETAIL and ENTITY_LOOKUP must use typed fields, not a metric surrogate",
+                )
+            )
+        if detail_shape and not contract.selected_fields:
+            gaps.append(
+                _gap(
+                    "DETAIL_PROJECTION_REQUIRED",
+                    "DETAIL execution requires at least one exact selected field read",
+                    "COLUMN",
+                )
+            )
+        if contract.query_shape == "ENTITY_LOOKUP" and not contract.entity_filters:
+            gaps.append(
+                _gap(
+                    "ENTITY_FILTER_REQUIRED",
+                    "ENTITY_LOOKUP requires at least one typed entity filter",
+                    "COLUMN",
                 )
             )
         table_by_name = {table.table: table for table in contract.tables}
@@ -1046,6 +1294,118 @@ class GroundedQueryContractValidator:
                         dimension.requested_phrase,
                     )
                 )
+        for selected in contract.selected_fields:
+            if selected.semantic_ref_id not in evidence_refs:
+                gaps.append(
+                    _binding_ref_gap(
+                        "SELECTED_FIELD_EVIDENCE_REF_MISSING",
+                        selected.semantic_ref_id,
+                        selected.topic,
+                        selected.table,
+                    )
+                )
+            table = table_by_name.get(selected.table)
+            if table is None or not table.detail_ref_id:
+                gaps.append(
+                    _gap(
+                        "TABLE_DETAIL_EVIDENCE_REQUIRED",
+                        "Selected field owner table %s lacks TABLE_DETAIL evidence"
+                        % selected.table,
+                        "TABLE_DETAIL",
+                        selected.topic,
+                        selected.table,
+                    )
+                )
+            if table and selected.column == table.merchant_filter_column:
+                gaps.append(
+                    _gap(
+                        "MERCHANT_SCOPE_PROJECTION_FORBIDDEN",
+                        "Merchant scope columns are internal filters and cannot be projected",
+                        "COLUMN",
+                        selected.topic,
+                        selected.table,
+                    )
+                )
+        for entity_filter in contract.entity_filters:
+            if entity_filter.semantic_ref_id not in evidence_refs:
+                gaps.append(
+                    _binding_ref_gap(
+                        "ENTITY_FILTER_EVIDENCE_REF_MISSING",
+                        entity_filter.semantic_ref_id,
+                        entity_filter.topic,
+                        entity_filter.table,
+                    )
+                )
+            table = table_by_name.get(entity_filter.table)
+            if table is None or not table.detail_ref_id:
+                gaps.append(
+                    _gap(
+                        "TABLE_DETAIL_EVIDENCE_REQUIRED",
+                        "Entity filter owner table %s lacks TABLE_DETAIL evidence"
+                        % entity_filter.table,
+                        "TABLE_DETAIL",
+                        entity_filter.topic,
+                        entity_filter.table,
+                    )
+                )
+            if table and entity_filter.column == table.merchant_filter_column:
+                gaps.append(
+                    _gap(
+                        "MERCHANT_SCOPE_ENTITY_FILTER_FORBIDDEN",
+                        "Merchant scope is injected by the executor and cannot be user-bound",
+                        "COLUMN",
+                        entity_filter.topic,
+                        entity_filter.table,
+                    )
+                )
+            if entity_filter.operator not in set(entity_filter.allowed_operators):
+                gaps.append(
+                    _gap(
+                        "ENTITY_FILTER_OPERATOR_NOT_DECLARED",
+                        "Entity filter operator is not allowed by the read field semantics",
+                        "COLUMN",
+                        entity_filter.topic,
+                        entity_filter.table,
+                    )
+                )
+        if contract.query_shape == "ENTITY_LOOKUP" and contract.entity_filters:
+            if not any(
+                item.is_unique_key or item.entity_identity
+                for item in contract.entity_filters
+            ):
+                gaps.append(
+                    _gap(
+                        "ENTITY_IDENTITY_DECLARATION_REQUIRED",
+                        "ENTITY_LOOKUP requires a filter field declared as a unique/entity identity",
+                        "COLUMN",
+                    )
+                )
+            for item in contract.entity_filters:
+                if (item.is_unique_key or item.entity_identity) and not item.lookup_time_policy:
+                    gaps.append(
+                        _gap(
+                            "LOOKUP_TIME_POLICY_REQUIRED",
+                            "Entity identity fields must declare lookupTimePolicy",
+                            "COLUMN",
+                            item.topic,
+                            item.table,
+                            item.requested_phrase,
+                        )
+                    )
+                if not any(
+                    field.table == item.table and field.column == item.column
+                    for field in contract.selected_fields
+                ):
+                    gaps.append(
+                        _gap(
+                            "ENTITY_FILTER_PROJECTION_REQUIRED",
+                            "Entity identity field must be projected so execution can verify lookup identity",
+                            "COLUMN",
+                            item.topic,
+                            item.table,
+                            item.requested_phrase,
+                        )
+                    )
         grouped_dimensions = [
             dimension for dimension in contract.dimensions if dimension.usage == "group_by"
         ]
@@ -1109,6 +1469,29 @@ class GroundedQueryContractValidator:
             if contract.ranking.limit <= 0:
                 gaps.append(_gap("RANKING_LIMIT_REQUIRED", "Ranking requires an explicit positive limit"))
         selected_tables = {table.table for table in contract.tables if table.table}
+        for relationship in contract.relationships:
+            for endpoint in (relationship.left_table, relationship.right_table):
+                if endpoint in selected_tables:
+                    continue
+                gaps.append(
+                    GroundedContractGap(
+                        code="RELATIONSHIP_ENDPOINT_TABLE_BINDING_REQUIRED",
+                        message=(
+                            "Relationship %s requires endpoint table %s to be selected and read"
+                            % (relationship.name, endpoint)
+                        ),
+                        evidence_kind="TABLE_DETAIL",
+                        table=endpoint,
+                        resolution="REVISE_BINDINGS",
+                        search_scope="READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX",
+                        required_capability={
+                            "endpointTable": endpoint,
+                            "relationshipRef": relationship.semantic_ref_id,
+                            "requiredSemanticRole": "RELATIONSHIP_ENDPOINT_TABLE",
+                        },
+                        rejected_ref_ids=[],
+                    )
+                )
         if len(selected_tables) > 1:
             if not _tables_connected(selected_tables, contract.relationships):
                 gaps.append(
@@ -1123,14 +1506,52 @@ class GroundedQueryContractValidator:
                     gaps.append(_binding_ref_gap("RELATIONSHIP_EVIDENCE_REF_MISSING", relationship.semantic_ref_id, relationship.topic, ""))
                 if not relationship.keys:
                     gaps.append(_gap("RELATIONSHIP_KEYS_REQUIRED", "Relationship %s has no governed keys" % relationship.name, "RELATIONSHIPS", relationship.topic))
-        if str(contract.time_range.source or "") == "default_days":
+                if detail_shape and not relationship.grain:
+                    gaps.append(_gap("RELATIONSHIP_GRAIN_REQUIRED", "Detail relationship %s has no governed grain" % relationship.name, "RELATIONSHIPS", relationship.topic))
+                if detail_shape and not relationship.cardinality:
+                    gaps.append(_gap("RELATIONSHIP_CARDINALITY_REQUIRED", "Detail relationship %s has no governed cardinality" % relationship.name, "RELATIONSHIPS", relationship.topic))
+                if detail_shape and not relationship.fanout_policy:
+                    gaps.append(_gap("RELATIONSHIP_FANOUT_POLICY_REQUIRED", "Detail relationship %s has no governed fanout policy" % relationship.name, "RELATIONSHIPS", relationship.topic))
+            if detail_shape and len(selected_tables) == 2:
+                execution_candidates = grounded_detail_relationship_candidates(
+                    contract.primary_table,
+                    selected_tables,
+                    contract.relationships,
+                )
+                if not execution_candidates:
+                    gaps.append(
+                        _gap(
+                            "DETAIL_RELATIONSHIP_EXECUTION_PROOF_REQUIRED",
+                            "No relationship proves the requested primary-table join direction, grain, cardinality and fanout policy",
+                            "RELATIONSHIPS",
+                        )
+                    )
+                elif len(execution_candidates) > 1:
+                    gaps.append(
+                        GroundedContractGap(
+                            code="DETAIL_RELATIONSHIP_BINDING_AMBIGUOUS",
+                            message="Multiple relationships provide competing detail join proofs",
+                            evidence_kind="RELATIONSHIPS",
+                            resolution="REVISE_BINDINGS",
+                            search_scope="READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX",
+                            required_capability={
+                                "primaryTable": contract.primary_table,
+                                "candidateRelationshipNames": [
+                                    item.name for item in execution_candidates
+                                ],
+                                "requiredSemanticRole": "UNAMBIGUOUS_DETAIL_RELATIONSHIP",
+                            },
+                        )
+                    )
+        time_required = not detail_shape or _detail_lookup_time_required(contract)
+        if time_required and str(contract.time_range.source or "") == "default_days":
             gaps.append(
                 _gap(
                     "TIME_RANGE_REQUIRED",
                     "The user did not specify a time window; ask how far back to query before execution",
                 )
             )
-        elif contract.time_range.days <= 0:
+        elif time_required and contract.time_range.days <= 0:
             gaps.append(_gap("TIME_RANGE_REQUIRED", "A positive time window is required"))
         gaps.extend(GroundedSemanticFitValidator().validate(contract))
         return GroundedQueryContractValidationResult(valid=not gaps, gaps=_dedupe_gaps(gaps))
@@ -1211,6 +1632,18 @@ def materialize_grounded_asset_pack(
             [*required_columns[dimension.table], dimension.column]
         )
         column_evidence[(dimension.table, dimension.column)] = dimension.semantic_ref_id
+    for selected in grounded.selected_fields:
+        required_columns.setdefault(selected.table, [])
+        required_columns[selected.table] = _dedupe(
+            [*required_columns[selected.table], selected.column]
+        )
+        column_evidence[(selected.table, selected.column)] = selected.semantic_ref_id
+    for entity_filter in grounded.entity_filters:
+        required_columns.setdefault(entity_filter.table, [])
+        required_columns[entity_filter.table] = _dedupe(
+            [*required_columns[entity_filter.table], entity_filter.column]
+        )
+        column_evidence[(entity_filter.table, entity_filter.column)] = entity_filter.semantic_ref_id
     relationship_key_columns: set[tuple[str, str]] = set()
     for relationship in grounded.relationships:
         for left, right in relationship.keys:
@@ -1235,6 +1668,33 @@ def materialize_grounded_asset_pack(
         }
         for dimension in grounded.dimensions
     }
+    for selected in grounded.selected_fields:
+        dimension_semantics[(selected.table, selected.column)] = {
+            "columnName": selected.column,
+            "businessName": selected.business_name or selected.column,
+            "aliases": list(selected.aliases),
+            "role": selected.role,
+            "usage": "projection",
+            "isUniqueKey": selected.is_unique_key,
+            "entityIdentity": selected.entity_identity,
+            "filterOperators": list(selected.filter_operators),
+            "lookupTimePolicy": dict(selected.lookup_time_policy),
+            "groundedEvidenceRef": selected.semantic_ref_id,
+        }
+    for entity_filter in grounded.entity_filters:
+        dimension_semantics.setdefault(
+            (entity_filter.table, entity_filter.column),
+            {
+                "columnName": entity_filter.column,
+                "role": "ENTITY_FILTER",
+                "usage": "entity_filter",
+                "isUniqueKey": entity_filter.is_unique_key,
+                "entityIdentity": entity_filter.entity_identity,
+                "filterOperators": list(entity_filter.allowed_operators),
+                "lookupTimePolicy": dict(entity_filter.lookup_time_policy),
+                "groundedEvidenceRef": entity_filter.semantic_ref_id,
+            },
+        )
 
     for table_name, table in table_bindings.items():
         asset = _safe_mapping_call(topic_assets, "load_table_asset", table.topic, table_name)
@@ -1466,6 +1926,8 @@ def compile_grounded_query(
             "grounded query contract is unresolved: %s"
             % ",".join(gap.code for gap in grounded.unresolved_gaps if gap.blocking)
         )
+    if grounded.query_shape in {"DETAIL", "ENTITY_LOOKUP"}:
+        return _compile_grounded_detail_query(grounded, asset_pack)
     if not grounded.metrics:
         raise ValueError("grounded query contract has no metric bindings")
     metric_tables = {metric.table for metric in grounded.metrics if metric.table}
@@ -1682,9 +2144,270 @@ def compile_grounded_query(
     )
 
 
+def _compile_grounded_detail_query(
+    contract: GroundedQueryContract,
+    asset_pack: PlanningAssetPack,
+) -> GroundedExecutionPreparation:
+    if contract.metrics:
+        raise ValueError("grounded detail execution cannot contain metric bindings")
+    if not contract.selected_fields:
+        raise ValueError("grounded detail execution requires selected field bindings")
+    selected_tables = {item.table for item in contract.selected_fields}
+    selected_tables.update(item.table for item in contract.entity_filters)
+    if not selected_tables or len(selected_tables) > 2:
+        raise ValueError("grounded detail execution supports one or two explicitly bound tables")
+    if len(selected_tables) == 2 and not _tables_connected(
+        selected_tables,
+        contract.relationships,
+    ):
+        raise ValueError("grounded detail join requires an explicitly read relationship")
+    primary_table = contract.primary_table
+    if primary_table not in selected_tables:
+        raise ValueError("grounded detail primary table is not part of the selected field/filter bindings")
+    if len(selected_tables) == 2:
+        relationship_candidates = grounded_detail_relationship_candidates(
+            primary_table,
+            selected_tables,
+            contract.relationships,
+        )
+        if len(relationship_candidates) != 1:
+            raise ValueError(
+                "grounded detail join requires exactly one direction-safe relationship proof"
+            )
+    aliases = [item.output_alias or item.column for item in contract.selected_fields]
+    if len(set(aliases)) != len(aliases):
+        raise ValueError("grounded detail output aliases must be unique")
+    primary_filter = next(
+        (item for item in contract.entity_filters if item.table == primary_table),
+        contract.entity_filters[0] if contract.entity_filters else None,
+    )
+    task_id = "grounded_%s_%s" % (
+        contract.query_shape.lower(),
+        _safe_task_token(primary_table),
+    )
+    entity_reference = EntityReference()
+    obligations: list[EntityFilterObligation] = []
+    if primary_filter is not None:
+        primary_filter_output = next(
+            (
+                item.output_alias or item.column
+                for item in contract.selected_fields
+                if item.table == primary_filter.table
+                and item.column == primary_filter.column
+            ),
+            primary_filter.column,
+        )
+        entity_reference = EntityReference(
+            semantic_ref_id=primary_filter.semantic_ref_id,
+            field=primary_filter.column,
+            table=primary_filter.table,
+            raw_label=primary_filter.requested_phrase,
+            raw_value=str(primary_filter.literal_value),
+            values=(
+                list(primary_filter.literal_value)
+                if primary_filter.operator == "IN"
+                and isinstance(primary_filter.literal_value, (list, tuple))
+                else [primary_filter.literal_value]
+            ),
+            comparison_policy=primary_filter.operator.lower(),
+            source="grounded_query_contract",
+            confidence=1.0,
+            status="bound",
+            time_scope_explicit=bool(contract.time_range.explicit),
+            lookup_time_policy=dict(primary_filter.lookup_time_policy),
+        )
+    for index, entity_filter in enumerate(contract.entity_filters):
+        reference = EntityReference(
+            semantic_ref_id=entity_filter.semantic_ref_id,
+            field=entity_filter.column,
+            table=entity_filter.table,
+            raw_label=entity_filter.requested_phrase,
+            raw_value=str(entity_filter.literal_value),
+            values=(
+                list(entity_filter.literal_value)
+                if entity_filter.operator == "IN"
+                and isinstance(entity_filter.literal_value, (list, tuple))
+                else [entity_filter.literal_value]
+            ),
+            comparison_policy=entity_filter.operator.lower(),
+            source="grounded_query_contract",
+            confidence=1.0,
+            status="bound",
+            time_scope_explicit=bool(contract.time_range.explicit),
+            lookup_time_policy=dict(entity_filter.lookup_time_policy),
+        )
+        obligations.append(
+            EntityFilterObligation(
+                obligation_id="grounded_entity_filter_%d" % (index + 1),
+                task_id=task_id,
+                required=True,
+                reference=reference,
+                status="bound",
+                reason="exact GroundedQueryContract entity filter",
+            )
+        )
+    intent = QuestionIntent(
+        question=contract.question,
+        intent_type=IntentType.VALID,
+        answer_mode=AnswerMode.DETAIL,
+        plan_task_id=task_id,
+        task_role=TaskRole.ANCHOR,
+        preferred_table=primary_table,
+        filter_column=primary_filter_output if primary_filter else "",
+        filter_value=str(primary_filter.literal_value) if primary_filter else "",
+        entity_reference=entity_reference,
+        days=int(contract.time_range.days or 0),
+        limit=100,
+        required_evidence=list(aliases),
+        output_keys=list(aliases),
+        knowledge_ref_ids=list(contract.evidence_refs),
+        analysis_source="grounded_query_contract",
+        analysis_note="typed detail projections and entity filters",
+        sql_strategy="grounded_deterministic",
+        time_range=contract.time_range.model_copy(deep=True),
+    )
+    plan = QueryPlan(
+        intents=[intent],
+        entity_filter_obligations=obligations,
+        evidence_contracts=[
+            {
+                "taskId": task_id,
+                "table": field.table,
+                "semanticLabel": field.output_alias or field.column,
+                "requiredLevel": "required",
+                "columns": [field.output_alias or field.column],
+                "semanticRefId": field.semantic_ref_id,
+            }
+            for field in contract.selected_fields
+        ],
+        final_required_evidence=list(aliases),
+        agent_trace=[
+            "planner=grounded_query_contract_direct_compiler",
+            "planner_llm_calls=0",
+        ],
+        question_understanding={
+            "source": "grounded_query_contract",
+            "contractVersion": contract.contract_version,
+            "queryShape": contract.query_shape,
+            "executionShape": contract.execution_shape,
+            "semanticSelectionRefs": list(contract.evidence_refs),
+        },
+        compiler_trace=[
+            "GROUNDED_DIRECT_COMPILE:%s" % contract.execution_shape,
+            "GROUNDED_DETAIL_TABLES:%s" % ",".join(sorted(selected_tables)),
+        ],
+        planner_loaded_refs=list(contract.evidence_refs),
+    )
+    validation = _validate_grounded_plan_projection(contract, plan, asset_pack)
+    fingerprint = query_graph_fingerprint(plan)
+    return GroundedExecutionPreparation(
+        plan=plan,
+        validation=validation,
+        source_plan_fingerprint=fingerprint,
+        execution_plan_fingerprint=fingerprint,
+        question_fingerprint=_stable_hash(contract.question),
+        asset_pack_fingerprint=_stable_hash(
+            asset_pack.model_dump(by_alias=True, mode="json")
+        ),
+    )
+
+
 def _safe_task_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "")).strip("_")
     return token[:64] or "metric"
+
+
+def _field_usage_semantics(definition: dict[str, Any]) -> dict[str, Any]:
+    raw = (
+        definition.get("entitySemantics")
+        if isinstance(definition.get("entitySemantics"), dict)
+        else {}
+    )
+    role = str(definition.get("role") or definition.get("semanticRole") or "").upper()
+    operators = definition.get("filterOperators") or definition.get("filter_operators") or raw.get("filterOperators") or []
+    if isinstance(operators, str):
+        operators = [operators]
+    return {
+        "is_unique_key": bool(
+            definition.get("isUniqueKey")
+            or definition.get("is_unique_key")
+            or definition.get("isUniqueEntityKey")
+            or definition.get("is_unique_entity_key")
+            or raw.get("isUniqueKey")
+            or raw.get("isUniqueEntityKey")
+            or role in {"PRIMARY_KEY", "UNIQUE_KEY", "ENTITY_UNIQUE_KEY"}
+        ),
+        "entity_identity": str(
+            definition.get("entityIdentity")
+            or definition.get("entity_identity")
+            or definition.get("canonicalEntityRef")
+            or definition.get("canonical_entity_ref")
+            or definition.get("canonicalEntityType")
+            or definition.get("canonical_entity_type")
+            or definition.get("entityType")
+            or definition.get("entity_type")
+            or raw.get("entityIdentity")
+            or raw.get("canonicalEntityRef")
+            or raw.get("canonicalEntityType")
+            or raw.get("entityType")
+            or ""
+        ),
+        "filter_operators": _dedupe(
+            _normalize_entity_filter_operator(item) for item in operators
+        ),
+        "lookup_time_policy": dict(
+            definition.get("lookupTimePolicy")
+            or definition.get("lookup_time_policy")
+            or raw.get("lookupTimePolicy")
+            or {}
+        ),
+    }
+
+
+def _normalize_entity_filter_operator(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace(" ", "_")
+    aliases = {
+        "=": "EQ",
+        "==": "EQ",
+        "IN": "IN",
+        "EQ": "EQ",
+        "NE": "NE",
+        "!=": "NE",
+        "GT": "GT",
+        ">": "GT",
+        "GTE": "GTE",
+        ">=": "GTE",
+        "LT": "LT",
+        "<": "LT",
+        "LTE": "LTE",
+        "<=": "LTE",
+    }
+    return aliases.get(normalized, "")
+
+
+def _detail_lookup_time_required(contract: GroundedQueryContract) -> bool:
+    if bool(getattr(contract.time_range, "explicit", False)):
+        return False
+    identity_filters = [
+        item
+        for item in contract.entity_filters
+        if item.is_unique_key or item.entity_identity
+    ]
+    if not identity_filters:
+        return True
+    for item in identity_filters:
+        policy = dict(item.lookup_time_policy or {})
+        mode = str(
+            policy.get("mode")
+            or policy.get("lookupMode")
+            or policy.get("lookup_mode")
+            or ""
+        ).strip().lower()
+        if mode in {"unbounded", "global", "not_required", "identity_lookup"}:
+            continue
+        if bool(policy.get("timeRequired", policy.get("time_required", True))):
+            return True
+    return False
 
 
 def _validate_grounded_plan_projection(
@@ -1712,6 +2435,13 @@ def _validate_grounded_plan_projection(
         return GraphValidationResult(valid=False, gaps=gaps, repairable=False)
 
     intent = plan.intents[0]
+    if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}:
+        return _validate_grounded_detail_projection(
+            contract,
+            plan,
+            asset_pack,
+            gaps,
+        )
     shape_modes = {
         "SCALAR": AnswerMode.METRIC,
         "GROUPED": AnswerMode.GROUP_AGG,
@@ -1840,6 +2570,113 @@ def _validate_grounded_plan_projection(
     return GraphValidationResult(valid=not gaps, gaps=gaps, repairable=False)
 
 
+def _validate_grounded_detail_projection(
+    contract: GroundedQueryContract,
+    plan: QueryPlan,
+    asset_pack: PlanningAssetPack,
+    gaps: list[GraphValidationGap],
+) -> GraphValidationResult:
+    intent = plan.intents[0]
+    if intent.answer_mode != AnswerMode.DETAIL:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_DETAIL_MODE_MISMATCH",
+                task_id=intent.plan_task_id,
+                reason="DETAIL/ENTITY_LOOKUP Contract must compile to AnswerMode.DETAIL",
+            )
+        )
+    if contract.metrics or intent.metric_name or intent.metric_formula or intent.metric_specs:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_DETAIL_METRIC_SURROGATE",
+                task_id=intent.plan_task_id,
+                reason="Detail execution may not be represented as an aggregate metric",
+            )
+        )
+    expected_aliases = [
+        item.output_alias or item.column for item in contract.selected_fields
+    ]
+    if intent.output_keys != expected_aliases:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_DETAIL_PROJECTION_MISMATCH",
+                task_id=intent.plan_task_id,
+                reason="Detail output keys differ from exact selected field bindings",
+            )
+        )
+    if contract.primary_table != intent.preferred_table:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_DETAIL_PRIMARY_TABLE_MISMATCH",
+                task_id=intent.plan_task_id,
+                evidence=intent.preferred_table,
+                reason="Detail preferredTable differs from Contract primaryTable",
+            )
+        )
+    contract_tables = {item.table for item in contract.tables}
+    if set(asset_pack.known_tables()) != contract_tables:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_PACK_TABLE_SCOPE_MISMATCH",
+                evidence=",".join(sorted(set(asset_pack.known_tables()) ^ contract_tables)),
+                reason="Detail PlanningAssetPack must contain exactly Contract-bound tables",
+            )
+        )
+    evidence_refs = set(contract.evidence_refs)
+    for selected_field in contract.selected_fields:
+        if selected_field.semantic_ref_id not in evidence_refs:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_DETAIL_FIELD_UNREAD",
+                    evidence=selected_field.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Selected detail field is not backed by read evidence",
+                )
+            )
+        if selected_field.column not in set(
+            asset_pack.known_columns(selected_field.table)
+        ):
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_PACK_COLUMN_MISSING",
+                    evidence="%s.%s"
+                    % (selected_field.table, selected_field.column),
+                    task_id=intent.plan_task_id,
+                    reason="Selected detail field is missing from the materialized pack",
+                )
+            )
+    for entity_filter in contract.entity_filters:
+        if entity_filter.semantic_ref_id not in evidence_refs:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_ENTITY_FILTER_UNREAD",
+                    evidence=entity_filter.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Entity filter field is not backed by read evidence",
+                )
+            )
+        if entity_filter.column not in set(asset_pack.known_columns(entity_filter.table)):
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_PACK_COLUMN_MISSING",
+                    evidence="%s.%s" % (entity_filter.table, entity_filter.column),
+                    task_id=intent.plan_task_id,
+                    reason="Entity filter field is missing from the materialized pack",
+                )
+            )
+    for relationship in contract.relationships:
+        if relationship.semantic_ref_id not in evidence_refs:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_RELATIONSHIP_UNREAD",
+                    evidence=relationship.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Detail join relationship is not backed by read evidence",
+                )
+            )
+    return GraphValidationResult(valid=not gaps, gaps=gaps, repairable=False)
+
+
 def _stable_hash(value: Any) -> str:
     payload = (
         value
@@ -1860,7 +2697,14 @@ def _execution_shape(
     dimensions: Sequence[GroundedDimensionBinding],
     tables: Sequence[str],
     ranking: GroundedRankingBinding,
+    *,
+    selected_fields: Sequence[GroundedSelectedFieldBinding] = (),
+    entity_filters: Sequence[GroundedEntityFilterBinding] = (),
 ) -> str:
+    if selected_fields and entity_filters:
+        return "detail_join" if len(set(tables)) > 1 else "entity_lookup"
+    if selected_fields:
+        return "detail_join" if len(set(tables)) > 1 else "detail"
     if ranking.enabled:
         return "ranked_group"
     if len(set(tables)) > 1:
@@ -1878,6 +2722,8 @@ def _canonical_query_shape(
     hints: GroundedBindingHints,
     metrics: Sequence[GroundedMetricBinding],
     dimensions: Sequence[GroundedDimensionBinding],
+    selected_fields: Sequence[GroundedSelectedFieldBinding],
+    entity_filters: Sequence[GroundedEntityFilterBinding],
     tables: Sequence[str],
     ranking: GroundedRankingBinding,
 ) -> str:
@@ -1890,10 +2736,18 @@ def _canonical_query_shape(
     """
 
     mode = str(hints.analysis_mode or "").strip().lower()
+    if mode in {"entity_lookup", "lookup", "entity_detail"}:
+        return "ENTITY_LOOKUP"
+    if mode in {"detail", "detail_list", "list"}:
+        return "DETAIL"
     if mode in {"topn", "ranking", "ranked_group"} or ranking.enabled:
         return "RANKED"
     if mode in {"trend", "time_series", "timeseries"}:
         return "TREND"
+    if selected_fields and entity_filters:
+        return "ENTITY_LOOKUP"
+    if selected_fields:
+        return "DETAIL"
     if len(set(tables)) > 1:
         return "MULTI_TABLE"
     if any(dimension.usage == "group_by" for dimension in dimensions):
@@ -1986,6 +2840,60 @@ def _normalize_binding_hints(
             if ref_id:
                 payload["groupByRef"] = ref_id
                 break
+
+    if not (payload.get("selectedFields") or payload.get("selected_fields")):
+        raw_selected = payload.get("selectedFieldRefs") or payload.get("selected_field_refs") or []
+        selected_items = raw_selected if isinstance(raw_selected, list) else [raw_selected]
+        normalized_selected = []
+        for item in selected_items:
+            if isinstance(item, str):
+                normalized_selected.append({"fieldRef": item})
+            elif isinstance(item, dict):
+                ref_id = ref_from(item)
+                if ref_id:
+                    normalized_selected.append(
+                        {
+                            "fieldRef": ref_id,
+                            "outputAlias": str(
+                                item.get("outputAlias")
+                                or item.get("output_alias")
+                                or ""
+                            ),
+                        }
+                    )
+        if normalized_selected:
+            payload["selectedFields"] = normalized_selected
+
+    raw_entity_filters = payload.get("entityFilters") or payload.get("entity_filters") or []
+    if isinstance(raw_entity_filters, dict):
+        raw_entity_filters = [raw_entity_filters]
+    if isinstance(raw_entity_filters, list):
+        normalized_filters = []
+        for item in raw_entity_filters:
+            if not isinstance(item, dict):
+                continue
+            ref_id = ref_from(item)
+            if not ref_id:
+                ref_id = str(item.get("fieldRef") or item.get("field_ref") or "").strip()
+            if not ref_id:
+                continue
+            normalized_filters.append(
+                {
+                    "fieldRef": ref_id,
+                    "operator": item.get("operator") or "EQ",
+                    "literalValue": item.get(
+                        "literalValue",
+                        item.get("literal_value", item.get("value")),
+                    ),
+                    "requestedPhrase": str(
+                        item.get("requestedPhrase")
+                        or item.get("requested_phrase")
+                        or item.get("phrase")
+                        or ""
+                    ),
+                }
+            )
+        payload["entityFilters"] = normalized_filters
 
     if not (payload.get("timeExpression") or payload.get("time_expression")):
         time_expression = ""
@@ -2085,6 +2993,14 @@ def _canonicalize_binding_hints(
                 for item in hints.field_aggregations
             ],
             "dimension_refs": _dedupe(canonical(item) for item in hints.dimension_refs),
+            "selected_fields": [
+                item.model_copy(update={"field_ref": canonical(item.field_ref)})
+                for item in hints.selected_fields
+            ],
+            "entity_filters": [
+                item.model_copy(update={"field_ref": canonical(item.field_ref)})
+                for item in hints.entity_filters
+            ],
             "group_by_ref": canonical(hints.group_by_ref),
             "relationship_refs": _dedupe(canonical(item) for item in hints.relationship_refs),
             "label_refs": {
@@ -2108,13 +3024,26 @@ def _missing_binding_ref_gaps(
             [item.field_ref for item in hints.field_aggregations],
         ),
         ("DIMENSION_BINDING_REF_NOT_READ", "COLUMN", hints.dimension_refs),
+        (
+            "SELECTED_FIELD_REF_NOT_READ",
+            "COLUMN",
+            [item.field_ref for item in hints.selected_fields],
+        ),
+        (
+            "ENTITY_FILTER_REF_NOT_READ",
+            "COLUMN",
+            [item.field_ref for item in hints.entity_filters],
+        ),
         ("RELATIONSHIP_BINDING_REF_NOT_READ", "RELATIONSHIPS", hints.relationship_refs),
     ]
     gaps: list[GroundedContractGap] = []
     for code, kind, refs in groups:
         for ref_id in refs:
             observed_kind = str(available_ref_kinds.get(ref_id) or "").upper()
-            if observed_kind == kind:
+            if observed_kind == kind or (
+                kind == "RELATIONSHIPS"
+                and observed_kind in {"RELATIONSHIP", "RELATIONSHIPS"}
+            ):
                 continue
             if observed_kind:
                 gaps.append(
@@ -2191,6 +3120,8 @@ _REVISE_BINDING_GAP_CODES = {
     "REJECTED_BINDING_REUSED",
     "INCOMPATIBLE_METRIC_TIME_POLICIES",
     "METRIC_TIME_GRAIN_MISMATCH",
+    "RELATIONSHIP_ENDPOINT_TABLE_BINDING_REQUIRED",
+    "DETAIL_RELATIONSHIP_BINDING_AMBIGUOUS",
 }
 
 
@@ -2479,6 +3410,51 @@ def _tables_connected(tables: set[str], relationships: Sequence[GroundedRelation
         visited.add(current)
         pending.extend(graph.get(current, set()) - visited)
     return visited == tables
+
+
+def grounded_detail_relationship_candidates(
+    primary_table: str,
+    selected_tables: set[str],
+    relationships: Sequence[GroundedRelationshipBinding],
+) -> list[GroundedRelationshipBinding]:
+    """Return relationships with a complete, direction-safe detail join proof."""
+
+    if len(selected_tables) != 2 or primary_table not in selected_tables:
+        return []
+    candidates: list[GroundedRelationshipBinding] = []
+    for relationship in relationships:
+        if {relationship.left_table, relationship.right_table} != selected_tables:
+            continue
+        join_type = str(relationship.join_type or "INNER").upper()
+        if join_type not in {"INNER", "LEFT"}:
+            continue
+        if join_type == "LEFT" and relationship.left_table != primary_table:
+            continue
+        if not (
+            relationship.keys
+            and relationship.grain
+            and relationship.cardinality
+            and relationship.fanout_policy
+        ):
+            continue
+        if any(
+            token in relationship.fanout_policy
+            for token in ("FORBID", "BLOCK", "UNSAFE")
+        ):
+            continue
+        candidates.append(relationship)
+    return sorted(
+        candidates,
+        key=lambda item: (
+            item.left_table,
+            item.right_table,
+            item.join_type,
+            item.cardinality,
+            item.fanout_policy,
+            item.grain,
+            item.name,
+        ),
+    )
 
 
 def _metric_phrase_in_question(question: str, aliases: Sequence[str]) -> str:

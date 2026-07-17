@@ -30,7 +30,10 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     _skill_output_contract_issues,
     _thin_recall,
 )
-from merchant_ai.services.grounded_query_contract import GroundedQueryContract
+from merchant_ai.services.grounded_query_contract import (
+    GroundedContractGap,
+    GroundedQueryContract,
+)
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
@@ -353,6 +356,55 @@ def test_subagent_semantic_reads_never_enter_core_submission_ledger() -> None:
     assert session.core_semantic_evidence[0]["refId"] == "semantic:客服工单:tickets:detail"
 
 
+def test_topic_expansion_is_driven_by_structured_search_scope_not_gap_code() -> None:
+    relationship_ref = "semantic:alpha:relationship:edge_one"
+    runtime_state = GroundedRuntimeSession(
+        session_id="s-expand",
+        question="cross topic detail",
+        merchant_id="m-1",
+        workspace_topics=["alpha"],
+        attempts=[
+            GroundedRuntimeAttempt(
+                attempt_id="attempt-1",
+                contract=GroundedQueryContract(
+                    question="cross topic detail",
+                    topics=["alpha"],
+                    status="REVISE_BINDINGS",
+                    unresolved_gaps=[
+                        GroundedContractGap(
+                            code="ARBITRARY_CAPABILITY_GAP",
+                            message="endpoint is outside current workspace",
+                            topic="alpha",
+                            resolution="REVISE_BINDINGS",
+                            search_scope=(
+                                "READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX"
+                            ),
+                            required_capability={
+                                "relationshipRef": relationship_ref,
+                                "endpointTable": "beta_detail",
+                            },
+                        )
+                    ],
+                ),
+            )
+        ],
+    )
+    session = GroundedDeepAgentSession(
+        runtime=runtime_state,
+        core_semantic_evidence=[
+            {
+                "refId": relationship_ref,
+                "topic": "alpha",
+                "kind": "RELATIONSHIP",
+            }
+        ],
+    )
+
+    assert session.can_expand_topic() is True
+    session.mark_topic_expanded()
+    assert session.can_expand_topic() is False
+
+
 def test_root_core_read_middleware_records_exact_complete_file() -> None:
     backend = GroundedSemanticBackend(
         FakeSemanticCatalog(),
@@ -476,6 +528,46 @@ def test_full_table_asset_is_never_exposed_by_grounded_filesystem_or_thin_recall
         "semantic:客服工单:tickets:metric:ticket_cnt",
     ]
     assert thin[1]["path"] == "topics/客服工单/tables/tickets/metrics/ticket_cnt.json"
+
+
+def test_thin_recall_never_leaks_host_paths_and_keeps_rules_inline_only() -> None:
+    recall = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="/Users/example/resources/runtime/rules/platform_rules.md#chunk-1",
+                source_type="GOVERNED_RULE",
+                content="unsafe legacy rule",
+            ),
+            RecallItem(
+                doc_id="semantic:rules:platform_rules:chunk:0001",
+                source_type="GOVERNED_RULE",
+                content="governed inline rule",
+                metadata={"semanticPath": "rules/platform_rules.md"},
+            ),
+            RecallItem(
+                doc_id="/private/tmp/untrusted",
+                source_type="SEMANTIC_METRIC",
+                metadata={"semanticPath": "/private/tmp/metric.json"},
+            ),
+        ]
+    )
+
+    thin = _thin_recall(recall, 8)
+
+    assert thin == [
+        {
+            "refId": "semantic:rules:platform_rules:chunk:0001",
+            "path": "",
+            "kind": "GOVERNED_RULE",
+            "topic": "",
+            "table": "",
+            "title": "",
+            "snippet": "governed inline rule",
+            "score": 0.0,
+            "navigationMode": "INLINE_ONLY",
+            "bindingEligible": False,
+        }
+    ]
 
 
 def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() -> None:

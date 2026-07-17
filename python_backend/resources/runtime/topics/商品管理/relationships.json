@@ -6,8 +6,31 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["spu_id", "spu_id"]],
     "grain": "spu_id_sub_order_id",
+    "cardinality": "one_to_many",
+    "fanoutPolicy": "DIRECTIONAL_GRAIN_GUARD",
+    "rowIdentityPreserved": {
+      "leftToRight": false,
+      "rightToLeft": true
+    },
     "pathSemantics": ["product_entity", "order_entity", "entity_filter"],
     "useCases": ["商品明细关联订单明细", "商品审核结果关联成交表现"]
+  },
+  {
+    "name": "order_goods_by_spu_id",
+    "leftTable": "dwm_trade_order_detail_di",
+    "rightTable": "dwm_goods_detail_df",
+    "joinType": "LEFT",
+    "keys": [["seller_id", "seller_id"], ["spu_id", "spu_id"]],
+    "grain": "sub_order_id",
+    "cardinality": "many_to_one",
+    "fanoutPolicy": "PRESERVE_LEFT_GRAIN",
+    "dedupKeys": ["seller_id", "spu_id"],
+    "rowIdentityPreserved": {
+      "leftToRight": true,
+      "rightToLeft": false
+    },
+    "pathSemantics": ["order_entity", "product_entity", "detail_projection"],
+    "useCases": ["订单明细回看对应商品属性和发布时间"]
   },
   {
     "name": "goods_refund_by_spu_name",

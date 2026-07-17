@@ -13,6 +13,10 @@ from merchant_ai.services.assets import (
     TopicAssetService,
     semantic_relationship_path,
     semantic_relationship_ref_id,
+    semantic_relationship_index_path,
+    semantic_relationship_index_ref_id,
+    semantic_relationship_entry_path,
+    semantic_relationship_entry_ref_id,
     semantic_table_detail_path,
     semantic_table_detail_ref_id,
     semantic_table_entry_keys,
@@ -168,11 +172,76 @@ def test_context_manifest_canonicalizes_and_deduplicates_before_limit() -> None:
 
     assert [(item["refId"], item["path"]) for item in manifest["refs"]] == [
         (semantic_table_detail_ref_id(topic, table), semantic_table_detail_path(topic, table)),
-        (relationship_ref, relationship_path),
+        (
+            semantic_relationship_index_ref_id(topic),
+            semantic_relationship_index_path(topic),
+        ),
     ]
     serialized = json.dumps(manifest, ensure_ascii=False)
     assert "#metric:" not in serialized
     assert "/asset.json\"" not in serialized
+
+
+def test_entity_field_discloses_typed_lookup_capabilities_only_at_exact_field_read() -> None:
+    catalog = _catalog()
+    result = catalog.read(
+        path=(
+            "topics/电商交易/tables/dwm_trade_order_detail_di/"
+            "columns/order_id.json"
+        ),
+        max_chars=2_000_000,
+    )
+
+    assert result["success"] is True
+    definition = json.loads(str(result["content"]))["definition"]
+    assert definition["entityRole"] == "KEY"
+    assert definition["canonicalEntityRef"] == "entity:order"
+    assert definition["isUniqueEntityKey"] is True
+    assert definition["filterOperators"] == ["EQ", "IN"]
+    assert definition["lookupTimePolicy"] == {
+        "mode": "unbounded",
+        "timeRequired": False,
+        "timeColumn": "pt",
+        "policySource": "field",
+    }
+    assert definition["schemaContract"]["dataType"] == "varchar(128)"
+
+
+def test_relationships_are_progressively_disclosed_as_index_then_one_exact_edge() -> None:
+    catalog = _catalog()
+    topic = "商品管理"
+    index = catalog.read(
+        ref_id=semantic_relationship_index_ref_id(topic),
+        path=semantic_relationship_index_path(topic),
+        max_chars=2_000_000,
+    )
+
+    assert index["success"] is True
+    index_payload = json.loads(str(index["content"]))
+    selected = next(
+        item
+        for item in index_payload["entries"]
+        if item["name"] == "order_goods_by_spu_id"
+    )
+    assert selected["refId"] == semantic_relationship_entry_ref_id(
+        topic,
+        "order_goods_by_spu_id",
+    )
+    assert selected["path"] == semantic_relationship_entry_path(
+        topic,
+        "order_goods_by_spu_id",
+    )
+
+    edge = catalog.read(
+        ref_id=str(selected["refId"]),
+        path=str(selected["path"]),
+        max_chars=2_000_000,
+    )
+    assert edge["success"] is True
+    edge_payload = json.loads(str(edge["content"]))
+    assert len(edge_payload["relationships"]) == 1
+    assert edge_payload["relationships"][0]["name"] == "order_goods_by_spu_id"
+    assert "goods_refund_by_spu_name" not in str(edge["content"])
 
 
 def test_semantic_entry_keys_are_stable_across_reordering_and_fail_closed_on_duplicates() -> None:

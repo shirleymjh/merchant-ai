@@ -156,6 +156,15 @@ SUPPORTED_ENTITY_COMPARISON_POLICIES = frozenset(
         "numeric",
     }
 )
+SUPPORTED_ENTITY_FILTER_OPERATORS = frozenset(
+    {"EQ", "IN", "NE", "GT", "GTE", "LT", "LTE"}
+)
+ENTITY_SEMANTIC_ROLES = frozenset(
+    {"KEY", "ENTITY", "ENTITY_KEY", "PRIMARY_KEY", "IDENTIFIER", "UNIQUE_KEY"}
+)
+NO_TIME_ENTITY_LOOKUP_MODES = frozenset(
+    {"not_required", "global", "unbounded", "all_partitions"}
+)
 
 # These are the table-level semantic files that are actually overlaid by every
 # active asset reader. Keep the runtime loader and activation identity derived
@@ -807,6 +816,8 @@ class SemanticCatalogService:
     TABLE_KIND = "TABLE_ASSET"
     METRIC_KIND = "METRIC"
     RELATIONSHIP_KIND = "RELATIONSHIPS"
+    RELATIONSHIP_INDEX_KIND = "RELATIONSHIP_CATALOG"
+    RELATIONSHIP_ENTRY_KIND = "RELATIONSHIP"
     TABLE_DETAIL_KIND = "TABLE_DETAIL"
     TABLE_SECTION_KINDS = {
         "metrics": "METRIC_CATALOG",
@@ -1048,9 +1059,23 @@ class SemanticCatalogService:
                 semantic_path = semantic_table_detail_path(topic, table)
             elif kind in {"METRIC", "SEMANTIC_METRIC"} and topic and table and ":metric:" in ref_id:
                 semantic_path = semantic_metric_path(topic, table, ref_id.split(":metric:", 1)[1])
-            elif kind in {"RELATIONSHIP", "RELATIONSHIPS", "SEMANTIC_RELATIONSHIP"} and topic:
-                ref_id = semantic_relationship_ref_id(topic)
-                semantic_path = semantic_relationship_path(topic)
+            elif kind in {
+                "RELATIONSHIP",
+                "RELATIONSHIPS",
+                "RELATIONSHIP_CATALOG",
+                "SEMANTIC_RELATIONSHIP",
+            } and topic:
+                relationship_id = str(metadata.get("relationshipId") or "").strip()
+                relationship_key = semantic_relationship_key_for_name(
+                    self.topic_assets.load_relationships(topic),
+                    relationship_id,
+                )
+                if relationship_key:
+                    ref_id = semantic_relationship_entry_ref_id(topic, relationship_key)
+                    semantic_path = semantic_relationship_entry_path(topic, relationship_key)
+                else:
+                    ref_id = semantic_relationship_index_ref_id(topic)
+                    semantic_path = semantic_relationship_index_path(topic)
             if not semantic_path or not ref_id.startswith("semantic:"):
                 continue
             resolved_by_ref = self._resolve_ref(ref_id, "")
@@ -1229,9 +1254,9 @@ class SemanticCatalogService:
         ]
         child_refs.append(
             {
-                "kind": self.RELATIONSHIP_KIND,
-                "refId": semantic_relationship_ref_id(topic),
-                "path": semantic_relationship_path(topic),
+                "kind": self.RELATIONSHIP_INDEX_KIND,
+                "refId": semantic_relationship_index_ref_id(topic),
+                "path": semantic_relationship_index_path(topic),
                 "use": "read only when the plan needs a cross-table edge",
             }
         )
@@ -1369,6 +1394,8 @@ class SemanticCatalogService:
             return None
         if section_name == "metrics":
             return self.metric_ref(topic, table, entry_key, selected)
+        if section_name == "columns":
+            selected = progressive_semantic_column_definition(asset, selected)
         kind = {"columns": "COLUMN", "terms": "TERM", "rules": "BUSINESS_RULE"}.get(section_name, "SEMANTIC_ENTRY")
         payload = {
             "topic": topic,
@@ -1445,6 +1472,125 @@ class SemanticCatalogService:
             "content": content,
             "searchText": json.dumps(relationships, ensure_ascii=False),
         }, ref_id=semantic_relationship_ref_id(topic), topic=topic, kind=self.RELATIONSHIP_KIND, path=semantic_relationship_path(topic))
+
+    def relationship_index_ref(
+        self,
+        topic: str,
+        relationships: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+        relationships = (
+            relationships
+            if relationships is not None
+            else self.topic_assets.load_relationships(topic)
+        )
+        keys = semantic_table_entry_keys("relationships", relationships)
+        entries: List[Dict[str, Any]] = []
+        for index, relationship in enumerate(relationships):
+            if not isinstance(relationship, dict):
+                continue
+            key = keys[index]
+            entries.append(
+                {
+                    "key": key,
+                    "name": str(relationship.get("name") or key),
+                    "leftTable": str(relationship.get("leftTable") or ""),
+                    "rightTable": str(relationship.get("rightTable") or ""),
+                    "refId": semantic_relationship_entry_ref_id(topic, key),
+                    "path": semantic_relationship_entry_path(topic, key),
+                    "useCases": [
+                        str(item)
+                        for item in relationship.get("useCases") or []
+                        if str(item or "").strip()
+                    ],
+                }
+            )
+        payload = {
+            "topic": topic,
+            "section": "relationships",
+            "entries": entries,
+            "policy": (
+                "This is an index only. Read exactly one relationship entry before "
+                "binding or requesting a Topic expansion."
+            ),
+        }
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        ref_id = semantic_relationship_index_ref_id(topic)
+        path = semantic_relationship_index_path(topic)
+        return add_context_uri(
+            {
+                "refId": ref_id,
+                "kind": self.RELATIONSHIP_INDEX_KIND,
+                "topic": topic,
+                "table": "",
+                "path": path,
+                "title": "%s/relationships/index" % topic,
+                "summary": "%d governed relationship entries" % len(entries),
+                "layers": {"relationships": len(entries), "layer": "index"},
+                "estimatedChars": len(content),
+                "offloadRecommended": False,
+                "content": content,
+                "searchText": json.dumps(entries, ensure_ascii=False),
+            },
+            ref_id=ref_id,
+            topic=topic,
+            kind=self.RELATIONSHIP_INDEX_KIND,
+            path=path,
+        )
+
+    def relationship_entry_ref(
+        self,
+        topic: str,
+        entry_key: str,
+        relationships: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any] | None:
+        relationships = (
+            relationships
+            if relationships is not None
+            else self.topic_assets.load_relationships(topic)
+        )
+        keys = semantic_table_entry_keys("relationships", relationships)
+        selected: Dict[str, Any] | None = None
+        for index, relationship in enumerate(relationships):
+            if isinstance(relationship, dict) and keys[index] == entry_key:
+                selected = dict(relationship)
+                break
+        if selected is None:
+            return None
+        payload = {
+            "topic": topic,
+            "section": "relationships",
+            "key": entry_key,
+            "relationships": [selected],
+        }
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        ref_id = semantic_relationship_entry_ref_id(topic, entry_key)
+        path = semantic_relationship_entry_path(topic, entry_key)
+        left = str(selected.get("leftTable") or "")
+        right = str(selected.get("rightTable") or "")
+        return add_context_uri(
+            {
+                "refId": ref_id,
+                "kind": self.RELATIONSHIP_ENTRY_KIND,
+                "topic": topic,
+                "table": left,
+                "path": path,
+                "title": "%s/%s relationship" % (
+                    topic,
+                    str(selected.get("name") or entry_key),
+                ),
+                "summary": "%s -> %s" % (left, right),
+                "layers": {"relationship": entry_key, "layer": "entry"},
+                "estimatedChars": len(content),
+                "offloadRecommended": False,
+                "content": content,
+                "searchText": json.dumps(selected, ensure_ascii=False),
+            },
+            ref_id=ref_id,
+            topic=topic,
+            table=left,
+            kind=self.RELATIONSHIP_ENTRY_KIND,
+            path=path,
+        )
 
     def metric_ref(
         self,
@@ -1534,7 +1680,7 @@ class SemanticCatalogService:
                         refs.append(self._section_public_ref(topic_name, table, section, manifest_item))
             relationships = self.topic_assets.load_relationships(topic_name)
             if relationships:
-                refs.append(self.relationship_ref(topic_name, relationships))
+                refs.append(self.relationship_index_ref(topic_name, relationships))
         self._refs_cache[cache_key] = refs
         return refs
 
@@ -1543,6 +1689,26 @@ class SemanticCatalogService:
         wanted_path = normalize_semantic_path(path)
         if wanted_ref == "semantic:topics:index" or wanted_path == "topics/index.json":
             return self.topic_index_ref()
+        relationship_entry_identity = parse_semantic_relationship_entry_identity(
+            wanted_ref,
+            wanted_path,
+        )
+        if relationship_entry_identity:
+            relationship_kind, relationship_topic, relationship_key = (
+                relationship_entry_identity
+            )
+            if relationship_topic not in self.topic_assets.all_topic_names():
+                return None
+            if relationship_kind == "index":
+                return self.relationship_index_ref(
+                    relationship_topic,
+                    self.topic_assets.load_relationships(relationship_topic),
+                )
+            return self.relationship_entry_ref(
+                relationship_topic,
+                relationship_key,
+                self.topic_assets.load_relationships(relationship_topic),
+            )
         # Resolve directory/index files before exact entries.  Otherwise paths
         # such as ``metrics/index.json`` and ``columns/index.json`` are
         # accidentally parsed as an exact entry whose key is literally
@@ -1613,6 +1779,26 @@ class SemanticCatalogService:
                     continue
                 entry = self.table_entry_ref(topic, table, section, str(item.get("key") or ""))
                 if entry and (not terms or score_document(terms, entry.get("searchText", "")) > 0):
+                    refs.append(self._public_ref(entry))
+                if len(refs) >= max(1, limit):
+                    break
+            return refs
+        relationship_match = re.fullmatch(r"topics/([^/]+)/relationships", normalized)
+        if relationship_match:
+            topic = relationship_match.group(1)
+            index_ref = self.relationship_index_ref(topic)
+            try:
+                payload = json.loads(index_ref.get("content") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            refs = []
+            for item in payload.get("entries") or []:
+                if not isinstance(item, dict):
+                    continue
+                entry = self.relationship_entry_ref(topic, str(item.get("key") or ""))
+                if entry and (
+                    not terms or score_document(terms, entry.get("searchText", "")) > 0
+                ):
                     refs.append(self._public_ref(entry))
                 if len(refs) >= max(1, limit):
                     break
@@ -2067,12 +2253,12 @@ class HybridRecallService:
                     )
             relationships = self.topic_assets.load_relationships(topic)
             if relationships:
-                ref = self.semantic_catalog.relationship_ref(topic, relationships)
+                ref = self.semantic_catalog.relationship_index_ref(topic, relationships)
                 docs.append(
                     RecallItem(
                         doc_id=ref["refId"],
-                        title="%s semantic relationships" % topic,
-                        content=json.dumps(relationships, ensure_ascii=False)[:8000],
+                        title="%s semantic relationship index" % topic,
+                        content=str(ref.get("content") or "")[:8000],
                         source_type="SEMANTIC_RELATIONSHIP",
                         topic=topic,
                         metadata={
@@ -2099,10 +2285,20 @@ class HybridRecallService:
                         continue
                     left = str(rel.get("leftTable") or "")
                     right = str(rel.get("rightTable") or "")
-                    rel_ref_id = "semantic:%s:relationship:%s" % (topic, rel_name)
+                    rel_key = semantic_relationship_key_for_name(
+                        relationships,
+                        rel_name,
+                    )
+                    rel_ref = self.semantic_catalog.relationship_entry_ref(
+                        topic,
+                        rel_key,
+                        relationships,
+                    )
+                    if rel_ref is None:
+                        continue
                     docs.append(
                         RecallItem(
-                            doc_id=rel_ref_id,
+                            doc_id=rel_ref["refId"],
                             title="%s/%s relationship" % (topic, rel_name),
                             content=json.dumps(rel, ensure_ascii=False)[:2400],
                             source_type="SEMANTIC_RELATIONSHIP",
@@ -2110,19 +2306,15 @@ class HybridRecallService:
                             table=left,
                             metadata={
                                 "semanticSource": "relationships.json",
-                                # The grounded contract consumes the governed
-                                # Topic relationship file.  The individual hit
-                                # remains a retrieval document, but its browse
-                                # coordinate must be a real readable file.
-                                "semanticKind": self.semantic_catalog.RELATIONSHIP_KIND,
-                                "semanticRefId": semantic_relationship_ref_id(topic),
-                                "semanticPath": semantic_relationship_path(topic),
+                                "semanticKind": self.semantic_catalog.RELATIONSHIP_ENTRY_KIND,
+                                "semanticRefId": rel_ref["refId"],
+                                "semanticPath": rel_ref["path"],
                                 "merchantUri": merchant_uri_for_semantic_ref(
-                                    semantic_relationship_ref_id(topic),
+                                    rel_ref["refId"],
                                     topic=topic,
-                                    kind=self.semantic_catalog.RELATIONSHIP_KIND,
+                                    kind=self.semantic_catalog.RELATIONSHIP_ENTRY_KIND,
                                 ),
-                                "contextLayer": "L1",
+                                "contextLayer": "L2",
                                 "relationshipId": rel_name,
                                 "leftTable": left,
                                 "rightTable": right,
@@ -4875,6 +5067,14 @@ def semantic_relationship_ref_id(topic: str) -> str:
     return "semantic:%s:relationships" % topic
 
 
+def semantic_relationship_index_ref_id(topic: str) -> str:
+    return "semantic:%s:relationship_index" % topic
+
+
+def semantic_relationship_entry_ref_id(topic: str, entry_key: str) -> str:
+    return "semantic:%s:relationship:%s" % (topic, entry_key)
+
+
 def semantic_metric_ref_id(topic: str, table: str, metric_key: str) -> str:
     return "semantic:%s:%s:metric:%s" % (topic, table, metric_key)
 
@@ -4908,6 +5108,155 @@ def semantic_table_entry_ref_id(topic: str, table: str, section: str, entry_key:
 
 def semantic_table_entry_path(topic: str, table: str, section: str, entry_key: str) -> str:
     return "topics/%s/tables/%s/%s/%s.json" % (topic, table, section, entry_key)
+
+
+def normalize_entity_filter_operator(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace(" ", "_")
+    return {
+        "=": "EQ",
+        "==": "EQ",
+        "EQ": "EQ",
+        "IN": "IN",
+        "!=": "NE",
+        "<>": "NE",
+        "NE": "NE",
+        ">": "GT",
+        "GT": "GT",
+        ">=": "GTE",
+        "GTE": "GTE",
+        "<": "LT",
+        "LT": "LT",
+        "<=": "LTE",
+        "LTE": "LTE",
+    }.get(normalized, "")
+
+
+def normalize_entity_lookup_policy(
+    raw: Any,
+    *,
+    inherited_time_column: str = "",
+    source: str = "",
+) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    policy = dict(raw)
+    mode = str(policy.get("mode") or "").strip().lower()
+    if not mode:
+        return {}
+    normalized: Dict[str, Any] = {
+        **policy,
+        "mode": mode,
+        "timeColumn": str(
+            policy.get("timeColumn")
+            or policy.get("time_column")
+            or inherited_time_column
+            or ""
+        ).strip(),
+    }
+    if "timeRequired" in policy or "time_required" in policy:
+        normalized["timeRequired"] = bool(
+            policy.get("timeRequired", policy.get("time_required"))
+        )
+    else:
+        normalized["timeRequired"] = mode not in NO_TIME_ENTITY_LOOKUP_MODES
+    if source:
+        normalized["policySource"] = source
+    return normalized
+
+
+def progressive_semantic_column_definition(
+    asset: Dict[str, Any],
+    semantic_column: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Publish one field's governed usage capabilities at the L2 boundary.
+
+    This projection is deliberately generic. It translates declarations from
+    the semantic asset into a stable field contract; it never recognizes a
+    business domain, table name, column name, or example literal.
+    """
+
+    definition = dict(semantic_column or {})
+    column_name = str(
+        definition.get("columnName")
+        or definition.get("Field")
+        or definition.get("field")
+        or ""
+    ).strip()
+    schema = next(
+        (
+            dict(item)
+            for item in schema_columns(asset)
+            if isinstance(item, dict)
+            and str(item.get("columnName") or item.get("Field") or "").strip()
+            == column_name
+        ),
+        {},
+    )
+    if schema:
+        definition["schemaContract"] = {
+            "dataType": str(
+                schema.get("dataType") or schema.get("Type") or ""
+            ).strip(),
+            "nullable": schema.get("nullable", schema.get("Null")),
+            "keyType": str(schema.get("keyType") or schema.get("Key") or "").strip(),
+        }
+
+    role = str(
+        definition.get("entityRole")
+        or definition.get("role")
+        or definition.get("semanticRole")
+        or ""
+    ).strip().upper()
+    if role not in ENTITY_SEMANTIC_ROLES:
+        return definition
+
+    definition["entityRole"] = role
+    canonical_entity = str(
+        definition.get("canonicalEntityRef")
+        or definition.get("entityIdentity")
+        or definition.get("canonicalEntityType")
+        or definition.get("entityType")
+        or ""
+    ).strip()
+    if canonical_entity:
+        definition["canonicalEntityRef"] = canonical_entity
+
+    definition["isUniqueEntityKey"] = bool(
+        definition.get("isUniqueEntityKey")
+        or definition.get("isUniqueKey")
+        or definition.get("is_unique_entity_key")
+    )
+
+    raw_operators = (
+        definition.get("filterOperators")
+        or definition.get("filter_operators")
+        or []
+    )
+    if isinstance(raw_operators, str):
+        raw_operators = [raw_operators]
+    operators = dedupe_strings(
+        normalize_entity_filter_operator(item) for item in raw_operators
+    )
+    comparison_policy = str(definition.get("comparisonPolicy") or "").strip().lower()
+    if not operators and comparison_policy in SUPPORTED_ENTITY_COMPARISON_POLICIES:
+        # A governed equality comparison policy implies exact/same-entity
+        # lookup operators. Range support remains opt-in.
+        operators = ["EQ", "IN"]
+    definition["filterOperators"] = operators
+
+    field_policy = definition.get("lookupTimePolicy") or definition.get(
+        "lookup_time_policy"
+    )
+    policy_source = "field"
+    if not isinstance(field_policy, dict):
+        field_policy = asset.get("entityLookupPolicy")
+        policy_source = "table"
+    definition["lookupTimePolicy"] = normalize_entity_lookup_policy(
+        field_policy,
+        inherited_time_column=str(asset.get("timeColumn") or ""),
+        source=policy_source,
+    )
+    return definition
 
 
 def semantic_table_entry_key(section: str, value: Dict[str, Any], index: int) -> str:
@@ -4966,6 +5315,54 @@ def semantic_table_entry_title(section: str, value: Dict[str, Any], fallback: st
 
 def semantic_relationship_path(topic: str) -> str:
     return "topics/%s/relationships.json" % topic
+
+
+def semantic_relationship_index_path(topic: str) -> str:
+    return "topics/%s/relationships/index.json" % topic
+
+
+def semantic_relationship_entry_path(topic: str, entry_key: str) -> str:
+    return "topics/%s/relationships/%s.json" % (topic, entry_key)
+
+
+def semantic_relationship_key_for_name(
+    relationships: Sequence[Any],
+    relationship_name: str,
+) -> str:
+    wanted = str(relationship_name or "").strip()
+    if not wanted:
+        return ""
+    keys = semantic_table_entry_keys("relationships", relationships)
+    for index, relationship in enumerate(relationships):
+        if not isinstance(relationship, dict):
+            continue
+        if str(relationship.get("name") or "").strip() == wanted:
+            return keys[index]
+    return ""
+
+
+def parse_semantic_relationship_entry_identity(
+    ref_id: str,
+    path: str,
+) -> Tuple[str, str, str] | None:
+    wanted_ref = str(ref_id or "").strip()
+    wanted_path = normalize_semantic_path(path)
+    index_ref = re.fullmatch(r"semantic:([^:]+):relationship_index", wanted_ref)
+    if index_ref:
+        return "index", str(index_ref.group(1)), ""
+    index_path = re.fullmatch(r"topics/([^/]+)/relationships/index\.json", wanted_path)
+    if index_path:
+        return "index", str(index_path.group(1)), ""
+    entry_ref = re.fullmatch(r"semantic:([^:]+):relationship:(.+)", wanted_ref)
+    if entry_ref:
+        return "entry", str(entry_ref.group(1)), str(entry_ref.group(2))
+    entry_path = re.fullmatch(
+        r"topics/([^/]+)/relationships/([^/]+)\.json",
+        wanted_path,
+    )
+    if entry_path:
+        return "entry", str(entry_path.group(1)), str(entry_path.group(2))
+    return None
 
 
 def parse_semantic_metric_identity(ref_id: str, path: str) -> Tuple[str, str, str] | None:
@@ -5699,6 +6096,17 @@ class TopicBuilderWorkflow:
             "dataGrain": str(generated.get("dataGrain") or existing.get("dataGrain") or "UNDECLARED"),
             "timeColumn": str(generated.get("timeColumn") or existing.get("timeColumn") or profile.get("timeColumn") or ""),
             "merchantFilterColumn": str(generated.get("merchantFilterColumn") or existing.get("merchantFilterColumn") or ""),
+            "entityLookupPolicy": normalize_entity_lookup_policy(
+                generated.get("entityLookupPolicy")
+                or existing.get("entityLookupPolicy")
+                or {},
+                inherited_time_column=str(
+                    generated.get("timeColumn")
+                    or existing.get("timeColumn")
+                    or profile.get("timeColumn")
+                    or ""
+                ),
+            ),
             "rowAccessPolicy": normalize_row_access_policy(
                 generated.get("rowAccessPolicy")
                 or existing.get("rowAccessPolicy")
@@ -5718,6 +6126,8 @@ class TopicBuilderWorkflow:
             "generatedAt": datetime.utcnow().isoformat() + "Z",
             "status": "PENDING_REVIEW",
         }
+        if not asset_payload.get("entityLookupPolicy"):
+            asset_payload.pop("entityLookupPolicy", None)
         semantic_columns = self._merge_generated_list(
             existing.get("semanticColumns"),
             generated.get("semanticColumns"),
@@ -6116,6 +6526,7 @@ class TopicBuilderWorkflow:
                 "dataGrain": existing.get("dataGrain"),
                 "timeColumn": existing.get("timeColumn"),
                 "merchantFilterColumn": existing.get("merchantFilterColumn"),
+                "entityLookupPolicy": existing.get("entityLookupPolicy") or {},
                 "rowAccessPolicy": existing.get("rowAccessPolicy") or {},
                 "resultAccessPolicies": existing.get("resultAccessPolicies") or {},
                 "semanticColumns": existing.get("semanticColumns") or [],
@@ -6138,6 +6549,9 @@ class TopicBuilderWorkflow:
             "alternativeCapability。比率、平均、快照、去重计数和固定窗口必须根据业务知识声明，"
             "不得从指标名或字段名猜测。可派生度量的字段可声明 allowedAggregations 和 derivableMeasures。"
             "不得把数据缺失默认解释为业务为 0；没有可核验证据时使用 undeclared，不要猜测。"
+            "对可作为实体过滤条件的字段，应基于业务证据声明 canonicalEntityRef、comparisonPolicy、"
+            "filterOperators、isUniqueEntityKey 与字段级 lookupTimePolicy；唯一实体的无时间查询能力"
+            "必须由 lookupTimePolicy 显式声明，不能从字段名、样例值或 KEY 角色推断。"
             "如果字段疑似手机号、邮箱、身份证、地址等敏感信息，请补充 visibilityPolicy 和 maskingPolicy；"
             "如果表有明确租户过滤列，请补充 rowAccessPolicy。"
             "聚合指标结果、时间或其他维度能否返回必须通过 resultAccessPolicies 按语义角色显式声明；"
@@ -6175,6 +6589,12 @@ class TopicBuilderWorkflow:
             "dataGrain": str(existing.get("dataGrain") or "UNDECLARED"),
             "timeColumn": str(existing.get("timeColumn") or profile.get("timeColumn") or ""),
             "merchantFilterColumn": str(existing.get("merchantFilterColumn") or ""),
+            "entityLookupPolicy": normalize_entity_lookup_policy(
+                existing.get("entityLookupPolicy") or {},
+                inherited_time_column=str(
+                    existing.get("timeColumn") or profile.get("timeColumn") or ""
+                ),
+            ),
             "rowAccessPolicy": normalize_row_access_policy(existing.get("rowAccessPolicy") or {}),
             "resultAccessPolicies": normalize_result_access_policies(existing.get("resultAccessPolicies") or {}),
             "semanticColumns": semantic_columns,
@@ -6580,12 +7000,41 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
         },
         "additionalProperties": False,
     }
+    entity_lookup_policy_schema = {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_ENTITY_LOOKUP_POLICY_MODES),
+            },
+            "timeColumn": {"type": "string"},
+            "timeRequired": {"type": "boolean"},
+            "defaultDays": {"type": "integer", "minimum": 1},
+        },
+        "required": ["mode"],
+        "additionalProperties": False,
+    }
     semantic_column_schema = {
         "type": "object",
         "properties": {
             "columnName": {"type": "string"},
             "businessName": {"type": "string"},
             "role": {"type": "string", "enum": ["KEY", "TIME", "DIMENSION", "ATTRIBUTE"]},
+            "entityRole": {"type": "string"},
+            "canonicalEntityRef": {"type": "string"},
+            "comparisonPolicy": {
+                "type": "string",
+                "enum": sorted(SUPPORTED_ENTITY_COMPARISON_POLICIES),
+            },
+            "isUniqueEntityKey": {"type": "boolean"},
+            "filterOperators": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": sorted(SUPPORTED_ENTITY_FILTER_OPERATORS),
+                },
+            },
+            "lookupTimePolicy": entity_lookup_policy_schema,
             "description": {"type": "string"},
             "aliases": {"type": "array", "items": {"type": "string"}},
             "enumValues": {"type": "array", "items": {"type": "string"}},
@@ -6737,6 +7186,7 @@ def semantic_asset_builder_tool() -> AgentToolDefinition:
                 "dataGrain": {"type": "string"},
                 "timeColumn": {"type": "string"},
                 "merchantFilterColumn": {"type": "string"},
+                "entityLookupPolicy": entity_lookup_policy_schema,
                 "rowAccessPolicy": row_access_policy_schema,
                 "resultAccessPolicies": {
                     "type": "object",
@@ -7311,7 +7761,7 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         for field in semantic_columns
         if isinstance(field, dict)
         and str(field.get("role") or field.get("semanticRole") or "").strip().upper()
-        in {"KEY", "ENTITY", "ENTITY_KEY", "PRIMARY_KEY", "IDENTIFIER"}
+        in ENTITY_SEMANTIC_ROLES
     ]
     table_time_column = str(asset.get("timeColumn") or "").strip()
     raw_entity_lookup_policy = asset.get("entityLookupPolicy")
@@ -7365,6 +7815,112 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
                     "code": "ENTITY_COMPARISON_POLICY_INVALID",
                     "column": entity_column,
                     "comparisonPolicy": comparison_policy,
+                }
+            )
+        raw_unique = entity_field.get(
+            "isUniqueEntityKey",
+            entity_field.get("isUniqueKey", entity_field.get("is_unique_entity_key")),
+        )
+        if raw_unique is not None and not isinstance(raw_unique, bool):
+            errors.append(
+                {
+                    "code": "ENTITY_UNIQUE_KEY_DECLARATION_INVALID",
+                    "column": entity_column,
+                }
+            )
+        raw_operators = entity_field.get("filterOperators") or entity_field.get(
+            "filter_operators"
+        )
+        if isinstance(raw_operators, str):
+            raw_operators = [raw_operators]
+        if raw_operators is not None and not isinstance(raw_operators, list):
+            errors.append(
+                {
+                    "code": "ENTITY_FILTER_OPERATORS_INVALID",
+                    "column": entity_column,
+                }
+            )
+            raw_operators = []
+        operators = {
+            normalize_entity_filter_operator(item)
+            for item in raw_operators or []
+        }
+        invalid_operators = sorted(
+            operator
+            for operator in operators
+            if not operator or operator not in SUPPORTED_ENTITY_FILTER_OPERATORS
+        )
+        if invalid_operators:
+            errors.append(
+                {
+                    "code": "ENTITY_FILTER_OPERATOR_INVALID",
+                    "column": entity_column,
+                    "operators": invalid_operators,
+                }
+            )
+        if not raw_operators:
+            warnings.append(
+                {
+                    "code": "ENTITY_FILTER_OPERATORS_UNDECLARED",
+                    "column": entity_column,
+                }
+            )
+
+        field_lookup_policy = entity_field.get("lookupTimePolicy") or entity_field.get(
+            "lookup_time_policy"
+        )
+        if field_lookup_policy is not None:
+            if not isinstance(field_lookup_policy, dict):
+                errors.append(
+                    {
+                        "code": "FIELD_LOOKUP_TIME_POLICY_INVALID",
+                        "column": entity_column,
+                    }
+                )
+            else:
+                normalized_field_policy = normalize_entity_lookup_policy(
+                    field_lookup_policy,
+                    inherited_time_column=table_time_column,
+                )
+                field_mode = str(normalized_field_policy.get("mode") or "")
+                if field_mode not in SUPPORTED_ENTITY_LOOKUP_POLICY_MODES:
+                    errors.append(
+                        {
+                            "code": "FIELD_LOOKUP_TIME_POLICY_MODE_INVALID",
+                            "column": entity_column,
+                            "mode": field_mode or "UNDECLARED",
+                        }
+                    )
+                field_time_column = str(
+                    normalized_field_policy.get("timeColumn") or ""
+                )
+                if field_time_column and field_time_column not in columns:
+                    errors.append(
+                        {
+                            "code": "FIELD_LOOKUP_TIME_COLUMN_MISSING",
+                            "column": entity_column,
+                            "timeColumn": field_time_column,
+                        }
+                    )
+                if field_mode in {"bounded_default", "default_window"}:
+                    try:
+                        field_default_days = int(
+                            normalized_field_policy.get("defaultDays") or 0
+                        )
+                    except (TypeError, ValueError):
+                        field_default_days = 0
+                    if field_default_days <= 0:
+                        errors.append(
+                            {
+                                "code": "FIELD_LOOKUP_DEFAULT_DAYS_INVALID",
+                                "column": entity_column,
+                            }
+                        )
+        elif bool(raw_unique):
+            warnings.append(
+                {
+                    "code": "FIELD_LOOKUP_TIME_POLICY_UNDECLARED",
+                    "column": entity_column,
                 }
             )
     if row_access_policy and str(row_access_policy.get("filterColumn") or "") not in columns:

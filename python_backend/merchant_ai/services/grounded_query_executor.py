@@ -15,6 +15,7 @@ from merchant_ai.models import (
     AgentTaskResult,
     EvidenceCheckResult,
     EvidenceGap,
+    EntityFilterVerificationProof,
     NodePlanContract,
     NodeTaskProfile,
     QueryBundle,
@@ -28,7 +29,17 @@ from merchant_ai.services.assets import (
     normalize_row_access_policy,
 )
 from merchant_ai.services.formulas import compile_metric_formula
-from merchant_ai.services.grounded_query_contract import GroundedQueryContract
+from merchant_ai.services.entity_contracts import (
+    canonical_entity_values,
+    entity_comparison_policy,
+    entity_filter_contract_hash,
+    entity_filter_sql_hash,
+    entity_value_hash,
+)
+from merchant_ai.services.grounded_query_contract import (
+    GroundedQueryContract,
+    grounded_detail_relationship_candidates,
+)
 from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
 from merchant_ai.services.time_semantics import (
@@ -43,10 +54,12 @@ from merchant_ai.services.time_semantics import (
 class GroundedSqlCompilation:
     sql: str
     table: str
+    tables: tuple[str, ...]
     metric_aliases: tuple[str, ...]
     group_columns: tuple[str, ...]
     required_columns: tuple[str, ...]
     node_contract: NodePlanContract
+    access_contracts: tuple[NodePlanContract, ...] = ()
 
 
 class GroundedQueryExecutionKernel:
@@ -111,17 +124,22 @@ class GroundedQueryExecutionKernel:
                 validation.message,
             )
 
-        decision = self.access_control.authorize_contract(
-            compilation.node_contract,
-            compilation.sql,
-            run_id=run_id,
-        )
-        if not decision.allowed:
+        access_contracts = compilation.access_contracts or (compilation.node_contract,)
+        decisions = [
+            self.access_control.authorize_contract(
+                item,
+                compilation.sql,
+                run_id=run_id,
+            )
+            for item in access_contracts
+        ]
+        denied_decision = next((item for item in decisions if not item.allowed), None)
+        if denied_decision is not None:
             denied = SqlValidationResult(
                 valid=False,
-                error_code=decision.code or "ACCESS_DENIED",
-                message=decision.message or "grounded query access denied",
-                base_tables=[compilation.table],
+                error_code=denied_decision.code or "ACCESS_DENIED",
+                message=denied_decision.message or "grounded query access denied",
+                base_tables=list(compilation.tables),
             )
             return self._failed_result(
                 plan,
@@ -133,17 +151,31 @@ class GroundedQueryExecutionKernel:
 
         started = time.perf_counter()
         try:
-            rows = self.doris_repository.query(
+            raw_rows = [
+                dict(row)
+                for row in self.doris_repository.query(
                 compilation.sql,
                 timeout_seconds=max(
                     1,
                     int(getattr(self.settings, "doris_read_timeout_seconds", 30) or 30),
                 ),
+                )
+            ]
+            entity_filter_verification = self._entity_filter_verification(
+                compilation.node_contract,
+                raw_rows,
+                compilation.sql,
             )
             rows = apply_column_masks(
-                [dict(row) for row in rows],
+                raw_rows,
                 compilation.node_contract.model_copy(
-                    update={"masked_columns": dict(decision.masked_columns or {})}
+                    update={
+                        "masked_columns": {
+                            key: value
+                            for decision in decisions
+                            for key, value in (decision.masked_columns or {}).items()
+                        }
+                    }
                 ),
             )
             for row in rows:
@@ -171,7 +203,7 @@ class GroundedQueryExecutionKernel:
         task_id = intent.plan_task_id
         bundle = QueryBundle(
             sql=compilation.sql,
-            tables=[compilation.table],
+            tables=list(compilation.tables),
             rows=rows,
             original_row_count=len(rows),
             source_row_counts={task_id: len(rows)},
@@ -227,12 +259,14 @@ class GroundedQueryExecutionKernel:
                 sql_draft_source="grounded_deterministic",
             ),
             node_plan_contract=compilation.node_contract,
+            entity_filter_verification=entity_filter_verification,
         )
-        self.access_control.record_query_audit(
-            decision,
-            row_count=len(rows),
-            status="success",
-        )
+        for decision in decisions:
+            self.access_control.record_query_audit(
+                decision,
+                row_count=len(rows),
+                status="success",
+            )
         return AgentRunResult(
             executed_query_graph_fingerprint=query_graph_fingerprint(plan),
             tasks=[
@@ -264,6 +298,15 @@ class GroundedQueryExecutionKernel:
         access_role: str,
         user_scope: dict[str, Any],
     ) -> GroundedSqlCompilation:
+        if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}:
+            return self._compile_detail_sql(
+                merchant_id,
+                contract,
+                plan,
+                asset_pack,
+                access_role=access_role,
+                user_scope=user_scope,
+            )
         intent = plan.intents[0]
         table = str(intent.preferred_table or contract.primary_table or "").strip()
         table_binding = next(
@@ -460,10 +503,342 @@ class GroundedQueryExecutionKernel:
         return GroundedSqlCompilation(
             sql=sql,
             table=table,
+            tables=(table,),
             metric_aliases=tuple(metric_aliases),
             group_columns=tuple(group_columns),
             required_columns=required,
             node_contract=node_contract,
+            access_contracts=(node_contract,),
+        )
+
+    def _compile_detail_sql(
+        self,
+        merchant_id: str,
+        contract: GroundedQueryContract,
+        plan: QueryPlan,
+        asset_pack: Any,
+        *,
+        access_role: str,
+        user_scope: dict[str, Any],
+    ) -> GroundedSqlCompilation:
+        intent = plan.intents[0]
+        if contract.metrics:
+            raise RuntimeError("grounded detail execution cannot contain metrics")
+        tables = self._dedupe(
+            [contract.primary_table]
+            + [item.table for item in contract.selected_fields]
+            + [item.table for item in contract.entity_filters]
+        )
+        if not tables or len(tables) > 2:
+            raise RuntimeError("grounded detail execution supports one or two tables")
+        table_bindings = {item.table: item for item in contract.tables}
+        if any(table not in table_bindings for table in tables):
+            raise RuntimeError("detail table is not bound by the Contract")
+        columns_by_table = {
+            table: set(asset_pack.known_columns(table)) for table in tables
+        }
+        if any(not columns for columns in columns_by_table.values()):
+            raise RuntimeError("detail table has no projected schema")
+        aliases = {table: "t%d" % index for index, table in enumerate(tables)}
+
+        output_aliases: set[str] = set()
+        select_parts: list[str] = []
+        required_by_table: dict[str, list[str]] = {table: [] for table in tables}
+        for field_binding in contract.selected_fields:
+            if field_binding.table not in columns_by_table:
+                raise RuntimeError("selected field table is outside detail execution scope")
+            if field_binding.column not in columns_by_table[field_binding.table]:
+                raise RuntimeError("selected detail field is absent from projected schema")
+            output_alias = str(
+                field_binding.output_alias or field_binding.column
+            ).strip()
+            if not output_alias or output_alias in output_aliases:
+                raise RuntimeError("detail output aliases must be non-empty and unique")
+            output_aliases.add(output_alias)
+            select_parts.append(
+                "%s.%s AS %s"
+                % (
+                    aliases[field_binding.table],
+                    quote_identifier(field_binding.column),
+                    quote_identifier(output_alias),
+                )
+            )
+            required_by_table[field_binding.table].append(field_binding.column)
+        if not select_parts:
+            raise RuntimeError("detail execution requires exact selected fields")
+
+        primary = tables[0]
+        from_sql = "%s %s" % (quote_identifier(primary), aliases[primary])
+        if len(tables) == 2:
+            secondary = tables[1]
+            relationship_candidates = grounded_detail_relationship_candidates(
+                primary,
+                set(tables),
+                contract.relationships,
+            )
+            if len(relationship_candidates) != 1:
+                raise RuntimeError(
+                    "detail join requires exactly one direction-safe relationship proof"
+                )
+            relationship = relationship_candidates[0]
+            join_type = str(relationship.join_type or "INNER").upper()
+            predicates: list[str] = []
+            for left_column, right_column in relationship.keys:
+                if left_column not in columns_by_table[relationship.left_table]:
+                    raise RuntimeError("relationship left key is absent from projected schema")
+                if right_column not in columns_by_table[relationship.right_table]:
+                    raise RuntimeError("relationship right key is absent from projected schema")
+                predicates.append(
+                    "%s.%s = %s.%s"
+                    % (
+                        aliases[relationship.left_table],
+                        quote_identifier(left_column),
+                        aliases[relationship.right_table],
+                        quote_identifier(right_column),
+                    )
+                )
+                required_by_table[relationship.left_table].append(left_column)
+                required_by_table[relationship.right_table].append(right_column)
+            if not predicates:
+                raise RuntimeError("detail relationship has no join keys")
+            from_sql += " %s JOIN %s %s ON %s" % (
+                join_type,
+                quote_identifier(secondary),
+                aliases[secondary],
+                " AND ".join(predicates),
+            )
+
+        where: list[str] = []
+        for entity_filter in contract.entity_filters:
+            if entity_filter.table not in columns_by_table:
+                raise RuntimeError("entity filter table is outside detail execution scope")
+            if entity_filter.column not in columns_by_table[entity_filter.table]:
+                raise RuntimeError("entity filter field is absent from projected schema")
+            if entity_filter.operator not in set(entity_filter.allowed_operators):
+                raise RuntimeError("entity filter operator is not declared by field semantics")
+            where.append(
+                self._detail_filter_predicate(
+                    aliases[entity_filter.table],
+                    entity_filter.column,
+                    entity_filter.operator,
+                    entity_filter.literal_value,
+                )
+            )
+            required_by_table[entity_filter.table].append(entity_filter.column)
+
+        for table in tables:
+            binding = table_bindings[table]
+            merchant_column = str(binding.merchant_filter_column or "").strip()
+            if not merchant_column or merchant_column not in columns_by_table[table]:
+                raise RuntimeError("detail table has no governed merchant scope column")
+            where.append(
+                "%s.%s = %s"
+                % (aliases[table], quote_identifier(merchant_column), sql_literal(merchant_id))
+            )
+            required_by_table[table].append(merchant_column)
+            if contract.time_range.explicit and binding.time_column:
+                if binding.time_column not in columns_by_table[table]:
+                    raise RuntimeError("detail time field is absent from projected schema")
+                if not contract.time_range.start_date or not contract.time_range.end_date:
+                    raise RuntimeError("explicit detail time range lacks start/end bounds")
+                where.append(
+                    "%s.%s BETWEEN %s AND %s"
+                    % (
+                        aliases[table],
+                        quote_identifier(binding.time_column),
+                        sql_literal(contract.time_range.start_date),
+                        sql_literal(contract.time_range.end_date),
+                    )
+                )
+                required_by_table[table].append(binding.time_column)
+
+        sql = "SELECT %s FROM %s" % (", ".join(select_parts), from_sql)
+        if where:
+            sql += " WHERE " + " AND ".join("(%s)" % item for item in where)
+        sql += " LIMIT %d" % max(1, min(int(intent.limit or 100), 1000))
+
+        access_contracts: list[NodePlanContract] = []
+        for table in tables:
+            binding = table_bindings[table]
+            metadata = self._table_metadata(asset_pack, table)
+            visible = [
+                item.column for item in contract.selected_fields if item.table == table
+            ]
+            required = self._dedupe(required_by_table[table])
+            table_filter = next(
+                (item for item in contract.entity_filters if item.table == table),
+                None,
+            )
+            filter_output_alias = ""
+            if table_filter is not None:
+                filter_output_alias = next(
+                    (
+                        item.output_alias or item.column
+                        for item in contract.selected_fields
+                        if item.table == table
+                        and item.column == table_filter.column
+                    ),
+                    table_filter.column,
+                )
+            access_contracts.append(
+                NodePlanContract(
+                    task_id=intent.plan_task_id,
+                    question=contract.question,
+                    preferred_table=table,
+                    allowed_columns=self._dedupe(columns_by_table[table]),
+                    visible_columns=visible,
+                    internal_only_columns=[
+                        column for column in required if column not in visible
+                    ],
+                    required_columns=required,
+                    output_keys=visible,
+                    required_evidence=visible,
+                    filter_column=filter_output_alias,
+                    filter_values=[
+                        item.literal_value
+                        for item in contract.entity_filters
+                        if item.table == table
+                    ],
+                    entity_filter_obligations=[
+                        item
+                        for item in plan.entity_filter_obligations
+                        if item.reference.table == table
+                    ],
+                    days=int(intent.days or 0),
+                    limit=int(intent.limit or 100),
+                    merchant_id=merchant_id,
+                    merchant_filter_column=binding.merchant_filter_column,
+                    effective_user_id=str(
+                        user_scope.get("userId") or user_scope.get("user_id") or ""
+                    ),
+                    access_role=access_role or "merchant_analyst",
+                    row_scope_policy=normalize_row_access_policy(
+                        metadata.get("rowAccessPolicy")
+                        or default_row_access_policy(binding.merchant_filter_column)
+                    ),
+                    answer_mode=str(intent.answer_mode),
+                    task_role=str(intent.task_role),
+                    sql_strategy="grounded_deterministic",
+                    metric_governance_mode="grounded_query_contract",
+                )
+            )
+        primary_contract = next(
+            item for item in access_contracts if item.preferred_table == primary
+        )
+        return GroundedSqlCompilation(
+            sql=sql,
+            table=primary,
+            tables=tuple(tables),
+            metric_aliases=(),
+            group_columns=(),
+            required_columns=tuple(
+                self._dedupe(
+                    column
+                    for table in tables
+                    for column in required_by_table[table]
+                )
+            ),
+            node_contract=primary_contract,
+            access_contracts=tuple(access_contracts),
+        )
+
+    @staticmethod
+    def _detail_filter_predicate(
+        table_alias: str,
+        column: str,
+        operator: str,
+        literal_value: Any,
+    ) -> str:
+        left = "%s.%s" % (table_alias, quote_identifier(column))
+        operators = {
+            "EQ": "=",
+            "NE": "!=",
+            "GT": ">",
+            "GTE": ">=",
+            "LT": "<",
+            "LTE": "<=",
+        }
+        if operator == "IN":
+            if not isinstance(literal_value, (list, tuple)) or not literal_value:
+                raise RuntimeError("IN entity filter requires a non-empty literal list")
+            return "%s IN (%s)" % (
+                left,
+                ", ".join(sql_literal(item) for item in literal_value),
+            )
+        sql_operator = operators.get(operator)
+        if not sql_operator:
+            raise RuntimeError("unsupported grounded entity filter operator")
+        return "%s %s %s" % (left, sql_operator, sql_literal(literal_value))
+
+    @staticmethod
+    def _entity_filter_verification(
+        contract: NodePlanContract,
+        rows: list[dict[str, Any]],
+        sql: str,
+    ) -> EntityFilterVerificationProof:
+        obligations = [
+            item
+            for item in contract.entity_filter_obligations
+            if item.required and item.status == "bound"
+        ]
+        if not obligations:
+            return EntityFilterVerificationProof(
+                task_id=contract.task_id,
+                status="not_required",
+            )
+        reference = obligations[0].reference
+        policy = entity_comparison_policy(reference)
+        requested = canonical_entity_values(contract.filter_values, policy)
+        observed = canonical_entity_values(
+            [row.get(contract.filter_column) for row in rows if contract.filter_column in row],
+            policy,
+        )
+        contract_hash = entity_filter_contract_hash(contract)
+        base = {
+            "task_id": contract.task_id,
+            "obligation_id": obligations[0].obligation_id,
+            "field": contract.filter_column,
+            "comparison_policy": policy,
+            "contract_hash": contract_hash,
+            "sql_hash": entity_filter_sql_hash(sql),
+            "requested_value_hashes": sorted(
+                entity_value_hash(item, contract_hash) for item in requested
+            ),
+            "observed_value_hashes": sorted(
+                entity_value_hash(item, contract_hash) for item in observed
+            ),
+            "row_count": len(rows),
+            "coverage_complete": True,
+        }
+        if not contract.filter_column or not requested:
+            return EntityFilterVerificationProof(
+                **base,
+                status="failed",
+                code="ENTITY_FILTER_CONTRACT_INVALID",
+                reason="grounded entity filter lacks an executable field/value",
+            )
+        if any(contract.filter_column not in row for row in rows):
+            return EntityFilterVerificationProof(
+                **base,
+                status="failed",
+                code="ENTITY_FILTER_RESULT_UNVERIFIABLE",
+                reason="detail rows do not expose the governed entity identity",
+            )
+        unexpected = observed - requested
+        if unexpected:
+            return EntityFilterVerificationProof(
+                **base,
+                status="failed",
+                code="ENTITY_FILTER_RESULT_MISMATCH",
+                unexpected_value_count=len(unexpected),
+                reason="detail result contains identities outside the requested filter",
+            )
+        missing = requested - observed
+        return EntityFilterVerificationProof(
+            **base,
+            verified=True,
+            status="verified",
+            missing_values=sorted(missing),
         )
 
     @staticmethod
@@ -566,7 +941,7 @@ class GroundedQueryExecutionKernel:
         intent = plan.intents[0]
         bundle = QueryBundle(
             sql=compilation.sql,
-            tables=[compilation.table],
+            tables=list(compilation.tables),
             failed=True,
             error="%s: %s" % (code, message),
             summary=message,

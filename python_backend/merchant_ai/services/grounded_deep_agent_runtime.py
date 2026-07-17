@@ -137,6 +137,7 @@ class GroundedDeepAgentSession:
     core_semantic_evidence: list[dict[str, Any]] = field(default_factory=list)
     opened_topics: list[str] = field(default_factory=list)
     topic_index_read: bool = False
+    expanded_from_attempt_ids: list[str] = field(default_factory=list)
     skill_runs: list[dict[str, Any]] = field(default_factory=list)
     analysis_skill_headers_disclosed: bool = False
     analysis_skill_started: bool = False
@@ -152,7 +153,10 @@ class GroundedDeepAgentSession:
     def can_expand_topic(self) -> bool:
         if len(self.opened_topics) >= 2 or not self.runtime.attempts:
             return False
-        latest = self.runtime.attempts[-1].contract
+        latest_attempt = self.runtime.attempts[-1]
+        if latest_attempt.attempt_id in set(self.expanded_from_attempt_ids):
+            return False
+        latest = latest_attempt.contract
         if latest.status != "REVISE_BINDINGS":
             return False
         structured_gaps = [
@@ -160,22 +164,43 @@ class GroundedDeepAgentSession:
             for gap in latest.unresolved_gaps
             if gap.blocking
             and gap.required_capability
-            and gap.code
-            in {
-                "TABLE_INSUFFICIENT",
-                "REQUIRED_CAPABILITY_NOT_BOUND",
-                "METRIC_BINDING_REQUIRED",
-                "DIMENSION_BINDING_REQUIRED",
-            }
+            and (
+                "TOPIC_INDEX" in str(gap.search_scope or "").upper()
+                or bool(gap.required_capability.get("allowTopicExpansion"))
+            )
         ]
         if not structured_gaps:
             return False
-        active_topics = set(self.runtime.workspace_topics)
-        return any(
+        evidence_refs = {
             str(item.get("refId") or "")
-            and str(item.get("topic") or "") in active_topics
             for item in self.core_semantic_evidence
-        )
+            if str(item.get("refId") or "")
+        }
+        evidence_topics = {
+            str(item.get("topic") or "")
+            for item in self.core_semantic_evidence
+            if str(item.get("topic") or "")
+        }
+        for gap in structured_gaps:
+            if evidence_refs.intersection(gap.rejected_ref_ids):
+                return True
+            capability_refs = {
+                str(value)
+                for value in _nested_values(gap.required_capability)
+                if str(value).startswith("semantic:")
+            }
+            if evidence_refs.intersection(capability_refs):
+                return True
+            if gap.topic and gap.topic in evidence_topics:
+                return True
+        return False
+
+    def mark_topic_expanded(self) -> None:
+        if not self.runtime.attempts:
+            return
+        attempt_id = self.runtime.attempts[-1].attempt_id
+        if attempt_id not in self.expanded_from_attempt_ids:
+            self.expanded_from_attempt_ids.append(attempt_id)
 
 
 @dataclass(frozen=True)
@@ -320,7 +345,10 @@ class GroundedSemanticBackend:
             elif kind == "TOPIC_MANIFEST" and topic_name not in session.effective_topics():
                 if not session.topic_index_read:
                     return ReadResult(error="TOPIC_INDEX_READ_REQUIRED")
+                if not session.can_expand_topic():
+                    return ReadResult(error="TOPIC_EXPANSION_REQUIRES_STRUCTURED_GAP")
                 session.opened_topics.append(topic_name)
+                session.mark_topic_expanded()
                 if topic_name not in session.runtime.workspace_topics:
                     session.runtime.workspace_topics.append(topic_name)
 
@@ -600,19 +628,19 @@ class GroundedDeepAgentRuntime:
     SYSTEM_PROMPT = """You are the single Grounded merchant-analysis Core.
 
 The first user message already contains the automatically selected Topic L0 manifest and one Topic-scoped thin recall. Recall is navigation evidence, never planning authority.
-Before any filesystem or retrieval tool call, inspect userInputRequirements. If an analytical data question has explicitTimeExpression=false, call ask_human for a time range immediately; do not read semantic files, propose a Contract, or execute SQL first.
+Before execution, inspect userInputRequirements and the progressively-read semantic capabilities. Time is required for analytical aggregates, rankings, trends and unbounded detail lists unless the user supplied it. A concrete entity lookup is different: when the selected semantic field declares an entity identity and its lookupTimePolicy permits global/unbounded lookup, do not ask for time; bind the entity filter and let the Contract gate validate that policy. Never infer this exception from a business-specific field name or value pattern.
 The first user message also contains trustedExecutionScope. It is authoritative runtime state, not a user claim. When merchantScopeBound=true, never ask the user for merchant_id and never propose bypassing tenant filtering; the executor binds the declared merchant scope automatically.
 Use native ls/read_file/grep progressively under /knowledge. Read exact table detail, metric, column and relationship files before proposing bindings.
 Published metric files already contain the governed formula, source columns, unit and time semantics. When metricRefs satisfy the question, do not also submit fieldAggregations for the same measures.
 One Grounded Contract represents one coherent execution shape. Never combine metrics whose timeSemantics.selectionPolicy values differ. A period_window metric is a period scalar and must not be grouped by the time dimension; a per_time_grain metric over multiple days must preserve that time dimension. If the gate returns REVISE_BINDINGS, follow requiredCapability and submit a smaller compatible binding set before execution.
 For a simple same-table scalar metric query, the expected disclosure path is table detail plus the exact metric files. Do not read schema, columns/index.json, the time column, or metric source-column files unless the question needs a field aggregation, business dimension, filter, join, or a published metric is unavailable.
 When thinRecallCandidates already contains an exact readable path, read that path directly instead of opening an index. Never navigate to asset.json or a #fragment path.
-Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never maps an invented label key to a ref.
+Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
 GroundedQueryContract is the only planning authority. A candidate may be revised; only a READY candidate that compiles successfully becomes active.
-propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression; never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
+propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. Use analysisMode=ENTITY_LOOKUP for a concrete entity lookup and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
 Available governed tools are retrieve_knowledge, propose_grounded_contract, execute_grounded_query, compose_verified_answer, run_skill and ask_human. There is no action catalog and no legacy planner.
 Analysis Skill headers are not disclosed until execute_grounded_query has returned VERIFIED evidence. The Core cannot read SKILL.md and must never use a Skill procedure or header to choose metrics, dimensions, tables, or Contract shape. First execute and verify the minimal grounded data query; then select only from the Skill headers returned by execute_grounded_query and call run_skill when appropriate. run_skill is a one-way isolation boundary: after it starts, do not retrieve more knowledge, propose another Contract, execute another query, or call run_skill again. It mounts the selected full Skill for an independent subagent, workspace and checkpoint, streams progress, and publishes a structured result artifact. Do not use task for Skill execution.
-Use retrieve_knowledge only for a targeted supplemental query; it remains inside the active Topic workspace. Do not read /knowledge/topics/index.json or open another Topic merely to compare alternatives. Topic expansion is allowed only after a submitted Contract returns REVISE_BINDINGS with a structured requiredCapability gap based on evidence already read in the active Topic; then read the Topic index and expand at most one relevant Topic.
+Use retrieve_knowledge only for a targeted supplemental query; it remains inside the active Topic workspace. Governed-rule recall items marked INLINE_ONLY are usable snippets, not filesystem refs and not binding evidence. Do not read /knowledge/topics/index.json or open another Topic merely to compare alternatives. Topic expansion is allowed only after a submitted Contract returns REVISE_BINDINGS with a structured requiredCapability/searchScope gap based on evidence already read in the active Topic. A read relationship may establish that a required endpoint table is outside the current workspace; submit that relationship in the candidate Contract, then follow the returned gap to read the Topic index and exactly one relevant Topic manifest. Never expand from a normal pending request or a failed filename guess.
 Do not call task in this runtime. SubAgent dispatch is disabled until worker evidence acceptance is independently auditable.
 Never invent a formula, binding, SQL result, evidence status or answer. Finish only after compose_verified_answer, a verified run_skill result, or ask_human succeeds.
 """
@@ -1784,10 +1812,16 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 "explicitTimeExpression": has_explicit_time_expression(
                     session.runtime.question
                 ),
-                "policy": (
-                    "Analytical data queries without an explicit time expression must ask the user "
-                    "for a time range before any filesystem, recall, Contract, or SQL tool call."
-                ),
+                "timeRequirementPolicy": {
+                    "analyticalOrDetailList": "EXPLICIT_TIME_REQUIRED",
+                    "resolvedEntityLookup": "USE_FIELD_LOOKUP_TIME_POLICY",
+                    "decisionAuthority": "PROGRESSIVELY_READ_SEMANTIC_ASSET",
+                    "rule": (
+                        "Do not create field-name or business-domain exceptions. A no-time entity "
+                        "lookup is allowed only when a selected semantic entity field explicitly "
+                        "declares a compatible lookupTimePolicy."
+                    ),
+                },
             },
             "trustedExecutionScope": {
                 "merchantScopeBound": bool(session.runtime.merchant_id),
@@ -1893,13 +1927,23 @@ def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for item in bundle.items:
         metadata = dict(item.metadata or {})
-        ref_id = str(metadata.get("semanticRefId") or item.doc_id or "").strip()
-        path = _canonical_recall_path(
-            ref_id,
-            str(metadata.get("semanticPath") or metadata.get("path") or ""),
-        )
         kind = str(metadata.get("semanticKind") or item.source_type or "").upper()
-        if ref_id.endswith(":asset") or "asset.json" in path or kind == "TABLE_ASSET":
+        raw_ref_id = str(metadata.get("semanticRefId") or "").strip()
+        if not raw_ref_id and str(item.doc_id or "").startswith("semantic:"):
+            raw_ref_id = str(item.doc_id or "").strip()
+        ref_id = _canonical_progressive_ref(raw_ref_id)
+        if not ref_id.startswith("semantic:"):
+            continue
+        inline_only = kind == "GOVERNED_RULE"
+        path = ""
+        if not inline_only:
+            path = _canonical_recall_path(
+                ref_id,
+                str(metadata.get("semanticPath") or metadata.get("path") or ""),
+            )
+            if not _is_safe_semantic_path(path):
+                continue
+        if "asset.json" in path or kind == "TABLE_ASSET":
             continue
         if not ref_id or ref_id in seen:
             continue
@@ -1914,11 +1958,22 @@ def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:
                 "title": item.title,
                 "snippet": item.content[:600],
                 "score": float(item.fusion_score or 0.0),
+                "navigationMode": "INLINE_ONLY" if inline_only else "READ_FILE",
+                "bindingEligible": not inline_only,
             }
         )
         if len(result) >= max(1, int(limit or 1)):
             break
     return result
+
+
+def _is_safe_semantic_path(path: str) -> bool:
+    candidate = str(path or "").strip().lstrip("/")
+    if not candidate or ".." in candidate.split("/"):
+        return False
+    if candidate.startswith(("Users/", "private/", "var/", "tmp/")):
+        return False
+    return candidate.startswith("topics/") and "asset.json" not in candidate
 
 
 def _canonical_progressive_ref(ref_id: str) -> str:
@@ -1943,6 +1998,18 @@ def _canonical_binding_hints(hints: GroundedBindingHints) -> GroundedBindingHint
             ],
             "dimension_refs": [
                 _canonical_progressive_ref(item) for item in hints.dimension_refs
+            ],
+            "selected_fields": [
+                item.model_copy(
+                    update={"field_ref": _canonical_progressive_ref(item.field_ref)}
+                )
+                for item in hints.selected_fields
+            ],
+            "entity_filters": [
+                item.model_copy(
+                    update={"field_ref": _canonical_progressive_ref(item.field_ref)}
+                )
+                for item in hints.entity_filters
             ],
             "group_by_ref": _canonical_progressive_ref(hints.group_by_ref),
             "label_refs": {
@@ -1971,10 +2038,13 @@ def _canonical_recall_path(ref_id: str, path: str) -> str:
     canonical = ""
     if len(parts) >= 3 and parts[0] == "semantic":
         topic = parts[1]
-        if parts[2] == "relationships":
-            canonical = "topics/%s/relationships.json" % topic
+        if parts[2] in {"relationships", "relationship_index"}:
+            canonical = "topics/%s/relationships/index.json" % topic
         elif parts[2] == "relationship" and len(parts) >= 4:
-            canonical = "topics/%s/relationships.json" % topic
+            canonical = "topics/%s/relationships/%s.json" % (
+                topic,
+                ":".join(parts[3:]),
+            )
         elif len(parts) >= 5:
             table = parts[2]
             kind = parts[3]
@@ -1999,6 +2069,17 @@ def _canonical_recall_path(ref_id: str, path: str) -> str:
     if not candidate or "asset.json" in candidate or candidate.startswith(("Users/", "private/", "var/")):
         return ""
     return candidate
+
+
+def _nested_values(value: Any) -> Iterator[Any]:
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _nested_values(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _nested_values(item)
+    else:
+        yield value
 
 
 def _deepagent_reader_is_core() -> bool:

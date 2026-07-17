@@ -108,6 +108,7 @@ def column_read(
     business_name: str,
     aliases: list[str],
     role: str = "DIMENSION",
+    extra_definition: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return core_read(
         "semantic:%s:%s:column:%s" % (topic, table, column),
@@ -125,9 +126,113 @@ def column_read(
                 "description": business_name,
                 "aliases": aliases,
                 "role": role,
+                **dict(extra_definition or {}),
             },
         },
     )
+
+
+def entity_lookup_evidence() -> tuple[list[dict[str, object]], dict[str, object]]:
+    order_topic = "电商交易"
+    goods_topic = "商品管理"
+    order_table = "fact_entity_detail"
+    goods_table = "dim_related_entity"
+    order_detail = table_detail(order_topic, order_table, merchant_column="seller_id")
+    goods_detail = table_detail(goods_topic, goods_table, merchant_column="seller_id")
+    entity_id = column_read(
+        order_topic,
+        order_table,
+        "entity_id",
+        "实体编号",
+        ["实体ID"],
+        role="ENTITY_UNIQUE_KEY",
+        extra_definition={
+            "isUniqueKey": True,
+            "entityIdentity": "PRIMARY_ENTITY",
+            "filterOperators": ["EQ", "IN"],
+            "lookupTimePolicy": {"timeRequired": False, "mode": "IDENTITY_LOOKUP"},
+        },
+    )
+    related_id = column_read(
+        order_topic,
+        order_table,
+        "related_id",
+        "关联实体编号",
+        ["关联ID"],
+        role="JOIN_KEY",
+    )
+    detail_status = column_read(
+        order_topic,
+        order_table,
+        "detail_status",
+        "明细状态",
+        ["状态"],
+    )
+    published_at = column_read(
+        goods_topic,
+        goods_table,
+        "published_at",
+        "发布时间",
+        ["发布于"],
+        role="DATETIME",
+    )
+    relationship = core_read(
+        "semantic:电商交易:relationships",
+        "RELATIONSHIPS",
+        order_topic,
+        "",
+        [
+            {
+                "name": "primary_to_related",
+                "leftTable": order_table,
+                "rightTable": goods_table,
+                "joinType": "LEFT",
+                "keys": [["seller_id", "seller_id"], ["related_id", "related_id"]],
+                "grain": "primary_entity_related_entity",
+                "cardinality": "MANY_TO_ONE",
+                "fanoutPolicy": "PRESERVE_LEFT_GRAIN",
+            },
+            {
+                "name": "related_to_primary_reverse",
+                "leftTable": goods_table,
+                "rightTable": order_table,
+                "joinType": "LEFT",
+                "keys": [["seller_id", "seller_id"], ["related_id", "related_id"]],
+                "grain": "related_entity_primary_entity",
+                "cardinality": "ONE_TO_MANY",
+                "fanoutPolicy": "ALLOW_DECLARED_FANOUT",
+            }
+        ],
+    )
+    evidence = [
+        order_detail,
+        goods_detail,
+        entity_id,
+        related_id,
+        detail_status,
+        published_at,
+        relationship,
+    ]
+    hints = {
+        "tableRefs": [order_detail["refId"], goods_detail["refId"]],
+        "selectedFieldRefs": [
+            entity_id["refId"],
+            related_id["refId"],
+            detail_status["refId"],
+            published_at["refId"],
+        ],
+        "entityFilters": [
+            {
+                "fieldRef": entity_id["refId"],
+                "operator": "EQ",
+                "literalValue": "entity_100",
+                "requestedPhrase": "实体 entity_100",
+            }
+        ],
+        "relationshipRefs": [relationship["refId"]],
+        "analysisMode": "entity_lookup",
+    }
+    return evidence, hints
 
 
 def test_builds_ready_same_table_multi_metric_contract_from_core_reads_only() -> None:
@@ -225,6 +330,213 @@ def test_builds_ready_same_table_multi_metric_contract_from_core_reads_only() ->
     )
 
 
+def test_builds_typed_two_table_entity_lookup_without_metric_surrogate() -> None:
+    evidence, hints = entity_lookup_evidence()
+    contract = GroundedQueryContractBuilder().build(
+        "查询实体 entity_100 的明细，再看关联对象什么时候发布",
+        ["电商交易", "商品管理"],
+        evidence,
+        binding_hints=hints,
+    )
+
+    assert contract.ready is True, [gap.model_dump() for gap in contract.unresolved_gaps]
+    assert contract.query_shape == "ENTITY_LOOKUP"
+    assert contract.execution_shape == "detail_join"
+    assert contract.metrics == []
+    assert [item.column for item in contract.selected_fields] == [
+        "entity_id",
+        "related_id",
+        "detail_status",
+        "published_at",
+    ]
+    assert contract.entity_filters[0].column == "entity_id"
+    assert contract.entity_filters[0].operator == "EQ"
+    assert contract.entity_filters[0].literal_value == "entity_100"
+    assert contract.entity_filters[0].is_unique_key is True
+    assert contract.entity_filters[0].lookup_time_policy["timeRequired"] is False
+    assert contract.time_range.source == "default_days"
+    assert contract.relationships[0].cardinality == "MANY_TO_ONE"
+    assert contract.relationships[0].fanout_policy == "PRESERVE_LEFT_GRAIN"
+
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_grounded_query(contract, pack)
+    assert preparation.validation.valid, [
+        gap.model_dump() for gap in preparation.validation.gaps
+    ]
+    intent = preparation.plan.intents[0]
+    assert intent.answer_mode == "DETAIL"
+    assert intent.metric_name == ""
+    assert intent.metric_formula == ""
+    assert intent.metric_specs == []
+    assert intent.filter_column == "entity_id"
+    assert intent.filter_value == "entity_100"
+    assert intent.output_keys == [
+        "entity_id",
+        "related_id",
+        "detail_status",
+        "published_at",
+    ]
+
+
+def test_order_detail_question_is_bound_as_generic_entity_lookup_not_metric() -> None:
+    evidence, hints = entity_lookup_evidence()
+    hints["entityFilters"][0]["literalValue"] = "order_id_100"
+    hints["entityFilters"][0]["requestedPhrase"] = "订单 order_id_100"
+    contract = GroundedQueryContractBuilder().build(
+        "查询订单 order_id_100 的订单明细，再看对应商品什么时候发布",
+        ["电商交易", "商品管理"],
+        evidence,
+        binding_hints=hints,
+    )
+
+    assert contract.ready is True
+    assert contract.query_shape == "ENTITY_LOOKUP"
+    assert contract.metrics == []
+    assert contract.entity_filters[0].literal_value == "order_id_100"
+    assert contract.entity_filters[0].entity_identity == "PRIMARY_ENTITY"
+
+
+def test_label_refs_cannot_substitute_for_typed_entity_filter() -> None:
+    evidence, hints = entity_lookup_evidence()
+    entity_filter = hints.pop("entityFilters")
+    hints["labelRefs"] = {
+        entity_filter[0]["fieldRef"]: "entity_100",
+    }
+    contract = GroundedQueryContractBuilder().build(
+        "查询实体 entity_100 的明细",
+        ["电商交易", "商品管理"],
+        evidence,
+        binding_hints=hints,
+    )
+
+    assert contract.ready is False
+    assert contract.entity_filters == []
+    assert "ENTITY_FILTER_REQUIRED" in {gap.code for gap in contract.unresolved_gaps}
+
+
+def test_single_table_detail_list_uses_typed_projection_and_explicit_time() -> None:
+    topic = "通用明细"
+    table = "fact_activity_detail"
+    detail = table_detail(topic, table, merchant_column="tenant_id")
+    activity_id = column_read(
+        topic,
+        table,
+        "activity_id",
+        "活动编号",
+        ["活动ID"],
+        role="ENTITY_KEY",
+    )
+    activity_status = column_read(
+        topic,
+        table,
+        "activity_status",
+        "活动状态",
+        ["状态"],
+    )
+    contract = GroundedQueryContractBuilder().build(
+        "查看最近30天活动明细",
+        [topic],
+        [detail, activity_id, activity_status],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "selectedFieldRefs": [activity_id["refId"], activity_status["refId"]],
+            "analysisMode": "detail",
+            "timeExpression": "最近30天",
+        },
+    )
+
+    assert contract.ready is True
+    assert contract.query_shape == "DETAIL"
+    assert contract.metrics == []
+    assert contract.entity_filters == []
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_grounded_query(contract, pack)
+    assert preparation.validation.valid
+    assert preparation.plan.intents[0].answer_mode == "DETAIL"
+
+
+def test_relationship_endpoint_gap_drives_generic_binding_expansion() -> None:
+    evidence, hints = entity_lookup_evidence()
+    goods_detail_ref = hints["tableRefs"].pop()
+    hints["selectedFieldRefs"] = hints["selectedFieldRefs"][:-1]
+    evidence = [item for item in evidence if item["refId"] != goods_detail_ref]
+    contract = GroundedQueryContractBuilder().build(
+        "查询实体 entity_100 的明细并查看关联对象",
+        ["电商交易", "商品管理"],
+        evidence,
+        binding_hints=hints,
+    )
+
+    assert contract.status == "REVISE_BINDINGS"
+    gap = next(
+        item
+        for item in contract.unresolved_gaps
+        if item.code == "RELATIONSHIP_ENDPOINT_TABLE_BINDING_REQUIRED"
+    )
+    assert gap.search_scope == "READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX"
+    assert gap.required_capability == {
+        "endpointTable": "dim_related_entity",
+        "relationshipRef": "semantic:电商交易:relationships",
+        "requiredSemanticRole": "RELATIONSHIP_ENDPOINT_TABLE",
+    }
+
+
+def test_detail_join_fails_closed_without_declared_fanout_policy() -> None:
+    evidence, hints = entity_lookup_evidence()
+    relationship = evidence[-1]
+    payload = json.loads(str(relationship["contentSnippet"]))
+    payload[0].pop("fanoutPolicy")
+    replacement = core_read(
+        str(relationship["refId"]),
+        "RELATIONSHIPS",
+        str(relationship["topic"]),
+        "",
+        payload,
+    )
+    evidence[-1] = replacement
+    contract = GroundedQueryContractBuilder().build(
+        "查询实体 entity_100 的明细和关联对象",
+        ["电商交易", "商品管理"],
+        evidence,
+        binding_hints=hints,
+    )
+
+    assert contract.ready is False
+    assert "RELATIONSHIP_FANOUT_POLICY_REQUIRED" in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+
+
+def test_detail_join_fails_closed_when_multiple_direction_safe_proofs_remain() -> None:
+    evidence, hints = entity_lookup_evidence()
+    relationship = evidence[-1]
+    payload = json.loads(str(relationship["contentSnippet"]))
+    competing = dict(payload[0])
+    competing["name"] = "primary_to_related_competing"
+    payload.append(competing)
+    evidence[-1] = core_read(
+        str(relationship["refId"]),
+        "RELATIONSHIPS",
+        str(relationship["topic"]),
+        "",
+        payload,
+    )
+    contract = GroundedQueryContractBuilder().build(
+        "查询实体 entity_100 的明细和关联对象",
+        ["电商交易", "商品管理"],
+        evidence,
+        binding_hints=hints,
+    )
+
+    assert contract.status == "REVISE_BINDINGS"
+    gap = next(
+        item
+        for item in contract.unresolved_gaps
+        if item.code == "DETAIL_RELATIONSHIP_BINDING_AMBIGUOUS"
+    )
+    assert gap.required_capability["requiredSemanticRole"] == (
+        "UNAMBIGUOUS_DETAIL_RELATIONSHIP"
+    )
 def test_model_style_binding_aliases_normalize_to_typed_contract_fields() -> None:
     topic = "经营画像"
     table = "ads_merchant_profile"
