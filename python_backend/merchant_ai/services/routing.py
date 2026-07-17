@@ -386,7 +386,7 @@ class KeywordExtractService:
         for item in business + time_words + keyword_actions + keyword_ranking:
             if item and item not in keywords:
                 keywords.append(item)
-        analysis_intent = classify_analysis_intent(normalized, action, ranking)
+        analysis_intent = classify_analysis_intent(action, lexical_spans)
         confidence = keyword_confidence(topic_scores, metric_mentions, dimension_mentions, normalized, ambiguous_metrics)
         unresolved: List[str] = []
         return ExtractedKeywords(
@@ -1072,24 +1072,21 @@ def dedupe_topics(items: List[Any]) -> List[QuestionCategory]:
     return result
 
 
-def classify_analysis_intent(text: str, actions: List[str], ranking: List[str]) -> str:
-    if any(term in text for term in ["为什么", "原因", "归因", "影响因素", "导致"]):
-        return "attribution"
-    if any(term in text for term in ["占比", "比例", "比率", "占了多少", "占多少"]):
-        return "ratio"
-    if ranking:
+def classify_analysis_intent(
+    actions: List[str],
+    lexical_spans: List[RouteLexicalSpan],
+) -> str:
+    """Expose only analysis intent that routing can prove structurally.
+
+    A typed ranking span has an operator/position contract and may therefore be
+    surfaced as ``ranking``. Action tokens are retained as lexical facts, but
+    their business meaning belongs to Planner understanding rather than a
+    routing synonym table.
+    """
+
+    if any(span.span_type == RouteSpanType.RANKING for span in lexical_spans):
         return "ranking"
-    if any(term in text for term in ["同比", "环比", "对比", "比较", "同时", "分别", "关联", "相关"]):
-        return "comparison"
-    if any(term in text for term in ["异常", "是否正常", "风险", "波动"]):
-        return "anomaly"
-    if any(term in text for term in ["趋势", "走势", "变化", "上升", "下降", "同步"]):
-        return "trend"
-    if any(term in text for term in ["建议", "优化", "改善", "怎么办"]):
-        return "advice"
-    if any(term in text for term in ["明细", "详情", "列表", "记录", "单号", "流水"]):
-        return "detail"
-    return "analysis" if actions else "lookup"
+    return "unresolved" if actions else "lookup"
 
 
 def keyword_confidence(
@@ -1493,7 +1490,8 @@ class PreflightUnderstandingService:
         business_surface = self.keyword_service.business_surface_signal(text)
         has_time = bool(extract_temporal_lexical_spans(text))
         has_object_ref = self.slot_extractor.has_object_ref(text)
-        raw_analysis_intent = bool(any(term in text for term in ACTION_KEYWORDS))
+        lexical_spans = extract_route_lexical_spans(text)
+        has_typed_ranking = any(span.span_type == RouteSpanType.RANKING for span in lexical_spans)
         write_operation = bool(any(term.lower() in lowered for term in RouteSlotExtractor.WRITE_TERMS))
         greeting = bool(re.match(r"^(你好|您好|hi|hello|hey|在吗|嗨|哈喽|早上好|下午好|晚上好)[!！。,.，\s]*$", lowered, re.I))
         assistant_chat_phrase = bool(
@@ -1513,7 +1511,7 @@ class PreflightUnderstandingService:
         )
         confidence = 0.2
         has_analysis_intent = bool(
-            raw_analysis_intent
+            has_typed_ranking
             and (
                 business_surface.get("hasBusinessDomainPhrase")
                 or business_metric_like
@@ -1531,6 +1529,7 @@ class PreflightUnderstandingService:
             "writeOperation": write_operation,
             "hasTimeExpression": has_time,
             "hasObjectRef": has_object_ref,
+            "hasTypedRankingSpan": has_typed_ranking,
             "hasMetricLikePhrase": metric_like,
             "hasBusinessMetricLikePhrase": business_metric_like,
             "hasGenericMetricLikePhrase": generic_metric_like,
@@ -1714,41 +1713,11 @@ class RouteSlotExtractor:
         return spans[0].text if spans else ""
 
     def _analysis_signals(self, keywords: ExtractedKeywords) -> List[str]:
-        analysis_actions = {
-            "为什么",
-            "原因",
-            "影响",
-            "分析",
-            "对比",
-            "环比",
-            "同比",
-            "同时",
-            "分别",
-            "并且",
-            "综合",
-            "关联",
-            "对应",
-            "趋势",
-            "走势",
-            "变化",
-            "同步",
-            "上升",
-            "下降",
-            "波动",
-            "异常",
-            "风险",
-            "建议",
-            "优化",
-            "改善",
-            "怎么办",
-            "排查",
-            "最高",
-            "最低",
-            "最多",
-            "最少",
-        }
-        if keywords and any(action in analysis_actions for action in keywords.action_keywords):
-            return ["weak_analysis_hint"]
+        if keywords and any(
+            span.span_type == RouteSpanType.RANKING
+            for span in keywords.lexical_spans
+        ):
+            return ["typed_ranking_span"]
         return []
 
     def _topic_candidates(

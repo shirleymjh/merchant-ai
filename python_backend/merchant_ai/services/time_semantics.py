@@ -226,26 +226,44 @@ def resolve_time_window_contract(
     )
     primary.window_role = "primary"
     if len(explicit_windows) >= 2:
-        comparison = explicit_windows[1]
-        comparison.window_role = "comparison"
-        comparison.comparison_type = "explicit_multi_window"
+        secondary = explicit_windows[1]
+        if window_relation == "explicit_comparison":
+            secondary.window_role = "comparison"
+            secondary.comparison_type = "explicit_comparison"
+        else:
+            secondary.window_role = "additional_1"
+            secondary.comparison_type = ""
+        comparison = secondary if window_relation == "explicit_comparison" else None
     else:
+        secondary = None
         comparison = resolve_comparison_time_range(text, primary, timezone_name, now=now)
-    grain = resolve_time_grain(text, comparison)
+    grain = resolve_time_grain(text, comparison or secondary)
     windows = [primary.model_dump(by_alias=True)]
-    if comparison:
+    if secondary:
+        windows.append(secondary.model_dump(by_alias=True))
+    elif comparison:
         windows.append(comparison.model_dump(by_alias=True))
     if len(explicit_windows) > 2:
         for index, window in enumerate(explicit_windows[2:], start=2):
-            window.window_role = "comparison_%d" % index
-            window.comparison_type = "explicit_multi_window"
+            window.window_role = (
+                "comparison_%d" % index
+                if window_relation == "explicit_comparison"
+                else "additional_%d" % index
+            )
+            window.comparison_type = "explicit_comparison" if window_relation == "explicit_comparison" else ""
             windows.append(window.model_dump(by_alias=True))
+    requires_comparison = bool(comparison)
     contract: Dict[str, Any] = {
         "primary": primary.model_dump(by_alias=True),
         "comparison": comparison.model_dump(by_alias=True) if comparison else {},
+        "additionalWindows": (
+            [dict(item) for item in windows[1:]]
+            if len(windows) > 1 and not requires_comparison
+            else []
+        ),
         "windows": windows,
         "grain": grain,
-        "requiresComparison": bool(comparison),
+        "requiresComparison": requires_comparison,
         "requiresMultipleWindows": len(windows) > 1,
         "comparisonType": comparison.comparison_type if comparison else "",
         "windowRelation": window_relation or ("comparison" if comparison else "single"),
@@ -679,11 +697,11 @@ def apply_time_window_contract_to_plan(plan: QueryPlan, contract: Dict[str, Any]
         plan = apply_period_grain_to_plan(plan, contract)
         understanding = dict(plan.question_understanding or understanding)
         understanding["timeWindowContract"] = contract
-    if contract.get("requiresComparison"):
-        understanding["analysisIntent"] = "comparison"
-        plan = add_comparison_baseline_to_plan(plan, contract)
+    if contract.get("requiresMultipleWindows"):
+        plan = add_secondary_time_windows_to_plan(plan, contract)
         understanding = dict(plan.question_understanding or understanding)
         understanding["timeWindowContract"] = contract
+    if contract.get("requiresComparison"):
         understanding["analysisIntent"] = "comparison"
     return plan.model_copy(update={"question_understanding": understanding})
 
@@ -1026,61 +1044,104 @@ def declared_time_column_for_intent(
     return ""
 
 
-def add_comparison_baseline_to_plan(plan: QueryPlan, contract: Dict[str, Any]) -> QueryPlan:
-    comparison = time_range_from_contract(contract.get("comparison") or {})
-    if not comparison or any(str(intent.plan_task_id or "").endswith("_baseline") for intent in plan.intents):
+def add_secondary_time_windows_to_plan(plan: QueryPlan, contract: Dict[str, Any]) -> QueryPlan:
+    """Clone the primary graph for every additional structured time window.
+
+    Multiple requested windows are an execution-shape obligation.  They only
+    become an analysis comparison when the time contract explicitly declares
+    that relation; conjunction windows keep independent roles and values.
+    """
+
+    raw_windows = [item for item in contract.get("windows") or [] if isinstance(item, dict)]
+    secondary_payloads = raw_windows[1:]
+    if not secondary_payloads and isinstance(contract.get("comparison"), dict) and contract.get("comparison"):
+        secondary_payloads = [dict(contract["comparison"])]
+    if not plan.intents or not secondary_payloads:
         return plan
-    comparison.window_role = "comparison"
+
+    base_intents = list(plan.intents)
+    base_dependencies = list(plan.dependencies)
     existing_ids = {str(intent.plan_task_id or "") for intent in plan.intents if intent.plan_task_id}
-    task_id_map: Dict[str, str] = {}
-    baseline_intents = []
-    for intent in plan.intents:
-        if not intent.plan_task_id:
+    cloned_intents = []
+    cloned_dependencies = []
+    trace_entries: list[str] = []
+    agent_entries: list[str] = []
+    for index, payload in enumerate(secondary_payloads, start=1):
+        window = time_range_from_contract(payload)
+        if not window:
             continue
-        baseline_id = unique_baseline_task_id(intent.plan_task_id, existing_ids)
-        existing_ids.add(baseline_id)
-        task_id_map[intent.plan_task_id] = baseline_id
-    for intent in plan.intents:
-        baseline_id = task_id_map.get(intent.plan_task_id)
-        if not baseline_id:
+        role = str(window.window_role or payload.get("windowRole") or "additional_%d" % index)
+        window.window_role = role
+        if any(
+            intent.time_range.window_role == role
+            and intent.time_range.start_date == window.start_date
+            and intent.time_range.end_date == window.end_date
+            for intent in plan.intents
+        ):
             continue
-        resolution = dict(intent.metric_resolution or {})
-        resolution["timeWindowRole"] = "comparison"
-        resolution["displayRole"] = resolution.get("displayRole") or "comparison_baseline"
-        baseline_intents.append(
-            intent.model_copy(
+        task_id_map: Dict[str, str] = {}
+        for intent in base_intents:
+            if not intent.plan_task_id:
+                continue
+            clone_id = unique_time_window_task_id(intent.plan_task_id, role, existing_ids)
+            existing_ids.add(clone_id)
+            task_id_map[intent.plan_task_id] = clone_id
+        for intent in base_intents:
+            clone_id = task_id_map.get(intent.plan_task_id)
+            if not clone_id:
+                continue
+            resolution = dict(intent.metric_resolution or {})
+            resolution["timeWindowRole"] = role
+            if role == "comparison" or role.startswith("comparison_"):
+                resolution["displayRole"] = resolution.get("displayRole") or "comparison_baseline"
+                note = "comparison baseline %s" % (window.label or "")
+            else:
+                resolution["displayRole"] = resolution.get("displayRole") or "summary"
+                note = "additional time window %s" % (window.label or "")
+            cloned_intents.append(
+                intent.model_copy(
+                    update={
+                        "plan_task_id": clone_id,
+                        "depends_on_task_ids": [task_id_map.get(task_id, task_id) for task_id in intent.depends_on_task_ids],
+                        "time_range": window,
+                        "days": window.days or intent.days,
+                        "metric_resolution": resolution,
+                        "analysis_note": append_note(intent.analysis_note, note),
+                    }
+                )
+            )
+        cloned_dependencies.extend(
+            dep.model_copy(
                 update={
-                    "plan_task_id": baseline_id,
-                    "depends_on_task_ids": [task_id_map.get(task_id, task_id) for task_id in intent.depends_on_task_ids],
-                    "time_range": comparison,
-                    "days": comparison.days or intent.days,
-                    "metric_resolution": resolution,
-                    "analysis_note": append_note(intent.analysis_note, "comparison baseline %s" % (comparison.label or "")),
+                    "anchor_task_id": task_id_map.get(dep.anchor_task_id, dep.anchor_task_id),
+                    "dependent_task_id": task_id_map.get(dep.dependent_task_id, dep.dependent_task_id),
                 }
             )
+            for dep in base_dependencies
+            if dep.anchor_task_id in task_id_map and dep.dependent_task_id in task_id_map
         )
-    baseline_deps = [
-        dep.model_copy(
-            update={
-                "anchor_task_id": task_id_map.get(dep.anchor_task_id, dep.anchor_task_id),
-                "dependent_task_id": task_id_map.get(dep.dependent_task_id, dep.dependent_task_id),
-            }
-        )
-        for dep in plan.dependencies
-        if dep.anchor_task_id in task_id_map and dep.dependent_task_id in task_id_map
-    ]
+        trace_entries.append("TIME_WINDOW_%s:%s" % (role.upper(), ",".join(task_id_map.values())))
+        agent_entries.append("time_window_tool=%s" % role)
+    if not cloned_intents:
+        return plan
     trace = list(plan.compiler_trace or [])
-    trace.append("TIME_WINDOW_COMPARISON_BASELINE:%s" % ",".join(task_id_map.values()))
+    trace.extend(trace_entries)
     agent_trace = list(plan.agent_trace or [])
-    agent_trace.append("time_window_tool=comparison_baseline")
+    agent_trace.extend(agent_entries)
     return plan.model_copy(
         update={
-            "intents": list(plan.intents) + baseline_intents,
-            "dependencies": list(plan.dependencies) + baseline_deps,
+            "intents": list(plan.intents) + cloned_intents,
+            "dependencies": list(plan.dependencies) + cloned_dependencies,
             "compiler_trace": trace,
             "agent_trace": agent_trace,
         }
     )
+
+
+def add_comparison_baseline_to_plan(plan: QueryPlan, contract: Dict[str, Any]) -> QueryPlan:
+    """Backward-compatible wrapper for callers with a comparison contract."""
+
+    return add_secondary_time_windows_to_plan(plan, contract)
 
 
 def time_range_from_contract(payload: Dict[str, Any]) -> Optional[ResolvedTimeRange]:
@@ -1094,6 +1155,19 @@ def time_range_from_contract(payload: Dict[str, Any]) -> Optional[ResolvedTimeRa
 
 def unique_baseline_task_id(task_id: str, existing_ids: set[str]) -> str:
     base = "%s_baseline" % str(task_id or "task").strip()
+    candidate = base
+    index = 2
+    while candidate in existing_ids:
+        candidate = "%s_%d" % (base, index)
+        index += 1
+    return candidate
+
+
+def unique_time_window_task_id(task_id: str, role: str, existing_ids: set[str]) -> str:
+    if role == "comparison":
+        return unique_baseline_task_id(task_id, existing_ids)
+    safe_role = re.sub(r"[^A-Za-z0-9_]+", "_", str(role or "additional")).strip("_") or "additional"
+    base = "%s_%s" % (str(task_id or "task").strip(), safe_role)
     candidate = base
     index = 2
     while candidate in existing_ids:

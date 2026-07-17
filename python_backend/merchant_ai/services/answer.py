@@ -2056,7 +2056,7 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
         return []
     values: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    comparison_plan = plan_has_time_window_comparison(plan)
+    multi_window_plan = plan_has_multiple_time_windows(plan)
     for intent in plan.intents:
         if not intent:
             continue
@@ -2076,7 +2076,7 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
         if metric_spec_values:
             for item in metric_spec_values:
                 metric_key = str(item.get("metricKey") or "")
-                seen_key = summary_metric_seen_key(metric_key, str(item.get("timeWindowRole") or ""), comparison_plan)
+                seen_key = summary_metric_seen_key(metric_key, str(item.get("timeWindowRole") or ""), multi_window_plan)
                 if not metric_key or seen_key in seen:
                     continue
                 seen.add(seen_key)
@@ -2091,7 +2091,7 @@ def summary_metric_values(plan: QueryPlan, run_result: AgentRunResult) -> List[D
         resolution = intent.metric_resolution or {}
         metric_key = str(resolution.get("metricKey") or intent.metric_name or value_column)
         time_role = answer_time_window_role(intent, rows[0])
-        seen_key = summary_metric_seen_key(metric_key, time_role, comparison_plan)
+        seen_key = summary_metric_seen_key(metric_key, time_role, multi_window_plan)
         if seen_key in seen:
             continue
         seen.add(seen_key)
@@ -2168,8 +2168,16 @@ def plan_has_time_window_comparison(plan: QueryPlan) -> bool:
     return False
 
 
-def summary_metric_seen_key(metric_key: str, time_role: str, comparison_plan: bool) -> str:
-    if comparison_plan:
+def plan_has_multiple_time_windows(plan: QueryPlan) -> bool:
+    contract = (plan.question_understanding or {}).get("timeWindowContract") or {}
+    if isinstance(contract, dict) and contract.get("requiresMultipleWindows"):
+        return True
+    roles = {answer_time_window_role(intent, {}) for intent in plan.intents}
+    return len({role for role in roles if role}) > 1
+
+
+def summary_metric_seen_key(metric_key: str, time_role: str, multi_window_plan: bool) -> str:
+    if multi_window_plan:
         return "%s|%s" % (metric_key, time_role or "primary")
     return metric_key
 
@@ -2650,6 +2658,9 @@ def summary_metric_sentence_from_items(question: str, summaries: List[Dict[str, 
     comparison_sentence = comparison_metric_sentence_from_items(question, summaries)
     if comparison_sentence:
         return comparison_sentence
+    multi_window_sentence = independent_time_window_sentence_from_items(summaries)
+    if multi_window_sentence:
+        return multi_window_sentence
     time_phrase = extract_question_time_phrase(question)
     prefix = "%s，" % time_phrase if time_phrase else "当前查询范围内，"
     parts = []
@@ -2660,6 +2671,34 @@ def summary_metric_sentence_from_items(question: str, summaries: List[Dict[str, 
         )
         parts.append("%s为 %s" % (label, value))
     return prefix + "，".join(parts) + "。"
+
+
+def independent_time_window_sentence_from_items(summaries: List[Dict[str, Any]]) -> str:
+    """Render several requested windows without inventing a comparison."""
+
+    roles = [str(item.get("timeWindowRole") or "") for item in summaries]
+    if len({role for role in roles if role}) <= 1:
+        return ""
+    grouped: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for item in summaries:
+        role = str(item.get("timeWindowRole") or "primary")
+        label = str(item.get("timeWindowLabel") or role)
+        grouped.setdefault((role, label), []).append(item)
+    parts: List[str] = []
+    for (_role, window_label), items in grouped.items():
+        values = []
+        for item in items[:6]:
+            metric_label = str(item.get("label") or item.get("metricKey") or "指标")
+            value = format_metric_value_for_answer(
+                item.get("value"),
+                str(item.get("metricKey") or ""),
+                metric_label,
+                item.get("displayMetadata"),
+            )
+            values.append("%s为 %s" % (metric_label, value))
+        if values:
+            parts.append("%s：%s" % (window_label, "，".join(values)))
+    return ("；".join(parts) + "。") if len(parts) > 1 else ""
 
 
 def comparison_metric_sentence_from_items(question: str, summaries: List[Dict[str, Any]]) -> str:

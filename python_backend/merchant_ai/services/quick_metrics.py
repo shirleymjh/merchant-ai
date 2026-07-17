@@ -329,7 +329,7 @@ def quick_metric_temporal_mode(time_range: Any, temporal_contract: Dict[str, Any
     Planner rather than silently answering only the primary window.
     """
 
-    if bool((temporal_contract or {}).get("requiresComparison")):
+    if bool((temporal_contract or {}).get("requiresMultipleWindows")):
         return "unsupported"
     if str(getattr(time_range, "kind", "") or "") == "exact_date":
         return "exact_day"

@@ -2814,7 +2814,14 @@ class MerchantQaWorkflow:
         clarified_metric_focus = str((state.get("clarification_resolution") or {}).get("metricFocus") or "")
         if clarified_metric_focus:
             metric_phrases = dedupe_texts([clarified_metric_focus, *metric_phrases])
-        analysis_requested = bool(slots.analysis_signals or state.get("open_diagnostic_intent"))
+        # Routing may flag that a semantic goal still needs interpretation, but
+        # it must not name that goal.  The Planner sees the raw question and
+        # owns the exact analysis relation.
+        analysis_requested = bool(
+            slots.analysis_signals
+            or str(keywords.analysis_intent or "").strip().lower() == "unresolved"
+            or state.get("open_diagnostic_intent")
+        )
         if route.route == QuestionRoute.GREETING:
             intent_kind = "chat"
             complexity = "simple"
@@ -2836,15 +2843,20 @@ class MerchantQaWorkflow:
         elif object_refs and not analysis_requested and len(topics) <= 3:
             intent_kind = "detail_lookup"
             complexity = "simple" if len(topics) <= 2 else "medium"
+        # Multiple independently requested measures require one semantic
+        # understanding pass even when the user only asks for their values.
+        # Whether those measures are related by a comparison, ratio, trend, or
+        # no analysis relation at all is Planner-owned; a connective word must
+        # never decide that relationship in the routing layer.
+        elif len(metric_phrases) >= 2:
+            intent_kind = "multi_metric"
+            complexity = "medium"
         elif analysis_requested:
             intent_kind = "analysis"
             complexity = "complex"
         elif business_topic_count >= 3:
             intent_kind = "multi_hop"
             complexity = "complex"
-        elif len(metric_phrases) >= 3:
-            intent_kind = "multi_metric"
-            complexity = "medium"
         elif has_data:
             intent_kind = "metric_query"
             complexity = "simple"

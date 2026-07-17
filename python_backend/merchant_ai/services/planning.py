@@ -247,6 +247,150 @@ class QuestionGraphContract:
         )
 
 
+COMPARISON_RELATION_OPERATIONS = {"comparison", "difference", "ratio", "percentage"}
+
+
+def planner_question_understanding_output_validation_errors(
+    question: str,
+    payload: Dict[str, Any],
+    schema: Dict[str, Any],
+    planning_contract: Dict[str, Any] | None = None,
+) -> List[str]:
+    """Validate schema plus the semantic evidence required by ``comparison``.
+
+    A list of requested metrics is not a comparison contract.  The emitted
+    understanding must instead bind two explicit operands in
+    ``calculationIntents`` or inherit an explicit primary-vs-comparison time
+    relation from the deterministic planning contract.  Keeping this check at
+    the LLM output boundary lets the normal invalid-output retry repair a false
+    comparison before QueryGraph compilation.
+    """
+
+    errors = list(planner_structured_output_validation_errors(payload, schema))
+    if str((payload or {}).get("status") or "").strip().upper() != "UNDERSTOOD":
+        return errors
+    understanding = (payload or {}).get("questionUnderstanding") or (payload or {}).get("question_understanding") or {}
+    if not isinstance(understanding, dict):
+        return errors
+    analysis_intent = str(
+        understanding.get("analysisIntent") or understanding.get("analysis_intent") or "none"
+    ).strip().lower()
+    if analysis_intent != "comparison":
+        return errors
+    required_evidence = understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []
+    if not isinstance(required_evidence, list) or not required_evidence:
+        errors.append(
+            "$.questionUnderstanding.requiredEvidenceIntents: comparison requires at least one evidence intent"
+        )
+    if comparison_relation_is_structured(question, understanding, planning_contract or {}):
+        return list(dict.fromkeys(errors))
+    errors.append(
+        "$.questionUnderstanding.analysisIntent: comparison requires an explicit structured relation: "
+        "two grounded and bound metric operands in calculationIntents, or distinct primary/comparison windows "
+        "with an explicit comparison relation"
+    )
+    return list(dict.fromkeys(errors))
+
+
+def comparison_relation_is_structured(
+    question: str,
+    understanding: Dict[str, Any],
+    planning_contract: Dict[str, Any] | None = None,
+) -> bool:
+    declared_metric_owners = comparison_declared_metric_owners(understanding)
+    calculations = understanding.get("calculationIntents") or understanding.get("calculation_intents") or []
+    for calculation in calculations if isinstance(calculations, list) else []:
+        if not isinstance(calculation, dict):
+            continue
+        operation = str(calculation.get("operation") or "").strip().lower()
+        source_phrase = str(
+            calculation.get("sourcePhrase") or calculation.get("source_phrase") or ""
+        ).strip()
+        if operation not in COMPARISON_RELATION_OPERATIONS or not comparison_phrase_is_grounded(question, source_phrase):
+            continue
+        left_metric = str(
+            calculation.get("numeratorMetricRef") or calculation.get("numerator_metric_ref") or ""
+        ).strip()
+        right_metric = str(
+            calculation.get("denominatorMetricRef") or calculation.get("denominator_metric_ref") or ""
+        ).strip()
+        metric_operands_are_bound = bool(
+            left_metric
+            and right_metric
+            and left_metric != right_metric
+            and len(declared_metric_owners.get(left_metric) or set()) == 1
+            and len(declared_metric_owners.get(right_metric) or set()) == 1
+        )
+        if metric_operands_are_bound:
+            return True
+    return explicit_time_comparison_is_structured(planning_contract or {})
+
+
+def comparison_declared_metric_owners(understanding: Dict[str, Any]) -> Dict[str, Set[str]]:
+    owners: Dict[str, Set[str]] = {}
+    for key in ["anchorMetric", "anchor_metric", "rankingObjective", "ranking_objective"]:
+        item = understanding.get(key)
+        if isinstance(item, dict):
+            metric_ref = str(item.get("metricRef") or item.get("metric_ref") or "").strip()
+            if metric_ref:
+                owner = str(item.get("ownerTable") or item.get("owner_table") or "").strip()
+                owners.setdefault(metric_ref, set()).add(owner)
+    for key in ["supportMetrics", "support_metrics", "requestedMeasures", "requested_measures"]:
+        items = understanding.get(key) or []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            metric_ref = str(item.get("metricRef") or item.get("metric_ref") or "").strip()
+            if metric_ref:
+                owner = str(item.get("ownerTable") or item.get("owner_table") or "").strip()
+                owners.setdefault(metric_ref, set()).add(owner)
+    return owners
+
+
+def comparison_phrase_is_grounded(question: str, phrase: str) -> bool:
+    normalized_question = normalize_for_match(question)
+    normalized_phrase = normalize_for_match(phrase)
+    return bool(normalized_phrase and normalized_phrase in normalized_question)
+
+
+def explicit_time_comparison_is_structured(planning_contract: Dict[str, Any]) -> bool:
+    if not isinstance(planning_contract, dict):
+        return False
+    relation = str(
+        planning_contract.get("windowRelation") or planning_contract.get("window_relation") or ""
+    ).strip().lower()
+    requires_comparison = planning_contract.get("requiresComparison")
+    if isinstance(requires_comparison, str):
+        requires_comparison = requires_comparison.strip().lower() in {"1", "true", "yes"}
+    if not requires_comparison or relation not in {"comparison", "explicit_comparison"}:
+        return False
+    primary = planning_contract.get("timeRange") or planning_contract.get("time_range") or planning_contract.get("primary") or {}
+    comparison = (
+        planning_contract.get("comparisonTimeRange")
+        or planning_contract.get("comparison_time_range")
+        or planning_contract.get("comparison")
+        or {}
+    )
+    if not isinstance(primary, dict) or not primary or not isinstance(comparison, dict) or not comparison:
+        return False
+    return structured_time_window_signature(primary) != structured_time_window_signature(comparison)
+
+
+def structured_time_window_signature(window: Dict[str, Any]) -> Tuple[str, ...]:
+    return tuple(
+        str(window.get(key) or "")
+        for key in [
+            "kind",
+            "startDate",
+            "endDate",
+            "days",
+            "windowRole",
+            "offsetDays",
+            "comparisonType",
+        ]
+    )
+
+
 @dataclass
 class UnderstandingCoverageResult:
     understanding: Dict[str, Any]
@@ -3509,7 +3653,12 @@ class QueryGraphPlanner:
             transient_call_failed = bool(operational_attempts) and not bool(raw_payload)
             payload = raw_payload
             payload = normalize_question_understanding_payload(payload if isinstance(payload, dict) else {})
-            validation_errors = planner_structured_output_validation_errors(payload, tool.parameters)
+            validation_errors = planner_question_understanding_output_validation_errors(
+                question,
+                payload,
+                tool.parameters,
+                planning_contract=selected_user_payload.get("planningContract") or {},
+            )
             retry_attempts: List[Dict[str, Any]] = []
             retry_budget = max(
                 0,
@@ -3576,7 +3725,12 @@ class QueryGraphPlanner:
                 payload = normalize_question_understanding_payload(
                     retry_payload if isinstance(retry_payload, dict) else {}
                 )
-                validation_errors = planner_structured_output_validation_errors(payload, tool.parameters)
+                validation_errors = planner_question_understanding_output_validation_errors(
+                    question,
+                    payload,
+                    tool.parameters,
+                    planning_contract=selected_user_payload.get("planningContract") or {},
+                )
             if (
                 validation_errors
                 and not transient_call_failed
@@ -3937,7 +4091,7 @@ class QueryGraphPlanner:
                     "filters[field,value] is read only for migration compatibility; new plans must use semanticQuery with "
                     "predicate/group nodes and rootFilterNodeId"
                 ),
-                "calculationRule": "when the user asks for proportion/percentage/占比/占多少, declare calculationIntents as event population divided by base population",
+                "calculationRule": "declare calculationIntents only for a user-requested relation and bind both explicit operands",
                 "memoryRule": (
                     "memoryConstraints are validate-only hints: use them only by selecting semanticCatalog-supported "
                     "metricRefs/filters; never rewrite semanticCatalog formulas, fields, or relationships from memory"
@@ -3957,6 +4111,10 @@ class QueryGraphPlanner:
                     )
                 ),
                 "analysisRule": "analysisIntent none => requiresExplanation false and requiredEvidenceIntents []; otherwise include evidence intents",
+                "comparisonIntentRule": (
+                    "comparison needs two grounded operands or two windows with relation comparison/explicit_comparison; "
+                    "metric lists and explicit_conjunction are independent lookups"
+                ),
                 "skillWorkflowRule": "skill matching is owned by the Lead Agent from dynamically loaded skill headers, not by this Planner",
             },
         }
@@ -4264,9 +4422,11 @@ class QueryGraphPlanner:
                         }
                     )
                     continue
-                validation_errors = planner_structured_output_validation_errors(
+                validation_errors = planner_question_understanding_output_validation_errors(
+                    str(user_payload.get("question") or ""),
                     candidate_payload,
                     output_tool.parameters,
+                    planning_contract=user_payload.get("planningContract") or {},
                 )
                 if validation_errors:
                     record_invalid_output(
@@ -4339,7 +4499,12 @@ class QueryGraphPlanner:
             parsed = parse_json_object(str(result.get("content") or ""))
             if parsed:
                 parsed = normalize_question_understanding_payload(parsed)
-                validation_errors = planner_structured_output_validation_errors(parsed, output_tool.parameters)
+                validation_errors = planner_question_understanding_output_validation_errors(
+                    str(user_payload.get("question") or ""),
+                    parsed,
+                    output_tool.parameters,
+                    planning_contract=user_payload.get("planningContract") or {},
+                )
                 if validation_errors:
                     record_invalid_output(
                         round_index + 1,
@@ -7048,7 +7213,9 @@ def compact_asset_planning_contract(
             "timeRange": time_range,
             "comparisonTimeRange": compact_comparison,
             "requiresComparison": canonical_time.get("requiresComparison"),
+            "requiresMultipleWindows": canonical_time.get("requiresMultipleWindows"),
             "comparisonType": canonical_time.get("comparisonType"),
+            "windowRelation": canonical_time.get("windowRelation"),
             "objectRefs": fast.get("objectRefs") or fast.get("object_refs"),
         }.items()
         if value not in (None, "", [], {})

@@ -342,7 +342,9 @@ class EvidenceVerifier:
                     )
                 )
         time_contract = (plan.question_understanding or {}).get("timeWindowContract") or {}
-        if not isinstance(time_contract, dict) or not time_contract.get("requiresComparison"):
+        if not isinstance(time_contract, dict) or not (
+            time_contract.get("requiresMultipleWindows") or time_contract.get("requiresComparison")
+        ):
             return gaps
         metric_identities = {
             str(item.get("semanticRefId") or item.get("metric") or "")
@@ -357,15 +359,22 @@ class EvidenceVerifier:
             for item in derived_evidence
             if item.get("covered")
         }
+        expected_roles = [
+            str(item.get("windowRole") or "")
+            for item in time_contract.get("windows") or []
+            if isinstance(item, dict) and str(item.get("windowRole") or "")
+        ]
+        if not expected_roles:
+            expected_roles = ["primary", "comparison"]
         for metric_identity in sorted(metric_identities):
-            for role in ["primary", "comparison"]:
+            for role in expected_roles:
                 if (metric_identity, role) in covered_roles:
                     continue
                 gaps.append(
                     EvidenceGap(
                         code="MISSING_TIME_WINDOW_EVIDENCE",
                         evidence=metric_identity,
-                        reason="对比契约缺少指标在 %s 窗口的完整证据" % role,
+                        reason="多窗口契约缺少指标在 %s 窗口的完整证据" % role,
                         missing_metric=metric_identity,
                         missing_time_range=role,
                         details={"metricIdentity": metric_identity, "timeWindowRole": role},
