@@ -22,6 +22,7 @@ from merchant_ai.models import (
     RoutingDecision,
     TopicRoutingDecision,
 )
+from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudgetExceeded
 from merchant_ai.services.time_semantics import extract_temporal_lexical_spans, resolve_time_range
 
 
@@ -1799,6 +1800,512 @@ def topic_domain_order(scores: Optional[Dict[QuestionCategory, Any]] = None) -> 
             str(category),
         ),
     )
+
+
+class SemanticTopicRouterService:
+    """LLM-only Topic scope selection over the complete published L0 directory.
+
+    This service deliberately does not consume keyword extraction, metric hints,
+    dimensions, route slots, or table candidates.  Its only authority is to
+    select the published Topic workspaces whose semantic assets may be relevant
+    to the original question.  Query understanding and execution planning stay
+    with the Core and governed Contract path.
+    """
+
+    STATUSES = {"RESOLVED", "AMBIGUOUS", "UNSUPPORTED"}
+
+    def __init__(self, settings: Any, topic_assets: Any = None, llm: Any = None):
+        self.settings = settings
+        self.topic_assets = topic_assets or default_topic_assets()
+        if llm is not None:
+            self.llm = llm
+        else:
+            model = (
+                str(getattr(settings, "topic_semantic_route_model", "") or "")
+                or str(getattr(settings, "llm_fast_model", "") or "")
+                or str(getattr(settings, "preflight_semantic_route_model", "") or "")
+                or str(getattr(settings, "openai_model", "") or "")
+            )
+            try:
+                from merchant_ai.services.llm import LlmClient
+
+                route_base_url = (
+                    str(getattr(settings, "preflight_llm_base_url", "") or "")
+                    or str(getattr(settings, "openai_base_url", "") or "")
+                )
+                extra_body = (
+                    {"thinking": {"type": "disabled"}}
+                    if model.lower().startswith("kimi-for-coding")
+                    and "api.kimi.com/coding" in route_base_url.lower()
+                    else None
+                )
+                self.llm = LlmClient(
+                    settings,
+                    model_name=model,
+                    api_key=str(getattr(settings, "preflight_llm_api_key", "") or ""),
+                    base_url=str(getattr(settings, "preflight_llm_base_url", "") or ""),
+                    extra_body=extra_body,
+                    max_tokens=400,
+                )
+            except Exception:
+                self.llm = None
+
+    def route(
+        self,
+        question: str,
+        keywords: Optional[ExtractedKeywords] = None,
+        **_: Any,
+    ) -> TopicRoutingDecision:
+        """Compatibility entry point; ``keywords`` is intentionally ignored."""
+
+        del keywords
+        return self.route_with_budget(question)
+
+    def route_with_budget(
+        self,
+        question: str,
+        *,
+        runtime_budget: Any = None,
+    ) -> TopicRoutingDecision:
+        cards = self.topic_cards()
+        topic_names = [str(item.get("topic") or "") for item in cards if item.get("topic")]
+        if not topic_names:
+            return TopicRoutingDecision(
+                primary_topic=QuestionCategory.UNKNOWN,
+                candidate_topics=[],
+                confidence=0.0,
+                clarification_required=True,
+                routing_mode="topic_catalog_empty",
+                selection_mode="semantic_llm",
+                selection_evidence={
+                    "router": "semantic_topic_llm",
+                    "status": "catalog_empty",
+                    "keywordRoutingUsed": False,
+                },
+                reason="没有已发布 Topic，无法建立语义检索范围",
+            )
+
+        if not self._llm_available():
+            return self._open_directory_decision(
+                topic_names,
+                status="llm_unavailable",
+                reason="Topic LLM 不可用；扩大到全部已发布 Topic，未回退关键词路由",
+            )
+
+        attempts = max(
+            1,
+            min(2, int(getattr(self.settings, "topic_semantic_route_max_attempts", 2) or 2)),
+        )
+        minimum_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(self.settings, "topic_semantic_route_min_confidence", 0.55)
+                    or 0.55
+                ),
+            ),
+        )
+        validation_error = ""
+        last_payload: Dict[str, Any] = {}
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                payload = self._call_model(
+                    question,
+                    cards,
+                    topic_names,
+                    validation_error=validation_error,
+                    runtime_budget=runtime_budget,
+                    attempt=attempt,
+                )
+            except Exception as exc:
+                if isinstance(exc, GroundedRuntimeBudgetExceeded):
+                    raise
+                last_error = "%s:%s" % (type(exc).__name__, str(exc)[:300])
+                break
+            last_payload = payload if isinstance(payload, dict) else {}
+            provider_error = str(getattr(self.llm, "last_error", "") or "")
+            if not last_payload and provider_error:
+                last_error = provider_error
+                break
+            normalized, validation_error = self._validate_payload(last_payload, topic_names)
+            if normalized is None:
+                last_error = validation_error
+                continue
+            if (
+                normalized["status"] == "RESOLVED"
+                and normalized["confidence"] < minimum_confidence
+                and attempt < attempts
+            ):
+                validation_error = (
+                    "上一次返回 RESOLVED 但置信度 %.2f 低于 %.2f。"
+                    "请改为 AMBIGUOUS 并返回所有合理 Topic，或提高有依据的置信度。"
+                    % (normalized["confidence"], minimum_confidence)
+                )
+                continue
+            return self._decision_from_payload(
+                normalized,
+                topic_names,
+                attempts=attempt,
+            )
+
+        provider_error = str(getattr(self.llm, "last_error", "") or "")
+        return self._open_directory_decision(
+            topic_names,
+            status="llm_failed",
+            reason=(
+                "Topic LLM 返回无效结果；扩大到全部已发布 Topic，未回退关键词路由"
+            ),
+            detail=(last_error or provider_error or str(last_payload)[:300]),
+        )
+
+    def topic_cards(self) -> List[Dict[str, Any]]:
+        """Build compact, question-independent Topic cards from published L0 assets."""
+
+        cards: List[Dict[str, Any]] = []
+        names_loader = getattr(self.topic_assets, "all_topic_names", None)
+        topic_names = list(names_loader() or []) if callable(names_loader) else []
+        for topic in topic_names:
+            contract = load_asset_topic_contract(self.topic_assets, topic)
+            manifest_loader = getattr(self.topic_assets, "load_manifest", None)
+            try:
+                manifest = list(manifest_loader(topic) or []) if callable(manifest_loader) else []
+            except Exception:
+                manifest = []
+            summaries: List[str] = []
+            grains: List[str] = []
+            for item in manifest:
+                if not isinstance(item, dict):
+                    continue
+                summary = str(item.get("businessSummary") or "").strip()
+                grain = str(item.get("dataGrain") or "").strip()
+                if summary and summary not in summaries:
+                    summaries.append(summary)
+                if grain and grain not in grains:
+                    grains.append(grain)
+            cards.append(
+                {
+                    "topic": str(topic),
+                    "displayName": str(contract.get("displayName") or topic),
+                    "aliases": [str(item) for item in contract.get("aliases") or []][:8],
+                    "capabilitySummaries": summaries[:6],
+                    "dataGrains": grains[:6],
+                }
+            )
+        return cards
+
+    def _call_model(
+        self,
+        question: str,
+        cards: List[Dict[str, Any]],
+        topic_names: List[str],
+        *,
+        validation_error: str,
+        runtime_budget: Any,
+        attempt: int,
+    ) -> Dict[str, Any]:
+        timeout_seconds = self._timeout_seconds(runtime_budget)
+        if runtime_budget is not None:
+            runtime_budget.consume_llm_call(name="semantic_topic_router")
+        system_prompt = self._system_prompt(topic_names)
+        user_payload = {
+            "question": str(question or "")[:1200],
+            "topicDirectory": cards,
+            "instruction": (
+                "只选择后续应检索的 Topic 集合。不要输出指标、维度、时间、操作、表、主 Topic、"
+                "支持 Topic、JOIN 或 SQL 计划。"
+            ),
+            "outputSchema": {
+                "status": "RESOLVED|AMBIGUOUS|UNSUPPORTED",
+                "relevantTopics": topic_names,
+                "confidence": "0.0-1.0",
+                "ambiguityReason": "仅 AMBIGUOUS 或 UNSUPPORTED 时填写",
+            },
+        }
+        if validation_error:
+            user_payload["repair"] = {
+                "previousResultProblem": validation_error,
+                "allowedTopics": topic_names,
+            }
+        tool = self._selection_tool(topic_names)
+
+        def invoke() -> Dict[str, Any]:
+            if self._use_tool_json():
+                return self.llm.tool_json_chat(
+                    system_prompt,
+                    json.dumps(user_payload, ensure_ascii=False, default=str),
+                    tool,
+                    fallback={},
+                    timeout_seconds=timeout_seconds,
+                )
+            if hasattr(self.llm, "json_chat"):
+                return self.llm.json_chat(
+                    system_prompt,
+                    json.dumps(user_payload, ensure_ascii=False, default=str),
+                    fallback={},
+                    timeout_seconds=timeout_seconds,
+                )
+            return {}
+
+        if runtime_budget is None:
+            return invoke()
+        with runtime_budget.stage("llm.topic_route.attempt_%d" % attempt):
+            return invoke()
+
+    def _use_tool_json(self) -> bool:
+        if not hasattr(self.llm, "tool_json_chat"):
+            return False
+        model_name = str(getattr(self.llm, "model_name", "") or "").lower()
+        base_url = str(getattr(self.llm, "base_url", "") or "").lower()
+        # Kimi Coding's forced tool path is materially slower for this tiny
+        # classification even when thinking is disabled.  JSON prompting plus
+        # Kernel validation is both faster and still fails closed on bad Topic
+        # names, without spending an unreported fallback provider call.
+        return not (
+            model_name.startswith("kimi-for-coding")
+            and "api.kimi.com/coding" in base_url
+        )
+
+    def _system_prompt(self, topic_names: List[str]) -> str:
+        examples = self._few_shot_examples(topic_names)
+        return (
+            "你是企业 BI 系统的 Topic 语义路由器。你的唯一任务是判断原始问题需要在哪些已发布 "
+            "Topic 中检索语义资产。Topic 只是检索范围，不代表主表、事实锚点或执行顺序。"
+            "必须阅读完整 Topic Directory 的业务能力和边界，不得按关键词命中次数做分类。"
+            "可以选择一个或多个 Topic；问题跨域时把所有相关 Topic 放进同一个 relevantTopics 数组。"
+            "不要解析或输出指标、维度、时间范围、聚合方式、排行方式、表、字段、JOIN、Contract 或 SQL。"
+            "只能返回目录中真实存在的 Topic 名称，不能翻译、缩写或创造 Topic。"
+            "如果有多个合理范围，返回 AMBIGUOUS 并包含所有合理 Topic；如果目录完全不支持，返回 UNSUPPORTED。"
+            "不要因为用户问法口语化、同义表达或缺少标准术语就缩小范围。\n"
+            "可选 Topic：%s\n"
+            "示例：\n%s"
+            % ("、".join(topic_names), "\n".join(examples))
+        )
+
+    @staticmethod
+    def _few_shot_examples(topic_names: List[str]) -> List[str]:
+        available = set(topic_names)
+        examples: List[str] = []
+        if {"电商交易", "商品管理"} <= available:
+            examples.extend(
+                [
+                    "问题：最近10天卖得最多的商品是哪个？品牌和货号是多少？\n"
+                    "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"电商交易\",\"商品管理\"],\"confidence\":0.96}",
+                    "问题：最近7天订单量是多少？\n"
+                    "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"电商交易\"],\"confidence\":0.98}",
+                    "问题：货号 A123 属于哪个品牌？\n"
+                    "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"商品管理\"],\"confidence\":0.98}",
+                ]
+            )
+        if {"电商退货", "商品管理"} <= available:
+            examples.append(
+                "问题：最近退款最多的是哪个商品？\n"
+                "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"电商退货\",\"商品管理\"],\"confidence\":0.95}"
+            )
+        if {"供应链", "商品管理"} <= available:
+            examples.append(
+                "问题：当前库存最多的是哪个商品？\n"
+                "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"供应链\",\"商品管理\"],\"confidence\":0.94}"
+            )
+        ambiguous_topics = [
+            item
+            for item in ["电商交易", "电商退货", "供应链", "客服工单", "商品管理"]
+            if item in available
+        ]
+        if len(ambiguous_topics) >= 2:
+            examples.append(
+                "问题：哪个商品最多？\n"
+                "输出：%s"
+                % json.dumps(
+                    {
+                        "status": "AMBIGUOUS",
+                        "relevantTopics": ambiguous_topics,
+                        "confidence": 0.55,
+                        "ambiguityReason": "没有说明是销量、退款、库存还是工单数量",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        if not examples:
+            examples.append(
+                "问题：一个问题同时需要业务事实和对象属性。\n"
+                "输出：选择目录中覆盖这两类信息的全部 Topic；不要指定主次，也不要规划查询。"
+            )
+        return examples
+
+    @staticmethod
+    def _selection_tool(topic_names: List[str]) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": "select_relevant_topics",
+                "description": "只返回需要检索的已发布 Topic 集合",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["RESOLVED", "AMBIGUOUS", "UNSUPPORTED"],
+                        },
+                        "relevantTopics": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": topic_names},
+                            "uniqueItems": True,
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                        "ambiguityReason": {"type": "string", "maxLength": 300},
+                    },
+                    "required": ["status", "relevantTopics", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _validate_payload(
+        self,
+        payload: Dict[str, Any],
+        topic_names: List[str],
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        status = str(payload.get("status") or "").strip().upper()
+        if status not in self.STATUSES:
+            return None, "status 必须是 RESOLVED、AMBIGUOUS 或 UNSUPPORTED"
+        raw_topics = payload.get("relevantTopics")
+        if not isinstance(raw_topics, list):
+            return None, "relevantTopics 必须是数组"
+        selected = dedupe_ordered([str(item or "").strip() for item in raw_topics if str(item or "").strip()])
+        invalid = [item for item in selected if item not in topic_names]
+        if invalid:
+            return None, "返回了未发布 Topic：%s" % "、".join(invalid)
+        if status in {"RESOLVED", "AMBIGUOUS"} and not selected:
+            return None, "%s 必须至少返回一个 relevantTopics" % status
+        if status == "UNSUPPORTED" and selected:
+            return None, "UNSUPPORTED 不应返回 relevantTopics"
+        try:
+            confidence = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
+        except (TypeError, ValueError):
+            return None, "confidence 必须是 0 到 1 的数字"
+        return (
+            {
+                "status": status,
+                "relevantTopics": selected,
+                "confidence": confidence,
+                "ambiguityReason": str(payload.get("ambiguityReason") or "")[:300],
+            },
+            "",
+        )
+
+    def _decision_from_payload(
+        self,
+        payload: Dict[str, Any],
+        all_topic_names: List[str],
+        *,
+        attempts: int,
+    ) -> TopicRoutingDecision:
+        selected_names = list(payload.get("relevantTopics") or [])
+        categories = [
+            resolve_asset_topic_category(self.topic_assets, item)
+            for item in selected_names
+        ]
+        categories = dedupe_topics(
+            [item for item in categories if item != QuestionCategory.UNKNOWN]
+        )
+        status = str(payload.get("status") or "")
+        unsupported = status == "UNSUPPORTED"
+        reason = str(payload.get("ambiguityReason") or "").strip()
+        if unsupported:
+            reason = reason or "已发布 Topic 目录不支持该问题"
+        elif status == "AMBIGUOUS":
+            reason = reason or "Topic LLM 无法唯一收敛，保留所有合理 Topic 作为检索范围"
+        else:
+            reason = "Topic LLM 已选择相关语义检索范围；未指定主次或执行计划"
+        return TopicRoutingDecision(
+            primary_topic=QuestionCategory.UNKNOWN,
+            candidate_topics=categories,
+            dimension_topics=[],
+            confidence=float(payload.get("confidence") or 0.0),
+            clarification_required=unsupported,
+            routing_mode=(
+                "semantic_topic_unsupported"
+                if unsupported
+                else "semantic_topic_ambiguous"
+                if status == "AMBIGUOUS"
+                else "semantic_topic_scope"
+            ),
+            workspace_topics=categories,
+            selection_mode="semantic_llm",
+            selection_evidence={
+                "router": "semantic_topic_llm",
+                "status": status.lower(),
+                "modelSelectedTopics": selected_names,
+                "publishedTopicCount": len(all_topic_names),
+                "llmAttempts": attempts,
+                "keywordRoutingUsed": False,
+            },
+            reason=reason,
+        )
+
+    def _open_directory_decision(
+        self,
+        topic_names: List[str],
+        *,
+        status: str,
+        reason: str,
+        detail: str = "",
+    ) -> TopicRoutingDecision:
+        categories = dedupe_topics(
+            [
+                resolve_asset_topic_category(self.topic_assets, item)
+                for item in topic_names
+            ]
+        )
+        categories = [item for item in categories if item != QuestionCategory.UNKNOWN]
+        return TopicRoutingDecision(
+            primary_topic=QuestionCategory.UNKNOWN,
+            candidate_topics=categories,
+            dimension_topics=[],
+            confidence=0.0,
+            clarification_required=False,
+            routing_mode="semantic_topic_open_directory",
+            workspace_topics=categories,
+            selection_mode="semantic_llm_degraded",
+            selection_evidence={
+                "router": "semantic_topic_llm",
+                "status": status,
+                "publishedTopicCount": len(topic_names),
+                "modelSelectedTopics": [],
+                "keywordRoutingUsed": False,
+                "detail": str(detail or "")[:300],
+            },
+            reason=reason,
+        )
+
+    def _llm_available(self) -> bool:
+        return bool(
+            self.llm
+            and getattr(self.llm, "configured", False)
+            and (hasattr(self.llm, "tool_json_chat") or hasattr(self.llm, "json_chat"))
+        )
+
+    def _timeout_seconds(self, runtime_budget: Any = None) -> float:
+        configured = max(
+            1,
+            int(getattr(self.settings, "topic_semantic_route_timeout_seconds", 12) or 12),
+        )
+        if runtime_budget is None:
+            return float(configured)
+        return float(
+            runtime_budget.clamp_timeout_seconds(
+                configured,
+                minimum_seconds=1,
+                operation="topic_route_timeout",
+            )
+        )
 
 
 class TopicRouterService:

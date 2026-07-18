@@ -142,6 +142,63 @@ def test_compound_ranking_lookup_answer_uses_field_label_without_duplicate_ranki
     assert answer.count("按客服工单明细量排序") <= 1
 
 
+def test_same_table_ranked_answer_keeps_all_explicit_lookup_fields():
+    question = "最近10天卖的最多的商品是哪个？他的品牌名字，货号是多少"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.TOPN,
+                plan_task_id="sales_rank",
+                preferred_table="dwm_trade_order_detail_di",
+                metric_name="sku_cnt",
+                group_by_column="spu_id",
+                group_by_name="商品ID",
+                output_keys=["spu_id", "商品名称", "品牌名称", "货号"],
+                required_evidence=["spu_id", "商品名称", "品牌名称", "货号", "sku_cnt"],
+                metric_resolution={
+                    "metricKey": "sku_cnt",
+                    "displayName": "销量",
+                    "sourceColumnLabels": {
+                        "spu_id": "商品ID",
+                        "商品名称": "商品名称",
+                        "品牌名称": "品牌名称",
+                        "货号": "货号",
+                    },
+                },
+            )
+        ]
+    )
+    bundle = QueryBundle(
+        tables=["dwm_trade_order_detail_di"],
+        rows=[
+            {
+                "spu_id": "6",
+                "商品名称": "Cotton Casual Pants Khaki",
+                "品牌名称": "brand_name_569",
+                "货号": "article_id_569",
+                "sku_cnt": 3,
+            }
+        ],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[AgentTaskResult(task_id="sales_rank", success=True, query_bundle=bundle)],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    answer = deterministic_structured_answer(question, plan, run)
+
+    assert "Cotton Casual Pants Khaki" in answer
+    assert "brand_name_569" in answer
+    assert "article_id_569" in answer
+    assert "3" in answer
+    assert "| 商品ID | 商品名称 | 品牌名称 | 货号 | 销量 |" in answer
+    assert "| 指标 |" not in answer
+
+
 def detail_plan():
     return QueryPlan(
         intents=[

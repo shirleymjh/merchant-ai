@@ -316,6 +316,32 @@ def test_allows_ascending_ranked_shape_without_core_sql() -> None:
     assert decision.execution_mode == GroundedExecutionMode.DETERMINISTIC_RANKED
 
 
+def test_allows_same_table_ranked_display_fields_with_safe_business_aliases() -> None:
+    contract = ranked_contract()
+    contract.selected_fields = [
+        GroundedSelectedFieldBinding(
+            semantic_ref_id="semantic:topic_alpha:table_alpha:field:product_name",
+            topic="topic_alpha",
+            table="table_alpha",
+            column="product_name",
+            output_alias="商品名称",
+        ),
+        GroundedSelectedFieldBinding(
+            semantic_ref_id="semantic:topic_alpha:table_alpha:field:brand_name",
+            topic="topic_alpha",
+            table="table_alpha",
+            column="brand_name",
+            output_alias="品牌名称",
+        ),
+    ]
+
+    decision = evaluate_deterministic_execution(contract)
+
+    assert decision.eligible is True
+    assert decision.execution_mode == GroundedExecutionMode.DETERMINISTIC_RANKED
+    assert decision.reason_codes == []
+
+
 def test_allows_same_table_multi_metric_scalar_without_core_sql() -> None:
     decision = evaluate_deterministic_execution(same_table_multi_metric_contract())
 

@@ -347,6 +347,7 @@ def _evaluate_metric_query_fast_path(
     required_group_dimensions: int,
     require_temporal_dimension: bool = False,
     allow_ranking: bool = False,
+    allow_same_table_selected_fields: bool = False,
 ) -> GroundedFastPathDecision:
     """Admit only one-table aggregate projections supported by the compiler.
 
@@ -381,7 +382,9 @@ def _evaluate_metric_query_fast_path(
         reject(GroundedFastPathReason.TABLE_COUNT_NOT_ONE)
     if not contract.metrics:
         reject(GroundedFastPathReason.METRICS_MISSING)
-    if contract.selected_fields or contract.binding_hints.selected_fields:
+    if (
+        contract.selected_fields or contract.binding_hints.selected_fields
+    ) and not allow_same_table_selected_fields:
         reject(GroundedFastPathReason.SELECTED_FIELDS_PRESENT)
     if contract.relationships or contract.binding_hints.relationship_refs:
         reject(GroundedFastPathReason.RELATIONSHIPS_PRESENT)
@@ -455,6 +458,49 @@ def _evaluate_metric_query_fast_path(
             ):
                 reject(GroundedFastPathReason.TREND_DIMENSION_NOT_TEMPORAL)
 
+    if allow_same_table_selected_fields:
+        selected_aliases: list[str] = []
+        selected_refs: set[str] = set()
+        for field in contract.selected_fields:
+            alias = str(field.output_alias or field.column or "").strip()
+            selected_aliases.append(alias)
+            selected_refs.add(str(field.semantic_ref_id or "").strip())
+            if (
+                not str(field.semantic_ref_id or "").startswith("semantic:")
+                or field.table != table
+                or not str(field.column or "").strip()
+                or not alias
+                or len(alias) > 128
+                or any(ord(character) < 32 for character in alias)
+                or (
+                    table
+                    and len(contract.tables) == 1
+                    and contract.tables[0].merchant_filter_column
+                    and field.column == contract.tables[0].merchant_filter_column
+                )
+            ):
+                reject(GroundedFastPathReason.SELECTED_FIELD_BINDING_INVALID)
+        if len(contract.selected_fields) > 8:
+            reject(
+                GroundedFastPathReason.SELECTED_FIELD_BINDING_INVALID,
+                "deterministic ranked projection supports at most 8 same-table labels",
+            )
+        if len(set(selected_aliases)) != len(selected_aliases):
+            reject(GroundedFastPathReason.SELECTED_FIELD_ALIAS_DUPLICATE)
+        reserved_aliases = {
+            *(str(metric.metric_key or "").strip() for metric in contract.metrics),
+            str(group_dimension.column or "").strip() if group_dimension else "",
+        }
+        if any(alias in reserved_aliases for alias in selected_aliases):
+            reject(GroundedFastPathReason.SELECTED_FIELD_ALIAS_DUPLICATE)
+        hinted = {
+            str(item.field_ref or "").strip()
+            for item in contract.binding_hints.selected_fields
+            if str(item.field_ref or "").strip()
+        }
+        if hinted and hinted != selected_refs:
+            reject(GroundedFastPathReason.SELECTED_FIELD_BINDING_INVALID)
+
     metric_refs: list[str] = []
     metric_aliases: list[str] = []
     for metric in contract.metrics:
@@ -504,6 +550,7 @@ def _evaluate_ranked_fast_path(
         allowed_execution_shapes={"", "ranked_group"},
         required_group_dimensions=1,
         allow_ranking=True,
+        allow_same_table_selected_fields=True,
     )
     reasons = list(base.reason_codes)
     details = dict(base.reason_details)

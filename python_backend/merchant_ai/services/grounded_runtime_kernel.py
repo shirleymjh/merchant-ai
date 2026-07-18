@@ -404,9 +404,21 @@ class GroundedRuntimeKernel:
             )
         return [item.model_copy(deep=True) for item in adopted]
 
-    def route_topic(self, session: GroundedRuntimeSession) -> TopicRoutingDecision:
+    def route_topic(
+        self,
+        session: GroundedRuntimeSession,
+        *,
+        runtime_budget: Any = None,
+    ) -> TopicRoutingDecision:
         keywords = self.keyword_service.extract(session.question)
-        routing = self.topic_router.route(session.question, keywords)
+        semantic_route = getattr(self.topic_router, "route_with_budget", None)
+        if callable(semantic_route):
+            routing = semantic_route(
+                session.question,
+                runtime_budget=runtime_budget,
+            )
+        else:
+            routing = self.topic_router.route(session.question, keywords)
         categories = routing.recall_topics()
         topic_names = list(self.topic_assets.topic_names_for_categories(categories))
         with self._lock:

@@ -16,7 +16,7 @@ class GroundedRuntimeBudgetLimits:
     """Hard limits shared by one grounded-runtime invocation."""
 
     max_duration_seconds: float = 90.0
-    max_llm_calls: int = 8
+    max_llm_calls: int = 16
     max_tool_calls: int = 60
     max_doris_queries: int = 12
     profile: str = "complex"
@@ -35,7 +35,7 @@ class GroundedRuntimeBudgetLimits:
                 0.001,
                 float(getattr(settings, duration_setting, duration_default) or duration_default),
             ),
-            max_llm_calls=max(1, int(getattr(settings, "run_budget_max_llm_calls", 8) or 8)),
+            max_llm_calls=max(1, int(getattr(settings, "run_budget_max_llm_calls", 16) or 16)),
             max_tool_calls=max(1, int(getattr(settings, "run_budget_max_tool_calls", 60) or 60)),
             max_doris_queries=max(1, int(getattr(settings, "run_budget_max_doris_queries", 12) or 12)),
             profile="fast" if fast_path else "complex",

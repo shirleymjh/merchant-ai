@@ -3644,8 +3644,20 @@ def ranking_display_columns(question: str, plan: QueryPlan, rows: List[Dict[str,
     display_entity = display_entity_column(plan, rows, columns)
     if display_entity and display_entity not in entity_columns:
         entity_columns.append(display_entity)
+    requested_outputs: List[str] = []
+    for intent in plan.intents:
+        for column in intent.output_keys:
+            text = str(column or "").strip()
+            if (
+                text
+                and text in columns
+                and text not in entity_columns
+                and text not in requested_outputs
+            ):
+                requested_outputs.append(text)
     metrics = ranking_metric_columns(question, plan, rows, columns)
-    selected = entity_columns + [column for column in metrics if column not in entity_columns]
+    selected = [*entity_columns, *requested_outputs]
+    selected.extend(column for column in metrics if column not in selected)
     return selected or columns
 
 
@@ -4149,6 +4161,8 @@ def answer_column_labels(plan: QueryPlan) -> Dict[str, str]:
             labels[intent.group_by_column] = intent.group_by_name
         for column in [intent.group_by_column, intent.filter_column, *intent.output_keys, *intent.required_evidence]:
             text = str(column or "").strip()
+            if text and re.search(r"[\u3400-\u9fff]", text):
+                labels.setdefault(text, text)
             default = default_answer_column_label(text)
             if text and default:
                 labels.setdefault(text, default)

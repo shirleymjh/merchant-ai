@@ -1732,7 +1732,7 @@ def build_run_budget_report(state: AgentState, settings: Settings) -> Dict[str, 
     limits = {
         "maxDurationSeconds": duration_limit,
         "maxActions": max(1, int(getattr(settings, "run_budget_max_actions", 20) or 20)),
-        "maxLlmCalls": max(1, int(getattr(settings, "run_budget_max_llm_calls", 8) or 8)),
+        "maxLlmCalls": max(1, int(getattr(settings, "run_budget_max_llm_calls", 16) or 16)),
         "maxDorisQueries": max(1, int(getattr(settings, "run_budget_max_doris_queries", 12) or 12)),
         "maxToolCalls": max(1, int(getattr(settings, "run_budget_max_tool_calls", 60) or 60)),
         "maxEstimatedTokens": max(1, int(getattr(settings, "run_budget_max_estimated_tokens", 60000) or 60000)),

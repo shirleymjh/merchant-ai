@@ -30,7 +30,7 @@ from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     HybridKnowledgeRetrievalService,
 )
-from merchant_ai.services.routing import KeywordExtractService, TopicRouterService
+from merchant_ai.services.routing import KeywordExtractService, SemanticTopicRouterService
 from merchant_ai.services.runtime_bindings import SemanticRuntimeBindingRegistry
 from merchant_ai.services.security import identity_scope_payload
 
@@ -252,7 +252,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         knowledge_retriever = HybridKnowledgeRetrievalService(recall_service)
 
     keyword_service = KeywordExtractService(topic_assets)
-    topic_router = TopicRouterService(topic_assets)
+    topic_router = SemanticTopicRouterService(settings, topic_assets)
     query_executor = GroundedQueryExecutionKernel(
         doris_repository,
         settings,

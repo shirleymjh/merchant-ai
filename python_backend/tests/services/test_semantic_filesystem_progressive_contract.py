@@ -98,6 +98,37 @@ def test_ref_and_path_conflict_and_full_asset_reads_fail_closed() -> None:
     assert legacy_fragment["error"] == "SEMANTIC_REF_NOT_FOUND"
 
 
+def test_trade_l1_exposes_compact_exact_leaf_navigation_without_binding_evidence() -> None:
+    catalog = _catalog()
+    detail = catalog.read(
+        path="topics/电商交易/tables/dwm_trade_order_detail_di/detail.json",
+        max_chars=20_000,
+    )
+
+    assert detail["success"] is True
+    payload = json.loads(str(detail["content"]))
+    navigation = payload["semanticNavigation"]
+    metric = next(item for item in navigation["metricLeaves"] if item["key"] == "sku_cnt")
+    brand = next(item for item in navigation["columnLeaves"] if item["key"] == "brand_name")
+    article = next(item for item in navigation["columnLeaves"] if item["key"] == "article_id")
+
+    assert "销量" in metric["aliases"]
+    assert "品牌名字" in brand["aliases"]
+    assert metric["path"].endswith("/metrics/sku_cnt.json")
+    assert brand["path"].endswith("/columns/brand_name.json")
+    assert article["path"].endswith("/columns/article_id.json")
+    assert "formula" not in json.dumps(navigation, ensure_ascii=False).lower()
+
+    for leaf in (metric, brand, article):
+        exact = catalog.read(
+            ref_id=leaf["refId"],
+            path=leaf["path"],
+            max_chars=20_000,
+        )
+        assert exact["success"] is True
+        assert exact["kind"] in {"METRIC", "COLUMN"}
+
+
 def test_recall_navigation_has_no_host_paths_fragments_or_default_asset_coordinates() -> None:
     settings = get_settings()
     assets = TopicAssetService(settings)

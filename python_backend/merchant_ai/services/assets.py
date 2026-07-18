@@ -1260,6 +1260,55 @@ class SemanticCatalogService:
                 "use": "read only when the plan needs a cross-table edge",
             }
         )
+        navigation_hints = item.get("navigationHints") or {}
+        semantic_navigation: Dict[str, Any] = {}
+        if isinstance(navigation_hints, dict):
+            for source_key, section, target_key in (
+                ("metrics", "metrics", "metricLeaves"),
+                ("columns", "columns", "columnLeaves"),
+            ):
+                leaves: List[Dict[str, Any]] = []
+                raw_leaves = navigation_hints.get(source_key) or []
+                if not isinstance(raw_leaves, list):
+                    continue
+                for raw_leaf in raw_leaves[:16]:
+                    if isinstance(raw_leaf, str):
+                        key = raw_leaf.strip()
+                        aliases: List[str] = []
+                    elif isinstance(raw_leaf, dict):
+                        key = str(raw_leaf.get("key") or "").strip()
+                        aliases = dedupe_strings(
+                            [str(value) for value in raw_leaf.get("aliases") or []]
+                        )[:8]
+                    else:
+                        continue
+                    if not key or not re.fullmatch(r"[A-Za-z0-9_]+", key):
+                        continue
+                    leaf = {
+                        "key": key,
+                        "refId": semantic_table_entry_ref_id(
+                            topic,
+                            table,
+                            section,
+                            key,
+                        ),
+                        "path": semantic_table_entry_path(
+                            topic,
+                            table,
+                            section,
+                            key,
+                        ),
+                    }
+                    if aliases:
+                        leaf["aliases"] = aliases
+                    leaves.append(leaf)
+                if leaves:
+                    semantic_navigation[target_key] = leaves
+        if semantic_navigation:
+            semantic_navigation["policy"] = (
+                "Navigation only. Read each exact leaf before binding it into a Contract; "
+                "do not scan the broad index when one of these aliases matches."
+            )
         payload = {
             "topic": topic,
             "tableName": table,
@@ -1277,6 +1326,8 @@ class SemanticCatalogService:
             "children": child_refs,
             "policy": "Choose only the metric/column/schema/rule index needed next. Full asset.json is not exposed to the Planner.",
         }
+        if semantic_navigation:
+            payload["semanticNavigation"] = semantic_navigation
         content = json.dumps(payload, ensure_ascii=False, indent=2)
         ref_id = semantic_table_detail_ref_id(topic, table)
         path = semantic_table_detail_path(topic, table)

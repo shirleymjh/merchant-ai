@@ -389,10 +389,26 @@ class GroundedQueryContractBuilder:
             hints.label_refs,
             hints.group_by_ref,
         )
+        dimension_ref_ids = {item.semantic_ref_id for item in dimensions}
+        hints = hints.model_copy(
+            update={
+                "selected_fields": [
+                    item
+                    for item in hints.selected_fields
+                    if item.field_ref not in dimension_ref_ids
+                ]
+            }
+        )
         selected_fields = self._selected_field_bindings(
             documents,
             hints.selected_fields,
         )
+        # A group-by dimension is already projected by the deterministic
+        # compiler.  Treating the same semantic field as an additional
+        # selected field creates two required output aliases for one column
+        # (for example ``spu_id`` and ``商品ID``), which needlessly pushes a
+        # simple ranked query into SQL repair.  Keep the authoritative
+        # dimension binding and discard only the exact duplicate projection.
         entity_filters, entity_filter_gaps = self._entity_filter_bindings(
             documents,
             hints.entity_filters,
@@ -1067,7 +1083,12 @@ class GroundedQueryContractBuilder:
         dimensions: Sequence[GroundedDimensionBinding],
     ) -> GroundedRankingBinding:
         direction = str(hints.ranking.order or "").strip().upper()
-        ranking_mode = hints.analysis_mode.lower() in {"topn", "ranking", "ranked_group"}
+        ranking_mode = hints.analysis_mode.lower() in {
+            "topn",
+            "ranking",
+            "ranked",
+            "ranked_group",
+        }
         # A limit is an execution bound, not a ranking declaration.  Ranking is
         # only meaningful when Core explicitly binds a grouping dimension and
         # either declares an order or selects a ranking analysis mode.
@@ -1970,6 +1991,24 @@ def compile_grounded_query(
         }:
             raise ValueError("grounded direct compiler requires an explicit ASC or DESC ranking")
 
+    ranked_selected_fields = (
+        list(grounded.selected_fields)
+        if grounded.query_shape == "RANKED"
+        else []
+    )
+    for field in ranked_selected_fields:
+        if field.table != execution_table:
+            raise ValueError(
+                "grounded deterministic ranking labels must belong to the execution table"
+            )
+        output_alias = str(field.output_alias or field.column or "").strip()
+        if not output_alias or len(output_alias) > 128 or any(
+            ord(character) < 32 for character in output_alias
+        ):
+            raise ValueError(
+                "grounded deterministic ranking labels require a safe non-empty output alias"
+            )
+
     if grounded.query_shape == "RANKED":
         answer_mode = AnswerMode.TOPN
     elif grounded.query_shape in {"GROUPED", "TREND"}:
@@ -1979,6 +2018,22 @@ def compile_grounded_query(
     else:
         raise ValueError("unsupported grounded query shape: %s" % grounded.query_shape)
     group_by = group_dimension.column if group_dimension is not None else ""
+    source_column_labels: dict[str, str] = {}
+    if group_dimension is not None and group_by:
+        source_column_labels[group_by] = (
+            group_dimension.requested_phrase
+            or group_dimension.business_name
+            or group_by
+        )
+    for field in ranked_selected_fields:
+        output_alias = str(field.output_alias or field.column or "").strip()
+        if output_alias:
+            source_column_labels[output_alias] = output_alias
+        if field.column:
+            source_column_labels.setdefault(
+                field.column,
+                output_alias or field.business_name or field.column,
+            )
 
     def metric_resolution(metric: GroundedMetricBinding) -> dict[str, Any]:
         return seal_semantic_metric_resolution(
@@ -1992,6 +2047,7 @@ def compile_grounded_query(
                 "semanticRefId": metric.semantic_ref_id,
                 "formula": metric.formula,
                 "sourceColumns": list(metric.source_columns),
+                "sourceColumnLabels": dict(source_column_labels),
                 "confidence": 1.0,
                 "resolutionSource": "grounded_query_contract",
                 "aggregationPolicy": metric.aggregation_policy,
@@ -2057,6 +2113,14 @@ def compile_grounded_query(
     source_columns = _dedupe(
         column for metric in ordered_metrics for column in metric.source_columns
     )
+    ranked_output_columns = _dedupe(
+        field.column for field in ranked_selected_fields if field.column
+    )
+    ranked_output_aliases = _dedupe(
+        str(field.output_alias or field.column or "").strip()
+        for field in ranked_selected_fields
+        if str(field.output_alias or field.column or "").strip()
+    )
     intents = [
         QuestionIntent(
             question=grounded.question,
@@ -2074,22 +2138,30 @@ def compile_grounded_query(
             metric_formula=anchor_metric.formula,
             metric_specs=[metric_spec(metric, task_id) for metric in ordered_metrics],
             group_by_column=group_by,
-            group_by_name=group_dimension.business_name if group_dimension else "",
+            group_by_name=(
+                group_dimension.requested_phrase
+                or group_dimension.business_name
+                if group_dimension
+                else ""
+            ),
             days=grounded.time_range.days,
             limit=(
                 grounded.ranking.limit
                 if grounded.query_shape == "RANKED"
                 else 20 if group_dimension is not None else 1
             ),
-            required_evidence=_dedupe([*source_columns, group_by]),
+            required_evidence=_dedupe(
+                [*source_columns, group_by, *ranked_output_columns]
+            ),
             # Physical output columns are produced only by explicit grouping.
             # Tenant/access columns remain internal filters.
-            output_keys=[group_by] if group_by else [],
+            output_keys=_dedupe([group_by, *ranked_output_aliases]),
             knowledge_ref_ids=_dedupe(
                 [
                     table_binding.detail_ref_id,
                     *(metric.semantic_ref_id for metric in ordered_metrics),
                     group_dimension.semantic_ref_id if group_dimension else "",
+                    *(item.semantic_ref_id for item in ranked_selected_fields),
                     *(item.semantic_ref_id for item in grounded.entity_filters),
                 ]
             ),
@@ -2123,6 +2195,15 @@ def compile_grounded_query(
         compiler_trace=[
             "GROUNDED_DIRECT_COMPILE:%s" % grounded.execution_shape,
             "GROUNDED_GROUP_BY:%s" % (group_by or "none"),
+            "GROUNDED_RANKED_LABELS:%s"
+            % (
+                ",".join(
+                    "%s->%s"
+                    % (field.column, field.output_alias or field.column)
+                    for field in ranked_selected_fields
+                )
+                or "none"
+            ),
         ],
         planner_loaded_refs=list(grounded.evidence_refs),
     )
@@ -2507,6 +2588,27 @@ def _validate_grounded_plan_projection(
                 reason="groupByColumn differs from the explicit Contract dimension",
             )
         )
+    expected_ranked_outputs = _dedupe(
+        [
+            expected_group,
+            *(
+                [item.output_alias or item.column for item in contract.selected_fields]
+                if contract.query_shape == "RANKED"
+                else []
+            ),
+        ]
+    )
+    if intent.output_keys != expected_ranked_outputs:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_OUTPUT_PROJECTION_MISMATCH",
+                evidence=",".join(intent.output_keys),
+                task_id=intent.plan_task_id,
+                reason=(
+                    "outputKeys differ from the explicit ranked group and same-table label bindings"
+                ),
+            )
+        )
 
     table_binding = next(
         (table for table in contract.tables if table.table == intent.preferred_table),
@@ -2591,6 +2693,27 @@ def _validate_grounded_plan_projection(
             )
         )
     evidence_refs = set(contract.evidence_refs)
+    for selected_field in contract.selected_fields:
+        if contract.query_shape != "RANKED":
+            continue
+        if selected_field.table != expected_table:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_RANKED_LABEL_TABLE_MISMATCH",
+                    evidence=selected_field.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Deterministic ranked labels must belong to the metric owner table",
+                )
+            )
+        if selected_field.semantic_ref_id not in evidence_refs:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_RANKED_LABEL_UNREAD",
+                    evidence=selected_field.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Ranked label field is not backed by read evidence",
+                )
+            )
     for entity_filter in contract.entity_filters:
         if entity_filter.table != expected_table:
             gaps.append(
@@ -2624,6 +2747,11 @@ def _validate_grounded_plan_projection(
     known_columns = set(asset_pack.known_columns(intent.preferred_table))
     required_columns = {
         *[column for metric in contract.metrics for column in metric.source_columns],
+        *(
+            [item.column for item in contract.selected_fields]
+            if contract.query_shape == "RANKED"
+            else []
+        ),
         *[item.column for item in contract.entity_filters],
         *([expected_group] if expected_group else []),
         *([table_binding.time_column] if table_binding and table_binding.time_column else []),
@@ -2800,6 +2928,12 @@ def _execution_shape(
     selected_fields: Sequence[GroundedSelectedFieldBinding] = (),
     entity_filters: Sequence[GroundedEntityFilterBinding] = (),
 ) -> str:
+    if ranking.enabled and len(set(tables)) == 1:
+        # Same-table label projections are still one ranked aggregate shape.
+        # They do not turn the query into detail lookup or require Core SQL;
+        # the deterministic executor groups the requested label columns with
+        # the explicit entity dimension.
+        return "ranked_group"
     if selected_fields and entity_filters:
         return "detail_join" if len(set(tables)) > 1 else "entity_lookup"
     if selected_fields:
@@ -2839,7 +2973,7 @@ def _canonical_query_shape(
         return "ENTITY_LOOKUP"
     if mode in {"detail", "detail_list", "list"}:
         return "DETAIL"
-    if mode in {"topn", "ranking", "ranked_group"} or ranking.enabled:
+    if mode in {"topn", "ranking", "ranked", "ranked_group"} or ranking.enabled:
         return "RANKED"
     if mode in {"trend", "time_series", "timeseries"}:
         return "TREND"
@@ -3024,6 +3158,37 @@ def _normalize_binding_hints(
             payload["analysisMode"] = "grouped_metric"
         elif any(token in intent for token in ("METRIC", "SCALAR", "SUMMARY")):
             payload["analysisMode"] = "metric_total"
+
+    # Core models commonly express the canonical shape as ``RANKED`` and bind
+    # the sole grouping field through ``dimensionRefs`` without repeating it
+    # as ``groupByRef``.  That proposal is unambiguous when there is exactly
+    # one dimension and an explicit ranking declaration.  Normalize this
+    # representational variation in the Contract boundary instead of forcing
+    # another LLM repair turn.  Multiple dimensions remain ambiguous and are
+    # deliberately not inferred.
+    if not (payload.get("groupByRef") or payload.get("group_by_ref")):
+        raw_dimensions = payload.get("dimensionRefs") or payload.get("dimension_refs") or []
+        dimension_refs = refs_from(raw_dimensions)
+        analysis_mode = str(
+            payload.get("analysisMode") or payload.get("analysis_mode") or ""
+        ).strip().lower()
+        ranking = payload.get("ranking") or {}
+        ranking_declared = bool(
+            isinstance(ranking, dict)
+            and (
+                ranking.get("metricRef")
+                or ranking.get("metric_ref")
+                or ranking.get("order")
+            )
+        )
+        if (
+            len(dimension_refs) == 1
+            and (
+                analysis_mode in {"topn", "ranking", "ranked", "ranked_group"}
+                or ranking_declared
+            )
+        ):
+            payload["groupByRef"] = dimension_refs[0]
 
     raw_labels = payload.get("labelRefs", payload.get("label_refs", {}))
     if isinstance(raw_labels, list):

@@ -16,6 +16,11 @@ from merchant_ai.services.grounded_query_contract import (
     compile_grounded_query,
     materialize_grounded_asset_pack,
 )
+from merchant_ai.services.grounded_execution_policy import (
+    GroundedExecutionMode,
+    evaluate_deterministic_execution,
+)
+from merchant_ai.services.grounded_query_executor import GroundedQueryExecutionKernel
 from merchant_ai.services.query import NodeWorkerExecutor
 from merchant_ai.services.semantic_metrics import semantic_metric_temporal_contract_issue
 
@@ -998,6 +1003,150 @@ def test_ticket_ranking_uses_product_id_without_ungoverned_name_label() -> None:
     assert "GROUP BY `spu_id`" in sql
     assert "`spu_name`" not in sql
     assert "GROUP BY `spu_id`, `spu_name`" not in sql
+
+
+def test_same_table_ranked_contract_projects_requested_labels_deterministically() -> None:
+    topic = "电商交易"
+    table = "dwm_trade_order_detail_di"
+    detail = table_detail(topic, table, merchant_column="seller_id")
+    metric = metric_read(
+        topic,
+        table,
+        "sku_cnt",
+        "下单商品数量",
+        ["销量", "卖出数量"],
+        "SUM(sku_cnt)",
+        ["sku_cnt"],
+    )
+    product_id = column_read(topic, table, "spu_id", "商品ID", ["商品"], role="KEY")
+    product_name = column_read(topic, table, "spu_name", "商品名称", ["商品名"])
+    brand_name = column_read(topic, table, "brand_name", "品牌名称", ["品牌"])
+    article_id = column_read(topic, table, "article_id", "货号", ["货号"], role="KEY")
+    contract = GroundedQueryContractBuilder().build(
+        "最近10天卖的最多的商品是哪个？他的品牌名字，货号是多少",
+        [topic],
+        [detail, metric, product_id, product_name, brand_name, article_id],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [metric["refId"]],
+            "dimensionRefs": [product_id["refId"]],
+            "groupByRef": product_id["refId"],
+            "selectedFields": [
+                {"fieldRef": product_name["refId"], "outputAlias": "商品名称"},
+                {"fieldRef": brand_name["refId"], "outputAlias": "品牌名称"},
+                {"fieldRef": article_id["refId"], "outputAlias": "货号"},
+            ],
+            "ranking": {
+                "metricRef": metric["refId"],
+                "order": "DESC",
+                "limit": 1,
+            },
+            "analysisMode": "TOPN",
+            "timeExpression": "最近10天",
+        },
+        now=datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.ready is True, [gap.model_dump() for gap in contract.unresolved_gaps]
+    decision = evaluate_deterministic_execution(contract)
+    assert decision.execution_mode == GroundedExecutionMode.DETERMINISTIC_RANKED
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    assert preparation.validation.valid, [gap.model_dump() for gap in preparation.validation.gaps]
+    intent = preparation.plan.intents[0]
+    assert intent.output_keys == ["spu_id", "商品名称", "品牌名称", "货号"]
+
+    compilation = GroundedQueryExecutionKernel(object(), get_settings()).compile_sql(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        access_role="merchant_admin",
+        user_scope={},
+    )
+    assert "`spu_name` AS `商品名称`" in compilation.sql
+    assert "`brand_name` AS `品牌名称`" in compilation.sql
+    assert "`article_id` AS `货号`" in compilation.sql
+    assert "GROUP BY `spu_id`, `spu_name`, `brand_name`, `article_id`" in compilation.sql
+    assert "ORDER BY `sku_cnt` DESC LIMIT 1" in compilation.sql
+
+
+def test_ranked_contract_normalizes_model_shaped_dimension_binding() -> None:
+    topic = "电商交易"
+    table = "dwm_trade_order_detail_di"
+    detail = table_detail(topic, table, merchant_column="seller_id")
+    metric = metric_read(
+        topic,
+        table,
+        "sku_cnt",
+        "下单商品数量",
+        ["销量", "卖出数量"],
+        "SUM(sku_cnt)",
+        ["sku_cnt"],
+    )
+    product_id = column_read(topic, table, "spu_id", "商品ID", ["商品"], role="KEY")
+    product_name = column_read(topic, table, "spu_name", "商品名称", ["商品名"])
+    brand_name = column_read(topic, table, "brand_name", "品牌名称", ["品牌"])
+    article_id = column_read(topic, table, "article_id", "货号", ["货号"], role="KEY")
+
+    contract = GroundedQueryContractBuilder().build(
+        "最近10天卖的最多的商品是哪个？他的品牌名字，货号是多少",
+        [topic],
+        [detail, metric, product_id, product_name, brand_name, article_id],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [metric["refId"]],
+            "dimensionRefs": [product_id["refId"]],
+            # This mirrors the real Core proposal: the grouping field is also
+            # present in selectedFields, analysisMode uses the canonical noun,
+            # and groupByRef is omitted.
+            "selectedFields": [
+                {"fieldRef": product_id["refId"], "outputAlias": "商品ID"},
+                {"fieldRef": product_name["refId"], "outputAlias": "商品名称"},
+                {"fieldRef": brand_name["refId"], "outputAlias": "品牌名字"},
+                {"fieldRef": article_id["refId"], "outputAlias": "货号"},
+            ],
+            "ranking": {
+                "metricRef": metric["refId"],
+                "order": "DESC",
+                "limit": 1,
+            },
+            "analysisMode": "RANKED",
+            "timeExpression": "最近10天",
+        },
+        now=datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.ready is True, [gap.model_dump() for gap in contract.unresolved_gaps]
+    assert contract.binding_hints.group_by_ref == product_id["refId"]
+    assert contract.query_shape == "RANKED"
+    assert [field.output_alias for field in contract.selected_fields] == [
+        "商品名称",
+        "品牌名字",
+        "货号",
+    ]
+    decision = evaluate_deterministic_execution(contract)
+    assert decision.execution_mode == GroundedExecutionMode.DETERMINISTIC_RANKED
+
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    assert preparation.validation.valid, [gap.model_dump() for gap in preparation.validation.gaps]
+    assert preparation.plan.intents[0].output_keys == [
+        "spu_id",
+        "商品名称",
+        "品牌名字",
+        "货号",
+    ]
+    assert preparation.plan.intents[0].group_by_name == "商品ID"
+    assert preparation.plan.intents[0].metric_resolution["sourceColumnLabels"] == {
+        "spu_id": "商品ID",
+        "spu_name": "商品名称",
+        "商品名称": "商品名称",
+        "brand_name": "品牌名字",
+        "品牌名字": "品牌名字",
+        "article_id": "货号",
+        "货号": "货号",
+    }
 
 
 def test_ranked_multi_metric_uses_only_explicit_sort_metric_as_anchor() -> None:

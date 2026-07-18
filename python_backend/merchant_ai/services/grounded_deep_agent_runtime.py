@@ -417,6 +417,7 @@ class GroundedDeepAgentSession:
     goal_coverage_result: dict[str, Any] = field(default_factory=dict)
     operational_failure: dict[str, Any] = field(default_factory=dict)
     runtime_budget_report: dict[str, Any] = field(default_factory=dict)
+    core_context_reports: list[dict[str, Any]] = field(default_factory=list)
     lock: Any = field(default_factory=RLock, repr=False)
 
     def effective_topics(self) -> list[str]:
@@ -677,6 +678,23 @@ class GroundedSemanticBackend:
         offset: int = 0,
         limit: int = 2000,
     ) -> bool:
+        return bool(
+            self.record_core_read_receipt(
+                session,
+                file_path,
+                offset=offset,
+                limit=limit,
+            )
+        )
+
+    def record_core_read_receipt(
+        self,
+        session: GroundedDeepAgentSession,
+        file_path: str,
+        *,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> dict[str, Any]:
         """Record one successful root-Core read without relying on thread config.
 
         Deep Agents may execute filesystem backends in a worker context where
@@ -700,7 +718,7 @@ class GroundedSemanticBackend:
             receipt = self._read_receipts.pop(receipt_key, None)
         if receipt is not None:
             self._retain_evidence(session, receipt)
-            return True
+            return dict(receipt)
         try:
             result = self.semantic_catalog.read(
                 path=normalized,
@@ -708,20 +726,20 @@ class GroundedSemanticBackend:
                 offset=0,
             )
         except Exception:
-            return False
+            return {}
         if not isinstance(result, dict) or not result.get("success"):
-            return False
+            return {}
         kind = str(result.get("kind") or "").upper()
         topic_name = str(result.get("topic") or "")
         if kind in {"TOPIC_INDEX", "TOPIC_MANIFEST"}:
-            return False
+            return {}
         full_content = str(result.get("content") or "")
         lines = full_content.splitlines(keepends=True)
         start = max(0, int(offset or 0))
         end = start + max(1, int(limit or 1))
         complete = start == 0 and end >= len(lines) and not bool(result.get("truncated"))
         if not complete or topic_name not in session.effective_topics():
-            return False
+            return {}
         evidence = {
             "refId": str(result.get("refId") or ""),
             "path": str(result.get("path") or normalized).lstrip("/"),
@@ -734,9 +752,9 @@ class GroundedSemanticBackend:
             "offset": 0,
         }
         if not evidence["refId"]:
-            return False
+            return {}
         self._retain_evidence(session, evidence)
-        return True
+        return dict(evidence)
 
     def _retain_evidence(
         self,
@@ -882,10 +900,633 @@ class GroundedSemanticBackend:
         return self.grep_raw(pattern, path, glob)
 
 
+def _message_content_text(message: Any) -> str:
+    if message is None:
+        return ""
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except Exception:
+        return str(content or "")
+
+
+def _knowledge_relative_path(value: str) -> str:
+    normalized = GroundedSemanticBackend._path(value)
+    if normalized == "knowledge":
+        return ""
+    if normalized.startswith("knowledge/"):
+        return normalized[len("knowledge/") :]
+    return normalized
+
+
+def _replace_message_content(message: Any, content: str) -> Any:
+    model_copy = getattr(message, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(update={"content": content})
+    return ToolMessage(
+        content=content,
+        name=str(getattr(message, "name", "") or ""),
+        tool_call_id=str(getattr(message, "tool_call_id", "") or ""),
+        status=str(getattr(message, "status", "success") or "success"),
+    )
+
+
+def _compact_json_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 3:
+        if isinstance(value, (dict, list, tuple)):
+            return {"omitted": True, "itemCount": len(value)}
+        return str(value or "")[:240]
+    if isinstance(value, dict):
+        return {
+            str(key): _compact_json_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:16]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _compact_json_value(item, depth=depth + 1)
+            for item in list(value)[:12]
+        ]
+    if isinstance(value, str):
+        return value[:400]
+    return value
+
+
+def _semantic_payload_summary(kind: str, content: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    normalized_kind = str(kind or "").upper()
+    if normalized_kind == "TABLE_DETAIL":
+        return _compact_json_value(
+            {
+                key: payload.get(key)
+                for key in (
+                    "tableName",
+                    "title",
+                    "businessSummary",
+                    "dataGrain",
+                    "timeColumn",
+                    "merchantFilterColumn",
+                    "freshnessType",
+                    "supportsDetail",
+                    "supportsMetrics",
+                    "preferredFor",
+                    "children",
+                )
+                if payload.get(key) not in (None, "", [], {})
+            }
+        )
+    if normalized_kind == "METRIC":
+        definition = payload.get("metric") if isinstance(payload.get("metric"), dict) else payload
+        return _compact_json_value(
+            {
+                key: definition.get(key)
+                for key in (
+                    "metricKey",
+                    "businessName",
+                    "formula",
+                    "unit",
+                    "description",
+                    "sourceColumns",
+                    "aliases",
+                    "aggregationPolicy",
+                    "metricGrain",
+                    "applicableTimeGrain",
+                    "timeColumn",
+                    "timeSemantics",
+                )
+                if definition.get(key) not in (None, "", [], {})
+            }
+        )
+    if normalized_kind in {"COLUMN", "FIELD"}:
+        definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else payload
+        summary = {
+            "key": payload.get("key"),
+            **{
+                key: definition.get(key)
+                for key in (
+                    "columnName",
+                    "businessName",
+                    "role",
+                    "description",
+                    "aliases",
+                    "schemaContract",
+                    "entityRole",
+                    "isUniqueEntityKey",
+                    "canonicalEntityRef",
+                    "entityIdentity",
+                    "filterOperators",
+                    "lookupTimePolicy",
+                )
+                if definition.get(key) not in (None, "", [], {})
+            },
+        }
+        return _compact_json_value(
+            {key: value for key, value in summary.items() if value not in (None, "", [], {})}
+        )
+    if "INDEX" in normalized_kind or "CATALOG" in normalized_kind:
+        counts = {
+            str(key): len(value)
+            for key, value in payload.items()
+            if isinstance(value, list)
+        }
+        return {
+            "catalogKeys": list(payload.keys())[:16],
+            "itemCounts": counts,
+            "instruction": "Use grep to locate a named leaf; do not reload the full catalog.",
+        }
+    selected = {
+        key: payload.get(key)
+        for key in (
+            "key",
+            "title",
+            "description",
+            "tableName",
+            "leftTable",
+            "rightTable",
+            "leftColumn",
+            "rightColumn",
+            "joinType",
+            "relationship",
+            "rule",
+            "definition",
+        )
+        if payload.get(key) not in (None, "", [], {})
+    }
+    return _compact_json_value(selected)
+
+
+def _core_visible_semantic_receipt(evidence: Any) -> dict[str, Any]:
+    if not isinstance(evidence, dict) or not evidence:
+        return {}
+    content = str(evidence.get("contentSnippet") or "")
+    content_hash = str(evidence.get("contentHash") or "")
+    if not content_hash and content:
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    receipt = {
+        "refId": str(evidence.get("refId") or ""),
+        "path": str(evidence.get("path") or ""),
+        "kind": str(evidence.get("kind") or ""),
+        "topic": str(evidence.get("topic") or ""),
+        "table": str(evidence.get("table") or ""),
+        "contentHash": content_hash,
+        "contentChars": len(content),
+        "contentComplete": bool(evidence.get("contentComplete")),
+        "summary": _semantic_payload_summary(
+            str(evidence.get("kind") or ""),
+            content,
+        ),
+    }
+    return {
+        key: value
+        for key, value in receipt.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def _grounded_semantic_read_control(
+    session: GroundedDeepAgentSession,
+) -> dict[str, Any]:
+    state = session.runtime
+    if state.phase in {
+        "ACTIVE_COMPILED",
+        "ACTIVE_CORE_SQL_REQUIRED",
+        "ACTIVE_CORE_SQL_VALIDATED",
+    } and state.active_contract is not None:
+        return {
+            "status": "READY_TO_EXECUTE",
+            "nextAction": (
+                "SUBMIT_GROUNDED_SQL_CANDIDATE"
+                if _enum_value(state.active_execution_mode) == "CORE_SQL_REQUIRED"
+                else "EXECUTE_GROUNDED_QUERY"
+            ),
+            "activeGeneration": state.active_generation,
+            "activeAttemptId": state.active_attempt_id,
+            "executionMode": state.active_execution_mode,
+            "retrievalClosed": True,
+        }
+    if state.attempts:
+        latest = state.attempts[-1]
+        blocking = [gap for gap in latest.contract.unresolved_gaps if gap.blocking]
+        if blocking:
+            return {
+                "status": "NEED_MORE_EVIDENCE",
+                "nextAction": "READ_ONLY_FOR_RETURNED_STRUCTURED_GAPS_THEN_RESUBMIT",
+                "attemptId": latest.attempt_id,
+                "blockingGapCount": len(blocking),
+                "gaps": [
+                    {
+                        "code": gap.code,
+                        "evidenceKind": gap.evidence_kind,
+                        "topic": gap.topic,
+                        "table": gap.table,
+                        "phrase": gap.phrase,
+                        "searchScope": gap.search_scope,
+                        "requiredCapability": gap.required_capability,
+                    }
+                    for gap in blocking[:8]
+                ],
+                "retrievalClosed": False,
+            }
+    exact_kinds = [
+        str(item.get("kind") or "").upper()
+        for item in session.core_semantic_evidence
+        if bool(item.get("contentComplete"))
+    ]
+    table_count = sum(kind == "TABLE_DETAIL" for kind in exact_kinds)
+    metric_count = sum(kind == "METRIC" for kind in exact_kinds)
+    column_count = sum(kind in {"COLUMN", "FIELD"} for kind in exact_kinds)
+    relationship_count = sum(kind == "RELATIONSHIP" for kind in exact_kinds)
+    status = (
+        "CONTRACT_CHECKPOINT_AVAILABLE"
+        if table_count >= 1 and (metric_count >= 1 or column_count >= 2)
+        else "CONTINUE_TARGETED_RETRIEVAL"
+    )
+    return {
+        "status": status,
+        "nextAction": (
+            "PROPOSE_GROUNDED_CONTRACT_WITH_CURRENT_BINDINGS"
+            if status == "CONTRACT_CHECKPOINT_AVAILABLE"
+            else "READ_ONE_EXACT_LEAF_OR_USE_GREP"
+        ),
+        "evidenceCounts": {
+            "tableDetails": table_count,
+            "metrics": metric_count,
+            "columns": column_count,
+            "relationships": relationship_count,
+        },
+        "retrievalClosed": False,
+    }
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _is_provider_timeout_error(exc: BaseException) -> bool:
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__.lower()
+        message = str(current).lower()
+        if "timeout" in name or "timed out" in message or "read operation timed out" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _tool_name(item: Any) -> str:
+    if isinstance(item, dict):
+        function = item.get("function") if isinstance(item.get("function"), dict) else {}
+        return str(item.get("name") or function.get("name") or "")
+    return str(getattr(item, "name", "") or "")
+
+
+def _phase_visible_tools(
+    session: Optional[GroundedDeepAgentSession],
+    tools: list[Any],
+) -> tuple[list[Any], list[str]]:
+    if session is None or not tools:
+        return tools, []
+    all_names = {_tool_name(item) for item in tools if _tool_name(item)}
+    always_hidden = {
+        "task",
+        "execute",
+        "write_file",
+        "edit_file",
+        "glob",
+        "write_todos",
+    }
+    allowed: set[str]
+    if session.data_collection_sealed or session.analysis_skill_started:
+        allowed = {"run_skill", "compose_verified_answer", "ask_human"}
+    elif _grounded_semantic_read_control(session).get("status") == "READY_TO_EXECUTE":
+        allowed = {"ask_human"}
+        if _enum_value(session.runtime.active_execution_mode) == "CORE_SQL_REQUIRED":
+            allowed.add("submit_grounded_sql_candidate")
+        else:
+            allowed.add("execute_grounded_query")
+    elif session.question_goal_contract is None:
+        # The first model turn needs only one decision: commit the immutable
+        # original-question goal ledger (or ask for genuinely missing business
+        # input).  Hiding every later-phase schema keeps the largest static
+        # request in the run small and makes the transaction boundary explicit.
+        allowed = {"declare_original_question_goals", "ask_human"}
+    else:
+        allowed = {
+            "ls",
+            "read_file",
+            "grep",
+            "retrieve_knowledge",
+            "propose_grounded_contract",
+            "prepare_grounded_query_batch",
+            "ask_human",
+        }
+        if session.parallel_branches:
+            allowed.add("execute_grounded_query_batch")
+        if session.runtime.verified_query_ledger:
+            allowed.update(
+                {
+                    "publish_verified_entity_set",
+                    "finalize_evidence_collection",
+                }
+            )
+    blocked = (all_names - allowed) | always_hidden
+    visible = [item for item in tools if _tool_name(item) not in blocked]
+    removed = sorted(
+        {
+            _tool_name(item)
+            for item in tools
+            if _tool_name(item) in blocked
+        }
+    )
+    return visible, removed
+
+
+def _message_context_chars(message: Any) -> int:
+    total = len(_message_content_text(message))
+    tool_calls = getattr(message, "tool_calls", None) or []
+    try:
+        total += len(json.dumps(tool_calls, ensure_ascii=False, default=str))
+    except Exception:
+        total += len(str(tool_calls))
+    return total
+
+
+def _historical_tool_call_receipt(call: dict[str, Any]) -> dict[str, Any]:
+    args = dict(call.get("args") or {})
+    serialized = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+    receipt: dict[str, Any] = {
+        "historicalReceipt": True,
+        "argumentHash": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    }
+    name = str(call.get("name") or "")
+    if name == "read_file":
+        receipt.update(
+            {
+                "file_path": str(args.get("file_path") or ""),
+                "offset": int(args.get("offset") or 0),
+                "limit": int(args.get("limit") or 0),
+            }
+        )
+    elif name in {"propose_grounded_contract", "prepare_grounded_query_batch"}:
+        receipt.update(
+            {
+                "readRefCount": len(args.get("read_ref_ids") or []),
+                "goalIds": list(args.get("goal_ids") or [])[:12],
+            }
+        )
+    return receipt
+
+
+def _compact_ai_tool_calls(message: Any) -> Any:
+    tool_calls = list(getattr(message, "tool_calls", None) or [])
+    if not tool_calls:
+        return message
+    compacted_calls = [
+        {
+            "id": str(call.get("id") or ""),
+            "name": str(call.get("name") or ""),
+            "args": _historical_tool_call_receipt(dict(call)),
+            "type": str(call.get("type") or "tool_call"),
+        }
+        for call in tool_calls
+    ]
+    additional_kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+    additional_kwargs.pop("tool_calls", None)
+    model_copy = getattr(message, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(
+            update={
+                "tool_calls": compacted_calls,
+                "additional_kwargs": additional_kwargs,
+            }
+        )
+    return message
+
+
+def _compact_prior_human_message(message: Any) -> Any:
+    content = _message_content_text(message)
+    question = ""
+    try:
+        payload = json.loads(content)
+        if isinstance(payload, dict):
+            question = str(payload.get("question") or "")
+    except (TypeError, ValueError):
+        question = content[:500]
+    compacted = json.dumps(
+        {
+            "historicalRunReceipt": True,
+            "question": question,
+            "originalContextHash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "instruction": "Historical Core internals are not current semantic authority.",
+        },
+        ensure_ascii=False,
+    )
+    return _replace_message_content(message, compacted)
+
+
+def _compact_tool_result_message(
+    message: Any,
+    *,
+    path: str = "",
+    evidence: Optional[dict[str, Any]] = None,
+) -> Any:
+    content = _message_content_text(message)
+    name = str(getattr(message, "name", "") or "")
+    payload: dict[str, Any] = {
+        "status": "HISTORICAL_TOOL_RESULT_RECEIPT",
+        "contextLevel": "L1_RECEIPT",
+        "tool": name,
+        "originalChars": len(content),
+        "contentHash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+    if path:
+        payload["path"] = path
+    if evidence:
+        payload["semanticReceipt"] = _core_visible_semantic_receipt(evidence)
+    if name == "propose_grounded_contract":
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            payload["contractReceipt"] = {
+                key: parsed.get(key)
+                for key in (
+                    "attemptId",
+                    "status",
+                    "queryShape",
+                    "compileStatus",
+                    "activationStatus",
+                    "executionMode",
+                    "nextAction",
+                    "activeGeneration",
+                    "contractFingerprint",
+                    "assignedGoalIds",
+                )
+                if parsed.get(key) not in (None, "", [], {})
+            }
+            payload["gapCodes"] = [
+                str(item.get("code") or "")
+                for item in parsed.get("gaps") or []
+                if isinstance(item, dict) and item.get("code")
+            ][:12]
+    return _replace_message_content(
+        message,
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+
+
+def _compact_grounded_model_messages(
+    messages: list[Any],
+    session: Optional[GroundedDeepAgentSession],
+) -> tuple[list[Any], dict[str, Any]]:
+    if not messages:
+        return [], {
+            "messageCount": 0,
+            "originalMessageChars": 0,
+            "compactedMessageChars": 0,
+            "savedChars": 0,
+            "semanticReadMessagesCompacted": 0,
+            "toolCallMessagesCompacted": 0,
+            "priorRunMessagesCompacted": 0,
+        }
+    latest_human_index = max(
+        (index for index, item in enumerate(messages) if getattr(item, "type", "") == "human"),
+        default=0,
+    )
+    latest_ai_index = max(
+        (
+            index
+            for index, item in enumerate(messages)
+            if index >= latest_human_index and getattr(item, "type", "") == "ai"
+        ),
+        default=latest_human_index,
+    )
+    latest_contract_index = max(
+        (
+            index
+            for index, item in enumerate(messages)
+            if getattr(item, "type", "") == "tool"
+            and str(getattr(item, "name", "") or "") == "propose_grounded_contract"
+        ),
+        default=-1,
+    )
+    paths_by_tool_call_id: dict[str, str] = {}
+    for item in messages:
+        for call in getattr(item, "tool_calls", None) or []:
+            if str(call.get("name") or "") != "read_file":
+                continue
+            args = dict(call.get("args") or {})
+            paths_by_tool_call_id[str(call.get("id") or "")] = str(
+                args.get("file_path") or ""
+            )
+    evidence_by_path = {
+        str(item.get("path") or "").lstrip("/"): item
+        for item in (session.core_semantic_evidence if session is not None else [])
+        if str(item.get("path") or "")
+    }
+    compacted: list[Any] = []
+    read_compacted = 0
+    tool_calls_compacted = 0
+    prior_run_compacted = 0
+    for index, item in enumerate(messages):
+        message_type = str(getattr(item, "type", "") or "")
+        updated = item
+        if index < latest_human_index:
+            prior_run_compacted += 1
+            if message_type == "human":
+                updated = _compact_prior_human_message(item)
+            elif message_type == "ai":
+                updated = _compact_ai_tool_calls(item)
+                if updated is not item:
+                    tool_calls_compacted += 1
+            elif message_type == "tool":
+                tool_call_id = str(getattr(item, "tool_call_id", "") or "")
+                path = paths_by_tool_call_id.get(tool_call_id, "")
+                normalized_path = _knowledge_relative_path(path)
+                updated = _compact_tool_result_message(
+                    item,
+                    path=path,
+                    evidence=evidence_by_path.get(normalized_path),
+                )
+                if str(getattr(item, "name", "") or "") == "read_file":
+                    read_compacted += 1
+        elif message_type == "ai" and index < latest_ai_index:
+            updated = _compact_ai_tool_calls(item)
+            if updated is not item:
+                tool_calls_compacted += 1
+        elif message_type == "tool":
+            name = str(getattr(item, "name", "") or "")
+            should_compact = False
+            if name == "read_file" and index < latest_ai_index:
+                should_compact = True
+                read_compacted += 1
+            elif name == "propose_grounded_contract" and index != latest_contract_index:
+                should_compact = True
+            elif index < latest_ai_index and len(_message_content_text(item)) > 8_000:
+                should_compact = True
+            if should_compact:
+                tool_call_id = str(getattr(item, "tool_call_id", "") or "")
+                path = paths_by_tool_call_id.get(tool_call_id, "")
+                normalized_path = _knowledge_relative_path(path)
+                updated = _compact_tool_result_message(
+                    item,
+                    path=path,
+                    evidence=evidence_by_path.get(normalized_path),
+                )
+        compacted.append(updated)
+    original_chars = sum(_message_context_chars(item) for item in messages)
+    compacted_chars = sum(_message_context_chars(item) for item in compacted)
+    return compacted, {
+        "messageCount": len(messages),
+        "originalMessageChars": original_chars,
+        "compactedMessageChars": compacted_chars,
+        "savedChars": max(0, original_chars - compacted_chars),
+        "semanticReadMessagesCompacted": read_compacted,
+        "toolCallMessagesCompacted": tool_calls_compacted,
+        "priorRunMessagesCompacted": prior_run_compacted,
+    }
+
+
+def _tool_schema_chars(tools: list[Any]) -> int:
+    total = 0
+    for item in tools:
+        if isinstance(item, dict):
+            payload = item
+        else:
+            schema: Any = {}
+            args_schema = getattr(item, "args_schema", None)
+            model_json_schema = getattr(args_schema, "model_json_schema", None)
+            if callable(model_json_schema):
+                try:
+                    schema = model_json_schema()
+                except Exception:
+                    schema = {}
+            payload = {
+                "name": str(getattr(item, "name", "") or ""),
+                "description": str(getattr(item, "description", "") or ""),
+                "schema": schema,
+            }
+        try:
+            total += len(json.dumps(payload, ensure_ascii=False, default=str))
+        except Exception:
+            total += len(str(payload))
+    return total
+
+
 class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
     """Bind semantic-read authority to the root Core's actual tool calls."""
 
     name = "GroundedCoreToolBoundaryMiddleware"
+    MAX_INLINE_READ_CHARS = 8_000
 
     def __init__(self, semantic_backend: GroundedSemanticBackend):
         self.semantic_backend = semantic_backend
@@ -905,22 +1546,199 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        result = handler(request)
-        if tool_name != "read_file" or getattr(result, "status", "success") == "error":
-            return result
         runtime = getattr(request, "runtime", None)
         context = getattr(runtime, "context", None)
         session = getattr(context, "session", None)
+        args = dict(tool_call.get("args") or {})
+        file_path = str(args.get("file_path") or "")
+        if tool_name == "read_file" and isinstance(session, GroundedDeepAgentSession):
+            normalized = _knowledge_relative_path(file_path)
+            read_control = _grounded_semantic_read_control(session)
+            if read_control["status"] == "READY_TO_EXECUTE":
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "READ_BLOCKED",
+                            "code": "GROUNDED_CONTRACT_READY",
+                            "message": "The active Contract is complete; semantic retrieval is closed until it is executed.",
+                            "readControl": read_control,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+            existing = next(
+                (
+                    item
+                    for item in reversed(session.core_semantic_evidence)
+                    if str(item.get("path") or "").lstrip("/") == normalized
+                    and bool(item.get("contentComplete"))
+                ),
+                None,
+            )
+            if existing is not None:
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "ALREADY_READ",
+                            "receipt": _core_visible_semantic_receipt(existing),
+                            "readControl": read_control,
+                            "nextAction": read_control["nextAction"],
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                )
+            if normalized.endswith("/index.json") and int(args.get("offset") or 0) > 0:
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "READ_BLOCKED",
+                            "code": "PAGINATED_CATALOG_SCAN_DENIED",
+                            "message": (
+                                "Do not page through a broad semantic catalog. Use grep with the "
+                                "user's metric, dimension, entity or rule phrase and open only the "
+                                "matching L2 leaf."
+                            ),
+                            "path": file_path,
+                            "readControl": read_control,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+            if (
+                read_control["status"] == "CONTRACT_CHECKPOINT_AVAILABLE"
+                and normalized.endswith("/index.json")
+            ):
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "READ_BLOCKED",
+                            "code": "CONTRACT_CHECKPOINT_REQUIRED",
+                            "message": (
+                                "Enough bindable leaf evidence is already loaded to let the Kernel "
+                                "check the candidate Contract. Submit it now; if unresolved, follow "
+                                "the returned structured gaps. Use grep for a named child instead of "
+                                "opening another broad index."
+                            ),
+                            "readControl": read_control,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+
+        result = handler(request)
+        if tool_name != "read_file" or getattr(result, "status", "success") == "error":
+            return result
         if not isinstance(session, GroundedDeepAgentSession):
             return result
-        args = dict(tool_call.get("args") or {})
-        self.semantic_backend.record_core_read(
+        receipt = self.semantic_backend.record_core_read_receipt(
             session,
-            str(args.get("file_path") or ""),
+            file_path,
             offset=int(args.get("offset") or 0),
             limit=int(args.get("limit") or 2000),
         )
-        return result
+        content = _message_content_text(result)
+        read_control = _grounded_semantic_read_control(session)
+        if len(content) > self.MAX_INLINE_READ_CHARS:
+            compacted_content = json.dumps(
+                {
+                    "status": "TOOL_RESULT_OFFLOADED",
+                    "code": "SEMANTIC_READ_RESULT_TOO_LARGE",
+                    "contextLevel": "L1_OVERVIEW",
+                    "path": file_path,
+                    "originalChars": len(content),
+                    "contentHash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "receipt": _core_visible_semantic_receipt(receipt),
+                    "detailContext": {
+                        "level": "L2_DETAIL",
+                        "path": file_path,
+                        "loadPolicy": "ON_DEMAND_AFTER_GREP_OR_STRUCTURED_GAP",
+                    },
+                    "instruction": (
+                        "The complete semantic asset remains available at the original /knowledge "
+                        "path and is retained in the Kernel evidence ledger, not in the model working "
+                        "set. Use grep with the user's exact business phrase, then read the matching "
+                        "leaf file."
+                    ),
+                    "readControl": read_control,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        else:
+            inline_receipt = _core_visible_semantic_receipt(receipt)
+            inline_receipt.pop("summary", None)
+            compacted_content = "%s\n\n%s" % (
+                content,
+                json.dumps(
+                    {
+                        "groundedReadControl": read_control,
+                        "receipt": inline_receipt,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+        return _replace_message_content(result, compacted_content)
+
+
+class GroundedContextManagementMiddleware(AgentMiddleware):
+    """Keep the Core working set bounded while preserving the durable raw log.
+
+    Deep Agents intentionally leaves the checkpoint message log intact.  This
+    middleware changes only the request sent to the model: prior-run tool
+    arguments are reduced to receipts, older semantic reads are replaced by
+    Kernel-backed references, and only the newest tool-result batch remains
+    verbatim.  Durable semantic assets stay under /knowledge and the current
+    Kernel evidence ledger remains complete.
+    """
+
+    name = "GroundedContextManagementMiddleware"
+
+    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        original = list(getattr(request, "messages", None) or [])
+        runtime = getattr(request, "runtime", None)
+        context = getattr(runtime, "context", None)
+        session = getattr(context, "session", None)
+        compacted, report = _compact_grounded_model_messages(
+            original,
+            session if isinstance(session, GroundedDeepAgentSession) else None,
+        )
+        original_tools = list(getattr(request, "tools", None) or [])
+        visible_tools, removed_tools = _phase_visible_tools(
+            session if isinstance(session, GroundedDeepAgentSession) else None,
+            original_tools,
+        )
+        system_message = getattr(request, "system_message", None)
+        report["systemChars"] = len(_message_content_text(system_message))
+        report["toolCountBefore"] = len(original_tools)
+        report["toolCountAfter"] = len(visible_tools)
+        report["removedTools"] = removed_tools
+        report["toolSchemaChars"] = _tool_schema_chars(visible_tools)
+        report["estimatedRequestChars"] = (
+            report["compactedMessageChars"]
+            + report["systemChars"]
+            + report["toolSchemaChars"]
+        )
+        if isinstance(session, GroundedDeepAgentSession):
+            with session.lock:
+                session.core_context_reports.append(report)
+                session.core_context_reports = session.core_context_reports[-32:]
+        override = getattr(request, "override", None)
+        if callable(override):
+            request = override(messages=compacted, tools=visible_tools)
+        return handler(request)
 
 
 class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
@@ -969,13 +1787,16 @@ Before execution, inspect userInputRequirements and the progressively-read seman
 The first user message also contains trustedExecutionScope. It is authoritative runtime state, not a user claim. When merchantScopeBound=true, never ask the user for merchant_id and never propose bypassing tenant filtering; the executor binds the declared merchant scope automatically.
 Before proposing any query Contract, call declare_original_question_goals exactly once with a typed, complete ledger of the original question's metric, dimension, time-window, comparison, entity and dependency goals. Preserve explicit conjunctions and comparison operands. After exact semantic refs have been read, attach them to the corresponding metric, dimension and entity goals so final coverage can be checked against artifact evidence rather than labels alone. Every serial or parallel query must declare the goalIds it covers. Finalization is blocked until every required goal and dependency is covered by verified artifacts.
 Use native ls/read_file/grep progressively under /knowledge. Read exact table detail, metric, column and relationship files before proposing bindings.
+When a table detail exposes semanticNavigation, match its question-independent aliases and batch-read the exact advertised leaves directly. Those coordinates are navigation only, not binding evidence; do not grep the same section first and do not read a support Topic when the selected fact table advertises every required field.
+Every successful semantic read includes groundedReadControl. CONTRACT_CHECKPOINT_AVAILABLE means the Kernel can now validate a coherent candidate: submit when the current bindings cover every assigned original-question goal; otherwise read only exact leaves for the explicitly uncovered goals and never scan another broad index for reassurance. Only READY_TO_EXECUTE means semantic coverage is complete; then retrieval is closed and you must execute the active Contract. A historical semantic receipt is trusted proof that the complete content remains Kernel-side; reopen it only when a new structured gap specifically requires details absent from the receipt.
 Published metric files already contain the governed formula, source columns, unit and time semantics. When metricRefs satisfy the question, do not also submit fieldAggregations for the same measures.
 One Grounded Contract represents one coherent execution shape. Never combine metrics whose timeSemantics.selectionPolicy values differ. A period_window metric is a period scalar and must not be grouped by the time dimension; a per_time_grain metric over multiple days must preserve that time dimension. If the gate returns REVISE_BINDINGS, follow requiredCapability and submit a smaller compatible binding set before execution.
 For a simple same-table scalar metric query, the expected disclosure path is table detail plus the exact metric files. Do not read schema, columns/index.json, the time column, or metric source-column files unless the question needs a field aggregation, business dimension, filter, join, or a published metric is unavailable.
-When thinRecallCandidates already contains an exact readable path, read that path directly instead of opening an index. Never navigate to asset.json or a #fragment path.
+When thinRecallCandidates already contains an exact readable path, read that path directly instead of opening an index. For a named metric, field or rule, use grep inside the selected table before opening a large catalog. Never navigate to asset.json or a #fragment path.
 Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
-GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC, DETERMINISTIC_MULTI_METRIC, DETERMINISTIC_GROUPED, DETERMINISTIC_TREND, DETERMINISTIC_RANKED and DETERMINISTIC_ENTITY_LOOKUP are runtime-owned deterministic compilation modes and may be executed directly; they compile only the already-grounded Contract and never plan goals or impose an execution order. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. Implement sqlObligations exactly. The runtime will not invent semantic bindings, joins, CTEs, windows, complex dependency logic, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
-propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. Use analysisMode=ENTITY_LOOKUP for a concrete entity lookup and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
+Before creating a TopN -> entity lookup chain, check whether the ranked fact table itself has every requested display attribute. If it does, include those exact same-table fields in selectedFields of the single RANKED Contract and execute once. Publish an entity set and create a serial downstream lookup only when a required attribute is genuinely absent from the ranked table or the Contract returns a structured cross-table gap.
+GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC, DETERMINISTIC_MULTI_METRIC, DETERMINISTIC_GROUPED, DETERMINISTIC_TREND, DETERMINISTIC_RANKED and DETERMINISTIC_ENTITY_LOOKUP are runtime-owned deterministic compilation modes and may be executed directly; they compile only the already-grounded Contract and never plan goals or impose an execution order. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. An ACCEPTED Core SQL candidate is executed and evidence-verified atomically inside that same tool call, so do not call execute_grounded_query afterward. Implement sqlObligations exactly. The runtime will not invent semantic bindings, joins, CTEs, windows, complex dependency logic, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
+propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. Use analysisMode=RANKED plus groupByRef for TopN/ranking, ENTITY_LOOKUP for a concrete entity lookup, and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
 Available governed tools are declare_original_question_goals, retrieve_knowledge, propose_grounded_contract, prepare_grounded_query_batch, submit_grounded_sql_candidate, execute_grounded_query, execute_grounded_query_batch, publish_verified_entity_set, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
 One verified query may be only partial evidence for the user's question. When a later query depends on a verified entity output, call publish_verified_entity_set, progressively read the downstream target field, and propose a new Contract using upstreamEntityBindings. Do not treat a first successful TopN/entity query as the end of data collection. Each query remains an independent grounded QueryGraph chosen dynamically by you, not a fixed workflow.
 When two or more query goals are independent and none uses upstreamEntityBindings, prepare them together with prepare_grounded_query_batch and execute them with execute_grounded_query_batch. The runtime gives every branch its own Contract generation and adopts only independently verified artifacts. Never batch an entity chain: publish the upstream entity set first, then run the dependent Contract serially.
@@ -1024,6 +1845,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(
             self.knowledge_backend
         )
+        self.context_middleware = GroundedContextManagementMiddleware()
         self.budget_middleware = GroundedRuntimeBudgetMiddleware()
         self.backend = backend or self._build_backend()
         self.tools = self._build_tools()
@@ -1053,7 +1875,11 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 model=model,
                 tools=self.tools,
                 system_prompt=self.SYSTEM_PROMPT,
-                middleware=[self.budget_middleware, self.core_tool_boundary],
+                middleware=[
+                    self.context_middleware,
+                    self.budget_middleware,
+                    self.core_tool_boundary,
+                ],
                 subagents=[
                     {
                         # deepagents 0.6.x otherwise appends a default worker
@@ -1433,6 +2259,24 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                         attempt.contract
                     ),
                     "assignedGoalIds": list(assigned_goal_ids),
+                    "semanticCoverage": {
+                        "status": (
+                            "READY_TO_EXECUTE"
+                            if attempt.contract.ready and attempt.activated
+                            else "NEED_MORE_EVIDENCE"
+                        ),
+                        "retrievalClosed": bool(
+                            attempt.contract.ready and attempt.activated
+                        ),
+                        "blockingGapCount": len(
+                            [
+                                gap
+                                for gap in attempt.contract.unresolved_gaps
+                                if gap.blocking
+                            ]
+                        ),
+                        "nextAction": attempt.next_action,
+                    },
                     "gaps": [
                         gap.model_dump(by_alias=True)
                         for gap in attempt.contract.unresolved_gaps
@@ -1897,7 +2741,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             evidence_ref_ids: list[str],
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
-            """Submit the complete Doris SQL authored by Core for the active Contract."""
+            """Validate Core SQL and atomically execute it only when accepted."""
 
             deep_session = runtime.context.session
             if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
@@ -1957,32 +2801,58 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     ensure_ascii=False,
                 )
             internal_error = attempt.status == "VALIDATOR_INTERNAL_ERROR"
-            return json.dumps(
+            candidate_payload = {
+                "candidateId": attempt.candidate_id,
+                "status": "BLOCKED" if internal_error else attempt.status,
+                "code": (
+                    "SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR"
+                    if internal_error
+                    else ""
+                ),
+                "activeGeneration": attempt.active_generation,
+                "nextAction": (
+                    "STOP_INTERNAL" if internal_error else attempt.next_action
+                ),
+                "astFingerprint": attempt.ast_fingerprint,
+                "contractFingerprint": attempt.contract_fingerprint,
+                "outputColumns": attempt.output_columns,
+                "gaps": attempt.validation_gaps,
+                "submittedAndExecuted": False,
+                "instruction": (
+                    "For REPAIR_SQL, change the SQL AST using the exact gap. For "
+                    "REVISE_BINDINGS, progressively read missing semantic assets and "
+                    "propose a new Contract generation. Never retry the same SQL/error state."
+                ),
+            }
+            if internal_error or attempt.status != "ACCEPTED":
+                return json.dumps(
+                    candidate_payload,
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            # The validator has accepted the complete Core-authored SQL and the
+            # Kernel has atomically activated its preparation. Execute and
+            # verify inside this same governed tool call so a second LLM turn
+            # is not required merely to dispatch the accepted candidate.
+            execution_payload = json.loads(
+                execute_grounded_query.func(
+                    reason="Core SQL candidate accepted; execute and verify atomically",
+                    runtime=runtime,
+                )
+            )
+            execution_payload.update(
                 {
+                    "sqlCandidateStatus": "ACCEPTED",
                     "candidateId": attempt.candidate_id,
-                    "status": "BLOCKED" if internal_error else attempt.status,
-                    "code": (
-                        "SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR"
-                        if internal_error
-                        else ""
-                    ),
                     "activeGeneration": attempt.active_generation,
-                    "nextAction": (
-                        "STOP_INTERNAL"
-                        if internal_error
-                        else attempt.next_action
-                    ),
                     "astFingerprint": attempt.ast_fingerprint,
                     "contractFingerprint": attempt.contract_fingerprint,
-                    "outputColumns": attempt.output_columns,
-                    "gaps": attempt.validation_gaps,
-                    "instruction": (
-                        "Execute only when status=ACCEPTED. For REPAIR_SQL, change the SQL AST "
-                        "using the exact gap. For REVISE_BINDINGS, progressively read missing "
-                        "semantic assets and propose a new Contract generation. Never retry the "
-                        "same SQL/error state."
-                    ),
-                },
+                    "submittedAndExecuted": True,
+                }
+            )
+            return json.dumps(
+                execution_payload,
                 ensure_ascii=False,
                 default=str,
             )
@@ -2286,7 +3156,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 default=str,
             )
 
-        @tool("compose_verified_answer")
+        @tool("compose_verified_answer", return_direct=True)
         def compose_verified_answer(
             allow_llm: bool,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
@@ -3313,7 +4183,13 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     user_scope=user_scope,
                 )
             with budget.stage("routing.topic"):
-                self.kernel.route_topic(kernel_session)
+                if isinstance(self.kernel, GroundedRuntimeKernel):
+                    self.kernel.route_topic(
+                        kernel_session,
+                        runtime_budget=budget,
+                    )
+                else:
+                    self.kernel.route_topic(kernel_session)
             try:
                 with budget.stage("recall.initial"):
                     self.kernel.recall_navigation(kernel_session)
@@ -3410,6 +4286,39 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 actual_thread_id,
                 actual_run_id,
             )
+        except Exception as exc:
+            if session is not None and session.runtime.answer:
+                # compose_verified_answer is terminal, but preserve a verified
+                # answer if a provider/framework performs an unnecessary tail
+                # turn and that tail fails.  A post-answer transport error must
+                # never overwrite successfully verified evidence.
+                session.runtime.events.append(
+                    GroundedRuntimeEvent(
+                        sequence=len(session.runtime.events) + 1,
+                        stage="post_answer_tail",
+                        status="IGNORED",
+                        detail="%s:%s" % (type(exc).__name__, str(exc)[:300]),
+                    )
+                )
+            elif _is_provider_timeout_error(exc):
+                if session is None and kernel_session is not None:
+                    session = GroundedDeepAgentSession(runtime=kernel_session)
+                if session is None:
+                    raise
+                session.operational_failure = {
+                    "code": "GROUNDED_PROVIDER_TIMEOUT",
+                    "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
+                    "retryable": True,
+                }
+                session.runtime.phase = "PROVIDER_TIMEOUT"
+                _emit_runtime_listener(
+                    listener,
+                    "runtime.provider_timeout",
+                    "GROUNDED_CORE",
+                    session.operational_failure,
+                )
+            else:
+                raise
         finally:
             if session is not None and not session.runtime_budget_report:
                 session.runtime_budget_report = budget.finish()
@@ -3477,7 +4386,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             },
             "topicRouting": session.runtime.routing.model_dump(by_alias=True),
             "topicL0Manifests": manifests,
-            "thinRecallCandidates": _thin_recall(session.runtime.recall, limit=8),
+            "thinRecallCandidates": _thin_recall(session.runtime.recall, limit=4),
             "originalQuestionGoalPolicy": {
                 "requiredBeforeQuery": True,
                 "immutableAfterQueryStart": True,
@@ -3544,6 +4453,17 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 ],
                 "runtimeBudget": dict(session.runtime_budget_report),
                 "goalCoverage": dict(session.goal_coverage_result),
+                "contextManagement": {
+                    "modelCallCount": len(session.core_context_reports),
+                    "latest": (
+                        dict(session.core_context_reports[-1])
+                        if session.core_context_reports
+                        else {}
+                    ),
+                    "calls": [
+                        dict(item) for item in session.core_context_reports[-16:]
+                    ],
+                },
             }
         }
         if session.operational_failure:
@@ -3552,7 +4472,10 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             )
             return ChatResponse(
                 answer=(
-                    "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
+                    "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；"
+                    "请稍后重试。"
+                    if session.operational_failure.get("code") == "GROUNDED_PROVIDER_TIMEOUT"
+                    else "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
                     "请缩小查询范围，或稍后重试。"
                 ),
                 category_name=state.routing.display_summary(),
@@ -3795,7 +4718,7 @@ def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:
                 "topic": item.topic,
                 "table": item.table,
                 "title": item.title,
-                "snippet": item.content[:600],
+                "snippet": item.content[:600] if inline_only else item.content[:160],
                 "score": float(item.fusion_score or 0.0),
                 "navigationMode": "INLINE_ONLY" if inline_only else "READ_FILE",
                 "bindingEligible": not inline_only,

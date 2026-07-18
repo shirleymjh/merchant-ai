@@ -463,6 +463,7 @@ class GroundedQueryExecutionKernel:
         if len(group_bindings) > 1:
             raise RuntimeError("grounded direct execution supports one explicit group dimension")
         group_columns: list[str] = []
+        primary_group_columns: list[str] = []
         if group_bindings:
             dimension = group_bindings[0]
             if dimension.table != table or dimension.column not in columns:
@@ -470,7 +471,40 @@ class GroundedQueryExecutionKernel:
             if dimension.column == table_binding.merchant_filter_column:
                 raise RuntimeError("merchant scope column cannot be a business dimension")
             group_columns.append(dimension.column)
+            primary_group_columns.append(dimension.column)
             required_columns.append(dimension.column)
+
+        selected_projections: list[tuple[str, str]] = []
+        if contract.query_shape == "RANKED":
+            selected_aliases: set[str] = set()
+            for field in contract.selected_fields:
+                output_alias = str(field.output_alias or field.column or "").strip()
+                if (
+                    field.table != table
+                    or field.column not in columns
+                    or not output_alias
+                    or len(output_alias) > 128
+                    or any(ord(character) < 32 for character in output_alias)
+                ):
+                    raise RuntimeError(
+                        "grounded ranked label field is outside the one-table deterministic projection"
+                    )
+                if output_alias in selected_aliases or output_alias in {
+                    *metric_aliases,
+                    *primary_group_columns,
+                }:
+                    raise RuntimeError(
+                        "grounded ranked output aliases must be non-empty and unique"
+                    )
+                selected_aliases.add(output_alias)
+                if field.column == table_binding.merchant_filter_column:
+                    raise RuntimeError(
+                        "merchant scope column cannot be a ranked output label"
+                    )
+                if field.column not in group_columns:
+                    group_columns.append(field.column)
+                selected_projections.append((field.column, output_alias))
+                required_columns.append(field.column)
 
         where: list[str] = []
         merchant_column = str(table_binding.merchant_filter_column or "").strip()
@@ -556,7 +590,14 @@ class GroundedQueryExecutionKernel:
                 ]
             )
 
-        select_parts = [quote_identifier(column) for column in group_columns]
+        select_parts = [
+            quote_identifier(column) for column in primary_group_columns
+        ]
+        select_parts.extend(
+            "%s AS %s"
+            % (quote_identifier(column), quote_identifier(output_alias))
+            for column, output_alias in selected_projections
+        )
         select_parts.extend(metric_parts)
         sql = "SELECT %s FROM %s" % (
             ", ".join(select_parts),
@@ -600,7 +641,10 @@ class GroundedQueryExecutionKernel:
             question=contract.question,
             preferred_table=table,
             allowed_columns=allowed_columns,
-            visible_columns=list(group_columns),
+            visible_columns=[
+                *primary_group_columns,
+                *(output_alias for _, output_alias in selected_projections),
+            ],
             internal_only_columns=[
                 column
                 for column in required

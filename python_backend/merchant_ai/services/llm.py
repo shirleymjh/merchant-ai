@@ -18,11 +18,21 @@ from merchant_ai.services.semantic_request import explicit_semantic_request_fing
 class LlmClient:
     """Small LangChain wrapper with local fallback behavior."""
 
-    def __init__(self, settings: Settings, model_name: str = "", api_key: str = "", base_url: str = ""):
+    def __init__(
+        self,
+        settings: Settings,
+        model_name: str = "",
+        api_key: str = "",
+        base_url: str = "",
+        extra_body: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 0,
+    ):
         self.settings = settings
         self.model_name = str(model_name or settings.openai_model)
         self.api_key_override = str(api_key or "")
         self.base_url_override = str(base_url or "")
+        self.extra_body_override = dict(extra_body or {})
+        self.max_tokens_override = max(0, int(max_tokens or 0))
         self._model = None
         self._models_by_timeout: Dict[int, Any] = {}
         self._last_error: ContextVar[str] = ContextVar("llm_last_error_%x" % id(self), default="")
@@ -89,13 +99,22 @@ class LlmClient:
         try:
             from langchain_openai import ChatOpenAI
 
+            model_kwargs: Dict[str, Any] = {
+                "model": self.model_name,
+                "api_key": self.api_key,
+                "base_url": self.base_url.rstrip("/"),
+                "temperature": self._temperature(),
+                "timeout": effective_timeout,
+                "max_tokens": self.max_tokens_override or self.settings.llm_max_tokens,
+                # LangChain/OpenAI clients retry by default.  A hidden retry can
+                # outlive the grounded runtime's remaining wall-clock budget,
+                # so the governed caller owns retries explicitly instead.
+                "max_retries": 0,
+            }
+            if self.extra_body_override:
+                model_kwargs["extra_body"] = dict(self.extra_body_override)
             model = ChatOpenAI(
-                model=self.model_name,
-                api_key=self.api_key,
-                base_url=self.base_url.rstrip("/"),
-                temperature=self._temperature(),
-                timeout=effective_timeout,
-                max_tokens=self.settings.llm_max_tokens,
+                **model_kwargs,
             )
             if timeout_seconds is None:
                 self._model = model
@@ -124,6 +143,13 @@ class LlmClient:
         model = self.model_name.strip().lower()
         base_url = self.base_url.strip().lower()
         if model.startswith("kimi-for-coding") and "api.kimi.com/coding" in base_url:
+            thinking = (
+                self.extra_body_override.get("thinking")
+                if isinstance(self.extra_body_override.get("thinking"), dict)
+                else {}
+            )
+            if str(thinking.get("type") or "").lower() == "disabled":
+                return 0.6
             return 1.0
         return 0.0
 
@@ -404,6 +430,8 @@ class LlmClient:
                 "kind": kind,
                 "model": self.model_name,
                 "baseUrl": self.base_url,
+                "extraBody": self.extra_body_override,
+                "maxTokens": self.max_tokens_override or self.settings.llm_max_tokens,
                 "promptId": prompt_meta.get("promptId", ""),
                 "promptVersion": prompt_meta.get("promptVersion", ""),
                 "promptAgent": prompt_meta.get("promptAgent", ""),

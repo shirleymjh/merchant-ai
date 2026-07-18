@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from merchant_ai.models import (
     AgentRunResult,
@@ -25,6 +25,7 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentRunContext,
     GroundedDeepAgentRuntime,
     GroundedDeepAgentSession,
+    GroundedContextManagementMiddleware,
     GroundedCoreToolBoundaryMiddleware,
     GroundedRuntimeBudgetMiddleware,
     GroundedSemanticBackend,
@@ -42,6 +43,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedUpstreamEntityBinding,
     GroundedUpstreamEntityHint,
 )
+from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
@@ -333,14 +335,28 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "tableRefs" in contract_schema
     assert "metricRefs" in contract_schema
     assert "timeExpression" in contract_schema
+    compose_tool = next(
+        item
+        for item in factory.kwargs["tools"]
+        if item.name == "compose_verified_answer"
+    )
+    assert compose_tool.return_direct is True
     assert factory.kwargs["backend"] is not None
-    assert len(factory.kwargs["middleware"]) == 2
+    assert [item.name for item in factory.kwargs["middleware"]] == [
+        "GroundedContextManagementMiddleware",
+        "GroundedRuntimeBudgetMiddleware",
+        "GroundedCoreToolBoundaryMiddleware",
+    ]
     assert isinstance(
         factory.kwargs["middleware"][0],
-        GroundedRuntimeBudgetMiddleware,
+        GroundedContextManagementMiddleware,
     )
     assert isinstance(
         factory.kwargs["middleware"][1],
+        GroundedRuntimeBudgetMiddleware,
+    )
+    assert isinstance(
+        factory.kwargs["middleware"][2],
         GroundedCoreToolBoundaryMiddleware,
     )
     assert [item["name"] for item in factory.kwargs["subagents"]] == [
@@ -453,6 +469,43 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
     }
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
+
+
+def test_provider_timeout_is_returned_as_controlled_operational_failure() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory, FakeKernel())
+
+    class TimeoutGraph:
+        @staticmethod
+        def invoke(payload: dict[str, Any], *, config: Any, context: Any) -> None:
+            del payload, config, context
+            raise TimeoutError("provider read operation timed out")
+
+    outer.deep_agent_graph = TimeoutGraph()
+    response = outer.run("工单量", "m-1")
+    failure = response.debug_trace["harness"]["operationalFailure"]
+
+    assert failure["code"] == "GROUNDED_PROVIDER_TIMEOUT"
+    assert failure["retryable"] is True
+    assert "模型调用时限" in response.answer
+
+
+def test_post_answer_tail_timeout_cannot_overwrite_verified_answer() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory, FakeKernel())
+
+    class AnswerThenTimeoutGraph:
+        @staticmethod
+        def invoke(payload: dict[str, Any], *, config: Any, context: Any) -> None:
+            del payload, config
+            context.session.runtime.answer = "已验证答案"
+            raise TimeoutError("unnecessary tail turn timed out")
+
+    outer.deep_agent_graph = AnswerThenTimeoutGraph()
+    response = outer.run("工单量", "m-1")
+
+    assert response.answer == "已验证答案"
+    assert "operationalFailure" not in response.debug_trace["harness"]
 
 
 def test_semantic_backend_records_only_complete_exact_reads() -> None:
@@ -670,6 +723,406 @@ def test_core_read_uses_same_successful_catalog_receipt_without_second_read() ->
     ]
 
 
+def test_duplicate_complete_semantic_read_returns_receipt_without_backend_call() -> None:
+    backend = GroundedSemanticBackend(FakeSemanticCatalog())
+    middleware = GroundedCoreToolBoundaryMiddleware(backend)
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="duplicate-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        ),
+        core_semantic_evidence=[
+            {
+                "refId": "semantic:客服工单:tickets:detail",
+                "path": "topics/客服工单/tables/tickets/detail.json",
+                "kind": "TABLE_DETAIL",
+                "topic": "客服工单",
+                "table": "tickets",
+                "contentSnippet": '{"tableName":"tickets"}',
+                "contentHash": "hash",
+                "contentComplete": True,
+            }
+        ],
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-duplicate",
+            "name": "read_file",
+            "args": {
+                "file_path": "/knowledge/topics/客服工单/tables/tickets/detail.json",
+                "offset": 0,
+                "limit": 2000,
+            },
+        },
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="duplicate-thread",
+                run_id="duplicate-run",
+                session=session,
+            )
+        ),
+    )
+    called = {"handler": False}
+
+    def handler(_: Any) -> ToolMessage:
+        called["handler"] = True
+        return ToolMessage(content="unexpected", tool_call_id="call-duplicate")
+
+    result = middleware.wrap_tool_call(request, handler)
+    payload = json.loads(str(result.content))
+
+    assert called["handler"] is False
+    assert payload["status"] == "ALREADY_READ"
+    assert payload["receipt"]["refId"] == "semantic:客服工单:tickets:detail"
+
+
+def test_ready_contract_closes_semantic_read_boundary() -> None:
+    backend = GroundedSemanticBackend(FakeSemanticCatalog())
+    middleware = GroundedCoreToolBoundaryMiddleware(backend)
+    contract = GroundedQueryContract(
+        question="工单量",
+        status="READY",
+        query_shape="RANKED",
+    )
+    runtime_state = GroundedRuntimeSession(
+        session_id="ready-session",
+        question="工单量",
+        merchant_id="m-1",
+        workspace_topics=["客服工单"],
+        phase="ACTIVE_COMPILED",
+        active_generation=1,
+        active_attempt_id="attempt-ready",
+        active_execution_mode=GroundedExecutionMode.DETERMINISTIC_RANKED,
+        active_contract=contract,
+    )
+    session = GroundedDeepAgentSession(runtime=runtime_state)
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-after-ready",
+            "name": "read_file",
+            "args": {
+                "file_path": "/knowledge/topics/客服工单/tables/tickets/detail.json"
+            },
+        },
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="ready-thread",
+                run_id="ready-run",
+                session=session,
+            )
+        ),
+    )
+    called = {"handler": False}
+
+    def handler(_: Any) -> ToolMessage:
+        called["handler"] = True
+        return ToolMessage(content="unexpected", tool_call_id="call-after-ready")
+
+    result = middleware.wrap_tool_call(request, handler)
+    payload = json.loads(str(result.content))
+
+    assert called["handler"] is False
+    assert result.status == "error"
+    assert payload["code"] == "GROUNDED_CONTRACT_READY"
+    assert payload["readControl"]["status"] == "READY_TO_EXECUTE"
+
+
+def test_large_semantic_read_is_offloaded_but_full_evidence_is_retained() -> None:
+    large_content = json.dumps(
+        {
+            "topic": "客服工单",
+            "tableName": "tickets",
+            "section": "columns",
+            "items": [
+                {"key": "field_%04d" % index, "description": "x" * 80}
+                for index in range(300)
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    class LargeCatalog(FakeSemanticCatalog):
+        def read(self, *, path: str, max_chars: int, offset: int) -> dict[str, Any]:
+            del max_chars, offset
+            return {
+                "success": True,
+                "refId": "semantic:客服工单:tickets:columns",
+                "path": path,
+                "kind": "COLUMN_INDEX",
+                "topic": "客服工单",
+                "table": "tickets",
+                "content": large_content,
+            }
+
+    backend = GroundedSemanticBackend(LargeCatalog())
+    middleware = GroundedCoreToolBoundaryMiddleware(backend)
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="large-session",
+            question="工单字段",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="large-thread",
+        run_id="large-run",
+        session=session,
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-large",
+            "name": "read_file",
+            "args": {
+                "file_path": "/knowledge/topics/客服工单/tables/tickets/columns/index.json",
+                "offset": 0,
+                "limit": 2000,
+            },
+        },
+        runtime=SimpleNamespace(context=context),
+    )
+
+    def handler(_: Any) -> ToolMessage:
+        read_result = backend.read(
+            "/topics/客服工单/tables/tickets/columns/index.json",
+            0,
+            2000,
+        )
+        assert read_result.error is None
+        return ToolMessage(
+            content=large_content,
+            tool_call_id="call-large",
+            name="read_file",
+        )
+
+    with backend.scope(session):
+        result = middleware.wrap_tool_call(request, handler)
+    payload = json.loads(str(result.content))
+
+    assert len(large_content) > middleware.MAX_INLINE_READ_CHARS
+    assert len(str(result.content)) < 3_000
+    assert payload["status"] == "TOOL_RESULT_OFFLOADED"
+    assert payload["receipt"]["refId"] == "semantic:客服工单:tickets:columns"
+    assert len(session.core_semantic_evidence[0]["contentSnippet"]) == len(large_content)
+
+
+def test_catalog_pagination_is_rejected_in_favor_of_targeted_grep() -> None:
+    backend = GroundedSemanticBackend(FakeSemanticCatalog())
+    middleware = GroundedCoreToolBoundaryMiddleware(backend)
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="catalog-page-session",
+            question="品牌字段",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-catalog-page",
+            "name": "read_file",
+            "args": {
+                "file_path": "/knowledge/topics/客服工单/tables/tickets/columns/index.json",
+                "offset": 200,
+                "limit": 200,
+            },
+        },
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="catalog-page-thread",
+                run_id="catalog-page-run",
+                session=session,
+            )
+        ),
+    )
+    called = {"handler": False}
+
+    def handler(_: Any) -> ToolMessage:
+        called["handler"] = True
+        return ToolMessage(content="unexpected", tool_call_id="call-catalog-page")
+
+    result = middleware.wrap_tool_call(request, handler)
+    payload = json.loads(str(result.content))
+
+    assert called["handler"] is False
+    assert result.status == "error"
+    assert payload["code"] == "PAGINATED_CATALOG_SCAN_DENIED"
+    assert "grep" in payload["message"]
+
+
+def test_context_middleware_compacts_old_reads_and_hides_retrieval_tools_when_ready() -> None:
+    contract = GroundedQueryContract(
+        question="工单量",
+        status="READY",
+        query_shape="RANKED",
+    )
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="context-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+            phase="ACTIVE_COMPILED",
+            active_generation=1,
+            active_attempt_id="attempt-context",
+            active_execution_mode=GroundedExecutionMode.DETERMINISTIC_RANKED,
+            active_contract=contract,
+        )
+    )
+    messages = [
+        HumanMessage(content=json.dumps({"question": "工单量", "context": "x" * 2000})),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "read-old",
+                    "name": "read_file",
+                    "args": {"file_path": "/knowledge/old.json", "limit": 2000},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="z" * 20_000,
+            tool_call_id="read-old",
+            name="read_file",
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-execute",
+                    "name": "execute_grounded_query",
+                    "args": {"reason": "ready"},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content='{"status":"VERIFIED"}',
+            tool_call_id="call-execute",
+            name="execute_grounded_query",
+        ),
+    ]
+    tools = [
+        SimpleNamespace(name="read_file", description="read", args_schema=None),
+        SimpleNamespace(name="grep", description="grep", args_schema=None),
+        SimpleNamespace(
+            name="execute_grounded_query",
+            description="execute",
+            args_schema=None,
+        ),
+        SimpleNamespace(
+            name="submit_grounded_sql_candidate",
+            description="submit",
+            args_schema=None,
+        ),
+    ]
+    request = SimpleNamespace(
+        messages=messages,
+        tools=tools,
+        system_message=HumanMessage(content="system"),
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="context-thread",
+                run_id="context-run",
+                session=session,
+            )
+        ),
+    )
+
+    def override(**updates: Any) -> Any:
+        values = dict(request.__dict__)
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    request.override = override
+    captured: dict[str, Any] = {}
+
+    def handler(updated_request: Any) -> str:
+        captured["request"] = updated_request
+        return "ok"
+
+    result = GroundedContextManagementMiddleware().wrap_model_call(request, handler)
+    updated = captured["request"]
+
+    assert result == "ok"
+    assert len(str(updated.messages[2].content)) < 1_000
+    assert str(updated.messages[4].content) == '{"status":"VERIFIED"}'
+    assert [_tool.name for _tool in updated.tools] == ["execute_grounded_query"]
+    report = session.core_context_reports[-1]
+    assert report["savedChars"] > 15_000
+    assert report["semanticReadMessagesCompacted"] == 1
+    assert report["removedTools"] == [
+        "grep",
+        "read_file",
+        "submit_grounded_sql_candidate",
+    ]
+
+
+def test_context_middleware_exposes_only_goal_transaction_on_first_model_turn() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="first-turn-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    tools = [
+        SimpleNamespace(
+            name=name,
+            description=name,
+            args_schema=None,
+        )
+        for name in (
+            "declare_original_question_goals",
+            "read_file",
+            "grep",
+            "propose_grounded_contract",
+            "execute_grounded_query",
+            "compose_verified_answer",
+            "ask_human",
+            "task",
+            "write_todos",
+        )
+    ]
+    request = SimpleNamespace(
+        messages=[HumanMessage(content='{"question":"工单量"}')],
+        tools=tools,
+        system_message=HumanMessage(content="system"),
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="first-turn-thread",
+                run_id="first-turn-run",
+                session=session,
+            )
+        ),
+    )
+
+    def override(**updates: Any) -> Any:
+        values = dict(request.__dict__)
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    request.override = override
+    captured: dict[str, Any] = {}
+
+    def handler(updated_request: Any) -> str:
+        captured["tools"] = updated_request.tools
+        return "ok"
+
+    GroundedContextManagementMiddleware().wrap_model_call(request, handler)
+
+    assert [_tool.name for _tool in captured["tools"]] == [
+        "declare_original_question_goals",
+        "ask_human",
+    ]
+    assert session.core_context_reports[-1]["toolCountAfter"] == 2
+
+
 def test_task_dispatch_is_blocked_before_subagent_execution() -> None:
     middleware = GroundedCoreToolBoundaryMiddleware(
         GroundedSemanticBackend(FakeSemanticCatalog())
@@ -842,6 +1295,12 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
     assert contract_result["fastPathEligible"] is True
     assert contract_result["fastPathReasonCodes"] == []
     assert contract_result["nextAction"] == "EXECUTE_GROUNDED_QUERY"
+    assert contract_result["semanticCoverage"] == {
+        "status": "READY_TO_EXECUTE",
+        "retrievalClosed": True,
+        "blockingGapCount": 0,
+        "nextAction": "EXECUTE_GROUNDED_QUERY",
+    }
     assert contract_result["activeGeneration"] == 1
     assert len(contract_result["contractFingerprint"]) == 64
     assert "requiredFinalOutputAliases" in contract_result["sqlObligations"]
@@ -1277,8 +1736,71 @@ def test_ready_core_sql_contract_is_activated_without_template_switch() -> None:
 
 
 def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
+    class TransactionalCoreSqlKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.execute_calls = 0
+            self.verify_calls = 0
+
+        def execute_active(
+            self,
+            session: GroundedRuntimeSession,
+            **kwargs: Any,
+        ) -> AgentRunResult:
+            del kwargs
+            self.execute_calls += 1
+            result = AgentRunResult(
+                merged_query_bundle=QueryBundle(
+                    rows=[{"ticket_count": 3}],
+                    tables=["tickets"],
+                )
+            )
+            session.run_result = result
+            return result
+
+        def verify_active(
+            self,
+            session: GroundedRuntimeSession,
+        ) -> VerifiedEvidence:
+            self.verify_calls += 1
+            verified = VerifiedEvidence(passed=True)
+            session.verified_evidence = verified
+            assert session.run_result is not None
+            contract = GroundedQueryContract(
+                question=session.question,
+                status="READY",
+                query_shape="GROUPED",
+            )
+            session.verified_query_ledger.append(
+                GroundedVerifiedQueryArtifact(
+                    artifact_id="query_artifact_core_sql",
+                    generation=1,
+                    contract_fingerprint=grounded_query_contract_fingerprint(
+                        contract
+                    ),
+                    sql_fingerprint="a" * 64,
+                    contract=contract,
+                    plan=QueryPlan(),
+                    run_result=session.run_result,
+                    verified_evidence=verified,
+                    output_columns=["ticket_count"],
+                )
+            )
+            return verified
+
+        @staticmethod
+        def latest_verified_query_artifact(
+            session: GroundedRuntimeSession,
+        ) -> GroundedVerifiedQueryArtifact | None:
+            return (
+                session.verified_query_ledger[-1]
+                if session.verified_query_ledger
+                else None
+            )
+
     factory = CapturingFactory(action="none")
-    outer = runtime(factory, FakeKernel())
+    kernel = TransactionalCoreSqlKernel()
+    outer = runtime(factory, kernel)
     kernel_session = outer.kernel.new_session("按商品统计工单量", "m-1")
     context = GroundedDeepAgentRunContext(
         thread_id="t-submit-core-sql",
@@ -1298,9 +1820,14 @@ def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
         )
     )
 
-    assert result["status"] == "ACCEPTED"
-    assert result["nextAction"] == "EXECUTE_GROUNDED_QUERY"
+    assert result["status"] == "VERIFIED"
+    assert result["sqlCandidateStatus"] == "ACCEPTED"
+    assert result["submittedAndExecuted"] is True
+    assert result["nextAction"] == "PUBLISH_ENTITY_SET_OR_CONTINUE_QUERYING_OR_FINALIZE"
     assert result["outputColumns"] == ["ticket_count"]
+    assert result["rowCount"] == 1
+    assert kernel.execute_calls == 1
+    assert kernel.verify_calls == 1
 
 
 def test_internal_runtime_failure_cannot_be_disguised_as_user_clarification() -> None:

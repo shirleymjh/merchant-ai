@@ -17,6 +17,68 @@
       "RULE_REFERENCE"
     ],
     "metricCount": 7,
-    "ruleCount": 3
+    "ruleCount": 3,
+    "navigationHints": {
+      "metrics": [
+        {
+          "key": "order_detail_cnt",
+          "aliases": ["订单量", "订单明细量", "下单数"]
+        },
+        {
+          "key": "sku_cnt",
+          "aliases": ["销量", "商品销量", "销售数量", "卖出数量", "卖得最多"]
+        },
+        {
+          "key": "pay_amt",
+          "aliases": ["GMV", "支付金额", "成交金额"]
+        },
+        {
+          "key": "product_amt",
+          "aliases": ["商品总额", "商品金额"]
+        },
+        {
+          "key": "discount_amt",
+          "aliases": ["优惠金额"]
+        }
+      ],
+      "columns": [
+        {
+          "key": "order_id",
+          "aliases": ["主订单号", "订单"]
+        },
+        {
+          "key": "sub_order_id",
+          "aliases": ["子订单号"]
+        },
+        {
+          "key": "spu_id",
+          "aliases": ["商品ID", "商品"]
+        },
+        {
+          "key": "spu_name",
+          "aliases": ["商品名称", "商品名"]
+        },
+        {
+          "key": "sku_id",
+          "aliases": ["SKU ID", "规格商品ID"]
+        },
+        {
+          "key": "sku_name",
+          "aliases": ["SKU名称", "规格商品名称"]
+        },
+        {
+          "key": "brand_name",
+          "aliases": ["品牌名称", "品牌名字", "品牌"]
+        },
+        {
+          "key": "article_id",
+          "aliases": ["货号"]
+        },
+        {
+          "key": "pt",
+          "aliases": ["业务日期", "日期"]
+        }
+      ]
+    }
   }
 ]

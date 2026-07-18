@@ -56,6 +56,29 @@ def test_kimi_code_client_uses_supported_temperature():
     assert default._temperature() == 0.0
 
 
+def test_llm_client_disables_hidden_provider_retries(monkeypatch):
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    settings = get_settings().model_copy(
+        update={
+            "llm_api_key": "test-key",
+            "llm_base_url": "https://example.test/v1",
+            "llm_model": "test-model",
+        }
+    )
+
+    model = LlmClient(settings)._chat_model(timeout_seconds=17)
+
+    assert isinstance(model, FakeChatOpenAI)
+    assert captured["timeout"] == 17
+    assert captured["max_retries"] == 0
+
+
 def test_runtime_memory_event_is_principal_scoped():
     event = memory_event_from_state(
         {
