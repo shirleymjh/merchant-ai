@@ -712,6 +712,10 @@ class GroundedSqlCandidateValidator:
             wrapper = select.args.get(key)
             if isinstance(wrapper, exp.Expression) and isinstance(wrapper.this, exp.Expression):
                 roots.append(wrapper.this)
+        runtime_injected_refs = {
+            item.target_field_ref
+            for item in context.contract.upstream_entity_bindings
+        }
         for root in roots:
             for term in _and_terms(root):
                 signature = _predicate_signature(term, state, context.allowed_columns)
@@ -726,6 +730,20 @@ class GroundedSqlCandidateValidator:
                         if (origin.table, origin.column) == expected_origin
                     }
                     if not matching_origins:
+                        continue
+                    if obligation.semantic_ref_id in runtime_injected_refs:
+                        context.gaps.append(
+                            _gap(
+                                "SQL_RUNTIME_ENTITY_PREDICATE_FORBIDDEN",
+                                "Core SQL may not author predicates whose values are owned by a verified entity-set artifact",
+                                table=obligation.table,
+                                column=obligation.column,
+                                details={
+                                    "semanticRefId": obligation.semantic_ref_id,
+                                },
+                                resolution="Remove the predicate; trusted execution injects the complete sealed IN set.",
+                            )
+                        )
                         continue
                     if not _operator_satisfies(operator, obligation.operator):
                         continue
@@ -861,7 +879,13 @@ class GroundedSqlCandidateValidator:
         return outputs
 
     def _validate_entity_obligations(self, context: _ValidationContext) -> None:
+        runtime_injected_refs = {
+            item.target_field_ref
+            for item in context.contract.upstream_entity_bindings
+        }
         for index, obligation in enumerate(context.contract.entity_filters):
+            if obligation.semantic_ref_id in runtime_injected_refs:
+                continue
             expected_scans = context.entity_scans.get(index, set())
             covered_scans = context.entity_predicate_coverage.get(index, set())
             if expected_scans and expected_scans.issubset(covered_scans):
@@ -1134,6 +1158,10 @@ def grounded_query_contract_fingerprint(contract: GroundedQueryContract) -> str:
         "dimensions": [item.model_dump(by_alias=True, mode="json") for item in contract.dimensions],
         "selectedFields": [item.model_dump(by_alias=True, mode="json") for item in contract.selected_fields],
         "entityFilters": [item.model_dump(by_alias=True, mode="json") for item in contract.entity_filters],
+        "upstreamEntityBindings": [
+            item.model_dump(by_alias=True, mode="json")
+            for item in contract.upstream_entity_bindings
+        ],
         "relationships": [item.model_dump(by_alias=True, mode="json") for item in contract.relationships],
         "timeRange": contract.time_range.model_dump(by_alias=True, mode="json"),
         "evidenceRefs": sorted(contract.evidence_refs),

@@ -27,12 +27,19 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentSession,
     GroundedCoreToolBoundaryMiddleware,
     GroundedSemanticBackend,
+    _core_visible_binding_hints,
+    _grounded_contract_sql_obligations,
     _skill_output_contract_issues,
     _thin_recall,
 )
 from merchant_ai.services.grounded_query_contract import (
+    GroundedBindingHints,
     GroundedContractGap,
+    GroundedEntityFilterBinding,
+    GroundedEntityFilterHint,
     GroundedQueryContract,
+    GroundedUpstreamEntityBinding,
+    GroundedUpstreamEntityHint,
 )
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
@@ -270,6 +277,8 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "propose_grounded_contract",
         "submit_grounded_sql_candidate",
         "execute_grounded_query",
+        "publish_verified_entity_set",
+        "finalize_evidence_collection",
         "compose_verified_answer",
         "run_skill",
         "ask_human",
@@ -301,6 +310,67 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
 
 
+def test_upstream_entity_values_are_hidden_from_parent_core_contract_response() -> None:
+    target_ref = "semantic:商品管理:goods:field:spu_id"
+    contract = GroundedQueryContract(
+        question="查看该商品",
+        status="READY",
+        binding_hints=GroundedBindingHints(
+            entity_filters=[
+                GroundedEntityFilterHint(
+                    field_ref=target_ref,
+                    operator="IN",
+                    literal_value=["secret-spu-1", "secret-spu-2"],
+                )
+            ],
+            upstream_entity_bindings=[
+                GroundedUpstreamEntityHint(
+                    entity_set_artifact_id="entity_set_1",
+                    target_field_ref=target_ref,
+                )
+            ],
+        ),
+        entity_filters=[
+            GroundedEntityFilterBinding(
+                semantic_ref_id=target_ref,
+                topic="商品管理",
+                table="goods",
+                column="spu_id",
+                operator="IN",
+                literal_value=["secret-spu-1", "secret-spu-2"],
+                entity_identity="entity:product",
+                allowed_operators=["IN"],
+            )
+        ],
+        upstream_entity_bindings=[
+            GroundedUpstreamEntityBinding(
+                entity_set_artifact_id="entity_set_1",
+                source_query_artifact_id="query_artifact_1",
+                source_column="spu_id",
+                source_semantic_ref_id="semantic:tickets:field:spu_id",
+                source_entity_identity="entity:product",
+                target_field_ref=target_ref,
+                target_table="goods",
+                target_column="spu_id",
+                target_entity_identity="entity:product",
+                value_count=2,
+                values_hash="sealed-values-hash",
+            )
+        ],
+    )
+
+    payload = {
+        "acceptedBindingHints": _core_visible_binding_hints(contract),
+        "sqlObligations": _grounded_contract_sql_obligations(contract),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False)
+
+    assert "secret-spu-1" not in encoded
+    assert "secret-spu-2" not in encoded
+    assert payload["sqlObligations"]["entityFilters"][0]["runtimeInjected"] is True
+    assert payload["sqlObligations"]["entityFilters"][0]["entitySetArtifactId"] == (
+        "entity_set_1"
+    )
 def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> None:
     factory = CapturingFactory()
     kernel = FakeKernel()
@@ -325,7 +395,7 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
         "requiresVerifiedEvidence": True,
         "mayInfluenceSemanticBindings": False,
         "mayExecuteSql": False,
-        "headersDisclosedAfterVerifiedQueryOnly": True,
+        "headersDisclosedAfterEvidenceFinalizationOnly": True,
     }
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
@@ -476,6 +546,71 @@ def test_root_core_read_middleware_records_exact_complete_file() -> None:
     )
 
     assert result.status == "success"
+    assert [item["refId"] for item in session.core_semantic_evidence] == [
+        "semantic:客服工单:tickets:detail"
+    ]
+
+
+def test_core_read_uses_same_successful_catalog_receipt_without_second_read() -> None:
+    class OneShotCatalog(FakeSemanticCatalog):
+        calls = 0
+
+        def read(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls > 1:
+                return {"success": False, "error": "TRANSIENT_FAILURE"}
+            return super().read(**kwargs)
+
+    catalog = OneShotCatalog()
+    backend = GroundedSemanticBackend(
+        catalog,
+        reader_is_core=lambda: False,
+    )
+    middleware = GroundedCoreToolBoundaryMiddleware(backend)
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="receipt-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="receipt-thread",
+        run_id="receipt-run",
+        session=session,
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-receipt",
+            "name": "read_file",
+            "args": {
+                "file_path": "/knowledge/topics/客服工单/tables/tickets/detail.json",
+                "offset": 0,
+                "limit": 2000,
+            },
+        },
+        runtime=SimpleNamespace(context=context),
+    )
+
+    def handler(_: Any) -> ToolMessage:
+        read_result = backend.read(
+            "/topics/客服工单/tables/tickets/detail.json",
+            0,
+            2000,
+        )
+        assert read_result.error is None
+        return ToolMessage(
+            content="file content",
+            tool_call_id="call-receipt",
+            name="read_file",
+        )
+
+    with backend.scope(session):
+        result = middleware.wrap_tool_call(request, handler)
+
+    assert result.status == "success"
+    assert catalog.calls == 1
     assert [item["refId"] for item in session.core_semantic_evidence] == [
         "semantic:客服工单:tickets:detail"
     ]
@@ -840,7 +975,7 @@ def test_run_skill_is_rejected_before_query_execution_and_verification() -> None
         )
     )
 
-    assert result["status"] == "VERIFIED_EVIDENCE_REQUIRED"
+    assert result["status"] == "EVIDENCE_COLLECTION_NOT_SEALED"
     assert kernel_session.run_result is None
     assert context.session.skill_runs == []
 
@@ -873,7 +1008,7 @@ def test_execute_tool_returns_revise_instruction_instead_of_crashing_core() -> N
     assert "Do not retry the same bindings" in result["instruction"]
 
 
-def test_verified_execution_discloses_analysis_skill_headers_only_after_query() -> None:
+def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None:
     class VerifiedKernel(FakeKernel):
         @staticmethod
         def execute_active(session: GroundedRuntimeSession, **kwargs: Any) -> AgentRunResult:
@@ -891,6 +1026,19 @@ def test_verified_execution_discloses_analysis_skill_headers_only_after_query() 
             verified = VerifiedEvidence(passed=True)
             session.verified_evidence = verified
             return verified
+
+        @staticmethod
+        def verify_portfolio(
+            session: GroundedRuntimeSession,
+        ) -> tuple[QueryPlan, AgentRunResult, VerifiedEvidence, list[str]]:
+            assert session.run_result is not None
+            assert session.verified_evidence is not None
+            return (
+                QueryPlan(),
+                session.run_result,
+                session.verified_evidence,
+                ["query_artifact_1"],
+            )
 
     factory = CapturingFactory(action="none")
     outer = GroundedDeepAgentRuntime(
@@ -917,14 +1065,26 @@ def test_verified_execution_discloses_analysis_skill_headers_only_after_query() 
     )
 
     assert result["status"] == "VERIFIED"
+    assert deep_session.analysis_skill_headers_disclosed is False
+    assert "availableAnalysisSkillHeaders" not in result
+
+    finalized = json.loads(
+        tools["finalize_evidence_collection"].func(
+            reason="原问题所需数据已经齐全",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert finalized["status"] == "EVIDENCE_COLLECTION_SEALED"
     assert deep_session.analysis_skill_headers_disclosed is True
+    assert deep_session.data_collection_sealed is True
     assert any(
         item["name"] == "refund-rate-diagnosis"
-        for item in result["availableAnalysisSkillHeaders"]
+        for item in finalized["availableAnalysisSkillHeaders"]
     )
     assert all(
         item["lifecyclePhase"] == "post_query_analysis"
-        for item in result["availableAnalysisSkillHeaders"]
+        for item in finalized["availableAnalysisSkillHeaders"]
     )
 
 
@@ -1030,9 +1190,13 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
         merged_query_bundle=QueryBundle(rows=[{"risk_value": 1}], tables=["tickets"])
     )
     kernel_session.verified_evidence = VerifiedEvidence(passed=True)
+    kernel_session.answer_plan = kernel_session.active_plan
+    kernel_session.answer_run_result = kernel_session.run_result
+    kernel_session.answer_verified_evidence = kernel_session.verified_evidence
     session = GroundedDeepAgentSession(
         runtime=kernel_session,
         analysis_skill_headers_disclosed=True,
+        data_collection_sealed=True,
     )
     events: list[tuple[str, str, dict[str, Any]]] = []
     context = GroundedDeepAgentRunContext(
@@ -1132,9 +1296,13 @@ def test_skill_repairs_once_inside_isolation_without_query_mutation(
         merged_query_bundle=QueryBundle(rows=[{"risk_value": 1}], tables=["tickets"])
     )
     kernel_session.verified_evidence = VerifiedEvidence(passed=True)
+    kernel_session.answer_plan = kernel_session.active_plan
+    kernel_session.answer_run_result = kernel_session.run_result
+    kernel_session.answer_verified_evidence = kernel_session.verified_evidence
     deep_session = GroundedDeepAgentSession(
         runtime=kernel_session,
         analysis_skill_headers_disclosed=True,
+        data_collection_sealed=True,
     )
     context = GroundedDeepAgentRunContext(
         thread_id="thread-skill-repair",
@@ -1218,9 +1386,13 @@ def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
         merged_query_bundle=QueryBundle(rows=[{"risk_value": 1}], tables=["tickets"])
     )
     kernel_session.verified_evidence = VerifiedEvidence(passed=True)
+    kernel_session.answer_plan = kernel_session.active_plan
+    kernel_session.answer_run_result = kernel_session.run_result
+    kernel_session.answer_verified_evidence = kernel_session.verified_evidence
     deep_session = GroundedDeepAgentSession(
         runtime=kernel_session,
         analysis_skill_headers_disclosed=True,
+        data_collection_sealed=True,
     )
     context = GroundedDeepAgentRunContext(
         thread_id="thread-skill-fallback",

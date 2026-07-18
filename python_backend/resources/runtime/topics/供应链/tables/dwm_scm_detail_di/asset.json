@@ -2170,6 +2170,16 @@
       "columnName": "spu_id",
       "businessName": "商品spuid",
       "role": "KEY",
+      "canonicalEntityRef": "entity:product",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "商品spuid",
       "aliases": [
         "商品spuid",
@@ -2184,6 +2194,16 @@
       "columnName": "sku_id",
       "businessName": "商品skuid",
       "role": "KEY",
+      "canonicalEntityRef": "entity:sku",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "商品skuid",
       "aliases": [
         "商品skuid",
@@ -2198,6 +2218,16 @@
       "columnName": "spu_name",
       "businessName": "spu名称",
       "role": "DIMENSION",
+      "canonicalEntityRef": "entity:product_name",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "spu名称",
       "aliases": [
         "spu名称",
@@ -2467,6 +2497,16 @@
       "columnName": "seller_id",
       "businessName": "卖家id",
       "role": "KEY",
+      "canonicalEntityRef": "entity:merchant",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "卖家id-个人卖家",
       "aliases": [
         "卖家id",

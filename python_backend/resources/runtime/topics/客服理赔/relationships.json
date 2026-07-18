@@ -6,6 +6,10 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
     "grain": "sub_order_id_bill_id",
+    "cardinality": "many_to_many",
+    "fanoutPolicy": "BLOCK_UNSAFE_FANOUT",
+    "dedupKeys": [],
+    "rowIdentityPreserved": {"leftToRight": false, "rightToLeft": false},
     "pathSemantics": ["order_entity", "compensation_entity", "entity_filter"],
     "useCases": ["赔付明细关联订单明细", "赔付单回看订单金额和商品"]
   },
@@ -16,6 +20,10 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["ticket_id", "ticket_id"]],
     "grain": "ticket_id_bill_id",
+    "cardinality": "many_to_many",
+    "fanoutPolicy": "BLOCK_UNSAFE_FANOUT",
+    "dedupKeys": [],
+    "rowIdentityPreserved": {"leftToRight": false, "rightToLeft": false},
     "pathSemantics": ["ticket_entity", "compensation_entity", "entity_filter"],
     "useCases": ["赔付明细关联工单明细", "工单责任和赔付状态联合分析"]
   }

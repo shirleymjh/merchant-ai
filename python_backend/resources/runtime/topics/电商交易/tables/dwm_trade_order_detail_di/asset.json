@@ -2137,6 +2137,16 @@
       "columnName": "buyer_id",
       "businessName": "买家ID",
       "role": "KEY",
+      "canonicalEntityRef": "entity:buyer",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "买家ID",
       "aliases": [
         "买家ID",
@@ -2179,6 +2189,16 @@
       "columnName": "seller_id",
       "businessName": "卖家ID",
       "role": "KEY",
+      "canonicalEntityRef": "entity:merchant",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "卖家ID",
       "aliases": [
         "卖家ID",
@@ -2241,6 +2261,10 @@
         "EQ",
         "IN"
       ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "spuId",
       "aliases": [
         "spuId",
@@ -2255,6 +2279,16 @@
       "columnName": "sku_id",
       "businessName": "skuId",
       "role": "KEY",
+      "canonicalEntityRef": "entity:sku",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "skuId",
       "aliases": [
         "skuId",
@@ -2749,6 +2783,10 @@
       "columnName": "discount_rel_id",
       "businessName": "优惠方式关联的id",
       "role": "KEY",
+      "canonicalEntityRef": "entity:coupon",
+      "comparisonPolicy": "exact",
+      "filterOperators": ["EQ", "IN"],
+      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
       "description": "优惠方式关联的id，优惠券id,红包账号等",
       "aliases": [
         "优惠方式关联的id",

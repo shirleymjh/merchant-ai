@@ -17,11 +17,13 @@ from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
 from merchant_ai.services.grounded_query_contract import (
     GroundedDimensionBinding,
+    GroundedEntityFilterBinding,
     GroundedMetricBinding,
     GroundedQueryContract,
     GroundedRelationshipBinding,
     GroundedSelectedFieldBinding,
     GroundedTableBinding,
+    GroundedUpstreamEntityBinding,
 )
 from merchant_ai.services.grounded_query_executor import GroundedQueryExecutionKernel
 from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeKernel
@@ -96,6 +98,8 @@ def grouped_contract() -> GroundedQueryContract:
                 table="fact_orders",
                 column="buyer_id",
                 usage="group_by",
+                entity_identity="entity:buyer",
+                filter_operators=["EQ", "IN"],
             )
         ],
         time_range=ResolvedTimeRange(
@@ -119,6 +123,79 @@ def grouped_pack() -> PlanningAssetPack:
                 columns=["tenant_id", "event_date", "buyer_id", "amount"],
             )
         ]
+    )
+
+
+def upstream_filtered_contract() -> GroundedQueryContract:
+    detail_ref = "semantic:orders:fact_orders:detail"
+    metric_ref = "semantic:orders:fact_orders:metric:total_amount"
+    buyer_ref = "semantic:orders:fact_orders:field:buyer_id"
+    return GroundedQueryContract(
+        status="READY",
+        question="查询已验证买家集合的下单金额",
+        topics=["orders"],
+        query_shape="SCALAR",
+        primary_table="fact_orders",
+        tables=[
+            GroundedTableBinding(
+                topic="orders",
+                table="fact_orders",
+                time_column="event_date",
+                merchant_filter_column="tenant_id",
+                detail_ref_id=detail_ref,
+            )
+        ],
+        metrics=[
+            GroundedMetricBinding(
+                requested_phrase="下单金额",
+                semantic_ref_id=metric_ref,
+                topic="orders",
+                table="fact_orders",
+                metric_key="total_amount",
+                formula="SUM(amount)",
+                source_columns=["amount"],
+                time_column="event_date",
+                binding_type="published_metric",
+            )
+        ],
+        entity_filters=[
+            GroundedEntityFilterBinding(
+                semantic_ref_id=buyer_ref,
+                topic="orders",
+                table="fact_orders",
+                column="buyer_id",
+                operator="IN",
+                literal_value=["b-1", "b-2"],
+                entity_identity="entity:buyer",
+                allowed_operators=["IN"],
+            )
+        ],
+        upstream_entity_bindings=[
+            GroundedUpstreamEntityBinding(
+                entity_set_artifact_id="entity_set_test",
+                source_query_artifact_id="query_artifact_test",
+                source_contract_fingerprint="source-contract",
+                source_sql_fingerprint="source-sql",
+                source_column="buyer_id",
+                source_semantic_ref_id="semantic:source:buyers:field:buyer_id",
+                source_entity_identity="entity:buyer",
+                target_field_ref=buyer_ref,
+                target_table="fact_orders",
+                target_column="buyer_id",
+                target_entity_identity="entity:buyer",
+                operator="IN",
+                value_count=2,
+                values_hash="values-hash",
+            )
+        ],
+        time_range=ResolvedTimeRange(
+            explicit=True,
+            start_date="2026-06-01",
+            end_date="2026-06-30",
+            days=30,
+            window_role="primary",
+        ),
+        evidence_refs=[detail_ref, metric_ref, buyer_ref],
     )
 
 
@@ -180,6 +257,17 @@ def test_complex_contract_accepts_core_sql_and_executes_without_template(
     assert verified.passed is True, [
         item.model_dump(by_alias=True) for item in verified.blocking_gaps
     ]
+    artifact = kernel.latest_verified_query_artifact(session)
+    assert artifact is not None
+    assert artifact.output_semantic_refs["buyer_id"].endswith(":field:buyer_id")
+    entity_set = kernel.publish_verified_entity_set(
+        session,
+        artifact.artifact_id,
+        "buyer_id",
+    )
+    assert entity_set.values == ["b-1"]
+    assert entity_set.source_entity_identity == "entity:buyer"
+    assert entity_set.truncated is False
     with pytest.raises(RuntimeError, match="SQL_EXECUTION_NO_PROGRESS"):
         kernel.execute_active(session)
 
@@ -222,6 +310,67 @@ def test_same_invalid_sql_is_fused_as_no_progress() -> None:
     assert first.next_action == "REPAIR_SQL"
     assert second.status == "NO_PROGRESS"
     assert second.validation_gaps[0]["code"] == "SQL_CANDIDATE_NO_PROGRESS"
+
+
+def test_upstream_entity_set_is_injected_without_disclosing_values_to_core_sql(
+    tmp_path: Path,
+) -> None:
+    contract = upstream_filtered_contract()
+    doris = FakeDoris([{"total_amount": 22.5}])
+    settings = get_settings()
+    executor = GroundedQueryExecutionKernel(
+        doris,
+        settings,
+        access_control=AccessControlService(settings, root=tmp_path / "acl"),
+    )
+    kernel = GroundedRuntimeKernel(
+        object(),
+        keyword_service=object(),
+        topic_router=object(),
+        contract_builder=QueueBuilder(contract),
+        asset_materializer=lambda _contract, _assets: grouped_pack(),
+        compiler=NoTemplateCompiler(),
+        executor=executor,
+        verifier=EvidenceVerifier(),
+    )
+    session = kernel.new_session(contract.question, "merchant-1")
+    proposed = kernel.propose_contract(session, [], {})
+    activated = kernel.activate_contract(session, proposed.attempt_id)
+    contract_fingerprint = grounded_query_contract_fingerprint(
+        activated.contract
+    )
+    forbidden = kernel.submit_sql_candidate(
+        session,
+        """
+        SELECT SUM(o.amount) AS total_amount
+        FROM fact_orders o
+        WHERE o.event_date BETWEEN '2026-06-01' AND '2026-06-30'
+          AND o.buyer_id IN ('b-1')
+        """,
+        expected_generation=activated.active_generation,
+        expected_contract_fingerprint=contract_fingerprint,
+    )
+    submitted = kernel.submit_sql_candidate(
+        session,
+        """
+        SELECT SUM(o.amount) AS total_amount
+        FROM fact_orders o
+        WHERE o.event_date BETWEEN '2026-06-01' AND '2026-06-30'
+        """,
+        expected_generation=activated.active_generation,
+        expected_contract_fingerprint=contract_fingerprint,
+    )
+
+    result = kernel.execute_active(session)
+
+    assert forbidden.status == "REJECTED"
+    assert forbidden.validation_gaps[0]["code"] == (
+        "SQL_RUNTIME_ENTITY_PREDICATE_FORBIDDEN"
+    )
+    assert submitted.status == "ACCEPTED"
+    assert result.merged_query_bundle.rows[0]["total_amount"] == 22.5
+    assert "buyer_id IN ('b-1', 'b-2')" in doris.sql
+    assert "merchant-1" in doris.sql
 
 
 def test_sql_submission_rejects_stale_contract_generation() -> None:
@@ -421,6 +570,33 @@ def test_left_join_right_scope_is_injected_into_on_clause() -> None:
                 output_alias="label",
             ),
         ],
+        entity_filters=[
+            GroundedEntityFilterBinding(
+                semantic_ref_id="semantic:goods:dim_goods:field:goods_id",
+                topic="goods",
+                table="dim_goods",
+                column="goods_id",
+                operator="IN",
+                literal_value=["g-1", "g-2"],
+                entity_identity="entity:product",
+                allowed_operators=["IN"],
+            )
+        ],
+        upstream_entity_bindings=[
+            GroundedUpstreamEntityBinding(
+                entity_set_artifact_id="entity_set_goods",
+                source_query_artifact_id="query_artifact_goods",
+                source_column="goods_id",
+                source_semantic_ref_id="semantic:source:field:goods_id",
+                source_entity_identity="entity:product",
+                target_field_ref="semantic:goods:dim_goods:field:goods_id",
+                target_table="dim_goods",
+                target_column="goods_id",
+                target_entity_identity="entity:product",
+                value_count=2,
+                values_hash="goods-values-hash",
+            )
+        ],
         relationships=[
             GroundedRelationshipBinding(
                 semantic_ref_id="semantic:orders:relationship:order_goods",
@@ -466,8 +642,10 @@ def test_left_join_right_scope_is_injected_into_on_clause() -> None:
     )
 
     assert "b.tenant_id = 'merchant-1'" in scoped
+    assert "b.goods_id IN ('g-1', 'g-2')" in scoped
     assert "a.tenant_id = 'merchant-1'" in scoped
     assert scoped.index("b.tenant_id = 'merchant-1'") < scoped.find(" WHERE ")
+    assert scoped.index("b.goods_id IN ('g-1', 'g-2')") < scoped.find(" WHERE ")
 
 
 def test_post_scope_validation_does_not_union_multitable_columns() -> None:

@@ -244,6 +244,134 @@ def test_relationships_are_progressively_disclosed_as_index_then_one_exact_edge(
     assert "goods_refund_by_spu_name" not in str(edge["content"])
 
 
+def test_all_published_relationships_and_transfer_keys_are_governed() -> None:
+    catalog = _catalog()
+    table_details: dict[str, dict[str, object]] = {}
+    field_entries: dict[tuple[str, str], dict[str, object]] = {}
+
+    for topic in catalog.topic_assets.all_topic_names():
+        manifest = catalog.read(
+            path="topics/%s/manifest.json" % topic,
+            max_chars=2_000_000,
+        )
+        assert manifest["success"], topic
+        for table_item in json.loads(str(manifest["content"]))["tables"]:
+            table = str(table_item["table"])
+            detail_read = catalog.read(
+                path=str(table_item["detailPath"]),
+                max_chars=2_000_000,
+            )
+            detail = json.loads(str(detail_read["content"]))
+            table_details[table] = detail
+            columns_child = next(
+                item
+                for item in detail["children"]
+                if str(item["path"]).endswith("/columns/index.json")
+            )
+            columns_index = catalog.read(
+                path=str(columns_child["path"]),
+                max_chars=2_000_000,
+            )
+            for entry in json.loads(str(columns_index["content"]))["entries"]:
+                field_entries[(table, str(entry["key"]))] = entry
+
+    checked_relationships: set[tuple[str, str, str]] = set()
+    for topic in catalog.topic_assets.all_topic_names():
+        relationship_index = catalog.read(
+            path=semantic_relationship_index_path(topic),
+            max_chars=2_000_000,
+        )
+        if not relationship_index.get("success"):
+            continue
+        for entry in json.loads(str(relationship_index["content"])).get(
+            "entries", []
+        ):
+            edge_read = catalog.read(
+                path=str(entry["path"]),
+                max_chars=2_000_000,
+            )
+            relationship = json.loads(str(edge_read["content"]))[
+                "relationships"
+            ][0]
+            identity = (
+                str(relationship["name"]),
+                str(relationship["leftTable"]),
+                str(relationship["rightTable"]),
+            )
+            if identity in checked_relationships:
+                continue
+            checked_relationships.add(identity)
+
+            assert relationship.get("keys"), identity
+            assert relationship.get("grain"), identity
+            assert str(relationship.get("cardinality") or "").lower() in {
+                "one_to_one",
+                "one_to_many",
+                "many_to_one",
+                "many_to_many",
+            }, identity
+            assert relationship.get("fanoutPolicy"), identity
+            assert "dedupKeys" in relationship, identity
+            assert relationship.get("rowIdentityPreserved"), identity
+
+            left_table = str(relationship["leftTable"])
+            right_table = str(relationship["rightTable"])
+            left_detail = table_details[left_table]
+            right_detail = table_details[right_table]
+            for left_key, right_key in relationship["keys"]:
+                is_scope_key = (
+                    left_key == left_detail.get("merchantFilterColumn")
+                    and right_key == right_detail.get("merchantFilterColumn")
+                )
+                is_time_key = (
+                    left_key == left_detail.get("timeColumn")
+                    and right_key == right_detail.get("timeColumn")
+                )
+                if is_scope_key or is_time_key:
+                    continue
+                left_entry = field_entries[(left_table, str(left_key))]
+                right_entry = field_entries[(right_table, str(right_key))]
+                left_definition = json.loads(
+                    str(
+                        catalog.read(
+                            path=str(left_entry["path"]),
+                            max_chars=2_000_000,
+                        )["content"]
+                    )
+                )["definition"]
+                right_definition = json.loads(
+                    str(
+                        catalog.read(
+                            path=str(right_entry["path"]),
+                            max_chars=2_000_000,
+                        )["content"]
+                    )
+                )["definition"]
+                left_entity = str(
+                    left_definition.get("canonicalEntityRef") or ""
+                )
+                right_entity = str(
+                    right_definition.get("canonicalEntityRef") or ""
+                )
+                assert left_entity and left_entity == right_entity, (
+                    identity,
+                    left_key,
+                    right_key,
+                    left_entity,
+                    right_entity,
+                )
+                assert "IN" in left_definition.get("filterOperators", []), (
+                    identity,
+                    left_key,
+                )
+                assert "IN" in right_definition.get("filterOperators", []), (
+                    identity,
+                    right_key,
+                )
+
+    assert len(checked_relationships) >= 16
+
+
 def test_semantic_entry_keys_are_stable_across_reordering_and_fail_closed_on_duplicates() -> None:
     rules = [
         {"ruleId": "refund-policy", "title": "Refund policy", "content": "A"},

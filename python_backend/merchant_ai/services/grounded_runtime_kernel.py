@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from merchant_ai.models import (
     KnowledgeRetrievalRequest,
     MerchantInfo,
     PlanningAssetPack,
+    QueryBundle,
     QueryPlan,
     QuestionIntent,
     RecallBundle,
@@ -29,8 +31,12 @@ from merchant_ai.models import (
     VerifiedEvidence,
 )
 from merchant_ai.services.grounded_query_contract import (
+    GroundedBindingHints,
+    GroundedContractGap,
+    GroundedEntityFilterHint,
     GroundedQueryContract,
     GroundedQueryContractBuilder,
+    GroundedUpstreamEntityBinding,
     compile_grounded_query,
     materialize_grounded_asset_pack,
 )
@@ -77,6 +83,42 @@ class GroundedRuntimeSqlCandidateAttempt(APIModel):
     progress_fingerprint: str = ""
     output_columns: list[str] = Field(default_factory=list)
     validation_gaps: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: str = ""
+
+
+class GroundedVerifiedQueryArtifact(APIModel):
+    """Immutable snapshot of one independently grounded and verified query."""
+
+    artifact_id: str
+    generation: int
+    attempt_id: str = ""
+    contract_fingerprint: str
+    sql_fingerprint: str
+    contract: GroundedQueryContract
+    plan: QueryPlan
+    run_result: AgentRunResult
+    verified_evidence: VerifiedEvidence
+    output_columns: list[str] = Field(default_factory=list)
+    output_semantic_refs: dict[str, str] = Field(default_factory=dict)
+    output_entity_identities: dict[str, str] = Field(default_factory=dict)
+    output_lineage: dict[str, list[str]] = Field(default_factory=dict)
+    sealed_entity_values: dict[str, list[Any]] = Field(default_factory=dict)
+    sealed_entity_values_truncated: bool = False
+    created_at: str = ""
+
+
+class GroundedVerifiedEntitySet(APIModel):
+    """Kernel-retained entity values published from verified query evidence."""
+
+    artifact_id: str
+    source_query_artifact_id: str
+    source_column: str
+    source_semantic_ref_id: str
+    source_entity_identity: str = ""
+    values: list[Any] = Field(default_factory=list)
+    value_count: int = 0
+    truncated: bool = False
+    values_hash: str = ""
     created_at: str = ""
 
 
@@ -135,6 +177,16 @@ class GroundedRuntimeSession(APIModel):
     terminal_guard_code: str = ""
     run_result: Optional[AgentRunResult] = None
     verified_evidence: Optional[VerifiedEvidence] = None
+    verified_query_ledger: list[GroundedVerifiedQueryArtifact] = Field(
+        default_factory=list
+    )
+    verified_entity_sets: list[GroundedVerifiedEntitySet] = Field(
+        default_factory=list
+    )
+    answer_plan: Optional[QueryPlan] = None
+    answer_run_result: Optional[AgentRunResult] = None
+    answer_verified_evidence: Optional[VerifiedEvidence] = None
+    answer_artifact_ids: list[str] = Field(default_factory=list)
     answer: str = ""
     clarification: Optional[ClarificationRequest] = None
     events: list[GroundedRuntimeEvent] = Field(default_factory=list)
@@ -296,7 +348,7 @@ class GroundedRuntimeKernel:
         self,
         session: GroundedRuntimeSession,
         core_semantic_evidence: Iterable[dict[str, Any]],
-        binding_hints: dict[str, Any] | None = None,
+        binding_hints: dict[str, Any] | GroundedBindingHints | None = None,
         *,
         topics: Sequence[str] | None = None,
         timezone_name: str = "Asia/Shanghai",
@@ -309,15 +361,47 @@ class GroundedRuntimeKernel:
                     "TERMINAL_GUARD:%s" % session.terminal_guard_code
                 )
         selected_topics = _dedupe(topics or session.workspace_topics)
+        normalized_hints = (
+            binding_hints
+            if isinstance(binding_hints, GroundedBindingHints)
+            else GroundedBindingHints.model_validate(binding_hints or {})
+        )
+        (
+            normalized_hints,
+            upstream_bindings,
+            upstream_gaps,
+        ) = self._resolve_upstream_entity_hints(session, normalized_hints)
         contract = self.contract_builder.build(
             session.question,
             selected_topics,
             list(core_semantic_evidence),
-            binding_hints=binding_hints,
+            binding_hints=normalized_hints,
             timezone_name=timezone_name,
             now=now,
             default_days=default_days,
         )
+        if upstream_bindings or upstream_gaps:
+            resolved_bindings, identity_gaps = self._bind_upstream_targets(
+                contract,
+                upstream_bindings,
+            )
+            combined_gaps = [
+                *contract.unresolved_gaps,
+                *upstream_gaps,
+                *identity_gaps,
+            ]
+            contract = contract.model_copy(
+                update={
+                    "status": (
+                        "UNRESOLVED"
+                        if any(item.blocking for item in combined_gaps)
+                        else contract.status
+                    ),
+                    "upstream_entity_bindings": resolved_bindings,
+                    "unresolved_gaps": combined_gaps,
+                },
+                deep=True,
+            )
         attempt = GroundedRuntimeAttempt(
             attempt_id="attempt_%s" % uuid.uuid4().hex[:12],
             contract=contract,
@@ -336,6 +420,196 @@ class GroundedRuntimeKernel:
                 attempt.attempt_id,
             )
         return attempt
+
+    def _resolve_upstream_entity_hints(
+        self,
+        session: GroundedRuntimeSession,
+        hints: GroundedBindingHints,
+    ) -> tuple[
+        GroundedBindingHints,
+        list[GroundedUpstreamEntityBinding],
+        list[GroundedContractGap],
+    ]:
+        """Resolve artifact references inside the kernel, never in Core context."""
+
+        if not hints.upstream_entity_bindings:
+            return hints, [], []
+        with self._lock:
+            entity_sets = {
+                item.artifact_id: item.model_copy(deep=True)
+                for item in session.verified_entity_sets
+            }
+            query_artifacts = {
+                item.artifact_id: item.model_copy(deep=True)
+                for item in session.verified_query_ledger
+            }
+        filters = [item.model_copy(deep=True) for item in hints.entity_filters]
+        resolved: list[GroundedUpstreamEntityBinding] = []
+        gaps: list[GroundedContractGap] = []
+        occupied_targets = {item.field_ref for item in filters}
+        for item in hints.upstream_entity_bindings:
+            artifact_id = str(item.entity_set_artifact_id or "").strip()
+            target_ref = str(item.target_field_ref or "").strip()
+            entity_set = entity_sets.get(artifact_id)
+            if entity_set is None:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_SET_NOT_FOUND",
+                        message="Verified entity set %s does not exist" % artifact_id,
+                        evidence_kind="VERIFIED_ENTITY_SET",
+                        phrase=item.requested_phrase,
+                        resolution="Publish an entity set from a verified query artifact first.",
+                    )
+                )
+                continue
+            source_query = query_artifacts.get(entity_set.source_query_artifact_id)
+            if source_query is None or not source_query.verified_evidence.passed:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_QUERY_EVIDENCE_NOT_VERIFIED",
+                        message="Entity set source query is not present in the verified ledger",
+                        evidence_kind="VERIFIED_QUERY_ARTIFACT",
+                        phrase=item.requested_phrase,
+                        resolution="Use only an entity set retained by the active verified ledger.",
+                    )
+                )
+                continue
+            if entity_set.truncated:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_SET_TRUNCATED",
+                        message="A truncated entity set cannot authorize a complete downstream query",
+                        evidence_kind="VERIFIED_ENTITY_SET",
+                        phrase=item.requested_phrase,
+                        resolution="Publish a bounded complete entity set or revise the query strategy.",
+                    )
+                )
+                continue
+            if not entity_set.values:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_SET_EMPTY",
+                        message="Verified entity set contains no usable values",
+                        evidence_kind="VERIFIED_ENTITY_SET",
+                        phrase=item.requested_phrase,
+                        resolution="Treat the empty upstream result as verified final evidence; do not query an unrelated entity.",
+                    )
+                )
+                continue
+            operator = str(item.operator or "IN").strip().upper()
+            if operator != "IN":
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_OPERATOR_INVALID",
+                        message="Verified entity sets use the stable typed IN protocol",
+                        evidence_kind="VERIFIED_ENTITY_SET",
+                        phrase=item.requested_phrase,
+                    )
+                )
+                continue
+            if not target_ref:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_TARGET_REQUIRED",
+                        message="Verified entity binding requires a target semantic field ref",
+                        evidence_kind="COLUMN",
+                        phrase=item.requested_phrase,
+                    )
+                )
+                continue
+            if target_ref in occupied_targets:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_FILTER_CONFLICT",
+                        message="Target field already has another entity filter binding",
+                        evidence_kind="COLUMN",
+                        phrase=item.requested_phrase,
+                        rejected_ref_ids=[target_ref],
+                    )
+                )
+                continue
+            occupied_targets.add(target_ref)
+            literal_value: Any = list(entity_set.values)
+            filters.append(
+                GroundedEntityFilterHint(
+                    field_ref=target_ref,
+                    operator=operator,
+                    literal_value=literal_value,
+                    requested_phrase=(
+                        item.requested_phrase
+                        or "verified entity set %s" % artifact_id
+                    ),
+                )
+            )
+            resolved.append(
+                GroundedUpstreamEntityBinding(
+                    entity_set_artifact_id=artifact_id,
+                    source_query_artifact_id=entity_set.source_query_artifact_id,
+                    source_contract_fingerprint=source_query.contract_fingerprint,
+                    source_sql_fingerprint=source_query.sql_fingerprint,
+                    source_column=entity_set.source_column,
+                    source_semantic_ref_id=entity_set.source_semantic_ref_id,
+                    source_entity_identity=entity_set.source_entity_identity,
+                    target_field_ref=target_ref,
+                    operator=operator,
+                    value_count=entity_set.value_count,
+                    values_hash=entity_set.values_hash,
+                    requested_phrase=item.requested_phrase,
+                )
+            )
+        return hints.model_copy(update={"entity_filters": filters}), resolved, gaps
+
+    @staticmethod
+    def _bind_upstream_targets(
+        contract: GroundedQueryContract,
+        bindings: Sequence[GroundedUpstreamEntityBinding],
+    ) -> tuple[list[GroundedUpstreamEntityBinding], list[GroundedContractGap]]:
+        by_ref = {item.semantic_ref_id: item for item in contract.entity_filters}
+        resolved: list[GroundedUpstreamEntityBinding] = []
+        gaps: list[GroundedContractGap] = []
+        for item in bindings:
+            target = by_ref.get(item.target_field_ref)
+            if target is None:
+                resolved.append(item)
+                continue
+            bound = item.model_copy(
+                update={
+                    "target_table": target.table,
+                    "target_column": target.column,
+                    "target_entity_identity": target.entity_identity,
+                }
+            )
+            resolved.append(bound)
+            source_identity = str(item.source_entity_identity or "").strip()
+            target_identity = str(target.entity_identity or "").strip()
+            if not source_identity or not target_identity:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_IDENTITY_UNDECLARED",
+                        message="Both source and target fields must declare a canonical entity identity",
+                        evidence_kind="COLUMN",
+                        table=target.table,
+                        phrase=item.requested_phrase,
+                        resolution="Publish canonicalEntityRef/entityIdentity in the semantic field assets.",
+                        rejected_ref_ids=[item.source_semantic_ref_id, item.target_field_ref],
+                    )
+                )
+            elif source_identity != target_identity:
+                gaps.append(
+                    GroundedContractGap(
+                        code="UPSTREAM_ENTITY_IDENTITY_MISMATCH",
+                        message="Verified source entity identity does not match the downstream target field",
+                        evidence_kind="COLUMN",
+                        table=target.table,
+                        phrase=item.requested_phrase,
+                        required_capability={
+                            "sourceEntityIdentity": source_identity,
+                            "targetEntityIdentity": target_identity,
+                        },
+                        rejected_ref_ids=[item.source_semantic_ref_id, item.target_field_ref],
+                    )
+                )
+        return resolved, gaps
 
     def activate_contract(
         self,
@@ -508,7 +782,7 @@ class GroundedRuntimeKernel:
             session.active_generation = next_generation
             session.run_result = None
             session.verified_evidence = None
-            session.answer = ""
+            self._clear_answer_snapshot(session)
             session.clarification = None
             session.phase = "ACTIVE_COMPILED"
             session.revision += 1
@@ -641,7 +915,42 @@ class GroundedRuntimeKernel:
             ],
             rationale=str(rationale or "")[:2000],
         )
-        validation = self.sql_candidate_validator.validate(candidate, contract)
+        try:
+            validation = self.sql_candidate_validator.validate(candidate, contract)
+        except Exception as exc:
+            failed = GroundedRuntimeSqlCandidateAttempt(
+                candidate_id="sql_%s" % uuid.uuid4().hex[:12],
+                active_generation=generation,
+                status="VALIDATOR_INTERNAL_ERROR",
+                next_action="STOP_INTERNAL",
+                contract_fingerprint=contract_fingerprint,
+                validation_gaps=[
+                    {
+                        "code": "SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "blocking": True,
+                        "resolution": (
+                            "Stop this execution attempt; validator failures are not repairable by changing business bindings."
+                        ),
+                    }
+                ],
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            with self._lock:
+                self._require_generation(session, generation)
+                session.sql_candidate_attempts.append(failed)
+                self._clear_active_sql_candidate(session)
+                session.phase = "CORE_SQL_VALIDATOR_INTERNAL_ERROR"
+                session.revision += 1
+                self._event(
+                    session,
+                    "submit_sql_candidate",
+                    failed.status,
+                    "SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR",
+                    session.active_attempt_id,
+                )
+            return failed
         leading_code = next(
             (gap.code for gap in validation.gaps if gap.blocking),
             "VALID",
@@ -668,6 +977,18 @@ class GroundedRuntimeKernel:
             None,
         )
         if duplicate is not None:
+            if (
+                duplicate.status == "ACCEPTED"
+                and isinstance(
+                    session.active_preparation,
+                    GroundedCoreSqlPreparation,
+                )
+                and session.active_preparation.candidate_id
+                == duplicate.candidate_id
+                and session.active_sql_validation is not None
+                and session.active_sql_validation.valid
+            ):
+                return duplicate.model_copy(deep=True)
             no_progress = GroundedRuntimeSqlCandidateAttempt(
                 candidate_id="sql_%s" % uuid.uuid4().hex[:12],
                 active_generation=generation,
@@ -795,7 +1116,7 @@ class GroundedRuntimeKernel:
             session.active_sql_validation = validation
             session.run_result = None
             session.verified_evidence = None
-            session.answer = ""
+            self._clear_answer_snapshot(session)
             session.phase = "ACTIVE_CORE_SQL_VALIDATED"
             session.revision += 1
             self._event(
@@ -925,7 +1246,7 @@ class GroundedRuntimeKernel:
             if terminal_code:
                 session.terminal_guard_code = terminal_code
             session.verified_evidence = None
-            session.answer = ""
+            self._clear_answer_snapshot(session)
             session.phase = "EXECUTED"
             session.revision += 1
             self._event(
@@ -955,6 +1276,14 @@ class GroundedRuntimeKernel:
             session.verified_evidence = verified
             if session.run_result is not None:
                 session.run_result.verified_evidence = verified.model_copy(deep=True)
+            if verified.passed:
+                self._record_verified_query_artifact(
+                    session,
+                    generation=generation,
+                    plan=plan,
+                    run_result=session.run_result or run_result,
+                    verified=verified,
+                )
             session.phase = "VERIFIED" if verified.passed else "VERIFICATION_GAPPED"
             session.revision += 1
             self._event(
@@ -965,6 +1294,231 @@ class GroundedRuntimeKernel:
                 session.active_attempt_id,
             )
         return verified
+
+    def latest_verified_query_artifact(
+        self,
+        session: GroundedRuntimeSession,
+    ) -> GroundedVerifiedQueryArtifact | None:
+        with self._lock:
+            if not session.verified_query_ledger:
+                return None
+            return session.verified_query_ledger[-1].model_copy(deep=True)
+
+    def publish_verified_entity_set(
+        self,
+        session: GroundedRuntimeSession,
+        query_artifact_id: str,
+        output_column: str,
+        *,
+        limit: int = 500,
+    ) -> GroundedVerifiedEntitySet:
+        """Publish typed entity values from immutable verified evidence.
+
+        Full values remain kernel-side. Downstream Contracts reference the
+        returned artifact ID and cannot replace or amend its contents.
+        """
+
+        artifact_id = str(query_artifact_id or "").strip()
+        column = str(output_column or "").strip()
+        bounded_limit = max(1, min(int(limit or 500), 5000))
+        with self._lock:
+            source = next(
+                (
+                    item.model_copy(deep=True)
+                    for item in session.verified_query_ledger
+                    if item.artifact_id == artifact_id
+                ),
+                None,
+            )
+        if source is None:
+            raise RuntimeError(
+                "VERIFIED_QUERY_ARTIFACT_NOT_FOUND:%s" % artifact_id
+            )
+        if not source.verified_evidence.passed:
+            raise RuntimeError("VERIFIED_QUERY_ARTIFACT_REQUIRED")
+        if not column or column not in source.output_columns:
+            raise RuntimeError(
+                "VERIFIED_ENTITY_OUTPUT_COLUMN_NOT_FOUND:%s" % column
+            )
+        semantic_ref = str(source.output_semantic_refs.get(column) or "").strip()
+        if not semantic_ref:
+            raise RuntimeError(
+                "VERIFIED_ENTITY_SEMANTIC_LINEAGE_REQUIRED:%s" % column
+            )
+        entity_identity = str(
+            source.output_entity_identities.get(column) or ""
+        ).strip()
+        if not entity_identity:
+            raise RuntimeError(
+                "VERIFIED_ENTITY_IDENTITY_REQUIRED:%s" % column
+            )
+
+        sealed_values = list(source.sealed_entity_values.get(column) or [])
+        if not sealed_values and source.run_result.merged_query_bundle.rows:
+            raise RuntimeError(
+                "VERIFIED_ENTITY_PRE_MASK_VALUES_REQUIRED:%s" % column
+            )
+        values_by_identity: dict[str, Any] = {}
+        for value in sealed_values:
+            identity = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            values_by_identity.setdefault(identity, value)
+        ordered_identities = sorted(values_by_identity)
+        all_values_count = len(ordered_identities)
+        values = [
+            values_by_identity[identity]
+            for identity in ordered_identities[:bounded_limit]
+        ]
+        values_hash = _stable_json_hash(values)
+        entity_artifact_id = "entity_set_%s" % hashlib.sha256(
+            (
+                "%s:%s:%s:%s"
+                % (artifact_id, column, semantic_ref, values_hash)
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        published = GroundedVerifiedEntitySet(
+            artifact_id=entity_artifact_id,
+            source_query_artifact_id=artifact_id,
+            source_column=column,
+            source_semantic_ref_id=semantic_ref,
+            source_entity_identity=entity_identity,
+            values=values,
+            value_count=all_values_count,
+            truncated=(
+                source.sealed_entity_values_truncated
+                or all_values_count > len(values)
+            ),
+            values_hash=values_hash,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in session.verified_entity_sets
+                    if item.artifact_id == published.artifact_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing.model_copy(deep=True)
+            session.verified_entity_sets.append(published.model_copy(deep=True))
+            session.revision += 1
+            self._event(
+                session,
+                "publish_verified_entity_set",
+                "PUBLISHED",
+                "artifact=%s;column=%s;values=%d;truncated=%s"
+                % (
+                    published.artifact_id,
+                    column,
+                    published.value_count,
+                    str(published.truncated).lower(),
+                ),
+                source.attempt_id,
+            )
+        return published.model_copy(deep=True)
+
+    @staticmethod
+    def _record_verified_query_artifact(
+        session: GroundedRuntimeSession,
+        *,
+        generation: int,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        verified: VerifiedEvidence,
+    ) -> GroundedVerifiedQueryArtifact:
+        if session.active_contract is None:
+            raise RuntimeError("verified query has no active grounded Contract")
+        contract = session.active_contract.model_copy(deep=True)
+        contract_fingerprint = grounded_query_contract_fingerprint(contract)
+        validation = session.active_sql_validation
+        sql_fingerprint = (
+            str(validation.ast_fingerprint or "")
+            if validation is not None
+            else ""
+        )
+        if not sql_fingerprint:
+            sql_fingerprint = hashlib.sha256(
+                (
+                    "%s:%s"
+                    % (
+                        contract_fingerprint,
+                        run_result.merged_query_bundle.sql,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+        existing = next(
+            (
+                item
+                for item in session.verified_query_ledger
+                if item.generation == generation
+                and item.contract_fingerprint == contract_fingerprint
+                and item.sql_fingerprint == sql_fingerprint
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+
+        expected_columns = _contract_output_columns(contract)
+        observed_columns = _observed_output_columns(run_result)
+        output_columns = _dedupe([*expected_columns, *observed_columns])
+        semantic_refs, entity_identities = _contract_output_semantics(contract)
+        output_lineage = (
+            dict(validation.output_lineage)
+            if validation is not None
+            else dict(
+                plan.question_understanding.get("outputLineage") or {}
+            )
+        )
+        sealed_entity_values: dict[str, list[Any]] = {}
+        sealed_values_truncated = False
+        for task_result in run_result.task_results:
+            entity_set = task_result.entity_set
+            if entity_set is None:
+                continue
+            sealed_values_truncated = (
+                sealed_values_truncated or bool(entity_set.truncated)
+            )
+            for output, values in entity_set.column_values.items():
+                if output in output_columns:
+                    sealed_entity_values[output] = list(values)
+        artifact_id = "query_artifact_%s" % hashlib.sha256(
+            (
+                "%s:%d:%s:%s"
+                % (
+                    session.session_id,
+                    generation,
+                    contract_fingerprint,
+                    sql_fingerprint,
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        artifact = GroundedVerifiedQueryArtifact(
+            artifact_id=artifact_id,
+            generation=generation,
+            attempt_id=session.active_attempt_id,
+            contract_fingerprint=contract_fingerprint,
+            sql_fingerprint=sql_fingerprint,
+            contract=contract,
+            plan=plan.model_copy(deep=True),
+            run_result=run_result.model_copy(deep=True),
+            verified_evidence=verified.model_copy(deep=True),
+            output_columns=output_columns,
+            output_semantic_refs=semantic_refs,
+            output_entity_identities=entity_identities,
+            output_lineage=output_lineage,
+            sealed_entity_values=sealed_entity_values,
+            sealed_entity_values_truncated=sealed_values_truncated,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        session.verified_query_ledger.append(artifact)
+        return artifact
 
     def compose_answer(
         self,
@@ -981,10 +1535,32 @@ class GroundedRuntimeKernel:
                 "grounded answer composer is not configured; refusing workflow fallback"
             )
         with self._lock:
-            generation, plan, _pack = self._active_snapshot(session)
-            if session.run_result is None or session.verified_evidence is None:
-                raise RuntimeError("grounded answer requires executed and verified evidence")
-            run_result = session.run_result.model_copy(deep=True)
+            generation, _active_plan, _pack = self._active_snapshot(session)
+            plan, run_result, portfolio_verified, artifact_ids = (
+                self._verified_portfolio_snapshot(session)
+            )
+        if self.verifier is not None:
+            portfolio_verified = self.verifier.verify(
+                session.question,
+                plan,
+                run_result,
+            )
+            if not isinstance(portfolio_verified, VerifiedEvidence):
+                portfolio_verified = VerifiedEvidence.model_validate(
+                    portfolio_verified
+                )
+            run_result.verified_evidence = portfolio_verified.model_copy(
+                deep=True
+            )
+        if not portfolio_verified.passed:
+            codes = _dedupe(
+                gap.code or gap.gap_code
+                for gap in portfolio_verified.blocking_gaps
+            )
+            raise RuntimeError(
+                "EVIDENCE_PORTFOLIO_INCOMPLETE:%s"
+                % (",".join(codes[:8]) or "UNVERIFIED")
+            )
         answer = self.answer_composer.compose(
             session.question,
             session.merchant,
@@ -999,6 +1575,12 @@ class GroundedRuntimeKernel:
         with self._lock:
             self._require_generation(session, generation)
             session.answer = str(answer or "")
+            session.answer_plan = plan.model_copy(deep=True)
+            session.answer_run_result = run_result.model_copy(deep=True)
+            session.answer_verified_evidence = portfolio_verified.model_copy(
+                deep=True
+            )
+            session.answer_artifact_ids = list(artifact_ids)
             session.phase = "ANSWERED"
             session.revision += 1
             self._event(
@@ -1009,6 +1591,79 @@ class GroundedRuntimeKernel:
                 session.active_attempt_id,
             )
         return session.answer
+
+    def verified_portfolio(
+        self,
+        session: GroundedRuntimeSession,
+    ) -> tuple[QueryPlan, AgentRunResult, VerifiedEvidence, list[str]]:
+        with self._lock:
+            return self._verified_portfolio_snapshot(session)
+
+    def verify_portfolio(
+        self,
+        session: GroundedRuntimeSession,
+    ) -> tuple[QueryPlan, AgentRunResult, VerifiedEvidence, list[str]]:
+        with self._lock:
+            plan, run_result, verified, artifact_ids = (
+                self._verified_portfolio_snapshot(session)
+            )
+        if self.verifier is not None:
+            verified = self.verifier.verify(
+                session.question,
+                plan,
+                run_result,
+            )
+            if not isinstance(verified, VerifiedEvidence):
+                verified = VerifiedEvidence.model_validate(verified)
+            run_result.verified_evidence = verified.model_copy(deep=True)
+        return plan, run_result, verified, artifact_ids
+
+    @staticmethod
+    def _verified_portfolio_snapshot(
+        session: GroundedRuntimeSession,
+    ) -> tuple[QueryPlan, AgentRunResult, VerifiedEvidence, list[str]]:
+        artifacts = [
+            item.model_copy(deep=True)
+            for item in session.verified_query_ledger
+            if item.verified_evidence.passed
+        ]
+        if not artifacts:
+            raise RuntimeError(
+                "grounded answer requires at least one verified query artifact"
+            )
+        plans: list[QueryPlan] = []
+        runs: list[AgentRunResult] = []
+        for artifact in artifacts:
+            plans.append(
+                _namespace_artifact_plan(
+                    artifact.plan,
+                    artifact.artifact_id,
+                )
+            )
+            runs.append(
+                _namespace_artifact_run(
+                    artifact.run_result,
+                    artifact.artifact_id,
+                )
+            )
+        combined_plan = _combine_artifact_plans(
+            plans,
+            [item.artifact_id for item in artifacts],
+        )
+        combined_verified = _combine_verified_evidence(
+            [item.verified_evidence for item in artifacts]
+        )
+        combined_run = _combine_artifact_runs(
+            runs,
+            [item.artifact_id for item in artifacts],
+            combined_verified,
+        )
+        return (
+            combined_plan,
+            combined_run,
+            combined_verified,
+            [item.artifact_id for item in artifacts],
+        )
 
     def request_clarification(
         self,
@@ -1309,7 +1964,7 @@ class GroundedRuntimeKernel:
         session.active_generation = generation
         session.run_result = None
         session.verified_evidence = None
-        session.answer = ""
+        GroundedRuntimeKernel._clear_answer_snapshot(session)
         session.clarification = None
         session.phase = "ACTIVE_CORE_SQL_REQUIRED"
         session.revision += 1
@@ -1325,7 +1980,15 @@ class GroundedRuntimeKernel:
         session.active_sql_validation = None
         session.run_result = None
         session.verified_evidence = None
+        GroundedRuntimeKernel._clear_answer_snapshot(session)
+
+    @staticmethod
+    def _clear_answer_snapshot(session: GroundedRuntimeSession) -> None:
         session.answer = ""
+        session.answer_plan = None
+        session.answer_run_result = None
+        session.answer_verified_evidence = None
+        session.answer_artifact_ids = []
 
     @staticmethod
     def _active_snapshot(
@@ -1368,6 +2031,402 @@ class GroundedRuntimeKernel:
                 attempt_id=attempt_id,
             )
         )
+
+
+def _stable_json_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _contract_output_columns(contract: GroundedQueryContract) -> list[str]:
+    return _dedupe(
+        [item.metric_key for item in contract.metrics]
+        + [
+            item.output_alias or item.column
+            for item in contract.selected_fields
+        ]
+        + [
+            item.column
+            for item in contract.dimensions
+            if item.usage == "group_by"
+        ]
+    )
+
+
+def _observed_output_columns(run_result: AgentRunResult) -> list[str]:
+    columns: list[str] = []
+    for row in run_result.merged_query_bundle.rows:
+        for key in row:
+            name = str(key or "").strip()
+            if name and not name.startswith("__") and name not in columns:
+                columns.append(name)
+    return columns
+
+
+def _contract_output_semantics(
+    contract: GroundedQueryContract,
+) -> tuple[dict[str, str], dict[str, str]]:
+    semantic_refs: dict[str, str] = {}
+    entity_identities: dict[str, str] = {}
+    for metric in contract.metrics:
+        if metric.metric_key:
+            semantic_refs[metric.metric_key] = metric.semantic_ref_id
+    for dimension in contract.dimensions:
+        if dimension.usage != "group_by" or not dimension.column:
+            continue
+        semantic_refs[dimension.column] = dimension.semantic_ref_id
+        if dimension.entity_identity:
+            entity_identities[dimension.column] = dimension.entity_identity
+    for field in contract.selected_fields:
+        output = field.output_alias or field.column
+        if not output:
+            continue
+        semantic_refs[output] = field.semantic_ref_id
+        if field.entity_identity:
+            entity_identities[output] = field.entity_identity
+    return semantic_refs, entity_identities
+
+
+def _namespace_task_id(artifact_id: str, task_id: str) -> str:
+    value = str(task_id or "").strip()
+    if not value:
+        return value
+    return "%s::%s" % (artifact_id, value)
+
+
+def _namespace_artifact_plan(plan: QueryPlan, artifact_id: str) -> QueryPlan:
+    result = plan.model_copy(deep=True)
+    for intent in result.intents:
+        intent.plan_task_id = _namespace_task_id(
+            artifact_id,
+            intent.plan_task_id,
+        )
+        intent.depends_on_task_ids = [
+            _namespace_task_id(artifact_id, item)
+            for item in intent.depends_on_task_ids
+        ]
+    for dependency in result.dependencies:
+        dependency.anchor_task_id = _namespace_task_id(
+            artifact_id,
+            dependency.anchor_task_id,
+        )
+        dependency.dependent_task_id = _namespace_task_id(
+            artifact_id,
+            dependency.dependent_task_id,
+        )
+    for obligation in result.entity_filter_obligations:
+        obligation.task_id = _namespace_task_id(
+            artifact_id,
+            obligation.task_id,
+        )
+        if obligation.obligation_id:
+            obligation.obligation_id = _namespace_task_id(
+                artifact_id,
+                obligation.obligation_id,
+            )
+    for obligation in result.semantic_filter_obligations:
+        obligation.task_id = _namespace_task_id(
+            artifact_id,
+            obligation.task_id,
+        )
+        obligation.node_id = _namespace_task_id(
+            artifact_id,
+            obligation.node_id,
+        )
+        if obligation.obligation_id:
+            obligation.obligation_id = _namespace_task_id(
+                artifact_id,
+                obligation.obligation_id,
+            )
+    result.final_evidence_column_hints = {
+        _namespace_task_id(artifact_id, task_id): list(columns)
+        for task_id, columns in result.final_evidence_column_hints.items()
+    }
+    understanding = dict(result.question_understanding or {})
+    understanding["verifiedQueryArtifactId"] = artifact_id
+    result.question_understanding = understanding
+    result.agent_trace.append("VERIFIED_QUERY_ARTIFACT:%s" % artifact_id)
+    return result
+
+
+def _annotate_artifact_bundle(
+    bundle: QueryBundle,
+    artifact_id: str,
+) -> QueryBundle:
+    result = bundle.model_copy(deep=True)
+    result.rows = [
+        {
+            **dict(row),
+            "__evidenceArtifactId": artifact_id,
+        }
+        for row in result.rows
+    ]
+    result.runtime_events = [
+        *result.runtime_events,
+        {
+            "event": "verified_evidence_portfolio.member",
+            "artifactId": artifact_id,
+        },
+    ]
+    return result
+
+
+def _namespace_artifact_run(
+    run_result: AgentRunResult,
+    artifact_id: str,
+) -> AgentRunResult:
+    result = run_result.model_copy(deep=True)
+    for task in result.tasks:
+        task.task_id = _namespace_task_id(artifact_id, task.task_id)
+        task.depends_on = [
+            _namespace_task_id(artifact_id, item)
+            for item in task.depends_on
+        ]
+        for dependency in task.plan_dependencies:
+            dependency.anchor_task_id = _namespace_task_id(
+                artifact_id,
+                dependency.anchor_task_id,
+            )
+            dependency.dependent_task_id = _namespace_task_id(
+                artifact_id,
+                dependency.dependent_task_id,
+            )
+    for task_result in result.task_results:
+        task_result.task_id = _namespace_task_id(
+            artifact_id,
+            task_result.task_id,
+        )
+        task_result.query_bundle = _annotate_artifact_bundle(
+            task_result.query_bundle,
+            artifact_id,
+        )
+        task_result.node_plan_contract.task_id = _namespace_task_id(
+            artifact_id,
+            task_result.node_plan_contract.task_id,
+        )
+        task_result.node_task_profile.task_id = _namespace_task_id(
+            artifact_id,
+            task_result.node_task_profile.task_id,
+        )
+        task_result.entity_filter_verification.task_id = _namespace_task_id(
+            artifact_id,
+            task_result.entity_filter_verification.task_id,
+        )
+        task_result.semantic_filter_verification.task_id = _namespace_task_id(
+            artifact_id,
+            task_result.semantic_filter_verification.task_id,
+        )
+        if task_result.entity_set is not None:
+            task_result.entity_set.task_id = _namespace_task_id(
+                artifact_id,
+                task_result.entity_set.task_id,
+            )
+        for report in task_result.freshness_reports:
+            report.task_id = _namespace_task_id(
+                artifact_id,
+                report.task_id,
+            )
+    result.query_bundles = [
+        _annotate_artifact_bundle(item, artifact_id)
+        for item in result.query_bundles
+    ]
+    result.merged_query_bundle = _annotate_artifact_bundle(
+        result.merged_query_bundle,
+        artifact_id,
+    )
+    for item in result.node_plan_contracts:
+        item.task_id = _namespace_task_id(artifact_id, item.task_id)
+    for item in result.node_task_profiles:
+        item.task_id = _namespace_task_id(artifact_id, item.task_id)
+    for item in result.freshness_reports:
+        item.task_id = _namespace_task_id(artifact_id, item.task_id)
+    for fact in result.verified_facts:
+        fact.task_id = _namespace_task_id(artifact_id, fact.task_id)
+        if fact.fact_id:
+            fact.fact_id = _namespace_task_id(artifact_id, fact.fact_id)
+    return result
+
+
+def _combine_artifact_plans(
+    plans: Sequence[QueryPlan],
+    artifact_ids: Sequence[str],
+) -> QueryPlan:
+    combined = plans[0].model_copy(deep=True)
+    for plan in plans[1:]:
+        combined.intents.extend(item.model_copy(deep=True) for item in plan.intents)
+        combined.dependencies.extend(
+            item.model_copy(deep=True) for item in plan.dependencies
+        )
+        combined.knowledge_requests.extend(
+            item.model_copy(deep=True) for item in plan.knowledge_requests
+        )
+        combined.evidence_contracts.extend(
+            dict(item) for item in plan.evidence_contracts
+        )
+        combined.clarification_needs.extend(plan.clarification_needs)
+        combined.final_required_evidence.extend(plan.final_required_evidence)
+        combined.final_evidence_column_hints.update(
+            {
+                key: list(value)
+                for key, value in plan.final_evidence_column_hints.items()
+            }
+        )
+        combined.semantic_filter_obligations.extend(
+            item.model_copy(deep=True)
+            for item in plan.semantic_filter_obligations
+        )
+        combined.entity_filter_obligations.extend(
+            item.model_copy(deep=True)
+            for item in plan.entity_filter_obligations
+        )
+        combined.agent_trace.extend(plan.agent_trace)
+        combined.compiler_trace.extend(plan.compiler_trace)
+        combined.planner_loaded_refs.extend(plan.planner_loaded_refs)
+    combined.final_required_evidence = _dedupe(
+        combined.final_required_evidence
+    )
+    combined.planner_loaded_refs = _dedupe(combined.planner_loaded_refs)
+    combined.question_understanding = {
+        **dict(combined.question_understanding or {}),
+        "source": "verified_evidence_portfolio",
+        "verifiedQueryArtifactIds": list(artifact_ids),
+        "artifactCount": len(artifact_ids),
+    }
+    combined.agent_trace.append(
+        "VERIFIED_EVIDENCE_PORTFOLIO:%d" % len(artifact_ids)
+    )
+    return combined
+
+
+def _combine_verified_evidence(
+    items: Sequence[VerifiedEvidence],
+) -> VerifiedEvidence:
+    return VerifiedEvidence(
+        passed=bool(items) and all(item.passed for item in items),
+        covered_evidence=_dedupe(
+            value
+            for item in items
+            for value in item.covered_evidence
+        ),
+        derived_evidence=[
+            dict(value)
+            for item in items
+            for value in item.derived_evidence
+        ],
+        gaps=[
+            value.model_copy(deep=True)
+            for item in items
+            for value in item.gaps
+        ],
+        blocking_gaps=[
+            value.model_copy(deep=True)
+            for item in items
+            for value in item.blocking_gaps
+        ],
+        warning_gaps=[
+            value.model_copy(deep=True)
+            for item in items
+            for value in item.warning_gaps
+        ],
+        answer_guard_required=any(
+            item.answer_guard_required for item in items
+        ),
+        required_disclosures=_dedupe(
+            value
+            for item in items
+            for value in item.required_disclosures
+        ),
+        partial_answer_reason="; ".join(
+            _dedupe(item.partial_answer_reason for item in items)
+        ),
+    )
+
+
+def _combine_artifact_runs(
+    runs: Sequence[AgentRunResult],
+    artifact_ids: Sequence[str],
+    verified: VerifiedEvidence,
+) -> AgentRunResult:
+    combined = AgentRunResult()
+    for run in runs:
+        combined.tasks.extend(item.model_copy(deep=True) for item in run.tasks)
+        combined.task_results.extend(
+            item.model_copy(deep=True) for item in run.task_results
+        )
+        combined.query_bundles.extend(
+            item.model_copy(deep=True) for item in run.query_bundles
+        )
+        combined.sql_repairs.extend(
+            item.model_copy(deep=True) for item in run.sql_repairs
+        )
+        combined.evidence_gaps.extend(
+            item.model_copy(deep=True) for item in run.evidence_gaps
+        )
+        combined.reflection_notes.extend(run.reflection_notes)
+        combined.node_tool_traces.extend(
+            item.model_copy(deep=True) for item in run.node_tool_traces
+        )
+        combined.node_task_profiles.extend(
+            item.model_copy(deep=True) for item in run.node_task_profiles
+        )
+        combined.freshness_reports.extend(
+            item.model_copy(deep=True) for item in run.freshness_reports
+        )
+        combined.node_plan_contracts.extend(
+            item.model_copy(deep=True) for item in run.node_plan_contracts
+        )
+        combined.skill_lifecycle_records.extend(
+            item.model_copy(deep=True)
+            for item in run.skill_lifecycle_records
+        )
+        combined.verified_facts.extend(
+            item.model_copy(deep=True) for item in run.verified_facts
+        )
+    rows = [
+        dict(row)
+        for run in runs
+        for row in run.merged_query_bundle.rows
+    ]
+    tables = _dedupe(
+        table
+        for run in runs
+        for table in run.merged_query_bundle.tables
+    )
+    combined.merged_query_bundle = QueryBundle(
+        tables=tables,
+        rows=rows,
+        original_row_count=sum(
+            run.merged_query_bundle.effective_row_count()
+            for run in runs
+        ),
+        is_truncated=any(
+            run.merged_query_bundle.is_truncated for run in runs
+        ),
+        source_artifact_refs={
+            artifact_id: [artifact_id]
+            for artifact_id in artifact_ids
+        },
+        runtime_events=[
+            {
+                "event": "verified_evidence_portfolio.composed",
+                "artifactIds": list(artifact_ids),
+                "artifactCount": len(artifact_ids),
+            }
+        ],
+    )
+    combined.verified_evidence = verified.model_copy(deep=True)
+    combined.partial_answer_reason = verified.partial_answer_reason
+    combined.executed_query_graph_fingerprint = _stable_json_hash(
+        list(artifact_ids)
+    )
+    return combined
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:

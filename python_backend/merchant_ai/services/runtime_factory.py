@@ -232,14 +232,10 @@ def create_runtime(settings: Optional[Settings] = None) -> Any:
     mode = str(runtime_settings.agent_mode or "deepagent").strip().lower()
     if mode == "deepagent":
         return create_grounded_runtime(runtime_settings)
-    if mode == "legacy":
-        # Lazy import is the hard architecture boundary: the DeepAgent branch
-        # cannot construct or even import MerchantQaWorkflow as a side effect.
-        from merchant_ai.graph.workflow import create_workflow
-
-        legacy_settings = runtime_settings.model_copy(update={"agent_mode": "legacy"})
-        return create_workflow(legacy_settings)
-    raise ValueError("Unsupported agent_mode: %s" % mode)
+    raise ValueError(
+        "Unsupported agent_mode: %s; online query authority is grounded deepagent only"
+        % mode
+    )
 
 
 def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:

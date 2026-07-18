@@ -115,6 +115,7 @@ from merchant_ai.services.answer_claims import AnswerClaimVerifier
 from merchant_ai.services.assets import normalize_semantic_path
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeKernel,
+    GroundedRuntimeEvent,
     GroundedRuntimeSession,
 )
 from merchant_ai.services.time_semantics import has_explicit_time_expression
@@ -143,6 +144,7 @@ class GroundedDeepAgentSession:
     expanded_from_attempt_ids: list[str] = field(default_factory=list)
     skill_runs: list[dict[str, Any]] = field(default_factory=list)
     analysis_skill_headers_disclosed: bool = False
+    data_collection_sealed: bool = False
     analysis_skill_started: bool = False
     lock: Any = field(default_factory=RLock, repr=False)
 
@@ -227,6 +229,11 @@ class GroundedSemanticBackend:
     ):
         self.semantic_catalog = semantic_catalog
         self.reader_is_core = reader_is_core or _deepagent_reader_is_core
+        self._read_receipts: dict[
+            tuple[int, str, int, int],
+            dict[str, Any],
+        ] = {}
+        self._receipt_lock = RLock()
 
     @contextmanager
     def scope(self, session: GroundedDeepAgentSession) -> Iterator[None]:
@@ -365,7 +372,6 @@ class GroundedSemanticBackend:
             session is not None
             and complete
             and kind not in {"TOPIC_INDEX", "TOPIC_MANIFEST"}
-            and self.reader_is_core()
         ):
             evidence = {
                 "refId": str(result.get("refId") or ""),
@@ -379,14 +385,16 @@ class GroundedSemanticBackend:
                 "offset": 0,
             }
             if evidence["refId"] and topic_name in session.effective_topics():
-                with session.lock:
-                    retained = [
-                        item
-                        for item in session.core_semantic_evidence
-                        if item.get("refId") != evidence["refId"]
-                    ]
-                    retained.append(evidence)
-                    session.core_semantic_evidence = retained[-self.MAX_EVIDENCE_ITEMS :]
+                receipt_key = (
+                    id(session),
+                    normalized,
+                    int(offset or 0),
+                    int(limit or 2000),
+                )
+                with self._receipt_lock:
+                    self._read_receipts[receipt_key] = dict(evidence)
+                if self.reader_is_core():
+                    self._retain_evidence(session, evidence)
         return ReadResult(file_data={"content": content, "encoding": "utf-8"})
 
     def record_core_read(
@@ -410,6 +418,17 @@ class GroundedSemanticBackend:
             normalized = ""
         elif normalized.startswith("knowledge/"):
             normalized = normalized[len("knowledge/") :]
+        receipt_key = (
+            id(session),
+            normalized,
+            int(offset or 0),
+            int(limit or 2000),
+        )
+        with self._receipt_lock:
+            receipt = self._read_receipts.pop(receipt_key, None)
+        if receipt is not None:
+            self._retain_evidence(session, receipt)
+            return True
         try:
             result = self.semantic_catalog.read(
                 path=normalized,
@@ -444,15 +463,22 @@ class GroundedSemanticBackend:
         }
         if not evidence["refId"]:
             return False
+        self._retain_evidence(session, evidence)
+        return True
+
+    def _retain_evidence(
+        self,
+        session: GroundedDeepAgentSession,
+        evidence: dict[str, Any],
+    ) -> None:
         with session.lock:
             retained = [
                 item
                 for item in session.core_semantic_evidence
-                if item.get("refId") != evidence["refId"]
+                if item.get("refId") != evidence.get("refId")
             ]
-            retained.append(evidence)
+            retained.append(dict(evidence))
             session.core_semantic_evidence = retained[-self.MAX_EVIDENCE_ITEMS :]
-        return True
 
     def grep(
         self,
@@ -639,10 +665,11 @@ One Grounded Contract represents one coherent execution shape. Never combine met
 For a simple same-table scalar metric query, the expected disclosure path is table detail plus the exact metric files. Do not read schema, columns/index.json, the time column, or metric source-column files unless the question needs a field aggregation, business dimension, filter, join, or a published metric is unavailable.
 When thinRecallCandidates already contains an exact readable path, read that path directly instead of opening an index. Never navigate to asset.json or a #fragment path.
 Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
-GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC means the runtime may execute the single published scalar metric directly. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. Implement sqlObligations exactly. The runtime will not invent grouping, filters, joins, CTEs, windows, ranking, or fallback SQL for you. Never put merchant/tenant predicates in your SQL: trusted execution injects them after validation.
-propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. Use analysisMode=ENTITY_LOOKUP for a concrete entity lookup and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
-Available governed tools are retrieve_knowledge, propose_grounded_contract, submit_grounded_sql_candidate, execute_grounded_query, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
-Analysis Skill headers are not disclosed until execute_grounded_query has returned VERIFIED evidence. The Core cannot read SKILL.md and must never use a Skill procedure or header to choose metrics, dimensions, tables, or Contract shape. First execute and verify the minimal grounded data query; then select only from the Skill headers returned by execute_grounded_query and call run_skill when appropriate. run_skill is a one-way isolation boundary: after it starts, do not retrieve more knowledge, propose another Contract, execute another query, or call run_skill again. It mounts the selected full Skill for an independent subagent, workspace and checkpoint, streams progress, and publishes a structured result artifact. Do not use task for Skill execution.
+GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC means the runtime may execute the single published scalar metric directly. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. Implement sqlObligations exactly. The runtime will not invent grouping, filters, joins, CTEs, windows, ranking, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
+propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. Use analysisMode=ENTITY_LOOKUP for a concrete entity lookup and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
+Available governed tools are retrieve_knowledge, propose_grounded_contract, submit_grounded_sql_candidate, execute_grounded_query, publish_verified_entity_set, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
+One verified query may be only partial evidence for the user's question. When a later query depends on a verified entity output, call publish_verified_entity_set, progressively read the downstream target field, and propose a new Contract using upstreamEntityBindings. Do not treat a first successful TopN/entity query as the end of data collection. Each query remains an independent grounded QueryGraph chosen dynamically by you, not a fixed workflow.
+Analysis Skill headers are not disclosed by an individual query. The Core cannot read SKILL.md and must never use a Skill procedure or header to choose metrics, dimensions, tables, or Contract shape. After every datum required by the original question is in the verified evidence portfolio, call finalize_evidence_collection. Only that gate may disclose Skill headers and seal data collection. Then select at most one matching Skill or compose the verified answer. run_skill is a one-way isolation boundary: after it starts, do not retrieve more knowledge, propose another Contract, execute another query, or call run_skill again. It mounts the selected full Skill for an independent subagent, workspace and checkpoint, streams progress, and publishes a structured result artifact. Do not use task for Skill execution.
 Use retrieve_knowledge only for a targeted supplemental query; it remains inside the active Topic workspace. Governed-rule recall items marked INLINE_ONLY are usable snippets, not filesystem refs and not binding evidence. Do not read /knowledge/topics/index.json or open another Topic merely to compare alternatives. Topic expansion is allowed only after a submitted Contract returns REVISE_BINDINGS with a structured requiredCapability/searchScope gap based on evidence already read in the active Topic. A read relationship may establish that a required endpoint table is outside the current workspace; submit that relationship in the candidate Contract, then follow the returned gap to read the Topic index and exactly one relevant Topic manifest. Never expand from a normal pending request or a failed filename guess.
 Do not call task in this runtime. SubAgent dispatch is disabled until worker evidence acceptance is independently auditable.
 Never invent a formula, binding, SQL result, evidence status or answer. Finish only after compose_verified_answer, a verified run_skill result, or ask_human succeeds.
@@ -817,7 +844,10 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         ) -> str:
             """Run one targeted supplemental recall inside the active Topic scope."""
 
-            if runtime.context.session.analysis_skill_started:
+            if (
+                runtime.context.session.analysis_skill_started
+                or runtime.context.session.data_collection_sealed
+            ):
                 return json.dumps(
                     {
                         "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
@@ -827,10 +857,27 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     ensure_ascii=False,
                 )
 
-            bundle = runtime_owner.kernel.recall_navigation(
-                runtime.context.session.runtime,
-                query=str(query or "").strip(),
-            )
+            try:
+                bundle = runtime_owner.kernel.recall_navigation(
+                    runtime.context.session.runtime,
+                    query=str(query or "").strip(),
+                )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "RECALL_NAVIGATION_DEGRADED",
+                        "code": "RECALL_BACKEND_UNAVAILABLE",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "recallCandidates": [],
+                        "scope": runtime.context.session.effective_topics(),
+                        "nextAction": "CONTINUE_WITH_FILESYSTEM",
+                        "instruction": (
+                            "Recall is navigation only. Continue from the mounted Topic L0 manifest with ls/read_file/grep."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(
                 {
                     "status": "OK",
@@ -850,7 +897,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             """Propose from exact Core reads using the strict typed BindingHints schema."""
 
             session = runtime.context.session
-            if session.analysis_skill_started:
+            if session.analysis_skill_started or session.data_collection_sealed:
                 return json.dumps(
                     {
                         "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
@@ -931,6 +978,17 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     },
                     ensure_ascii=False,
                 )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "GROUNDED_CONTRACT_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "nextAction": "STOP_INTERNAL",
+                    },
+                    ensure_ascii=False,
+                )
             contract_fingerprint = grounded_query_contract_fingerprint(
                 attempt.contract
             )
@@ -953,8 +1011,8 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     "sqlObligations": _grounded_contract_sql_obligations(
                         attempt.contract
                     ),
-                    "acceptedBindingHints": attempt.contract.binding_hints.model_dump(
-                        by_alias=True
+                    "acceptedBindingHints": _core_visible_binding_hints(
+                        attempt.contract
                     ),
                     "gaps": [
                         gap.model_dump(by_alias=True)
@@ -981,7 +1039,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             """Submit the complete Doris SQL authored by Core for the active Contract."""
 
             deep_session = runtime.context.session
-            if deep_session.analysis_skill_started:
+            if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
                 return json.dumps(
                     {
                         "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
@@ -1024,12 +1082,33 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     },
                     ensure_ascii=False,
                 )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "SQL_CANDIDATE_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "nextAction": "STOP_INTERNAL",
+                    },
+                    ensure_ascii=False,
+                )
+            internal_error = attempt.status == "VALIDATOR_INTERNAL_ERROR"
             return json.dumps(
                 {
                     "candidateId": attempt.candidate_id,
-                    "status": attempt.status,
+                    "status": "BLOCKED" if internal_error else attempt.status,
+                    "code": (
+                        "SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR"
+                        if internal_error
+                        else ""
+                    ),
                     "activeGeneration": attempt.active_generation,
-                    "nextAction": attempt.next_action,
+                    "nextAction": (
+                        "STOP_INTERNAL"
+                        if internal_error
+                        else attempt.next_action
+                    ),
                     "astFingerprint": attempt.ast_fingerprint,
                     "contractFingerprint": attempt.contract_fingerprint,
                     "outputColumns": attempt.output_columns,
@@ -1053,7 +1132,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             """Execute the active compiled Contract and immediately verify evidence."""
 
             deep_session = runtime.context.session
-            if deep_session.analysis_skill_started:
+            if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
                 return json.dumps(
                     {
                         "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
@@ -1106,6 +1185,17 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     },
                     ensure_ascii=False,
                 )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "GROUNDED_EXECUTION_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "nextAction": "STOP_INTERNAL",
+                    },
+                    ensure_ascii=False,
+                )
             failed_results = [
                 item
                 for item in run_result.task_results
@@ -1127,7 +1217,13 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     "TABLE_ROLE_DENIED",
                     "COLUMN_DENIED",
                 }
-                core_sql_mode = str(session.active_execution_mode) == "CORE_SQL_REQUIRED"
+                core_sql_mode = str(
+                    getattr(
+                        session.active_execution_mode,
+                        "value",
+                        session.active_execution_mode,
+                    )
+                ) == "CORE_SQL_REQUIRED"
                 return json.dumps(
                     {
                         "status": (
@@ -1166,28 +1262,138 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     ensure_ascii=False,
                     default=str,
                 )
-            disclosed_headers: list[dict[str, str]] = []
-            if verified.passed:
-                with deep_session.lock:
-                    deep_session.analysis_skill_headers_disclosed = True
-                disclosed_headers = list(runtime_owner.skill_headers)
+            latest_artifact = getattr(
+                runtime_owner.kernel,
+                "latest_verified_query_artifact",
+                None,
+            )
+            query_artifact = (
+                latest_artifact(session)
+                if verified.passed and callable(latest_artifact)
+                else None
+            )
             return json.dumps(
                 {
                     "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
                     "reason": str(reason or "")[:500],
+                    "queryArtifactId": (
+                        query_artifact.artifact_id if query_artifact else ""
+                    ),
                     "rowCount": len(run_result.merged_query_bundle.rows),
                     "tables": list(run_result.merged_query_bundle.tables),
+                    "outputColumns": (
+                        list(query_artifact.output_columns)
+                        if query_artifact
+                        else []
+                    ),
+                    "entitySetEligibleOutputs": (
+                        sorted(query_artifact.output_entity_identities)
+                        if query_artifact
+                        else []
+                    ),
                     "blockingGaps": [
                         gap.model_dump(by_alias=True) for gap in verified.blocking_gaps
                     ],
                     "warningGaps": [
                         gap.model_dump(by_alias=True) for gap in verified.warning_gaps
                     ],
-                    "availableAnalysisSkillHeaders": disclosed_headers,
+                    "dataCollectionStatus": "OPEN",
+                    "nextAction": (
+                        "PUBLISH_ENTITY_SET_OR_CONTINUE_QUERYING_OR_FINALIZE"
+                        if verified.passed
+                        else "REVISE_BINDINGS_OR_SQL"
+                    ),
                     "skillSelectionPolicy": (
-                        "Match by semantic intent only after this verified query. A Skill "
-                        "may analyze this immutable evidence but cannot request new bindings, "
-                        "retrieval, or SQL."
+                        "No Skill header is disclosed by an individual query. Finalize the complete "
+                        "verified evidence portfolio only after every datum required by the original question is present."
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("publish_verified_entity_set")
+        def publish_verified_entity_set(
+            query_artifact_id: str,
+            output_column: str,
+            limit: int,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Publish a typed entity set from one immutable verified query output."""
+
+            deep_session = runtime.context.session
+            if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
+                return json.dumps(
+                    {
+                        "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
+                        "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                        "message": "Analysis Skill execution cannot publish new query inputs.",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
+                artifact = runtime_owner.kernel.publish_verified_entity_set(
+                    deep_session.runtime,
+                    query_artifact_id,
+                    output_column,
+                    limit=limit,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                code = message.partition(":")[0] or "VERIFIED_ENTITY_SET_REJECTED"
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": code,
+                        "message": message[:500],
+                        "nextAction": (
+                            "USE_LATEST_VERIFIED_QUERY_ARTIFACT"
+                            if code == "VERIFIED_QUERY_ARTIFACT_NOT_FOUND"
+                            else "REVISE_BINDINGS"
+                            if code in {
+                                "VERIFIED_ENTITY_OUTPUT_COLUMN_NOT_FOUND",
+                                "VERIFIED_ENTITY_SEMANTIC_LINEAGE_REQUIRED",
+                                "VERIFIED_ENTITY_IDENTITY_REQUIRED",
+                            }
+                            else "STOP_WITH_VERIFIED_EMPTY_RESULT"
+                            if code == "VERIFIED_ENTITY_SET_EMPTY"
+                            else "STOP"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "VERIFIED_ENTITY_SET_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "nextAction": "STOP_INTERNAL",
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "status": "PUBLISHED",
+                    "entitySetArtifactId": artifact.artifact_id,
+                    "sourceQueryArtifactId": artifact.source_query_artifact_id,
+                    "sourceColumn": artifact.source_column,
+                    "sourceSemanticRefId": artifact.source_semantic_ref_id,
+                    "entityIdentity": artifact.source_entity_identity,
+                    "valueCount": artifact.value_count,
+                    "truncated": artifact.truncated,
+                    "valuesHash": artifact.values_hash,
+                    "nextAction": (
+                        "STOP_WITH_VERIFIED_EMPTY_RESULT"
+                        if artifact.value_count == 0
+                        else "REVISE_QUERY_STRATEGY"
+                        if artifact.truncated
+                        else "READ_DOWNSTREAM_FIELD_AND_PROPOSE_CONTRACT"
+                    ),
+                    "instruction": (
+                        "Bind this artifact by entitySetArtifactId and a progressively read "
+                        "targetFieldRef. Never copy or invent entity values in entityFilters."
                     ),
                 },
                 ensure_ascii=False,
@@ -1201,13 +1407,128 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         ) -> str:
             """Compose and store the final answer from verified evidence only."""
 
-            answer = runtime_owner.kernel.compose_answer(
-                runtime.context.session.runtime,
-                allow_llm=allow_llm,
-            )
+            try:
+                answer = runtime_owner.kernel.compose_answer(
+                    runtime.context.session.runtime,
+                    allow_llm=allow_llm,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                incomplete = "EVIDENCE_PORTFOLIO_INCOMPLETE" in message
+                return json.dumps(
+                    {
+                        "status": "EVIDENCE_INCOMPLETE" if incomplete else "BLOCKED",
+                        "code": (
+                            "EVIDENCE_PORTFOLIO_INCOMPLETE"
+                            if incomplete
+                            else "ANSWER_COMPOSITION_BLOCKED"
+                        ),
+                        "message": message[:500],
+                        "nextAction": (
+                            "CONTINUE_PROGRESSIVE_QUERYING"
+                            if incomplete
+                            else "STOP"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "ANSWER_COMPOSITION_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "nextAction": "STOP_INTERNAL",
+                    },
+                    ensure_ascii=False,
+                )
+            state = runtime.context.session.runtime
             return json.dumps(
-                {"status": "ANSWERED", "answer": answer},
+                {
+                    "status": "ANSWERED",
+                    "answer": answer,
+                    "verifiedQueryArtifactIds": list(
+                        state.answer_artifact_ids
+                    ),
+                },
                 ensure_ascii=False,
+            )
+
+        @tool("finalize_evidence_collection")
+        def finalize_evidence_collection(
+            reason: str,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Seal the complete verified portfolio before optional Skill analysis."""
+
+            deep_session = runtime.context.session
+            if deep_session.analysis_skill_started:
+                return json.dumps(
+                    {
+                        "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
+                        "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
+                plan, run_result, verified, artifact_ids = (
+                    runtime_owner.kernel.verify_portfolio(
+                        deep_session.runtime
+                    )
+                )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "EVIDENCE_INCOMPLETE",
+                        "code": "VERIFIED_EVIDENCE_PORTFOLIO_UNAVAILABLE",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                        "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
+                    },
+                    ensure_ascii=False,
+                )
+            if not verified.passed:
+                return json.dumps(
+                    {
+                        "status": "EVIDENCE_INCOMPLETE",
+                        "code": "EVIDENCE_PORTFOLIO_INCOMPLETE",
+                        "reason": str(reason or "")[:500],
+                        "artifactIds": artifact_ids,
+                        "blockingGaps": [
+                            item.model_dump(by_alias=True)
+                            for item in verified.blocking_gaps
+                        ],
+                        "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            with deep_session.lock:
+                deep_session.data_collection_sealed = True
+                deep_session.analysis_skill_headers_disclosed = True
+                deep_session.runtime.answer_plan = plan.model_copy(deep=True)
+                deep_session.runtime.answer_run_result = run_result.model_copy(
+                    deep=True
+                )
+                deep_session.runtime.answer_verified_evidence = (
+                    verified.model_copy(deep=True)
+                )
+                deep_session.runtime.answer_artifact_ids = list(artifact_ids)
+            return json.dumps(
+                {
+                    "status": "EVIDENCE_COLLECTION_SEALED",
+                    "reason": str(reason or "")[:500],
+                    "verifiedQueryArtifactIds": artifact_ids,
+                    "rowCount": len(run_result.merged_query_bundle.rows),
+                    "tables": list(run_result.merged_query_bundle.tables),
+                    "availableAnalysisSkillHeaders": list(
+                        runtime_owner.skill_headers
+                    ),
+                    "nextAction": "RUN_ONE_MATCHING_SKILL_OR_COMPOSE_ANSWER",
+                },
+                ensure_ascii=False,
+                default=str,
             )
 
         @tool("run_skill")
@@ -1236,7 +1557,18 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             """Create a typed human clarification and stop query execution."""
 
             normalized_type = str(clarification_type or "").strip().upper()
-            if normalized_type.startswith(("SYSTEM_", "INTERNAL_", "TOOL_", "COMPILER_")):
+            if normalized_type.startswith(
+                (
+                    "SYSTEM_",
+                    "INTERNAL_",
+                    "TOOL_",
+                    "COMPILER_",
+                    "SEMANTIC_",
+                    "CONTRACT_",
+                    "SQL_",
+                    "EXECUTION_",
+                )
+            ):
                 return json.dumps(
                     {
                         "status": "REJECTED",
@@ -1266,6 +1598,8 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             propose_grounded_contract,
             submit_grounded_sql_candidate,
             execute_grounded_query,
+            publish_verified_entity_set,
+            finalize_evidence_collection,
             compose_verified_answer,
             run_skill,
             ask_human,
@@ -1288,11 +1622,20 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 "skillName": normalized_name,
                 "message": "Skill must be selected from the disclosed Skill headers.",
             }
+        if not session.data_collection_sealed:
+            return {
+                "status": "EVIDENCE_COLLECTION_NOT_SEALED",
+                "skillName": normalized_name,
+                "nextAction": "FINALIZE_EVIDENCE_COLLECTION",
+                "message": (
+                    "Finish every required data query and seal the verified evidence portfolio before running an analysis Skill."
+                ),
+            }
         if (
-            state.active_plan is None
-            or state.run_result is None
-            or state.verified_evidence is None
-            or not state.verified_evidence.passed
+            state.answer_plan is None
+            or state.answer_run_result is None
+            or state.answer_verified_evidence is None
+            or not state.answer_verified_evidence.passed
         ):
             return {
                 "status": "VERIFIED_EVIDENCE_REQUIRED",
@@ -1322,8 +1665,35 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 "message": "Skill isolation requires an independent checkpoint backend.",
             }
 
-        with session.lock:
-            session.analysis_skill_started = True
+        metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
+        lifecycle_phase = str(
+            metadata.get("lifecyclePhase")
+            or metadata.get("lifecycle_phase")
+            or "post_query_analysis"
+        ).strip()
+        requires_verified = str(
+            metadata.get("requiresVerifiedEvidence")
+            or metadata.get("requires_verified_evidence")
+            or "true"
+        ).strip().lower() not in {"false", "0", "no"}
+        output_contract = str(
+            metadata.get("outputContract")
+            or metadata.get("output_contract")
+            or ""
+        ).strip()
+        if (
+            lifecycle_phase != "post_query_analysis"
+            or not requires_verified
+            or output_contract != "verified_analysis_v1"
+        ):
+            return {
+                "status": "SKILL_LIFECYCLE_UNSUPPORTED",
+                "skillName": normalized_name,
+                "message": (
+                    "The current run_skill boundary only executes post-query analysis "
+                    "Skills that require verified evidence."
+                ),
+            }
 
         skill_run_id = "skill_%s_%s" % (
             re.sub(r"[^a-z0-9-]+", "-", normalized_name).strip("-") or "run",
@@ -1331,7 +1701,15 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         )
         skill_thread_id = "%s__%s" % (context.thread_id, skill_run_id)
         workspace = self.skill_run_root / skill_run_id
-        workspace.mkdir(parents=True, exist_ok=False)
+        try:
+            workspace.mkdir(parents=True, exist_ok=False)
+        except Exception as exc:
+            return {
+                "status": "SKILL_WORKSPACE_FAILED",
+                "skillName": normalized_name,
+                "message": "%s:%s"
+                % (type(exc).__name__, str(exc)[:400]),
+            }
         input_path = workspace / "input.json"
         script_output_path = workspace / "script-output.json"
         result_path = workspace / "result.json"
@@ -1367,41 +1745,27 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             objective,
             skill_run_id,
         )
-        input_path.write_text(
-            json.dumps(skill_payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
-        progress_event("workspace", "completed", str(workspace))
-
-        metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
-        lifecycle_phase = str(
-            metadata.get("lifecyclePhase")
-            or metadata.get("lifecycle_phase")
-            or "post_query_analysis"
-        ).strip()
-        requires_verified = str(
-            metadata.get("requiresVerifiedEvidence")
-            or metadata.get("requires_verified_evidence")
-            or "true"
-        ).strip().lower() not in {"false", "0", "no"}
-        output_contract = str(
-            metadata.get("outputContract")
-            or metadata.get("output_contract")
-            or ""
-        ).strip()
-        if (
-            lifecycle_phase != "post_query_analysis"
-            or not requires_verified
-            or output_contract != "verified_analysis_v1"
-        ):
+        try:
+            input_path.write_text(
+                json.dumps(skill_payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as exc:
             return {
-                "status": "SKILL_LIFECYCLE_UNSUPPORTED",
+                "status": "SKILL_INPUT_ARTIFACT_FAILED",
                 "skillName": normalized_name,
-                "message": (
-                    "The current run_skill boundary only executes post-query analysis "
-                    "Skills that require verified evidence."
-                ),
+                "message": "%s:%s"
+                % (type(exc).__name__, str(exc)[:400]),
             }
+        progress_event("workspace", "completed", str(workspace))
+        with session.lock:
+            if session.analysis_skill_started:
+                return {
+                    "status": "SKILL_ALREADY_ATTEMPTED",
+                    "skillName": normalized_name,
+                    "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                }
+            session.analysis_skill_started = True
         execution_mode = str(
             metadata.get("executionMode")
             or metadata.get("execution_mode")
@@ -1585,7 +1949,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 )
             contract_issues = _skill_output_contract_issues(
                 structured_output,
-                state.active_plan,
+                state.answer_plan or state.active_plan,
             )
             for key in (
                 "observations",
@@ -1610,9 +1974,13 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                         "message": "isolated Skill returned no answerMarkdown",
                     }
                 )
-            permitted_refs = set(
-                state.active_contract.evidence_refs if state.active_contract else []
-            )
+            selected_artifact_ids = set(state.answer_artifact_ids)
+            permitted_refs = {
+                ref_id
+                for artifact in state.verified_query_ledger
+                if artifact.artifact_id in selected_artifact_ids
+                for ref_id in artifact.contract.evidence_refs
+            }
             untrusted = [
                 str(ref_id)
                 for ref_id in structured_output.get("evidenceRefs") or []
@@ -1620,8 +1988,8 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             ]
             verification = AnswerClaimVerifier().verify(
                 state.question,
-                state.active_plan,
-                state.run_result,
+                state.answer_plan or state.active_plan,
+                state.answer_run_result or state.run_result,
                 rendered_answer,
                 support_context=_skill_claim_support_context(state),
             )
@@ -1785,10 +2153,23 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         skill_run_id: str,
     ) -> dict[str, Any]:
         state = session.runtime
-        plan = state.active_plan
-        run_result = state.run_result
+        plan = state.answer_plan or state.active_plan
+        run_result = state.answer_run_result or state.run_result
         active_contract = state.active_contract
-        verified = state.verified_evidence
+        verified = state.answer_verified_evidence or state.verified_evidence
+        selected_artifact_ids = set(state.answer_artifact_ids)
+        selected_artifacts = [
+            item
+            for item in state.verified_query_ledger
+            if item.artifact_id in selected_artifact_ids
+        ]
+        allowed_evidence_refs = list(
+            dict.fromkeys(
+                ref_id
+                for artifact in selected_artifacts
+                for ref_id in artifact.contract.evidence_refs
+            )
+        )
         return {
             "skillName": skill_name,
             "skillRunId": skill_run_id,
@@ -1796,19 +2177,24 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             "objective": objective,
             "topics": session.effective_topics(),
             "groundedSummary": {
-                "queryShape": str(active_contract.query_shape if active_contract else ""),
+                "queryShape": (
+                    "VERIFIED_EVIDENCE_PORTFOLIO"
+                    if len(selected_artifacts) > 1
+                    else str(active_contract.query_shape if active_contract else "")
+                ),
                 "analysisMode": str(active_contract.analysis_mode if active_contract else ""),
-                "tables": [
-                    table.table for table in (active_contract.tables if active_contract else [])
-                ],
+                "tables": list(
+                    run_result.merged_query_bundle.tables
+                    if run_result is not None
+                    else []
+                ),
                 "timeRange": (
                     active_contract.time_range.model_dump(by_alias=True)
                     if active_contract is not None
                     else {}
                 ),
-                "evidenceRefs": list(
-                    active_contract.evidence_refs if active_contract is not None else []
-                ),
+                "evidenceRefs": allowed_evidence_refs,
+                "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
             },
             "dataRows": (
                 list(run_result.merged_query_bundle.rows)[:200]
@@ -1840,9 +2226,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 for gap in (run_result.evidence_gaps[:32] if run_result is not None else [])
             ],
             "allowedEvidenceRefs": list(
-                state.active_contract.evidence_refs
-                if state.active_contract is not None
-                else []
+                allowed_evidence_refs
             ),
         }
 
@@ -1896,7 +2280,10 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
     ) -> None:
         with session.lock:
             session.skill_runs.append(dict(result))
-            run_result = session.runtime.run_result
+            run_result = (
+                session.runtime.answer_run_result
+                or session.runtime.run_result
+            )
             if run_result is not None:
                 run_result.skill_lifecycle_records.append(
                     SkillLifecycleRecord(
@@ -1944,7 +2331,20 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             user_scope=user_scope,
         )
         self.kernel.route_topic(kernel_session)
-        self.kernel.recall_navigation(kernel_session)
+        try:
+            self.kernel.recall_navigation(kernel_session)
+        except Exception as exc:
+            kernel_session.recall = RecallBundle()
+            kernel_session.phase = "RECALL_NAVIGATION_DEGRADED"
+            kernel_session.events.append(
+                GroundedRuntimeEvent(
+                    sequence=len(kernel_session.events) + 1,
+                    stage="recall_navigation",
+                    status="DEGRADED",
+                    detail="%s:%s"
+                    % (type(exc).__name__, str(exc)[:500]),
+                )
+            )
         session = GroundedDeepAgentSession(runtime=kernel_session)
         context = GroundedDeepAgentRunContext(
             thread_id=actual_thread_id,
@@ -2041,13 +2441,13 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 "requiresVerifiedEvidence": True,
                 "mayInfluenceSemanticBindings": False,
                 "mayExecuteSql": False,
-                "headersDisclosedAfterVerifiedQueryOnly": True,
+                "headersDisclosedAfterEvidenceFinalizationOnly": True,
             },
             "instructions": (
                 "Use Topic/recall only for initial navigation. trustedExecutionScope is authoritative. "
                 "Progressively read exact files under /knowledge, then use the typed Grounded tools. "
-                "No analysis Skill Header is available before query execution. The verified "
-                "execute_grounded_query response may disclose matching metadata; the parent Core "
+                "No analysis Skill Header is available while data collection remains open. "
+                "Only finalize_evidence_collection may disclose matching headers; the parent Core "
                 "never has access to full SKILL.md bodies."
             ),
         }
@@ -2068,6 +2468,8 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 "activeAttemptId": state.active_attempt_id,
                 "activeGeneration": state.active_generation,
                 "legacyFallbackUsed": False,
+                "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
+                "verifiedQueryArtifactCount": len(state.answer_artifact_ids),
                 "skillRuns": [
                     {
                         "skillName": item.get("skillName"),
@@ -2089,21 +2491,57 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 debug_trace=trace,
             )
         if state.answer:
+            display_run = state.answer_run_result or state.run_result
             rows = (
-                list(state.run_result.merged_query_bundle.rows)
-                if state.run_result is not None
+                list(display_run.merged_query_bundle.rows)
+                if display_run is not None
                 else []
             )
             tables = (
-                list(state.run_result.merged_query_bundle.tables)
-                if state.run_result is not None
+                list(display_run.merged_query_bundle.tables)
+                if display_run is not None
                 else []
             )
+            sections = [
+                {
+                    "title": (
+                        artifact.contract.query_shape
+                        or "Verified query evidence"
+                    ),
+                    "resultRole": "verified_query_artifact",
+                    "dorisTables": list(
+                        artifact.run_result.merged_query_bundle.tables
+                    ),
+                    "dataRows": [
+                        {
+                            **dict(row),
+                            "__evidenceArtifactId": artifact.artifact_id,
+                        }
+                        for row in artifact.run_result.merged_query_bundle.rows
+                    ],
+                    "offloaded": bool(
+                        artifact.run_result.merged_query_bundle.offloaded_files
+                    ),
+                    "offloadedFiles": list(
+                        artifact.run_result.merged_query_bundle.offloaded_files
+                    ),
+                    "originalRowCount": (
+                        artifact.run_result.merged_query_bundle.effective_row_count()
+                    ),
+                    "resultSummary": (
+                        "artifact=%s; verified=true"
+                        % artifact.artifact_id
+                    ),
+                }
+                for artifact in state.verified_query_ledger
+                if artifact.artifact_id in set(state.answer_artifact_ids)
+            ]
             return ChatResponse(
                 answer=state.answer,
                 category_name=state.routing.display_summary(),
                 doris_tables=tables,
                 data_rows=rows,
+                data_sections=sections,
                 debug_trace=trace,
             )
         raise RuntimeError(
@@ -2174,16 +2612,7 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
             }
             for item in contract.selected_fields
         ],
-        "entityFilters": [
-            {
-                "semanticRefId": item.semantic_ref_id,
-                "table": item.table,
-                "column": item.column,
-                "operator": item.operator,
-                "literalValue": item.literal_value,
-            }
-            for item in contract.entity_filters
-        ],
+        "entityFilters": _core_visible_entity_filter_obligations(contract),
         "relationships": [
             {
                 "semanticRefId": item.semantic_ref_id,
@@ -2199,6 +2628,62 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
         ],
         "timeRange": contract.time_range.model_dump(by_alias=True),
     }
+
+
+def _core_visible_binding_hints(contract: Any) -> dict[str, Any]:
+    """Keep kernel-owned upstream values out of the parent Core context."""
+
+    upstream_refs = {
+        str(item.target_field_ref or "")
+        for item in contract.upstream_entity_bindings
+    }
+    hints = contract.binding_hints.model_copy(
+        update={
+            "entity_filters": [
+                item
+                for item in contract.binding_hints.entity_filters
+                if item.field_ref not in upstream_refs
+            ]
+        },
+        deep=True,
+    )
+    return hints.model_dump(by_alias=True)
+
+
+def _core_visible_entity_filter_obligations(contract: Any) -> list[dict[str, Any]]:
+    upstream_by_ref = {
+        str(item.target_field_ref or ""): item
+        for item in contract.upstream_entity_bindings
+    }
+    result: list[dict[str, Any]] = []
+    for item in contract.entity_filters:
+        upstream = upstream_by_ref.get(item.semantic_ref_id)
+        if upstream is None:
+            result.append(
+                {
+                    "semanticRefId": item.semantic_ref_id,
+                    "table": item.table,
+                    "column": item.column,
+                    "operator": item.operator,
+                    "literalValue": item.literal_value,
+                    "runtimeInjected": False,
+                }
+            )
+            continue
+        result.append(
+            {
+                "semanticRefId": item.semantic_ref_id,
+                "table": item.table,
+                "column": item.column,
+                "operator": item.operator,
+                "runtimeInjected": True,
+                "entitySetArtifactId": upstream.entity_set_artifact_id,
+                "valueCount": upstream.value_count,
+                "valuesHash": upstream.values_hash,
+                "instruction": "Do not author this predicate; trusted execution injects it.",
+            }
+        )
+    return result
 
 
 def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:
@@ -2289,6 +2774,16 @@ def _canonical_binding_hints(hints: GroundedBindingHints) -> GroundedBindingHint
                     update={"field_ref": _canonical_progressive_ref(item.field_ref)}
                 )
                 for item in hints.entity_filters
+            ],
+            "upstream_entity_bindings": [
+                item.model_copy(
+                    update={
+                        "target_field_ref": _canonical_progressive_ref(
+                            item.target_field_ref
+                        )
+                    }
+                )
+                for item in hints.upstream_entity_bindings
             ],
             "group_by_ref": _canonical_progressive_ref(hints.group_by_ref),
             "label_refs": {
@@ -2436,10 +2931,11 @@ def _parse_skill_result(raw_output: str) -> dict[str, Any]:
 
 def _skill_claim_support_context(state: GroundedRuntimeSession) -> str:
     contract = state.active_contract
-    plan = state.active_plan
+    plan = state.answer_plan or state.active_plan
     return json.dumps(
         {
             "merchantId": state.merchant_id,
+            "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
             "timeRange": (
                 contract.time_range.model_dump(by_alias=True)
                 if contract is not None

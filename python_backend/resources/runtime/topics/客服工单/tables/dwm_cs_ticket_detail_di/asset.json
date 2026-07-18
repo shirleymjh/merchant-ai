@@ -1294,6 +1294,16 @@
       "columnName": "ticket_id",
       "businessName": "工单编号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:ticket",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "工单编号",
       "aliases": [
         "工单编号",
@@ -1681,6 +1691,16 @@
       "columnName": "spu_id",
       "businessName": "商品id",
       "role": "KEY",
+      "canonicalEntityRef": "entity:product",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "商品id",
       "aliases": [
         "商品id",
@@ -1817,6 +1837,16 @@
       "columnName": "order_id",
       "businessName": "订单号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:order",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "订单号",
       "aliases": [
         "订单号",
@@ -1831,6 +1861,16 @@
       "columnName": "sub_order_id",
       "businessName": "子订单号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:sub_order",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "子订单号",
       "aliases": [
         "子订单号",

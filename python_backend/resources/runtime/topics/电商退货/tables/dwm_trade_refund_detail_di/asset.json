@@ -1690,6 +1690,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:refund",
       "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "退货单号",
       "aliases": [
         "退货单号",
@@ -1720,6 +1728,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:order",
       "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "主订单编号",
       "aliases": [
         "主订单编号",
@@ -1736,6 +1752,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:sub_order",
       "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "子订单号",
       "aliases": [
         "子订单号",
@@ -1806,6 +1830,16 @@
       "columnName": "buyer_id",
       "businessName": "买家id",
       "role": "KEY",
+      "canonicalEntityRef": "entity:buyer",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "买家id",
       "aliases": [
         "买家id",
@@ -1834,6 +1868,16 @@
       "columnName": "seller_id",
       "businessName": "卖家id",
       "role": "KEY",
+      "canonicalEntityRef": "entity:merchant",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "卖家id",
       "aliases": [
         "卖家id",
@@ -1950,6 +1994,16 @@
       "columnName": "sku_id",
       "businessName": "skuid",
       "role": "KEY",
+      "canonicalEntityRef": "entity:sku",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "skuid",
       "aliases": [
         "skuid",
@@ -2611,6 +2665,16 @@
       "columnName": "discount_id",
       "businessName": "优惠券编号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:coupon",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "优惠券编号",
       "aliases": [
         "优惠券编号",
@@ -2737,6 +2801,16 @@
       "columnName": "spu_name",
       "businessName": "spu名称",
       "role": "DIMENSION",
+      "canonicalEntityRef": "entity:product_name",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "spu名称",
       "aliases": [
         "spu名称",

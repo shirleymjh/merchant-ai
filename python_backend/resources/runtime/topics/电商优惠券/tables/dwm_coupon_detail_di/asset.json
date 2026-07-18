@@ -770,6 +770,10 @@
       "columnName": "coupon_id",
       "businessName": "券编号",
       "role": "KEY",
+      "canonicalEntityRef": "entity:coupon",
+      "comparisonPolicy": "exact",
+      "filterOperators": ["EQ", "IN"],
+      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
       "description": "券编号",
       "aliases": [
         "券编号",

@@ -14,7 +14,9 @@ from merchant_ai.models import (
     KnowledgeBundle,
     MerchantInfo,
     PlanningAssetPack,
+    QueryBundle,
     QueryPlan,
+    QuestionIntent,
     QuestionCategory,
     RecallBundle,
     RecallItem,
@@ -24,12 +26,23 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
 from merchant_ai.services.grounded_query_contract import (
+    GroundedBindingHints,
     GroundedDimensionBinding,
+    GroundedEntityFilterBinding,
     GroundedMetricBinding,
     GroundedQueryContract,
+    GroundedSelectedFieldBinding,
     GroundedTableBinding,
+    GroundedUpstreamEntityHint,
 )
-from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeKernel
+from merchant_ai.services.grounded_runtime_kernel import (
+    GroundedRuntimeKernel,
+    GroundedVerifiedEntitySet,
+    GroundedVerifiedQueryArtifact,
+)
+from merchant_ai.services.grounded_sql_candidate import (
+    grounded_query_contract_fingerprint,
+)
 
 
 class FakeTopicAssets:
@@ -111,6 +124,61 @@ class QueueBuilder:
         return contract
 
 
+class UpstreamCapturingBuilder:
+    def build(
+        self,
+        question: str,
+        topics: list[str],
+        evidence: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> GroundedQueryContract:
+        hints = kwargs["binding_hints"]
+        entity_filter = hints.entity_filters[-1]
+        target_ref = entity_filter.field_ref
+        return GroundedQueryContract(
+            question=question,
+            topics=topics,
+            status="READY",
+            query_shape="ENTITY_LOOKUP",
+            primary_table="goods",
+            binding_hints=hints,
+            tables=[
+                GroundedTableBinding(
+                    topic="商品管理",
+                    table="goods",
+                    detail_ref_id="semantic:商品管理:goods:detail",
+                    merchant_filter_column="seller_id",
+                )
+            ],
+            selected_fields=[
+                GroundedSelectedFieldBinding(
+                    semantic_ref_id="semantic:商品管理:goods:field:publish_time",
+                    topic="商品管理",
+                    table="goods",
+                    column="publish_time",
+                    output_alias="publish_time",
+                )
+            ],
+            entity_filters=[
+                GroundedEntityFilterBinding(
+                    semantic_ref_id=target_ref,
+                    topic="商品管理",
+                    table="goods",
+                    column="spu_id",
+                    operator=entity_filter.operator,
+                    literal_value=entity_filter.literal_value,
+                    entity_identity="entity:product",
+                    allowed_operators=["IN"],
+                )
+            ],
+            evidence_refs=[
+                "semantic:商品管理:goods:detail",
+                target_ref,
+                "semantic:商品管理:goods:field:publish_time",
+            ],
+        )
+
+
 class FakeCompiler:
     def __init__(self, valid: bool = True):
         self.valid = valid
@@ -161,6 +229,25 @@ class FakeComposer:
     @staticmethod
     def compose(question: str, merchant: MerchantInfo, plan: QueryPlan, run_result: AgentRunResult, context: str, **kwargs: Any) -> str:
         return "%s:%s" % (merchant.merchant_id, question)
+
+
+class PortfolioComposer:
+    def __init__(self) -> None:
+        self.plan: QueryPlan | None = None
+        self.run_result: AgentRunResult | None = None
+
+    def compose(
+        self,
+        question: str,
+        merchant: MerchantInfo,
+        plan: QueryPlan,
+        run_result: AgentRunResult,
+        context: str,
+        **kwargs: Any,
+    ) -> str:
+        self.plan = plan.model_copy(deep=True)
+        self.run_result = run_result.model_copy(deep=True)
+        return "portfolio-answer"
 
 
 def contract(question: str, status: str) -> GroundedQueryContract:
@@ -481,3 +568,183 @@ def test_missing_runtime_services_fail_closed_and_clarification_is_typed() -> No
     )
     assert clarification.pending_question == session.question
     assert session.phase == "CLARIFICATION_REQUIRED"
+
+
+def test_verified_entity_set_materializes_typed_downstream_filter_and_audit() -> None:
+    runtime = GroundedRuntimeKernel(
+        FakeTopicAssets(),
+        keyword_service=FakeKeywordService(),
+        topic_router=FakeRouter(),
+        contract_builder=UpstreamCapturingBuilder(),
+    )
+    session = runtime.new_session("查看该商品发布时间", "m-1")
+    session.workspace_topics = ["商品管理"]
+    source_contract = GroundedQueryContract(
+        question="工单量最多的商品",
+        topics=["客服工单"],
+        status="READY",
+        query_shape="RANKED",
+    )
+    source_contract_fingerprint = grounded_query_contract_fingerprint(
+        source_contract
+    )
+    source_query = GroundedVerifiedQueryArtifact(
+        artifact_id="query_artifact_top_product",
+        generation=1,
+        contract_fingerprint=source_contract_fingerprint,
+        sql_fingerprint="source-sql-fingerprint",
+        contract=source_contract,
+        plan=QueryPlan(),
+        run_result=AgentRunResult(),
+        verified_evidence=VerifiedEvidence(passed=True),
+        output_columns=["spu_id"],
+        output_semantic_refs={
+            "spu_id": "semantic:客服工单:tickets:field:spu_id"
+        },
+        output_entity_identities={"spu_id": "entity:product"},
+        sealed_entity_values={"spu_id": ["spu-2", "spu-1"]},
+    )
+    entity_set = GroundedVerifiedEntitySet(
+        artifact_id="entity_set_top_product",
+        source_query_artifact_id=source_query.artifact_id,
+        source_column="spu_id",
+        source_semantic_ref_id=(
+            "semantic:客服工单:tickets:field:spu_id"
+        ),
+        source_entity_identity="entity:product",
+        values=["spu-1", "spu-2"],
+        value_count=2,
+        values_hash="set-values-hash",
+    )
+    session.verified_query_ledger.append(source_query)
+    session.verified_entity_sets.append(entity_set)
+    target_ref = "semantic:商品管理:goods:field:spu_id"
+    hints = GroundedBindingHints(
+        table_refs=["semantic:商品管理:goods:detail"],
+        selected_fields=[
+            {
+                "fieldRef": "semantic:商品管理:goods:field:publish_time",
+                "outputAlias": "publish_time",
+            }
+        ],
+        upstream_entity_bindings=[
+            GroundedUpstreamEntityHint(
+                entity_set_artifact_id=entity_set.artifact_id,
+                target_field_ref=target_ref,
+                operator="IN",
+            )
+        ],
+        analysis_mode="ENTITY_LOOKUP",
+    )
+
+    attempt = runtime.propose_contract(session, [], hints)
+
+    assert attempt.contract.ready is True
+    assert attempt.contract.entity_filters[0].literal_value == ["spu-1", "spu-2"]
+    assert attempt.contract.entity_filters[0].operator == "IN"
+    assert attempt.contract.upstream_entity_bindings[0].entity_set_artifact_id == (
+        entity_set.artifact_id
+    )
+    assert attempt.contract.upstream_entity_bindings[0].source_contract_fingerprint == (
+        source_contract_fingerprint
+    )
+    assert attempt.contract.upstream_entity_bindings[0].target_entity_identity == (
+        "entity:product"
+    )
+
+
+def test_verified_portfolio_preserves_multiple_query_graphs_and_namespaces_tasks() -> None:
+    runtime = GroundedRuntimeKernel(
+        FakeTopicAssets(),
+        keyword_service=FakeKeywordService(),
+        topic_router=FakeRouter(),
+    )
+    session = runtime.new_session("工单最多商品及退款和发布时间", "m-1")
+    for artifact_id, table, row in [
+        (
+            "query_artifact_top_product",
+            "ticket_detail",
+            {"spu_id": "spu-1", "ticket_count": 9},
+        ),
+        (
+            "query_artifact_refund",
+            "refund_detail",
+            {"refund_amount": 88.5},
+        ),
+    ]:
+        artifact_contract = GroundedQueryContract(
+            question=session.question,
+            status="READY",
+            query_shape="SCALAR",
+        )
+        session.verified_query_ledger.append(
+            GroundedVerifiedQueryArtifact(
+                artifact_id=artifact_id,
+                generation=len(session.verified_query_ledger) + 1,
+                contract_fingerprint=grounded_query_contract_fingerprint(
+                    artifact_contract
+                ),
+                sql_fingerprint="sql-%s" % artifact_id,
+                contract=artifact_contract,
+                plan=QueryPlan(
+                    intents=[
+                        QuestionIntent(
+                            question=session.question,
+                            plan_task_id="same_task_id",
+                        )
+                    ],
+                    final_evidence_column_hints={
+                        "same_task_id": list(row)
+                    },
+                ),
+                run_result=AgentRunResult(
+                    merged_query_bundle=QueryBundle(
+                        tables=[table],
+                        rows=[row],
+                    )
+                ),
+                verified_evidence=VerifiedEvidence(
+                    passed=True,
+                    covered_evidence=list(row),
+                ),
+                output_columns=list(row),
+            )
+        )
+
+    plan, run_result, verified, artifact_ids = runtime.verified_portfolio(
+        session
+    )
+
+    assert artifact_ids == [
+        "query_artifact_top_product",
+        "query_artifact_refund",
+    ]
+    assert verified.passed is True
+    assert run_result.merged_query_bundle.tables == [
+        "ticket_detail",
+        "refund_detail",
+    ]
+    assert {
+        row["__evidenceArtifactId"]
+        for row in run_result.merged_query_bundle.rows
+    } == set(artifact_ids)
+    assert len({item.plan_task_id for item in plan.intents}) == 2
+
+    composer = PortfolioComposer()
+    runtime.answer_composer = composer
+    runtime.verifier = FakeVerifier()
+    session.active_generation = 2
+    session.active_contract = session.verified_query_ledger[-1].contract.model_copy(
+        deep=True
+    )
+    session.active_plan = session.verified_query_ledger[-1].plan.model_copy(
+        deep=True
+    )
+    session.active_pack = PlanningAssetPack()
+
+    answer = runtime.compose_answer(session)
+
+    assert answer == "portfolio-answer"
+    assert composer.run_result is not None
+    assert len(composer.run_result.merged_query_bundle.rows) == 2
+    assert session.answer_artifact_ids == artifact_ids

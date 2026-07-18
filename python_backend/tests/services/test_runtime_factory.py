@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from merchant_ai.config import get_settings
 from merchant_ai.models import ChatContext, ChatResponse, MerchantInfo, UserIdentity
 from merchant_ai.services import runtime_factory
@@ -76,6 +78,13 @@ def test_deepagent_factory_branch_never_imports_legacy_workflow(monkeypatch: Any
     settings = get_settings().model_copy(update={"agent_mode": "deepagent"})
 
     assert runtime_factory.create_runtime(settings) is sentinel
+
+
+def test_legacy_workflow_cannot_be_selected_as_online_query_authority() -> None:
+    settings = get_settings().model_copy(update={"agent_mode": "legacy"})
+
+    with pytest.raises(ValueError, match="grounded deepagent only"):
+        runtime_factory.create_runtime(settings)
 
 
 def test_facade_adapts_api_signature_without_workflow_state() -> None:

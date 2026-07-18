@@ -112,6 +112,10 @@ class GroundedDimensionBinding(APIModel):
     role: str = ""
     aliases: list[str] = Field(default_factory=list)
     usage: str = "group_by"
+    is_unique_key: bool = False
+    entity_identity: str = ""
+    filter_operators: list[str] = Field(default_factory=list)
+    lookup_time_policy: dict[str, Any] = Field(default_factory=dict)
 
 
 class GroundedSelectedFieldBinding(APIModel):
@@ -190,6 +194,35 @@ class GroundedEntityFilterHint(APIModel):
     requested_phrase: str = ""
 
 
+class GroundedUpstreamEntityHint(APIModel):
+    """Reference a verified entity set without copying its values into Core context."""
+
+    entity_set_artifact_id: str
+    target_field_ref: str
+    operator: str = "IN"
+    requested_phrase: str = ""
+
+
+class GroundedUpstreamEntityBinding(APIModel):
+    """Auditable resolution of one verified result into a typed entity filter."""
+
+    entity_set_artifact_id: str
+    source_query_artifact_id: str
+    source_contract_fingerprint: str = ""
+    source_sql_fingerprint: str = ""
+    source_column: str
+    source_semantic_ref_id: str = ""
+    source_entity_identity: str = ""
+    target_field_ref: str
+    target_table: str = ""
+    target_column: str = ""
+    target_entity_identity: str = ""
+    operator: str = "IN"
+    value_count: int = 0
+    values_hash: str = ""
+    requested_phrase: str = ""
+
+
 class GroundedBindingHints(APIModel):
     table_refs: list[str] = Field(default_factory=list)
     metric_refs: list[str] = Field(default_factory=list)
@@ -197,6 +230,9 @@ class GroundedBindingHints(APIModel):
     dimension_refs: list[str] = Field(default_factory=list)
     selected_fields: list[GroundedSelectedFieldHint] = Field(default_factory=list)
     entity_filters: list[GroundedEntityFilterHint] = Field(default_factory=list)
+    upstream_entity_bindings: list[GroundedUpstreamEntityHint] = Field(
+        default_factory=list
+    )
     group_by_ref: str = ""
     label_refs: dict[str, str] = Field(default_factory=dict)
     relationship_refs: list[str] = Field(default_factory=list)
@@ -220,6 +256,9 @@ class GroundedQueryContract(APIModel):
     dimensions: list[GroundedDimensionBinding] = Field(default_factory=list)
     selected_fields: list[GroundedSelectedFieldBinding] = Field(default_factory=list)
     entity_filters: list[GroundedEntityFilterBinding] = Field(default_factory=list)
+    upstream_entity_bindings: list[GroundedUpstreamEntityBinding] = Field(
+        default_factory=list
+    )
     relationships: list[GroundedRelationshipBinding] = Field(default_factory=list)
     time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
     ranking: GroundedRankingBinding = Field(default_factory=GroundedRankingBinding)
@@ -310,6 +349,7 @@ class GroundedQueryContractBuilder:
             *hints.dimension_refs,
             *(item.field_ref for item in hints.selected_fields),
             *(item.field_ref for item in hints.entity_filters),
+            *(item.target_field_ref for item in hints.upstream_entity_bindings),
             *hints.relationship_refs,
             *hints.label_refs.keys(),
             *([hints.group_by_ref] if hints.group_by_ref else []),
@@ -819,6 +859,7 @@ class GroundedQueryContractBuilder:
                     ]
                 )
                 phrase = str(label_refs.get(document.ref.ref_id) or definition.get("businessName") or column)
+                semantics = _field_usage_semantics(definition)
                 bindings.append(
                     GroundedDimensionBinding(
                         requested_phrase=phrase,
@@ -830,6 +871,7 @@ class GroundedQueryContractBuilder:
                         role=role,
                         aliases=aliases,
                         usage="group_by" if document.ref.ref_id == group_by_ref else "label",
+                        **semantics,
                     )
                 )
         order = {ref_id: index for index, ref_id in enumerate(selected_refs)}
@@ -2910,6 +2952,12 @@ def _canonicalize_binding_hints(
                 item.model_copy(update={"field_ref": canonical(item.field_ref)})
                 for item in hints.entity_filters
             ],
+            "upstream_entity_bindings": [
+                item.model_copy(
+                    update={"target_field_ref": canonical(item.target_field_ref)}
+                )
+                for item in hints.upstream_entity_bindings
+            ],
             "group_by_ref": canonical(hints.group_by_ref),
             "relationship_refs": _dedupe(canonical(item) for item in hints.relationship_refs),
             "label_refs": {
@@ -2942,6 +2990,11 @@ def _missing_binding_ref_gaps(
             "ENTITY_FILTER_REF_NOT_READ",
             "COLUMN",
             [item.field_ref for item in hints.entity_filters],
+        ),
+        (
+            "UPSTREAM_ENTITY_TARGET_REF_NOT_READ",
+            "COLUMN",
+            [item.target_field_ref for item in hints.upstream_entity_bindings],
         ),
         ("RELATIONSHIP_BINDING_REF_NOT_READ", "RELATIONSHIPS", hints.relationship_refs),
     ]

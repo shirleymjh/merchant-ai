@@ -1041,10 +1041,15 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:product",
       "comparisonPolicy": "exact",
+      "isUniqueEntityKey": true,
       "filterOperators": [
         "EQ",
         "IN"
       ],
+      "lookupTimePolicy": {
+        "mode": "unbounded",
+        "timeRequired": false
+      },
       "description": "spu ID",
       "aliases": [
         "spu ID",
@@ -1061,6 +1066,16 @@
       "columnName": "spu_name",
       "businessName": "商品名称",
       "role": "DIMENSION",
+      "canonicalEntityRef": "entity:product_name",
+      "comparisonPolicy": "exact",
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "商品名称",
       "aliases": [
         "商品名称",

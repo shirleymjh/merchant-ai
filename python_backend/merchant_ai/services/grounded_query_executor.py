@@ -16,6 +16,7 @@ from merchant_ai.models import (
     AgentTaskResult,
     EvidenceCheckResult,
     EvidenceGap,
+    EntitySet,
     EntityFilterObligation,
     EntityFilterVerificationProof,
     EntityReference,
@@ -332,6 +333,11 @@ class GroundedQueryExecutionKernel:
             ),
             node_plan_contract=compilation.node_contract,
             entity_filter_verification=entity_filter_verification,
+            entity_set=self._sealed_raw_entity_outputs(
+                contract,
+                raw_rows,
+                task_id,
+            ),
         )
         for decision in decisions:
             self.access_control.record_query_audit(
@@ -693,6 +699,11 @@ class GroundedQueryExecutionKernel:
             required = self._dedupe(
                 [
                     *referenced_by_table[table],
+                    *[
+                        item.column
+                        for item in contract.entity_filters
+                        if item.table == table
+                    ],
                     merchant_column,
                     region_column if region else "",
                     store_column if store_ids else "",
@@ -843,7 +854,12 @@ class GroundedQueryExecutionKernel:
         asset_pack: Any,
         user_scope: dict[str, Any],
     ) -> str:
-        """Inject only access predicates, preserving Core's SQL topology."""
+        """Inject trusted access and upstream entity predicates.
+
+        Core owns query semantics and topology. The kernel owns secret runtime
+        values and injects them exactly like tenant scope, including into the
+        ON clause of a RIGHT-side table in a LEFT JOIN.
+        """
 
         if not str(merchant_id or "").strip():
             raise RuntimeError("trusted execution scope is missing merchant_id")
@@ -852,6 +868,14 @@ class GroundedQueryExecutionKernel:
         except Exception as exc:
             raise RuntimeError("accepted Core SQL could not be reparsed") from exc
         bindings = {item.table: item for item in contract.tables}
+        upstream_refs = {
+            item.target_field_ref
+            for item in contract.upstream_entity_bindings
+        }
+        upstream_filters_by_table: dict[str, list[Any]] = {}
+        for item in contract.entity_filters:
+            if item.semantic_ref_id in upstream_refs:
+                upstream_filters_by_table.setdefault(item.table, []).append(item)
         region = str(user_scope.get("region") or "").strip()
         store_ids = self._dedupe(
             user_scope.get("storeIds") or user_scope.get("store_ids") or []
@@ -895,6 +919,28 @@ class GroundedQueryExecutionKernel:
                         expression=exp.Literal.string(str(merchant_id)),
                     )
                 ]
+                for entity_filter in upstream_filters_by_table.get(table, []):
+                    if entity_filter.column not in columns:
+                        raise RuntimeError(
+                            "upstream entity field is absent from grounded schema: %s.%s"
+                            % (table, entity_filter.column)
+                        )
+                    if entity_filter.operator != "IN" or not isinstance(
+                        entity_filter.literal_value,
+                        (list, tuple),
+                    ) or not entity_filter.literal_value:
+                        raise RuntimeError(
+                            "upstream entity binding requires a non-empty typed IN set"
+                        )
+                    predicates.append(
+                        exp.In(
+                            this=exp.column(entity_filter.column, table=alias),
+                            expressions=[
+                                exp.convert(value)
+                                for value in entity_filter.literal_value
+                            ],
+                        )
+                    )
                 metadata = self._table_metadata(asset_pack, table)
                 if region:
                     region_column = str(
@@ -952,6 +998,54 @@ class GroundedQueryExecutionKernel:
             pretty=False,
             normalize=False,
             comments=False,
+        )
+
+    @staticmethod
+    def _sealed_raw_entity_outputs(
+        contract: GroundedQueryContract,
+        raw_rows: list[dict[str, Any]],
+        task_id: str,
+    ) -> EntitySet | None:
+        """Retain pre-mask entity outputs for later verified publication."""
+
+        entity_outputs: dict[str, str] = {}
+        for dimension in contract.dimensions:
+            if (
+                dimension.usage == "group_by"
+                and dimension.column
+                and dimension.entity_identity
+            ):
+                entity_outputs[dimension.column] = dimension.entity_identity
+        for field in contract.selected_fields:
+            output = field.output_alias or field.column
+            if output and field.entity_identity:
+                entity_outputs[output] = field.entity_identity
+        if not entity_outputs:
+            return None
+        column_values: dict[str, list[Any]] = {}
+        truncated = False
+        for output in entity_outputs:
+            values_by_key: dict[str, Any] = {}
+            for row in raw_rows:
+                if output not in row or row.get(output) is None:
+                    continue
+                value = row.get(output)
+                key = "%s:%r" % (type(value).__name__, value)
+                values_by_key.setdefault(key, value)
+            ordered = [values_by_key[key] for key in sorted(values_by_key)]
+            if len(ordered) > 5000:
+                truncated = True
+                ordered = ordered[:5000]
+            column_values[output] = ordered
+        first_column = next(iter(entity_outputs), "")
+        return EntitySet(
+            task_id=task_id,
+            join_key=first_column,
+            values=list(column_values.get(first_column) or []),
+            column_values=column_values,
+            truncated=truncated,
+            source_row_count=len(raw_rows),
+            source_key="grounded_pre_mask_verified_candidate",
         )
 
     @staticmethod

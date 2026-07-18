@@ -6,6 +6,10 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["sub_order_id", "sub_order_id"]],
     "grain": "sub_order_id_ticket_id",
+    "cardinality": "many_to_many",
+    "fanoutPolicy": "BLOCK_UNSAFE_FANOUT",
+    "dedupKeys": [],
+    "rowIdentityPreserved": {"leftToRight": false, "rightToLeft": false},
     "pathSemantics": ["order_entity", "ticket_entity", "entity_filter"],
     "useCases": ["工单关联订单", "催单工单定位订单"]
   },
@@ -16,6 +20,10 @@
     "joinType": "LEFT",
     "keys": [["seller_id", "seller_id"], ["ticket_id", "ticket_id"]],
     "grain": "ticket_id_bill_id",
+    "cardinality": "many_to_many",
+    "fanoutPolicy": "BLOCK_UNSAFE_FANOUT",
+    "dedupKeys": [],
+    "rowIdentityPreserved": {"leftToRight": false, "rightToLeft": false},
     "pathSemantics": ["ticket_entity", "compensation_entity", "entity_filter"],
     "useCases": ["工单关联赔付", "赔付单回看工单状态"]
   }
