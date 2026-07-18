@@ -408,6 +408,11 @@ class GroundedQueryContractBuilder:
             now=now,
             default_days=default_days,
         )
+        if str(time_range.source or "") == "default_days":
+            # The resolver's fallback calendar window is an execution default,
+            # not evidence that the user supplied a time condition. Entity
+            # lookup policy may deliberately remove this fallback entirely.
+            time_range.explicit = False
         anchor_policies = _dedupe(metric.anchor_policy for metric in metrics if metric.anchor_policy)
         if len(anchor_policies) == 1:
             time_range.anchor_policy = anchor_policies[0]
@@ -1215,6 +1220,15 @@ class GroundedSemanticFitValidator:
 
 
 class GroundedQueryContractValidator:
+    """Validate semantic authority and execution obligations, not SQL topology.
+
+    ``query_shape`` is descriptive context for Core and answer composition.  It
+    must not turn the Contract into a deterministic SQL template: grouping
+    cardinality, CTE/window structure and the exact governed join edge are
+    proved later against the Core-authored SQL AST.  This gate only requires
+    that every semantic object is read, scoped, complete and safe to use.
+    """
+
     def validate(self, contract: GroundedQueryContract) -> GroundedQueryContractValidationResult:
         gaps: list[GroundedContractGap] = []
         evidence_refs = set(contract.evidence_refs)
@@ -1223,27 +1237,13 @@ class GroundedQueryContractValidator:
         if not contract.topics:
             gaps.append(_gap("TOPIC_REQUIRED", "At least one active Topic is required"))
         detail_shape = contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
-        if not contract.metrics and not detail_shape:
+        if not (
+            contract.metrics or contract.dimensions or contract.selected_fields
+        ):
             gaps.append(
                 _gap(
-                    "METRIC_EVIDENCE_REQUIRED",
-                    "No requested metric was bound from trusted Core reads",
-                    "METRIC",
-                )
-            )
-        if detail_shape and contract.metrics:
-            gaps.append(
-                _gap(
-                    "DETAIL_METRIC_BINDING_FORBIDDEN",
-                    "DETAIL and ENTITY_LOOKUP must use typed fields, not a metric surrogate",
-                )
-            )
-        if detail_shape and not contract.selected_fields:
-            gaps.append(
-                _gap(
-                    "DETAIL_PROJECTION_REQUIRED",
-                    "DETAIL execution requires at least one exact selected field read",
-                    "COLUMN",
+                    "OUTPUT_BINDING_EVIDENCE_REQUIRED",
+                    "No metric, dimension or selected field was bound from trusted Core reads",
                 )
             )
         if contract.query_shape == "ENTITY_LOOKUP" and not contract.entity_filters:
@@ -1392,66 +1392,6 @@ class GroundedQueryContractValidator:
                             item.requested_phrase,
                         )
                     )
-                if not any(
-                    field.table == item.table and field.column == item.column
-                    for field in contract.selected_fields
-                ):
-                    gaps.append(
-                        _gap(
-                            "ENTITY_FILTER_PROJECTION_REQUIRED",
-                            "Entity identity field must be projected so execution can verify lookup identity",
-                            "COLUMN",
-                            item.topic,
-                            item.table,
-                            item.requested_phrase,
-                        )
-                    )
-        grouped_dimensions = [
-            dimension for dimension in contract.dimensions if dimension.usage == "group_by"
-        ]
-        if contract.query_shape == "SCALAR":
-            if grouped_dimensions:
-                gaps.append(
-                    _gap(
-                        "SCALAR_GROUP_BY_FORBIDDEN",
-                        "SCALAR shape cannot contain a groupBy dimension",
-                        "COLUMN",
-                    )
-                )
-            if contract.ranking.enabled:
-                gaps.append(
-                    _gap(
-                        "SCALAR_RANKING_FORBIDDEN",
-                        "SCALAR shape cannot contain ranking semantics",
-                    )
-                )
-        elif contract.query_shape in {"GROUPED", "TREND", "RANKED"}:
-            if len(grouped_dimensions) != 1:
-                gaps.append(
-                    _gap(
-                        "%s_DIMENSION_REQUIRED" % contract.query_shape,
-                        "%s shape requires exactly one explicitly read groupBy dimension"
-                        % contract.query_shape,
-                        "COLUMN",
-                    )
-                )
-        if contract.query_shape == "TREND" and len(grouped_dimensions) == 1:
-            dimension = grouped_dimensions[0]
-            table = table_by_name.get(dimension.table)
-            time_roles = {"TIME", "DATE", "DATETIME", "TIMESTAMP", "TIME_DIMENSION"}
-            if not table or not (
-                dimension.column == table.time_column or dimension.role in time_roles
-            ):
-                gaps.append(
-                    _gap(
-                        "TREND_TIME_DIMENSION_REQUIRED",
-                        "TREND shape groupBy must be the governed time dimension",
-                        "COLUMN",
-                        dimension.topic,
-                        dimension.table,
-                        dimension.requested_phrase,
-                    )
-                )
         if contract.query_shape == "RANKED" and not contract.ranking.enabled:
             gaps.append(
                 _gap(
@@ -1506,43 +1446,12 @@ class GroundedQueryContractValidator:
                     gaps.append(_binding_ref_gap("RELATIONSHIP_EVIDENCE_REF_MISSING", relationship.semantic_ref_id, relationship.topic, ""))
                 if not relationship.keys:
                     gaps.append(_gap("RELATIONSHIP_KEYS_REQUIRED", "Relationship %s has no governed keys" % relationship.name, "RELATIONSHIPS", relationship.topic))
-                if detail_shape and not relationship.grain:
-                    gaps.append(_gap("RELATIONSHIP_GRAIN_REQUIRED", "Detail relationship %s has no governed grain" % relationship.name, "RELATIONSHIPS", relationship.topic))
-                if detail_shape and not relationship.cardinality:
-                    gaps.append(_gap("RELATIONSHIP_CARDINALITY_REQUIRED", "Detail relationship %s has no governed cardinality" % relationship.name, "RELATIONSHIPS", relationship.topic))
-                if detail_shape and not relationship.fanout_policy:
-                    gaps.append(_gap("RELATIONSHIP_FANOUT_POLICY_REQUIRED", "Detail relationship %s has no governed fanout policy" % relationship.name, "RELATIONSHIPS", relationship.topic))
-            if detail_shape and len(selected_tables) == 2:
-                execution_candidates = grounded_detail_relationship_candidates(
-                    contract.primary_table,
-                    selected_tables,
-                    contract.relationships,
-                )
-                if not execution_candidates:
-                    gaps.append(
-                        _gap(
-                            "DETAIL_RELATIONSHIP_EXECUTION_PROOF_REQUIRED",
-                            "No relationship proves the requested primary-table join direction, grain, cardinality and fanout policy",
-                            "RELATIONSHIPS",
-                        )
-                    )
-                elif len(execution_candidates) > 1:
-                    gaps.append(
-                        GroundedContractGap(
-                            code="DETAIL_RELATIONSHIP_BINDING_AMBIGUOUS",
-                            message="Multiple relationships provide competing detail join proofs",
-                            evidence_kind="RELATIONSHIPS",
-                            resolution="REVISE_BINDINGS",
-                            search_scope="READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX",
-                            required_capability={
-                                "primaryTable": contract.primary_table,
-                                "candidateRelationshipNames": [
-                                    item.name for item in execution_candidates
-                                ],
-                                "requiredSemanticRole": "UNAMBIGUOUS_DETAIL_RELATIONSHIP",
-                            },
-                        )
-                    )
+                if not relationship.grain:
+                    gaps.append(_gap("RELATIONSHIP_GRAIN_REQUIRED", "Relationship %s has no governed grain" % relationship.name, "RELATIONSHIPS", relationship.topic))
+                if not relationship.cardinality:
+                    gaps.append(_gap("RELATIONSHIP_CARDINALITY_REQUIRED", "Relationship %s has no governed cardinality" % relationship.name, "RELATIONSHIPS", relationship.topic))
+                if not relationship.fanout_policy:
+                    gaps.append(_gap("RELATIONSHIP_FANOUT_POLICY_REQUIRED", "Relationship %s has no governed fanout policy" % relationship.name, "RELATIONSHIPS", relationship.topic))
         time_required = not detail_shape or _detail_lookup_time_required(contract)
         if time_required and str(contract.time_range.source or "") == "default_days":
             gaps.append(

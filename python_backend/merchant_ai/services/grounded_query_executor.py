@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from merchant_ai.config import Settings
 from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
@@ -15,7 +16,9 @@ from merchant_ai.models import (
     AgentTaskResult,
     EvidenceCheckResult,
     EvidenceGap,
+    EntityFilterObligation,
     EntityFilterVerificationProof,
+    EntityReference,
     NodePlanContract,
     NodeTaskProfile,
     QueryBundle,
@@ -40,6 +43,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedQueryContract,
     grounded_detail_relationship_candidates,
 )
+from merchant_ai.services.grounded_sql_candidate import GroundedSqlValidationResult
 from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
 from merchant_ai.services.time_semantics import (
@@ -63,13 +67,14 @@ class GroundedSqlCompilation:
 
 
 class GroundedQueryExecutionKernel:
-    """Deterministic Data Engine for an activated GroundedQueryContract.
+    """Data Engine for the two explicitly governed grounded execution lanes.
 
-    The executor has no Planner, NodeAgent, ReAct SQL drafting, critic, repair
-    loop, or workflow dependency.  It projects the already-grounded semantic
-    formulae into one governed SQL statement, validates the exact table and
-    columns, applies tenant/access scope, executes Doris, and returns the
-    ordinary evidence models consumed by the verifier and answer renderer.
+    An extremely simple published scalar metric may arrive through the strict
+    deterministic fast path. Every other query arrives as a complete SQL AST
+    authored by the single Core LLM. The executor has no Planner, NodeAgent,
+    SQL-drafting ReAct loop, critic, repair workflow, or business query
+    templates; it only validates, injects trusted access scope, executes Doris,
+    and returns evidence models.
     """
 
     def __init__(
@@ -106,15 +111,32 @@ class GroundedQueryExecutionKernel:
             raise RuntimeError("grounded direct execution requires exactly one compiled node")
 
         intent = plan.intents[0]
-        compilation = self.compile_sql(
-            merchant_id,
-            contract,
-            plan,
-            asset_pack,
-            access_role=access_role,
-            user_scope=user_scope or {},
+        candidate_validation = getattr(
+            execution_preparation,
+            "candidate_validation",
+            None,
         )
-        validation = self.validate_sql(compilation.sql, asset_pack)
+        if isinstance(candidate_validation, GroundedSqlValidationResult):
+            compilation = self.compile_core_sql_candidate(
+                merchant_id,
+                contract,
+                plan,
+                asset_pack,
+                candidate_validation,
+                access_role=access_role,
+                user_scope=user_scope or {},
+            )
+            validation = self.validate_sql(compilation.sql, asset_pack)
+        else:
+            compilation = self.compile_sql(
+                merchant_id,
+                contract,
+                plan,
+                asset_pack,
+                access_role=access_role,
+                user_scope=user_scope or {},
+            )
+            validation = self.validate_sql(compilation.sql, asset_pack)
         if not validation.valid:
             return self._failed_result(
                 plan,
@@ -125,14 +147,22 @@ class GroundedQueryExecutionKernel:
             )
 
         access_contracts = compilation.access_contracts or (compilation.node_contract,)
-        decisions = [
-            self.access_control.authorize_contract(
-                item,
-                compilation.sql,
-                run_id=run_id,
-            )
-            for item in access_contracts
-        ]
+        decisions = []
+        for item in access_contracts:
+            if isinstance(candidate_validation, GroundedSqlValidationResult):
+                decision = self.access_control.authorize_contract(
+                    item,
+                    compilation.sql,
+                    run_id=run_id,
+                    checked_columns_override=item.required_columns,
+                )
+            else:
+                decision = self.access_control.authorize_contract(
+                    item,
+                    compilation.sql,
+                    run_id=run_id,
+                )
+            decisions.append(decision)
         denied_decision = next((item for item in decisions if not item.allowed), None)
         if denied_decision is not None:
             denied = SqlValidationResult(
@@ -161,21 +191,39 @@ class GroundedQueryExecutionKernel:
                 ),
                 )
             ]
-            entity_filter_verification = self._entity_filter_verification(
-                compilation.node_contract,
-                raw_rows,
-                compilation.sql,
+            entity_filter_verification = (
+                self._candidate_entity_filter_verification(
+                    compilation.node_contract,
+                    compilation.sql,
+                )
+                if isinstance(candidate_validation, GroundedSqlValidationResult)
+                else self._entity_filter_verification(
+                    compilation.node_contract,
+                    raw_rows,
+                    compilation.sql,
+                )
             )
+            masked_columns = {
+                key: value
+                for decision in decisions
+                for key, value in (decision.masked_columns or {}).items()
+            }
+            if isinstance(candidate_validation, GroundedSqlValidationResult):
+                masked_columns = self._candidate_output_masks(
+                    {
+                        "%s.%s" % (access_contract.preferred_table, key): value
+                        for access_contract, decision in zip(
+                            access_contracts,
+                            decisions,
+                        )
+                        for key, value in (decision.masked_columns or {}).items()
+                    },
+                    candidate_validation,
+                )
             rows = apply_column_masks(
                 raw_rows,
                 compilation.node_contract.model_copy(
-                    update={
-                        "masked_columns": {
-                            key: value
-                            for decision in decisions
-                            for key, value in (decision.masked_columns or {}).items()
-                        }
-                    }
+                    update={"masked_columns": masked_columns}
                 ),
             )
             for row in rows:
@@ -218,7 +266,11 @@ class GroundedQueryExecutionKernel:
                     "table": compilation.table,
                     "rowCount": len(rows),
                     "plannerLlmCalls": 0,
-                    "sqlLlmCalls": 0,
+                    "sqlLlmCalls": (
+                        1
+                        if isinstance(candidate_validation, GroundedSqlValidationResult)
+                        else 0
+                    ),
                 }
             ],
         )
@@ -232,22 +284,38 @@ class GroundedQueryExecutionKernel:
             react_trace=[
                 ReActStep(
                     round=1,
-                    reason="Execute the activated GroundedQueryContract deterministically",
-                    action="grounded_data_engine.execute_sql",
+                    reason=(
+                        "Execute the Core-authored SQL validated against the active GroundedQueryContract"
+                        if isinstance(candidate_validation, GroundedSqlValidationResult)
+                        else "Execute the activated GroundedQueryContract deterministically"
+                    ),
+                    action=(
+                        "grounded_data_engine.execute_core_sql"
+                        if isinstance(candidate_validation, GroundedSqlValidationResult)
+                        else "grounded_data_engine.execute_sql"
+                    ),
                     observation="table=%s;rows=%d" % (compilation.table, len(rows)),
                 )
             ],
             node_task_profile=NodeTaskProfile(
                 task_id=task_id,
                 task_kind="GROUNDED_DATA_ENGINE",
-                sql_strategy="grounded_deterministic",
+                sql_strategy=(
+                    "core_llm_grounded_sql"
+                    if isinstance(candidate_validation, GroundedSqlValidationResult)
+                    else "grounded_deterministic"
+                ),
                 selected_tools=[
                     "compile_grounded_sql",
                     "validate_grounded_sql",
                     "authorize_grounded_query",
                     "execute_doris",
                 ],
-                reason="READY GroundedQueryContract is compiled without a NodeAgent",
+                reason=(
+                    "Core authored the complete SQL; the runtime only validated and scoped it"
+                    if isinstance(candidate_validation, GroundedSqlValidationResult)
+                    else "READY GroundedQueryContract is compiled without a NodeAgent"
+                ),
                 risk_controls=[
                     "contract_bound_table",
                     "contract_bound_columns",
@@ -256,7 +324,11 @@ class GroundedQueryExecutionKernel:
                     "read_only_sql",
                 ],
                 contract_status="passed",
-                sql_draft_source="grounded_deterministic",
+                sql_draft_source=(
+                    "core_llm"
+                    if isinstance(candidate_validation, GroundedSqlValidationResult)
+                    else "grounded_deterministic"
+                ),
             ),
             node_plan_contract=compilation.node_contract,
             entity_filter_verification=entity_filter_verification,
@@ -281,11 +353,19 @@ class GroundedQueryExecutionKernel:
             query_bundles=[bundle.model_copy(deep=True)],
             merged_query_bundle=bundle.model_copy(deep=True),
             evidence_check=EvidenceCheckResult(
-                passed=True,
-                summary="Grounded Data Engine execution completed",
+                passed=False,
+                summary=(
+                    "Grounded Data Engine execution completed; independent EvidenceVerifier pending"
+                ),
             ),
             node_task_profiles=[task_result.node_task_profile.model_copy(deep=True)],
-            node_plan_contracts=[compilation.node_contract.model_copy(deep=True)],
+            node_plan_contracts=[
+                item.model_copy(deep=True)
+                for item in (
+                    compilation.access_contracts
+                    or (compilation.node_contract,)
+                )
+            ],
         )
 
     def compile_sql(
@@ -511,6 +591,477 @@ class GroundedQueryExecutionKernel:
             access_contracts=(node_contract,),
         )
 
+    def compile_core_sql_candidate(
+        self,
+        merchant_id: str,
+        contract: GroundedQueryContract,
+        plan: QueryPlan,
+        asset_pack: Any,
+        validation: GroundedSqlValidationResult,
+        *,
+        access_role: str,
+        user_scope: dict[str, Any],
+    ) -> GroundedSqlCompilation:
+        """Bind trusted execution scope around an already validated Core SQL AST.
+
+        Core owns the complete SQL topology. This method never adds a business
+        aggregate, grouping, ranking, join, window, CTE, or fallback template.
+        It only injects runtime access predicates and projects the accepted SQL
+        lineage into the existing ACL/evidence contracts.
+        """
+
+        if not validation.valid or not validation.canonical_sql:
+            raise RuntimeError("Core SQL candidate has not passed grounded AST validation")
+        if len(plan.intents) != 1:
+            raise RuntimeError("Core SQL execution requires one evidence intent")
+        referenced_tables = self._dedupe(validation.referenced_tables)
+        if not referenced_tables:
+            raise RuntimeError("Core SQL candidate has no grounded base table")
+        table_bindings = {item.table: item for item in contract.tables}
+        missing_bindings = [
+            table for table in referenced_tables if table not in table_bindings
+        ]
+        if missing_bindings:
+            raise RuntimeError(
+                "Core SQL references tables outside the active Contract: %s"
+                % ",".join(missing_bindings)
+            )
+
+        scoped_sql = self._inject_candidate_execution_scope(
+            validation.canonical_sql,
+            merchant_id,
+            contract,
+            asset_pack,
+            user_scope,
+        )
+        intent = plan.intents[0]
+        primary = (
+            contract.primary_table
+            if contract.primary_table in referenced_tables
+            else referenced_tables[0]
+        )
+        referenced_by_table: dict[str, list[str]] = {
+            table: [] for table in referenced_tables
+        }
+        for qualified in validation.referenced_columns:
+            table, separator, column = str(qualified or "").partition(".")
+            if separator and table in referenced_by_table and column:
+                referenced_by_table[table].append(column)
+        visible_by_table: dict[str, list[str]] = {
+            table: [] for table in referenced_tables
+        }
+        for lineage in validation.output_lineage.values():
+            for qualified in lineage:
+                table, separator, column = str(qualified or "").partition(".")
+                if separator and table in visible_by_table and column:
+                    visible_by_table[table].append(column)
+
+        obligations = self._candidate_entity_filter_obligations(
+            contract,
+            intent.plan_task_id,
+        )
+        store_ids = self._dedupe(
+            user_scope.get("storeIds") or user_scope.get("store_ids") or []
+        )[:200]
+        region = str(user_scope.get("region") or "").strip()
+        access_contracts: list[NodePlanContract] = []
+        for table in referenced_tables:
+            binding = table_bindings[table]
+            metadata = self._table_metadata(asset_pack, table)
+            columns = self._dedupe(asset_pack.known_columns(table))
+            if not columns:
+                raise RuntimeError(
+                    "Core SQL table has no progressively disclosed schema: %s" % table
+                )
+            merchant_column = str(binding.merchant_filter_column or "").strip()
+            if not merchant_column or merchant_column not in columns:
+                raise RuntimeError(
+                    "Core SQL table has no governed merchant scope column: %s" % table
+                )
+            region_column = str(metadata.get("regionFilterColumn") or "").strip()
+            store_column = str(metadata.get("storeFilterColumn") or "").strip()
+            if region and (not region_column or region_column not in columns):
+                raise RuntimeError(
+                    "authorized region scope has no declared semantic filter column: %s"
+                    % table
+                )
+            if store_ids and (not store_column or store_column not in columns):
+                raise RuntimeError(
+                    "authorized store scope has no declared semantic filter column: %s"
+                    % table
+                )
+            required = self._dedupe(
+                [
+                    *referenced_by_table[table],
+                    merchant_column,
+                    region_column if region else "",
+                    store_column if store_ids else "",
+                ]
+            )
+            visible = self._dedupe(visible_by_table[table])
+            table_filter = next(
+                (item for item in contract.entity_filters if item.table == table),
+                None,
+            )
+            filter_output_alias = ""
+            if table_filter is not None:
+                expected = "%s.%s" % (table_filter.table, table_filter.column)
+                filter_output_alias = next(
+                    (
+                        alias
+                        for alias, lineage in validation.output_lineage.items()
+                        if expected in lineage
+                    ),
+                    "",
+                )
+            table_metric_specs = [
+                dict(item)
+                for item in intent.metric_specs
+                if str(
+                    item.get("ownerTable")
+                    or item.get("owner_table")
+                    or intent.preferred_table
+                    or ""
+                )
+                == table
+            ]
+            access_contracts.append(
+                NodePlanContract(
+                    task_id=intent.plan_task_id,
+                    question=contract.question,
+                    preferred_table=table,
+                    allowed_columns=columns,
+                    visible_columns=visible,
+                    internal_only_columns=[
+                        column for column in required if column not in visible
+                    ],
+                    required_columns=required,
+                    metric_column=(
+                        intent.metric_column if intent.preferred_table == table else ""
+                    ),
+                    metric_name=(
+                        intent.metric_name if intent.preferred_table == table else ""
+                    ),
+                    metric_formula=(
+                        intent.metric_formula if intent.preferred_table == table else ""
+                    ),
+                    metric_specs=(
+                        [dict(item) for item in intent.metric_specs]
+                        if table == primary
+                        else table_metric_specs
+                    ),
+                    group_by_column=(
+                        intent.group_by_column
+                        if intent.group_by_column in visible
+                        else ""
+                    ),
+                    filter_column=filter_output_alias,
+                    filter_values=[
+                        item.literal_value
+                        for item in contract.entity_filters
+                        if table == primary or item.table == table
+                    ],
+                    entity_filter_obligations=[
+                        item
+                        for item in obligations
+                        if table == primary or item.reference.table == table
+                    ],
+                    output_keys=(
+                        list(validation.output_columns) if table == primary else []
+                    ),
+                    required_evidence=(
+                        list(validation.output_columns) if table == primary else []
+                    ),
+                    days=int(intent.days or 0),
+                    limit=int(intent.limit or 0),
+                    merchant_id=merchant_id,
+                    merchant_filter_column=merchant_column,
+                    effective_user_id=str(
+                        user_scope.get("userId") or user_scope.get("user_id") or ""
+                    ),
+                    authorized_region=region,
+                    authorized_store_ids=store_ids,
+                    region_filter_column=region_column,
+                    store_filter_column=store_column,
+                    access_role=access_role or "merchant_analyst",
+                    row_scope_policy=normalize_row_access_policy(
+                        metadata.get("rowAccessPolicy")
+                        or default_row_access_policy(merchant_column)
+                    ),
+                    answer_mode=str(intent.answer_mode),
+                    task_role=str(intent.task_role),
+                    sql_strategy="core_llm_grounded_sql",
+                    metric_resolution=(
+                        dict(intent.metric_resolution or {})
+                        if intent.preferred_table == table
+                        else {}
+                    ),
+                    metric_governance_mode="grounded_query_contract",
+                    time_window_contract={
+                        "kind": contract.time_range.kind,
+                        "label": contract.time_range.label,
+                        "days": contract.time_range.days,
+                        "startDate": contract.time_range.start_date,
+                        "endDate": contract.time_range.end_date,
+                        "anchorPolicy": contract.time_range.anchor_policy,
+                        "partitionColumn": binding.time_column,
+                        "tenantColumn": merchant_column,
+                    }
+                    if binding.time_column
+                    else {},
+                )
+            )
+        primary_contract = next(
+            item for item in access_contracts if item.preferred_table == primary
+        )
+        return GroundedSqlCompilation(
+            sql=scoped_sql,
+            table=primary,
+            tables=tuple(referenced_tables),
+            metric_aliases=tuple(metric.metric_key for metric in contract.metrics),
+            group_columns=tuple(
+                item.column
+                for item in contract.dimensions
+                if item.usage == "group_by"
+            ),
+            required_columns=tuple(
+                self._dedupe(
+                    column
+                    for table in referenced_tables
+                    for column in referenced_by_table[table]
+                )
+            ),
+            node_contract=primary_contract,
+            access_contracts=tuple(access_contracts),
+        )
+
+    def _inject_candidate_execution_scope(
+        self,
+        sql: str,
+        merchant_id: str,
+        contract: GroundedQueryContract,
+        asset_pack: Any,
+        user_scope: dict[str, Any],
+    ) -> str:
+        """Inject only access predicates, preserving Core's SQL topology."""
+
+        if not str(merchant_id or "").strip():
+            raise RuntimeError("trusted execution scope is missing merchant_id")
+        try:
+            parsed = sqlglot.parse_one(sql, read="doris")
+        except Exception as exc:
+            raise RuntimeError("accepted Core SQL could not be reparsed") from exc
+        bindings = {item.table: item for item in contract.tables}
+        region = str(user_scope.get("region") or "").strip()
+        store_ids = self._dedupe(
+            user_scope.get("storeIds") or user_scope.get("store_ids") or []
+        )[:200]
+        try:
+            scopes = list(traverse_scope(parsed))
+        except Exception as exc:
+            raise RuntimeError("Core SQL scope injection could not resolve aliases") from exc
+        for scope in scopes:
+            select = scope.expression
+            if not isinstance(select, exp.Select):
+                continue
+            for join in select.args.get("joins") or []:
+                side = str(join.args.get("side") or "").strip().upper()
+                if side in {"RIGHT", "FULL"}:
+                    raise RuntimeError(
+                        "RIGHT/FULL JOIN cannot receive fail-closed tenant scope injection; "
+                        "rewrite it as an equivalent governed INNER/LEFT JOIN"
+                    )
+            where_predicates: list[exp.Expression] = []
+            for raw_alias, pair in (
+                getattr(scope, "selected_sources", {}) or {}
+            ).items():
+                source = pair[1]
+                if not isinstance(source, exp.Table):
+                    continue
+                table = str(source.name or "").strip()
+                binding = bindings.get(table)
+                if binding is None:
+                    continue
+                alias = str(raw_alias or source.alias_or_name or table).strip()
+                columns = set(asset_pack.known_columns(table))
+                merchant_column = str(binding.merchant_filter_column or "").strip()
+                if not merchant_column or merchant_column not in columns:
+                    raise RuntimeError(
+                        "grounded table lacks an injectable merchant scope: %s" % table
+                    )
+                predicates: list[exp.Expression] = [
+                    exp.EQ(
+                        this=exp.column(merchant_column, table=alias),
+                        expression=exp.Literal.string(str(merchant_id)),
+                    )
+                ]
+                metadata = self._table_metadata(asset_pack, table)
+                if region:
+                    region_column = str(
+                        metadata.get("regionFilterColumn") or ""
+                    ).strip()
+                    if not region_column or region_column not in columns:
+                        raise RuntimeError(
+                            "authorized region scope cannot be injected for table %s"
+                            % table
+                        )
+                    predicates.append(
+                        exp.EQ(
+                            this=exp.column(region_column, table=alias),
+                            expression=exp.Literal.string(region),
+                        )
+                    )
+                if store_ids:
+                    store_column = str(
+                        metadata.get("storeFilterColumn") or ""
+                    ).strip()
+                    if not store_column or store_column not in columns:
+                        raise RuntimeError(
+                            "authorized store scope cannot be injected for table %s"
+                            % table
+                        )
+                    predicates.append(
+                        exp.In(
+                            this=exp.column(store_column, table=alias),
+                            expressions=[
+                                exp.Literal.string(value) for value in store_ids
+                            ],
+                        )
+                    )
+                predicate = self._and_expressions(predicates)
+                parent = source.parent
+                if isinstance(parent, exp.Join) and parent.this is source:
+                    side = str(parent.args.get("side") or "").strip().upper()
+                    if side == "LEFT":
+                        on = parent.args.get("on")
+                        if not isinstance(on, exp.Expression):
+                            raise RuntimeError(
+                                "LEFT JOIN is missing its governed ON predicate"
+                            )
+                        parent.set("on", exp.and_(on, predicate))
+                        continue
+                where_predicates.append(predicate)
+            if where_predicates:
+                injected = self._and_expressions(where_predicates)
+                existing = select.args.get("where")
+                if isinstance(existing, exp.Where):
+                    injected = exp.and_(existing.this, injected)
+                select.set("where", exp.Where(this=injected))
+        return parsed.sql(
+            dialect="doris",
+            pretty=False,
+            normalize=False,
+            comments=False,
+        )
+
+    @staticmethod
+    def _and_expressions(expressions: Iterable[exp.Expression]) -> exp.Expression:
+        items = [item for item in expressions if isinstance(item, exp.Expression)]
+        if not items:
+            raise RuntimeError("execution scope predicate is empty")
+        result = items[0]
+        for item in items[1:]:
+            result = exp.and_(result, item)
+        return result
+
+    @staticmethod
+    def _candidate_entity_filter_obligations(
+        contract: GroundedQueryContract,
+        task_id: str,
+    ) -> list[EntityFilterObligation]:
+        obligations: list[EntityFilterObligation] = []
+        for index, item in enumerate(contract.entity_filters):
+            values = (
+                list(item.literal_value)
+                if item.operator == "IN"
+                and isinstance(item.literal_value, (list, tuple))
+                else [item.literal_value]
+            )
+            obligations.append(
+                EntityFilterObligation(
+                    obligation_id="grounded_core_sql_entity_%d" % (index + 1),
+                    task_id=task_id,
+                    required=True,
+                    reference=EntityReference(
+                        semantic_ref_id=item.semantic_ref_id,
+                        field=item.column,
+                        table=item.table,
+                        raw_label=item.requested_phrase,
+                        raw_value=str(item.literal_value),
+                        values=values,
+                        comparison_policy=item.operator.lower(),
+                        source="grounded_core_sql_candidate",
+                        confidence=1.0,
+                        status="bound",
+                        time_scope_explicit=bool(contract.time_range.explicit),
+                        lookup_time_policy=dict(item.lookup_time_policy),
+                    ),
+                    status="bound",
+                    reason="validated mandatory predicate in Core SQL AST",
+                )
+            )
+        return obligations
+
+    @staticmethod
+    def _candidate_output_masks(
+        qualified_masks: dict[str, str],
+        validation: GroundedSqlValidationResult,
+    ) -> dict[str, str]:
+        output: dict[str, str] = {}
+        strength = {"partial": 1, "hash": 2, "full": 3}
+        for alias, lineage in validation.output_lineage.items():
+            strategies = [
+                str(qualified_masks.get(item) or "").strip().lower()
+                for item in lineage
+                if str(qualified_masks.get(item) or "").strip()
+            ]
+            if not strategies:
+                continue
+            output[alias] = max(
+                strategies,
+                key=lambda item: strength.get(item, 0),
+            )
+        return output
+
+    @staticmethod
+    def _candidate_entity_filter_verification(
+        contract: NodePlanContract,
+        sql: str,
+    ) -> EntityFilterVerificationProof:
+        obligations = [
+            item
+            for item in contract.entity_filter_obligations
+            if item.required and item.status == "bound"
+        ]
+        if not obligations:
+            return EntityFilterVerificationProof(
+                task_id=contract.task_id,
+                status="not_required",
+            )
+        contract_hash = entity_filter_contract_hash(contract)
+        requested = {
+            value
+            for obligation in obligations
+            for value in canonical_entity_values(
+                obligation.reference.values,
+                entity_comparison_policy(obligation.reference),
+            )
+        }
+        return EntityFilterVerificationProof(
+            task_id=contract.task_id,
+            obligation_id=obligations[0].obligation_id,
+            status="verified",
+            verified=True,
+            coverage_complete=True,
+            contract_hash=contract_hash,
+            sql_hash=entity_filter_sql_hash(sql),
+            requested_value_hashes=sorted(
+                entity_value_hash(item, contract_hash) for item in requested
+            ),
+            row_count=0,
+            reason="Grounded SQL AST proved each typed entity predicate mandatory before execution",
+        )
+
     def _compile_detail_sql(
         self,
         merchant_id: str,
@@ -569,6 +1120,7 @@ class GroundedQueryExecutionKernel:
 
         primary = tables[0]
         from_sql = "%s %s" % (quote_identifier(primary), aliases[primary])
+        join_scoped_tables: set[str] = set()
         if len(tables) == 2:
             secondary = tables[1]
             relationship_candidates = grounded_detail_relationship_candidates(
@@ -601,6 +1153,50 @@ class GroundedQueryExecutionKernel:
                 required_by_table[relationship.right_table].append(right_column)
             if not predicates:
                 raise RuntimeError("detail relationship has no join keys")
+            if join_type == "LEFT":
+                secondary_binding = table_bindings[secondary]
+                secondary_merchant = str(
+                    secondary_binding.merchant_filter_column or ""
+                ).strip()
+                if (
+                    not secondary_merchant
+                    or secondary_merchant not in columns_by_table[secondary]
+                ):
+                    raise RuntimeError(
+                        "detail secondary table has no governed merchant scope column"
+                    )
+                predicates.append(
+                    "%s.%s = %s"
+                    % (
+                        aliases[secondary],
+                        quote_identifier(secondary_merchant),
+                        sql_literal(merchant_id),
+                    )
+                )
+                required_by_table[secondary].append(secondary_merchant)
+                if contract.time_range.explicit and secondary_binding.time_column:
+                    if secondary_binding.time_column not in columns_by_table[secondary]:
+                        raise RuntimeError("detail time field is absent from projected schema")
+                    if (
+                        not contract.time_range.start_date
+                        or not contract.time_range.end_date
+                    ):
+                        raise RuntimeError(
+                            "explicit detail time range lacks start/end bounds"
+                        )
+                    predicates.append(
+                        "%s.%s BETWEEN %s AND %s"
+                        % (
+                            aliases[secondary],
+                            quote_identifier(secondary_binding.time_column),
+                            sql_literal(contract.time_range.start_date),
+                            sql_literal(contract.time_range.end_date),
+                        )
+                    )
+                    required_by_table[secondary].append(
+                        secondary_binding.time_column
+                    )
+                join_scoped_tables.add(secondary)
             from_sql += " %s JOIN %s %s ON %s" % (
                 join_type,
                 quote_identifier(secondary),
@@ -631,12 +1227,21 @@ class GroundedQueryExecutionKernel:
             merchant_column = str(binding.merchant_filter_column or "").strip()
             if not merchant_column or merchant_column not in columns_by_table[table]:
                 raise RuntimeError("detail table has no governed merchant scope column")
-            where.append(
-                "%s.%s = %s"
-                % (aliases[table], quote_identifier(merchant_column), sql_literal(merchant_id))
-            )
+            if table not in join_scoped_tables:
+                where.append(
+                    "%s.%s = %s"
+                    % (
+                        aliases[table],
+                        quote_identifier(merchant_column),
+                        sql_literal(merchant_id),
+                    )
+                )
             required_by_table[table].append(merchant_column)
-            if contract.time_range.explicit and binding.time_column:
+            if (
+                table not in join_scoped_tables
+                and contract.time_range.explicit
+                and binding.time_column
+            ):
                 if binding.time_column not in columns_by_table[table]:
                     raise RuntimeError("detail time field is absent from projected schema")
                 if not contract.time_range.start_date or not contract.time_range.end_date:
@@ -896,22 +1501,9 @@ class GroundedQueryExecutionKernel:
                 base_tables=base_tables,
                 unknown_tables=unknown_tables,
             )
-        allowed_columns = {
-            column
-            for table in base_tables
-            for column in asset_pack.known_columns(table)
-        }
-        aliases = {
-            alias.alias
-            for alias in parsed.find_all(exp.Alias)
-            if alias.alias
-        }
-        unknown_columns = sorted(
-            {
-                column.name
-                for column in parsed.find_all(exp.Column)
-                if column.name and column.name not in allowed_columns and column.name not in aliases
-            }
+        unknown_columns = GroundedQueryExecutionKernel._scope_unknown_columns(
+            parsed,
+            asset_pack,
         )
         if unknown_columns:
             return SqlValidationResult(
@@ -927,6 +1519,74 @@ class GroundedQueryExecutionKernel:
             cte_names=sorted(cte_names),
             message="passed",
         )
+
+    @staticmethod
+    def _scope_unknown_columns(
+        parsed: exp.Expression,
+        asset_pack: Any,
+    ) -> list[str]:
+        """Resolve columns per SQL alias/scope instead of unioning table schemas."""
+
+        unknown: set[str] = set()
+        try:
+            scopes = list(traverse_scope(parsed))
+        except Exception:
+            return ["<scope-analysis-failed>"]
+        for scope in scopes:
+            selected_sources = getattr(scope, "selected_sources", {}) or {}
+            sources = {
+                str(alias or "").lower(): pair[1]
+                for alias, pair in selected_sources.items()
+            }
+            select_aliases = {
+                str(item.alias or "").lower()
+                for item in (
+                    scope.expression.expressions
+                    if isinstance(scope.expression, exp.Select)
+                    else []
+                )
+                if isinstance(item, exp.Alias) and item.alias
+            }
+
+            def source_has_column(source: Any, column_name: str) -> bool:
+                if isinstance(source, exp.Table):
+                    known = {
+                        str(item or "").lower()
+                        for item in asset_pack.known_columns(source.name)
+                    }
+                    return column_name in known
+                expression = getattr(source, "expression", None)
+                outputs = {
+                    str(item or "").lower()
+                    for item in getattr(expression, "named_selects", []) or []
+                }
+                return column_name in outputs
+
+            for column in getattr(scope, "columns", []) or []:
+                if isinstance(column.this, exp.Star):
+                    continue
+                name = str(column.name or "").lower()
+                qualifier = str(column.table or "").lower()
+                if not name:
+                    continue
+                if not qualifier and name in select_aliases:
+                    continue
+                if qualifier:
+                    source = sources.get(qualifier)
+                    if source is None or not source_has_column(source, name):
+                        unknown.add("%s.%s" % (qualifier, name))
+                    continue
+                matches = [
+                    alias
+                    for alias, source in sources.items()
+                    if source_has_column(source, name)
+                ]
+                if len(matches) != 1:
+                    unknown.add(
+                        "%s:%s"
+                        % ("ambiguous" if len(matches) > 1 else "unknown", name)
+                    )
+        return sorted(unknown)
 
     def _failed_result(
         self,

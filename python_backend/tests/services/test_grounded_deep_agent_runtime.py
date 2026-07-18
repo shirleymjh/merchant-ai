@@ -37,6 +37,7 @@ from merchant_ai.services.grounded_query_contract import (
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
+    GroundedRuntimeSqlCandidateAttempt,
 )
 from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
 
@@ -148,12 +149,43 @@ class FakeKernel:
         session.attempts.append(attempt)
         return attempt
 
-    def compile_candidate(self, session: GroundedRuntimeSession, attempt_id: str) -> GroundedRuntimeAttempt:
+    def activate_contract(self, session: GroundedRuntimeSession, attempt_id: str) -> GroundedRuntimeAttempt:
         self.compile_calls += 1
         attempt = session.attempts[-1]
-        attempt.compile_status = "VALID"
+        is_core_sql = attempt.execution_mode == "CORE_SQL_REQUIRED"
+        attempt.compile_status = (
+            "NOT_APPLICABLE_CORE_SQL_REQUIRED" if is_core_sql else "VALID"
+        )
+        attempt.activation_status = "ACTIVATED"
+        if is_core_sql:
+            attempt.next_action = "SUBMIT_GROUNDED_SQL_CANDIDATE"
+        else:
+            attempt.execution_mode = "DETERMINISTIC_METRIC"
+            attempt.execution_reason_codes = ["SINGLE_METRIC_FAST_PATH_ELIGIBLE"]
+            attempt.fast_path_eligible = True
+            attempt.next_action = "EXECUTE_GROUNDED_QUERY"
         attempt.activated = True
+        session.active_generation = max(1, session.active_generation)
+        attempt.active_generation = session.active_generation
         return attempt
+
+    @staticmethod
+    def submit_sql_candidate(
+        session: GroundedRuntimeSession,
+        sql: str,
+        **kwargs: Any,
+    ) -> GroundedRuntimeSqlCandidateAttempt:
+        assert "SELECT" in sql.upper()
+        assert kwargs["rationale"]
+        return GroundedRuntimeSqlCandidateAttempt(
+            candidate_id="sql-1",
+            active_generation=1,
+            status="ACCEPTED",
+            next_action="EXECUTE_GROUNDED_QUERY",
+            ast_fingerprint="a" * 64,
+            contract_fingerprint="c" * 64,
+            output_columns=["ticket_count"],
+        )
 
     @staticmethod
     def request_clarification(session: GroundedRuntimeSession, question: str, **kwargs: Any) -> ClarificationRequest:
@@ -236,6 +268,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert {item.name for item in factory.kwargs["tools"]} == {
         "retrieve_knowledge",
         "propose_grounded_contract",
+        "submit_grounded_sql_candidate",
         "execute_grounded_query",
         "compose_verified_answer",
         "run_skill",
@@ -603,7 +636,6 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
         tools["propose_grounded_contract"].func(
             read_ref_ids=["semantic:客服工单:tickets:detail"],
             binding_hints={"tableRefs": ["semantic:客服工单:tickets:detail"]},
-            auto_compile=True,
             runtime=SimpleNamespace(context=context),
         )
     )
@@ -611,8 +643,105 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
     assert recall_result["status"] == "OK"
     assert kernel.recall_queries[-1] == "商品字段"
     assert contract_result["activated"] is True
+    assert contract_result["activationStatus"] == "ACTIVATED"
+    assert contract_result["executionMode"] == "DETERMINISTIC_METRIC"
+    assert contract_result["executionReasonCodes"] == [
+        "SINGLE_METRIC_FAST_PATH_ELIGIBLE"
+    ]
+    assert contract_result["fastPathEligible"] is True
+    assert contract_result["fastPathReasonCodes"] == []
+    assert contract_result["nextAction"] == "EXECUTE_GROUNDED_QUERY"
+    assert contract_result["activeGeneration"] == 1
+    assert len(contract_result["contractFingerprint"]) == 64
+    assert "requiredFinalOutputAliases" in contract_result["sqlObligations"]
     assert kernel.propose_calls == 1
     assert kernel.compile_calls == 1
+
+
+def test_ready_core_sql_contract_is_activated_without_template_switch() -> None:
+    class CoreSqlKernel(FakeKernel):
+        def propose_contract(
+            self,
+            session: GroundedRuntimeSession,
+            evidence: list[dict[str, Any]],
+            hints: dict[str, Any],
+            **kwargs: Any,
+        ) -> GroundedRuntimeAttempt:
+            attempt = super().propose_contract(session, evidence, hints, **kwargs)
+            attempt.execution_mode = "CORE_SQL_REQUIRED"
+            attempt.execution_reason_codes = [
+                "COMPLEX_QUERY_REQUIRES_CORE_SQL",
+                "QUERY_SHAPE_NOT_SCALAR",
+            ]
+            attempt.fast_path_reason_codes = ["QUERY_SHAPE_NOT_SCALAR"]
+            attempt.next_action = "SUBMIT_GROUNDED_SQL_CANDIDATE"
+            return attempt
+
+    factory = CapturingFactory(action="none")
+    kernel = CoreSqlKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("按商品统计工单量", "m-1")
+    session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        core_semantic_evidence=[
+            {
+                "refId": "semantic:客服工单:tickets:detail",
+                "kind": "TABLE_DETAIL",
+                "topic": "客服工单",
+                "table": "tickets",
+                "contentSnippet": "{}",
+                "contentHash": "hash",
+            }
+        ],
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-core-sql",
+        run_id="r-core-sql",
+        session=session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["propose_grounded_contract"].func(
+            read_ref_ids=["semantic:客服工单:tickets:detail"],
+            binding_hints={"tableRefs": ["semantic:客服工单:tickets:detail"]},
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert kernel.compile_calls == 1
+    assert result["activated"] is True
+    assert result["executionMode"] == "CORE_SQL_REQUIRED"
+    assert result["compileStatus"] == "NOT_APPLICABLE_CORE_SQL_REQUIRED"
+    assert result["fastPathReasonCodes"] == ["QUERY_SHAPE_NOT_SCALAR"]
+    assert result["nextAction"] == "SUBMIT_GROUNDED_SQL_CANDIDATE"
+
+
+def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory, FakeKernel())
+    kernel_session = outer.kernel.new_session("按商品统计工单量", "m-1")
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-submit-core-sql",
+        run_id="r-submit-core-sql",
+        session=GroundedDeepAgentSession(runtime=kernel_session),
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["submit_grounded_sql_candidate"].func(
+            sql="SELECT spu_id, COUNT(*) AS ticket_count FROM tickets GROUP BY spu_id",
+            expected_generation=1,
+            contract_fingerprint="c" * 64,
+            rationale="Contract requires grouped Core SQL",
+            evidence_ref_ids=["semantic:客服工单:tickets:detail"],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ACCEPTED"
+    assert result["nextAction"] == "EXECUTE_GROUNDED_QUERY"
+    assert result["outputColumns"] == ["ticket_count"]
 
 
 def test_internal_runtime_failure_cannot_be_disguised_as_user_clarification() -> None:

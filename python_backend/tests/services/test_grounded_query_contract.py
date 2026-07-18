@@ -396,6 +396,66 @@ def test_order_detail_question_is_bound_as_generic_entity_lookup_not_metric() ->
     assert contract.entity_filters[0].entity_identity == "PRIMARY_ENTITY"
 
 
+def test_real_progressive_assets_compile_order_to_product_lookup_without_time_filter() -> None:
+    settings = get_settings()
+    assets = TopicAssetService(settings)
+    catalog = SemanticCatalogService(assets)
+    refs = [
+        "semantic:电商交易:dwm_trade_order_detail_di:detail",
+        "semantic:商品管理:dwm_goods_detail_df:detail",
+        "semantic:电商交易:dwm_trade_order_detail_di:field:order_id",
+        "semantic:电商交易:dwm_trade_order_detail_di:field:sub_order_id",
+        "semantic:电商交易:dwm_trade_order_detail_di:field:spu_id",
+        "semantic:商品管理:dwm_goods_detail_df:field:spu_apply_create_time",
+        "semantic:商品管理:relationship:order_goods_by_spu_id",
+    ]
+    contract = build_grounded_query_contract_from_refs(
+        "查询订单 order_id_100 的订单明细，再看对应商品什么时候发布",
+        ["电商交易", "商品管理"],
+        refs,
+        catalog,
+        binding_hints={
+            "tableRefs": refs[:2],
+            "selectedFields": [
+                {"fieldRef": refs[2], "outputAlias": "order_id"},
+                {"fieldRef": refs[3], "outputAlias": "sub_order_id"},
+                {"fieldRef": refs[4], "outputAlias": "spu_id"},
+                {
+                    "fieldRef": refs[5],
+                    "outputAlias": "spu_apply_create_time",
+                },
+            ],
+            "entityFilters": [
+                {
+                    "fieldRef": refs[2],
+                    "operator": "EQ",
+                    "literalValue": "order_id_100",
+                    "requestedPhrase": "订单 order_id_100",
+                }
+            ],
+            "relationshipRefs": [refs[6]],
+            "analysisMode": "ENTITY_LOOKUP",
+        },
+    )
+
+    assert contract.ready is True, [
+        gap.model_dump() for gap in contract.unresolved_gaps
+    ]
+    assert contract.metrics == []
+    assert contract.time_range.source == "default_days"
+    assert contract.time_range.explicit is False
+    assert [item.name for item in contract.relationships] == [
+        "order_goods_by_spu_id"
+    ]
+    assert contract.entity_filters[0].lookup_time_policy["mode"] == "unbounded"
+
+    pack = materialize_grounded_asset_pack(contract, assets)
+    preparation = compile_grounded_query(contract, pack)
+    assert preparation.validation.valid, [
+        gap.model_dump() for gap in preparation.validation.gaps
+    ]
+
+
 def test_label_refs_cannot_substitute_for_typed_entity_filter() -> None:
     evidence, hints = entity_lookup_evidence()
     entity_filter = hints.pop("entityFilters")
@@ -507,7 +567,7 @@ def test_detail_join_fails_closed_without_declared_fanout_policy() -> None:
     }
 
 
-def test_detail_join_fails_closed_when_multiple_direction_safe_proofs_remain() -> None:
+def test_detail_contract_preserves_competing_relationships_for_sql_ast_proof() -> None:
     evidence, hints = entity_lookup_evidence()
     relationship = evidence[-1]
     payload = json.loads(str(relationship["contentSnippet"]))
@@ -528,15 +588,15 @@ def test_detail_join_fails_closed_when_multiple_direction_safe_proofs_remain() -
         binding_hints=hints,
     )
 
-    assert contract.status == "REVISE_BINDINGS"
-    gap = next(
-        item
-        for item in contract.unresolved_gaps
-        if item.code == "DETAIL_RELATIONSHIP_BINDING_AMBIGUOUS"
-    )
-    assert gap.required_capability["requiredSemanticRole"] == (
-        "UNAMBIGUOUS_DETAIL_RELATIONSHIP"
-    )
+    assert contract.status == "READY"
+    assert contract.ready is True
+    assert [item.name for item in contract.relationships] == [
+        "primary_to_related",
+        "related_to_primary_reverse",
+        "primary_to_related_competing",
+    ]
+
+
 def test_model_style_binding_aliases_normalize_to_typed_contract_fields() -> None:
     topic = "经营画像"
     table = "ads_merchant_profile"
@@ -1274,6 +1334,8 @@ def test_cross_table_binding_fails_closed_until_relationship_is_read() -> None:
                 "joinType": "LEFT",
                 "keys": [["seller_id", "seller_id"], ["spu_id", "spu_id"]],
                 "grain": "spu_id_sub_order_id",
+                "cardinality": "ONE_TO_MANY",
+                "fanoutPolicy": "ALLOW_DECLARED_FANOUT",
             }
         ],
     )

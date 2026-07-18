@@ -18,10 +18,17 @@ from merchant_ai.models import (
     QuestionCategory,
     RecallBundle,
     RecallItem,
+    ResolvedTimeRange,
     TopicRoutingDecision,
     VerifiedEvidence,
 )
-from merchant_ai.services.grounded_query_contract import GroundedQueryContract
+from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
+from merchant_ai.services.grounded_query_contract import (
+    GroundedDimensionBinding,
+    GroundedMetricBinding,
+    GroundedQueryContract,
+    GroundedTableBinding,
+)
 from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeKernel
 
 
@@ -157,12 +164,44 @@ class FakeComposer:
 
 
 def contract(question: str, status: str) -> GroundedQueryContract:
-    return GroundedQueryContract(
+    candidate = GroundedQueryContract(
         question=question,
         topics=["客服工单"],
         status=status,
         query_shape="SCALAR" if status == "READY" else "UNRESOLVED",
     )
+    if status != "READY":
+        return candidate
+    candidate.primary_table = "tickets"
+    candidate.tables = [GroundedTableBinding(topic="客服工单", table="tickets")]
+    candidate.metrics = [
+        GroundedMetricBinding(
+            requested_phrase="工单量",
+            semantic_ref_id="semantic:客服工单:tickets:metric:ticket_count",
+            topic="客服工单",
+            table="tickets",
+            metric_key="ticket_count",
+            formula="SUM(ticket_count)",
+            source_columns=["ticket_count"],
+            aggregation_policy="period_rollup",
+            metric_grain="merchant_day",
+            applicable_time_grain="period",
+            time_column="event_day",
+            time_semantics={
+                "selectionPolicy": "period_window",
+                "asOfPolicy": "calendar",
+                "missingDataPolicy": "disclose_unknown",
+                "zeroValuePolicy": "preserve_observed_zero",
+            },
+            binding_type="published_metric",
+        )
+    ]
+    candidate.time_range = ResolvedTimeRange(
+        days=30,
+        explicit=True,
+        window_role="primary",
+    )
+    return candidate
 
 
 def kernel(*, builder: Any, compiler: Any, executor: Any | None = None) -> GroundedRuntimeKernel:
@@ -248,12 +287,12 @@ def test_unresolved_candidate_is_recorded_without_replacing_active_contract() ->
     session.workspace_topics = ["客服工单"]
 
     first = runtime.propose_contract(session, [], {})
-    runtime.compile_candidate(session, first.attempt_id)
+    runtime.activate_contract(session, first.attempt_id)
     active_generation = session.active_generation
     active_attempt_id = session.active_attempt_id
 
     second = runtime.propose_contract(session, [], {})
-    compiled_second = runtime.compile_candidate(session, second.attempt_id)
+    compiled_second = runtime.activate_contract(session, second.attempt_id)
 
     assert compiled_second.compile_status == "SKIPPED_NOT_READY"
     assert compiler.calls == 1
@@ -261,6 +300,118 @@ def test_unresolved_candidate_is_recorded_without_replacing_active_contract() ->
     assert session.active_attempt_id == active_attempt_id
     assert session.active_contract is not None
     assert session.active_contract.status == "READY"
+
+
+def test_ready_contract_is_routed_before_any_compilation() -> None:
+    question = "最近30天工单量"
+    compiler = FakeCompiler()
+    runtime = kernel(
+        builder=QueueBuilder([contract(question, "READY")]),
+        compiler=compiler,
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+
+    attempt = runtime.propose_contract(session, [], {})
+
+    assert attempt.execution_mode == GroundedExecutionMode.DETERMINISTIC_METRIC
+    assert attempt.fast_path_eligible is True
+    assert attempt.fast_path_reason_codes == []
+    assert attempt.execution_reason_codes == [
+        "SINGLE_METRIC_FAST_PATH_ELIGIBLE"
+    ]
+    assert attempt.next_action == "ACTIVATE_DETERMINISTIC_METRIC"
+    assert compiler.calls == 0
+
+
+def test_complex_ready_contract_activates_scope_without_template_compilation() -> None:
+    question = "最近30天按商品统计工单量"
+    complex_contract = contract(question, "READY")
+    complex_contract.query_shape = "GROUPED"
+    complex_contract.dimensions = [
+        GroundedDimensionBinding(
+            requested_phrase="商品",
+            semantic_ref_id="semantic:客服工单:tickets:column:spu_id",
+            topic="客服工单",
+            table="tickets",
+            column="spu_id",
+            usage="group_by",
+        )
+    ]
+    compiler = FakeCompiler()
+    materialized: list[str] = []
+    runtime = kernel(builder=QueueBuilder([complex_contract]), compiler=compiler)
+    runtime.asset_materializer = lambda candidate, assets: materialized.append(
+        candidate.question
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+
+    attempt = runtime.propose_contract(session, [], {})
+    activated = runtime.activate_contract(session, attempt.attempt_id)
+
+    assert activated.execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
+    assert activated.fast_path_eligible is False
+    assert set(activated.fast_path_reason_codes) >= {
+        "QUERY_SHAPE_NOT_SCALAR",
+        "DIMENSIONS_PRESENT",
+        "GROUPING_PRESENT",
+    }
+    assert activated.execution_reason_codes[0] == (
+        "COMPLEX_QUERY_REQUIRES_CORE_SQL"
+    )
+    assert activated.compile_status == "NOT_APPLICABLE_CORE_SQL_REQUIRED"
+    assert activated.activation_status == "ACTIVATED"
+    assert activated.next_action == "SUBMIT_GROUNDED_SQL_CANDIDATE"
+    assert activated.activated is True
+    assert compiler.calls == 0
+    assert materialized == []
+    assert session.active_execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
+    assert session.active_contract == complex_contract
+    assert session.active_pack is None
+    assert session.active_plan is None
+    assert session.active_preparation is None
+    assert session.phase == "ACTIVE_CORE_SQL_REQUIRED"
+
+    with pytest.raises(RuntimeError, match="latest SQL candidate is not"):
+        runtime.execute_active(session)
+
+
+def test_complex_activation_replaces_old_compiled_artifacts_atomically() -> None:
+    question = "最近30天工单量与商品分布"
+    simple_contract = contract(question, "READY")
+    complex_contract = contract(question, "READY")
+    complex_contract.metrics.append(
+        complex_contract.metrics[0].model_copy(
+            update={
+                "semantic_ref_id": "semantic:客服工单:tickets:metric:buyer_count",
+                "metric_key": "buyer_count",
+            }
+        )
+    )
+    compiler = FakeCompiler()
+    runtime = kernel(
+        builder=QueueBuilder([simple_contract, complex_contract]),
+        compiler=compiler,
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+
+    first = runtime.propose_contract(session, [], {})
+    runtime.activate_contract(session, first.attempt_id)
+    first_generation = session.active_generation
+    assert session.active_plan is not None
+
+    second = runtime.propose_contract(session, [], {})
+    runtime.activate_contract(session, second.attempt_id)
+
+    assert compiler.calls == 1
+    assert session.active_generation == first_generation + 1
+    assert session.active_attempt_id == second.attempt_id
+    assert session.active_execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
+    assert session.active_plan is None
+    assert session.active_pack is None
+    assert session.active_preparation is None
 
 
 def test_invalid_compilation_never_partially_switches_active_generation() -> None:
@@ -273,7 +424,7 @@ def test_invalid_compilation_never_partially_switches_active_generation() -> Non
     session.workspace_topics = ["客服工单"]
     attempt = runtime.propose_contract(session, [], {})
 
-    compiled = runtime.compile_candidate(session, attempt.attempt_id)
+    compiled = runtime.activate_contract(session, attempt.attempt_id)
 
     assert compiled.compile_status == "VALIDATION_FAILED"
     assert compiled.validation_gaps[0]["code"] == "BROKEN"
@@ -294,13 +445,15 @@ def test_valid_candidate_executes_verifies_and_answers_through_contract_executor
     session = runtime.new_session(question, "m-1")
     session.workspace_topics = ["客服工单"]
     attempt = runtime.propose_contract(session, [], {})
-    activated = runtime.compile_candidate(session, attempt.attempt_id)
+    activated = runtime.activate_contract(session, attempt.attempt_id)
 
     run_result = runtime.execute_active(session)
     verified = runtime.verify_active(session)
     answer = runtime.compose_answer(session)
 
     assert activated.activated is True
+    assert activated.execution_mode == GroundedExecutionMode.DETERMINISTIC_METRIC
+    assert activated.activation_status == "ACTIVATED"
     assert isinstance(run_result, AgentRunResult)
     assert verified.passed is True
     assert answer == "m-1:最近30天工单量"

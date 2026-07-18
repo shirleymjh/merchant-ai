@@ -119,6 +119,9 @@ from merchant_ai.services.grounded_runtime_kernel import (
 )
 from merchant_ai.services.time_semantics import has_explicit_time_expression
 from merchant_ai.services.grounded_query_contract import GroundedBindingHints
+from merchant_ai.services.grounded_sql_candidate import (
+    grounded_query_contract_fingerprint,
+)
 from merchant_ai.services.grounded_subagent_runtime import (
     IsolatedSubagentJob,
     IsolatedSubagentRuntime,
@@ -636,9 +639,9 @@ One Grounded Contract represents one coherent execution shape. Never combine met
 For a simple same-table scalar metric query, the expected disclosure path is table detail plus the exact metric files. Do not read schema, columns/index.json, the time column, or metric source-column files unless the question needs a field aggregation, business dimension, filter, join, or a published metric is unavailable.
 When thinRecallCandidates already contains an exact readable path, read that path directly instead of opening an index. Never navigate to asset.json or a #fragment path.
 Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
-GroundedQueryContract is the only planning authority. A candidate may be revised; only a READY candidate that compiles successfully becomes active.
+GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC means the runtime may execute the single published scalar metric directly. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. Implement sqlObligations exactly. The runtime will not invent grouping, filters, joins, CTEs, windows, ranking, or fallback SQL for you. Never put merchant/tenant predicates in your SQL: trusted execution injects them after validation.
 propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. Use analysisMode=ENTITY_LOOKUP for a concrete entity lookup and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
-Available governed tools are retrieve_knowledge, propose_grounded_contract, execute_grounded_query, compose_verified_answer, run_skill and ask_human. There is no action catalog and no legacy planner.
+Available governed tools are retrieve_knowledge, propose_grounded_contract, submit_grounded_sql_candidate, execute_grounded_query, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
 Analysis Skill headers are not disclosed until execute_grounded_query has returned VERIFIED evidence. The Core cannot read SKILL.md and must never use a Skill procedure or header to choose metrics, dimensions, tables, or Contract shape. First execute and verify the minimal grounded data query; then select only from the Skill headers returned by execute_grounded_query and call run_skill when appropriate. run_skill is a one-way isolation boundary: after it starts, do not retrieve more knowledge, propose another Contract, execute another query, or call run_skill again. It mounts the selected full Skill for an independent subagent, workspace and checkpoint, streams progress, and publishes a structured result artifact. Do not use task for Skill execution.
 Use retrieve_knowledge only for a targeted supplemental query; it remains inside the active Topic workspace. Governed-rule recall items marked INLINE_ONLY are usable snippets, not filesystem refs and not binding evidence. Do not read /knowledge/topics/index.json or open another Topic merely to compare alternatives. Topic expansion is allowed only after a submitted Contract returns REVISE_BINDINGS with a structured requiredCapability/searchScope gap based on evidence already read in the active Topic. A read relationship may establish that a required endpoint table is outside the current workspace; submit that relationship in the candidate Contract, then follow the returned gap to read the Topic index and exactly one relevant Topic manifest. Never expand from a normal pending request or a failed filename guess.
 Do not call task in this runtime. SubAgent dispatch is disabled until worker evidence acceptance is independently auditable.
@@ -842,7 +845,6 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         def propose_grounded_contract(
             read_ref_ids: list[str],
             binding_hints: GroundedBindingHints,
-            auto_compile: bool,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
             """Propose from exact Core reads using the strict typed BindingHints schema."""
@@ -905,24 +907,52 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     ensure_ascii=False,
                 )
             evidence = [evidence_by_ref[ref_id] for ref_id in requested]
-            attempt = runtime_owner.kernel.propose_contract(
-                session.runtime,
-                evidence,
-                binding_hints,
-                topics=session.effective_topics(),
-            )
-            if attempt.contract.ready and auto_compile:
-                attempt = runtime_owner.kernel.compile_candidate(
+            try:
+                attempt = runtime_owner.kernel.propose_contract(
                     session.runtime,
-                    attempt.attempt_id,
+                    evidence,
+                    binding_hints,
+                    topics=session.effective_topics(),
                 )
+                if attempt.contract.ready:
+                    attempt = runtime_owner.kernel.activate_contract(
+                        session.runtime,
+                        attempt.attempt_id,
+                    )
+            except RuntimeError as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "GROUNDED_CONTRACT_ACTIVATION_BLOCKED",
+                        "message": str(exc)[:500],
+                        "nextAction": "STOP"
+                        if "TERMINAL_GUARD" in str(exc)
+                        else "REVISE_BINDINGS",
+                    },
+                    ensure_ascii=False,
+                )
+            contract_fingerprint = grounded_query_contract_fingerprint(
+                attempt.contract
+            )
             return json.dumps(
                 {
                     "attemptId": attempt.attempt_id,
                     "status": attempt.contract.status,
                     "queryShape": attempt.contract.query_shape,
                     "compileStatus": attempt.compile_status,
+                    "activationStatus": attempt.activation_status,
                     "activated": attempt.activated,
+                    "executionMode": attempt.execution_mode,
+                    "executionReasonCodes": attempt.execution_reason_codes,
+                    "fastPathEligible": attempt.fast_path_eligible,
+                    "fastPathReasonCodes": attempt.fast_path_reason_codes,
+                    "fastPathReasonDetails": attempt.fast_path_reason_details,
+                    "nextAction": attempt.next_action,
+                    "activeGeneration": attempt.active_generation,
+                    "contractFingerprint": contract_fingerprint,
+                    "sqlObligations": _grounded_contract_sql_obligations(
+                        attempt.contract
+                    ),
                     "acceptedBindingHints": attempt.contract.binding_hints.model_dump(
                         by_alias=True
                     ),
@@ -934,6 +964,82 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                         item.model_dump(by_alias=True)
                         for item in attempt.contract.rejected_bindings
                     ],
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("submit_grounded_sql_candidate")
+        def submit_grounded_sql_candidate(
+            sql: str,
+            expected_generation: int,
+            contract_fingerprint: str,
+            rationale: str,
+            evidence_ref_ids: list[str],
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Submit the complete Doris SQL authored by Core for the active Contract."""
+
+            deep_session = runtime.context.session
+            if deep_session.analysis_skill_started:
+                return json.dumps(
+                    {
+                        "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
+                        "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                        "message": "Analysis Skill execution cannot author or revise SQL.",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
+                attempt = runtime_owner.kernel.submit_sql_candidate(
+                    deep_session.runtime,
+                    sql,
+                    expected_generation=expected_generation,
+                    expected_contract_fingerprint=contract_fingerprint,
+                    rationale=rationale,
+                    evidence_refs=evidence_ref_ids,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                stale = "SQL_CANDIDATE_STALE_CONTRACT" in message
+                terminal = "TERMINAL_GUARD" in message
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": (
+                            "SQL_CANDIDATE_STALE_CONTRACT"
+                            if stale
+                            else "TERMINAL_GUARD"
+                            if terminal
+                            else "CORE_SQL_NOT_AUTHORIZED"
+                        ),
+                        "message": message[:500],
+                        "nextAction": (
+                            "USE_LATEST_CONTRACT"
+                            if stale
+                            else "STOP"
+                            if terminal
+                            else "PROPOSE_GROUNDED_CONTRACT"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "candidateId": attempt.candidate_id,
+                    "status": attempt.status,
+                    "activeGeneration": attempt.active_generation,
+                    "nextAction": attempt.next_action,
+                    "astFingerprint": attempt.ast_fingerprint,
+                    "contractFingerprint": attempt.contract_fingerprint,
+                    "outputColumns": attempt.output_columns,
+                    "gaps": attempt.validation_gaps,
+                    "instruction": (
+                        "Execute only when status=ACCEPTED. For REPAIR_SQL, change the SQL AST "
+                        "using the exact gap. For REVISE_BINDINGS, progressively read missing "
+                        "semantic assets and propose a new Contract generation. Never retry the "
+                        "same SQL/error state."
+                    ),
                 },
                 ensure_ascii=False,
                 default=str,
@@ -964,19 +1070,101 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 )
                 verified = runtime_owner.kernel.verify_active(session)
             except RuntimeError as exc:
+                message = str(exc)
+                no_progress = "SQL_EXECUTION_NO_PROGRESS" in message
+                core_sql_required = "CORE_SQL_REQUIRED" in message or no_progress
                 return json.dumps(
                     {
                         "status": "EXECUTION_REVISE_REQUIRED",
-                        "code": "GROUNDED_EXECUTION_COMPATIBILITY_BLOCKED",
-                        "message": str(exc)[:500],
-                        "nextAction": "REVISE_BINDINGS",
+                        "code": (
+                            "SQL_EXECUTION_NO_PROGRESS"
+                            if no_progress
+                            else
+                            "CORE_SQL_CANDIDATE_REQUIRED"
+                            if core_sql_required
+                            else "GROUNDED_EXECUTION_COMPATIBILITY_BLOCKED"
+                        ),
+                        "message": message[:500],
+                        "nextAction": (
+                            "SUBMIT_GROUNDED_SQL_CANDIDATE"
+                            if core_sql_required
+                            else "REVISE_BINDINGS"
+                        ),
                         "instruction": (
-                            "Return to the progressively read semantic evidence, submit a "
-                            "smaller compatible Grounded Contract, and execute only after "
-                            "the Contract gate activates it. Do not retry the same bindings."
+                            (
+                                "Submit a materially changed SQL candidate; executing the same accepted AST again is forbidden."
+                                if no_progress
+                                else "Author and submit the complete SQL for the active Contract before execution."
+                            )
+                            if core_sql_required
+                            else (
+                                "Return to the progressively read semantic evidence, submit a "
+                                "smaller compatible Grounded Contract, and execute only after "
+                                "the Contract gate activates it. Do not retry the same bindings."
+                            )
                         ),
                     },
                     ensure_ascii=False,
+                )
+            failed_results = [
+                item
+                for item in run_result.task_results
+                if item.query_bundle.failed or not item.success
+            ]
+            if failed_results:
+                failure_codes = [
+                    result.error_code
+                    for item in failed_results
+                    for result in item.validation_results
+                    if result.error_code
+                ]
+                failure_code = failure_codes[0] if failure_codes else "QUERY_EXECUTION_FAILED"
+                access_denied = failure_code in {
+                    "ACCESS_DENIED",
+                    "MERCHANT_SCOPE_DENIED",
+                    "TABLE_DENIED",
+                    "TABLE_NOT_ALLOWED",
+                    "TABLE_ROLE_DENIED",
+                    "COLUMN_DENIED",
+                }
+                core_sql_mode = str(session.active_execution_mode) == "CORE_SQL_REQUIRED"
+                return json.dumps(
+                    {
+                        "status": (
+                            "ACCESS_DENIED"
+                            if access_denied
+                            else "SQL_EXECUTION_REPAIR_REQUIRED"
+                            if core_sql_mode
+                            else "EXECUTION_FAILED"
+                        ),
+                        "code": failure_code,
+                        "nextAction": (
+                            "STOP_ACCESS_DENIED"
+                            if access_denied
+                            else "SUBMIT_GROUNDED_SQL_CANDIDATE"
+                            if core_sql_mode
+                            else "REVISE_BINDINGS"
+                        ),
+                        "message": str(
+                            failed_results[0].query_bundle.error
+                            or failed_results[0].summary
+                            or failure_code
+                        )[:500],
+                        "blockingGaps": [
+                            gap.model_dump(by_alias=True)
+                            for gap in verified.blocking_gaps
+                        ],
+                        "instruction": (
+                            "Access denial is terminal for this request; do not alter SQL to bypass policy."
+                            if access_denied
+                            else (
+                                "Use the execution error and active Contract to author one changed SQL AST. "
+                                "Do not rerun the same accepted candidate."
+                            )
+                        ),
+                    },
+                    ensure_ascii=False,
+                    default=str,
                 )
             disclosed_headers: list[dict[str, str]] = []
             if verified.passed:
@@ -1076,6 +1264,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         return [
             retrieve_knowledge,
             propose_grounded_contract,
+            submit_grounded_sql_candidate,
             execute_grounded_query,
             compose_verified_answer,
             run_skill,
@@ -1920,6 +2109,96 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         raise RuntimeError(
             "Grounded DeepAgent Core ended without verified answer or typed clarification"
         )
+
+
+def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
+    """Expose the normalized SQL obligations Core must implement exactly."""
+
+    required_outputs = list(
+        dict.fromkeys(
+            [
+                *[str(item.metric_key or "") for item in contract.metrics],
+                *[
+                    str(item.output_alias or item.column or "")
+                    for item in contract.selected_fields
+                ],
+                *[
+                    str(item.column or "")
+                    for item in contract.dimensions
+                    if item.usage == "group_by"
+                ],
+            ]
+        )
+    )
+    return {
+        "requiredFinalOutputAliases": [
+            item for item in required_outputs if item
+        ],
+        "tables": [
+            {
+                "table": item.table,
+                "timeColumn": item.time_column,
+                "tenantColumn": item.merchant_filter_column,
+                "instruction": "tenantColumn may be used only as a governed join key; do not compare it to a literal",
+            }
+            for item in contract.tables
+        ],
+        "metrics": [
+            {
+                "outputAlias": item.metric_key,
+                "semanticRefId": item.semantic_ref_id,
+                "table": item.table,
+                "formula": item.formula,
+                "sourceColumns": list(item.source_columns),
+                "timeColumn": item.time_column,
+                "timeSemantics": dict(item.time_semantics),
+            }
+            for item in contract.metrics
+        ],
+        "dimensions": [
+            {
+                "outputAlias": item.column,
+                "semanticRefId": item.semantic_ref_id,
+                "table": item.table,
+                "column": item.column,
+                "usage": item.usage,
+            }
+            for item in contract.dimensions
+        ],
+        "selectedFields": [
+            {
+                "outputAlias": item.output_alias or item.column,
+                "semanticRefId": item.semantic_ref_id,
+                "table": item.table,
+                "column": item.column,
+            }
+            for item in contract.selected_fields
+        ],
+        "entityFilters": [
+            {
+                "semanticRefId": item.semantic_ref_id,
+                "table": item.table,
+                "column": item.column,
+                "operator": item.operator,
+                "literalValue": item.literal_value,
+            }
+            for item in contract.entity_filters
+        ],
+        "relationships": [
+            {
+                "semanticRefId": item.semantic_ref_id,
+                "leftTable": item.left_table,
+                "rightTable": item.right_table,
+                "joinType": item.join_type,
+                "keys": [list(pair) for pair in item.keys],
+                "cardinality": item.cardinality,
+                "fanoutPolicy": item.fanout_policy,
+                "grain": item.grain,
+            }
+            for item in contract.relationships
+        ],
+        "timeRange": contract.time_range.model_dump(by_alias=True),
+    }
 
 
 def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:

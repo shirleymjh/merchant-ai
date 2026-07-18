@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from merchant_ai.config import Settings
 from merchant_ai.models import NodePlanContract
@@ -33,7 +33,13 @@ class AccessControlService:
         self.policy_path = self.root / "merchant_acl.json"
         self.audit_path = self.root / "query_audit.jsonl"
 
-    def authorize_contract(self, contract: NodePlanContract, sql: str = "", run_id: str = "") -> AccessDecision:
+    def authorize_contract(
+        self,
+        contract: NodePlanContract,
+        sql: str = "",
+        run_id: str = "",
+        checked_columns_override: Optional[Iterable[str]] = None,
+    ) -> AccessDecision:
         policy = self._load_policy()
         table = contract.preferred_table
         role = contract.access_role or "merchant_analyst"
@@ -51,8 +57,23 @@ class AccessControlService:
         table_roles = self._string_set(table_policy.get("allowedRoles"))
         if table_roles and role not in table_roles:
             return self._deny("TABLE_ROLE_DENIED", "role cannot access table", contract, sql, run_id, [])
-        sql_columns = self._columns_from_sql(sql, contract.allowed_columns)
-        checked_columns = sorted(sql_columns or set(contract.required_columns or []) or set(contract.visible_columns or []))
+        if checked_columns_override is not None:
+            allowed = set(contract.allowed_columns or [])
+            checked_columns = sorted(
+                {
+                    str(column or "").strip()
+                    for column in checked_columns_override
+                    if str(column or "").strip()
+                    and str(column or "").strip() in allowed
+                }
+            )
+        else:
+            sql_columns = self._columns_from_sql(sql, contract.allowed_columns)
+            checked_columns = sorted(
+                sql_columns
+                or set(contract.required_columns or [])
+                or set(contract.visible_columns or [])
+            )
         column_policies = table_policy.get("columns") if isinstance(table_policy.get("columns"), dict) else {}
         denied_columns: List[str] = []
         masked_columns = dict(contract.masked_columns or {})
