@@ -1,26 +1,28 @@
 #Merchant AI
 
-商家 AI 助手示例工程，采用 Diana 式 `Deep Agent Lead Runtime + FileSystem-as-Context + QueryGraph + NodeWorker` 架构，包含 Python FastAPI 后端、Vue 前端、Doris 查询、MySQL 问答记录以及规则/记忆沉淀。
+商家 AI 助手示例工程。当前在线查数采用 `单 Grounded DeepAgent Core + FileSystem-as-Context + Grounded Query Contract + Verified Artifact Ledger` 架构，包含 Python FastAPI 后端、Vue 前端、Doris 查询、MySQL 问答记录以及规则/记忆沉淀。
 
 运行时基线为 **Python 3.11/3.12 + Deep Agents 0.6.12 + LangChain 1.x + LangGraph 1.x**。Python 3.9 和 LangChain 0.3 环境不再受支持；启动脚本检测到旧 `.venv` 时会保留旧目录，并自动使用 `.venv-deepagent`。
 
 ## 模块
 
-- `python_backend`: Python FastAPI API，负责 Main Agent 编排、LangGraph 状态图、业务范围澄清、记忆召回、Doris 查询、Chat BI 回复、问答记录和每日经营日报。
+- `python_backend`: Python FastAPI API，负责单 Core ReAct、受治理语义读取、确定性/Core SQL 查询、证据校验、Chat BI 回复、问答记录和每日经营日报。
 - `frontend`: Vue 3 + Vite 商家助手页面，视觉参考美团企业版 AI 助手并替换为 yshopping 品牌。
 - `python_backend/resources/runtime/rules`: 经过治理的平台规则文档，按标题和语义段落建立召回索引。
 - `python_backend/resources/sql`: MySQL 初始化 SQL。
-- `python_backend/resources/runtime/topics`: Topic 资产、语义层、relationship 和 QueryGraph 规划资产。
+- `python_backend/resources/runtime/topics`: Topic、表、指标、字段、relationship 和查询约束等语义资产。
 
-## DeepAgent 与 Diana 的边界
+## Grounded Core 的边界
 
-- DeepAgent Core 是唯一主 ReAct 循环，默认最多 16 个受治理动作；Planner 不是 subagent，也没有隐藏文件工具循环。
-- Topic 由当前商家问题自动发现。Core 首先只看到跨候选 Topic 的 L0 表清单和业务摘要，再自行用 `ls/read_file/grep` 读取表详情、指标/字段/schema、关系与业务规则。
-- 只有成功 `read_file` 的精确内容进入 Planner 可信证据账本；`ls/grep` 和 RAG 排名只用于导航，不能直接授权指标口径或物理字段。
-- DeepAgent 托管短期消息上下文、checkpoint、自动摘要、state filesystem 和超过 20k token 的 tool result offload。
-- Diana domain 生成的 QueryGraph、SQL/result 与证据中间产物以只读 `/artifacts` 挂载给 DeepAgent，Core 可按需继续 `ls/read_file/grep`，不会把整份结果重新注入 prompt。
-- 商家个人 memory（偏好、习惯、近期关注）继续由 Diana 的租户隔离/TTL/冲突/反馈机制自动沉淀和按题召回；低可信内容只会被自动隔离，敏感标识拒绝落库，不会创建人审队列。共享指标口径、规则与术语才走独立的 knowledge 确认/审核/发布流程；私有或未标 scope 的候选禁止进入共享发布链路。两者都不使用全量常驻、可直接编辑的 `AGENTS.md` 代替。
-- 执行产生零行、SQL 错误、新鲜度或 snapshot 缺口时，Core 会看到结构化 observation，并可在预算内补读、换表、重新规划和重试；空结果不会被解释为业务为 0。
+- DeepAgent Core 是唯一主 ReAct 循环。底层 graph 只承载通用 model ↔ tool 循环，不存在预编排的业务查询 workflow/DAG。
+- Topic 由当前商家问题自动发现。Core 先看到 Topic L0 manifest 和一次 thin recall，再自行用 `ls/read_file/grep` 渐进读取表、指标、字段、relationship 与规则。
+- 只有成功读取的精确语义内容可以形成 Grounded Query Contract；`ls/grep` 和召回排名只用于导航，不能授权指标口径或物理字段。
+- Original Question Goal Contract 记录原问题必须覆盖的目标，但不选表、不写 SQL、不规定执行顺序；最终回答前必须通过 verified artifact coverage gate。
+- 单表安全形状走确定性编译，包括单/多指标、简单 grouped/trend、TopN 和 entity lookup；JOIN、CTE、窗口函数与复杂依赖由同一个 Core 提交完整 SQL。
+- 无依赖目标可由 Core 放入隔离 query branches，并发执行 Doris 与 Evidence 校验；依赖 verified entity set 的 entity chain 保持串行。查询 branch 不是 LLM subagent。
+- 每个查询独立通过 Contract、generation/fingerprint、SQL AST、权限和 Evidence 校验，只把 verified artifact 合并回主 session。
+- 一次运行共享 90 秒、LLM、工具和 Doris 预算，并记录各阶段耗时和按名称调用次数。预算耗尽时不会把未验证的部分结果包装成答案。
+- Analysis Skill 当前只在查询与 Goal coverage 完成后隔离运行，不能参与取数或修改查询状态。
 
 ## 关键环境变量
 
@@ -79,7 +81,7 @@ npm install
 npm run dev
 ```
 
-Python 版复用 `python_backend/resources` 和现有 Doris/MySQL 环境变量；DeepAgent 负责 Core ReAct 与上下文承载，现有 LangGraph domain kernel 作为受治理工具执行 QueryGraph、NodeWorker、证据和回答动作。
+Python 版复用 `python_backend/resources` 和现有 Doris/MySQL 环境变量；DeepAgent 负责单 Core ReAct 与上下文承载，Grounded Runtime Kernel 负责 Contract 生命周期、SQL/权限校验、查询执行、Evidence 和 artifact ledger，不负责业务步骤编排。
 
 ## ES Recall
 

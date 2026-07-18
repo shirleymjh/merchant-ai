@@ -26,6 +26,7 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentRuntime,
     GroundedDeepAgentSession,
     GroundedCoreToolBoundaryMiddleware,
+    GroundedRuntimeBudgetMiddleware,
     GroundedSemanticBackend,
     _core_visible_binding_hints,
     _grounded_contract_sql_obligations,
@@ -45,6 +46,16 @@ from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
     GroundedRuntimeSqlCandidateAttempt,
+    GroundedVerifiedQueryArtifact,
+)
+from merchant_ai.services.grounded_goal_contract import (
+    DependencyQuestionGoal,
+    MetricQuestionGoal,
+    OriginalQuestionGoalContract,
+    TimeWindowQuestionGoal,
+)
+from merchant_ai.services.grounded_sql_candidate import (
+    grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
 
@@ -251,6 +262,30 @@ def runtime(factory: CapturingFactory, kernel: FakeKernel | None = None) -> Grou
     )
 
 
+def declare_single_metric_goal(
+    tools: dict[str, Any],
+    context: GroundedDeepAgentRunContext,
+    *,
+    goal_id: str = "metric.primary",
+    label: str = "主指标",
+) -> None:
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=context.session.runtime.question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id=goal_id,
+                        label=label,
+                    )
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert result["status"] == "ACCEPTED"
+
+
 def test_runtime_source_has_no_legacy_or_action_catalog_dependencies() -> None:
     source = Path(
         "python_backend/merchant_ai/services/grounded_deep_agent_runtime.py"
@@ -273,10 +308,13 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     runtime(factory)
 
     assert {item.name for item in factory.kwargs["tools"]} == {
+        "declare_original_question_goals",
         "retrieve_knowledge",
         "propose_grounded_contract",
+        "prepare_grounded_query_batch",
         "submit_grounded_sql_candidate",
         "execute_grounded_query",
+        "execute_grounded_query_batch",
         "publish_verified_entity_set",
         "finalize_evidence_collection",
         "compose_verified_answer",
@@ -296,9 +334,13 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "metricRefs" in contract_schema
     assert "timeExpression" in contract_schema
     assert factory.kwargs["backend"] is not None
-    assert len(factory.kwargs["middleware"]) == 1
+    assert len(factory.kwargs["middleware"]) == 2
     assert isinstance(
         factory.kwargs["middleware"][0],
+        GroundedRuntimeBudgetMiddleware,
+    )
+    assert isinstance(
+        factory.kwargs["middleware"][1],
         GroundedCoreToolBoundaryMiddleware,
     )
     assert [item["name"] for item in factory.kwargs["subagents"]] == [
@@ -308,6 +350,18 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert factory.kwargs["subagents"][0]["skills"] is None
     assert factory.kwargs["skills"] is None
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
+    for deterministic_mode in (
+        "DETERMINISTIC_METRIC",
+        "DETERMINISTIC_MULTI_METRIC",
+        "DETERMINISTIC_GROUPED",
+        "DETERMINISTIC_TREND",
+        "DETERMINISTIC_RANKED",
+        "DETERMINISTIC_ENTITY_LOOKUP",
+    ):
+        assert deterministic_mode in factory.kwargs["system_prompt"]
+    assert "never plan goals or impose an execution order" in factory.kwargs[
+        "system_prompt"
+    ]
 
 
 def test_upstream_entity_values_are_hidden_from_parent_core_contract_response() -> None:
@@ -759,6 +813,7 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
     )
     context = GroundedDeepAgentRunContext(thread_id="t1", run_id="r1", session=session)
     tools = {item.name: item for item in outer.tools}
+    declare_single_metric_goal(tools, context)
 
     recall_result = json.loads(
         tools["retrieve_knowledge"].func(
@@ -771,6 +826,7 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
         tools["propose_grounded_contract"].func(
             read_ref_ids=["semantic:客服工单:tickets:detail"],
             binding_hints={"tableRefs": ["semantic:客服工单:tickets:detail"]},
+            goal_ids=["metric.primary"],
             runtime=SimpleNamespace(context=context),
         )
     )
@@ -791,6 +847,372 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
     assert "requiredFinalOutputAliases" in contract_result["sqlObligations"]
     assert kernel.propose_calls == 1
     assert kernel.compile_calls == 1
+
+
+def test_parallel_batch_rejects_declared_depends_on_goal_edge() -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("查询退款明细", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-batch-depends-on",
+        run_id="r-batch-depends-on",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.top_products",
+                        label="TopN 商品",
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.refunds",
+                        label="这些商品的退款",
+                        depends_on_goal_ids=["metric.top_products"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+
+    result = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {"queryId": "top-products", "goalIds": ["metric.top_products"]},
+                {"queryId": "refunds", "goalIds": ["metric.refunds"]},
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "REJECTED"
+    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
+    assert result["nextAction"] == "USE_SERIAL_GROUNDED_QUERY_TOOLS"
+    assert result["issues"] == [
+        {
+            "code": "BATCH_GOAL_DEPENDS_ON_EDGE",
+            "upstreamGoalId": "metric.top_products",
+            "downstreamGoalId": "metric.refunds",
+            "upstreamQueryIds": ["top-products"],
+            "downstreamQueryIds": ["refunds"],
+            "requiredExecution": "SERIAL",
+            "direct": True,
+            "pathGoalIds": ["metric.top_products", "metric.refunds"],
+            "pathEdges": [
+                {
+                    "relationType": "DEPENDS_ON_GOAL_IDS",
+                    "upstreamGoalId": "metric.top_products",
+                    "downstreamGoalId": "metric.refunds",
+                    "declaredByGoalId": "metric.refunds",
+                }
+            ],
+        }
+    ]
+    assert deep_session.parallel_branches == {}
+
+
+def test_parallel_batch_rejects_dependency_goal_endpoints() -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("查询商品退款链路", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-batch-dependency-goal",
+        run_id="r-batch-dependency-goal",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.top_products",
+                        label="TopN 商品",
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.refunds",
+                        label="这些商品的退款",
+                    ),
+                    DependencyQuestionGoal(
+                        goal_id="dependency.product_refunds",
+                        label="TopN 商品到退款的实体依赖",
+                        upstream_goal_ids=["metric.top_products"],
+                        downstream_goal_ids=["metric.refunds"],
+                        artifact_kind="entity_set",
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+
+    result = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {"queryId": "top-products", "goalIds": ["metric.top_products"]},
+                {"queryId": "refunds", "goalIds": ["metric.refunds"]},
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "REJECTED"
+    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
+    assert result["issues"] == [
+        {
+            "code": "BATCH_DEPENDENCY_GOAL_EDGE",
+            "upstreamGoalId": "metric.top_products",
+            "downstreamGoalId": "metric.refunds",
+            "upstreamQueryIds": ["top-products"],
+            "downstreamQueryIds": ["refunds"],
+            "requiredExecution": "SERIAL",
+            "direct": True,
+            "pathGoalIds": ["metric.top_products", "metric.refunds"],
+            "pathEdges": [
+                {
+                    "relationType": "DEPENDENCY_GOAL",
+                    "upstreamGoalId": "metric.top_products",
+                    "downstreamGoalId": "metric.refunds",
+                    "declaredByGoalId": "dependency.product_refunds",
+                    "dependencyGoalId": "dependency.product_refunds",
+                }
+            ],
+            "dependencyGoalIds": ["dependency.product_refunds"],
+            "dependencyGoalId": "dependency.product_refunds",
+            "dependencyGoalQueryIds": [],
+        }
+    ]
+    assert deep_session.parallel_branches == {}
+
+
+def test_parallel_batch_rejects_transitive_depends_on_path() -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("查询三级依赖结果", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-batch-transitive-depends-on",
+        run_id="r-batch-transitive-depends-on",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    MetricQuestionGoal(goal_id="metric.c", label="上游 C"),
+                    MetricQuestionGoal(
+                        goal_id="metric.b",
+                        label="中间 B",
+                        depends_on_goal_ids=["metric.c"],
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.a",
+                        label="下游 A",
+                        depends_on_goal_ids=["metric.b"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+
+    result = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {"queryId": "upstream-c", "goalIds": ["metric.c"]},
+                {"queryId": "downstream-a", "goalIds": ["metric.a"]},
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "REJECTED"
+    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
+    assert result["issues"] == [
+        {
+            "code": "BATCH_TRANSITIVE_GOAL_DEPENDENCY_PATH",
+            "upstreamGoalId": "metric.c",
+            "downstreamGoalId": "metric.a",
+            "upstreamQueryIds": ["upstream-c"],
+            "downstreamQueryIds": ["downstream-a"],
+            "requiredExecution": "SERIAL",
+            "direct": False,
+            "pathGoalIds": ["metric.c", "metric.b", "metric.a"],
+            "pathEdges": [
+                {
+                    "relationType": "DEPENDS_ON_GOAL_IDS",
+                    "upstreamGoalId": "metric.c",
+                    "downstreamGoalId": "metric.b",
+                    "declaredByGoalId": "metric.b",
+                },
+                {
+                    "relationType": "DEPENDS_ON_GOAL_IDS",
+                    "upstreamGoalId": "metric.b",
+                    "downstreamGoalId": "metric.a",
+                    "declaredByGoalId": "metric.a",
+                },
+            ],
+        }
+    ]
+    assert deep_session.parallel_branches == {}
+
+
+def test_parallel_batch_transitive_path_includes_dependency_goal_edges() -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("查询混合依赖结果", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-batch-transitive-dependency-goal",
+        run_id="r-batch-transitive-dependency-goal",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    MetricQuestionGoal(goal_id="metric.c", label="上游 C"),
+                    MetricQuestionGoal(goal_id="metric.b", label="中间 B"),
+                    MetricQuestionGoal(
+                        goal_id="metric.a",
+                        label="下游 A",
+                        depends_on_goal_ids=["metric.b"],
+                    ),
+                    DependencyQuestionGoal(
+                        goal_id="dependency.c_to_b",
+                        label="C 到 B 的实体依赖",
+                        upstream_goal_ids=["metric.c"],
+                        downstream_goal_ids=["metric.b"],
+                        artifact_kind="entity_set",
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+
+    result = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {"queryId": "upstream-c", "goalIds": ["metric.c"]},
+                {"queryId": "downstream-a", "goalIds": ["metric.a"]},
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "REJECTED"
+    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
+    issue = result["issues"][0]
+    assert issue["code"] == "BATCH_TRANSITIVE_GOAL_DEPENDENCY_PATH"
+    assert issue["direct"] is False
+    assert issue["pathGoalIds"] == ["metric.c", "metric.b", "metric.a"]
+    assert [edge["relationType"] for edge in issue["pathEdges"]] == [
+        "DEPENDENCY_GOAL",
+        "DEPENDS_ON_GOAL_IDS",
+    ]
+    assert issue["dependencyGoalIds"] == ["dependency.c_to_b"]
+    assert deep_session.parallel_branches == {}
+
+
+def test_parallel_batch_allows_mutually_independent_goals() -> None:
+    class ParallelKernel(FakeKernel):
+        @staticmethod
+        def fork_query_branch(
+            session: GroundedRuntimeSession,
+            branch_key: str,
+        ) -> GroundedRuntimeSession:
+            return GroundedRuntimeSession(
+                session_id=f"{session.session_id}:{branch_key}",
+                question=session.question,
+                merchant_id=session.merchant_id,
+                merchant=session.merchant,
+                workspace_topics=list(session.workspace_topics),
+            )
+
+    factory = CapturingFactory(action="none")
+    kernel = ParallelKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("查询工单量和退款量", "m-1")
+    evidence_ref = "semantic:客服工单:tickets:detail"
+    deep_session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        core_semantic_evidence=[
+            {
+                "refId": evidence_ref,
+                "kind": "TABLE_DETAIL",
+                "topic": "客服工单",
+                "table": "tickets",
+                "contentSnippet": "{}",
+                "contentHash": "hash",
+            }
+        ],
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-batch-independent",
+        run_id="r-batch-independent",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    MetricQuestionGoal(goal_id="metric.tickets", label="工单量"),
+                    MetricQuestionGoal(goal_id="metric.refunds", label="退款量"),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+
+    result = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {
+                    "queryId": "tickets",
+                    "readRefIds": [evidence_ref],
+                    "goalIds": ["metric.tickets"],
+                },
+                {
+                    "queryId": "refunds",
+                    "readRefIds": [evidence_ref],
+                    "goalIds": ["metric.refunds"],
+                },
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "PREPARED"
+    assert result["preparedCount"] == 2
+    assert {item["queryId"] for item in result["queries"]} == {
+        "tickets",
+        "refunds",
+    }
+    assert all(item["status"] == "PREPARED" for item in result["queries"])
+    assert set(deep_session.parallel_branches) == {"tickets", "refunds"}
 
 
 def test_ready_core_sql_contract_is_activated_without_template_switch() -> None:
@@ -835,11 +1257,13 @@ def test_ready_core_sql_contract_is_activated_without_template_switch() -> None:
         session=session,
     )
     tools = {item.name: item for item in outer.tools}
+    declare_single_metric_goal(tools, context)
 
     result = json.loads(
         tools["propose_grounded_contract"].func(
             read_ref_ids=["semantic:客服工单:tickets:detail"],
             binding_hints={"tableRefs": ["semantic:客服工单:tickets:detail"]},
+            goal_ids=["metric.primary"],
             runtime=SimpleNamespace(context=context),
         )
     )
@@ -1025,7 +1449,37 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
         def verify_active(session: GroundedRuntimeSession) -> VerifiedEvidence:
             verified = VerifiedEvidence(passed=True)
             session.verified_evidence = verified
+            assert session.run_result is not None
+            contract = GroundedQueryContract(
+                question=session.question,
+                status="READY",
+                query_shape="SCALAR",
+            )
+            session.verified_query_ledger.append(
+                GroundedVerifiedQueryArtifact(
+                    artifact_id="query_artifact_1",
+                    generation=1,
+                    contract_fingerprint=grounded_query_contract_fingerprint(
+                        contract
+                    ),
+                    sql_fingerprint="f" * 64,
+                    contract=contract,
+                    plan=QueryPlan(),
+                    run_result=session.run_result,
+                    verified_evidence=verified,
+                )
+            )
             return verified
+
+        @staticmethod
+        def latest_verified_query_artifact(
+            session: GroundedRuntimeSession,
+        ) -> GroundedVerifiedQueryArtifact | None:
+            return (
+                session.verified_query_ledger[-1]
+                if session.verified_query_ledger
+                else None
+            )
 
         @staticmethod
         def verify_portfolio(
@@ -1056,6 +1510,31 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
         session=deep_session,
     )
     tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.refund_rate",
+                        label="退款率",
+                    ),
+                    TimeWindowQuestionGoal(
+                        goal_id="time.recent_30_days",
+                        label="最近30天",
+                        time_expression="最近30天",
+                        applies_to_goal_ids=["metric.refund_rate"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+    deep_session.active_goal_ids = [
+        "metric.refund_rate",
+        "time.recent_30_days",
+    ]
 
     result = json.loads(
         tools["execute_grounded_query"].func(

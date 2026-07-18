@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+import pytest
+
 from merchant_ai.config import get_settings
 from merchant_ai.models import ResolvedTimeRange
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.assets import TopicAssetService
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.grounded_query_contract import (
+    GroundedDimensionBinding,
     GroundedEntityFilterBinding,
+    GroundedEntityFilterHint,
     GroundedMetricBinding,
     GroundedQueryContract,
+    GroundedRankingBinding,
     GroundedRelationshipBinding,
     GroundedSelectedFieldBinding,
     GroundedTableBinding,
+    compile_deterministic_grounded_query,
     compile_grounded_query,
     materialize_grounded_asset_pack,
 )
 from merchant_ai.services.grounded_query_executor import GroundedQueryExecutionKernel
+from merchant_ai.services.grounded_runtime_budget import (
+    GroundedRuntimeBudget,
+    GroundedRuntimeBudgetExceeded,
+    GroundedRuntimeBudgetLimits,
+)
 
 
 class FakeDoris:
@@ -40,6 +51,14 @@ class FakeDetailDoris(FakeDoris):
                 "published_at": "2026-01-05 10:30:00",
             }
         ]
+
+
+class ManualClock:
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
 
 
 def scalar_contract() -> GroundedQueryContract:
@@ -82,6 +101,8 @@ def scalar_contract() -> GroundedQueryContract:
                 time_semantics={
                     "selectionPolicy": "period_window",
                     "asOfPolicy": "latest_available_partition",
+                    "missingDataPolicy": "disclose_unknown",
+                    "zeroValuePolicy": "preserve_observed_zero",
                 },
             ),
             GroundedMetricBinding(
@@ -102,6 +123,8 @@ def scalar_contract() -> GroundedQueryContract:
                 time_semantics={
                     "selectionPolicy": "period_window",
                     "asOfPolicy": "latest_available_partition",
+                    "missingDataPolicy": "disclose_unknown",
+                    "zeroValuePolicy": "preserve_observed_zero",
                 },
             ),
         ],
@@ -115,6 +138,65 @@ def scalar_contract() -> GroundedQueryContract:
             explicit=True,
         ),
     )
+
+
+def literal_filtered_scalar_contract() -> GroundedQueryContract:
+    contract = scalar_contract()
+    contract.question = "最近30天处理中和待处理的订单数"
+    contract.execution_shape = "single_metric"
+    contract.metrics = [contract.metrics[0]]
+    field_ref = "semantic:经营画像:ads_merchant_profile:column:order_status"
+    contract.entity_filters = [
+        GroundedEntityFilterBinding(
+            semantic_ref_id=field_ref,
+            topic="经营画像",
+            table="ads_merchant_profile",
+            column="order_status",
+            operator="IN",
+            literal_value=["processing", "pending"],
+            requested_phrase="处理中和待处理",
+            allowed_operators=["EQ", "IN"],
+        )
+    ]
+    contract.binding_hints.entity_filters = [
+        GroundedEntityFilterHint(
+            field_ref=field_ref,
+            operator="IN",
+            literal_value=["processing", "pending"],
+            requested_phrase="处理中和待处理",
+        )
+    ]
+    contract.evidence_refs = [field_ref]
+    return contract
+
+
+def ascending_ranked_contract() -> GroundedQueryContract:
+    contract = scalar_contract()
+    contract.question = "最近30天订单数最少的5个商家类型"
+    contract.query_shape = "RANKED"
+    contract.execution_shape = "ranked_group"
+    contract.metrics = [contract.metrics[0]]
+    dimension_ref = "semantic:经营画像:ads_merchant_profile:column:merchant_type"
+    contract.dimensions = [
+        GroundedDimensionBinding(
+            requested_phrase="商家类型",
+            semantic_ref_id=dimension_ref,
+            topic="经营画像",
+            table="ads_merchant_profile",
+            column="merchant_type",
+            business_name="商家类型",
+            role="DIMENSION",
+            usage="group_by",
+        )
+    ]
+    contract.ranking = GroundedRankingBinding(
+        enabled=True,
+        direction="ASC",
+        limit=5,
+        metric_ref_id=contract.metrics[0].semantic_ref_id,
+        dimension_ref_id=dimension_ref,
+    )
+    return contract
 
 
 def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path) -> None:
@@ -160,6 +242,139 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
 
     verified = EvidenceVerifier().verify(contract.question, preparation.plan, result)
     assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
+
+
+def test_direct_executor_clamps_doris_timeout_to_shared_runtime_remaining_time(
+    tmp_path,
+) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=AccessControlService(settings, root=tmp_path),
+    )
+    clock = ManualClock()
+    budget = GroundedRuntimeBudget(
+        GroundedRuntimeBudgetLimits(max_duration_seconds=5),
+        monotonic_clock=clock,
+    )
+    clock.value = 2.4
+
+    executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-budget-timeout",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+        runtime_budget=budget,
+    )
+
+    assert len(repository.calls) == 1
+    assert repository.calls[0][1] == 2
+    assert repository.calls[0][1] <= budget.remaining_seconds()
+
+
+def test_direct_executor_fails_before_doris_when_runtime_has_under_one_second(
+    tmp_path,
+) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=AccessControlService(settings, root=tmp_path),
+    )
+    clock = ManualClock()
+    budget = GroundedRuntimeBudget(
+        GroundedRuntimeBudgetLimits(max_duration_seconds=5),
+        monotonic_clock=clock,
+    )
+    clock.value = 4.25
+
+    with pytest.raises(GroundedRuntimeBudgetExceeded) as raised:
+        executor.execute_contract(
+            "99999999999999999999999999999999",
+            contract,
+            preparation.plan,
+            pack,
+            contract.question,
+            run_id="run-budget-denied",
+            access_role="merchant_admin",
+            execution_preparation=preparation,
+            runtime_budget=budget,
+        )
+
+    assert raised.value.breaches == ("duration",)
+    assert repository.calls == []
+
+
+def test_direct_executor_compiles_and_proves_literal_metric_filters(tmp_path) -> None:
+    settings = get_settings()
+    contract = literal_filtered_scalar_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    repository = FakeDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=AccessControlService(settings, root=tmp_path),
+    )
+
+    result = executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-filtered-metric",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    sql = repository.calls[0][0]
+    assert "`order_status` IN ('processing', 'pending')" in sql
+    node_contract = result.task_results[0].node_plan_contract
+    assert node_contract.filter_column == "order_status"
+    assert node_contract.filter_values == ["processing", "pending"]
+    assert len(node_contract.entity_filter_obligations) == 1
+    proof = result.task_results[0].entity_filter_verification
+    assert proof.verified is True
+    assert proof.coverage_complete is True
+    verified = EvidenceVerifier().verify(contract.question, preparation.plan, result)
+    assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
+
+
+def test_direct_executor_preserves_ascending_rank_direction(tmp_path) -> None:
+    settings = get_settings()
+    contract = ascending_ranked_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    executor = GroundedQueryExecutionKernel(
+        FakeDoris(),
+        settings,
+        access_control=AccessControlService(settings, root=tmp_path),
+    )
+
+    compilation = executor.compile_sql(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        access_role="merchant_admin",
+        user_scope={},
+    )
+
+    assert "ORDER BY `order_cnt_1d` ASC LIMIT 5" in compilation.sql
 
 
 def test_runtime_factory_does_not_construct_node_worker() -> None:

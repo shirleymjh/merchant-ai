@@ -7,12 +7,17 @@ from typing import Any
 import pytest
 
 from merchant_ai.models import (
+    AgentTaskResult,
     AgentRunResult,
+    EntityFilterObligation,
+    EntityFilterVerificationProof,
+    EntityReference,
     ExtractedKeywords,
     GraphValidationGap,
     GraphValidationResult,
     KnowledgeBundle,
     MerchantInfo,
+    NodePlanContract,
     PlanningAssetPack,
     QueryBundle,
     QueryPlan,
@@ -29,6 +34,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedBindingHints,
     GroundedDimensionBinding,
     GroundedEntityFilterBinding,
+    GroundedFieldAggregationHint,
     GroundedMetricBinding,
     GroundedQueryContract,
     GroundedSelectedFieldBinding,
@@ -39,8 +45,17 @@ from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeKernel,
     GroundedVerifiedEntitySet,
     GroundedVerifiedQueryArtifact,
+    _namespace_artifact_run,
+)
+from merchant_ai.services.entity_contracts import (
+    canonical_entity_values,
+    entity_comparison_policy,
+    entity_filter_contract_hash,
+    entity_filter_sql_hash,
+    entity_value_hash,
 )
 from merchant_ai.services.grounded_sql_candidate import (
+    GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
 
@@ -49,6 +64,55 @@ class FakeTopicAssets:
     @staticmethod
     def topic_names_for_categories(categories: list[QuestionCategory]) -> list[str]:
         return ["客服工单" for item in categories if item == QuestionCategory.SERVICE]
+
+
+def test_core_sql_evidence_plan_preserves_dimension_and_selected_field_labels() -> None:
+    contract = GroundedQueryContract(
+        question="查询商品工单量和商品发布时间",
+        status="READY",
+        query_shape="DETAIL",
+        primary_table="dwm_goods_detail_df",
+        dimensions=[
+            GroundedDimensionBinding(
+                requested_phrase="商品",
+                semantic_ref_id="semantic:goods:field:spu_id",
+                topic="商品管理",
+                table="dwm_goods_detail_df",
+                column="spu_id",
+                business_name="商品id",
+            )
+        ],
+        selected_fields=[
+            GroundedSelectedFieldBinding(
+                semantic_ref_id="semantic:goods:field:publish_time",
+                topic="商品管理",
+                table="dwm_goods_detail_df",
+                column="spu_apply_create_time",
+                business_name="创建时间",
+                aliases=["创建时间", "商品发布时间"],
+                output_alias="spu_apply_create_time",
+            )
+        ],
+    )
+    validation = GroundedSqlValidationResult(
+        valid=True,
+        canonical_sql=(
+            "SELECT spu_id, spu_apply_create_time FROM dwm_goods_detail_df"
+        ),
+        ast_fingerprint="a" * 64,
+        referenced_tables=["dwm_goods_detail_df"],
+        output_columns=["spu_id", "spu_apply_create_time"],
+    )
+
+    plan = GroundedRuntimeKernel._build_core_sql_evidence_plan(
+        contract,
+        validation,
+    )
+
+    assert plan.intents[0].metric_resolution["sourceColumnLabels"] == {
+        "spu_id": "商品id",
+        "spu_apply_create_time": "商品发布时间",
+    }
 
 
 class FakeKeywordService:
@@ -204,6 +268,9 @@ class FakeCompiler:
 class FakeExecutor:
     execute_calls = 0
 
+    def __init__(self) -> None:
+        self.last_kwargs: dict[str, Any] = {}
+
     def execute_contract(
         self,
         merchant_id: str,
@@ -214,6 +281,7 @@ class FakeExecutor:
         **kwargs: Any,
     ) -> AgentRunResult:
         self.execute_calls += 1
+        self.last_kwargs = dict(kwargs)
         assert contract.ready is True
         assert kwargs["execution_preparation"].executable is True
         return AgentRunResult()
@@ -407,11 +475,47 @@ def test_ready_contract_is_routed_before_any_compilation() -> None:
     assert attempt.execution_reason_codes == [
         "SINGLE_METRIC_FAST_PATH_ELIGIBLE"
     ]
-    assert attempt.next_action == "ACTIVATE_DETERMINISTIC_METRIC"
+    assert attempt.next_action == "ACTIVATE_DETERMINISTIC_QUERY"
     assert compiler.calls == 0
 
 
-def test_complex_ready_contract_activates_scope_without_template_compilation() -> None:
+def test_allowlisted_field_count_is_routed_to_deterministic_kernel_lane() -> None:
+    question = "最近30天涉及多少买家"
+    candidate = contract(question, "READY")
+    field_ref = "semantic:客服工单:tickets:column:buyer_id"
+    metric = candidate.metrics[0]
+    metric.semantic_ref_id = field_ref
+    metric.source_field_ref_id = field_ref
+    metric.binding_type = "field_aggregation"
+    metric.field_aggregation = "COUNT_DISTINCT"
+    metric.metric_key = "count_distinct_buyer_id"
+    metric.formula = "COUNT(DISTINCT `buyer_id`)"
+    metric.source_columns = ["buyer_id"]
+    metric.calculation_capabilities = {
+        "allowedAggregations": ["COUNT_DISTINCT"],
+        "declaredAggregation": "COUNT_DISTINCT",
+    }
+    candidate.binding_hints.field_aggregations = [
+        GroundedFieldAggregationHint(
+            field_ref=field_ref,
+            aggregation="COUNT_DISTINCT",
+        )
+    ]
+    runtime = kernel(
+        builder=QueueBuilder([candidate]),
+        compiler=FakeCompiler(),
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+
+    attempt = runtime.propose_contract(session, [], {})
+
+    assert attempt.execution_mode == GroundedExecutionMode.DETERMINISTIC_METRIC
+    assert attempt.fast_path_eligible is True
+    assert attempt.next_action == "ACTIVATE_DETERMINISTIC_QUERY"
+
+
+def test_grouped_ready_contract_uses_deterministic_compilation() -> None:
     question = "最近30天按商品统计工单量"
     complex_contract = contract(question, "READY")
     complex_contract.query_shape = "GROUPED"
@@ -428,43 +532,38 @@ def test_complex_ready_contract_activates_scope_without_template_compilation() -
     compiler = FakeCompiler()
     materialized: list[str] = []
     runtime = kernel(builder=QueueBuilder([complex_contract]), compiler=compiler)
-    runtime.asset_materializer = lambda candidate, assets: materialized.append(
-        candidate.question
-    )
+    def materialize(candidate: GroundedQueryContract, assets: Any) -> PlanningAssetPack:
+        materialized.append(candidate.question)
+        return PlanningAssetPack()
+
+    runtime.asset_materializer = materialize
     session = runtime.new_session(question, "m-1")
     session.workspace_topics = ["客服工单"]
 
     attempt = runtime.propose_contract(session, [], {})
     activated = runtime.activate_contract(session, attempt.attempt_id)
 
-    assert activated.execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
-    assert activated.fast_path_eligible is False
-    assert set(activated.fast_path_reason_codes) >= {
-        "QUERY_SHAPE_NOT_SCALAR",
-        "DIMENSIONS_PRESENT",
-        "GROUPING_PRESENT",
-    }
-    assert activated.execution_reason_codes[0] == (
-        "COMPLEX_QUERY_REQUIRES_CORE_SQL"
-    )
-    assert activated.compile_status == "NOT_APPLICABLE_CORE_SQL_REQUIRED"
+    assert activated.execution_mode == GroundedExecutionMode.DETERMINISTIC_GROUPED
+    assert activated.fast_path_eligible is True
+    assert activated.fast_path_reason_codes == []
+    assert activated.execution_reason_codes == [
+        "GROUPED_DETERMINISTIC_ELIGIBLE"
+    ]
+    assert activated.compile_status == "VALID"
     assert activated.activation_status == "ACTIVATED"
-    assert activated.next_action == "SUBMIT_GROUNDED_SQL_CANDIDATE"
+    assert activated.next_action == "EXECUTE_GROUNDED_QUERY"
     assert activated.activated is True
-    assert compiler.calls == 0
-    assert materialized == []
-    assert session.active_execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
+    assert compiler.calls == 1
+    assert materialized == [question]
+    assert session.active_execution_mode == GroundedExecutionMode.DETERMINISTIC_GROUPED
     assert session.active_contract == complex_contract
-    assert session.active_pack is None
-    assert session.active_plan is None
-    assert session.active_preparation is None
-    assert session.phase == "ACTIVE_CORE_SQL_REQUIRED"
-
-    with pytest.raises(RuntimeError, match="latest SQL candidate is not"):
-        runtime.execute_active(session)
+    assert session.active_pack is not None
+    assert session.active_plan is not None
+    assert session.active_preparation is not None
+    assert session.phase == "ACTIVE_COMPILED"
 
 
-def test_complex_activation_replaces_old_compiled_artifacts_atomically() -> None:
+def test_multi_metric_activation_replaces_old_compiled_artifacts_atomically() -> None:
     question = "最近30天工单量与商品分布"
     simple_contract = contract(question, "READY")
     complex_contract = contract(question, "READY")
@@ -492,13 +591,13 @@ def test_complex_activation_replaces_old_compiled_artifacts_atomically() -> None
     second = runtime.propose_contract(session, [], {})
     runtime.activate_contract(session, second.attempt_id)
 
-    assert compiler.calls == 1
+    assert compiler.calls == 2
     assert session.active_generation == first_generation + 1
     assert session.active_attempt_id == second.attempt_id
-    assert session.active_execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
-    assert session.active_plan is None
-    assert session.active_pack is None
-    assert session.active_preparation is None
+    assert session.active_execution_mode == GroundedExecutionMode.DETERMINISTIC_MULTI_METRIC
+    assert session.active_plan is not None
+    assert session.active_pack is not None
+    assert session.active_preparation is not None
 
 
 def test_invalid_compilation_never_partially_switches_active_generation() -> None:
@@ -545,7 +644,27 @@ def test_valid_candidate_executes_verifies_and_answers_through_contract_executor
     assert verified.passed is True
     assert answer == "m-1:最近30天工单量"
     assert executor.execute_calls == 1
+    assert "runtime_budget" not in executor.last_kwargs
     assert session.phase == "ANSWERED"
+
+
+def test_kernel_forwards_optional_runtime_budget_to_contract_executor() -> None:
+    question = "最近30天工单量"
+    executor = FakeExecutor()
+    runtime = kernel(
+        builder=QueueBuilder([contract(question, "READY")]),
+        compiler=FakeCompiler(valid=True),
+        executor=executor,
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+    attempt = runtime.propose_contract(session, [], {})
+    runtime.activate_contract(session, attempt.attempt_id)
+    shared_budget = object()
+
+    runtime.execute_active(session, runtime_budget=shared_budget)
+
+    assert executor.last_kwargs["runtime_budget"] is shared_budget
 
 
 def test_missing_runtime_services_fail_closed_and_clarification_is_typed() -> None:
@@ -748,3 +867,147 @@ def test_verified_portfolio_preserves_multiple_query_graphs_and_namespaces_tasks
     assert composer.run_result is not None
     assert len(composer.run_result.merged_query_bundle.rows) == 2
     assert session.answer_artifact_ids == artifact_ids
+
+
+def test_artifact_namespacing_preserves_immutable_entity_filter_proof_hash() -> None:
+    reference = EntityReference(
+        field="spu_id",
+        table="dwm_goods_detail_df",
+        values=["1"],
+        comparison_policy="exact",
+        status="bound",
+    )
+    contract = NodePlanContract(
+        task_id="goods_lookup",
+        preferred_table="dwm_goods_detail_df",
+        filter_column="spu_id",
+        filter_values=["1"],
+        entity_filter_obligations=[
+            EntityFilterObligation(
+                obligation_id="goods_lookup_entity_1",
+                task_id="goods_lookup",
+                reference=reference,
+                status="bound",
+            )
+        ],
+    )
+    old_hash = entity_filter_contract_hash(contract)
+    policy = entity_comparison_policy(reference)
+    requested = canonical_entity_values(contract.filter_values, policy)
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="goods_lookup",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_goods_detail_df"],
+                    rows=[
+                        {
+                            "spu_id": "1",
+                            "goods_publish_time": "2026-04-06 15:54:00",
+                        }
+                    ],
+                    sql=(
+                        "SELECT spu_id, spu_apply_create_time AS goods_publish_time "
+                        "FROM dwm_goods_detail_df"
+                    ),
+                ),
+                node_plan_contract=contract,
+                entity_filter_verification=EntityFilterVerificationProof(
+                    task_id="goods_lookup",
+                    obligation_id="goods_lookup_entity_1",
+                    field="spu_id",
+                    comparison_policy=policy,
+                    contract_hash=old_hash,
+                    requested_value_hashes=sorted(
+                        entity_value_hash(value, old_hash)
+                        for value in requested
+                    ),
+                    verified=True,
+                    coverage_complete=True,
+                    status="verified",
+                ),
+            )
+        ]
+    )
+
+    namespaced = _namespace_artifact_run(run, "artifact_goods")
+    task_result = namespaced.task_results[0]
+    proof = task_result.entity_filter_verification
+    new_hash = entity_filter_contract_hash(task_result.node_plan_contract)
+
+    assert task_result.task_id == "artifact_goods::goods_lookup"
+    assert proof.task_id == "artifact_goods::goods_lookup"
+    assert new_hash == old_hash
+    assert proof.contract_hash == new_hash
+    assert proof.requested_value_hashes == sorted(
+        entity_value_hash(value, new_hash)
+        for value in requested
+    )
+
+
+def test_artifact_namespacing_accepts_nested_in_filter_values() -> None:
+    reference = EntityReference(
+        field="spu_id",
+        table="dwm_goods_detail_df",
+        values=["1"],
+        comparison_policy="exact",
+        status="bound",
+    )
+    contract = NodePlanContract(
+        task_id="goods_lookup",
+        preferred_table="dwm_goods_detail_df",
+        filter_column="",
+        filter_values=[["1"]],
+        entity_filter_obligations=[
+            EntityFilterObligation(
+                obligation_id="goods_lookup_entity_1",
+                task_id="goods_lookup",
+                reference=reference,
+                status="bound",
+            )
+        ],
+    )
+    contract_hash = entity_filter_contract_hash(contract)
+    requested = canonical_entity_values(reference.values, "exact")
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="goods_lookup",
+                success=True,
+                query_bundle=QueryBundle(
+                    tables=["dwm_goods_detail_df"],
+                    rows=[{"spu_apply_create_time": "2026-04-06 15:54:00"}],
+                    sql="SELECT spu_apply_create_time FROM dwm_goods_detail_df",
+                ),
+                node_plan_contract=contract,
+                entity_filter_verification=EntityFilterVerificationProof(
+                    task_id="goods_lookup",
+                    obligation_id="goods_lookup_entity_1",
+                    comparison_policy="exact",
+                    contract_hash=contract_hash,
+                    sql_hash=entity_filter_sql_hash(
+                        "SELECT spu_apply_create_time FROM dwm_goods_detail_df"
+                    ),
+                    requested_value_hashes=sorted(
+                        entity_value_hash(value, contract_hash)
+                        for value in requested
+                    ),
+                    verified=True,
+                    coverage_complete=True,
+                    status="verified",
+                ),
+            )
+        ]
+    )
+
+    namespaced = _namespace_artifact_run(run, "artifact_goods")
+    task_result = namespaced.task_results[0]
+
+    assert task_result.entity_filter_verification.contract_hash == (
+        entity_filter_contract_hash(task_result.node_plan_contract)
+    )
+    assert canonical_entity_values(
+        task_result.node_plan_contract.filter_values,
+        "exact",
+    ) == {"1"}

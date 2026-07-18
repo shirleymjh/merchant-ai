@@ -60,6 +60,88 @@ def test_mandatory_skeleton_does_not_duplicate_a_ranking_already_contained_in_it
     assert answer.count("当前查询范围内") == 1
 
 
+def test_compound_ranking_lookup_answer_uses_field_label_without_duplicate_ranking():
+    question = "最近30天工单量最多的商品，同时看这个商品的商品发布时间"
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.TOPN,
+                plan_task_id="ticket_rank",
+                preferred_table="dwm_cs_ticket_detail_di",
+                metric_name="ticket_cnt",
+                group_by_column="spu_id",
+                group_by_name="商品id",
+                output_keys=["spu_id", "ticket_cnt"],
+                required_evidence=["spu_id", "ticket_cnt"],
+                metric_resolution={
+                    "metricKey": "ticket_cnt",
+                    "displayName": "客服工单明细量",
+                    "sourceColumnLabels": {"spu_id": "商品id"},
+                    "unit": "单",
+                },
+            ),
+            QuestionIntent(
+                question=question,
+                intent_type="VALID",
+                answer_mode=AnswerMode.DETAIL,
+                plan_task_id="goods_lookup",
+                preferred_table="dwm_goods_detail_df",
+                output_keys=["spu_id", "spu_apply_create_time"],
+                required_evidence=["spu_id", "spu_apply_create_time"],
+                metric_resolution={
+                    "sourceColumnLabels": {
+                        "spu_id": "商品id",
+                        "spu_apply_create_time": "商品发布时间",
+                    }
+                },
+            ),
+        ]
+    )
+    rank = QueryBundle(
+        tables=["dwm_cs_ticket_detail_di"],
+        rows=[{"spu_id": "1", "ticket_cnt": 37}],
+        original_row_count=1,
+    )
+    lookup = QueryBundle(
+        tables=["dwm_goods_detail_df"],
+        rows=[
+            {
+                "spu_id": "1",
+                "spu_apply_create_time": "2026-04-06 15:54:00",
+            }
+        ],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(task_id="ticket_rank", success=True, query_bundle=rank),
+            AgentTaskResult(task_id="goods_lookup", success=True, query_bundle=lookup),
+        ],
+        merged_query_bundle=QueryBundle(
+            tables=["dwm_cs_ticket_detail_di", "dwm_goods_detail_df"],
+            rows=[*rank.rows, *lookup.rows],
+            original_row_count=2,
+        ),
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    answer = AnswerComposeService(ClaimAnswerLlm("")).compose(
+        question,
+        MerchantInfo(merchant_id="100"),
+        plan,
+        run,
+        "",
+        allow_llm=False,
+    )
+
+    assert "商品发布时间" in answer
+    assert "2026-04-06 15:54:00" in answer
+    assert "UNKNOWN" not in answer
+    assert answer.count("按客服工单明细量排序") <= 1
+
+
 def detail_plan():
     return QueryPlan(
         intents=[
@@ -585,6 +667,71 @@ def test_markdown_table_uses_headers_and_ignores_only_deterministic_row_position
     assert verification.passed is True
     assert verification.claims[0].text == "排名：1；商户ID：merchant_1；支付金额：121.5"
     assert verification.claims[0].numeric_values == ["121.5"]
+    assert verification.claims[0].fact_ids
+
+
+def test_ranking_accepts_numeric_entity_id_via_governed_group_label() -> None:
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                question="最近30天工单量最多的商品",
+                intent_type="VALID",
+                answer_mode=AnswerMode.TOPN,
+                plan_task_id="ticket_top_product",
+                preferred_table="dwm_cs_ticket_detail_di",
+                metric_column="ticket_id",
+                metric_name="ticket_cnt",
+                metric_formula="COUNT(DISTINCT ticket_id)",
+                metric_specs=[
+                    {
+                        "metricName": "ticket_cnt",
+                        "metricColumn": "ticket_id",
+                        "displayName": "客服工单明细量",
+                        "sourceColumns": ["ticket_id"],
+                    }
+                ],
+                metric_resolution={
+                    "metricKey": "ticket_cnt",
+                    "displayName": "客服工单明细量",
+                    "sourceColumns": ["ticket_id"],
+                },
+                group_by_column="spu_id",
+                group_by_name="商品id",
+                output_keys=["spu_id", "ticket_cnt"],
+                required_evidence=["spu_id", "ticket_cnt"],
+            )
+        ],
+        final_evidence_column_hints={
+            "ticket_top_product": ["spu_id", "ticket_cnt"]
+        },
+    )
+    bundle = QueryBundle(
+        tables=["dwm_cs_ticket_detail_di"],
+        rows=[{"spu_id": "1", "ticket_cnt": 37}],
+        original_row_count=1,
+    )
+    run = AgentRunResult(
+        task_results=[
+            AgentTaskResult(
+                task_id="ticket_top_product",
+                success=True,
+                query_bundle=bundle,
+            )
+        ],
+        merged_query_bundle=bundle,
+        verified_evidence=VerifiedEvidence(passed=True),
+    )
+
+    verification = AnswerClaimVerifier().verify(
+        plan.intents[0].question,
+        plan,
+        run,
+        "| 商品id | 客服工单明细量 |\n"
+        "| --- | ---: |\n"
+        "| 1 | 37 |",
+    )
+
+    assert verification.passed is True
     assert verification.claims[0].fact_ids
 
 

@@ -4,12 +4,15 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
+import pytest
+
 from merchant_ai.config import get_settings
 from merchant_ai.services.assets import SemanticCatalogService, TopicAssetService
 from merchant_ai.models import NodePlanContract
 from merchant_ai.services.grounded_query_contract import (
     GroundedQueryContractBuilder,
     build_grounded_query_contract_from_refs,
+    compile_deterministic_grounded_query,
     compile_grounded_query,
     materialize_grounded_asset_pack,
 )
@@ -308,7 +311,7 @@ def test_builds_ready_same_table_multi_metric_contract_from_core_reads_only() ->
     assert pack.tables[0].metadata["status"] == published["status"]
     assert pack.tables[0].metadata["version"] == published["version"]
 
-    preparation = compile_grounded_query(contract, pack)
+    preparation = compile_deterministic_grounded_query(contract, pack)
     assert preparation.validation.valid, [gap.model_dump() for gap in preparation.validation.gaps]
     assert len(preparation.plan.intents) == 1
     assert preparation.plan.intents[0].group_by_column == ""
@@ -376,6 +379,8 @@ def test_builds_typed_two_table_entity_lookup_without_metric_surrogate() -> None
         "detail_status",
         "published_at",
     ]
+    with pytest.raises(ValueError, match="EXECUTION_SHAPE_NOT_DETERMINISTIC"):
+        compile_deterministic_grounded_query(contract, pack)
 
 
 def test_order_detail_question_is_bound_as_generic_entity_lookup_not_metric() -> None:
@@ -394,6 +399,51 @@ def test_order_detail_question_is_bound_as_generic_entity_lookup_not_metric() ->
     assert contract.metrics == []
     assert contract.entity_filters[0].literal_value == "order_id_100"
     assert contract.entity_filters[0].entity_identity == "PRIMARY_ENTITY"
+
+
+def test_single_table_entity_lookup_uses_guarded_deterministic_compiler() -> None:
+    topic = "通用实体"
+    table = "fact_entity_detail"
+    detail = table_detail(topic, table, merchant_column="tenant_id")
+    entity_id = column_read(
+        topic,
+        table,
+        "entity_id",
+        "实体编号",
+        ["实体ID"],
+        role="ENTITY_UNIQUE_KEY",
+        extra_definition={
+            "isUniqueKey": True,
+            "entityIdentity": "GENERIC_ENTITY",
+            "filterOperators": ["EQ", "IN"],
+            "lookupTimePolicy": {"timeRequired": False, "mode": "global"},
+        },
+    )
+    status = column_read(topic, table, "entity_status", "实体状态", ["状态"])
+    contract = GroundedQueryContractBuilder().build(
+        "查询实体 entity_100 的状态",
+        [topic],
+        [detail, entity_id, status],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "selectedFieldRefs": [entity_id["refId"], status["refId"]],
+            "entityFilters": [
+                {
+                    "fieldRef": entity_id["refId"],
+                    "operator": "EQ",
+                    "literalValue": "entity_100",
+                }
+            ],
+            "analysisMode": "entity_lookup",
+        },
+    )
+
+    assert contract.ready is True
+    assert contract.execution_shape == "entity_lookup"
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    assert preparation.validation.valid
+    assert preparation.plan.intents[0].answer_mode == "DETAIL"
 
 
 def test_real_progressive_assets_compile_order_to_product_lookup_without_time_filter() -> None:
@@ -767,6 +817,65 @@ def test_merchant_scope_column_cannot_be_bound_as_group_dimension() -> None:
     }
 
 
+def test_simple_grouped_multi_metric_uses_guarded_deterministic_compiler() -> None:
+    topic = "经营画像"
+    table = "ads_merchant_profile"
+    detail = table_detail(topic, table)
+    orders = metric_read(
+        topic,
+        table,
+        "order_cnt_1d",
+        "订单量",
+        ["订单数"],
+        "SUM(order_cnt_1d)",
+        ["order_cnt_1d"],
+    )
+    refunds = metric_read(
+        topic,
+        table,
+        "refund_amt_1d",
+        "退款金额",
+        ["退款额"],
+        "SUM(refund_amt_1d)",
+        ["refund_amt_1d"],
+    )
+    category = column_read(
+        topic,
+        table,
+        "merchant_type",
+        "商家类型",
+        ["类型"],
+        role="DIMENSION",
+    )
+    contract = GroundedQueryContractBuilder().build(
+        "最近30天按商家类型查看订单数和退款额",
+        [topic],
+        [detail, orders, refunds, category],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [orders["refId"], refunds["refId"]],
+            "dimensionRefs": [category["refId"]],
+            "groupByRef": category["refId"],
+            "analysisMode": "grouped",
+            "timeExpression": "最近30天",
+        },
+    )
+
+    assert contract.ready is True
+    assert contract.query_shape == "GROUPED"
+    assert contract.execution_shape == "same_table_multi_metric"
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    assert preparation.validation.valid
+    intent = preparation.plan.intents[0]
+    assert intent.answer_mode == "GROUP_AGG"
+    assert intent.group_by_column == "merchant_type"
+    assert {item["metricName"] for item in intent.metric_specs} == {
+        "order_cnt_1d",
+        "refund_amt_1d",
+    }
+
+
 def test_builds_ranked_product_dimension_contract_for_ticket_metric() -> None:
     topic = "客服工单"
     table = "dwm_cs_ticket_detail_di"
@@ -816,7 +925,7 @@ def test_builds_ranked_product_dimension_contract_for_ticket_metric() -> None:
     assert contract.time_range.source == "relative_day_quantity"
 
     pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
-    preparation = compile_grounded_query(contract, pack)
+    preparation = compile_deterministic_grounded_query(contract, pack)
     assert preparation.validation.valid, [gap.model_dump() for gap in preparation.validation.gaps]
     assert len(preparation.plan.intents) == 1
     assert preparation.plan.intents[0].answer_mode == "TOPN"
@@ -937,7 +1046,7 @@ def test_ranked_multi_metric_uses_only_explicit_sort_metric_as_anchor() -> None:
     assert contract.ready is True
     assert contract.query_shape == "RANKED"
     pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
-    preparation = compile_grounded_query(contract, pack)
+    preparation = compile_deterministic_grounded_query(contract, pack)
     assert preparation.validation.valid, [gap.model_dump() for gap in preparation.validation.gaps]
     intent = preparation.plan.intents[0]
     assert intent.metric_name == "ticket_cnt"
@@ -951,7 +1060,19 @@ def test_governed_field_count_distinct_compiles_without_published_metric() -> No
     topic = "客服工单"
     table = "dwm_cs_ticket_detail_di"
     detail = table_detail(topic, table, merchant_column="seller_id")
-    buyer = column_read(topic, table, "buyer_id", "买家id", ["买家", "买家id"], role="KEY")
+    buyer = column_read(
+        topic,
+        table,
+        "buyer_id",
+        "买家id",
+        ["买家", "买家id"],
+        role="KEY",
+        extra_definition={
+            "calculationSemantics": {
+                "allowedAggregations": ["COUNT", "COUNT_DISTINCT"],
+            }
+        },
+    )
 
     contract = GroundedQueryContractBuilder().build(
         "最近30天涉及多少个买家",
@@ -989,7 +1110,7 @@ def test_governed_field_count_distinct_compiles_without_published_metric() -> No
     assert pack.metrics[0].source_ref_id.startswith("grounded-field-aggregation:")
     assert pack.metrics[0].metadata["sourceFieldRefId"] == buyer["refId"]
 
-    preparation = compile_grounded_query(contract, pack)
+    preparation = compile_deterministic_grounded_query(contract, pack)
     assert preparation.validation.valid, [gap.model_dump() for gap in preparation.validation.gaps]
     assert len(preparation.plan.intents) == 1
     intent = preparation.plan.intents[0]
@@ -1023,6 +1144,102 @@ def test_governed_field_count_distinct_compiles_without_published_metric() -> No
         "SELECT COUNT(DISTINCT `buyer_id`) AS `count_distinct_buyer_id` "
         "FROM `dwm_cs_ticket_detail_di`"
     )
+
+
+def test_single_table_metric_literal_filter_compiles_with_exact_obligation() -> None:
+    topic = "客服工单"
+    table = "dwm_cs_ticket_detail_di"
+    detail = table_detail(topic, table, merchant_column="seller_id")
+    count = metric_read(
+        topic,
+        table,
+        "ticket_cnt",
+        "工单量",
+        ["工单数"],
+        "COUNT(DISTINCT ticket_id)",
+        ["ticket_id"],
+    )
+    status = column_read(
+        topic,
+        table,
+        "ticket_status",
+        "工单状态",
+        ["状态"],
+        extra_definition={"filterOperators": ["EQ", "IN"]},
+    )
+    contract = GroundedQueryContractBuilder().build(
+        "最近30天处理中和待处理的工单量",
+        [topic],
+        [detail, count, status],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [count["refId"]],
+            "entityFilters": [
+                {
+                    "fieldRef": status["refId"],
+                    "operator": "IN",
+                    "literalValue": ["processing", "pending"],
+                    "requestedPhrase": "处理中和待处理",
+                }
+            ],
+            "analysisMode": "metric_total",
+            "timeExpression": "最近30天",
+        },
+    )
+
+    assert contract.ready is True
+    assert contract.query_shape == "SCALAR"
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+
+    assert preparation.validation.valid, [
+        gap.model_dump() for gap in preparation.validation.gaps
+    ]
+    assert len(preparation.plan.entity_filter_obligations) == 1
+    obligation = preparation.plan.entity_filter_obligations[0]
+    assert obligation.reference.field == "ticket_status"
+    assert obligation.reference.values == ["processing", "pending"]
+
+
+def test_ascending_ranked_contract_uses_guarded_deterministic_compiler() -> None:
+    topic = "客服工单"
+    table = "dwm_cs_ticket_detail_di"
+    detail = table_detail(topic, table, merchant_column="seller_id")
+    count = metric_read(
+        topic,
+        table,
+        "ticket_cnt",
+        "工单量",
+        ["工单数"],
+        "COUNT(DISTINCT ticket_id)",
+        ["ticket_id"],
+    )
+    product = column_read(topic, table, "spu_id", "商品id", ["商品"], role="KEY")
+    contract = GroundedQueryContractBuilder().build(
+        "最近30天工单量最少的5个商品",
+        [topic],
+        [detail, count, product],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [count["refId"]],
+            "dimensionRefs": [product["refId"]],
+            "groupByRef": product["refId"],
+            "ranking": {
+                "metricRef": count["refId"],
+                "order": "ASC",
+                "limit": 5,
+            },
+            "analysisMode": "ranking",
+            "timeExpression": "最近30天",
+        },
+    )
+
+    assert contract.ready is True
+    assert contract.ranking.direction == "ASC"
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    assert preparation.validation.valid
+    assert preparation.plan.intents[0].limit == 5
 
 
 def test_field_aggregation_rejects_non_allowlisted_sum() -> None:
@@ -1144,6 +1361,10 @@ def test_non_composable_daily_metric_remains_valid_at_native_trend_grain() -> No
     assert contract.status == "READY"
     assert contract.ready is True
     assert contract.query_shape == "TREND"
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(get_settings()))
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    assert preparation.validation.valid
+    assert preparation.plan.intents[0].group_by_column == "pt"
 
 
 def test_semantic_usage_policy_enforces_fixed_windows_and_required_components() -> None:

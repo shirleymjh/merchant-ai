@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
-from typing import Any, Dict, Iterable, Set
+from typing import Any, Dict, Iterable, Iterator, Set
 
 from merchant_ai.models import EntityReference, NodePlanContract
 
@@ -51,7 +51,7 @@ def canonical_entity_value(value: Any, policy: str) -> str:
 def canonical_entity_values(values: Iterable[Any], policy: str) -> Set[str]:
     return {
         canonical_entity_value(value, policy)
-        for value in values or []
+        for value in flatten_entity_values(values)
         if value is not None and str(value) != ""
     }
 
@@ -59,18 +59,61 @@ def canonical_entity_values(values: Iterable[Any], policy: str) -> Set[str]:
 def entity_value_display_map(values: Iterable[Any], policy: str) -> Dict[str, Any]:
     return {
         canonical_entity_value(value, policy): value
-        for value in values or []
+        for value in flatten_entity_values(values)
         if value is not None and str(value) != ""
     }
 
 
+def flatten_entity_values(values: Iterable[Any] | None) -> Iterator[Any]:
+    """Yield scalar entity values from literal and ``IN`` collection shapes."""
+
+    for value in values or []:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            yield from flatten_entity_values(value)
+        else:
+            yield value
+
+
 def entity_filter_contract_hash(contract: NodePlanContract) -> str:
+    """Return an immutable semantic identity for an entity-filter contract.
+
+    Runtime task IDs are deliberately excluded: portfolio namespacing is
+    provenance, not a semantic contract mutation.  SQL identity remains bound
+    separately by ``entity_filter_sql_hash``.
+    """
+
+    obligations = []
+    for item in contract.entity_filter_obligations:
+        reference = item.reference
+        policy = entity_comparison_policy(reference)
+        obligations.append(
+            {
+                "required": bool(item.required),
+                "status": str(item.status or ""),
+                "reference": {
+                    "semanticRefId": str(reference.semantic_ref_id or ""),
+                    "table": str(reference.table or ""),
+                    "field": str(reference.field or ""),
+                    "comparisonPolicy": str(policy or "exact"),
+                    "values": sorted(
+                        canonical_entity_values(reference.values, policy)
+                    ),
+                    "status": str(reference.status or ""),
+                },
+            }
+        )
+    contract_policy = (
+        entity_comparison_policy(contract.entity_filter_obligations[0].reference)
+        if contract.entity_filter_obligations
+        else "exact"
+    )
     payload = {
-        "taskId": contract.task_id,
         "preferredTable": contract.preferred_table,
         "filterColumn": contract.filter_column,
-        "filterValues": contract.filter_values,
-        "obligations": [item.model_dump(by_alias=True) for item in contract.entity_filter_obligations],
+        "filterValues": sorted(
+            canonical_entity_values(contract.filter_values, contract_policy)
+        ),
+        "obligations": obligations,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

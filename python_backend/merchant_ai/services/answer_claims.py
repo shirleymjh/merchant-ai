@@ -923,6 +923,10 @@ def governed_fact_columns(intent: Any, task: Any) -> Set[str]:
 def governed_column_labels(intent: Any, task: Any) -> Dict[str, str]:
     labels: Dict[str, str] = {}
     if intent is not None:
+        group_by_column = str(getattr(intent, "group_by_column", "") or "").strip()
+        group_by_name = str(getattr(intent, "group_by_name", "") or "").strip()
+        if group_by_column and group_by_name:
+            labels[group_by_column] = group_by_name
         resolution = dict(getattr(intent, "metric_resolution", {}) or {})
         for key in ["sourceColumnLabels", "columnLabels", "outputColumnLabels"]:
             raw = resolution.get(key)
@@ -949,6 +953,10 @@ def governed_column_label_aliases(intent: Any, task: Any) -> Dict[str, List[str]
 
     if intent is not None:
         resolution = dict(getattr(intent, "metric_resolution", {}) or {})
+        add(
+            getattr(intent, "group_by_column", ""),
+            [getattr(intent, "group_by_name", "")],
+        )
         primary_column = str(
             getattr(intent, "metric_column", "")
             or resolution.get("metricKey")

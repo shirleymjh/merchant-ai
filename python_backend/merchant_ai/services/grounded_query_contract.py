@@ -1858,6 +1858,40 @@ def materialize_grounded_asset_pack(
     return pack
 
 
+def compile_deterministic_grounded_query(
+    contract: GroundedQueryContract | dict[str, Any],
+    pack: PlanningAssetPack | dict[str, Any],
+) -> GroundedExecutionPreparation:
+    """Fail-closed entry point for the no-LLM deterministic execution lane.
+
+    ``compile_grounded_query`` remains the projection implementation used by
+    compatibility callers. Runtime activation should use this guarded entry
+    point so a READY Contract cannot accidentally reach the deterministic data
+    engine merely because the generic projection code knows how to represent
+    it. The local import avoids a module cycle: the policy consumes the typed
+    Contract while this function enforces its decision immediately before
+    compilation.
+    """
+
+    grounded = (
+        contract
+        if isinstance(contract, GroundedQueryContract)
+        else GroundedQueryContract.model_validate(contract)
+    )
+    from merchant_ai.services.grounded_execution_policy import (
+        evaluate_deterministic_execution,
+    )
+
+    decision = evaluate_deterministic_execution(grounded)
+    if not decision.eligible:
+        reasons = decision.reason_codes or decision.execution_reason_codes
+        raise ValueError(
+            "grounded deterministic compiler rejected Contract: %s"
+            % (",".join(reasons) or "DETERMINISTIC_CAPABILITY_REQUIRED")
+        )
+    return compile_grounded_query(grounded, pack)
+
+
 def compile_grounded_query(
     contract: GroundedQueryContract | dict[str, Any],
     pack: PlanningAssetPack | dict[str, Any],
@@ -1896,7 +1930,9 @@ def compile_grounded_query(
         raise ValueError("grounded metric owner table has no table binding")
 
     explicit_group_dimensions = [
-        dimension for dimension in grounded.dimensions if dimension.usage == "group_by"
+        dimension
+        for dimension in grounded.dimensions
+        if str(dimension.usage or "").strip().lower() == "group_by"
     ]
     if len(explicit_group_dimensions) > 1:
         raise ValueError("grounded direct compiler supports exactly one explicit groupBy binding")
@@ -1928,8 +1964,11 @@ def compile_grounded_query(
         )
         if ranking_metric is None:
             raise ValueError("grounded ranking metric is not an explicitly bound metric")
-        if grounded.ranking.direction not in {"", "DESC"}:
-            raise ValueError("grounded direct compiler does not yet support ascending ranking")
+        if str(grounded.ranking.direction or "").strip().upper() not in {
+            "ASC",
+            "DESC",
+        }:
+            raise ValueError("grounded direct compiler requires an explicit ASC or DESC ranking")
 
     if grounded.query_shape == "RANKED":
         answer_mode = AnswerMode.TOPN
@@ -2051,6 +2090,7 @@ def compile_grounded_query(
                     table_binding.detail_ref_id,
                     *(metric.semantic_ref_id for metric in ordered_metrics),
                     group_dimension.semantic_ref_id if group_dimension else "",
+                    *(item.semantic_ref_id for item in grounded.entity_filters),
                 ]
             ),
             analysis_source="grounded_query_contract",
@@ -2064,6 +2104,11 @@ def compile_grounded_query(
 
     plan = QueryPlan(
         intents=intents,
+        entity_filter_obligations=_grounded_entity_filter_obligations(
+            grounded,
+            task_id,
+            source="grounded_deterministic_metric",
+        ),
         agent_trace=[
             "planner=grounded_query_contract_direct_compiler",
             "planner_llm_calls=0",
@@ -2137,7 +2182,11 @@ def _compile_grounded_detail_query(
         _safe_task_token(primary_table),
     )
     entity_reference = EntityReference()
-    obligations: list[EntityFilterObligation] = []
+    obligations = _grounded_entity_filter_obligations(
+        contract,
+        task_id,
+        source="grounded_query_contract",
+    )
     if primary_filter is not None:
         primary_filter_output = next(
             (
@@ -2167,36 +2216,6 @@ def _compile_grounded_detail_query(
             time_scope_explicit=bool(contract.time_range.explicit),
             lookup_time_policy=dict(primary_filter.lookup_time_policy),
         )
-    for index, entity_filter in enumerate(contract.entity_filters):
-        reference = EntityReference(
-            semantic_ref_id=entity_filter.semantic_ref_id,
-            field=entity_filter.column,
-            table=entity_filter.table,
-            raw_label=entity_filter.requested_phrase,
-            raw_value=str(entity_filter.literal_value),
-            values=(
-                list(entity_filter.literal_value)
-                if entity_filter.operator == "IN"
-                and isinstance(entity_filter.literal_value, (list, tuple))
-                else [entity_filter.literal_value]
-            ),
-            comparison_policy=entity_filter.operator.lower(),
-            source="grounded_query_contract",
-            confidence=1.0,
-            status="bound",
-            time_scope_explicit=bool(contract.time_range.explicit),
-            lookup_time_policy=dict(entity_filter.lookup_time_policy),
-        )
-        obligations.append(
-            EntityFilterObligation(
-                obligation_id="grounded_entity_filter_%d" % (index + 1),
-                task_id=task_id,
-                required=True,
-                reference=reference,
-                status="bound",
-                reason="exact GroundedQueryContract entity filter",
-            )
-        )
     intent = QuestionIntent(
         question=contract.question,
         intent_type=IntentType.VALID,
@@ -2215,6 +2234,19 @@ def _compile_grounded_detail_query(
         analysis_source="grounded_query_contract",
         analysis_note="typed detail projections and entity filters",
         sql_strategy="grounded_deterministic",
+        metric_resolution={
+            "sourceColumnLabels": {
+                str(field.output_alias or field.column): str(
+                    requested_semantic_label(
+                        contract.question,
+                        field.aliases,
+                        field.business_name or field.output_alias or field.column,
+                    )
+                )
+                for field in contract.selected_fields
+                if str(field.output_alias or field.column or "").strip()
+            }
+        },
         time_range=contract.time_range.model_copy(deep=True),
     )
     plan = QueryPlan(
@@ -2261,6 +2293,46 @@ def _compile_grounded_detail_query(
             asset_pack.model_dump(by_alias=True, mode="json")
         ),
     )
+
+
+def _grounded_entity_filter_obligations(
+    contract: GroundedQueryContract,
+    task_id: str,
+    *,
+    source: str,
+) -> list[EntityFilterObligation]:
+    obligations: list[EntityFilterObligation] = []
+    for index, entity_filter in enumerate(contract.entity_filters):
+        reference = EntityReference(
+            semantic_ref_id=entity_filter.semantic_ref_id,
+            field=entity_filter.column,
+            table=entity_filter.table,
+            raw_label=entity_filter.requested_phrase,
+            raw_value=str(entity_filter.literal_value),
+            values=(
+                list(entity_filter.literal_value)
+                if entity_filter.operator == "IN"
+                and isinstance(entity_filter.literal_value, (list, tuple))
+                else [entity_filter.literal_value]
+            ),
+            comparison_policy=entity_filter.operator.lower(),
+            source=source,
+            confidence=1.0,
+            status="bound",
+            time_scope_explicit=bool(contract.time_range.explicit),
+            lookup_time_policy=dict(entity_filter.lookup_time_policy),
+        )
+        obligations.append(
+            EntityFilterObligation(
+                obligation_id="grounded_entity_filter_%d" % (index + 1),
+                task_id=task_id,
+                required=True,
+                reference=reference,
+                status="bound",
+                reason="exact GroundedQueryContract entity filter",
+            )
+        )
+    return obligations
 
 
 def _safe_task_token(value: str) -> str:
@@ -2487,6 +2559,58 @@ def _validate_grounded_plan_projection(
                 )
             )
 
+    expected_filter_bindings = [
+        (
+            item.semantic_ref_id,
+            item.table,
+            item.column,
+            item.operator.lower(),
+            list(item.literal_value)
+            if item.operator == "IN" and isinstance(item.literal_value, (list, tuple))
+            else [item.literal_value],
+        )
+        for item in contract.entity_filters
+    ]
+    actual_filter_bindings = [
+        (
+            item.reference.semantic_ref_id,
+            item.reference.table,
+            item.reference.field,
+            item.reference.comparison_policy,
+            list(item.reference.values),
+        )
+        for item in plan.entity_filter_obligations
+        if item.required and item.status == "bound"
+    ]
+    if actual_filter_bindings != expected_filter_bindings:
+        gaps.append(
+            GraphValidationGap(
+                code="GROUNDED_ENTITY_FILTER_OBLIGATION_MISMATCH",
+                task_id=intent.plan_task_id,
+                reason="Entity filter obligations do not exactly cover the Contract literal predicates",
+            )
+        )
+    evidence_refs = set(contract.evidence_refs)
+    for entity_filter in contract.entity_filters:
+        if entity_filter.table != expected_table:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_ENTITY_FILTER_TABLE_MISMATCH",
+                    evidence=entity_filter.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Deterministic metric filters must belong to the one execution table",
+                )
+            )
+        if entity_filter.semantic_ref_id not in evidence_refs:
+            gaps.append(
+                GraphValidationGap(
+                    code="GROUNDED_ENTITY_FILTER_UNREAD",
+                    evidence=entity_filter.semantic_ref_id,
+                    task_id=intent.plan_task_id,
+                    reason="Entity filter field is not backed by read evidence",
+                )
+            )
+
     known_tables = set(asset_pack.known_tables())
     contract_tables = {table.table for table in contract.tables if table.table}
     if known_tables != contract_tables:
@@ -2500,6 +2624,7 @@ def _validate_grounded_plan_projection(
     known_columns = set(asset_pack.known_columns(intent.preferred_table))
     required_columns = {
         *[column for metric in contract.metrics for column in metric.source_columns],
+        *[item.column for item in contract.entity_filters],
         *([expected_group] if expected_group else []),
         *([table_binding.time_column] if table_binding and table_binding.time_column else []),
         *(
@@ -2641,6 +2766,29 @@ def _stable_hash(value: Any) -> str:
         )
     )
     return hashlib.sha256(str(payload).encode("utf-8")).hexdigest()
+
+
+def requested_semantic_label(
+    question: str,
+    aliases: Iterable[str],
+    fallback: str,
+) -> str:
+    """Prefer the governed alias explicitly used by the user."""
+
+    normalized_question = re.sub(r"\s+", "", str(question or "")).casefold()
+    candidates = _dedupe([*aliases, fallback])
+    matched = [
+        candidate
+        for candidate in candidates
+        if candidate
+        and re.sub(r"\s+", "", candidate).casefold() in normalized_question
+    ]
+    if matched:
+        return max(
+            matched,
+            key=lambda item: len(re.sub(r"\s+", "", item)),
+        )
+    return str(fallback or "").strip()
 
 
 def _execution_shape(

@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -16,6 +17,7 @@ from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
+from pydantic import Field as PydanticField
 
 try:
     from deepagents import FilesystemPermission, create_deep_agent
@@ -106,6 +108,7 @@ except ImportError:  # pragma: no cover - compatibility for minimal test runtime
         context: _ContextT
 
 from merchant_ai.models import (
+    APIModel,
     ChatResponse,
     MerchantInfo,
     RecallBundle,
@@ -117,6 +120,21 @@ from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeKernel,
     GroundedRuntimeEvent,
     GroundedRuntimeSession,
+)
+from merchant_ai.services.grounded_runtime_budget import (
+    GroundedRuntimeBudget,
+    GroundedRuntimeBudgetExceeded,
+)
+from merchant_ai.services.grounded_goal_contract import (
+    GoalCoverageBlocked,
+    GoalCoverageVerifier,
+    OriginalQuestionGoalContract,
+    VerifiedArtifactGoalCoverage,
+    canonical_goal_id,
+    declare_verified_artifact_goal_coverage,
+    original_question_goal_contract_fingerprint,
+    parse_original_question_goal_contract,
+    required_goal_ids,
 )
 from merchant_ai.services.time_semantics import has_explicit_time_expression
 from merchant_ai.services.grounded_query_contract import GroundedBindingHints
@@ -135,6 +153,251 @@ _SEMANTIC_SCOPE: ContextVar[Optional["GroundedDeepAgentSession"]] = ContextVar(
 )
 
 
+class GroundedParallelQuerySpec(APIModel):
+    """One independent query branch prepared from already-read semantics."""
+
+    query_id: str
+    read_ref_ids: list[str] = PydanticField(default_factory=list)
+    binding_hints: GroundedBindingHints = PydanticField(
+        default_factory=GroundedBindingHints
+    )
+    goal_ids: list[str] = PydanticField(default_factory=list)
+
+
+class GroundedParallelExecutionSpec(APIModel):
+    """Execution input for a previously prepared independent branch."""
+
+    query_id: str
+    sql: str = ""
+    rationale: str = ""
+    evidence_ref_ids: list[str] = PydanticField(default_factory=list)
+
+
+def _validated_goal_assignment(
+    session: "GroundedDeepAgentSession",
+    goal_ids: list[str],
+) -> tuple[list[str], dict[str, Any]]:
+    contract = session.question_goal_contract
+    if contract is None:
+        return [], {
+            "status": "BLOCKED",
+            "code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED",
+            "nextAction": "DECLARE_ORIGINAL_QUESTION_GOALS",
+        }
+    try:
+        normalized = list(
+            dict.fromkeys(canonical_goal_id(item) for item in goal_ids)
+        )
+    except ValueError as exc:
+        return [], {
+            "status": "REJECTED",
+            "code": "QUERY_GOAL_ID_INVALID",
+            "message": str(exc),
+        }
+    if not normalized:
+        return [], {
+            "status": "REJECTED",
+            "code": "QUERY_GOAL_ASSIGNMENT_REQUIRED",
+        }
+    known = set(contract.goal_map())
+    unknown = [item for item in normalized if item not in known]
+    if unknown:
+        return [], {
+            "status": "REJECTED",
+            "code": "QUERY_GOAL_ID_UNKNOWN",
+            "unknownGoalIds": unknown,
+        }
+    return normalized, {}
+
+
+def _parallel_goal_dependency_issues(
+    contract: OriginalQuestionGoalContract,
+    goal_ids_by_query_id: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    """Find declared goal paths that make one query batch non-independent.
+
+    This is a batch-safety check, not an execution planner.  It only rejects
+    dependency paths whose two endpoints are assigned somewhere in the same
+    requested batch; the Core remains responsible for choosing the serial
+    query sequence.
+    """
+
+    query_ids_by_goal_id: dict[str, list[str]] = {}
+    for query_id, goal_ids in goal_ids_by_query_id.items():
+        for goal_id in goal_ids:
+            query_ids_by_goal_id.setdefault(goal_id, []).append(query_id)
+
+    for query_ids in query_ids_by_goal_id.values():
+        query_ids.sort()
+
+    edges_by_upstream_goal_id: dict[str, list[dict[str, Any]]] = {}
+
+    def add_edge(
+        *,
+        upstream_goal_id: str,
+        downstream_goal_id: str,
+        relation_type: str,
+        declared_by_goal_id: str,
+        dependency_goal_id: str = "",
+    ) -> None:
+        edge: dict[str, Any] = {
+            "relationType": relation_type,
+            "upstreamGoalId": upstream_goal_id,
+            "downstreamGoalId": downstream_goal_id,
+            "declaredByGoalId": declared_by_goal_id,
+        }
+        if dependency_goal_id:
+            edge["dependencyGoalId"] = dependency_goal_id
+        existing = edges_by_upstream_goal_id.setdefault(upstream_goal_id, [])
+        if edge not in existing:
+            existing.append(edge)
+
+    for goal in contract.goals:
+        for upstream_goal_id in goal.depends_on_goal_ids:
+            add_edge(
+                upstream_goal_id=upstream_goal_id,
+                downstream_goal_id=goal.goal_id,
+                relation_type="DEPENDS_ON_GOAL_IDS",
+                declared_by_goal_id=goal.goal_id,
+            )
+        if str(getattr(goal, "kind", "")) != "DEPENDENCY":
+            continue
+        for upstream_goal_id in getattr(goal, "upstream_goal_ids", ()):
+            for downstream_goal_id in getattr(goal, "downstream_goal_ids", ()):
+                add_edge(
+                    upstream_goal_id=upstream_goal_id,
+                    downstream_goal_id=downstream_goal_id,
+                    relation_type="DEPENDENCY_GOAL",
+                    declared_by_goal_id=goal.goal_id,
+                    dependency_goal_id=goal.goal_id,
+                )
+
+    def dependency_path(
+        upstream_goal_id: str,
+        downstream_goal_id: str,
+    ) -> list[dict[str, Any]]:
+        pending: list[tuple[str, list[dict[str, Any]]]] = [
+            (upstream_goal_id, [])
+        ]
+        visited = {upstream_goal_id}
+        cursor = 0
+        while cursor < len(pending):
+            current_goal_id, current_path = pending[cursor]
+            cursor += 1
+            for edge in edges_by_upstream_goal_id.get(current_goal_id, []):
+                next_goal_id = str(edge["downstreamGoalId"])
+                next_path = [*current_path, edge]
+                if next_goal_id == downstream_goal_id:
+                    return next_path
+                if next_goal_id in visited:
+                    continue
+                visited.add(next_goal_id)
+                pending.append((next_goal_id, next_path))
+        return []
+
+    goal_order = {
+        goal.goal_id: index
+        for index, goal in enumerate(contract.goals)
+    }
+    assigned_goal_ids = sorted(
+        query_ids_by_goal_id,
+        key=lambda goal_id: (goal_order.get(goal_id, len(goal_order)), goal_id),
+    )
+    issues: list[dict[str, Any]] = []
+    for upstream_goal_id in assigned_goal_ids:
+        for downstream_goal_id in assigned_goal_ids:
+            if upstream_goal_id == downstream_goal_id:
+                continue
+            path_edges = dependency_path(upstream_goal_id, downstream_goal_id)
+            if not path_edges:
+                continue
+            direct = len(path_edges) == 1
+            path_goal_ids = [upstream_goal_id]
+            path_goal_ids.extend(
+                str(edge["downstreamGoalId"])
+                for edge in path_edges
+            )
+            first_edge = path_edges[0]
+            if direct and first_edge["relationType"] == "DEPENDS_ON_GOAL_IDS":
+                code = "BATCH_GOAL_DEPENDS_ON_EDGE"
+            elif direct and first_edge["relationType"] == "DEPENDENCY_GOAL":
+                code = "BATCH_DEPENDENCY_GOAL_EDGE"
+            else:
+                code = "BATCH_TRANSITIVE_GOAL_DEPENDENCY_PATH"
+            issue: dict[str, Any] = {
+                "code": code,
+                "upstreamGoalId": upstream_goal_id,
+                "downstreamGoalId": downstream_goal_id,
+                "upstreamQueryIds": list(
+                    query_ids_by_goal_id[upstream_goal_id]
+                ),
+                "downstreamQueryIds": list(
+                    query_ids_by_goal_id[downstream_goal_id]
+                ),
+                "requiredExecution": "SERIAL",
+                "direct": direct,
+                "pathGoalIds": path_goal_ids,
+                "pathEdges": [dict(edge) for edge in path_edges],
+            }
+            dependency_goal_ids = list(
+                dict.fromkeys(
+                    str(edge.get("dependencyGoalId") or "")
+                    for edge in path_edges
+                    if str(edge.get("dependencyGoalId") or "")
+                )
+            )
+            if dependency_goal_ids:
+                issue["dependencyGoalIds"] = dependency_goal_ids
+            if direct and dependency_goal_ids:
+                dependency_goal_id = dependency_goal_ids[0]
+                issue["dependencyGoalId"] = dependency_goal_id
+                issue["dependencyGoalQueryIds"] = list(
+                    query_ids_by_goal_id.get(dependency_goal_id, [])
+                )
+            issues.append(issue)
+    return issues
+
+
+def _goal_assignment_contract_issues(
+    session: "GroundedDeepAgentSession",
+    goal_ids: list[str],
+    contract: Any,
+) -> list[dict[str, Any]]:
+    goal_contract = session.question_goal_contract
+    if goal_contract is None:
+        return [{"code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED"}]
+    selected_refs = set(getattr(contract, "evidence_refs", ()) or ())
+    issues: list[dict[str, Any]] = []
+    for goal_id in goal_ids:
+        goal = goal_contract.goal_map().get(goal_id)
+        if goal is None:
+            continue
+        declared_refs = set(getattr(goal, "semantic_ref_ids", ()) or ())
+        for attribute in ("metric_ref_id", "dimension_ref_id", "entity_ref_id"):
+            value = str(getattr(goal, attribute, "") or "").strip()
+            if value:
+                declared_refs.add(value)
+        if declared_refs and not declared_refs.intersection(selected_refs):
+            issues.append(
+                {
+                    "code": "QUERY_GOAL_SEMANTIC_REF_MISMATCH",
+                    "goalId": goal_id,
+                    "declaredSemanticRefIds": sorted(declared_refs),
+                    "contractEvidenceRefs": sorted(selected_refs),
+                }
+            )
+        if str(getattr(goal, "kind", "")) == "TIME_WINDOW":
+            time_range = getattr(contract, "time_range", None)
+            if time_range is None or not bool(getattr(time_range, "explicit", False)):
+                issues.append(
+                    {
+                        "code": "QUERY_GOAL_TIME_WINDOW_NOT_BOUND",
+                        "goalId": goal_id,
+                    }
+                )
+    return issues
+
+
 @dataclass
 class GroundedDeepAgentSession:
     runtime: GroundedRuntimeSession
@@ -146,6 +409,14 @@ class GroundedDeepAgentSession:
     analysis_skill_headers_disclosed: bool = False
     data_collection_sealed: bool = False
     analysis_skill_started: bool = False
+    parallel_branches: dict[str, GroundedRuntimeSession] = field(default_factory=dict)
+    parallel_branch_goal_ids: dict[str, list[str]] = field(default_factory=dict)
+    artifact_goal_ids: dict[str, list[str]] = field(default_factory=dict)
+    active_goal_ids: list[str] = field(default_factory=list)
+    question_goal_contract: Optional[OriginalQuestionGoalContract] = None
+    goal_coverage_result: dict[str, Any] = field(default_factory=dict)
+    operational_failure: dict[str, Any] = field(default_factory=dict)
+    runtime_budget_report: dict[str, Any] = field(default_factory=dict)
     lock: Any = field(default_factory=RLock, repr=False)
 
     def effective_topics(self) -> list[str]:
@@ -213,6 +484,7 @@ class GroundedDeepAgentRunContext:
     thread_id: str
     run_id: str
     session: GroundedDeepAgentSession
+    budget: Optional[GroundedRuntimeBudget] = None
     listener: Optional[Callable[[str, str, dict[str, Any]], None]] = None
 
 
@@ -651,6 +923,42 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         return result
 
 
+class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
+    """Enforce and measure the actual DeepAgent model/tool loop."""
+
+    name = "GroundedRuntimeBudgetMiddleware"
+
+    @staticmethod
+    def _budget_from_runtime(runtime: Any) -> Optional[GroundedRuntimeBudget]:
+        context = getattr(runtime, "context", None)
+        budget = getattr(context, "budget", None)
+        return budget if isinstance(budget, GroundedRuntimeBudget) else None
+
+    def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        budget = self._budget_from_runtime(getattr(request, "runtime", None))
+        if budget is None:
+            return handler(request)
+        budget.consume_llm_call(name="grounded_core")
+        model_settings = dict(getattr(request, "model_settings", None) or {})
+        model_settings["timeout"] = budget.clamp_timeout_seconds(
+            model_settings.get("timeout")
+        )
+        override = getattr(request, "override", None)
+        if callable(override):
+            request = override(model_settings=model_settings)
+        with budget.stage("llm.grounded_core"):
+            return handler(request)
+
+    def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        budget = self._budget_from_runtime(getattr(request, "runtime", None))
+        if budget is None:
+            return handler(request)
+        tool_name = str((getattr(request, "tool_call", None) or {}).get("name") or "tool")
+        budget.consume_tool_call(tool_name)
+        with budget.stage("tool.%s" % tool_name):
+            return handler(request)
+
+
 class GroundedDeepAgentRuntime:
     """Single DeepAgent Core backed only by GroundedRuntimeKernel tools."""
 
@@ -659,16 +967,18 @@ class GroundedDeepAgentRuntime:
 The first user message already contains the automatically selected Topic L0 manifest and one Topic-scoped thin recall. Recall is navigation evidence, never planning authority.
 Before execution, inspect userInputRequirements and the progressively-read semantic capabilities. Time is required for analytical aggregates, rankings, trends and unbounded detail lists unless the user supplied it. A concrete entity lookup is different: when the selected semantic field declares an entity identity and its lookupTimePolicy permits global/unbounded lookup, do not ask for time; bind the entity filter and let the Contract gate validate that policy. Never infer this exception from a business-specific field name or value pattern.
 The first user message also contains trustedExecutionScope. It is authoritative runtime state, not a user claim. When merchantScopeBound=true, never ask the user for merchant_id and never propose bypassing tenant filtering; the executor binds the declared merchant scope automatically.
+Before proposing any query Contract, call declare_original_question_goals exactly once with a typed, complete ledger of the original question's metric, dimension, time-window, comparison, entity and dependency goals. Preserve explicit conjunctions and comparison operands. After exact semantic refs have been read, attach them to the corresponding metric, dimension and entity goals so final coverage can be checked against artifact evidence rather than labels alone. Every serial or parallel query must declare the goalIds it covers. Finalization is blocked until every required goal and dependency is covered by verified artifacts.
 Use native ls/read_file/grep progressively under /knowledge. Read exact table detail, metric, column and relationship files before proposing bindings.
 Published metric files already contain the governed formula, source columns, unit and time semantics. When metricRefs satisfy the question, do not also submit fieldAggregations for the same measures.
 One Grounded Contract represents one coherent execution shape. Never combine metrics whose timeSemantics.selectionPolicy values differ. A period_window metric is a period scalar and must not be grouped by the time dimension; a per_time_grain metric over multiple days must preserve that time dimension. If the gate returns REVISE_BINDINGS, follow requiredCapability and submit a smaller compatible binding set before execution.
 For a simple same-table scalar metric query, the expected disclosure path is table detail plus the exact metric files. Do not read schema, columns/index.json, the time column, or metric source-column files unless the question needs a field aggregation, business dimension, filter, join, or a published metric is unavailable.
 When thinRecallCandidates already contains an exact readable path, read that path directly instead of opening an index. Never navigate to asset.json or a #fragment path.
 Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
-GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC means the runtime may execute the single published scalar metric directly. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. Implement sqlObligations exactly. The runtime will not invent grouping, filters, joins, CTEs, windows, ranking, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
+GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC, DETERMINISTIC_MULTI_METRIC, DETERMINISTIC_GROUPED, DETERMINISTIC_TREND, DETERMINISTIC_RANKED and DETERMINISTIC_ENTITY_LOOKUP are runtime-owned deterministic compilation modes and may be executed directly; they compile only the already-grounded Contract and never plan goals or impose an execution order. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. Implement sqlObligations exactly. The runtime will not invent semantic bindings, joins, CTEs, windows, complex dependency logic, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
 propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. Use analysisMode=ENTITY_LOOKUP for a concrete entity lookup and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
-Available governed tools are retrieve_knowledge, propose_grounded_contract, submit_grounded_sql_candidate, execute_grounded_query, publish_verified_entity_set, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
+Available governed tools are declare_original_question_goals, retrieve_knowledge, propose_grounded_contract, prepare_grounded_query_batch, submit_grounded_sql_candidate, execute_grounded_query, execute_grounded_query_batch, publish_verified_entity_set, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
 One verified query may be only partial evidence for the user's question. When a later query depends on a verified entity output, call publish_verified_entity_set, progressively read the downstream target field, and propose a new Contract using upstreamEntityBindings. Do not treat a first successful TopN/entity query as the end of data collection. Each query remains an independent grounded QueryGraph chosen dynamically by you, not a fixed workflow.
+When two or more query goals are independent and none uses upstreamEntityBindings, prepare them together with prepare_grounded_query_batch and execute them with execute_grounded_query_batch. The runtime gives every branch its own Contract generation and adopts only independently verified artifacts. Never batch an entity chain: publish the upstream entity set first, then run the dependent Contract serially.
 Analysis Skill headers are not disclosed by an individual query. The Core cannot read SKILL.md and must never use a Skill procedure or header to choose metrics, dimensions, tables, or Contract shape. After every datum required by the original question is in the verified evidence portfolio, call finalize_evidence_collection. Only that gate may disclose Skill headers and seal data collection. Then select at most one matching Skill or compose the verified answer. run_skill is a one-way isolation boundary: after it starts, do not retrieve more knowledge, propose another Contract, execute another query, or call run_skill again. It mounts the selected full Skill for an independent subagent, workspace and checkpoint, streams progress, and publishes a structured result artifact. Do not use task for Skill execution.
 Use retrieve_knowledge only for a targeted supplemental query; it remains inside the active Topic workspace. Governed-rule recall items marked INLINE_ONLY are usable snippets, not filesystem refs and not binding evidence. Do not read /knowledge/topics/index.json or open another Topic merely to compare alternatives. Topic expansion is allowed only after a submitted Contract returns REVISE_BINDINGS with a structured requiredCapability/searchScope gap based on evidence already read in the active Topic. A read relationship may establish that a required endpoint table is outside the current workspace; submit that relationship in the candidate Contract, then follow the returned gap to read the Topic index and exactly one relevant Topic manifest. Never expand from a normal pending request or a failed filename guess.
 Do not call task in this runtime. SubAgent dispatch is disabled until worker evidence acceptance is independently auditable.
@@ -688,13 +998,17 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         skill_root: Optional[str] = None,
         skill_run_root: Optional[str] = None,
         isolated_subagent_model: Any = None,
+        parallel_max_workers: int = 4,
+        settings: Any = None,
         agent_factory: Any = None,
         backend: Any = None,
     ):
         self.kernel = kernel
         self.semantic_catalog = semantic_catalog
+        self.settings = settings
         self.checkpointer = checkpointer
         self.checkpoint_config_factory = checkpoint_config_factory
+        self.parallel_max_workers = max(1, min(int(parallel_max_workers or 1), 8))
         self.skill_root = Path(skill_root).resolve() if skill_root else None
         self.skill_run_root = Path(
             skill_run_root or ".merchant-ai/skill-runs"
@@ -710,6 +1024,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(
             self.knowledge_backend
         )
+        self.budget_middleware = GroundedRuntimeBudgetMiddleware()
         self.backend = backend or self._build_backend()
         self.tools = self._build_tools()
         self.initialization_error = ""
@@ -738,7 +1053,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 model=model,
                 tools=self.tools,
                 system_prompt=self.SYSTEM_PROMPT,
-                middleware=[self.core_tool_boundary],
+                middleware=[self.budget_middleware, self.core_tool_boundary],
                 subagents=[
                     {
                         # deepagents 0.6.x otherwise appends a default worker
@@ -836,6 +1151,84 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
     def _build_tools(self) -> list[Any]:
         runtime_owner = self
 
+        @tool("declare_original_question_goals")
+        def declare_original_question_goals(
+            contract: OriginalQuestionGoalContract,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Commit the immutable, typed coverage ledger for the original question."""
+
+            deep_session = runtime.context.session
+            try:
+                parsed = parse_original_question_goal_contract(contract)
+            except Exception as exc:
+                issues = [
+                    item.model_dump(by_alias=True)
+                    for item in getattr(exc, "issues", ())
+                ]
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "ORIGINAL_QUESTION_GOAL_CONTRACT_INVALID",
+                        "message": str(exc)[:500],
+                        "issues": issues,
+                        "nextAction": "REVISE_GOAL_CONTRACT",
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            if parsed.question.strip() != deep_session.runtime.question.strip():
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "GOAL_CONTRACT_QUESTION_MISMATCH",
+                        "message": "The goal ledger must retain the exact original question.",
+                    },
+                    ensure_ascii=False,
+                )
+            fingerprint = original_question_goal_contract_fingerprint(parsed)
+            with deep_session.lock:
+                existing = deep_session.question_goal_contract
+                if existing is not None:
+                    existing_fingerprint = (
+                        original_question_goal_contract_fingerprint(existing)
+                    )
+                    if existing_fingerprint != fingerprint and (
+                        deep_session.runtime.attempts
+                        or deep_session.runtime.verified_query_ledger
+                        or deep_session.parallel_branches
+                    ):
+                        return json.dumps(
+                            {
+                                "status": "REJECTED",
+                                "code": "GOAL_CONTRACT_IMMUTABLE_AFTER_QUERY_START",
+                                "contractFingerprint": existing_fingerprint,
+                            },
+                            ensure_ascii=False,
+                        )
+                deep_session.question_goal_contract = parsed.model_copy(deep=True)
+            return json.dumps(
+                {
+                    "status": "ACCEPTED",
+                    "contractId": parsed.contract_id,
+                    "contractFingerprint": fingerprint,
+                    "requiredGoalIds": required_goal_ids(parsed),
+                    "goals": [
+                        {
+                            "goalId": goal.goal_id,
+                            "kind": goal.kind,
+                            "label": goal.label,
+                            "required": goal.required,
+                            "dependsOnGoalIds": list(goal.depends_on_goal_ids),
+                        }
+                        for goal in parsed.goals
+                    ],
+                    "nextAction": "READ_SEMANTICS_AND_PROPOSE_QUERY_CONTRACTS",
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
         @tool("retrieve_knowledge")
         def retrieve_knowledge(
             query: str,
@@ -892,6 +1285,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
         def propose_grounded_contract(
             read_ref_ids: list[str],
             binding_hints: GroundedBindingHints,
+            goal_ids: list[str],
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
             """Propose from exact Core reads using the strict typed BindingHints schema."""
@@ -906,6 +1300,12 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     },
                     ensure_ascii=False,
                 )
+            assigned_goal_ids, goal_error = _validated_goal_assignment(
+                session,
+                goal_ids,
+            )
+            if goal_error:
+                return json.dumps(goal_error, ensure_ascii=False)
             if not isinstance(binding_hints, GroundedBindingHints):
                 binding_hints = GroundedBindingHints.model_validate(binding_hints)
             binding_hints = _canonical_binding_hints(binding_hints)
@@ -961,6 +1361,21 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     binding_hints,
                     topics=session.effective_topics(),
                 )
+                assignment_issues = _goal_assignment_contract_issues(
+                    session,
+                    assigned_goal_ids,
+                    attempt.contract,
+                )
+                if assignment_issues:
+                    return json.dumps(
+                        {
+                            "status": "BLOCKED",
+                            "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
+                            "issues": assignment_issues,
+                            "nextAction": "REVISE_BINDINGS_OR_GOAL_ASSIGNMENT",
+                        },
+                        ensure_ascii=False,
+                    )
                 if attempt.contract.ready:
                     attempt = runtime_owner.kernel.activate_contract(
                         session.runtime,
@@ -989,6 +1404,9 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     },
                     ensure_ascii=False,
                 )
+            if attempt.activated:
+                with session.lock:
+                    session.active_goal_ids = list(assigned_goal_ids)
             contract_fingerprint = grounded_query_contract_fingerprint(
                 attempt.contract
             )
@@ -1014,6 +1432,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     "acceptedBindingHints": _core_visible_binding_hints(
                         attempt.contract
                     ),
+                    "assignedGoalIds": list(assigned_goal_ids),
                     "gaps": [
                         gap.model_dump(by_alias=True)
                         for gap in attempt.contract.unresolved_gaps
@@ -1022,6 +1441,448 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                         item.model_dump(by_alias=True)
                         for item in attempt.contract.rejected_bindings
                     ],
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("prepare_grounded_query_batch")
+        def prepare_grounded_query_batch(
+            queries: list[GroundedParallelQuerySpec],
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Prepare isolated Contract generations for independent query goals."""
+
+            deep_session = runtime.context.session
+            if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
+                return json.dumps(
+                    {
+                        "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
+                        "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                    },
+                    ensure_ascii=False,
+                )
+            normalized = [
+                item
+                if isinstance(item, GroundedParallelQuerySpec)
+                else GroundedParallelQuerySpec.model_validate(item)
+                for item in queries
+            ]
+            if not normalized:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_QUERY_BATCH_EMPTY",
+                    },
+                    ensure_ascii=False,
+                )
+            if len(normalized) > runtime_owner.parallel_max_workers:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_QUERY_BATCH_TOO_LARGE",
+                        "maxWorkers": runtime_owner.parallel_max_workers,
+                    },
+                    ensure_ascii=False,
+                )
+            query_ids = [str(item.query_id or "").strip() for item in normalized]
+            if any(not item for item in query_ids) or len(set(query_ids)) != len(query_ids):
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_QUERY_ID_INVALID",
+                    },
+                    ensure_ascii=False,
+                )
+            goal_assignments_by_query_id: dict[str, list[str]] = {}
+            goal_errors_by_query_id: dict[str, dict[str, Any]] = {}
+            for raw_item, query_id in zip(normalized, query_ids):
+                assigned_goal_ids, goal_error = _validated_goal_assignment(
+                    deep_session,
+                    raw_item.goal_ids,
+                )
+                goal_assignments_by_query_id[query_id] = assigned_goal_ids
+                if goal_error:
+                    goal_errors_by_query_id[query_id] = goal_error
+            goal_contract = deep_session.question_goal_contract
+            dependency_issues = (
+                _parallel_goal_dependency_issues(
+                    goal_contract,
+                    {
+                        query_id: goal_ids
+                        for query_id, goal_ids in goal_assignments_by_query_id.items()
+                        if query_id not in goal_errors_by_query_id
+                    },
+                )
+                if goal_contract is not None
+                else []
+            )
+            if dependency_issues:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_GOAL_DEPENDENCY_DETECTED",
+                        "issues": dependency_issues,
+                        "instruction": (
+                            "Only mutually independent goals may share a batch. "
+                            "Dependency-connected goals are ineligible for this batch "
+                            "and must use the governed serial query tools."
+                        ),
+                        "nextAction": "USE_SERIAL_GROUNDED_QUERY_TOOLS",
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            with deep_session.lock:
+                evidence_by_ref = {
+                    str(item.get("refId") or ""): dict(item)
+                    for item in deep_session.core_semantic_evidence
+                    if str(item.get("refId") or "")
+                }
+            prepared: list[dict[str, Any]] = []
+            for raw_item, query_id in zip(normalized, query_ids):
+                assigned_goal_ids = goal_assignments_by_query_id[query_id]
+                goal_error = goal_errors_by_query_id.get(query_id, {})
+                if goal_error:
+                    prepared.append(
+                        {
+                            "queryId": query_id,
+                            **goal_error,
+                        }
+                    )
+                    continue
+                hints = _canonical_binding_hints(raw_item.binding_hints)
+                if hints.upstream_entity_bindings:
+                    prepared.append(
+                        {
+                            "queryId": query_id,
+                            "status": "REJECTED",
+                            "code": "DEPENDENT_QUERY_REQUIRES_SERIAL_EXECUTION",
+                            "instruction": (
+                                "Publish and bind the verified upstream entity set, then use "
+                                "the serial propose/submit/execute tools."
+                            ),
+                        }
+                    )
+                    continue
+                requested = list(
+                    dict.fromkeys(
+                        _canonical_progressive_ref(str(ref_id or "").strip())
+                        for ref_id in raw_item.read_ref_ids
+                        if str(ref_id or "").strip()
+                    )
+                )
+                missing = [ref_id for ref_id in requested if ref_id not in evidence_by_ref]
+                if missing:
+                    prepared.append(
+                        {
+                            "queryId": query_id,
+                            "status": "BLOCKED",
+                            "code": "SEMANTIC_REF_NOT_READ",
+                            "missingRefs": missing,
+                        }
+                    )
+                    continue
+                branch = runtime_owner.kernel.fork_query_branch(
+                    deep_session.runtime,
+                    query_id,
+                )
+                try:
+                    attempt = runtime_owner.kernel.propose_contract(
+                        branch,
+                        [evidence_by_ref[ref_id] for ref_id in requested],
+                        hints,
+                        topics=deep_session.effective_topics(),
+                    )
+                    assignment_issues = _goal_assignment_contract_issues(
+                        deep_session,
+                        assigned_goal_ids,
+                        attempt.contract,
+                    )
+                    if assignment_issues:
+                        prepared.append(
+                            {
+                                "queryId": query_id,
+                                "status": "BLOCKED",
+                                "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
+                                "issues": assignment_issues,
+                            }
+                        )
+                        continue
+                    if attempt.contract.ready:
+                        attempt = runtime_owner.kernel.activate_contract(
+                            branch,
+                            attempt.attempt_id,
+                        )
+                except GroundedRuntimeBudgetExceeded:
+                    raise
+                except Exception as exc:
+                    prepared.append(
+                        {
+                            "queryId": query_id,
+                            "status": "BLOCKED",
+                            "code": "PARALLEL_CONTRACT_PREPARATION_FAILED",
+                            "message": "%s:%s"
+                            % (type(exc).__name__, str(exc)[:400]),
+                        }
+                    )
+                    continue
+                if not attempt.activated:
+                    prepared.append(
+                        {
+                            "queryId": query_id,
+                            "status": attempt.contract.status,
+                            "code": "PARALLEL_CONTRACT_NOT_READY",
+                            "gaps": [
+                                gap.model_dump(by_alias=True)
+                                for gap in attempt.contract.unresolved_gaps
+                            ],
+                        }
+                    )
+                    continue
+                with deep_session.lock:
+                    deep_session.parallel_branches[query_id] = branch
+                    deep_session.parallel_branch_goal_ids[query_id] = list(
+                        assigned_goal_ids
+                    )
+                prepared.append(
+                    {
+                        "queryId": query_id,
+                        "status": "PREPARED",
+                        "queryShape": attempt.contract.query_shape,
+                        "executionMode": attempt.execution_mode,
+                        "activeGeneration": attempt.active_generation,
+                        "contractFingerprint": grounded_query_contract_fingerprint(
+                            attempt.contract
+                        ),
+                        "sqlObligations": _grounded_contract_sql_obligations(
+                            attempt.contract
+                        ),
+                        "goalIds": list(assigned_goal_ids),
+                        "nextAction": (
+                            "EXECUTE_BATCH"
+                            if attempt.execution_mode
+                            != "CORE_SQL_REQUIRED"
+                            else "AUTHOR_SQL_THEN_EXECUTE_BATCH"
+                        ),
+                    }
+                )
+            ready_count = sum(item.get("status") == "PREPARED" for item in prepared)
+            return json.dumps(
+                {
+                    "status": "PREPARED" if ready_count else "BLOCKED",
+                    "preparedCount": ready_count,
+                    "maxWorkers": runtime_owner.parallel_max_workers,
+                    "queries": prepared,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("execute_grounded_query_batch")
+        def execute_grounded_query_batch(
+            queries: list[GroundedParallelExecutionSpec],
+            reason: str,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Execute prepared independent branches concurrently and adopt verified artifacts."""
+
+            deep_session = runtime.context.session
+            if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
+                return json.dumps(
+                    {
+                        "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
+                        "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                    },
+                    ensure_ascii=False,
+                )
+            normalized = [
+                item
+                if isinstance(item, GroundedParallelExecutionSpec)
+                else GroundedParallelExecutionSpec.model_validate(item)
+                for item in queries
+            ]
+            if not normalized or len(normalized) > runtime_owner.parallel_max_workers:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_EXECUTION_BATCH_SIZE_INVALID",
+                        "maxWorkers": runtime_owner.parallel_max_workers,
+                    },
+                    ensure_ascii=False,
+                )
+            query_ids = [str(item.query_id or "").strip() for item in normalized]
+            if any(not item for item in query_ids) or len(set(query_ids)) != len(query_ids):
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_QUERY_ID_INVALID",
+                    },
+                    ensure_ascii=False,
+                )
+            with deep_session.lock:
+                branch_by_id = {
+                    query_id: deep_session.parallel_branches.get(query_id)
+                    for query_id in query_ids
+                }
+            missing_branches = [
+                query_id for query_id, branch in branch_by_id.items() if branch is None
+            ]
+            if missing_branches:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "PARALLEL_BRANCH_NOT_PREPARED",
+                        "queryIds": missing_branches,
+                    },
+                    ensure_ascii=False,
+                )
+
+            def execute_one(
+                item: GroundedParallelExecutionSpec,
+            ) -> tuple[str, GroundedRuntimeSession, dict[str, Any]]:
+                query_id = str(item.query_id).strip()
+                branch = branch_by_id[query_id]
+                assert branch is not None
+                try:
+                    if str(
+                        getattr(
+                            branch.active_execution_mode,
+                            "value",
+                            branch.active_execution_mode,
+                        )
+                    ) == "CORE_SQL_REQUIRED":
+                        if not str(item.sql or "").strip():
+                            return query_id, branch, {
+                                "queryId": query_id,
+                                "status": "BLOCKED",
+                                "code": "CORE_SQL_CANDIDATE_REQUIRED",
+                            }
+                        contract = branch.active_contract
+                        if contract is None:
+                            raise RuntimeError("parallel branch has no active Contract")
+                        submitted = runtime_owner.kernel.submit_sql_candidate(
+                            branch,
+                            item.sql,
+                            expected_generation=branch.active_generation,
+                            expected_contract_fingerprint=(
+                                grounded_query_contract_fingerprint(contract)
+                            ),
+                            rationale=item.rationale or reason,
+                            evidence_refs=item.evidence_ref_ids,
+                        )
+                        if submitted.status != "ACCEPTED":
+                            return query_id, branch, {
+                                "queryId": query_id,
+                                "status": submitted.status,
+                                "nextAction": submitted.next_action,
+                                "gaps": submitted.validation_gaps,
+                            }
+                    budget = runtime.context.budget
+                    if budget is not None:
+                        budget.consume_doris_query(
+                            name="parallel.%s" % query_id
+                        )
+                    if budget is None:
+                        run_result = runtime_owner.kernel.execute_active(
+                            branch,
+                            run_id="%s__%s" % (runtime.context.run_id, query_id),
+                        )
+                        verified = runtime_owner.kernel.verify_active(branch)
+                    else:
+                        with budget.stage("doris.parallel.%s" % query_id):
+                            run_result = runtime_owner.kernel.execute_active(
+                                branch,
+                                run_id="%s__%s"
+                                % (runtime.context.run_id, query_id),
+                                runtime_budget=budget,
+                            )
+                        with budget.stage("evidence.parallel.%s" % query_id):
+                            verified = runtime_owner.kernel.verify_active(branch)
+                    artifact = runtime_owner.kernel.latest_verified_query_artifact(
+                        branch
+                    )
+                    return query_id, branch, {
+                        "queryId": query_id,
+                        "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
+                        "queryArtifactId": artifact.artifact_id if artifact else "",
+                        "rowCount": len(run_result.merged_query_bundle.rows),
+                        "tables": list(run_result.merged_query_bundle.tables),
+                        "blockingGaps": [
+                            gap.model_dump(by_alias=True)
+                            for gap in verified.blocking_gaps
+                        ],
+                    }
+                except GroundedRuntimeBudgetExceeded:
+                    raise
+                except Exception as exc:
+                    return query_id, branch, {
+                        "queryId": query_id,
+                        "status": "FAILED",
+                        "code": "PARALLEL_QUERY_EXECUTION_FAILED",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:500]),
+                    }
+
+            results: list[dict[str, Any]] = []
+            successful_branches: list[GroundedRuntimeSession] = []
+            with ThreadPoolExecutor(
+                max_workers=min(len(normalized), runtime_owner.parallel_max_workers),
+                thread_name_prefix="grounded-query",
+            ) as pool:
+                futures = {pool.submit(execute_one, item): item.query_id for item in normalized}
+                for future in as_completed(futures):
+                    query_id, branch, result = future.result()
+                    results.append(result)
+                    if result.get("status") == "VERIFIED":
+                        successful_branches.append(branch)
+            successful_branches.sort(
+                key=lambda branch: query_ids.index(
+                    next(
+                        query_id
+                        for query_id, candidate in branch_by_id.items()
+                        if candidate is branch
+                    )
+                )
+            )
+            adopted = runtime_owner.kernel.adopt_verified_branches(
+                deep_session.runtime,
+                successful_branches,
+            )
+            artifact_ids = {artifact.artifact_id for artifact in adopted}
+            with deep_session.lock:
+                for result in results:
+                    artifact_id = str(result.get("queryArtifactId") or "")
+                    query_id = str(result.get("queryId") or "")
+                    if artifact_id and artifact_id in artifact_ids:
+                        deep_session.artifact_goal_ids[artifact_id] = list(
+                            deep_session.parallel_branch_goal_ids.get(query_id) or []
+                        )
+                for query_id in query_ids:
+                    deep_session.parallel_branches.pop(query_id, None)
+                    deep_session.parallel_branch_goal_ids.pop(query_id, None)
+            results.sort(key=lambda item: query_ids.index(str(item.get("queryId") or "")))
+            return json.dumps(
+                {
+                    "status": (
+                        "VERIFIED"
+                        if len(adopted) == len(normalized)
+                        else "PARTIAL"
+                        if adopted
+                        else "FAILED"
+                    ),
+                    "reason": str(reason or "")[:500],
+                    "executedInParallel": True,
+                    "workerCount": min(
+                        len(normalized), runtime_owner.parallel_max_workers
+                    ),
+                    "adoptedArtifactIds": [item.artifact_id for item in adopted],
+                    "queries": results,
+                    "nextAction": (
+                        "CONTINUE_QUERYING_OR_FINALIZE"
+                        if adopted
+                        else "REVISE_BINDINGS_OR_SQL"
+                    ),
                 },
                 ensure_ascii=False,
                 default=str,
@@ -1057,6 +1918,8 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     rationale=rationale,
                     evidence_refs=evidence_ref_ids,
                 )
+            except GroundedRuntimeBudgetExceeded:
+                raise
             except RuntimeError as exc:
                 message = str(exc)
                 stale = "SQL_CANDIDATE_STALE_CONTRACT" in message
@@ -1143,11 +2006,26 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 )
             session = deep_session.runtime
             try:
-                run_result = runtime_owner.kernel.execute_active(
-                    session,
-                    run_id=runtime.context.run_id,
-                )
-                verified = runtime_owner.kernel.verify_active(session)
+                budget = runtime.context.budget
+                if budget is not None:
+                    budget.consume_doris_query(name="serial.grounded_query")
+                if budget is None:
+                    run_result = runtime_owner.kernel.execute_active(
+                        session,
+                        run_id=runtime.context.run_id,
+                    )
+                    verified = runtime_owner.kernel.verify_active(session)
+                else:
+                    with budget.stage("doris.serial"):
+                        run_result = runtime_owner.kernel.execute_active(
+                            session,
+                            run_id=runtime.context.run_id,
+                            runtime_budget=budget,
+                        )
+                    with budget.stage("evidence.serial"):
+                        verified = runtime_owner.kernel.verify_active(session)
+            except GroundedRuntimeBudgetExceeded:
+                raise
             except RuntimeError as exc:
                 message = str(exc)
                 no_progress = "SQL_EXECUTION_NO_PROGRESS" in message
@@ -1272,12 +2150,20 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                 if verified.passed and callable(latest_artifact)
                 else None
             )
+            if query_artifact is not None:
+                with deep_session.lock:
+                    deep_session.artifact_goal_ids[
+                        query_artifact.artifact_id
+                    ] = list(deep_session.active_goal_ids)
             return json.dumps(
                 {
                     "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
                     "reason": str(reason or "")[:500],
                     "queryArtifactId": (
                         query_artifact.artifact_id if query_artifact else ""
+                    ),
+                    "coveredGoalIds": list(
+                        deep_session.active_goal_ids if query_artifact else []
                     ),
                     "rowCount": len(run_result.merged_query_bundle.rows),
                     "tables": list(run_result.merged_query_bundle.tables),
@@ -1408,10 +2294,44 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             """Compose and store the final answer from verified evidence only."""
 
             try:
+                runtime_owner._require_complete_goal_coverage(
+                    runtime.context.session
+                )
+            except GoalCoverageBlocked as exc:
+                result = exc.result.model_dump(by_alias=True)
+                runtime.context.session.goal_coverage_result = result
+                return json.dumps(
+                    {
+                        "status": "GOAL_COVERAGE_INCOMPLETE",
+                        "code": "ORIGINAL_QUESTION_GOALS_UNCOVERED",
+                        "missingRequiredGoalIds": result.get(
+                            "missingRequiredGoalIds", []
+                        ),
+                        "issues": result.get("issues", []),
+                        "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except RuntimeError as exc:
+                return json.dumps(
+                    {
+                        "status": "GOAL_CONTRACT_REQUIRED",
+                        "code": str(exc),
+                        "nextAction": "DECLARE_ORIGINAL_QUESTION_GOALS",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
+                compose_kwargs: dict[str, Any] = {"allow_llm": allow_llm}
+                if runtime.context.budget is not None:
+                    compose_kwargs["runtime_budget"] = runtime.context.budget
                 answer = runtime_owner.kernel.compose_answer(
                     runtime.context.session.runtime,
-                    allow_llm=allow_llm,
+                    **compose_kwargs,
                 )
+            except GroundedRuntimeBudgetExceeded:
+                raise
             except RuntimeError as exc:
                 message = str(exc)
                 incomplete = "EVIDENCE_PORTFOLIO_INCOMPLETE" in message
@@ -1472,6 +2392,35 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     ensure_ascii=False,
                 )
             try:
+                coverage = runtime_owner._require_complete_goal_coverage(
+                    deep_session
+                )
+            except GoalCoverageBlocked as exc:
+                result = exc.result.model_dump(by_alias=True)
+                deep_session.goal_coverage_result = result
+                return json.dumps(
+                    {
+                        "status": "EVIDENCE_INCOMPLETE",
+                        "code": "ORIGINAL_QUESTION_GOALS_UNCOVERED",
+                        "missingRequiredGoalIds": result.get(
+                            "missingRequiredGoalIds", []
+                        ),
+                        "issues": result.get("issues", []),
+                        "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except RuntimeError as exc:
+                return json.dumps(
+                    {
+                        "status": "EVIDENCE_INCOMPLETE",
+                        "code": str(exc),
+                        "nextAction": "DECLARE_ORIGINAL_QUESTION_GOALS",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
                 plan, run_result, verified, artifact_ids = (
                     runtime_owner.kernel.verify_portfolio(
                         deep_session.runtime
@@ -1520,6 +2469,7 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     "status": "EVIDENCE_COLLECTION_SEALED",
                     "reason": str(reason or "")[:500],
                     "verifiedQueryArtifactIds": artifact_ids,
+                    "goalCoverage": coverage.model_dump(by_alias=True),
                     "rowCount": len(run_result.merged_query_bundle.rows),
                     "tables": list(run_result.merged_query_bundle.tables),
                     "availableAnalysisSkillHeaders": list(
@@ -1594,10 +2544,13 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             )
 
         return [
+            declare_original_question_goals,
             retrieve_knowledge,
             propose_grounded_contract,
+            prepare_grounded_query_batch,
             submit_grounded_sql_candidate,
             execute_grounded_query,
+            execute_grounded_query_batch,
             publish_verified_entity_set,
             finalize_evidence_collection,
             compose_verified_answer,
@@ -2309,6 +3262,30 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     )
                 )
 
+    @staticmethod
+    def _require_complete_goal_coverage(
+        session: GroundedDeepAgentSession,
+    ) -> Any:
+        contract = session.question_goal_contract
+        if contract is None:
+            raise RuntimeError("ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED")
+        declarations: list[VerifiedArtifactGoalCoverage] = []
+        for artifact in session.runtime.verified_query_ledger:
+            declarations.append(
+                declare_verified_artifact_goal_coverage(
+                    contract,
+                    artifact,
+                    session.artifact_goal_ids.get(artifact.artifact_id) or [],
+                    evidence_refs=artifact.contract.evidence_refs,
+                )
+            )
+        result = GoalCoverageVerifier().require_complete(
+            contract,
+            declarations,
+        )
+        session.goal_coverage_result = result.model_dump(by_alias=True)
+        return result
+
     def run(
         self,
         question: str,
@@ -2323,53 +3300,120 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
     ) -> ChatResponse:
         actual_thread_id = thread_id or "thread_%s" % uuid.uuid4().hex
         actual_run_id = run_id or "run_%s" % uuid.uuid4().hex
-        kernel_session = self.kernel.new_session(
-            question,
-            merchant_id,
-            merchant=merchant,
-            access_role=access_role,
-            user_scope=user_scope,
-        )
-        self.kernel.route_topic(kernel_session)
+        budget = GroundedRuntimeBudget.from_settings(self.settings or object())
+        kernel_session: Optional[GroundedRuntimeSession] = None
+        session: Optional[GroundedDeepAgentSession] = None
         try:
-            self.kernel.recall_navigation(kernel_session)
-        except Exception as exc:
-            kernel_session.recall = RecallBundle()
-            kernel_session.phase = "RECALL_NAVIGATION_DEGRADED"
-            kernel_session.events.append(
-                GroundedRuntimeEvent(
-                    sequence=len(kernel_session.events) + 1,
-                    stage="recall_navigation",
-                    status="DEGRADED",
-                    detail="%s:%s"
-                    % (type(exc).__name__, str(exc)[:500]),
+            with budget.stage("bootstrap.session"):
+                kernel_session = self.kernel.new_session(
+                    question,
+                    merchant_id,
+                    merchant=merchant,
+                    access_role=access_role,
+                    user_scope=user_scope,
                 )
+            with budget.stage("routing.topic"):
+                self.kernel.route_topic(kernel_session)
+            try:
+                with budget.stage("recall.initial"):
+                    self.kernel.recall_navigation(kernel_session)
+            except GroundedRuntimeBudgetExceeded:
+                raise
+            except Exception as exc:
+                kernel_session.recall = RecallBundle()
+                kernel_session.phase = "RECALL_NAVIGATION_DEGRADED"
+                kernel_session.events.append(
+                    GroundedRuntimeEvent(
+                        sequence=len(kernel_session.events) + 1,
+                        stage="recall_navigation",
+                        status="DEGRADED",
+                        detail="%s:%s"
+                        % (type(exc).__name__, str(exc)[:500]),
+                    )
+                )
+            session = GroundedDeepAgentSession(runtime=kernel_session)
+            context = GroundedDeepAgentRunContext(
+                thread_id=actual_thread_id,
+                run_id=actual_run_id,
+                session=session,
+                budget=budget,
+                listener=listener,
             )
-        session = GroundedDeepAgentSession(runtime=kernel_session)
-        context = GroundedDeepAgentRunContext(
-            thread_id=actual_thread_id,
-            run_id=actual_run_id,
-            session=session,
-            listener=listener,
-        )
-        first_context = self._initial_context(session)
-        if self.checkpoint_config_factory is not None:
-            config = self.checkpoint_config_factory(actual_thread_id, actual_run_id)
-        elif self.checkpointer is not None:
-            config = {
-                "configurable": {
-                    "thread_id": actual_thread_id,
-                    "run_id": actual_run_id,
+            with budget.stage("bootstrap.context"):
+                first_context = self._initial_context(session)
+            if self.checkpoint_config_factory is not None:
+                config = self.checkpoint_config_factory(actual_thread_id, actual_run_id)
+            elif self.checkpointer is not None:
+                config = {
+                    "configurable": {
+                        "thread_id": actual_thread_id,
+                        "run_id": actual_run_id,
+                    }
                 }
+            else:
+                config = None
+            with self.knowledge_backend.scope(session):
+                with budget.stage("core.react_loop"):
+                    self.deep_agent_graph.invoke(
+                        {"messages": [{"role": "user", "content": first_context}]},
+                        config=config,
+                        context=context,
+                    )
+        except GroundedRuntimeBudgetExceeded as exc:
+            failure = {
+                "code": "GROUNDED_RUNTIME_BUDGET_EXHAUSTED",
+                "message": str(exc),
+                "breaches": list(exc.breaches),
+                "report": dict(exc.report),
             }
-        else:
-            config = None
-        with self.knowledge_backend.scope(session):
-            self.deep_agent_graph.invoke(
-                {"messages": [{"role": "user", "content": first_context}]},
-                config=config,
-                context=context,
+            if session is None and kernel_session is not None:
+                session = GroundedDeepAgentSession(runtime=kernel_session)
+            report = budget.finish()
+            if session is None:
+                _emit_runtime_listener(
+                    listener,
+                    "runtime.budget_exhausted",
+                    "GROUNDED_CORE",
+                    failure,
+                )
+                return ChatResponse(
+                    answer=(
+                        "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
+                        "请缩小查询范围，或稍后重试。"
+                    ),
+                    debug_trace={
+                        "harness": {
+                            "runtime": "grounded_deepagent",
+                            "threadId": actual_thread_id,
+                            "runId": actual_run_id,
+                            "legacyFallbackUsed": False,
+                            "runtimeBudget": report,
+                            "goalCoverage": {},
+                            "operationalFailure": failure,
+                        }
+                    },
+                )
+            session.operational_failure = {
+                **failure,
+                "report": report,
+            }
+            session.runtime.phase = "BUDGET_EXHAUSTED"
+            session.runtime_budget_report = report
+            _emit_runtime_listener(
+                listener,
+                "runtime.budget_exhausted",
+                "GROUNDED_CORE",
+                session.operational_failure,
             )
+            return self._governed_response(
+                session,
+                actual_thread_id,
+                actual_run_id,
+            )
+        finally:
+            if session is not None and not session.runtime_budget_report:
+                session.runtime_budget_report = budget.finish()
+        assert session is not None
         return self._governed_response(session, actual_thread_id, actual_run_id)
 
     def _initial_context(self, session: GroundedDeepAgentSession) -> str:
@@ -2434,6 +3478,23 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
             "topicRouting": session.runtime.routing.model_dump(by_alias=True),
             "topicL0Manifests": manifests,
             "thinRecallCandidates": _thin_recall(session.runtime.recall, limit=8),
+            "originalQuestionGoalPolicy": {
+                "requiredBeforeQuery": True,
+                "immutableAfterQueryStart": True,
+                "goalKinds": [
+                    "METRIC",
+                    "DIMENSION",
+                    "TIME_WINDOW",
+                    "COMPARISON",
+                    "ENTITY",
+                    "DEPENDENCY",
+                ],
+                "queryAssignmentRequired": True,
+                "finalizationRequiresVerifiedCoverage": True,
+                "parallelRule": (
+                    "Only goals without dependency/upstream entity bindings may share a batch."
+                ),
+            },
             "analysisSkillPolicy": {
                 "lifecyclePhase": "post_query_analysis",
                 "requiresGroundedContract": True,
@@ -2481,8 +3542,22 @@ Never invent a formula, binding, SQL result, evidence status or answer. Finish o
                     }
                     for item in session.skill_runs
                 ],
+                "runtimeBudget": dict(session.runtime_budget_report),
+                "goalCoverage": dict(session.goal_coverage_result),
             }
         }
+        if session.operational_failure:
+            trace["harness"]["operationalFailure"] = dict(
+                session.operational_failure
+            )
+            return ChatResponse(
+                answer=(
+                    "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
+                    "请缩小查询范围，或稍后重试。"
+                ),
+                category_name=state.routing.display_summary(),
+                debug_trace=trace,
+            )
         if state.clarification is not None:
             return ChatResponse(
                 answer=state.clarification.question,

@@ -44,6 +44,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedQueryContract,
     grounded_detail_relationship_candidates,
 )
+from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudget
 from merchant_ai.services.grounded_sql_candidate import GroundedSqlValidationResult
 from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
@@ -101,6 +102,7 @@ class GroundedQueryExecutionKernel:
         access_role: str = "merchant_analyst",
         user_scope: dict[str, Any] | None = None,
         execution_preparation: Any = None,
+        runtime_budget: GroundedRuntimeBudget | None = None,
     ) -> AgentRunResult:
         if execution_preparation is None or not bool(
             getattr(execution_preparation, "executable", False)
@@ -180,16 +182,34 @@ class GroundedQueryExecutionKernel:
                 denied.message,
             )
 
+        query_timeout_seconds = max(
+            1,
+            int(getattr(self.settings, "doris_read_timeout_seconds", 30) or 30),
+        )
+        if runtime_budget is not None:
+            # Clamp as close as possible to the external call. Contract
+            # compilation, SQL validation and access checks may already have
+            # consumed part of the shared run deadline. Doris accepts an
+            # integer timeout, so fail before querying when less than one
+            # whole second remains rather than rounding beyond the deadline.
+            query_timeout_seconds = max(
+                1,
+                int(
+                    runtime_budget.clamp_timeout_seconds(
+                        query_timeout_seconds,
+                        minimum_seconds=1.0,
+                        operation="doris_query_timeout",
+                    )
+                ),
+            )
+
         started = time.perf_counter()
         try:
             raw_rows = [
                 dict(row)
                 for row in self.doris_repository.query(
                 compilation.sql,
-                timeout_seconds=max(
-                    1,
-                    int(getattr(self.settings, "doris_read_timeout_seconds", 30) or 30),
-                ),
+                timeout_seconds=query_timeout_seconds,
                 )
             ]
             entity_filter_verification = (
@@ -202,6 +222,12 @@ class GroundedQueryExecutionKernel:
                     compilation.node_contract,
                     raw_rows,
                     compilation.sql,
+                )
+                if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
+                else self._deterministic_metric_filter_verification(
+                    compilation.node_contract,
+                    compilation.sql,
+                    len(raw_rows),
                 )
             )
             masked_columns = {
@@ -384,6 +410,13 @@ class GroundedQueryExecutionKernel:
         access_role: str,
         user_scope: dict[str, Any],
     ) -> GroundedSqlCompilation:
+        if (
+            contract.upstream_entity_bindings
+            or contract.binding_hints.upstream_entity_bindings
+        ):
+            raise RuntimeError(
+                "upstream entity dependencies remain Core SQL and serial-chain owned"
+            )
         if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}:
             return self._compile_detail_sql(
                 merchant_id,
@@ -492,6 +525,28 @@ class GroundedQueryExecutionKernel:
             )
             required_columns.append(time_column)
 
+        for entity_filter in contract.entity_filters:
+            if entity_filter.table != table:
+                raise RuntimeError(
+                    "grounded deterministic metric filter is outside the execution table"
+                )
+            if entity_filter.column not in columns:
+                raise RuntimeError(
+                    "grounded deterministic metric filter field is absent from projected schema"
+                )
+            if entity_filter.operator not in set(entity_filter.allowed_operators):
+                raise RuntimeError(
+                    "grounded deterministic metric filter operator is not declared"
+                )
+            where.append(
+                self._literal_filter_predicate(
+                    entity_filter.column,
+                    entity_filter.operator,
+                    entity_filter.literal_value,
+                )
+            )
+            required_columns.append(entity_filter.column)
+
         if group_columns:
             group_column = group_columns[0]
             where.extend(
@@ -524,15 +579,22 @@ class GroundedQueryExecutionKernel:
             )
             if not ranking_metric:
                 raise RuntimeError("grounded ranking metric is not bound")
-            sql += " ORDER BY %s DESC LIMIT %d" % (
+            ranking_direction = str(contract.ranking.direction or "").strip().upper()
+            if ranking_direction not in {"ASC", "DESC"}:
+                raise RuntimeError("grounded ranking direction is not executable")
+            sql += " ORDER BY %s %s LIMIT %d" % (
                 quote_identifier(ranking_metric),
+                ranking_direction,
                 max(1, int(contract.ranking.limit or 1)),
             )
-        elif group_columns:
-            sql += " LIMIT %d" % max(1, int(intent.limit or 20))
+        # Unranked GROUPED/TREND results are evidence-complete by default.
+        # Applying an unordered LIMIT here silently drops valid groups/time
+        # buckets and makes a deterministic query incomplete. Bounded Top-N
+        # remains explicit through the governed RANKED Contract above.
 
         required = tuple(self._dedupe(required_columns))
         allowed_columns = self._dedupe([*columns])
+        primary_filter = contract.entity_filters[0] if contract.entity_filters else None
         node_contract = NodePlanContract(
             task_id=intent.plan_task_id,
             question=contract.question,
@@ -552,6 +614,12 @@ class GroundedQueryExecutionKernel:
             group_by_column=intent.group_by_column,
             output_keys=list(intent.output_keys),
             required_evidence=list(intent.required_evidence),
+            filter_column=primary_filter.column if primary_filter else "",
+            filter_values=self._entity_filter_values(contract.entity_filters),
+            entity_filter_obligations=[
+                item.model_copy(deep=True)
+                for item in plan.entity_filter_obligations
+            ],
             days=int(intent.days or 0),
             limit=int(intent.limit or 0),
             merchant_id=merchant_id,
@@ -767,11 +835,11 @@ class GroundedQueryExecutionKernel:
                         else ""
                     ),
                     filter_column=filter_output_alias,
-                    filter_values=[
-                        item.literal_value
+                    filter_values=self._entity_filter_values(
+                        item
                         for item in contract.entity_filters
                         if table == primary or item.table == table
-                    ],
+                    ),
                     entity_filter_obligations=[
                         item
                         for item in obligations
@@ -1393,11 +1461,11 @@ class GroundedQueryExecutionKernel:
                     output_keys=visible,
                     required_evidence=visible,
                     filter_column=filter_output_alias,
-                    filter_values=[
-                        item.literal_value
+                    filter_values=self._entity_filter_values(
+                        item
                         for item in contract.entity_filters
                         if item.table == table
-                    ],
+                    ),
                     entity_filter_obligations=[
                         item
                         for item in plan.entity_filter_obligations
@@ -1468,6 +1536,139 @@ class GroundedQueryExecutionKernel:
         if not sql_operator:
             raise RuntimeError("unsupported grounded entity filter operator")
         return "%s %s %s" % (left, sql_operator, sql_literal(literal_value))
+
+    @staticmethod
+    def _literal_filter_predicate(
+        column: str,
+        operator: str,
+        literal_value: Any,
+    ) -> str:
+        left = quote_identifier(column)
+        operators = {
+            "EQ": "=",
+            "NE": "!=",
+            "GT": ">",
+            "GTE": ">=",
+            "LT": "<",
+            "LTE": "<=",
+        }
+        if operator == "IN":
+            if not isinstance(literal_value, (list, tuple)) or not literal_value:
+                raise RuntimeError("IN entity filter requires a non-empty literal list")
+            if len(literal_value) > 100:
+                raise RuntimeError("IN entity filter exceeds the deterministic value bound")
+            return "%s IN (%s)" % (
+                left,
+                ", ".join(sql_literal(item) for item in literal_value),
+            )
+        sql_operator = operators.get(operator)
+        if not sql_operator:
+            raise RuntimeError("unsupported grounded entity filter operator")
+        return "%s %s %s" % (left, sql_operator, sql_literal(literal_value))
+
+    @classmethod
+    def _deterministic_metric_filter_verification(
+        cls,
+        contract: NodePlanContract,
+        sql: str,
+        row_count: int,
+    ) -> EntityFilterVerificationProof:
+        """Bind generated literal predicates to the executed SQL and Contract.
+
+        Aggregate rows do not expose the internal filter field, so result-row
+        identity comparison would be impossible without changing the requested
+        grain.  Instead, this lane proves that every exact Contract obligation
+        is a mandatory top-level conjunct in the generated SELECT and seals the
+        proof to both the NodePlanContract and executed SQL hashes.
+        """
+
+        obligations = [
+            item
+            for item in contract.entity_filter_obligations
+            if item.required and item.status == "bound"
+        ]
+        if not obligations:
+            return EntityFilterVerificationProof(
+                task_id=contract.task_id,
+                status="not_required",
+            )
+        contract_hash = entity_filter_contract_hash(contract)
+        requested = {
+            value
+            for obligation in obligations
+            for value in canonical_entity_values(
+                obligation.reference.values,
+                entity_comparison_policy(obligation.reference),
+            )
+        }
+        verified = cls._sql_contains_all_literal_filter_obligations(sql, obligations)
+        return EntityFilterVerificationProof(
+            task_id=contract.task_id,
+            obligation_id=obligations[0].obligation_id,
+            status="verified" if verified else "failed",
+            code="" if verified else "ENTITY_FILTER_SQL_PREDICATE_MISSING",
+            verified=verified,
+            coverage_complete=verified,
+            contract_hash=contract_hash,
+            sql_hash=entity_filter_sql_hash(sql),
+            requested_value_hashes=sorted(
+                entity_value_hash(item, contract_hash) for item in requested
+            ),
+            row_count=max(0, int(row_count or 0)),
+            reason=(
+                "Deterministic compiler proved every typed literal filter as a mandatory SQL conjunct"
+                if verified
+                else "Executed deterministic SQL does not contain every typed literal filter obligation"
+            ),
+        )
+
+    @classmethod
+    def _sql_contains_all_literal_filter_obligations(
+        cls,
+        sql: str,
+        obligations: list[EntityFilterObligation],
+    ) -> bool:
+        try:
+            parsed = sqlglot.parse_one(sql, read="doris")
+        except Exception:
+            return False
+        where = parsed.args.get("where") if isinstance(parsed, exp.Select) else None
+        if not isinstance(where, exp.Where):
+            return False
+        actual = cls._and_conjuncts(where.this)
+        for obligation in obligations:
+            reference = obligation.reference
+            operator = str(reference.comparison_policy or "").strip().upper()
+            values = list(reference.values or [])
+            literal: Any = values if operator == "IN" else values[0] if values else None
+            try:
+                predicate = cls._literal_filter_predicate(
+                    reference.field,
+                    operator,
+                    literal,
+                )
+                expected_select = sqlglot.parse_one(
+                    "SELECT 1 WHERE %s" % predicate,
+                    read="doris",
+                )
+            except Exception:
+                return False
+            expected_where = expected_select.args.get("where")
+            if not isinstance(expected_where, exp.Where):
+                return False
+            if not any(item == expected_where.this for item in actual):
+                return False
+        return True
+
+    @classmethod
+    def _and_conjuncts(cls, expression: exp.Expression) -> list[exp.Expression]:
+        current = expression.this if isinstance(expression, exp.Paren) else expression
+        if isinstance(current, exp.And):
+            return [
+                *cls._and_conjuncts(current.this),
+                *cls._and_conjuncts(current.expression),
+            ]
+        return [current]
 
     @staticmethod
     def _entity_filter_verification(
@@ -1832,3 +2033,17 @@ class GroundedQueryExecutionKernel:
             if text and text not in result:
                 result.append(text)
         return result
+
+    @staticmethod
+    def _entity_filter_values(filters: Iterable[Any]) -> list[Any]:
+        values: list[Any] = []
+        for item in filters:
+            literal = item.literal_value
+            if item.operator == "IN" and isinstance(
+                literal,
+                (list, tuple, set, frozenset),
+            ):
+                values.extend(literal)
+            else:
+                values.append(literal)
+        return values

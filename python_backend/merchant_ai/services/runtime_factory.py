@@ -294,6 +294,8 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         checkpoint_config_factory=checkpoint_manager.config_for_deep_agent,
         skill_root=str(settings.resources_root / "runtime" / "agent_skills"),
         skill_run_root=str(settings.resolved_workspace_path / "skill_runs"),
+        parallel_max_workers=int(settings.tool_max_concurrency or 4),
+        settings=settings,
     )
     return GroundedApplicationRuntime(
         settings=settings,

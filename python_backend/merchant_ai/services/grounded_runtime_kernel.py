@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
@@ -37,13 +39,20 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedQueryContract,
     GroundedQueryContractBuilder,
     GroundedUpstreamEntityBinding,
-    compile_grounded_query,
+    compile_deterministic_grounded_query,
     materialize_grounded_asset_pack,
+    requested_semantic_label,
 )
 from merchant_ai.services.grounded_execution_policy import (
+    DETERMINISTIC_EXECUTION_MODES,
     GroundedExecutionMode,
-    GroundedExecutionReason,
-    evaluate_single_metric_fast_path,
+    evaluate_deterministic_execution,
+)
+from merchant_ai.services.entity_contracts import (
+    canonical_entity_values,
+    entity_comparison_policy,
+    entity_filter_contract_hash,
+    entity_value_hash,
 )
 from merchant_ai.services.grounded_sql_candidate import (
     GroundedSqlCandidate,
@@ -196,11 +205,11 @@ class GroundedRuntimeKernel:
     """Independent runtime for the progressively grounded query path.
 
     The kernel owns state transitions but delegates domain work to narrow
-    services.  It deliberately has no graph/workflow dependency: a candidate
-    Contract is routed by a generic execution policy. Only an extremely simple
-    published scalar metric may use deterministic compilation. Every other
-    READY Contract activates only its grounded semantic scope and waits for a
-    Core-authored SQL candidate.
+    services. It deliberately has no graph/workflow dependency: a candidate
+    Contract is routed by a capability-based execution policy. Safe single-
+    table scalar, multi-metric, grouped, trend, ranked and entity lookup shapes
+    use deterministic compilation. JOIN/CTE/window/dependency topology remains
+    Core-authored SQL.
     """
 
     def __init__(
@@ -225,7 +234,7 @@ class GroundedRuntimeKernel:
         self.recall_service = recall_service
         self.contract_builder = contract_builder or GroundedQueryContractBuilder()
         self.asset_materializer = asset_materializer or materialize_grounded_asset_pack
-        self.compiler = compiler or compile_grounded_query
+        self.compiler = compiler or compile_deterministic_grounded_query
         self.sql_candidate_validator = (
             sql_candidate_validator or GroundedSqlCandidateValidator()
         )
@@ -260,6 +269,140 @@ class GroundedRuntimeKernel:
             access_role=access_role or "merchant_analyst",
             user_scope=dict(user_scope or {}),
         )
+
+    def fork_query_branch(
+        self,
+        session: GroundedRuntimeSession,
+        branch_id: str,
+    ) -> GroundedRuntimeSession:
+        """Create an isolated execution branch for one independent query goal.
+
+        Active Contract generations are intentionally branch-local.  This lets
+        independent queries compile and execute concurrently without making a
+        sibling SQL candidate stale.  Verified artifacts are adopted into the
+        parent only through :meth:`adopt_verified_branches`.
+        """
+
+        token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(branch_id or "")).strip("_")
+        if not token:
+            raise ValueError("parallel query branch_id is required")
+        branch = self.new_session(
+            session.question,
+            session.merchant_id,
+            merchant=session.merchant.model_copy(deep=True),
+            access_role=session.access_role,
+            user_scope=dict(session.user_scope),
+            session_id="%s__branch_%s_%s"
+            % (session.session_id, token[:48], uuid.uuid4().hex[:8]),
+        )
+        branch.keywords = session.keywords.model_copy(deep=True)
+        branch.routing = session.routing.model_copy(deep=True)
+        branch.workspace_topics = list(session.workspace_topics)
+        branch.recall = session.recall.model_copy(deep=True)
+        branch.phase = "BRANCH_CREATED"
+        self._event(
+            branch,
+            "fork_query_branch",
+            "READY",
+            "parent=%s;branch=%s" % (session.session_id, token),
+        )
+        return branch
+
+    def adopt_verified_branches(
+        self,
+        session: GroundedRuntimeSession,
+        branches: Sequence[GroundedRuntimeSession],
+    ) -> list[GroundedVerifiedQueryArtifact]:
+        """Atomically merge successful independent branches into the parent.
+
+        Failed or unverified branch state never mutates the parent.  The last
+        successful branch becomes the active compatibility snapshot so legacy
+        answer composition and a later serial entity-chain query can continue.
+        """
+
+        verified_branches = [
+            branch
+            for branch in branches
+            if branch.verified_query_ledger
+            and branch.verified_evidence is not None
+            and branch.verified_evidence.passed
+        ]
+        if not verified_branches:
+            return []
+        artifacts = [
+            artifact.model_copy(deep=True)
+            for branch in verified_branches
+            for artifact in branch.verified_query_ledger
+            if artifact.verified_evidence.passed
+        ]
+        if not artifacts:
+            return []
+        with self._lock:
+            existing_ids = {
+                item.artifact_id for item in session.verified_query_ledger
+            }
+            adopted = [
+                artifact for artifact in artifacts if artifact.artifact_id not in existing_ids
+            ]
+            if not adopted:
+                return []
+            session.verified_query_ledger.extend(adopted)
+            last = verified_branches[-1]
+            session.active_generation += 1
+            session.active_attempt_id = last.active_attempt_id
+            session.active_execution_mode = last.active_execution_mode
+            session.active_execution_reason_codes = list(
+                last.active_execution_reason_codes
+            )
+            session.active_contract = (
+                last.active_contract.model_copy(deep=True)
+                if last.active_contract is not None
+                else None
+            )
+            session.active_pack = (
+                last.active_pack.model_copy(deep=True)
+                if last.active_pack is not None
+                else None
+            )
+            session.active_plan = (
+                last.active_plan.model_copy(deep=True)
+                if last.active_plan is not None
+                else None
+            )
+            session.active_preparation = deepcopy(last.active_preparation)
+            session.active_sql_candidate = (
+                last.active_sql_candidate.model_copy(deep=True)
+                if last.active_sql_candidate is not None
+                else None
+            )
+            session.active_sql_validation = (
+                last.active_sql_validation.model_copy(deep=True)
+                if last.active_sql_validation is not None
+                else None
+            )
+            session.run_result = (
+                last.run_result.model_copy(deep=True)
+                if last.run_result is not None
+                else None
+            )
+            session.verified_evidence = (
+                last.verified_evidence.model_copy(deep=True)
+                if last.verified_evidence is not None
+                else None
+            )
+            if last.terminal_guard_code:
+                session.terminal_guard_code = last.terminal_guard_code
+            self._clear_answer_snapshot(session)
+            session.phase = "PARALLEL_BRANCHES_ADOPTED"
+            session.revision += 1
+            self._event(
+                session,
+                "adopt_verified_branches",
+                "ADOPTED",
+                "branches=%d;artifacts=%d"
+                % (len(verified_branches), len(adopted)),
+            )
+        return [item.model_copy(deep=True) for item in adopted]
 
     def route_topic(self, session: GroundedRuntimeSession) -> TopicRoutingDecision:
         keywords = self.keyword_service.extract(session.question)
@@ -618,8 +761,8 @@ class GroundedRuntimeKernel:
     ) -> GroundedRuntimeAttempt:
         """Activate a READY candidate according to its execution authority.
 
-        This method may invoke deterministic compilation only for
-        ``DETERMINISTIC_METRIC``.
+        This method invokes deterministic compilation only for modes admitted
+        by the capability gate in ``DETERMINISTIC_EXECUTION_MODES``.
         ``CORE_SQL_REQUIRED`` activates the Contract as the allowed semantic
         scope without materializing or compiling a template query.
         """
@@ -701,7 +844,7 @@ class GroundedRuntimeKernel:
                     attempt_id,
                 )
                 return attempt
-            if attempt.execution_mode != GroundedExecutionMode.DETERMINISTIC_METRIC:
+            if attempt.execution_mode not in DETERMINISTIC_EXECUTION_MODES:
                 attempt.compile_status = "EXECUTION_MODE_UNDECIDED"
                 attempt.activation_status = "NOT_ACTIVATED"
                 attempt.error = "READY Contract has no permitted execution mode"
@@ -769,7 +912,7 @@ class GroundedRuntimeKernel:
             # every candidate artifact has passed its own validation.
             next_generation = session.active_generation + 1
             session.active_contract = contract
-            session.active_execution_mode = GroundedExecutionMode.DETERMINISTIC_METRIC
+            session.active_execution_mode = attempt.execution_mode
             session.active_execution_reason_codes = list(
                 attempt.execution_reason_codes
             )
@@ -1134,6 +1277,7 @@ class GroundedRuntimeKernel:
         *,
         knowledge_context: str = "",
         run_id: str = "",
+        runtime_budget: Any = None,
     ) -> AgentRunResult:
         with self._lock:
             execution_mode = session.active_execution_mode
@@ -1200,16 +1344,24 @@ class GroundedRuntimeKernel:
                 "grounded executor must implement execute_contract; "
                 "legacy execute_plan/NodeAgent execution is forbidden"
             )
+        execution_kwargs = {
+            "run_id": run_id,
+            "access_role": session.access_role,
+            "user_scope": dict(session.user_scope),
+            "execution_preparation": runtime_preparation,
+        }
+        # Keep non-budget callers fully backward-compatible. Grounded tools
+        # explicitly pass the one shared run budget so the executor can clamp
+        # Doris immediately before the repository call.
+        if runtime_budget is not None:
+            execution_kwargs["runtime_budget"] = runtime_budget
         run_result = execute_contract(
             session.merchant_id,
             contract,
             runtime_preparation.plan,
             pack,
             session.question,
-            run_id=run_id,
-            access_role=session.access_role,
-            user_scope=dict(session.user_scope),
-            execution_preparation=runtime_preparation,
+            **execution_kwargs,
         )
         if not isinstance(run_result, AgentRunResult):
             run_result = AgentRunResult.model_validate(run_result)
@@ -1529,6 +1681,7 @@ class GroundedRuntimeKernel:
         allow_llm: bool = True,
         rule_context: str = "",
         personalization_context: dict[str, Any] | None = None,
+        runtime_budget: Any | None = None,
     ) -> str:
         if self.answer_composer is None:
             raise RuntimeError(
@@ -1571,6 +1724,7 @@ class GroundedRuntimeKernel:
             allow_llm=allow_llm,
             rule_context=rule_context,
             personalization_context=personalization_context,
+            runtime_budget=runtime_budget,
         )
         with self._lock:
             self._require_generation(session, generation)
@@ -1817,6 +1971,51 @@ class GroundedRuntimeKernel:
                 )
             )
         output_columns = list(validation.output_columns)
+        output_labels = {
+            str(item.column): str(item.business_name or item.column)
+            for item in contract.dimensions
+            if str(item.column or "").strip()
+        }
+        output_labels.update(
+            {
+                str(item.output_alias or item.column): str(
+                    requested_semantic_label(
+                        contract.question,
+                        item.aliases,
+                        item.business_name or item.output_alias or item.column,
+                    )
+                )
+                for item in contract.selected_fields
+                if str(item.output_alias or item.column or "").strip()
+            }
+        )
+        metric_resolution = (
+            {
+                "requestedMetricRef": first_metric.semantic_ref_id,
+                "metricKey": first_metric.metric_key,
+                "displayName": (
+                    first_metric.requested_phrase
+                    or first_metric.business_name
+                    or first_metric.metric_key
+                ),
+                "ownerTable": first_metric.table,
+                "semanticRefId": first_metric.semantic_ref_id,
+                "formula": first_metric.formula,
+                "sourceColumns": list(first_metric.source_columns),
+                "resolutionSource": "grounded_core_sql_candidate",
+                "aggregationPolicy": first_metric.aggregation_policy,
+                "metricGrain": first_metric.metric_grain,
+                "applicableTimeGrain": first_metric.applicable_time_grain,
+                "timeColumn": first_metric.time_column,
+                "timeSemantics": dict(first_metric.time_semantics),
+                "unit": first_metric.unit,
+                "bindingType": first_metric.binding_type,
+            }
+            if first_metric
+            else {}
+        )
+        if output_labels:
+            metric_resolution["sourceColumnLabels"] = output_labels
         intent = QuestionIntent(
             question=contract.question,
             intent_type=IntentType.VALID,
@@ -1862,31 +2061,7 @@ class GroundedRuntimeKernel:
             ),
             sql_strategy="core_llm_grounded_sql",
             sql=validation.canonical_sql,
-            metric_resolution=(
-                {
-                    "requestedMetricRef": first_metric.semantic_ref_id,
-                    "metricKey": first_metric.metric_key,
-                    "displayName": (
-                        first_metric.requested_phrase
-                        or first_metric.business_name
-                        or first_metric.metric_key
-                    ),
-                    "ownerTable": first_metric.table,
-                    "semanticRefId": first_metric.semantic_ref_id,
-                    "formula": first_metric.formula,
-                    "sourceColumns": list(first_metric.source_columns),
-                    "resolutionSource": "grounded_core_sql_candidate",
-                    "aggregationPolicy": first_metric.aggregation_policy,
-                    "metricGrain": first_metric.metric_grain,
-                    "applicableTimeGrain": first_metric.applicable_time_grain,
-                    "timeColumn": first_metric.time_column,
-                    "timeSemantics": dict(first_metric.time_semantics),
-                    "unit": first_metric.unit,
-                    "bindingType": first_metric.binding_type,
-                }
-                if first_metric
-                else {}
-            ),
+            metric_resolution=metric_resolution,
             time_range=contract.time_range.model_copy(deep=True),
         )
         return QueryPlan(
@@ -1917,29 +2092,18 @@ class GroundedRuntimeKernel:
 
     @staticmethod
     def _apply_execution_policy(attempt: GroundedRuntimeAttempt) -> None:
-        decision = evaluate_single_metric_fast_path(attempt.contract)
+        decision = evaluate_deterministic_execution(attempt.contract)
         attempt.fast_path_eligible = decision.eligible
         attempt.fast_path_reason_codes = list(decision.reason_codes)
         attempt.fast_path_reason_details = dict(decision.reason_details)
-        if not attempt.contract.ready or attempt.contract.status != "READY":
-            attempt.execution_mode = GroundedExecutionMode.UNDECIDED
-            attempt.execution_reason_codes = [
-                GroundedExecutionReason.CONTRACT_NOT_READY.value
-            ]
+        attempt.execution_mode = decision.execution_mode
+        attempt.execution_reason_codes = list(decision.execution_reason_codes)
+        if attempt.execution_mode == GroundedExecutionMode.UNDECIDED:
             attempt.next_action = "RESOLVE_CONTRACT"
             return
-        if decision.eligible:
-            attempt.execution_mode = GroundedExecutionMode.DETERMINISTIC_METRIC
-            attempt.execution_reason_codes = [
-                GroundedExecutionReason.SINGLE_METRIC_FAST_PATH_ELIGIBLE.value
-            ]
-            attempt.next_action = "ACTIVATE_DETERMINISTIC_METRIC"
+        if attempt.execution_mode in DETERMINISTIC_EXECUTION_MODES:
+            attempt.next_action = "ACTIVATE_DETERMINISTIC_QUERY"
             return
-        attempt.execution_mode = GroundedExecutionMode.CORE_SQL_REQUIRED
-        attempt.execution_reason_codes = [
-            GroundedExecutionReason.COMPLEX_QUERY_REQUIRES_CORE_SQL.value,
-            *decision.reason_codes,
-        ]
         attempt.next_action = "SUBMIT_GROUNDED_SQL_CANDIDATE"
 
     @staticmethod
@@ -2219,6 +2383,7 @@ def _namespace_artifact_run(
             artifact_id,
             task_result.entity_filter_verification.task_id,
         )
+        _refresh_namespaced_entity_filter_proof(task_result)
         task_result.semantic_filter_verification.task_id = _namespace_task_id(
             artifact_id,
             task_result.semantic_filter_verification.task_id,
@@ -2252,6 +2417,43 @@ def _namespace_artifact_run(
         if fact.fact_id:
             fact.fact_id = _namespace_task_id(artifact_id, fact.fact_id)
     return result
+
+
+def _refresh_namespaced_entity_filter_proof(task_result: Any) -> None:
+    """Upgrade legacy task-bound proofs after portfolio namespacing."""
+
+    contract = task_result.node_plan_contract
+    proof = task_result.entity_filter_verification
+    obligations = [
+        item
+        for item in contract.entity_filter_obligations
+        if item.required and item.status == "bound"
+    ]
+    if not obligations or proof.status == "not_required" or not proof.contract_hash:
+        return
+    new_contract_hash = entity_filter_contract_hash(contract)
+    if proof.contract_hash == new_contract_hash:
+        return
+    policy = entity_comparison_policy(obligations[0].reference)
+    requested = {
+        value
+        for obligation in obligations
+        for value in canonical_entity_values(
+            obligation.reference.values,
+            entity_comparison_policy(obligation.reference),
+        )
+    }
+    old_requested_hashes = sorted(
+        entity_value_hash(value, proof.contract_hash)
+        for value in requested
+    )
+    if old_requested_hashes != sorted(proof.requested_value_hashes):
+        return
+    proof.contract_hash = new_contract_hash
+    proof.requested_value_hashes = sorted(
+        entity_value_hash(value, new_contract_hash)
+        for value in requested
+    )
 
 
 def _combine_artifact_plans(

@@ -45,6 +45,7 @@ from merchant_ai.services.evidence import (
     snapshot_alignment_incomplete,
     snapshot_time_display,
 )
+from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudget
 from merchant_ai.services.time_semantics import declared_time_column_for_intent
 
 
@@ -157,6 +158,7 @@ class AnswerComposeService:
         allow_llm: bool = True,
         rule_context: str = "",
         personalization_context: Optional[Dict[str, Any]] = None,
+        runtime_budget: Optional[GroundedRuntimeBudget] = None,
     ) -> str:
         self.last_compose_llm_attempted = False
         self.last_compose_used_llm = False
@@ -170,7 +172,11 @@ class AnswerComposeService:
         if primary.answer_mode == AnswerMode.INVALID:
             return "问题还缺少业务对象或查询范围，请补充要看的指标、时间范围或业务域。"
         if primary.answer_mode == AnswerMode.RULE:
-            return self._compose_rule_answer(question, knowledge_context)
+            return self._compose_rule_answer(
+                question,
+                knowledge_context,
+                runtime_budget=runtime_budget,
+            )
         effective_rule_context = rule_context if plan_requires_rule_evidence(plan) else ""
         bundle = run_result.merged_query_bundle if run_result else QueryBundle()
         mandatory_skeleton = self._mandatory_answer_skeleton(question, plan, run_result)
@@ -289,7 +295,11 @@ class AnswerComposeService:
                     personalization_context,
                 )
         if not question_requests_diagnosis(question):
-            structured_answer = ranking_answer or deterministic_structured_answer(question, plan, run_result)
+            structured_answer = deterministic_structured_answer(
+                question,
+                plan,
+                run_result,
+            ) or ranking_answer
             if structured_answer:
                 structured_answer = ensure_required_field_answer_coverage(structured_answer, plan, run_result)
                 return self._compose_final_answer(
@@ -314,6 +324,7 @@ class AnswerComposeService:
                 merchant,
                 personalization_context,
                 mandatory_skeleton=mandatory_skeleton,
+                runtime_budget=runtime_budget,
             )
             if answer:
                 hybrid_ranking_analysis = bool(ranking_answer and question_requests_diagnosis(question))
@@ -377,6 +388,7 @@ class AnswerComposeService:
                 merchant,
                 personalization_context,
                 mandatory_skeleton=mandatory_skeleton,
+                runtime_budget=runtime_budget,
             )
             if answer:
                 hybrid_ranking_analysis = bool(ranking_answer and question_requests_diagnosis(question))
@@ -500,6 +512,7 @@ class AnswerComposeService:
         personalization_context: Optional[Dict[str, Any]],
         analysis_summary: str = "",
         mandatory_skeleton: str = "",
+        runtime_budget: Optional[GroundedRuntimeBudget] = None,
     ) -> str:
         self.last_compose_llm_attempted = True
         package = answer_data_package(
@@ -520,12 +533,25 @@ class AnswerComposeService:
             sections={"answer_context_policy": answer_context_policy()},
         )
         self.last_prompt_chars += len(prompt) + len(answer_prompt.system_prompt)
-        answer = self.llm.chat(
-            answer_prompt.system_prompt,
-            prompt,
-            "",
-            timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
-        )
+        if runtime_budget is None:
+            answer = self.llm.chat(
+                answer_prompt.system_prompt,
+                prompt,
+                "",
+                timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
+            )
+        else:
+            runtime_budget.consume_llm_call(name="answer_composer")
+            timeout_seconds = runtime_budget.clamp_timeout_seconds(
+                self.llm.settings.llm_answer_timeout_seconds
+            )
+            with runtime_budget.stage("llm.answer_composer"):
+                answer = self.llm.chat(
+                    answer_prompt.system_prompt,
+                    prompt,
+                    "",
+                    timeout_seconds=timeout_seconds,
+                )
         if not answer:
             return ""
         self.last_compose_used_llm = True
@@ -1332,18 +1358,42 @@ class AnswerComposeService:
             )
         return sections
 
-    def _compose_rule_answer(self, question: str, knowledge_context: str) -> str:
+    def _compose_rule_answer(
+        self,
+        question: str,
+        knowledge_context: str,
+        *,
+        runtime_budget: Optional[GroundedRuntimeBudget] = None,
+    ) -> str:
         if self.llm.configured and knowledge_context:
             rule_prompt = self.prompt_assembler.render(
                 "answer.rule",
                 sections={"rule_context_policy": "只基于给定 knowledge 片段回答，缺知识时明确要求运营补充。"},
             )
-            answer = self.llm.chat(
-                rule_prompt.system_prompt,
-                json.dumps({"question": question, "knowledge": knowledge_context[:12000]}, ensure_ascii=False, default=str),
-                "",
-                timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
+            prompt = json.dumps(
+                {"question": question, "knowledge": knowledge_context[:12000]},
+                ensure_ascii=False,
+                default=str,
             )
+            if runtime_budget is None:
+                answer = self.llm.chat(
+                    rule_prompt.system_prompt,
+                    prompt,
+                    "",
+                    timeout_seconds=self.llm.settings.llm_answer_timeout_seconds,
+                )
+            else:
+                runtime_budget.consume_llm_call(name="answer_composer")
+                timeout_seconds = runtime_budget.clamp_timeout_seconds(
+                    self.llm.settings.llm_answer_timeout_seconds
+                )
+                with runtime_budget.stage("llm.answer_composer"):
+                    answer = self.llm.chat(
+                        rule_prompt.system_prompt,
+                        prompt,
+                        "",
+                        timeout_seconds=timeout_seconds,
+                    )
             if answer:
                 return answer
         if knowledge_context:
@@ -3331,6 +3381,7 @@ def deterministic_cross_task_detail_answer(
         return ""
     task_map = {item.task_id: item for item in run_result.task_results if not item.query_bundle.failed and item.query_bundle.rows}
     sections: List[str] = []
+    seen_identity_cells: set[tuple[str, str]] = set()
     for intent in plan.intents:
         task = task_map.get(intent.plan_task_id)
         if not task:
@@ -3343,18 +3394,35 @@ def deterministic_cross_task_detail_answer(
         for column in requested:
             if column not in row or row.get(column) in (None, ""):
                 continue
+            identity_cell = (column, str(row.get(column)))
+            if identifier_like_column(column) and identity_cell in seen_identity_cells:
+                continue
             if identifier_like_column(column) and not labels.get(column):
                 continue
             if column.endswith("_id") and column.replace("_id", "_name") in row and row.get(column.replace("_id", "_name")) not in (None, ""):
                 continue
             display_columns.append(column)
+            if identifier_like_column(column):
+                seen_identity_cells.add(identity_cell)
         if not display_columns:
             continue
         contracts = answer_column_display_contracts(section_plan)
         resolution = intent.metric_resolution or {}
         title = str(resolution.get("displayName") or "").strip()
         if not title:
-            title = "%s明细" % category_display(intent.category)
+            category_label = category_display(intent.category)
+            if intent.category != QuestionCategory.UNKNOWN and category_label:
+                title = "%s明细" % category_label
+            else:
+                descriptive_labels = [
+                    friendly_column_label(section_plan, column)
+                    for column in display_columns
+                    if not identifier_like_column(column)
+                ]
+                title = (
+                    "、".join(dedupe_strings(descriptive_labels[:3]))
+                    or friendly_column_label(section_plan, display_columns[0])
+                )
         lines = ["%s：" % title]
         for column in display_columns[:10]:
             label = friendly_column_label(section_plan, column)
