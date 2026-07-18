@@ -43,7 +43,15 @@ DEMO_TABLES = [
     "dwd_merchant_appeal_detail_df",
 ]
 BATCH_SIZE = 10
-REALISTIC_ORDER_COUNT = 360
+REALISTIC_ORDER_COUNT = 600
+REFUND_ROW_COUNT = 160
+TICKET_ROW_COUNT = 300
+TICKET_TOP_PRODUCT_BOOST = 30
+REPAY_ROW_COUNT = 90
+COUPON_ROW_COUNT = 240
+SCM_ROW_COUNT = 240
+DEPOSIT_ROW_COUNT = 30
+APPEAL_ROW_COUNT = 28
 
 PRODUCT_CATALOG = [
     ("spu_id_001", "Urban Tote Bag Black", "sku_id_001", "Urban Tote Bag Black", 399.00),
@@ -299,9 +307,9 @@ def build_orders(base_date: date, rng: random.Random) -> list[dict]:
         "seller_name": "杭州云尚优选商贸有限公司",
         "sub_order_status_name": "交易成功",
         "order_status_name": "交易成功",
-        "spu_id": "spu_id_100",
+        "spu_id": "100",
         "spu_name": "spu_name_100",
-        "sku_id": "sku_id_100",
+        "sku_id": "100",
         "sku_name": "sku_name_100",
         "sku_cnt": 1,
         "quantity": 1,
@@ -382,7 +390,7 @@ def build_refunds(base_date: date, orders: list[dict], rng: random.Random) -> li
             propensity += 0.04
         if rng.random() < propensity:
             refund_orders.append(order)
-    target = 78
+    target = REFUND_ROW_COUNT
     if len(refund_orders) > target:
         keep_special = [order for order in refund_orders if order["order_id"] == "order_id_100"]
         others = [order for order in refund_orders if order["order_id"] != "order_id_100"]
@@ -438,8 +446,12 @@ def build_goods(base_date: date, orders: list[dict], rng: random.Random) -> list
         pt = datetime.strptime(str(order["pt"])[:10], "%Y-%m-%d").date()
         first_order_by_spu[order["spu_id"]] = min(first_order_by_spu.get(order["spu_id"], pt), pt)
     rows = []
-    for raw in PRODUCT_CATALOG:
-        spu_id, spu_name, sku_id, sku_name, _price = raw
+    for index, _raw in enumerate(PRODUCT_CATALOG):
+        product = product_for_index(index)
+        spu_id = product["spu_id"]
+        spu_name = product["spu_name"]
+        sku_id = product["sku_id"]
+        sku_name = product["sku_name"]
         first_order = first_order_by_spu.get(spu_id, base_date - timedelta(days=30))
         apply_date = max(base_date - timedelta(days=180), first_order - timedelta(days=rng.randrange(7, 45)))
         status = "已上架" if rng.random() > 0.08 else rng.choice(["审核中", "审核拒绝"])
@@ -462,7 +474,25 @@ def build_goods(base_date: date, orders: list[dict], rng: random.Random) -> list
 
 
 def build_tickets(base_date: date, orders: list[dict], refunds: list[dict], rng: random.Random) -> list[dict]:
-    source_orders = rng.sample([order for order in orders if order["pay_amt"] > 0], 62)
+    paid_orders = [order for order in orders if order["pay_amt"] > 0]
+    base_count = max(1, TICKET_ROW_COUNT - TICKET_TOP_PRODUCT_BOOST)
+    source_orders = rng.sample(paid_orders, min(base_count, len(paid_orders)))
+    recent_cutoff = base_date - timedelta(days=25)
+    top_product_orders = [
+        order
+        for order in paid_orders
+        if str(order.get("spu_id")) == "1"
+        and datetime.strptime(str(order["pt"])[:10], "%Y-%m-%d").date() >= recent_cutoff
+    ]
+    if not top_product_orders:
+        top_product_orders = [
+            order
+            for order in paid_orders
+            if datetime.strptime(str(order["pt"])[:10], "%Y-%m-%d").date() >= recent_cutoff
+        ]
+    if top_product_orders:
+        boosted_order = max(top_product_orders, key=lambda item: str(item["pt"]))
+        source_orders.extend([boosted_order] * TICKET_TOP_PRODUCT_BOOST)
     refund_by_sub = {refund["sub_order_id"]: refund for refund in refunds}
     titles = ["物流进度咨询", "退款处理进度咨询", "商品质量反馈", "尺码咨询", "优惠券无法使用", "发票开具咨询"]
     rows = []
@@ -480,6 +510,8 @@ def build_tickets(base_date: date, orders: list[dict], refunds: list[dict], rng:
             "buyer_name": order["buyer_name"],
             "order_id": order["order_id"],
             "sub_order_id": order["sub_order_id"],
+            "spu_id": order["spu_id"],
+            "spu_name": order["spu_name"],
             "ticket_title": title,
             "content": f"{title}，关联订单{order['order_id']}",
             "ticket_status_name": status,
@@ -497,7 +529,8 @@ def build_repay(base_date: date, tickets: list[dict], orders: list[dict], rng: r
     order_by_sub = {order["sub_order_id"]: order for order in orders}
     candidates = [ticket for ticket in tickets if ticket.get("sub_order_id") in order_by_sub]
     rows = []
-    for index, ticket in enumerate(rng.sample(candidates, 18), start=1):
+    selected = rng.sample(candidates, min(REPAY_ROW_COUNT, len(candidates)))
+    for index, ticket in enumerate(selected, start=1):
         order = order_by_sub[ticket["sub_order_id"]]
         pt = min(base_date, datetime.strptime(str(ticket["pt"])[:10], "%Y-%m-%d").date() + timedelta(days=rng.randrange(0, 3)))
         repay_amt = money(min(order["pay_amt"], rng.choice([20, 30, 50, 80, 100])))
@@ -576,7 +609,7 @@ def build_coupons(base_date: date, orders: list[dict], rng: random.Random) -> li
             "coupon_content": f"{title}，满{threshold}减{amt}",
         })
     next_index = len(rows) + 1
-    while len(rows) < 90:
+    while len(rows) < COUPON_ROW_COUNT:
         pt = base_date - timedelta(days=rng.randrange(0, 90))
         title, amt, threshold = rng.choice(templates)
         rows.append({
@@ -609,7 +642,7 @@ def build_coupons(base_date: date, orders: list[dict], rng: random.Random) -> li
 
 def build_scm(base_date: date, rng: random.Random) -> list[dict]:
     rows = []
-    for index in range(1, 81):
+    for index in range(1, SCM_ROW_COUNT + 1):
         product = product_for_index(index)
         pt = base_date - timedelta(days=rng.randrange(0, 90))
         inbound_cnt = rng.choice([20, 30, 40, 50, 60, 80, 100, 120])
@@ -632,7 +665,7 @@ def build_scm(base_date: date, rng: random.Random) -> list[dict]:
 
 def build_deposits(base_date: date, rng: random.Random) -> list[dict]:
     rows = []
-    for index in range(1, 9):
+    for index in range(1, DEPOSIT_ROW_COUNT + 1):
         pt = base_date - timedelta(days=rng.randrange(0, 90))
         rows.append({
             "pt": pt,
@@ -652,7 +685,8 @@ def build_deposits(base_date: date, rng: random.Random) -> list[dict]:
 
 def build_appeals(base_date: date, goods: list[dict], rng: random.Random) -> list[dict]:
     rows = []
-    for index, product in enumerate(rng.sample(goods, min(14, len(goods))), start=1):
+    selected = rng.sample(goods, min(APPEAL_ROW_COUNT, len(goods)))
+    for index, product in enumerate(selected, start=1):
         pt = base_date - timedelta(days=rng.randrange(0, 90))
         rows.append({
             "pt": pt,
@@ -840,7 +874,7 @@ def build_seed_model(base_date: date) -> dict[str, list[dict]]:
     scm_rows = build_scm(base_date, rng)
     deposits = build_deposits(base_date, rng)
     appeals = build_appeals(base_date, goods, rng)
-    return {
+    seed_model = {
         "ads_merchant_profile": build_profile_rows(
             base_date, pt_values, orders, refunds, tickets, repays, coupons, goods, deposits, appeals, scm_rows),
         "dim_merchant_df": build_dim_rows(base_date),
@@ -854,6 +888,72 @@ def build_seed_model(base_date: date) -> dict[str, list[dict]]:
         "dwd_merchant_deposit_recharge_df": deposits,
         "dwd_merchant_appeal_detail_df": appeals,
     }
+    validate_seed_model(seed_model, base_date)
+    return seed_model
+
+
+def validate_seed_model(seed_model: dict[str, list[dict]], base_date: date) -> None:
+    """Fail before TRUNCATE when generated cross-table entities do not align."""
+
+    orders = seed_model["dwm_trade_order_detail_di"]
+    refunds = seed_model["dwm_trade_refund_detail_di"]
+    tickets = seed_model["dwm_cs_ticket_detail_di"]
+    repays = seed_model["dwm_cs_repay_detail_df"]
+    goods = seed_model["dwm_goods_detail_df"]
+    scm_rows = seed_model["dwm_scm_detail_di"]
+    appeals = seed_model["dwd_merchant_appeal_detail_df"]
+
+    order_by_sub = {str(row["sub_order_id"]): row for row in orders}
+    ticket_by_id = {str(row["ticket_id"]): row for row in tickets}
+    goods_by_spu = {str(row["spu_id"]): row for row in goods}
+
+    def require_numeric_product_id(row: dict, table: str) -> str:
+        spu_id = str(row.get("spu_id") or "")
+        if not spu_id.isdigit():
+            raise ValueError(f"{table} has non-canonical spu_id={spu_id!r}")
+        if spu_id not in goods_by_spu:
+            raise ValueError(f"{table} spu_id={spu_id!r} is absent from goods")
+        return spu_id
+
+    for order in orders:
+        require_numeric_product_id(order, "orders")
+    for row in [*scm_rows, *appeals]:
+        require_numeric_product_id(row, "product_dimension")
+
+    for ticket in tickets:
+        spu_id = require_numeric_product_id(ticket, "tickets")
+        order = order_by_sub.get(str(ticket.get("sub_order_id") or ""))
+        if order is None:
+            raise ValueError(f"ticket {ticket.get('ticket_id')} has no source order")
+        if spu_id != str(order.get("spu_id")) or ticket.get("spu_name") != order.get("spu_name"):
+            raise ValueError(f"ticket {ticket.get('ticket_id')} product differs from source order")
+
+    for refund in refunds:
+        order = order_by_sub.get(str(refund.get("sub_order_id") or ""))
+        if order is None:
+            raise ValueError(f"refund {refund.get('refund_id')} has no source order")
+        if refund.get("spu_name") != order.get("spu_name"):
+            raise ValueError(f"refund {refund.get('refund_id')} product differs from source order")
+
+    for repay in repays:
+        ticket = ticket_by_id.get(str(repay.get("ticket_id") or ""))
+        order = order_by_sub.get(str(repay.get("sub_order_id") or ""))
+        if ticket is None or order is None:
+            raise ValueError(f"repay {repay.get('bill_id')} has broken ticket/order lineage")
+        if repay.get("order_id") != order.get("order_id"):
+            raise ValueError(f"repay {repay.get('bill_id')} order differs from source order")
+
+    recent_start = base_date - timedelta(days=29)
+    recent_counts: dict[str, int] = defaultdict(int)
+    for ticket in tickets:
+        pt = datetime.strptime(str(ticket["pt"])[:10], "%Y-%m-%d").date()
+        if recent_start <= pt <= base_date:
+            recent_counts[str(ticket["spu_id"])] += 1
+    if not recent_counts or max(recent_counts.values()) <= 1:
+        raise ValueError("recent ticket data must contain a meaningful product ranking")
+    top_count = max(recent_counts.values())
+    if sum(1 for value in recent_counts.values() if value == top_count) != 1:
+        raise ValueError("recent ticket data must have one deterministic top product")
 
 
 def seed_value(table: str, column: dict[str, str], row_index: int, pt_value: date):
