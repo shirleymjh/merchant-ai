@@ -122,14 +122,26 @@ class Settings(BaseSettings):
     preflight_llm_base_url: str = Field("", validation_alias="YSHOPPING_PREFLIGHT_LLM_BASE_URL")
     preflight_llm_api_key: str = Field("", validation_alias="YSHOPPING_PREFLIGHT_LLM_API_KEY")
     preflight_semantic_route_model: str = Field("", validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MODEL")
-    preflight_semantic_route_timeout_seconds: int = Field(3, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_TIMEOUT_SECONDS")
-    preflight_semantic_route_max_timeout_seconds: int = Field(5, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MAX_TIMEOUT_SECONDS")
-    preflight_semantic_route_min_confidence: float = Field(0.62, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MIN_CONFIDENCE")
-    preflight_semantic_route_high_confidence: float = Field(0.86, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_HIGH_CONFIDENCE")
+    preflight_semantic_route_timeout_seconds: int = Field(
+        3, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_TIMEOUT_SECONDS"
+    )
+    preflight_semantic_route_max_timeout_seconds: int = Field(
+        5, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MAX_TIMEOUT_SECONDS"
+    )
+    preflight_semantic_route_min_confidence: float = Field(
+        0.62, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_MIN_CONFIDENCE"
+    )
+    preflight_semantic_route_high_confidence: float = Field(
+        0.86, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_HIGH_CONFIDENCE"
+    )
     topic_semantic_route_model: str = Field("", validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_MODEL")
-    topic_semantic_route_timeout_seconds: int = Field(12, validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_TIMEOUT_SECONDS")
+    topic_semantic_route_timeout_seconds: int = Field(
+        12, validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_TIMEOUT_SECONDS"
+    )
     topic_semantic_route_max_attempts: int = Field(2, validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_MAX_ATTEMPTS")
-    topic_semantic_route_min_confidence: float = Field(0.55, validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_MIN_CONFIDENCE")
+    topic_semantic_route_min_confidence: float = Field(
+        0.55, validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_MIN_CONFIDENCE"
+    )
     answer_skill_match_mode: str = Field("always", validation_alias="YSHOPPING_ANSWER_SKILL_MATCH_MODE")
     always_apply_rule_budget: int = Field(20, validation_alias="YSHOPPING_ALWAYS_APPLY_RULE_BUDGET")
     skill_confirmation_required: bool = Field(False, validation_alias="YSHOPPING_SKILL_CONFIRMATION_REQUIRED")
@@ -138,7 +150,9 @@ class Settings(BaseSettings):
     skill_worker_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_SKILL_WORKER_TIMEOUT_SECONDS")
     sandbox_backend: str = Field("local", validation_alias="YSHOPPING_SANDBOX_BACKEND")
     sandbox_container_runtime: str = Field("docker", validation_alias="YSHOPPING_SANDBOX_CONTAINER_RUNTIME")
-    sandbox_container_image: str = Field("python:3.11-slim-bookworm", validation_alias="YSHOPPING_SANDBOX_CONTAINER_IMAGE")
+    sandbox_container_image: str = Field(
+        "python:3.11-slim-bookworm", validation_alias="YSHOPPING_SANDBOX_CONTAINER_IMAGE"
+    )
     sandbox_container_memory: str = Field("512m", validation_alias="YSHOPPING_SANDBOX_CONTAINER_MEMORY")
     sandbox_container_cpus: float = Field(1.0, validation_alias="YSHOPPING_SANDBOX_CONTAINER_CPUS")
     skill_worker_parallel_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_PARALLEL_ENABLED")
@@ -194,9 +208,15 @@ class Settings(BaseSettings):
     memory_index_async: bool = Field(True, validation_alias="YSHOPPING_MEMORY_INDEX_ASYNC")
     memory_es_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_ES_INDEX")
     memory_vector_index: str = Field("merchant_memory", validation_alias="YSHOPPING_MEMORY_VECTOR_INDEX")
-    memory_query_understanding_enabled: bool = Field(True, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_ENABLED")
-    memory_query_understanding_timeout_seconds: int = Field(4, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_TIMEOUT_SECONDS")
-    memory_query_understanding_max_timeout_seconds: int = Field(5, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_MAX_TIMEOUT_SECONDS")
+    memory_query_understanding_enabled: bool = Field(
+        True, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_ENABLED"
+    )
+    memory_query_understanding_timeout_seconds: int = Field(
+        4, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_TIMEOUT_SECONDS"
+    )
+    memory_query_understanding_max_timeout_seconds: int = Field(
+        5, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_MAX_TIMEOUT_SECONDS"
+    )
     memory_curator_enabled: bool = Field(True, validation_alias="YSHOPPING_MEMORY_CURATOR_ENABLED")
     memory_curator_timeout_seconds: int = Field(8, validation_alias="YSHOPPING_MEMORY_CURATOR_TIMEOUT_SECONDS")
     memory_curator_min_confidence: float = Field(0.72, validation_alias="YSHOPPING_MEMORY_CURATOR_MIN_CONFIDENCE")
@@ -204,7 +224,9 @@ class Settings(BaseSettings):
     knowledge_conflict_enabled: bool = Field(True, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_ENABLED")
     knowledge_conflict_timeout_seconds: int = Field(6, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_TIMEOUT_SECONDS")
     knowledge_conflict_top_k: int = Field(5, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_TOP_K")
-    knowledge_conflict_min_similarity: float = Field(0.18, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_MIN_SIMILARITY")
+    knowledge_conflict_min_similarity: float = Field(
+        0.18, validation_alias="YSHOPPING_KNOWLEDGE_CONFLICT_MIN_SIMILARITY"
+    )
 
     harness_workspace_path: str = Field("", validation_alias="YSHOPPING_HARNESS_WORKSPACE")
     thread_context_summary_ttl_seconds: int = Field(
@@ -215,13 +237,17 @@ class Settings(BaseSettings):
     tool_result_preview_rows: int = Field(20, validation_alias="YSHOPPING_HARNESS_TOOL_RESULT_PREVIEW_ROWS")
     max_sub_agent_tasks: int = Field(3, validation_alias="YSHOPPING_HARNESS_MAX_SUB_AGENT_TASKS")
     max_concurrent_sub_agents: int = Field(3, validation_alias="YSHOPPING_HARNESS_MAX_CONCURRENT_SUB_AGENTS")
-    hypothesis_query_exploration_enabled: bool = Field(True, validation_alias="YSHOPPING_HYPOTHESIS_QUERY_EXPLORATION_ENABLED")
+    hypothesis_query_exploration_enabled: bool = Field(
+        True, validation_alias="YSHOPPING_HYPOTHESIS_QUERY_EXPLORATION_ENABLED"
+    )
     hypothesis_max_candidates: int = Field(2, validation_alias="YSHOPPING_HYPOTHESIS_MAX_CANDIDATES")
     hypothesis_max_rounds: int = Field(2, validation_alias="YSHOPPING_HYPOTHESIS_MAX_ROUNDS")
     hypothesis_max_parallel_queries: int = Field(3, validation_alias="YSHOPPING_HYPOTHESIS_MAX_PARALLEL_QUERIES")
     hypothesis_min_survivor_score: int = Field(45, validation_alias="YSHOPPING_HYPOTHESIS_MIN_SURVIVOR_SCORE")
     hypothesis_max_survivors: int = Field(2, validation_alias="YSHOPPING_HYPOTHESIS_MAX_SURVIVORS")
-    hypothesis_second_round_min_information_gain: float = Field(0.35, validation_alias="YSHOPPING_HYPOTHESIS_SECOND_ROUND_MIN_INFORMATION_GAIN")
+    hypothesis_second_round_min_information_gain: float = Field(
+        0.35, validation_alias="YSHOPPING_HYPOTHESIS_SECOND_ROUND_MIN_INFORMATION_GAIN"
+    )
     hypothesis_answer_reserve_seconds: int = Field(15, validation_alias="YSHOPPING_HYPOTHESIS_ANSWER_RESERVE_SECONDS")
     max_sub_agent_rounds: int = Field(6, validation_alias="YSHOPPING_HARNESS_MAX_SUB_AGENT_ROUNDS")
     tool_max_concurrency: int = Field(4, validation_alias="YSHOPPING_TOOL_MAX_CONCURRENCY")
@@ -248,9 +274,13 @@ class Settings(BaseSettings):
     agent_doris_split_chunk_days: int = Field(7, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_CHUNK_DAYS")
     agent_doris_split_max_chunks: int = Field(6, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_MAX_CHUNKS")
     agent_doris_split_max_concurrency: int = Field(3, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_MAX_CONCURRENCY")
-    agent_partition_date_anchor_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_PARTITION_DATE_ANCHOR_ENABLED")
+    agent_partition_date_anchor_enabled: bool = Field(
+        True, validation_alias="YSHOPPING_AGENT_PARTITION_DATE_ANCHOR_ENABLED"
+    )
     agent_trace_replay_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_TRACE_REPLAY_ENABLED")
-    agent_compact_success_artifacts_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_COMPACT_SUCCESS_ARTIFACTS_ENABLED")
+    agent_compact_success_artifacts_enabled: bool = Field(
+        True, validation_alias="YSHOPPING_AGENT_COMPACT_SUCCESS_ARTIFACTS_ENABLED"
+    )
     agent_run_retention_days: int = Field(14, validation_alias="YSHOPPING_AGENT_RUN_RETENTION_DAYS")
     agent_completed_checkpoint_limit: int = Field(30, validation_alias="YSHOPPING_AGENT_COMPLETED_CHECKPOINT_LIMIT")
     attachment_retention_days: int = Field(7, validation_alias="YSHOPPING_ATTACHMENT_RETENTION_DAYS")
@@ -277,7 +307,9 @@ class Settings(BaseSettings):
         True,
         validation_alias="YSHOPPING_PLANNER_SEMANTIC_CONTRACT_COMPILE_ENABLED",
     )
-    agent_deferred_tool_schema_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_DEFERRED_TOOL_SCHEMA_ENABLED")
+    agent_deferred_tool_schema_enabled: bool = Field(
+        True, validation_alias="YSHOPPING_AGENT_DEFERRED_TOOL_SCHEMA_ENABLED"
+    )
     planner_filesystem_context_mode: str = Field("off", validation_alias="YSHOPPING_PLANNER_FILESYSTEM_CONTEXT_MODE")
     legacy_question_planner_enabled: bool = Field(False, validation_alias="YSHOPPING_LEGACY_QUESTION_PLANNER_ENABLED")
     lead_action_llm_mode: str = Field("adaptive", validation_alias="YSHOPPING_LEAD_ACTION_LLM_MODE")
@@ -285,19 +317,29 @@ class Settings(BaseSettings):
     agent_planner_seed_table_limit: int = Field(4, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_TABLE_LIMIT")
     agent_planner_seed_metric_limit: int = Field(14, validation_alias="YSHOPPING_AGENT_PLANNER_SEED_METRIC_LIMIT")
     agent_asset_field_entry_limit: int = Field(240, validation_alias="YSHOPPING_AGENT_ASSET_FIELD_ENTRY_LIMIT")
-    agent_planner_prompt_budget_chars: int = Field(30000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS")
+    agent_planner_prompt_budget_chars: int = Field(
+        30000, validation_alias="YSHOPPING_AGENT_PLANNER_PROMPT_BUDGET_CHARS"
+    )
     agent_node_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_AGENT_NODE_FILE_TOOL_ROUNDS")
     answer_file_tool_rounds: int = Field(1, validation_alias="YSHOPPING_ANSWER_FILE_TOOL_ROUNDS")
     route_llm_mode: str = Field("low_confidence", validation_alias="YSHOPPING_ROUTE_LLM_MODE")
-    route_force_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_ROUTE_FORCE_CLARIFICATION_ENABLED")
+    route_force_clarification_enabled: bool = Field(
+        True, validation_alias="YSHOPPING_ROUTE_FORCE_CLARIFICATION_ENABLED"
+    )
     merchant_clarification_enabled: bool = Field(True, validation_alias="YSHOPPING_MERCHANT_CLARIFICATION_ENABLED")
     route_topic_min_confidence: float = Field(0.52, validation_alias="YSHOPPING_ROUTE_TOPIC_MIN_CONFIDENCE")
     route_topic_high_confidence: float = Field(0.75, validation_alias="YSHOPPING_ROUTE_TOPIC_HIGH_CONFIDENCE")
     route_topic_max_candidates: int = Field(4, validation_alias="YSHOPPING_ROUTE_TOPIC_MAX_CANDIDATES")
-    route_mixed_rule_data_min_confidence: float = Field(0.75, validation_alias="YSHOPPING_ROUTE_MIXED_RULE_DATA_MIN_CONFIDENCE")
+    route_mixed_rule_data_min_confidence: float = Field(
+        0.75, validation_alias="YSHOPPING_ROUTE_MIXED_RULE_DATA_MIN_CONFIDENCE"
+    )
     context_file_inline_max_chars: int = Field(12000, validation_alias="YSHOPPING_AGENT_CONTEXT_FILE_INLINE_MAX_CHARS")
-    context_artifact_inline_max_rows: int = Field(20, validation_alias="YSHOPPING_AGENT_CONTEXT_ARTIFACT_INLINE_MAX_ROWS")
-    context_compaction_threshold_ratio: float = Field(0.85, validation_alias="YSHOPPING_CONTEXT_COMPACTION_THRESHOLD_RATIO")
+    context_artifact_inline_max_rows: int = Field(
+        20, validation_alias="YSHOPPING_AGENT_CONTEXT_ARTIFACT_INLINE_MAX_ROWS"
+    )
+    context_compaction_threshold_ratio: float = Field(
+        0.85, validation_alias="YSHOPPING_CONTEXT_COMPACTION_THRESHOLD_RATIO"
+    )
     context_compaction_target_ratio: float = Field(0.4, validation_alias="YSHOPPING_CONTEXT_COMPACTION_TARGET_RATIO")
     context_runtime_budget_chars: int = Field(6000, validation_alias="YSHOPPING_CONTEXT_RUNTIME_BUDGET_CHARS")
     context_planner_budget_chars: int = Field(12000, validation_alias="YSHOPPING_CONTEXT_PLANNER_BUDGET_CHARS")
@@ -305,12 +347,22 @@ class Settings(BaseSettings):
     context_memory_budget_tokens: int = Field(1200, validation_alias="YSHOPPING_CONTEXT_MEMORY_BUDGET_TOKENS")
     context_memory_budget_chars: int = Field(1800, validation_alias="YSHOPPING_CONTEXT_MEMORY_BUDGET_CHARS")
     middleware_loop_guard_threshold: int = Field(3, validation_alias="YSHOPPING_MIDDLEWARE_LOOP_GUARD_THRESHOLD")
-    middleware_tool_repeat_warning_threshold: int = Field(3, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_REPEAT_WARNING_THRESHOLD")
-    middleware_tool_repeat_hard_stop_threshold: int = Field(5, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_REPEAT_HARD_STOP_THRESHOLD")
-    middleware_tool_type_warning_threshold: int = Field(30, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_TYPE_WARNING_THRESHOLD")
-    middleware_tool_type_hard_stop_threshold: int = Field(50, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_TYPE_HARD_STOP_THRESHOLD")
+    middleware_tool_repeat_warning_threshold: int = Field(
+        3, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_REPEAT_WARNING_THRESHOLD"
+    )
+    middleware_tool_repeat_hard_stop_threshold: int = Field(
+        5, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_REPEAT_HARD_STOP_THRESHOLD"
+    )
+    middleware_tool_type_warning_threshold: int = Field(
+        30, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_TYPE_WARNING_THRESHOLD"
+    )
+    middleware_tool_type_hard_stop_threshold: int = Field(
+        50, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_TYPE_HARD_STOP_THRESHOLD"
+    )
     middleware_tool_loop_window_size: int = Field(20, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_LOOP_WINDOW_SIZE")
-    middleware_tool_output_budget_chars: int = Field(12000, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_OUTPUT_BUDGET_CHARS")
+    middleware_tool_output_budget_chars: int = Field(
+        12000, validation_alias="YSHOPPING_MIDDLEWARE_TOOL_OUTPUT_BUDGET_CHARS"
+    )
     harness_middleware_disabled: str = Field("", validation_alias="YSHOPPING_HARNESS_MIDDLEWARE_DISABLED")
     harness_middleware_order: str = Field("", validation_alias="YSHOPPING_HARNESS_MIDDLEWARE_ORDER")
     run_budget_max_duration_seconds: int = Field(90, validation_alias="YSHOPPING_RUN_BUDGET_MAX_DURATION_SECONDS")
@@ -320,12 +372,45 @@ class Settings(BaseSettings):
     run_budget_max_doris_queries: int = Field(12, validation_alias="YSHOPPING_RUN_BUDGET_MAX_DORIS_QUERIES")
     run_budget_max_tool_calls: int = Field(60, validation_alias="YSHOPPING_RUN_BUDGET_MAX_TOOL_CALLS")
     run_budget_max_estimated_tokens: int = Field(60000, validation_alias="YSHOPPING_RUN_BUDGET_MAX_ESTIMATED_TOKENS")
-    grounded_branch_max_semantic_reads: int = Field(8, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_SEMANTIC_READS")
-    grounded_branch_max_semantic_chars: int = Field(200000, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_SEMANTIC_CHARS")
-    grounded_branch_max_contract_attempts: int = Field(3, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_CONTRACT_ATTEMPTS")
+    grounded_core_model_call_timeout_seconds: int = Field(
+        20,
+        validation_alias="YSHOPPING_GROUNDED_CORE_MODEL_CALL_TIMEOUT_SECONDS",
+    )
+    # Total provider attempts for one Core turn, including the initial call.
+    grounded_core_model_retry_attempts: int = Field(
+        2,
+        validation_alias="YSHOPPING_GROUNDED_CORE_MODEL_RETRY_ATTEMPTS",
+    )
+    grounded_branch_max_semantic_reads: int = Field(16, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_SEMANTIC_READS")
+    grounded_branch_max_semantic_chars: int = Field(
+        200000, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_SEMANTIC_CHARS"
+    )
+    grounded_branch_max_contract_attempts: int = Field(
+        3, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_CONTRACT_ATTEMPTS"
+    )
     grounded_branch_max_doris_queries: int = Field(2, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_DORIS_QUERIES")
-    grounded_branch_max_duration_seconds: int = Field(50, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_DURATION_SECONDS")
-    grounded_finalization_reserve_seconds: int = Field(15, validation_alias="YSHOPPING_GROUNDED_FINALIZATION_RESERVE_SECONDS")
+    grounded_branch_max_duration_seconds: int = Field(
+        50, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_DURATION_SECONDS"
+    )
+    grounded_finalization_reserve_seconds: int = Field(
+        15, validation_alias="YSHOPPING_GROUNDED_FINALIZATION_RESERVE_SECONDS"
+    )
+    grounded_exploration_max_observation_rows: int = Field(
+        64,
+        validation_alias="YSHOPPING_GROUNDED_EXPLORATION_MAX_OBSERVATION_ROWS",
+    )
+    grounded_exploration_max_observation_chars: int = Field(
+        12000,
+        validation_alias="YSHOPPING_GROUNDED_EXPLORATION_MAX_OBSERVATION_CHARS",
+    )
+    grounded_exploration_max_assignments: int = Field(
+        2,
+        validation_alias="YSHOPPING_GROUNDED_EXPLORATION_MAX_ASSIGNMENTS",
+    )
+    grounded_exploration_timeout_seconds: int = Field(
+        15,
+        validation_alias="YSHOPPING_GROUNDED_EXPLORATION_TIMEOUT_SECONDS",
+    )
     middleware_max_manifest_entries: int = Field(200, validation_alias="YSHOPPING_MIDDLEWARE_MAX_MANIFEST_ENTRIES")
     tool_result_offload_chars: int = Field(20000, validation_alias="YSHOPPING_TOOL_RESULT_OFFLOAD_CHARS")
     result_csv_download_min_rows: int = Field(50, validation_alias="YSHOPPING_RESULT_CSV_DOWNLOAD_MIN_ROWS")
@@ -333,6 +418,22 @@ class Settings(BaseSettings):
     cache_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_CACHE_ENABLED")
     cache_memory_max_entries: int = Field(512, validation_alias="YSHOPPING_AGENT_CACHE_MEMORY_MAX_ENTRIES")
     cache_doris_select_ttl_seconds: int = Field(60, validation_alias="YSHOPPING_AGENT_CACHE_DORIS_SELECT_TTL_SECONDS")
+    # Doris result caching is safe only when its identity is bound to an
+    # explicitly governed datasource environment, data generation and semantic
+    # activation.  Empty values deliberately mean "capability unavailable";
+    # the repository then executes SELECTs without a result-cache lookup.
+    doris_datasource_environment: str = Field(
+        "", validation_alias="YSHOPPING_DORIS_DATASOURCE_ENVIRONMENT"
+    )
+    doris_data_epoch_sql: str = Field(
+        "", validation_alias="YSHOPPING_DORIS_DATA_EPOCH_SQL"
+    )
+    doris_data_epoch_column: str = Field(
+        "", validation_alias="YSHOPPING_DORIS_DATA_EPOCH_COLUMN"
+    )
+    doris_cache_generation: str = Field(
+        "", validation_alias="YSHOPPING_DORIS_CACHE_GENERATION"
+    )
     cache_recall_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_RECALL_TTL_SECONDS")
     cache_asset_pack_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_ASSET_PACK_TTL_SECONDS")
     cache_llm_ttl_seconds: int = Field(300, validation_alias="YSHOPPING_AGENT_CACHE_LLM_TTL_SECONDS")
@@ -347,14 +448,22 @@ class Settings(BaseSettings):
     distributed_subagents_enabled: bool = Field(False, validation_alias="YSHOPPING_DISTRIBUTED_SUBAGENTS_ENABLED")
     distributed_worker_poll_seconds: float = Field(0.5, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_POLL_SECONDS")
     distributed_worker_lease_seconds: int = Field(120, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_LEASE_SECONDS")
-    distributed_worker_result_timeout_seconds: int = Field(180, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_RESULT_TIMEOUT_SECONDS")
+    distributed_worker_result_timeout_seconds: int = Field(
+        180, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_RESULT_TIMEOUT_SECONDS"
+    )
     distributed_worker_max_attempts: int = Field(3, validation_alias="YSHOPPING_DISTRIBUTED_WORKER_MAX_ATTEMPTS")
-    distributed_worker_execution_backend: str = Field("process", validation_alias="YSHOPPING_DISTRIBUTED_WORKER_EXECUTION_BACKEND")
+    distributed_worker_execution_backend: str = Field(
+        "process", validation_alias="YSHOPPING_DISTRIBUTED_WORKER_EXECUTION_BACKEND"
+    )
     distributed_artifact_backend: str = Field("filesystem", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_BACKEND")
     distributed_artifact_s3_bucket: str = Field("", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_BUCKET")
-    distributed_artifact_s3_prefix: str = Field("merchant-ai", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_PREFIX")
+    distributed_artifact_s3_prefix: str = Field(
+        "merchant-ai", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_PREFIX"
+    )
     distributed_artifact_s3_endpoint: str = Field("", validation_alias="YSHOPPING_DISTRIBUTED_ARTIFACT_S3_ENDPOINT")
-    python_executable: str = Field(default_factory=lambda: sys.executable, validation_alias="YSHOPPING_PYTHON_EXECUTABLE")
+    python_executable: str = Field(
+        default_factory=lambda: sys.executable, validation_alias="YSHOPPING_PYTHON_EXECUTABLE"
+    )
 
     rule_knowledge_path: str = Field("", validation_alias="YSHOPPING_RULE_KNOWLEDGE_PATH")
     topic_path: str = Field("", validation_alias="YSHOPPING_TOPIC_PATH")

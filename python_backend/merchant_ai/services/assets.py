@@ -29,7 +29,7 @@ from merchant_ai.models import (
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.llm import LlmClient
-from merchant_ai.services.repositories import DorisRepository, write_json
+from merchant_ai.services.repositories import DorisRepository, safe_identifier, write_json
 from merchant_ai.services.semantic_request import semantic_request_cache_key
 from merchant_ai.services.semantic_joins import plan_governed_joins
 from merchant_ai.services.time_semantics import resolve_time_range
@@ -179,6 +179,7 @@ ACTIVE_SEMANTIC_SIDECAR_FIELDS = {
 }
 ACTIVE_TOPIC_SEMANTIC_FILENAMES = frozenset({"manifest.json", "relationships.json"})
 ACTIVE_TABLE_SEMANTIC_FILENAMES = frozenset({"asset.json", *ACTIVE_SEMANTIC_SIDECAR_FIELDS.values()})
+EXECUTABLE_SEMANTIC_ASSET_STATUSES = frozenset({"ACTIVE", "PUBLISHED"})
 
 SemanticActivationSignature = Tuple[Tuple[str, int, int, int, int], ...]
 
@@ -213,6 +214,7 @@ class TopicAssetService:
         self.settings = settings
         self._table_asset_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._manifest_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._navigation_manifest_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._relationship_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._topic_names_cache: Optional[List[str]] = None
         self._topic_contract_cache: Dict[str, Dict[str, Any]] = {}
@@ -285,6 +287,7 @@ class TopicAssetService:
             manifest_changed = self._upsert_published_manifest_entry(topic, active_asset)
             self._table_asset_cache.pop((topic, table_name), None)
             self._manifest_cache.pop(topic, None)
+            self._navigation_manifest_cache.pop(topic, None)
             self._relationship_cache.pop(topic, None)
             self._topic_names_cache = None
             self._topic_contract_cache.pop(topic, None)
@@ -308,13 +311,91 @@ class TopicAssetService:
         return {"success": True, "status": "REJECTED", "topic": topic, "tableName": table_name}
 
     def load_manifest(self, topic: str) -> List[Dict[str, Any]]:
+        """Return only manifest coordinates backed by an executable asset.
+
+        A manifest is a navigation index, not publication authority.  Runtime
+        binding callers use this method and therefore cannot promote a stale
+        or hand-written manifest row when the governed ``asset.json`` is
+        absent, malformed, or not explicitly active.
+        """
+
         if topic in self._manifest_cache:
             return self._manifest_cache[topic]
+        manifest = [
+            item
+            for item in self.load_navigation_manifest(topic)
+            if isinstance(item, dict)
+            and self.table_activation_decision(
+                topic,
+                str(item.get("tableName") or ""),
+            ).get("allowed")
+        ]
+        self._manifest_cache[topic] = manifest
+        return manifest
+
+    def load_navigation_manifest(self, topic: str) -> List[Dict[str, Any]]:
+        """Return untrusted manifest coordinates for browse-only surfaces."""
+
+        if topic in self._navigation_manifest_cache:
+            return self._navigation_manifest_cache[topic]
         path = self.root / topic / "manifest.json"
         data = read_json(path)
         manifest = data if isinstance(data, list) else []
-        self._manifest_cache[topic] = manifest
+        self._navigation_manifest_cache[topic] = manifest
         return manifest
+
+    def table_activation_decision(self, topic: str, table: str) -> Dict[str, Any]:
+        """Return a structured, fail-closed execution-authority decision."""
+
+        topic_name = str(topic or "").strip()
+        table_name = str(table or "").strip()
+        source = self.table_asset_dir(topic_name, table_name) / "asset.json"
+        if not topic_name or not table_name:
+            return {
+                "allowed": False,
+                "code": "SEMANTIC_ASSET_COORDINATE_INVALID",
+                "topic": topic_name,
+                "tableName": table_name,
+                "lifecycleStatus": "",
+            }
+        payload = read_json(source)
+        if not isinstance(payload, dict) or not payload:
+            return {
+                "allowed": False,
+                "code": "SEMANTIC_ASSET_FILE_REQUIRED",
+                "topic": topic_name,
+                "tableName": table_name,
+                "lifecycleStatus": "",
+            }
+        declared_topic = str(payload.get("topic") or topic_name).strip()
+        declared_table = str(payload.get("tableName") or table_name).strip()
+        if declared_topic != topic_name or declared_table != table_name:
+            return {
+                "allowed": False,
+                "code": "SEMANTIC_ASSET_IDENTITY_MISMATCH",
+                "topic": topic_name,
+                "tableName": table_name,
+                "declaredTopic": declared_topic,
+                "declaredTableName": declared_table,
+                "lifecycleStatus": str(payload.get("status") or "").strip().upper(),
+            }
+        lifecycle_status = str(payload.get("status") or "").strip().upper()
+        if lifecycle_status not in EXECUTABLE_SEMANTIC_ASSET_STATUSES:
+            return {
+                "allowed": False,
+                "code": "SEMANTIC_ASSET_NOT_ACTIVE",
+                "topic": topic_name,
+                "tableName": table_name,
+                "lifecycleStatus": lifecycle_status,
+                "acceptedStatuses": sorted(EXECUTABLE_SEMANTIC_ASSET_STATUSES),
+            }
+        return {
+            "allowed": True,
+            "code": "SEMANTIC_ASSET_ACTIVE",
+            "topic": topic_name,
+            "tableName": table_name,
+            "lifecycleStatus": lifecycle_status,
+        }
 
     def load_topic_contract(self, topic: str) -> Dict[str, Any]:
         """Load the open topic/category contract declared by published assets."""
@@ -323,7 +404,25 @@ class TopicAssetService:
         if topic_name in self._topic_contract_cache:
             return dict(self._topic_contract_cache[topic_name])
         manifest = self.load_manifest(topic_name)
-        sources: List[Dict[str, Any]] = [item for item in manifest if isinstance(item, dict)]
+        if not manifest:
+            denied = {
+                "success": False,
+                "authority": "DENIED",
+                "activation": {
+                    "allowed": False,
+                    "code": "TOPIC_HAS_NO_ACTIVE_SEMANTIC_ASSETS",
+                    "topic": topic_name,
+                },
+                "topic": topic_name,
+                "categoryId": str(QuestionCategory.UNKNOWN),
+                "declaredCategoryId": "",
+                "displayName": "",
+                "aliases": [],
+                "metadata": {},
+            }
+            self._topic_contract_cache[topic_name] = denied
+            return dict(denied)
+        sources: List[Dict[str, Any]] = []
         for item in manifest:
             table = str(item.get("tableName") or "") if isinstance(item, dict) else ""
             if table:
@@ -430,8 +529,19 @@ class TopicAssetService:
             return self._topic_names_cache
         if not self.root.exists():
             return []
-        self._topic_names_cache = [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
+        self._topic_names_cache = [
+            path.name
+            for path in sorted(self.root.iterdir())
+            if path.is_dir() and bool(self.load_manifest(path.name))
+        ]
         return self._topic_names_cache
+
+    def all_navigation_topic_names(self) -> List[str]:
+        """List directory coordinates without granting query authority."""
+
+        if not self.root.exists():
+            return []
+        return [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
 
     def semantic_source_hash(self, topics: Iterable[str]) -> str:
         cache_key = tuple(sorted({str(item or "") for item in topics if item}))
@@ -452,6 +562,9 @@ class TopicAssetService:
 
     def semantic_table_source_hash(self, topic: str, table: str) -> str:
         """Return the active semantic identity relevant to one governed table."""
+
+        if not self.table_activation_decision(topic, table).get("allowed"):
+            return ""
 
         candidates = [
             *(self.root / topic / name for name in ACTIVE_TOPIC_SEMANTIC_FILENAMES),
@@ -511,18 +624,25 @@ class TopicAssetService:
         if cache_key in self._table_asset_cache:
             return self._table_asset_cache[cache_key]
         table_dir = self.table_asset_dir(topic, table)
-        asset = read_json(table_dir / "asset.json")
-        if not isinstance(asset, dict) or not asset:
-            manifest_item = next((item for item in self.load_manifest(topic) if str(item.get("tableName") or "") == table), {})
-            asset = {
-                **manifest_item,
+        activation = self.table_activation_decision(topic, table)
+        if not activation.get("allowed"):
+            denied = {
+                "success": False,
+                "authority": "DENIED",
+                "activation": activation,
                 "topic": topic,
                 "tableName": table,
+                "status": str(activation.get("lifecycleStatus") or ""),
+                **{field: [] for field in self.SEMANTIC_LIST_FIELDS},
             }
-        else:
-            asset = {**asset}
-            asset.setdefault("topic", topic)
-            asset.setdefault("tableName", table)
+            self._table_asset_cache[cache_key] = denied
+            return denied
+        asset = read_json(table_dir / "asset.json")
+        asset = {**asset}
+        asset.setdefault("topic", topic)
+        asset.setdefault("tableName", table)
+        asset["activation"] = activation
+        asset["authority"] = "EXECUTABLE"
         for field, file_name in ACTIVE_SEMANTIC_SIDECAR_FIELDS.items():
             sidecar = read_json(table_dir / file_name)
             if isinstance(sidecar, list):
@@ -797,6 +917,9 @@ class TopicAssetService:
     def load_relationships(self, topic: str) -> List[Dict[str, Any]]:
         if topic in self._relationship_cache:
             return self._relationship_cache[topic]
+        if not self.load_manifest(topic):
+            self._relationship_cache[topic] = []
+            return []
         data = read_json(self.root / topic / "relationships.json")
         relationships = data if isinstance(data, list) else []
         self._relationship_cache[topic] = relationships
@@ -867,7 +990,7 @@ class SemanticCatalogService:
             manifest_ref = self.manifest_ref(topic_name)
             if not terms or score_document(terms, manifest_ref["searchText"]) > 0:
                 refs.append(manifest_ref)
-            for manifest_item in self.topic_assets.load_manifest(topic_name):
+            for manifest_item in self.topic_assets.load_navigation_manifest(topic_name):
                 table = str(manifest_item.get("tableName") or "")
                 if not table:
                     continue
@@ -913,6 +1036,21 @@ class SemanticCatalogService:
             ref = self._resolve_ref(wanted_ref, wanted_path)
         if not ref:
             return {"success": False, "error": "SEMANTIC_REF_NOT_FOUND", "refId": ref_id, "path": path}
+        ref_topic = str(ref.get("topic") or "")
+        ref_table = str(ref.get("table") or "")
+        ref_path = str(ref.get("path") or "")
+        if ref_topic and ref_table and "/tables/" in ref_path:
+            activation = self.topic_assets.table_activation_decision(ref_topic, ref_table)
+            if not activation.get("allowed"):
+                return {
+                    "success": False,
+                    "error": "SEMANTIC_BINDING_AUTHORITY_DENIED",
+                    "refId": str(ref.get("refId") or ref_id),
+                    "path": str(ref.get("path") or path),
+                    "topic": ref_topic,
+                    "table": ref_table,
+                    "activation": activation,
+                }
         if (
             str(ref.get("kind") or "").upper() == self.TABLE_KIND
             or str(ref.get("path") or "").endswith("/asset.json")
@@ -1152,7 +1290,9 @@ class SemanticCatalogService:
         }
 
     def manifest_ref(self, topic: str) -> Dict[str, Any]:
-        manifest = self.topic_assets.load_manifest(topic)
+        # The manifest is an L0 coordinate index.  Its rows may be browsed,
+        # but reading a table child still passes the activation gate above.
+        manifest = self.topic_assets.load_navigation_manifest(topic)
         compact_tables: List[Dict[str, Any]] = []
         search_parts: List[str] = [topic]
         for item in manifest:
@@ -1173,6 +1313,7 @@ class SemanticCatalogService:
         content_payload = {
             "topic": topic,
             "layer": "manifest",
+            "bindingAuthority": False,
             "policy": "Choose a table, then read only its detailRefId. This layer contains no metric, column, schema, relationship, or rule definitions.",
             "tables": compact_tables,
         }
@@ -1430,18 +1571,22 @@ class SemanticCatalogService:
             indexed = [*diverse, *repeated]
         selected: List[Dict[str, Any]] = []
         for _index, value, key in indexed[: max(0, limit)]:
-            selected.append(
-                {
-                    "key": key,
-                    "aliases": automatic_l1_navigation_aliases(
-                        section,
-                        value,
-                        key,
-                    )[: self.L1_NAVIGATION_MAX_ALIASES_PER_LEAF],
-                    "refId": semantic_table_entry_ref_id(topic, table, section, key),
-                    "path": semantic_table_entry_path(topic, table, section, key),
-                }
-            )
+            leaf = {
+                "key": key,
+                "aliases": automatic_l1_navigation_aliases(
+                    section,
+                    value,
+                    key,
+                )[: self.L1_NAVIGATION_MAX_ALIASES_PER_LEAF],
+                "refId": semantic_table_entry_ref_id(topic, table, section, key),
+                "path": semantic_table_entry_path(topic, table, section, key),
+            }
+            if section == "columns":
+                leaf["semanticRole"] = str(
+                    value.get("semanticRole") or value.get("role") or "UNDECLARED"
+                ).upper()
+                leaf["timeRole"] = str(value.get("timeRole") or "").upper()
+            selected.append(leaf)
         return selected
 
     def _trim_l1_navigation_to_budget(self, payload: Dict[str, Any]) -> None:
@@ -1988,7 +2133,7 @@ class SemanticCatalogService:
         return next(
             (
                 dict(item)
-                for item in self.topic_assets.load_manifest(topic)
+                for item in self.topic_assets.load_navigation_manifest(topic)
                 if isinstance(item, dict) and str(item.get("tableName") or "") == table
             ),
             {},
@@ -2359,7 +2504,8 @@ class HybridRecallService:
                             "layers": ref["layers"],
                             "estimatedChars": ref["estimatedChars"],
                             "offloadRecommended": ref["offloadRecommended"],
-                            "status": asset.get("status") or manifest_item.get("status") or "PUBLISHED",
+                            "status": asset.get("status") or "",
+                            "assetStatus": asset.get("status") or "",
                             "version": asset.get("version") or "",
                             "merchantId": asset.get("merchantId") or "",
                             "allowedRoles": asset.get("allowedRoles") or [],
@@ -2414,7 +2560,8 @@ class HybridRecallService:
                                 "aliases": metric.get("aliases") or [],
                                 "merchantUri": merchant_uri_for_semantic_ref(semantic_ref_id, topic=topic, table=table, kind="METRIC", key=metric_key),
                                 "contextLayer": "L1",
-                                "status": metric.get("status") or asset.get("status") or "PUBLISHED",
+                                "status": metric.get("status") or asset.get("status") or "",
+                                "assetStatus": asset.get("status") or "",
                                 "version": metric.get("version") or asset.get("version") or "",
                                 "merchantId": metric.get("merchantId") or asset.get("merchantId") or "",
                                 "allowedRoles": metric.get("allowedRoles") or asset.get("allowedRoles") or [],
@@ -5738,6 +5885,20 @@ def normalize_physical_table_metadata(payload: Any) -> Dict[str, Any]:
                 "primaryKeyColumns": dedupe_strings([str(item) for item in payload.get("primaryKeyColumns") or []]),
                 "partitionColumns": dedupe_strings([str(item) for item in payload.get("partitionColumns") or []]),
                 "bucketColumns": dedupe_strings([str(item) for item in payload.get("bucketColumns") or []]),
+                "bucketCount": int(payload.get("bucketCount") or 0),
+                "partitionExpression": str(payload.get("partitionExpression") or ""),
+                "partitionTimeZone": str(payload.get("partitionTimeZone") or ""),
+                "colocateGroup": str(payload.get("colocateGroup") or ""),
+                "invertedIndexes": [
+                    dict(item)
+                    for item in payload.get("invertedIndexes") or []
+                    if isinstance(item, dict)
+                ],
+                "invertedIndexColumns": dedupe_strings(
+                    [str(item) for item in payload.get("invertedIndexColumns") or []]
+                ),
+                "ddlHash": str(payload.get("ddlHash") or ""),
+                "capturedAt": str(payload.get("capturedAt") or ""),
                 "source": str(payload.get("source") or "metadata_provider"),
             }
         ddl = show_create_table_ddl_from_payload(payload)
@@ -5750,6 +5911,91 @@ def normalize_physical_table_metadata(payload: Any) -> Dict[str, Any]:
     if isinstance(payload, str):
         return parse_doris_create_table_metadata(payload)
     return {}
+
+
+def _metadata_row_value(row: Dict[str, Any], *candidate_keys: str) -> Any:
+    normalized = {
+        "".join(character.casefold() for character in str(key) if character.isalnum()): value
+        for key, value in row.items()
+    }
+    for candidate in candidate_keys:
+        key = "".join(
+            character.casefold()
+            for character in str(candidate)
+            if character.isalnum()
+        )
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def normalize_doris_index_rows(payload: Any) -> Dict[str, Any]:
+    rows = payload if isinstance(payload, list) else []
+    indexes: List[Dict[str, Any]] = []
+    columns: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        index_type = str(
+            _metadata_row_value(row, "Index_type", "IndexType", "Type") or ""
+        ).strip().upper()
+        if index_type != "INVERTED":
+            continue
+        column = str(
+            _metadata_row_value(row, "Column_name", "ColumnName", "Column") or ""
+        ).strip()
+        name = str(
+            _metadata_row_value(row, "Key_name", "IndexName", "Name") or ""
+        ).strip()
+        if not column:
+            continue
+        columns.append(column)
+        indexes.append(
+            {
+                "name": name,
+                "column": column,
+                "type": index_type,
+                "properties": str(
+                    _metadata_row_value(row, "Properties", "Property") or ""
+                ),
+                "comment": str(_metadata_row_value(row, "Comment") or ""),
+            }
+        )
+    return {
+        "invertedIndexes": indexes,
+        "invertedIndexColumns": dedupe_strings(columns),
+    }
+
+
+def normalize_doris_partition_rows(payload: Any) -> Dict[str, Any]:
+    rows = [item for item in payload or [] if isinstance(item, dict)] if isinstance(payload, list) else []
+    bucket_counts: List[int] = []
+    partition_names: List[str] = []
+    for row in rows:
+        name = str(_metadata_row_value(row, "PartitionName", "Partition") or "").strip()
+        if name:
+            partition_names.append(name)
+        raw_buckets = _metadata_row_value(row, "Buckets", "BucketNum", "BucketCount")
+        try:
+            count = int(raw_buckets or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            bucket_counts.append(count)
+    snapshot_payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str)
+    return {
+        "partitionCount": len(partition_names),
+        "bucketCount": (
+            bucket_counts[0]
+            if bucket_counts and len(set(bucket_counts)) == 1
+            else 0
+        ),
+        "partitionSnapshotHash": (
+            hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest()
+            if rows
+            else ""
+        ),
+    }
 
 
 def show_create_table_ddl_from_payload(payload: Any) -> str:
@@ -6337,13 +6583,32 @@ class TopicBuilderWorkflow:
         if not table:
             return {"success": False, "message": "tableName is required"}
         pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
-        pending_dir.mkdir(parents=True, exist_ok=True)
         existing = self._existing_asset_context(topic, table)
         schema = self._load_schema(table, request)
         physical_metadata = self._load_physical_metadata(table)
         schema = self._enrich_schema_with_physical_metadata(schema, physical_metadata)
-        sample_rows = self._load_sample_rows(table, request)
-        profile = self._sample_profile(table, schema, sample_rows, request, physical_metadata)
+        tenant_scope = self._resolve_topic_builder_tenant_scope(topic, table, request, schema)
+        if not tenant_scope.get("valid"):
+            return {
+                "success": False,
+                "status": "TENANT_SCOPE_REJECTED",
+                "code": str(tenant_scope.get("code") or "TENANT_FILTER_COLUMN_REQUIRED"),
+                "message": str(tenant_scope.get("message") or "governed merchantFilterColumn is required"),
+                "topic": topic,
+                "tableName": table,
+            }
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        merchant_filter_column = str(tenant_scope["merchantFilterColumn"])
+        sample_rows = self._load_sample_rows(table, request, merchant_filter_column)
+        profile = self._sample_profile(
+            table,
+            schema,
+            sample_rows,
+            request,
+            physical_metadata,
+            merchant_filter_column=merchant_filter_column,
+            merchant_filter_column_source=str(tenant_scope.get("source") or ""),
+        )
         generated = self._generate_candidate_payload(topic, table, request, schema, sample_rows, profile, existing)
         builder_phases = {
             "schemaDiscovery": {
@@ -6352,6 +6617,12 @@ class TopicBuilderWorkflow:
                 "columnCount": len(schema),
                 "primaryKeyColumns": list(physical_metadata.get("primaryKeyColumns") or []),
                 "partitionColumns": list(physical_metadata.get("partitionColumns") or []),
+                "bucketColumns": list(physical_metadata.get("bucketColumns") or []),
+                "bucketCount": int(physical_metadata.get("bucketCount") or 0),
+                "invertedIndexColumns": list(
+                    physical_metadata.get("invertedIndexColumns") or []
+                ),
+                "ddlHash": str(physical_metadata.get("ddlHash") or ""),
                 "keyModel": str(physical_metadata.get("keyModel") or ""),
             },
             "sampleProfiling": {
@@ -6381,8 +6652,11 @@ class TopicBuilderWorkflow:
             "tableName": table,
             "tableComment": str(generated.get("tableComment") or existing.get("tableComment") or ""),
             "dataGrain": str(generated.get("dataGrain") or existing.get("dataGrain") or "UNDECLARED"),
-            "timeColumn": str(generated.get("timeColumn") or existing.get("timeColumn") or profile.get("timeColumn") or ""),
-            "merchantFilterColumn": str(generated.get("merchantFilterColumn") or existing.get("merchantFilterColumn") or ""),
+            "timeColumn": str(generated.get("timeColumn") or existing.get("timeColumn") or ""),
+            # This value is execution authority.  It comes only from explicit
+            # admin configuration or an already-published semantic asset, never
+            # from LLM output or naming heuristics.
+            "merchantFilterColumn": merchant_filter_column,
             "entityLookupPolicy": normalize_entity_lookup_policy(
                 generated.get("entityLookupPolicy")
                 or existing.get("entityLookupPolicy")
@@ -6390,13 +6664,12 @@ class TopicBuilderWorkflow:
                 inherited_time_column=str(
                     generated.get("timeColumn")
                     or existing.get("timeColumn")
-                    or profile.get("timeColumn")
                     or ""
                 ),
             ),
-            "rowAccessPolicy": normalize_row_access_policy(
-                generated.get("rowAccessPolicy")
-                or existing.get("rowAccessPolicy")
+            "rowAccessPolicy": self._tenant_row_access_policy(
+                merchant_filter_column,
+                generated.get("rowAccessPolicy") or existing.get("rowAccessPolicy"),
             ),
             "resultAccessPolicies": normalize_result_access_policies(
                 generated.get("resultAccessPolicies")
@@ -6412,6 +6685,11 @@ class TopicBuilderWorkflow:
             "generationMode": str(generated.get("generationMode") or "metadata_only"),
             "generatedAt": datetime.utcnow().isoformat() + "Z",
             "status": "PENDING_REVIEW",
+            "samplingGovernance": {
+                "tenantIsolation": "ENFORCED",
+                "merchantFilterColumn": merchant_filter_column,
+                "merchantFilterColumnSource": str(tenant_scope.get("source") or ""),
+            },
         }
         if not asset_payload.get("entityLookupPolicy"):
             asset_payload.pop("entityLookupPolicy", None)
@@ -6584,6 +6862,8 @@ class TopicBuilderWorkflow:
         return payload
 
     def _load_physical_metadata(self, table: str) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        raw_ddl = ""
         providers = ["table_physical_metadata", "show_create_table"]
         for name in providers:
             provider = getattr(self.doris_repository, name, None)
@@ -6593,10 +6873,129 @@ class TopicBuilderWorkflow:
                 payload = provider(table)
             except Exception:
                 payload = {}
-            metadata = normalize_physical_table_metadata(payload)
-            if metadata:
-                return metadata
-        return {}
+            candidate = normalize_physical_table_metadata(payload)
+            if candidate:
+                metadata.update(candidate)
+                if name == "show_create_table":
+                    rows = payload if isinstance(payload, list) else [payload]
+                    raw_ddl = next(
+                        (
+                            show_create_table_ddl_from_payload(item)
+                            for item in rows
+                            if show_create_table_ddl_from_payload(item)
+                        ),
+                        "",
+                    )
+                break
+
+        index_provider = getattr(self.doris_repository, "show_indexes", None)
+        if callable(index_provider):
+            try:
+                metadata.update(normalize_doris_index_rows(index_provider(table)))
+            except Exception:
+                pass
+        partition_provider = getattr(self.doris_repository, "show_partitions", None)
+        if callable(partition_provider):
+            try:
+                metadata.update(
+                    normalize_doris_partition_rows(partition_provider(table))
+                )
+            except Exception:
+                pass
+        if raw_ddl:
+            metadata["ddlHash"] = hashlib.sha256(
+                raw_ddl.encode("utf-8")
+            ).hexdigest()
+        if metadata:
+            metadata["capturedAt"] = datetime.utcnow().isoformat() + "Z"
+        return metadata
+
+    def _resolve_topic_builder_tenant_scope(
+        self,
+        topic: str,
+        table: str,
+        request: TopicBuildRequest,
+        schema: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Resolve tenant execution authority without guessing a column name."""
+
+        requested = str(request.merchant_filter_column or "").strip()
+        published_column = ""
+        published_dir = self.topic_assets.table_asset_dir(topic, table)
+        if published_dir.exists():
+            published = self._load_asset_dir(published_dir, topic, table)
+            published_policy = published.get("rowAccessPolicy") if isinstance(published.get("rowAccessPolicy"), dict) else {}
+            published_column = str(
+                published.get("merchantFilterColumn")
+                or published_policy.get("filterColumn")
+                or ""
+            ).strip()
+
+        if requested and published_column and requested != published_column:
+            return {
+                "valid": False,
+                "code": "TENANT_FILTER_COLUMN_CONFLICT",
+                "message": (
+                    "merchantFilterColumn conflicts with the published semantic asset; "
+                    "change it through the governed publish workflow"
+                ),
+            }
+
+        column = requested or published_column
+        source = "ADMIN_REQUEST" if requested else "PUBLISHED_SEMANTIC_ASSET"
+        if not column:
+            return {
+                "valid": False,
+                "code": "TENANT_FILTER_COLUMN_REQUIRED",
+                "message": (
+                    "Topic Builder sampling requires an explicit merchantFilterColumn "
+                    "or an already-published semantic asset"
+                ),
+            }
+        try:
+            safe_identifier(column)
+        except ValueError:
+            return {
+                "valid": False,
+                "code": "TENANT_FILTER_COLUMN_INVALID",
+                "message": "merchantFilterColumn must be a safe schema identifier",
+            }
+        schema_columns = {
+            str(item.get("columnName") or "")
+            for item in schema
+            if isinstance(item, dict) and str(item.get("columnName") or "")
+        }
+        if column not in schema_columns:
+            return {
+                "valid": False,
+                "code": "TENANT_FILTER_COLUMN_NOT_IN_SCHEMA",
+                "message": "merchantFilterColumn is not present in the live table schema",
+            }
+        if not str(request.merchant_id or self.settings.merchant_id or "").strip():
+            return {
+                "valid": False,
+                "code": "MERCHANT_ID_REQUIRED",
+                "message": "merchantId is required for tenant-scoped Topic Builder sampling",
+            }
+        return {
+            "valid": True,
+            "merchantFilterColumn": column,
+            "source": source,
+        }
+
+    def _tenant_row_access_policy(self, merchant_filter_column: str, supplied: Any) -> Dict[str, Any]:
+        policy = normalize_row_access_policy(supplied or {})
+        if policy and str(policy.get("filterColumn") or "") not in {"", merchant_filter_column}:
+            policy = {}
+        return {
+            **policy,
+            "scopeType": "merchant",
+            "filterColumn": merchant_filter_column,
+            "operator": "=",
+            "valueSource": "request.merchantId",
+            "required": True,
+            "reason": str(policy.get("reason") or "governed Topic Builder tenant scope"),
+        }
 
     def _enrich_schema_with_physical_metadata(
         self,
@@ -6643,12 +7042,22 @@ class TopicBuilderWorkflow:
             ]
         return [self._normalize_schema_column(item) for item in (schema if isinstance(schema, list) else [])]
 
-    def _load_sample_rows(self, table: str, request: TopicBuildRequest) -> List[Dict[str, Any]]:
+    def _load_sample_rows(
+        self,
+        table: str,
+        request: TopicBuildRequest,
+        merchant_filter_column: str,
+    ) -> List[Dict[str, Any]]:
         provider = getattr(self.doris_repository, "sample_rows", None)
         if not callable(provider):
             return []
         try:
-            rows = provider(table, request.merchant_id or self.settings.merchant_id, max(1, int(request.sample_limit or 20)))
+            rows = provider(
+                table,
+                request.merchant_id or self.settings.merchant_id,
+                merchant_filter_column,
+                max(1, int(request.sample_limit or 20)),
+            )
         except Exception:
             return []
         normalized: List[Dict[str, Any]] = []
@@ -6665,6 +7074,8 @@ class TopicBuilderWorkflow:
         rows: List[Dict[str, Any]],
         request: TopicBuildRequest,
         physical_metadata: Optional[Dict[str, Any]] = None,
+        merchant_filter_column: str = "",
+        merchant_filter_column_source: str = "",
     ) -> Dict[str, Any]:
         physical_metadata = physical_metadata or {}
         columns = [str(item.get("columnName") or "") for item in schema if str(item.get("columnName") or "")]
@@ -6673,7 +7084,13 @@ class TopicBuilderWorkflow:
         sample_values: Dict[str, List[Any]] = {}
         enum_candidates: Dict[str, List[Any]] = {}
         enum_candidate_profiles: Dict[str, Dict[str, Any]] = {}
-        global_enum_profiles = self._load_global_enum_profiles(table, columns, request, enum_limit)
+        global_enum_profiles = self._load_global_enum_profiles(
+            table,
+            columns,
+            request,
+            enum_limit,
+            merchant_filter_column,
+        )
         for column in columns:
             values = [row.get(column) for row in rows if isinstance(row, dict)]
             total = len(values)
@@ -6723,7 +7140,6 @@ class TopicBuilderWorkflow:
             [str(item) for item in physical_metadata.get("partitionColumns") or [] if str(item) in columns]
             + [str(item.get("columnName") or "") for item in schema if bool(item.get("isPartitionColumn"))]
         )
-        time_column = partition_candidates[0] if len(partition_candidates) == 1 else ""
         primary_key_columns = dedupe_strings(
             [str(item) for item in physical_metadata.get("primaryKeyColumns") or [] if str(item) in columns]
             + [str(item.get("columnName") or "") for item in schema if bool(item.get("isPrimaryKey"))]
@@ -6738,8 +7154,12 @@ class TopicBuilderWorkflow:
             "primaryKeyColumns": primary_key_columns,
             "bucketColumns": [str(item) for item in physical_metadata.get("bucketColumns") or [] if str(item) in columns],
             "keyModel": str(physical_metadata.get("keyModel") or ""),
-            "timeColumn": time_column,
-            "merchantFilterColumn": "",
+            # Physical partitioning is not business-time authority.  A
+            # governed business time column must come from a reviewed asset.
+            "timeColumn": "",
+            "merchantFilterColumn": merchant_filter_column,
+            "merchantFilterColumnSource": merchant_filter_column_source,
+            "tenantIsolation": "ENFORCED",
         }
 
     def _generate_candidate_payload(
@@ -6793,36 +7213,71 @@ class TopicBuilderWorkflow:
     ) -> Dict[str, Any]:
         if not bool(getattr(self.llm, "configured", False)):
             return {}
+        merchant_filter_column = str(profile.get("merchantFilterColumn") or "")
+        excluded_columns = self._llm_excluded_columns(
+            schema,
+            existing,
+            merchant_filter_column,
+        )
+        safe_schema = [
+            dict(item)
+            for item in schema
+            if str(item.get("columnName") or "") not in excluded_columns
+        ]
+        safe_sample_rows = [
+            {
+                str(key): value
+                for key, value in row.items()
+                if str(key) not in excluded_columns
+            }
+            for row in sample_rows[: min(len(sample_rows), 12)]
+            if isinstance(row, dict)
+        ]
+        safe_profile = self._llm_safe_sample_profile(profile, excluded_columns)
+        safe_existing = self._llm_safe_semantic_payload(existing, excluded_columns)
+        safe_heuristic = self._llm_safe_semantic_payload(heuristic, excluded_columns)
         prompt_payload = {
             "topic": topic,
             "tableName": table,
-            "schemaColumns": schema,
-            "sampleRows": sample_rows[: min(len(sample_rows), 12)],
-            "sampleProfile": profile,
+            "schemaColumns": safe_schema,
+            "sampleRows": safe_sample_rows,
+            "sampleProfile": safe_profile,
             "physicalTableMetadata": {
                 "keyModel": profile.get("keyModel") or "",
-                "primaryKeyColumns": profile.get("primaryKeyColumns") or [],
-                "partitionColumns": profile.get("partitionColumns") or [],
-                "bucketColumns": profile.get("bucketColumns") or [],
+                "primaryKeyColumns": [
+                    item for item in profile.get("primaryKeyColumns") or [] if str(item) not in excluded_columns
+                ],
+                "partitionColumns": [
+                    item for item in profile.get("partitionColumns") or [] if str(item) not in excluded_columns
+                ],
+                "bucketColumns": [
+                    item for item in profile.get("bucketColumns") or [] if str(item) not in excluded_columns
+                ],
             },
             "manualNotes": request.manual_notes,
             "businessKnowledge": request.business_knowledge,
-            "sampleSqls": request.sample_sqls[:8],
+            "sampleSqls": [
+                sql
+                for sql in request.sample_sqls[:8]
+                if not self._text_mentions_any_column(sql, excluded_columns)
+            ],
             "existingAsset": {
-                "tableComment": existing.get("tableComment"),
-                "dataGrain": existing.get("dataGrain"),
-                "timeColumn": existing.get("timeColumn"),
-                "merchantFilterColumn": existing.get("merchantFilterColumn"),
-                "entityLookupPolicy": existing.get("entityLookupPolicy") or {},
-                "rowAccessPolicy": existing.get("rowAccessPolicy") or {},
-                "resultAccessPolicies": existing.get("resultAccessPolicies") or {},
-                "semanticColumns": existing.get("semanticColumns") or [],
-                "metrics": existing.get("metrics") or [],
-                "terms": existing.get("terms") or [],
-                "knowledgeRules": existing.get("knowledgeRules") or [],
-                "tableUsageProfile": existing.get("tableUsageProfile") or {},
+                "tableComment": safe_existing.get("tableComment"),
+                "dataGrain": safe_existing.get("dataGrain"),
+                "timeColumn": safe_existing.get("timeColumn"),
+                "entityLookupPolicy": safe_existing.get("entityLookupPolicy") or {},
+                "resultAccessPolicies": safe_existing.get("resultAccessPolicies") or {},
+                "semanticColumns": safe_existing.get("semanticColumns") or [],
+                "metrics": safe_existing.get("metrics") or [],
+                "terms": safe_existing.get("terms") or [],
+                "knowledgeRules": safe_existing.get("knowledgeRules") or [],
+                "tableUsageProfile": safe_existing.get("tableUsageProfile") or {},
             },
-            "heuristicDraft": heuristic,
+            "heuristicDraft": safe_heuristic,
+            "samplingGovernance": {
+                "tenantFilterApplied": True,
+                "excludedGovernedColumnCount": len(excluded_columns),
+            },
         }
         system_prompt = (
             "你是资深数据语义建模助手。请基于表 schema、采样数据、业务备注和历史 SQL，"
@@ -6854,6 +7309,116 @@ class TopicBuilderWorkflow:
             payload = self.llm.tool_json_chat(system_prompt, json.dumps(prompt_payload, ensure_ascii=False), semantic_asset_builder_tool().openai_schema(), {})
         return payload if isinstance(payload, dict) else {}
 
+    def _llm_excluded_columns(
+        self,
+        schema: List[Dict[str, Any]],
+        existing: Dict[str, Any],
+        merchant_filter_column: str,
+    ) -> Set[str]:
+        excluded = {merchant_filter_column} if merchant_filter_column else set()
+        governed_columns = [
+            *[item for item in schema if isinstance(item, dict)],
+            *[
+                item
+                for item in existing.get("semanticColumns") or []
+                if isinstance(item, dict)
+            ],
+        ]
+        for column in governed_columns:
+            name = str(column.get("columnName") or column.get("Field") or "")
+            if not name:
+                continue
+            visibility = column.get("visibilityPolicy") if isinstance(column.get("visibilityPolicy"), dict) else None
+            masking = column.get("maskingPolicy") if isinstance(column.get("maskingPolicy"), dict) else None
+            if visibility is not None and str(visibility.get("level") or "").lower() in {"restricted", "hidden"}:
+                excluded.add(name)
+                continue
+            if masking is not None and str(masking.get("strategy") or "").lower() in {"partial", "full", "hash"}:
+                excluded.add(name)
+        return excluded
+
+    def _llm_safe_sample_profile(self, profile: Dict[str, Any], excluded_columns: Set[str]) -> Dict[str, Any]:
+        safe = dict(profile)
+        for field in ("nullRates", "sampleValues", "enumCandidates", "enumCandidateProfiles"):
+            values = safe.get(field)
+            if isinstance(values, dict):
+                safe[field] = {
+                    str(key): value
+                    for key, value in values.items()
+                    if str(key) not in excluded_columns
+                }
+        for field in ("primaryKeyColumns", "partitionColumns", "bucketColumns"):
+            safe[field] = [
+                item for item in safe.get(field) or [] if str(item) not in excluded_columns
+            ]
+        safe.pop("merchantFilterColumn", None)
+        safe.pop("merchantFilterColumnSource", None)
+        return safe
+
+    def _llm_safe_semantic_payload(self, payload: Dict[str, Any], excluded_columns: Set[str]) -> Dict[str, Any]:
+        safe = dict(payload or {})
+        safe.pop("merchantFilterColumn", None)
+        safe.pop("rowAccessPolicy", None)
+        if str(safe.get("timeColumn") or "") in excluded_columns:
+            safe["timeColumn"] = ""
+        if self._text_mentions_any_column(
+            json.dumps(safe.get("entityLookupPolicy") or {}, ensure_ascii=False),
+            excluded_columns,
+        ):
+            safe["entityLookupPolicy"] = {}
+        safe["semanticColumns"] = [
+            dict(item)
+            for item in safe.get("semanticColumns") or []
+            if isinstance(item, dict)
+            and str(item.get("columnName") or "") not in excluded_columns
+        ]
+        safe["metrics"] = [
+            dict(item)
+            for item in safe.get("metrics") or []
+            if isinstance(item, dict)
+            and not self._text_mentions_any_column(
+                json.dumps(item, ensure_ascii=False),
+                excluded_columns,
+            )
+        ]
+        safe["terms"] = [
+            dict(item)
+            for item in safe.get("terms") or []
+            if isinstance(item, dict)
+            and not self._text_mentions_any_column(
+                json.dumps(item, ensure_ascii=False),
+                excluded_columns,
+            )
+        ]
+        safe["knowledgeRules"] = [
+            dict(item)
+            for item in safe.get("knowledgeRules") or []
+            if isinstance(item, dict)
+            and not self._text_mentions_any_column(
+                json.dumps(item, ensure_ascii=False),
+                excluded_columns,
+            )
+        ]
+        usage = safe.get("tableUsageProfile")
+        if isinstance(usage, dict):
+            safe["tableUsageProfile"] = {
+                **usage,
+                "supportedDimensions": [
+                    item
+                    for item in usage.get("supportedDimensions") or []
+                    if str(item) not in excluded_columns
+                ],
+            }
+        return safe
+
+    def _text_mentions_any_column(self, text: str, columns: Set[str]) -> bool:
+        source = str(text or "")
+        return any(
+            re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(column), source, flags=re.IGNORECASE)
+            for column in columns
+            if column
+        )
+
     def _heuristic_candidate_payload(
         self,
         topic: str,
@@ -6874,15 +7439,18 @@ class TopicBuilderWorkflow:
         return {
             "tableComment": str(existing.get("tableComment") or request.manual_notes or table),
             "dataGrain": str(existing.get("dataGrain") or "UNDECLARED"),
-            "timeColumn": str(existing.get("timeColumn") or profile.get("timeColumn") or ""),
-            "merchantFilterColumn": str(existing.get("merchantFilterColumn") or ""),
+            "timeColumn": str(existing.get("timeColumn") or ""),
+            "merchantFilterColumn": str(profile.get("merchantFilterColumn") or ""),
             "entityLookupPolicy": normalize_entity_lookup_policy(
                 existing.get("entityLookupPolicy") or {},
                 inherited_time_column=str(
-                    existing.get("timeColumn") or profile.get("timeColumn") or ""
+                    existing.get("timeColumn") or ""
                 ),
             ),
-            "rowAccessPolicy": normalize_row_access_policy(existing.get("rowAccessPolicy") or {}),
+            "rowAccessPolicy": self._tenant_row_access_policy(
+                str(profile.get("merchantFilterColumn") or ""),
+                existing.get("rowAccessPolicy") or {},
+            ),
             "resultAccessPolicies": normalize_result_access_policies(existing.get("resultAccessPolicies") or {}),
             "semanticColumns": semantic_columns,
             "metrics": metrics,
@@ -6922,10 +7490,6 @@ class TopicBuilderWorkflow:
         name = str(column.get("columnName") or "")
         comment = str(column.get("comment") or column.get("Comment") or name)
         role = str(column.get("semanticRole") or column.get("role") or "UNDECLARED").upper()
-        if bool(column.get("isPrimaryKey")):
-            role = "KEY"
-        elif bool(column.get("isPartitionColumn")):
-            role = "TIME"
         aliases = dedupe_strings([name, comment])
         enum_values = [str(item) for item in (profile.get("enumCandidates", {}).get(name) or [])[:20]]
         enum_metadata = dict((profile.get("enumCandidateProfiles", {}) or {}).get(name) or {})
@@ -7000,7 +7564,6 @@ class TopicBuilderWorkflow:
 
     def _heuristic_rules(self, topic: str, profile: Dict[str, Any], request: TopicBuildRequest) -> List[Dict[str, Any]]:
         rules: List[Dict[str, Any]] = []
-        time_column = str(profile.get("timeColumn") or "")
         merchant_column = str(profile.get("merchantFilterColumn") or "")
         primary_key_columns = [str(item) for item in profile.get("primaryKeyColumns") or [] if str(item)]
         partition_columns = [str(item) for item in profile.get("partitionColumns") or [] if str(item)]
@@ -7019,20 +7582,10 @@ class TopicBuilderWorkflow:
             rules.append(
                 {
                     "ruleId": "partition_pruning_rule",
-                    "title": "分区字段过滤建议",
-                    "description": "该表分区/时间候选字段为 %s；有时间窗口的问题应优先下推这些字段以减少扫描范围。" % "、".join(partition_columns[:8]),
-                    "aliases": ["分区字段", "分区裁剪", "时间窗口"],
+                    "title": "物理分区信息",
+                    "description": "该表物理分区字段为 %s；它不代表业务时间，只有发布映射证明后才允许用于等价裁剪。" % "、".join(partition_columns[:8]),
+                    "aliases": ["物理分区", "分区裁剪"],
                     "appliesToColumns": partition_columns[:12],
-                }
-            )
-        if time_column:
-            rules.append(
-                {
-                    "ruleId": "time_partition_rule",
-                    "title": "时间过滤建议",
-                    "description": "该表建议优先使用 %s 作为时间过滤字段" % time_column,
-                    "aliases": ["时间过滤", "分区字段"],
-                    "appliesToColumns": [time_column],
                 }
             )
         if merchant_column:
@@ -7143,15 +7696,22 @@ class TopicBuilderWorkflow:
         columns: List[str],
         request: TopicBuildRequest,
         enum_limit: int,
+        merchant_filter_column: str,
     ) -> Dict[str, Any]:
         provider = getattr(self.doris_repository, "profile_enum_candidates", None)
         if not callable(provider) or not request.enum_discovery_enabled:
             return {}
-        candidate_columns = list(columns[:24])
+        candidate_columns = [column for column in columns[:24] if column != merchant_filter_column]
         if not candidate_columns:
             return {}
         try:
-            payload = provider(table, request.merchant_id or self.settings.merchant_id, candidate_columns, enum_limit)
+            payload = provider(
+                table,
+                request.merchant_id or self.settings.merchant_id,
+                merchant_filter_column,
+                candidate_columns,
+                enum_limit,
+            )
         except Exception:
             return {}
         return payload if isinstance(payload, dict) else {}
@@ -8883,7 +9443,10 @@ def semantic_catalog_conflict_detection(
 
     entries: List[Tuple[str, str, Dict[str, Any]]] = []
     candidate_seen = False
-    for topic in topic_assets.all_topic_names():
+    # Governance audits inspect every directory coordinate so an unpublished
+    # or orphaned asset cannot hide from review merely because runtime routing
+    # correctly excludes it.
+    for topic in topic_assets.all_navigation_topic_names():
         tables_dir = topic_assets.root / topic / "tables"
         if not tables_dir.exists():
             continue
@@ -8894,7 +9457,10 @@ def semantic_catalog_conflict_detection(
                 candidate_seen = True
             else:
                 asset = topic_assets.load_table_asset(topic, table)
-            status = str(asset.get("status") or "PUBLISHED").upper()
+            if candidate_asset is None or topic != candidate_topic or table != candidate_table:
+                if not bool((asset.get("activation") or {}).get("allowed")):
+                    continue
+            status = str(asset.get("status") or "").upper()
             if status in {"RETIRED", "DEPRECATED", "REJECTED"}:
                 continue
             entries.append((topic, table, asset))
@@ -9179,6 +9745,18 @@ def semantic_asset_lineage(
             "primaryKeyColumns": [str(item) for item in ((asset.get("physicalMetadata") or {}).get("primaryKeyColumns") or [])],
             "partitionColumns": [str(item) for item in ((asset.get("physicalMetadata") or {}).get("partitionColumns") or [])],
             "bucketColumns": [str(item) for item in ((asset.get("physicalMetadata") or {}).get("bucketColumns") or [])],
+            "bucketCount": int((asset.get("physicalMetadata") or {}).get("bucketCount") or 0),
+            "invertedIndexes": [
+                dict(item)
+                for item in ((asset.get("physicalMetadata") or {}).get("invertedIndexes") or [])
+                if isinstance(item, dict)
+            ],
+            "invertedIndexColumns": [
+                str(item)
+                for item in ((asset.get("physicalMetadata") or {}).get("invertedIndexColumns") or [])
+            ],
+            "ddlHash": str((asset.get("physicalMetadata") or {}).get("ddlHash") or ""),
+            "capturedAt": str((asset.get("physicalMetadata") or {}).get("capturedAt") or ""),
         },
         "metrics": metric_lineage[:50],
         "rules": [

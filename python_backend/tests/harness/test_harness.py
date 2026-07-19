@@ -273,6 +273,8 @@ from merchant_ai.services.tool_runtime import (
     tool_error_details,
 )
 from merchant_ai.services.tools import (
+    ToolCapability,
+    ToolRegistry,
     artifact_file_tool_schemas,
     lead_action_selection_tool,
     node_runtime_tool_schemas,
@@ -280,6 +282,20 @@ from merchant_ai.services.tools import (
     semantic_file_tool_schemas,
     sql_draft_tool,
 )
+
+
+def _declared_test_tool_registry(*names: str) -> ToolRegistry:
+    return ToolRegistry(
+        [
+            ToolCapability(
+                name=name,
+                side_effect_level="read",
+                cache_policy="disabled",
+                fail_closed=True,
+            )
+            for name in names
+        ]
+    )
 
 
 REGRESSION_CASES_7D = [
@@ -7577,8 +7593,12 @@ class TopicBuilderDoris:
             return []
         return [{"Table": table, "Create Table": self.create_ddl}]
 
-    def sample_rows(self, table, merchant_id, limit=20):
-        return list(self.sample_rows_payload)[:limit]
+    def sample_rows(self, table, merchant_id, merchant_filter_column, limit=20):
+        return [
+            row
+            for row in self.sample_rows_payload
+            if str(row.get(merchant_filter_column)) == str(merchant_id)
+        ][:limit]
 
 
 class TopicBuilderLlm:
@@ -7765,8 +7785,18 @@ def test_topic_builder_batch_build_reports_factory_status(tmp_path):
 
     result = workflow.build_batch(
         [
-            TopicBuildRequest(topic="电商退货", table_name="dwm_trade_refund_detail_di", merchant_id="100"),
-            TopicBuildRequest(topic="电商交易", table_name="dwm_trade_order_detail_di", merchant_id="100"),
+            TopicBuildRequest(
+                topic="电商退货",
+                table_name="dwm_trade_refund_detail_di",
+                merchant_id="100",
+                merchant_filter_column="seller_id",
+            ),
+            TopicBuildRequest(
+                topic="电商交易",
+                table_name="dwm_trade_order_detail_di",
+                merchant_id="100",
+                merchant_filter_column="seller_id",
+            ),
         ]
     )
 
@@ -7824,6 +7854,7 @@ def test_topic_builder_build_generates_pending_assets_with_llm_and_samples(tmp_p
             topic="电商退货",
             table_name="dwm_trade_refund_detail_di",
             merchant_id="100",
+            merchant_filter_column="seller_id",
             manual_notes="退款表",
             business_knowledge="退款金额按天看",
             sample_sqls=["SELECT seller_id, pt, pay_amt FROM dwm_trade_refund_detail_di LIMIT 10"],
@@ -7885,7 +7916,14 @@ DISTRIBUTED BY HASH(`seller_id`) BUCKETS 8
     )
     workflow = TopicBuilderWorkflow(settings, doris, topic_assets, llm=type("DisabledBuilderLlm", (), {"configured": False})())
 
-    result = workflow.build(TopicBuildRequest(topic="电商交易", table_name="dwm_trade_order_detail_di", merchant_id="100"))
+    result = workflow.build(
+        TopicBuildRequest(
+            topic="电商交易",
+            table_name="dwm_trade_order_detail_di",
+            merchant_id="100",
+            merchant_filter_column="seller_id",
+        )
+    )
 
     pending_dir = settings.resolved_topic_path / "电商交易" / "pending" / "dwm_trade_order_detail_di"
     asset = json.loads((pending_dir / "asset.json").read_text(encoding="utf-8"))
@@ -7920,7 +7958,12 @@ def test_topic_builder_refresh_incremental_rebuilds_pending_assets_after_schema_
     )
 
     workflow = TopicBuilderWorkflow(settings, doris, topic_assets, llm=type("DisabledBuilderLlm", (), {"configured": False})())
-    request = TopicBuildRequest(topic="电商退货", table_name="dwm_trade_refund_detail_di", merchant_id="100")
+    request = TopicBuildRequest(
+        topic="电商退货",
+        table_name="dwm_trade_refund_detail_di",
+        merchant_id="100",
+        merchant_filter_column="seller_id",
+    )
     workflow.build(request)
 
     topic_assets.publish("电商退货", "dwm_trade_refund_detail_di", True, "tester", "seed")
@@ -7960,7 +8003,14 @@ def test_topic_builder_heuristics_add_row_access_and_sensitive_column_policies(t
     )
     workflow = TopicBuilderWorkflow(settings, doris, topic_assets, llm=type("DisabledBuilderLlm", (), {"configured": False})())
 
-    result = workflow.build(TopicBuildRequest(topic="电商交易", table_name="dwm_trade_order_detail_di", merchant_id="100"))
+    result = workflow.build(
+        TopicBuildRequest(
+            topic="电商交易",
+            table_name="dwm_trade_order_detail_di",
+            merchant_id="100",
+            merchant_filter_column="seller_id",
+        )
+    )
 
     pending_dir = settings.resolved_topic_path / "电商交易" / "pending" / "dwm_trade_order_detail_di"
     asset = json.loads((pending_dir / "asset.json").read_text(encoding="utf-8"))
@@ -7990,6 +8040,7 @@ def test_topic_builder_generates_table_usage_governance_and_honors_overrides(tmp
             topic="电商交易",
             table_name="dwm_trade_order_detail_di",
             merchant_id="100",
+            merchant_filter_column="seller_id",
             table_usage_overrides={"authorityLevel": 99, "recommendedFor": ["GMV下降原因分析"]},
         )
     )
@@ -8021,7 +8072,14 @@ def test_topic_builder_enum_discovery_rejects_high_cardinality_names_and_tracks_
     )
     workflow = TopicBuilderWorkflow(settings, doris, TopicAssetService(settings), llm=type("DisabledBuilderLlm", (), {"configured": False})())
 
-    workflow.build(TopicBuildRequest(topic="电商交易", table_name="dwm_trade_order_detail_di", merchant_id="100"))
+    workflow.build(
+        TopicBuildRequest(
+            topic="电商交易",
+            table_name="dwm_trade_order_detail_di",
+            merchant_id="100",
+            merchant_filter_column="seller_id",
+        )
+    )
 
     pending = settings.resolved_topic_path / "电商交易" / "pending" / "dwm_trade_order_detail_di"
     profile = json.loads((pending / "sample_profile.json").read_text(encoding="utf-8"))
@@ -14342,7 +14400,12 @@ def test_entity_transfer_does_not_mix_order_id_into_sub_order_id_dependency():
 def test_tool_call_executor_pairs_parallel_results_and_isolates_failures():
     settings = get_settings()
     registry = ToolFailureRegistry()
-    executor = ToolCallExecutor(ToolRuntimePolicyRegistry(settings), registry, max_concurrency=2)
+    executor = ToolCallExecutor(
+        ToolRuntimePolicyRegistry(settings),
+        registry,
+        max_concurrency=2,
+        tool_registry=_declared_test_tool_registry("ok_tool", "bad_tool"),
+    )
 
     def ok(args):
         return {"value": args["value"]}
@@ -14375,7 +14438,12 @@ def test_tool_call_executor_pairs_parallel_results_and_isolates_failures():
 
 def test_tool_call_executor_timeout_returns_without_waiting_for_slow_handler():
     settings = get_settings().model_copy(update={"agent_node_timeout_seconds": 1})
-    executor = ToolCallExecutor(ToolRuntimePolicyRegistry(settings), ToolFailureRegistry(), max_concurrency=1)
+    executor = ToolCallExecutor(
+        ToolRuntimePolicyRegistry(settings),
+        ToolFailureRegistry(),
+        max_concurrency=1,
+        tool_registry=_declared_test_tool_registry("slow_tool"),
+    )
 
     def slow(_args):
         time.sleep(2.5)
@@ -14392,7 +14460,12 @@ def test_tool_call_executor_timeout_returns_without_waiting_for_slow_handler():
 
 def test_tool_call_timeout_signals_cooperative_handler_cancellation():
     settings = get_settings().model_copy(update={"agent_node_timeout_seconds": 1})
-    executor = ToolCallExecutor(ToolRuntimePolicyRegistry(settings), ToolFailureRegistry(), max_concurrency=1)
+    executor = ToolCallExecutor(
+        ToolRuntimePolicyRegistry(settings),
+        ToolFailureRegistry(),
+        max_concurrency=1,
+        tool_registry=_declared_test_tool_registry("cooperative_tool"),
+    )
     canceled = Event()
 
     def cooperative(_args):
@@ -14425,7 +14498,10 @@ def test_tool_failure_circuit_and_rate_limit_are_scoped_per_run():
     with tool_runtime_scope("100", "thread_a", "run_b"):
         assert registry.should_block("custom_tool", args) is None
 
-    runtime = ToolRuntimeService(settings)
+    runtime = ToolRuntimeService(
+        settings,
+        tool_registry=_declared_test_tool_registry("custom_tool"),
+    )
     with tool_runtime_scope("100", "thread_a", "run_a"):
         first = runtime.execute("custom_tool", args, lambda payload: payload)
         limited = runtime.execute("custom_tool", args, lambda payload: payload)
@@ -14441,7 +14517,10 @@ def test_parallel_tool_runtime_preserves_scope_and_rate_limits_each_tool_indepen
     settings = get_settings().model_copy(
         update={"tool_default_qps": 1, "tool_rate_limit_enabled": True, "cache_enabled": False}
     )
-    runtime = ToolRuntimeService(settings)
+    runtime = ToolRuntimeService(
+        settings,
+        tool_registry=_declared_test_tool_registry("tool_a", "tool_b"),
+    )
 
     def handler(payload):
         return {"value": payload["value"], "scope": current_tool_runtime_scope()}
@@ -14462,7 +14541,12 @@ def test_parallel_tool_runtime_preserves_scope_and_rate_limits_each_tool_indepen
 def test_tool_call_executor_failure_circuit_does_not_leak_across_runs():
     settings = get_settings()
     registry = ToolFailureRegistry(repeat_threshold=1, circuit_threshold=1)
-    executor = ToolCallExecutor(ToolRuntimePolicyRegistry(settings), registry, max_concurrency=1)
+    executor = ToolCallExecutor(
+        ToolRuntimePolicyRegistry(settings),
+        registry,
+        max_concurrency=1,
+        tool_registry=_declared_test_tool_registry("scoped_tool"),
+    )
 
     with tool_runtime_scope("100", "thread_a", "run_a"):
         failed = executor.execute(
@@ -24248,6 +24332,8 @@ def test_access_control_denies_columns_and_writes_audit(tmp_path):
     service.policy_path.write_text(
         json.dumps(
             {
+                "schemaVersion": 1,
+                "defaultEffect": "DENY",
                 "allowedMerchantIds": ["100"],
                 "tables": {
                     "ads_merchant_profile": {
@@ -27438,6 +27524,10 @@ def test_doris_repository_caches_repeated_selects(tmp_path):
             "cache_enabled": True,
             "cache_doris_select_ttl_seconds": 60,
             "cache_memory_max_entries": 8,
+            "doris_datasource_environment": "test",
+            "doris_data_epoch_sql": "SELECT generation AS data_epoch FROM governed_epoch",
+            "doris_data_epoch_column": "data_epoch",
+            "doris_cache_generation": "cache-schema-v1",
         }
     )
     repo = DorisRepository(settings)
@@ -27447,13 +27537,24 @@ def test_doris_repository_caches_repeated_selects(tmp_path):
             self.calls = 0
 
         def query(self, sql, params=None):
+            if sql == "SELECT generation AS data_epoch FROM governed_epoch":
+                return [{"data_epoch": "epoch-1"}]
             self.calls += 1
             return [{"seller_id": "100", "calls": self.calls}]
 
     repo.db = CountingDb()
-    first = repo.query("SELECT * FROM `fake_table` WHERE `seller_id` = %s", ["100"])
+    snapshot = repo.capture_data_snapshot("semantic-v1")
+    first = repo.query(
+        "SELECT * FROM `fake_table` WHERE `seller_id` = %s",
+        ["100"],
+        data_snapshot_contract=snapshot,
+    )
     assert not repo.last_cache_hit
-    second = repo.query("SELECT   * FROM `fake_table` WHERE `seller_id` = %s", ["100"])
+    second = repo.query(
+        "SELECT   * FROM `fake_table` WHERE `seller_id` = %s",
+        ["100"],
+        data_snapshot_contract=snapshot,
+    )
 
     assert second == first
     assert repo.last_cache_hit

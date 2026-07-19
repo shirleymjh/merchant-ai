@@ -146,6 +146,7 @@ from merchant_ai.services.time_semantics import (
     time_window_contract_payload,
 )
 from merchant_ai.services.tool_runtime import (
+    ExecutionIdentity,
     ToolFailureRegistry,
     ToolRuntimePolicyRegistry,
     ToolRuntimeService,
@@ -560,6 +561,45 @@ def execution_asset_pack_fingerprint(asset_pack: PlanningAssetPack) -> str:
     payload = asset_pack.model_dump(by_alias=True, mode="json")
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def node_tool_execution_identity(
+    contract: NodePlanContract,
+    context: NodeExecutionContext,
+    asset_pack: PlanningAssetPack,
+    settings: Settings,
+) -> ExecutionIdentity:
+    """Build tool authority only from the server-created node context."""
+
+    packaged_scope = context.context_package.get("userScope")
+    server_scope = packaged_scope if isinstance(packaged_scope, dict) else {}
+    permissions = server_scope.get("permissions")
+    if not isinstance(permissions, (list, tuple, set)):
+        permissions = []
+    row_policy = contract.row_scope_policy
+    if not isinstance(row_policy, dict):
+        row_policy = {}
+    tenant_id = str(
+        server_scope.get("tenantId")
+        or server_scope.get("tenant_id")
+        or contract.merchant_id
+        or context.merchant_id
+        or ""
+    )
+    return ExecutionIdentity.from_server_context(
+        merchant_id=contract.merchant_id or context.merchant_id,
+        tenant_id=tenant_id,
+        principal_id=contract.effective_user_id or context.effective_user_id,
+        role=contract.access_role or context.access_role,
+        permissions=permissions,
+        region=contract.authorized_region or context.authorized_region,
+        store_ids=contract.authorized_store_ids or context.authorized_store_ids,
+        row_policy=row_policy,
+        datasource_environment=str(
+            getattr(settings, "doris_datasource_environment", "") or ""
+        ),
+        semantic_activation_fingerprint=execution_asset_pack_fingerprint(asset_pack),
+    )
 
 
 def sql_references_filter_column(sql: str, column: str) -> bool:
@@ -1551,6 +1591,7 @@ class NodeWorkerExecutor:
             chunk_futures = {}
             future_modes: Dict[Any, str] = {}
             future_cancel_events: Dict[Any, Event] = {}
+            task_leases: Dict[str, NodeTaskState] = {}
             executor = ThreadPoolExecutor(max_workers=max_workers)
             try:
                 for task_id in chunk_ids:
@@ -1621,6 +1662,7 @@ class NodeWorkerExecutor:
                             batch.failed_task_ids.append(task_id)
                             results[task_id] = failed_result(task_id, pending[task_id], "node task could not acquire execution lease")
                             continue
+                        task_leases[task_id] = claimed
                         if task_mode == "subagent":
                             context = self._prepare_subagent_context(task_id, pending[task_id], context, asset_pack)
                             context.context_package["parentRunId"] = run_id
@@ -1678,11 +1720,16 @@ class NodeWorkerExecutor:
                         for running_future in not_done:
                             if future_modes.get(running_future) == "distributed_subagent":
                                 continue
+                            running_task_id = chunk_futures[running_future]
+                            lease = task_leases.get(running_task_id)
+                            if lease is None:
+                                continue
                             self.runtime_state_store.heartbeat_node_task(
                                 run_id,
-                                chunk_futures[running_future],
+                                running_task_id,
                                 "node_subagent" if future_modes.get(running_future) == "subagent" else "node_direct_worker",
                                 lease_seconds=max(1, self.settings.agent_node_timeout_seconds),
+                                lease_generation=lease.lease_generation,
                             )
                         batch.runtime_events.append(
                             {
@@ -1702,16 +1749,27 @@ class NodeWorkerExecutor:
                         if task_result.query_bundle.failed:
                             self.tool_failure_registry.record_failure("node_agent", node_args, "NODE_FAILED", task_result.query_bundle.error or task_result.summary)
                             batch.failed_task_ids.append(task_id)
-                            self.runtime_state_store.complete_node_task(run_id, task_id, "failed", {"error": task_result.query_bundle.error or task_result.summary})
+                            if future_modes.get(future) != "distributed_subagent":
+                                self._complete_local_node_task(
+                                    task_leases[task_id],
+                                    "failed",
+                                    {"error": task_result.query_bundle.error or task_result.summary},
+                                )
                         else:
                             self.tool_failure_registry.record_success("node_agent", node_args)
                             batch.completed_task_ids.append(task_id)
-                            self.runtime_state_store.complete_node_task(run_id, task_id, "completed", {"rows": task_result.query_bundle.effective_row_count()})
+                            if future_modes.get(future) != "distributed_subagent":
+                                self._complete_local_node_task(
+                                    task_leases[task_id],
+                                    "completed",
+                                    {"rows": task_result.query_bundle.effective_row_count()},
+                                )
                     except Exception as exc:
                         self.tool_failure_registry.record_failure("node_agent", node_args, "ERROR", str(exc))
                         task_result = failed_result(task_id, pending[task_id], "NodeWorker 执行异常: %s" % str(exc)[:200])
                         batch.failed_task_ids.append(task_id)
-                        self.runtime_state_store.complete_node_task(run_id, task_id, "failed", {"error": str(exc)[:500]})
+                        if future_modes.get(future) != "distributed_subagent" and task_id in task_leases:
+                            self._complete_local_node_task(task_leases[task_id], "failed", {"error": str(exc)[:500]})
                     task_result.task_id = task_id
                     results[task_id] = task_result
                 for future in not_done:
@@ -1720,7 +1778,15 @@ class NodeWorkerExecutor:
                     if run_was_canceled:
                         batch.failed_task_ids.append(task_id)
                         results[task_id] = cancelled_result(pending[task_id])
-                        self.runtime_state_store.complete_node_task(run_id, task_id, "canceled", {"reason": "run canceled"})
+                        current = self.runtime_state_store.get_node_task(run_id, task_id)
+                        if current and current.status not in {"completed", "partial", "failed", "timeout", "canceled"}:
+                            self.runtime_state_store.fence_node_task(
+                                run_id,
+                                task_id,
+                                "canceled",
+                                {"reason": "run canceled"},
+                                expected_generation=current.lease_generation,
+                            )
                         future.cancel()
                         continue
                     grace_seconds = max(0, int(getattr(self.settings, "agent_node_timeout_grace_seconds", 60) or 60))
@@ -1742,7 +1808,15 @@ class NodeWorkerExecutor:
                     batch.timed_out_task_ids.append(task_id)
                     batch.failed_task_ids.append(task_id)
                     results[task_id] = timed_out_result(task_id, pending[task_id], self.settings.agent_node_timeout_seconds)
-                    self.runtime_state_store.complete_node_task(run_id, task_id, "timeout", {"timeoutSeconds": self.settings.agent_node_timeout_seconds})
+                    current = self.runtime_state_store.get_node_task(run_id, task_id)
+                    if current and current.status not in {"completed", "partial", "failed", "timeout", "canceled"}:
+                        self.runtime_state_store.fence_node_task(
+                            run_id,
+                            task_id,
+                            "timeout",
+                            {"timeoutSeconds": self.settings.agent_node_timeout_seconds},
+                            expected_generation=current.lease_generation,
+                        )
                     future.cancel()
             finally:
                 for future in chunk_futures:
@@ -1766,6 +1840,21 @@ class NodeWorkerExecutor:
         batch.timed_out_task_ids = list(dict.fromkeys(batch.timed_out_task_ids))
         batch.duration_ms = int((time.perf_counter() - started) * 1000)
         return results, batch
+
+    def _complete_local_node_task(
+        self,
+        lease: NodeTaskState,
+        status: str,
+        payload: Dict[str, Any],
+    ) -> NodeTaskState:
+        return self.runtime_state_store.complete_node_task(
+            lease.run_id,
+            lease.task_id,
+            status,
+            payload,
+            lease_owner=lease.lease_owner,
+            lease_generation=lease.lease_generation,
+        )
 
     def _task_execution_mode(self, requested_mode: str, intent: QuestionIntent, question: str) -> str:
         if requested_mode in {"direct", "subagent"}:
@@ -2309,25 +2398,6 @@ class NodeWorkerExecutor:
                 "updatedAtMs": int(time.time() * 1000),
             }
             path.write_text(json.dumps(checkpoint, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
-            run_id = str(context.context_package.get("parentRunId") or context.sub_agent_run_id or "inline")
-            self.runtime_state_store.upsert_node_task(
-                NodeTaskState(
-                    run_id=run_id,
-                    task_id=intent.plan_task_id,
-                    status=status,
-                    idempotency_key=node_task_idempotency_key(run_id, intent.plan_task_id, intent.preferred_table),
-                    attempts=1,
-                    lease_owner=context.sub_agent_run_id,
-                    payload={
-                        "preferredTable": intent.preferred_table,
-                        "answerMode": str(intent.answer_mode),
-                        "summary": payload.get("summary") or "",
-                        "rows": payload.get("rows") or 0,
-                        "failed": bool(payload.get("failed")),
-                        "checkpointPath": str(path),
-                    },
-                )
-            )
         except Exception:
             return
 
@@ -3052,6 +3122,12 @@ class NodeWorkerExecutor:
                 call_id=intent.plan_task_id or "execute_sql",
                 target_kind="doris",
                 cancel_event=query_cancel_event,
+                execution_identity=node_tool_execution_identity(
+                    contract,
+                    context,
+                    asset_pack,
+                    self.settings,
+                ),
             )
             query_duration_ms = runtime_result.duration_ms or int((time.perf_counter() - query_started) * 1000)
             if context_is_cancelled(context):
@@ -3882,7 +3958,13 @@ class NodeWorkerExecutor:
                 ),
             },
         )
-            file_context, file_results = self._node_file_tool_loop(intent, context, contract, knowledge_context)
+            file_context, file_results = self._node_file_tool_loop(
+                intent,
+                context,
+                contract,
+                asset_pack,
+                knowledge_context,
+            )
             if file_results:
                 context.runtime_scratch["file_tool_results"] = file_results
             user_payload = self._node_llm_payload(intent, context, contract, file_context)
@@ -3956,6 +4038,7 @@ class NodeWorkerExecutor:
         intent: QuestionIntent,
         context: NodeExecutionContext,
         contract: NodePlanContract,
+        asset_pack: PlanningAssetPack,
         knowledge_context: str,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         max_rounds = int(getattr(self.settings, "agent_node_file_tool_rounds", 0) or 0)
@@ -4003,7 +4086,17 @@ class NodeWorkerExecutor:
                 "artifact_read": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
                 "artifact_grep": ToolCachePolicy(enabled=True, namespace="artifact_tool", ttl_seconds=self.settings.semantic_cache_ttl_seconds),
             }
-            executed = self.tool_runtime_service.execute_many(calls, handlers, cache_policies=cache_policies)
+            executed = self.tool_runtime_service.execute_many(
+                calls,
+                handlers,
+                cache_policies=cache_policies,
+                execution_identity=node_tool_execution_identity(
+                    contract,
+                    context,
+                    asset_pack,
+                    self.settings,
+                ),
+            )
             serialized = [serialize_tool_execution_result(item) for item in executed]
             calls_trace.extend([call.model_dump(by_alias=True) for call in calls])
             results.extend(serialized)
@@ -9290,7 +9383,11 @@ def is_repairable_doris_error(error_text: str) -> bool:
 def semantic_table_access_hint(asset_pack: PlanningAssetPack, table: str, columns: set) -> Dict[str, Any]:
     entry = next((item for item in asset_pack.tables if item.table == table), None)
     metadata = dict(getattr(entry, "metadata", {}) or {})
-    physical = dict(metadata.get("physicalTableMetadata") or {})
+    physical = dict(
+        metadata.get("physicalMetadata")
+        or metadata.get("physicalTableMetadata")
+        or {}
+    )
     usage = dict(metadata.get("tableUsageProfile") or {})
     primary = list(physical.get("primaryKeyColumns") or metadata.get("primaryKeyColumns") or [])
     partition = list(physical.get("partitionColumns") or metadata.get("partitionColumns") or [])

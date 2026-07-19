@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -17,6 +16,7 @@ class IsolatedSubagentJob:
     middleware: list[Any] = field(default_factory=list)
     permissions: list[Any] = field(default_factory=list)
     subagents: list[dict[str, Any]] = field(default_factory=list)
+    model_timeout_seconds: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -59,8 +59,19 @@ class IsolatedSubagentRuntime:
     ) -> IsolatedSubagentResult:
         if self.checkpointer is None:
             raise RuntimeError("isolated subagent requires a checkpoint backend")
+        model = self.model
+        if job.model_timeout_seconds is not None:
+            timeout_seconds = float(job.model_timeout_seconds)
+            if timeout_seconds <= 0:
+                raise RuntimeError("isolated subagent model timeout must be positive")
+            bind = getattr(model, "bind", None)
+            if not callable(bind):
+                raise RuntimeError(
+                    "isolated subagent model cannot enforce the requested provider timeout"
+                )
+            model = bind(timeout=timeout_seconds)
         graph = self.agent_factory(
-            model=self.model,
+            model=model,
             tools=list(job.tools),
             system_prompt=job.system_prompt,
             middleware=list(job.middleware),
@@ -69,8 +80,7 @@ class IsolatedSubagentRuntime:
             permissions=list(job.permissions),
             backend=job.backend,
             checkpointer=self.checkpointer,
-            name="isolated_worker_%s"
-            % (re.sub(r"[^a-zA-Z0-9_]+", "_", job.job_id)[:48] or "job"),
+            name="isolated_worker_%s" % _safe_agent_name_segment(job.job_id),
         )
         config = (
             self.checkpoint_config_factory(job.thread_id, job.job_id)
@@ -123,6 +133,21 @@ def _json_text(payload: dict[str, Any]) -> str:
     import json
 
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _safe_agent_name_segment(value: str) -> str:
+    normalized = "".join(
+        character
+        if (
+            "a" <= character <= "z"
+            or "A" <= character <= "Z"
+            or "0" <= character <= "9"
+            or character == "_"
+        )
+        else "_"
+        for character in str(value or "")
+    )[:48]
+    return normalized or "job"
 
 
 def _last_assistant_text(messages: list[Any]) -> str:

@@ -290,6 +290,7 @@ def test_ranked_compose_uses_internal_artifact_renderer_not_core_supplied_spans(
                         label="top 3 products",
                         metric_goal_ids=["metric.sales"],
                         limit=3,
+                        population_scope="ALL_MATCHING_ROWS",
                     ),
                 ],
             ),
@@ -324,9 +325,11 @@ def test_ranked_compose_uses_internal_artifact_renderer_not_core_supplied_spans(
                     {"product": "Product C", "sales": 10},
                 ],
                 tables=["orders"],
+                result_coverage="TOP_N",
             )
         ),
         verified_evidence=VerifiedEvidence(passed=True),
+        ranking_semantics_verified=True,
         output_columns=["product", "sales"],
     )
     context.session.runtime.verified_query_ledger.append(artifact)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any, Iterable
 
 import sqlglot
@@ -14,6 +16,7 @@ from merchant_ai.models import (
     AgentRunResult,
     AgentTask,
     AgentTaskResult,
+    DataSnapshotContract,
     EvidenceCheckResult,
     EvidenceGap,
     EntitySet,
@@ -25,6 +28,7 @@ from merchant_ai.models import (
     QueryBundle,
     QueryPlan,
     ReActStep,
+    ResultCoverage,
     SqlValidationResult,
 )
 from merchant_ai.services.access_control import AccessControlService
@@ -90,6 +94,20 @@ class GroundedQueryExecutionKernel:
         self.settings = settings
         self.access_control = access_control or AccessControlService(settings)
 
+    def capture_data_snapshot(
+        self,
+        semantic_activation_fingerprint: str,
+    ) -> DataSnapshotContract:
+        capture = getattr(self.doris_repository, "capture_data_snapshot", None)
+        if not callable(capture):
+            return DataSnapshotContract(
+                unsupported_reason="DATA_SNAPSHOT_CAPABILITY_UNAVAILABLE"
+            )
+        snapshot = capture(str(semantic_activation_fingerprint or "").strip())
+        if isinstance(snapshot, DataSnapshotContract):
+            return snapshot
+        return DataSnapshotContract.model_validate(snapshot)
+
     def execute_contract(
         self,
         merchant_id: str,
@@ -103,6 +121,7 @@ class GroundedQueryExecutionKernel:
         user_scope: dict[str, Any] | None = None,
         execution_preparation: Any = None,
         runtime_budget: GroundedRuntimeBudget | None = None,
+        data_snapshot_contract: DataSnapshotContract | None = None,
     ) -> AgentRunResult:
         if execution_preparation is None or not bool(
             getattr(execution_preparation, "executable", False)
@@ -203,15 +222,58 @@ class GroundedQueryExecutionKernel:
                 ),
             )
 
+        active_data_snapshot = data_snapshot_contract
+        capture_snapshot = getattr(
+            self.doris_repository,
+            "capture_data_snapshot",
+            None,
+        )
+        if active_data_snapshot is None and callable(capture_snapshot):
+            active_data_snapshot = capture_snapshot(
+                str(
+                    getattr(
+                        execution_preparation,
+                        "asset_pack_fingerprint",
+                        "",
+                    )
+                    or ""
+                )
+            )
+        if active_data_snapshot is None:
+            active_data_snapshot = DataSnapshotContract(
+                unsupported_reason="DATA_SNAPSHOT_CAPABILITY_UNAVAILABLE"
+            )
+
         started = time.perf_counter()
         try:
+            query_kwargs: dict[str, Any] = {
+                "timeout_seconds": query_timeout_seconds,
+            }
+            query_signature = inspect.signature(self.doris_repository.query)
+            if "data_snapshot_contract" in query_signature.parameters:
+                query_kwargs["data_snapshot_contract"] = active_data_snapshot
             raw_rows = [
                 dict(row)
                 for row in self.doris_repository.query(
-                compilation.sql,
-                timeout_seconds=query_timeout_seconds,
+                    compilation.sql,
+                    **query_kwargs,
                 )
             ]
+            (
+                result_raw_rows,
+                result_coverage,
+                result_is_truncated,
+                exact_result_row_count,
+            ) = self._classify_result_rows(
+                contract,
+                intent,
+                compilation.sql,
+                raw_rows,
+                core_sql_candidate=isinstance(
+                    candidate_validation,
+                    GroundedSqlValidationResult,
+                ),
+            )
             entity_filter_verification = (
                 self._candidate_entity_filter_verification(
                     compilation.node_contract,
@@ -220,7 +282,7 @@ class GroundedQueryExecutionKernel:
                 if isinstance(candidate_validation, GroundedSqlValidationResult)
                 else self._entity_filter_verification(
                     compilation.node_contract,
-                    raw_rows,
+                    result_raw_rows,
                     compilation.sql,
                 )
                 if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
@@ -248,7 +310,7 @@ class GroundedQueryExecutionKernel:
                     candidate_validation,
                 )
             rows = apply_column_masks(
-                raw_rows,
+                result_raw_rows,
                 compilation.node_contract.model_copy(
                     update={"masked_columns": masked_columns}
                 ),
@@ -272,6 +334,7 @@ class GroundedQueryExecutionKernel:
                 "DORIS_ERROR",
                 str(exc)[:500],
                 duration_ms=int((time.perf_counter() - started) * 1000),
+                data_snapshot=active_data_snapshot,
             )
 
         duration_ms = int((time.perf_counter() - started) * 1000)
@@ -280,11 +343,14 @@ class GroundedQueryExecutionKernel:
             sql=compilation.sql,
             tables=list(compilation.tables),
             rows=rows,
-            original_row_count=len(rows),
+            original_row_count=exact_result_row_count,
+            is_truncated=result_is_truncated,
+            result_coverage=result_coverage,
             source_row_counts={task_id: len(rows)},
             duration_ms=duration_ms,
             cache_hit=bool(getattr(self.doris_repository, "last_cache_hit", False)),
             cache_key=str(getattr(self.doris_repository, "last_cache_key", "") or ""),
+            data_snapshot=active_data_snapshot,
             runtime_events=[
                 {
                     "event": "grounded_data_engine.executed",
@@ -292,6 +358,13 @@ class GroundedQueryExecutionKernel:
                     "taskId": task_id,
                     "table": compilation.table,
                     "rowCount": len(rows),
+                    "fetchedRowCount": len(raw_rows),
+                    "resultCoverage": result_coverage,
+                    "resultRowCountExact": result_coverage
+                    in {
+                        ResultCoverage.ALL_ROWS.value,
+                        ResultCoverage.TOP_N.value,
+                    },
                     "plannerLlmCalls": 0,
                     "sqlLlmCalls": (
                         1
@@ -361,7 +434,7 @@ class GroundedQueryExecutionKernel:
             entity_filter_verification=entity_filter_verification,
             entity_set=self._sealed_raw_entity_outputs(
                 contract,
-                raw_rows,
+                result_raw_rows,
                 task_id,
             ),
         )
@@ -544,7 +617,11 @@ class GroundedQueryExecutionKernel:
             )
             required_columns.append(store_column)
 
-        time_column = self._time_column(contract, table_binding.time_column)
+        time_column = self._time_column(
+            contract,
+            table,
+            table_binding.time_column,
+        )
         if time_column:
             if time_column not in columns:
                 raise RuntimeError("metric time column is absent from projected schema")
@@ -558,6 +635,20 @@ class GroundedQueryExecutionKernel:
                 )
             )
             required_columns.append(time_column)
+        pruning_column = self._partition_pruning_column(contract, table)
+        if pruning_column and pruning_column != time_column:
+            if pruning_column not in columns:
+                raise RuntimeError(
+                    "declared partition pruning column is absent from projected schema"
+                )
+            pruning_predicate = self._partition_pruning_predicate(
+                contract,
+                table,
+                pruning_column,
+            )
+            if pruning_predicate:
+                where.append(pruning_predicate)
+                required_columns.append(pruning_column)
 
         for entity_filter in contract.entity_filters:
             if entity_filter.table != table:
@@ -1380,28 +1471,18 @@ class GroundedQueryExecutionKernel:
                     )
                 )
                 required_by_table[secondary].append(secondary_merchant)
-                if contract.time_range.explicit and secondary_binding.time_column:
-                    if secondary_binding.time_column not in columns_by_table[secondary]:
-                        raise RuntimeError("detail time field is absent from projected schema")
-                    if (
-                        not contract.time_range.start_date
-                        or not contract.time_range.end_date
-                    ):
+                for time_predicate, time_column in self._detail_time_predicates(
+                    contract,
+                    secondary,
+                    secondary_binding.time_column,
+                    aliases[secondary],
+                ):
+                    if time_column not in columns_by_table[secondary]:
                         raise RuntimeError(
-                            "explicit detail time range lacks start/end bounds"
+                            "detail time/pruning field is absent from projected schema"
                         )
-                    predicates.append(
-                        "%s.%s BETWEEN %s AND %s"
-                        % (
-                            aliases[secondary],
-                            quote_identifier(secondary_binding.time_column),
-                            sql_literal(contract.time_range.start_date),
-                            sql_literal(contract.time_range.end_date),
-                        )
-                    )
-                    required_by_table[secondary].append(
-                        secondary_binding.time_column
-                    )
+                    predicates.append(time_predicate)
+                    required_by_table[secondary].append(time_column)
                 join_scoped_tables.add(secondary)
             from_sql += " %s JOIN %s %s ON %s" % (
                 join_type,
@@ -1443,30 +1524,28 @@ class GroundedQueryExecutionKernel:
                     )
                 )
             required_by_table[table].append(merchant_column)
-            if (
-                table not in join_scoped_tables
-                and contract.time_range.explicit
-                and binding.time_column
-            ):
-                if binding.time_column not in columns_by_table[table]:
-                    raise RuntimeError("detail time field is absent from projected schema")
-                if not contract.time_range.start_date or not contract.time_range.end_date:
-                    raise RuntimeError("explicit detail time range lacks start/end bounds")
-                where.append(
-                    "%s.%s BETWEEN %s AND %s"
-                    % (
-                        aliases[table],
-                        quote_identifier(binding.time_column),
-                        sql_literal(contract.time_range.start_date),
-                        sql_literal(contract.time_range.end_date),
-                    )
-                )
-                required_by_table[table].append(binding.time_column)
+            if table not in join_scoped_tables:
+                for time_predicate, time_column in self._detail_time_predicates(
+                    contract,
+                    table,
+                    binding.time_column,
+                    aliases[table],
+                ):
+                    if time_column not in columns_by_table[table]:
+                        raise RuntimeError(
+                            "detail time/pruning field is absent from projected schema"
+                        )
+                    where.append(time_predicate)
+                    required_by_table[table].append(time_column)
 
         sql = "SELECT %s FROM %s" % (", ".join(select_parts), from_sql)
         if where:
             sql += " WHERE " + " AND ".join("(%s)" % item for item in where)
-        sql += " LIMIT %d" % max(1, min(int(intent.limit or 100), 1000))
+        # Fetch one sentinel row beyond the inline detail cap.  Without that
+        # row, exactly ``limit`` returned rows cannot distinguish a complete
+        # set from a capped preview.  The executor removes the sentinel before
+        # publishing the QueryBundle.
+        sql += " LIMIT %d" % (self._detail_display_limit(intent) + 1)
 
         access_contracts: list[NodePlanContract] = []
         for table in tables:
@@ -1936,6 +2015,7 @@ class GroundedQueryExecutionKernel:
         message: str,
         *,
         duration_ms: int = 0,
+        data_snapshot: DataSnapshotContract | None = None,
     ) -> AgentRunResult:
         intent = plan.intents[0]
         bundle = QueryBundle(
@@ -1945,6 +2025,7 @@ class GroundedQueryExecutionKernel:
             error="%s: %s" % (code, message),
             summary=message,
             duration_ms=duration_ms,
+            data_snapshot=data_snapshot or DataSnapshotContract(),
             runtime_events=[
                 {
                     "event": "grounded_data_engine.failed",
@@ -2001,6 +2082,94 @@ class GroundedQueryExecutionKernel:
         )
 
     @staticmethod
+    def _detail_display_limit(intent: Any) -> int:
+        return max(1, min(int(getattr(intent, "limit", 0) or 100), 1000))
+
+    @classmethod
+    def _classify_result_rows(
+        cls,
+        contract: GroundedQueryContract,
+        intent: Any,
+        sql: str,
+        raw_rows: list[dict[str, Any]],
+        *,
+        core_sql_candidate: bool,
+    ) -> tuple[list[dict[str, Any]], str, bool, int]:
+        """Classify row-set coverage without deriving it from equal counts.
+
+        Deterministic detail SQL deliberately fetches a sentinel row.  Core
+        SQL remains immutable, so its AST is inspected conservatively: an
+        exhausted sole outer LIMIT can prove completeness, while a saturated,
+        nested, offset, or unparseable limit is only a preview.
+        """
+
+        query_shape = str(getattr(contract, "query_shape", "") or "").upper()
+        if query_shape == "RANKED":
+            return (
+                list(raw_rows),
+                ResultCoverage.TOP_N.value,
+                False,
+                len(raw_rows),
+            )
+        if query_shape not in {"DETAIL", "ENTITY_LOOKUP"}:
+            return (
+                list(raw_rows),
+                ResultCoverage.ALL_ROWS.value,
+                False,
+                len(raw_rows),
+            )
+
+        if not core_sql_candidate:
+            display_limit = cls._detail_display_limit(intent)
+            if len(raw_rows) > display_limit:
+                return (
+                    list(raw_rows[:display_limit]),
+                    ResultCoverage.PREVIEW.value,
+                    True,
+                    0,
+                )
+            return (
+                list(raw_rows),
+                ResultCoverage.ALL_ROWS.value,
+                False,
+                len(raw_rows),
+            )
+
+        coverage = cls._core_sql_detail_coverage(sql, len(raw_rows))
+        complete = coverage == ResultCoverage.ALL_ROWS.value
+        return (
+            list(raw_rows),
+            coverage,
+            not complete,
+            len(raw_rows) if complete else 0,
+        )
+
+    @staticmethod
+    def _core_sql_detail_coverage(sql: str, returned_row_count: int) -> str:
+        try:
+            expression = sqlglot.parse_one(sql, read="mysql")
+        except Exception:
+            return ResultCoverage.PREVIEW.value
+
+        limits = list(expression.find_all(exp.Limit))
+        outer_limit = expression.args.get("limit")
+        outer_offset = expression.args.get("offset")
+        if not limits:
+            return ResultCoverage.ALL_ROWS.value
+        if len(limits) != 1 or outer_limit is None or outer_offset is not None:
+            return ResultCoverage.PREVIEW.value
+        limit_expression = getattr(outer_limit, "expression", None)
+        if not isinstance(limit_expression, exp.Literal) or not limit_expression.is_int:
+            return ResultCoverage.PREVIEW.value
+        try:
+            limit_value = int(limit_expression.this)
+        except (TypeError, ValueError):
+            return ResultCoverage.PREVIEW.value
+        if limit_value <= 0 or returned_row_count >= limit_value:
+            return ResultCoverage.PREVIEW.value
+        return ResultCoverage.ALL_ROWS.value
+
+    @staticmethod
     def _table_metadata(asset_pack: Any, table: str) -> dict[str, Any]:
         entry = next(
             (item for item in asset_pack.tables if str(item.table or "") == table),
@@ -2009,11 +2178,17 @@ class GroundedQueryExecutionKernel:
         return dict(getattr(entry, "metadata", {}) or {}) if entry is not None else {}
 
     @staticmethod
-    def _time_column(contract: GroundedQueryContract, table_default: str) -> str:
+    def _time_column(
+        contract: GroundedQueryContract,
+        table: str,
+        table_default: str,
+    ) -> str:
+        if contract.time_field.table == table and contract.time_field.column:
+            return str(contract.time_field.column)
         columns = GroundedQueryExecutionKernel._dedupe(
             metric.time_column or table_default
             for metric in contract.metrics
-            if metric.table == contract.primary_table
+            if metric.table == table
         )
         if len(columns) > 1:
             raise RuntimeError("grounded metrics have incompatible time columns")
@@ -2027,6 +2202,16 @@ class GroundedQueryExecutionKernel:
         merchant_column: str,
         merchant_id: str,
     ) -> str:
+        if (
+            contract.time_field.table == table
+            and contract.time_field.column == time_column
+            and contract.time_field.time_role != "PARTITION"
+        ):
+            return GroundedQueryExecutionKernel._bounded_time_predicate(
+                quote_identifier(time_column),
+                contract,
+                role=contract.time_field.role,
+            )
         policies = GroundedQueryExecutionKernel._dedupe(
             str(metric.time_semantics.get("selectionPolicy") or "period_window")
             for metric in contract.metrics
@@ -2068,6 +2253,136 @@ class GroundedQueryExecutionKernel:
         if time_range.anchor_policy == CALENDAR_ANCHOR_POLICY:
             raise RuntimeError("calendar time range is missing explicit start/end bounds")
         raise RuntimeError("grounded time semantics cannot be compiled")
+
+    @staticmethod
+    def _bounded_time_predicate(
+        qualified_column: str,
+        contract: GroundedQueryContract,
+        *,
+        role: str,
+        lower_expansion_days: int = 0,
+        upper_expansion_days: int = 0,
+    ) -> str:
+        start_raw = str(
+            contract.time_range.execution_start_date
+            or contract.time_range.start_date
+            or ""
+        ).strip()
+        end_raw = str(
+            contract.time_range.execution_end_date
+            or contract.time_range.end_date
+            or ""
+        ).strip()
+        try:
+            start = date.fromisoformat(start_raw[:10]) - timedelta(
+                days=max(0, int(lower_expansion_days or 0))
+            )
+            end = date.fromisoformat(end_raw[:10]) + timedelta(
+                days=max(0, int(upper_expansion_days or 0))
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "explicit business time range lacks canonical date bounds"
+            ) from exc
+        normalized_role = str(role or "").strip().upper()
+        if normalized_role in {"DATETIME", "TIMESTAMP", "TIME"}:
+            exclusive_end = end + timedelta(days=1)
+            return "%s >= %s AND %s < %s" % (
+                qualified_column,
+                sql_literal("%s 00:00:00" % start.isoformat()),
+                qualified_column,
+                sql_literal("%s 00:00:00" % exclusive_end.isoformat()),
+            )
+        return "%s BETWEEN %s AND %s" % (
+            qualified_column,
+            sql_literal(start.isoformat()),
+            sql_literal(end.isoformat()),
+        )
+
+    @staticmethod
+    def _partition_pruning_column(
+        contract: GroundedQueryContract,
+        table: str,
+    ) -> str:
+        time_field = contract.time_field
+        if (
+            time_field.table == table
+            and time_field.partition_pruning_column
+            and time_field.partition_pruning_policy
+            in {"EXACT_EQUIVALENT", "SAFE_SUPERSET"}
+        ):
+            return str(time_field.partition_pruning_column)
+        return ""
+
+    @staticmethod
+    def _partition_pruning_predicate(
+        contract: GroundedQueryContract,
+        table: str,
+        column: str,
+        *,
+        table_alias: str = "",
+    ) -> str:
+        time_field = contract.time_field
+        if time_field.table != table or column != time_field.partition_pruning_column:
+            return ""
+        qualified = (
+            "%s.%s" % (table_alias, quote_identifier(column))
+            if table_alias
+            else quote_identifier(column)
+        )
+        return GroundedQueryExecutionKernel._bounded_time_predicate(
+            qualified,
+            contract,
+            role="DATE",
+            lower_expansion_days=time_field.partition_lower_expansion_days,
+            upper_expansion_days=time_field.partition_upper_expansion_days,
+        )
+
+    @staticmethod
+    def _detail_time_predicates(
+        contract: GroundedQueryContract,
+        table: str,
+        table_default: str,
+        table_alias: str,
+    ) -> list[tuple[str, str]]:
+        if not contract.time_range.explicit:
+            return []
+        time_field = contract.time_field
+        if time_field.semantic_ref_id:
+            if time_field.table != table or not time_field.column:
+                return []
+            business_column = str(time_field.column)
+            business_predicate = GroundedQueryExecutionKernel._bounded_time_predicate(
+                "%s.%s" % (table_alias, quote_identifier(business_column)),
+                contract,
+                role=time_field.role,
+            )
+        else:
+            business_column = str(table_default or "").strip()
+            if not business_column:
+                return []
+            business_predicate = GroundedQueryExecutionKernel._bounded_time_predicate(
+                "%s.%s" % (table_alias, quote_identifier(business_column)),
+                contract,
+                role="DATE",
+            )
+        predicates = [(business_predicate, business_column)]
+        pruning_column = GroundedQueryExecutionKernel._partition_pruning_column(
+            contract,
+            table,
+        )
+        if pruning_column and pruning_column != business_column:
+            pruning_predicate = (
+                GroundedQueryExecutionKernel._partition_pruning_predicate(
+                    contract,
+                    table,
+                    pruning_column,
+                    table_alias=table_alias,
+                )
+            )
+            if pruning_predicate:
+                predicates.append((pruning_predicate, pruning_column))
+        return predicates
 
     @staticmethod
     def _dedupe(values: Iterable[Any]) -> list[str]:

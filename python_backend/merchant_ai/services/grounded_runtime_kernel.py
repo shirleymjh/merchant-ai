@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ from merchant_ai.models import (
     AgentRunResult,
     AnswerMode,
     ClarificationRequest,
+    DataSnapshotContract,
     EntityFilterObligation,
     EntityReference,
     ExtractedKeywords,
@@ -38,6 +38,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedEntityFilterHint,
     GroundedQueryContract,
     GroundedQueryContractBuilder,
+    GroundedReferenceScopeBinding,
     GroundedUpstreamEntityBinding,
     compile_deterministic_grounded_query,
     materialize_grounded_asset_pack,
@@ -111,6 +112,9 @@ class GroundedVerifiedQueryArtifact(APIModel):
     plan: QueryPlan
     run_result: AgentRunResult
     verified_evidence: VerifiedEvidence
+    execution_mode: str = ""
+    sql_validation: Optional[GroundedSqlValidationResult] = None
+    ranking_semantics_verified: bool = False
     output_columns: list[str] = Field(default_factory=list)
     output_semantic_refs: dict[str, str] = Field(default_factory=dict)
     output_entity_identities: dict[str, str] = Field(default_factory=dict)
@@ -164,6 +168,9 @@ class GroundedRuntimeSession(APIModel):
     merchant: MerchantInfo = Field(default_factory=MerchantInfo)
     access_role: str = "merchant_analyst"
     user_scope: dict[str, Any] = Field(default_factory=dict)
+    reference_scope: GroundedReferenceScopeBinding = Field(
+        default_factory=GroundedReferenceScopeBinding
+    )
     phase: str = "CREATED"
     revision: int = 0
     keywords: ExtractedKeywords = Field(default_factory=ExtractedKeywords)
@@ -259,6 +266,7 @@ class GroundedRuntimeKernel:
         merchant: MerchantInfo | None = None,
         access_role: str = "merchant_analyst",
         user_scope: dict[str, Any] | None = None,
+        reference_scope: GroundedReferenceScopeBinding | dict[str, Any] | None = None,
         session_id: str = "",
     ) -> GroundedRuntimeSession:
         normalized_question = str(question or "").strip()
@@ -276,6 +284,13 @@ class GroundedRuntimeKernel:
             ),
             access_role=access_role or "merchant_analyst",
             user_scope=dict(user_scope or {}),
+            reference_scope=(
+                reference_scope.model_copy(deep=True)
+                if isinstance(reference_scope, GroundedReferenceScopeBinding)
+                else GroundedReferenceScopeBinding.model_validate(
+                    reference_scope or {}
+                )
+            ),
         )
 
     def fork_query_branch(
@@ -295,15 +310,25 @@ class GroundedRuntimeKernel:
         parent only through :meth:`adopt_verified_branches`.
         """
 
-        token = re.sub(r"[^A-Za-z0-9_-]+", "_", str(branch_id or "")).strip("_")
-        if not token:
-            raise ValueError("parallel query branch_id is required")
+        token = str(branch_id or "").strip()
+        if (
+            not token
+            or len(token) > 128
+            or any(
+                not (character.isascii() and (character.isalnum() or character in {"_", "-"}))
+                for character in token
+            )
+        ):
+            raise ValueError(
+                "parallel query branch_id must be a typed ASCII identifier"
+            )
         branch = self.new_session(
             str(objective or session.question).strip(),
             session.merchant_id,
             merchant=session.merchant.model_copy(deep=True),
             access_role=session.access_role,
             user_scope=dict(session.user_scope),
+            reference_scope=session.reference_scope.model_copy(deep=True),
             session_id="%s__branch_%s_%s"
             % (session.session_id, token[:48], uuid.uuid4().hex[:8]),
         )
@@ -584,6 +609,11 @@ class GroundedRuntimeKernel:
             now=now,
             default_days=default_days,
         )
+        if session.reference_scope.enabled:
+            contract = self._attach_reference_scope(
+                contract,
+                session.reference_scope,
+            )
         if upstream_bindings or upstream_gaps:
             resolved_bindings, identity_gaps = self._bind_upstream_targets(
                 contract,
@@ -624,6 +654,43 @@ class GroundedRuntimeKernel:
                 attempt.attempt_id,
             )
         return attempt
+
+    def _attach_reference_scope(
+        self,
+        contract: GroundedQueryContract,
+        reference_scope: GroundedReferenceScopeBinding,
+    ) -> GroundedQueryContract:
+        """Attach server-owned lineage and re-run Contract validation.
+
+        Core never authors or edits this object.  It is copied from the
+        session after the persisted source artifact and fingerprint have been
+        checked by the application runtime.
+        """
+
+        updated = contract.model_copy(
+            update={"reference_scope": reference_scope.model_copy(deep=True)},
+            deep=True,
+        )
+        validation = self.contract_builder.validator.validate(updated)
+        combined: list[GroundedContractGap] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for gap in [*updated.unresolved_gaps, *validation.gaps]:
+            identity = (gap.code, gap.topic, gap.table, gap.phrase)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            combined.append(gap)
+        return updated.model_copy(
+            update={
+                "status": (
+                    "UNRESOLVED"
+                    if any(item.blocking for item in combined)
+                    else "READY"
+                ),
+                "unresolved_gaps": combined,
+            },
+            deep=True,
+        )
 
     def _resolve_upstream_entity_hints(
         self,
@@ -1332,6 +1399,24 @@ class GroundedRuntimeKernel:
             )
         return attempt
 
+    def capture_data_snapshot(
+        self,
+        semantic_activation_fingerprint: str,
+    ) -> DataSnapshotContract:
+        if self.executor is None:
+            return DataSnapshotContract(
+                unsupported_reason="GROUNDED_EXECUTOR_NOT_CONFIGURED"
+            )
+        capture = getattr(self.executor, "capture_data_snapshot", None)
+        if not callable(capture):
+            return DataSnapshotContract(
+                unsupported_reason="DATA_SNAPSHOT_CAPABILITY_UNAVAILABLE"
+            )
+        snapshot = capture(str(semantic_activation_fingerprint or "").strip())
+        if isinstance(snapshot, DataSnapshotContract):
+            return snapshot
+        return DataSnapshotContract.model_validate(snapshot)
+
     def execute_active(
         self,
         session: GroundedRuntimeSession,
@@ -1339,6 +1424,7 @@ class GroundedRuntimeKernel:
         knowledge_context: str = "",
         run_id: str = "",
         runtime_budget: Any = None,
+        data_snapshot_contract: DataSnapshotContract | None = None,
     ) -> AgentRunResult:
         with self._lock:
             execution_mode = session.active_execution_mode
@@ -1416,6 +1502,8 @@ class GroundedRuntimeKernel:
         # Doris immediately before the repository call.
         if runtime_budget is not None:
             execution_kwargs["runtime_budget"] = runtime_budget
+        if data_snapshot_contract is not None:
+            execution_kwargs["data_snapshot_contract"] = data_snapshot_contract
         run_result = execute_contract(
             session.merchant_id,
             contract,
@@ -1428,6 +1516,8 @@ class GroundedRuntimeKernel:
             run_result = AgentRunResult.model_validate(run_result)
         access_terminal_codes = {
             "ACCESS_DENIED",
+            "ACL_POLICY_UNAVAILABLE",
+            "ACL_SQL_PARSE_FAILED",
             "MERCHANT_SCOPE_DENIED",
             "TABLE_DENIED",
             "TABLE_NOT_ALLOWED",
@@ -1722,6 +1812,23 @@ class GroundedRuntimeKernel:
             plan=plan.model_copy(deep=True),
             run_result=run_result.model_copy(deep=True),
             verified_evidence=verified.model_copy(deep=True),
+            execution_mode=str(session.active_execution_mode or ""),
+            sql_validation=(
+                validation.model_copy(deep=True)
+                if validation is not None
+                else None
+            ),
+            ranking_semantics_verified=bool(
+                str(contract.query_shape or "").upper() != "RANKED"
+                or (
+                    validation is not None
+                    and validation.valid
+                    and validation.contract_fingerprint == contract_fingerprint
+                    and bool(validation.ast_fingerprint)
+                )
+                or session.active_execution_mode
+                == GroundedExecutionMode.DETERMINISTIC_RANKED
+            ),
             output_columns=output_columns,
             output_semantic_refs=semantic_refs,
             output_entity_identities=entity_identities,

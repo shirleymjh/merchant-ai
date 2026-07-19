@@ -87,13 +87,21 @@ class ToolRegistry:
 
 def default_tool_capability(name: str, description: str = "") -> ToolCapability:
     tool_name = str(name or "")
-    side_effect = "read"
-    permission = "agent.tool.read"
-    cache_policy = "ttl"
+    # An unregistered tool has unknown effects.  Treating it as a read would
+    # permit unsafe lease takeover and result caching for newly introduced
+    # writes before their capability card is reviewed.
+    side_effect = "unknown"
+    permission = "agent.tool.execute"
+    cache_policy = "disabled"
     sandbox_required = False
     output_required: List[str] = []
-    fail_closed = False
-    failure_modes = ["TIMEOUT", "INVALID_ARGUMENT", "PERMISSION_DENIED"]
+    fail_closed = True
+    failure_modes = [
+        "TIMEOUT",
+        "INVALID_ARGUMENT",
+        "PERMISSION_DENIED",
+        "UNCLASSIFIED_SIDE_EFFECT",
+    ]
     if tool_name in {"execute_sql", "doris_query"}:
         side_effect = "external_read"
         permission = "agent.sql.execute"
@@ -102,6 +110,7 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
         fail_closed = True
         failure_modes += ["UNKNOWN_COLUMN", "MEM_ALLOC_FAILED", "UNSAFE_SQL"]
     elif tool_name.startswith("artifact_"):
+        side_effect = "read"
         permission = "agent.artifact.read"
         cache_policy = "ttl"
         sandbox_required = True
@@ -111,6 +120,7 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
             output_required = ["path"]
             fail_closed = True
     elif tool_name.startswith("semantic_"):
+        side_effect = "read"
         permission = "agent.semantic.read"
         cache_policy = "versioned"
         if tool_name == "semantic_write":
@@ -122,6 +132,17 @@ def default_tool_capability(name: str, description: str = "") -> ToolCapability:
         "repair_sql",
         "summarize_node_result",
         "execution_contract_validation",
+    }:
+        side_effect = "none"
+        permission = "agent.reasoning"
+        cache_policy = "disabled"
+    elif tool_name in {"inspect_schema", "resolve_columns", "check_freshness"}:
+        side_effect = "read"
+        permission = "agent.tool.read"
+        cache_policy = "versioned"
+    elif tool_name in {
+        "choose_sql_strategy",
+        "validate_sql",
     }:
         side_effect = "none"
         permission = "agent.reasoning"

@@ -42,6 +42,7 @@ from merchant_ai.services.runs import (
     AgentAsyncRunService,
     AgentRunManager,
     AgentRunStreamService,
+    public_response_payload,
     run_duration_ms,
     run_summary_payload,
     valid_run_id,
@@ -49,6 +50,7 @@ from merchant_ai.services.runs import (
 )
 from merchant_ai.services.security import (
     Permission,
+    authorize_authenticated_merchant_access,
     authorize_merchant_access,
     identity_scope_hash,
     merchant_principal,
@@ -155,7 +157,7 @@ def require_ops_token(
     expected = str(settings.ops_token or "").strip()
     if not expected:
         client_host = str(request.client.host if request.client else "")
-        if client_host in {"127.0.0.1", "::1", "localhost"}:
+        if not settings.identity_auth_required and client_host in {"127.0.0.1", "::1", "localhost"}:
             return
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="ops token is not configured")
     bearer_prefix = "Bearer "
@@ -173,9 +175,35 @@ def require_ops_token(
 OpsAuth = Depends(require_ops_token)
 
 
-def require_merchant_access(merchant_id: str) -> str:
+def require_merchant_access(
+    merchant_id: str,
+    authorization: Optional[str] = None,
+    requested_identity: Any = None,
+    permission: Permission = Permission.CHAT_RUN,
+) -> str:
+    """Authorize a merchant API target without trusting its request merchantId.
+
+    Production identity mode is deliberately fail-closed: only a verified JWT
+    identity may establish merchant scope.  The synthetic same-merchant
+    principal remains available solely when identity authentication has been
+    explicitly disabled for local development.
+    """
+
     target = str(merchant_id or settings.merchant_id).strip()
-    return authorize_merchant_access(settings, merchant_principal(target), target, Permission.CHAT_RUN)
+    should_resolve_identity = bool(
+        settings.identity_auth_required
+        or str(authorization or "").strip()
+    )
+    identity = (
+        resolve_authenticated_identity(settings, authorization or "", requested_identity)
+        if should_resolve_identity
+        else None
+    )
+    if identity is not None:
+        return authorize_authenticated_merchant_access(settings, identity, target, permission)
+    if settings.identity_auth_required:
+        raise HTTPException(status_code=401, detail="authenticated merchant identity is required")
+    return authorize_merchant_access(settings, merchant_principal(target), target, permission)
 
 
 def require_ops_merchant_access(merchant_id: str, permission: Permission = Permission.OPS_READ) -> str:
@@ -215,7 +243,12 @@ def require_thread_access(
     if identity and thread.owner_scope_hash:
         if identity_scope_hash(identity, thread.merchant_id) != thread.owner_scope_hash:
             raise HTTPException(status_code=403, detail="authenticated identity scope cannot access thread")
-    require_merchant_access(thread.merchant_id)
+    require_merchant_access(
+        thread.merchant_id,
+        authorization=authorization,
+        requested_identity=identity,
+        permission=Permission.RUN_READ,
+    )
     return thread
 
 
@@ -229,6 +262,25 @@ def require_thread_run_access(
         raise HTTPException(status_code=400, detail="invalid runId")
     run = run_manager.get_run(run_id)
     if not run or run.thread_id != thread.thread_id or run.merchant_id != thread.merchant_id:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+def require_ops_thread_run_access(thread_id: str, run_id: str) -> Any:
+    if not valid_thread_id(thread_id):
+        raise HTTPException(status_code=400, detail="invalid threadId")
+    if not valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="invalid runId")
+    thread = run_manager.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="thread not found")
+    require_ops_merchant_access(thread.merchant_id, Permission.OPS_READ)
+    run = run_manager.get_run(run_id)
+    if (
+        not run
+        or run.thread_id != thread.thread_id
+        or run.merchant_id != thread.merchant_id
+    ):
         raise HTTPException(status_code=404, detail="run not found")
     return run
 
@@ -258,7 +310,11 @@ def health() -> Dict[str, Any]:
 @router.post("/api/chat")
 async def chat(request: ChatRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     apply_request_identity(request, authorization)
-    merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    merchant_id = require_merchant_access(
+        request.merchant_id or settings.merchant_id,
+        authorization=authorization,
+        requested_identity=request.user_identity,
+    )
     request.message = message_with_attachments(request.message, request.attachments, merchant_id)
     thread = run_manager.create_thread(
         merchant_id,
@@ -288,7 +344,7 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
             message_history=message_history,
         )
         run_manager.complete_run(run.run_id, response)
-        return response.model_dump(by_alias=True)
+        return public_response_payload(response)
     except Exception as exc:
         run_manager.fail_run(run.run_id, str(exc))
         raise
@@ -297,7 +353,11 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
 @router.post("/api/chat/stream")
 def stream_chat(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)):
     apply_request_identity(request, authorization)
-    request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.merchant_id = require_merchant_access(
+        request.merchant_id or settings.merchant_id,
+        authorization=authorization,
+        requested_identity=request.user_identity,
+    )
     if request.thread_id:
         require_thread_access(request.thread_id, request.merchant_id, authorization, request.user_identity)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
@@ -307,7 +367,11 @@ def stream_chat(request: RunCreateRequest, authorization: Optional[str] = Header
 @router.post("/api/runs/async")
 def create_async_run(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     apply_request_identity(request, authorization)
-    request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.merchant_id = require_merchant_access(
+        request.merchant_id or settings.merchant_id,
+        authorization=authorization,
+        requested_identity=request.user_identity,
+    )
     if request.thread_id:
         require_thread_access(request.thread_id, request.merchant_id, authorization, request.user_identity)
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
@@ -330,7 +394,11 @@ def create_async_run(request: RunCreateRequest, authorization: Optional[str] = H
 @router.post("/api/chat/resume")
 def resume_chat(request: RunCreateRequest, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     apply_request_identity(request, authorization)
-    request.merchant_id = require_merchant_access(request.merchant_id or settings.merchant_id)
+    request.merchant_id = require_merchant_access(
+        request.merchant_id or settings.merchant_id,
+        authorization=authorization,
+        requested_identity=request.user_identity,
+    )
     request.message = message_with_attachments(request.message, request.attachments, request.merchant_id)
     if not request.thread_id:
         raise HTTPException(status_code=400, detail="threadId is required for resume")
@@ -356,8 +424,12 @@ async def upload_attachment(
     name: str = Query("attachment"),
     content_type: str = Query("application/octet-stream", alias="type"),
     merchant_id: str = Query("", alias="merchantId"),
+    authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    effective_merchant_id = require_merchant_access(
+        merchant_id or settings.merchant_id,
+        authorization=authorization,
+    )
     allowed_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".pdf", ".xls", ".xlsx", ".csv", ".txt", ".json", ".md"}
     if Path(name).suffix.lower() not in allowed_suffixes:
         raise HTTPException(status_code=415, detail="unsupported attachment type")
@@ -382,9 +454,14 @@ def message_with_attachments(message: str, attachments: List[Any], merchant_id: 
 def list_runs(
     limit: int = Query(default=50, ge=1, le=200),
     status: Optional[str] = Query(default=None),
-    merchant_id: Optional[str] = Query(default=None),
+    merchant_id: Optional[str] = Query(default=None, alias="merchantId"),
+    authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    effective_merchant_id = require_merchant_access(
+        merchant_id or settings.merchant_id,
+        authorization=authorization,
+        permission=Permission.RUN_READ,
+    )
     runs = run_manager.list_runs(limit=limit, status=status or "", merchant_id=effective_merchant_id)
     summaries = [run_summary_payload(run, run_duration_ms(run)) for run in runs]
     return {"success": True, "runs": jsonable_encoder(summaries, by_alias=True)}
@@ -394,9 +471,14 @@ def list_runs(
 def runs_dashboard(
     limit: int = Query(default=50, ge=1, le=200),
     status: Optional[str] = Query(default=None),
-    merchant_id: Optional[str] = Query(default=None),
+    merchant_id: Optional[str] = Query(default=None, alias="merchantId"),
+    authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    effective_merchant_id = require_merchant_access(
+        merchant_id or settings.merchant_id,
+        authorization=authorization,
+        permission=Permission.RUN_READ,
+    )
     dashboard = run_manager.dashboard(limit=limit, status=status or "", merchant_id=effective_merchant_id)
     return {"success": True, "dashboard": jsonable_encoder(dashboard, by_alias=True)}
 
@@ -445,7 +527,11 @@ def create_thread(
 ) -> Dict[str, Any]:
     safe = request or RunCreateRequest()
     apply_request_identity(safe, authorization)
-    merchant_id = require_merchant_access(safe.merchant_id or settings.merchant_id)
+    merchant_id = require_merchant_access(
+        safe.merchant_id or settings.merchant_id,
+        authorization=authorization,
+        requested_identity=safe.user_identity,
+    )
     thread = run_manager.create_thread(
         merchant_id,
         safe.context.topic if safe.context else "",
@@ -484,7 +570,7 @@ def get_run_trace(
     run_id: str,
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
-    require_thread_run_access(thread_id, run_id)
+    require_ops_thread_run_access(thread_id, run_id)
     trace = run_manager.trace(run_id)
     if trace is None:
         return {"success": False, "message": "trace not found", "threadId": thread_id, "runId": run_id}
@@ -497,7 +583,7 @@ def get_run_checkpoint(
     run_id: str,
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
-    run = require_thread_run_access(thread_id, run_id)
+    run = require_ops_thread_run_access(thread_id, run_id)
     try:
         checkpoint = runtime.checkpoint_state_summary(thread_id, run_id)
     except Exception as exc:
@@ -533,7 +619,10 @@ def record_metric_definition_preference(
     request: MetricDefinitionPreferenceRequest,
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    target = require_merchant_access(request.merchant_id or settings.merchant_id)
+    target = require_merchant_access(
+        request.merchant_id or settings.merchant_id,
+        authorization=authorization,
+    )
     require_memory_write_identity(target, authorization)
     return memory_management_service.record_metric_definition_preference(target, request)
 
@@ -594,7 +683,10 @@ def merchant_knowledge_suggestion_action(
     request: KnowledgeSuggestionActionRequest,
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    target = require_merchant_access(request.merchant_id or settings.merchant_id)
+    target = require_merchant_access(
+        request.merchant_id or settings.merchant_id,
+        authorization=authorization,
+    )
     require_memory_write_identity(target, authorization)
     result = memory_governance_service.apply_merchant_action(
         target,
@@ -612,7 +704,7 @@ def merchant_knowledge_suggestion_action(
 
 @router.get("/api/memory/{merchant_id}")
 def get_memory(merchant_id: str, include_inactive: bool = Query(default=True), _auth: None = OpsAuth) -> Dict[str, Any]:
-    require_merchant_access(merchant_id)
+    require_ops_merchant_access(merchant_id)
     return memory_management_service.get_memory(merchant_id, include_inactive=include_inactive)
 
 
@@ -623,7 +715,7 @@ def patch_memory_item(
     request: MemoryItemPatchRequest,
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
-    require_merchant_access(merchant_id)
+    require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
     return memory_management_service.patch_item(merchant_id, memory_id, request)
 
 
@@ -634,13 +726,13 @@ def delete_memory_item(
     hard_delete: bool = Query(default=False),
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
-    require_merchant_access(merchant_id)
+    require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
     return memory_management_service.delete_item(merchant_id, memory_id, hard_delete=hard_delete)
 
 
 @router.post("/api/memory/{merchant_id}/cleanup")
 def cleanup_memory(merchant_id: str, request: MemoryCleanupRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
-    require_merchant_access(merchant_id)
+    require_ops_merchant_access(merchant_id, Permission.OPS_WRITE)
     return memory_management_service.cleanup_expired(merchant_id, hard_delete=request.hard_delete, dry_run=request.dry_run)
 
 
@@ -650,7 +742,7 @@ def evaluate_memory_recall(
     request: MemoryRecallEvaluationRequest,
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
-    require_merchant_access(merchant_id)
+    require_ops_merchant_access(merchant_id)
     return memory_management_service.evaluate_recall(
         merchant_id,
         request.cases,
@@ -771,13 +863,27 @@ def evaluate_golden_cases(request: GoldenEvaluationRequest, _auth: None = OpsAut
 
 
 @router.get("/api/daily-report")
-def daily_report(merchant_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    return daily_report_service.report(require_merchant_access(merchant_id or settings.merchant_id)).model_dump(by_alias=True)
+def daily_report(
+    merchant_id: Optional[str] = Query(default=None, alias="merchantId"),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    effective_merchant_id = require_merchant_access(
+        merchant_id or settings.merchant_id,
+        authorization=authorization,
+    )
+    return daily_report_service.report(effective_merchant_id).model_dump(by_alias=True)
 
 
 @router.get("/api/merchant-profile/{merchant_id}")
-def get_merchant_profile(merchant_id: str, include_expired: bool = Query(default=False)) -> Dict[str, Any]:
-    effective_merchant_id = require_merchant_access(merchant_id)
+def get_merchant_profile(
+    merchant_id: str,
+    include_expired: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    effective_merchant_id = require_merchant_access(
+        merchant_id,
+        authorization=authorization,
+    )
     return {
         "success": True,
         "profile": runtime.services.merchant_profile_store.get_profile(
@@ -848,7 +954,7 @@ def get_access_control_audit(limit: int = Query(default=50, ge=1, le=500), _auth
 
 @router.post("/api/es/rebuild-recall-index")
 def rebuild_recall_index(merchant_id: Optional[str] = Query(default=None), _auth: None = OpsAuth) -> Dict[str, Any]:
-    effective_merchant_id = require_merchant_access(merchant_id or settings.merchant_id)
+    effective_merchant_id = require_ops_merchant_access(merchant_id or settings.merchant_id, Permission.OPS_WRITE)
     result = recall_index_manager.rebuild(changed_only=True)
     return {
         "success": True,
@@ -881,7 +987,7 @@ def recall_mapping(_auth: None = OpsAuth) -> Dict[str, Any]:
 def build_topic_asset(request: TopicBuildRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
     if not request.merchant_id:
         request.merchant_id = settings.merchant_id
-    require_merchant_access(request.merchant_id)
+    require_ops_merchant_access(request.merchant_id, Permission.OPS_WRITE)
     return topic_builder_workflow.build(request)
 
 
@@ -890,7 +996,7 @@ def build_topic_assets_batch(requests: List[TopicBuildRequest], _auth: None = Op
     for request in requests:
         if not request.merchant_id:
             request.merchant_id = settings.merchant_id
-        require_merchant_access(request.merchant_id)
+        require_ops_merchant_access(request.merchant_id, Permission.OPS_WRITE)
     return topic_builder_workflow.build_batch(requests)
 
 
@@ -933,7 +1039,7 @@ def diff_topic_table_schema(
     target.table_name = table_name
     if not target.merchant_id:
         target.merchant_id = settings.merchant_id
-    require_merchant_access(target.merchant_id)
+    require_ops_merchant_access(target.merchant_id, Permission.OPS_WRITE)
     return topic_builder_workflow.diff_schema(target)
 
 
@@ -971,7 +1077,7 @@ def refresh_topic_table_incrementally(
     target.table_name = table_name
     if not target.merchant_id:
         target.merchant_id = settings.merchant_id
-    require_merchant_access(target.merchant_id)
+    require_ops_merchant_access(target.merchant_id, Permission.OPS_WRITE)
     return topic_builder_workflow.refresh_incremental(target)
 
 

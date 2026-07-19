@@ -298,7 +298,23 @@ class AgentRunManager:
             run.final_answer_hash = hashlib.sha256((response.answer or "").encode("utf-8")).hexdigest()[:16]
             trace = response.debug_trace or {}
             harness = trace.get("harness") or {}
-            run.performance_summary = harness.get("performance") or {}
+            performance = (
+                dict(harness.get("performance"))
+                if isinstance(harness.get("performance"), dict)
+                else {}
+            )
+            runtime_budget = (
+                dict(harness.get("runtimeBudget"))
+                if isinstance(harness.get("runtimeBudget"), dict)
+                else {}
+            )
+            if runtime_budget:
+                performance.setdefault("runtimeBudget", runtime_budget)
+                performance.setdefault(
+                    "totalDurationMs",
+                    runtime_budget.get("elapsedMs", 0),
+                )
+            run.performance_summary = performance
             if isinstance(harness.get("checkpoint"), dict) and harness.get("checkpoint"):
                 run.checkpoint_ref = harness["checkpoint"]
                 run.resumable = bool(harness["checkpoint"].get("resumable"))

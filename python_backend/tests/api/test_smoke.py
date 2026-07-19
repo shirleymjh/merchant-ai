@@ -33,13 +33,6 @@ def test_query_graph_smoke_contract():
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["debugTrace"]["harness"]["mode"] == "deepagent"
-    assert body["debugTrace"]["planningAssetPack"]["skills"]
-    agent_trace = body["debugTrace"]["agentTrace"]
-    assert agent_trace
-    assert "PY_FALLBACK:EXPLICIT_ORDER_LOOKUP" not in str(body["debugTrace"])
-    assert (
-        body["debugTrace"].get("planIntents")
-        or body["debugTrace"]["queryGraphValidation"]["gaps"]
-        or body["debugTrace"].get("taskResults")
-    )
+    assert body["answer"]
+    assert "debugTrace" not in body
+    assert "debug_trace" not in body

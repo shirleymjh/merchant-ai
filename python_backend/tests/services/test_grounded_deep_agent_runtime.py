@@ -31,6 +31,9 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedSemanticBackend,
     _core_visible_binding_hints,
     _grounded_contract_sql_obligations,
+    _grounded_semantic_read_control,
+    _parallel_goal_dependency_issues,
+    _phase_visible_tools,
     _skill_output_contract_issues,
     _thin_recall,
 )
@@ -52,6 +55,7 @@ from merchant_ai.services.grounded_runtime_kernel import (
     GroundedVerifiedQueryArtifact,
 )
 from merchant_ai.services.grounded_goal_contract import (
+    AnalysisQuestionGoal,
     DependencyQuestionGoal,
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
@@ -312,22 +316,49 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
 
     assert {item.name for item in factory.kwargs["tools"]} == {
         "declare_original_question_goals",
+        "propose_grounded_execution_graph",
+        "reopen_grounded_execution_graph_discovery",
         "declare_grounded_query_branches",
         "retrieve_knowledge",
         "publish_verified_rule_evidence",
         "compose_verified_rule_answer",
         "propose_grounded_contract",
-        "declare_grounded_query_branches",
         "prepare_grounded_query_batch",
         "submit_grounded_sql_candidate",
         "execute_grounded_query",
         "execute_grounded_query_batch",
         "publish_verified_entity_set",
+        "delegate_grounded_exploration",
         "finalize_evidence_collection",
         "compose_verified_answer",
         "run_skill",
         "ask_human",
     }
+
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="visibility",
+            question="主指标是多少",
+            merchant_id="merchant-1",
+            workspace_topics=["客服工单"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="主指标是多少",
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.primary",
+                    label="主指标",
+                )
+            ],
+        ),
+    )
+    visible, _ = _phase_visible_tools(
+        session,
+        factory.kwargs["tools"],
+    )
+    visible_names = {item.name for item in visible}
+    assert "propose_grounded_execution_graph" in visible_names
+    assert "declare_grounded_query_branches" not in visible_names
     contract_tool = next(
         item
         for item in factory.kwargs["tools"]
@@ -383,6 +414,76 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "never plan goals or impose an execution order" in factory.kwargs[
         "system_prompt"
     ]
+
+
+def test_discovery_read_control_never_uses_fixed_leaf_counts_to_freeze() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="discovery",
+            question="分析当前问题",
+            merchant_id="merchant-1",
+        ),
+        core_semantic_evidence=[
+            {
+                "refId": "semantic:topic:table:detail",
+                "kind": "TABLE_DETAIL",
+                "topic": "topic",
+                "contentHash": "table-hash",
+                "contentComplete": True,
+            },
+            {
+                "refId": "semantic:topic:table:metric:value",
+                "kind": "METRIC",
+                "topic": "topic",
+                "contentHash": "metric-hash",
+                "contentComplete": True,
+            },
+            {
+                "refId": "semantic:topic:table:column:id",
+                "kind": "COLUMN",
+                "topic": "topic",
+                "contentHash": "column-hash",
+                "contentComplete": True,
+            },
+        ],
+    )
+
+    control = _grounded_semantic_read_control(session)
+
+    assert control["status"] == "DISCOVERY_OPEN"
+    assert control["retrievalClosed"] is False
+    assert control["nextAction"] == (
+        "CONTINUE_DISCOVERY_OR_PROPOSE_CONTRACT_OR_GRAPH"
+    )
+
+
+def test_discovery_evidence_is_never_silently_fifo_evicted() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="evidence-ledger",
+            question="分析当前问题",
+            merchant_id="merchant-1",
+        )
+    )
+    backend = GroundedSemanticBackend(FakeSemanticCatalog())
+
+    for index in range(70):
+        backend._retain_evidence(
+            session,
+            {
+                "refId": "semantic:topic:table:field:%s" % index,
+                "path": "topics/topic/table/fields/%s.json" % index,
+                "kind": "COLUMN",
+                "topic": "topic",
+                "contentHash": "hash-%s" % index,
+                "contentComplete": True,
+            },
+        )
+
+    assert len(session.core_semantic_evidence) == 70
+    assert session.core_semantic_evidence[0]["refId"] == (
+        "semantic:topic:table:field:0"
+    )
 
 
 def test_upstream_entity_values_are_hidden_from_parent_core_contract_response() -> None:
@@ -1335,11 +1436,11 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
     assert kernel.compile_calls == 1
 
 
-def test_parallel_batch_rejects_declared_depends_on_goal_edge() -> None:
+def test_semantic_goal_dependency_does_not_force_query_serialization() -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
     outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("查询退款明细", "m-1")
+    kernel_session = kernel.new_session("查询两个指标", "m-1")
     deep_session = GroundedDeepAgentSession(runtime=kernel_session)
     context = GroundedDeepAgentRunContext(
         thread_id="t-batch-depends-on",
@@ -1368,40 +1469,14 @@ def test_parallel_batch_rejects_declared_depends_on_goal_edge() -> None:
     )
     assert declared["status"] == "ACCEPTED"
 
-    result = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {"queryId": "top-products", "goalIds": ["metric.top_products"]},
-                {"queryId": "refunds", "goalIds": ["metric.refunds"]},
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "REJECTED"
-    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
-    assert result["nextAction"] == "USE_SERIAL_GROUNDED_QUERY_TOOLS"
-    assert result["issues"] == [
+    assert deep_session.question_goal_contract is not None
+    assert _parallel_goal_dependency_issues(
+        deep_session.question_goal_contract,
         {
-            "code": "BATCH_GOAL_DEPENDS_ON_EDGE",
-            "upstreamGoalId": "metric.top_products",
-            "downstreamGoalId": "metric.refunds",
-            "upstreamQueryIds": ["top-products"],
-            "downstreamQueryIds": ["refunds"],
-            "requiredExecution": "SERIAL",
-            "direct": True,
-            "pathGoalIds": ["metric.top_products", "metric.refunds"],
-            "pathEdges": [
-                {
-                    "relationType": "DEPENDS_ON_GOAL_IDS",
-                    "upstreamGoalId": "metric.top_products",
-                    "downstreamGoalId": "metric.refunds",
-                    "declaredByGoalId": "metric.refunds",
-                }
-            ],
-        }
-    ]
-    assert deep_session.parallel_branches == {}
+            "top-products": ["metric.top_products"],
+            "refunds": ["metric.refunds"],
+        },
+    ) == []
 
 
 def test_parallel_batch_rejects_dependency_goal_endpoints() -> None:
@@ -1482,7 +1557,7 @@ def test_parallel_batch_rejects_dependency_goal_endpoints() -> None:
     assert deep_session.parallel_branches == {}
 
 
-def test_parallel_batch_rejects_transitive_depends_on_path() -> None:
+def test_transitive_semantic_goal_dependencies_do_not_create_artifact_waits() -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
     outer = runtime(factory, kernel)
@@ -1517,48 +1592,17 @@ def test_parallel_batch_rejects_transitive_depends_on_path() -> None:
     )
     assert declared["status"] == "ACCEPTED"
 
-    result = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {"queryId": "upstream-c", "goalIds": ["metric.c"]},
-                {"queryId": "downstream-a", "goalIds": ["metric.a"]},
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "REJECTED"
-    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
-    assert result["issues"] == [
+    assert deep_session.question_goal_contract is not None
+    assert _parallel_goal_dependency_issues(
+        deep_session.question_goal_contract,
         {
-            "code": "BATCH_TRANSITIVE_GOAL_DEPENDENCY_PATH",
-            "upstreamGoalId": "metric.c",
-            "downstreamGoalId": "metric.a",
-            "upstreamQueryIds": ["upstream-c"],
-            "downstreamQueryIds": ["downstream-a"],
-            "requiredExecution": "SERIAL",
-            "direct": False,
-            "pathGoalIds": ["metric.c", "metric.b", "metric.a"],
-            "pathEdges": [
-                {
-                    "relationType": "DEPENDS_ON_GOAL_IDS",
-                    "upstreamGoalId": "metric.c",
-                    "downstreamGoalId": "metric.b",
-                    "declaredByGoalId": "metric.b",
-                },
-                {
-                    "relationType": "DEPENDS_ON_GOAL_IDS",
-                    "upstreamGoalId": "metric.b",
-                    "downstreamGoalId": "metric.a",
-                    "declaredByGoalId": "metric.a",
-                },
-            ],
-        }
-    ]
-    assert deep_session.parallel_branches == {}
+            "upstream-c": ["metric.c"],
+            "downstream-a": ["metric.a"],
+        },
+    ) == []
 
 
-def test_parallel_batch_transitive_path_includes_dependency_goal_edges() -> None:
+def test_artifact_dependency_does_not_spread_through_semantic_only_edges() -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
     outer = runtime(factory, kernel)
@@ -1596,27 +1640,14 @@ def test_parallel_batch_transitive_path_includes_dependency_goal_edges() -> None
     )
     assert declared["status"] == "ACCEPTED"
 
-    result = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {"queryId": "upstream-c", "goalIds": ["metric.c"]},
-                {"queryId": "downstream-a", "goalIds": ["metric.a"]},
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "REJECTED"
-    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
-    issue = result["issues"][0]
-    assert issue["code"] == "BATCH_TRANSITIVE_GOAL_DEPENDENCY_PATH"
-    assert issue["direct"] is False
-    assert issue["pathGoalIds"] == ["metric.c", "metric.b", "metric.a"]
-    assert [edge["relationType"] for edge in issue["pathEdges"]] == [
-        "DEPENDENCY_GOAL",
-        "DEPENDS_ON_GOAL_IDS",
-    ]
-    assert issue["dependencyGoalIds"] == ["dependency.c_to_b"]
+    assert deep_session.question_goal_contract is not None
+    assert _parallel_goal_dependency_issues(
+        deep_session.question_goal_contract,
+        {
+            "upstream-c": ["metric.c"],
+            "downstream-a": ["metric.a"],
+        },
+    ) == []
     assert deep_session.parallel_branches == {}
 
 
@@ -2263,6 +2294,179 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert kernel_session.run_result.skill_lifecycle_records[0].matched_by == (
         "core_llm_skill_header"
     )
+
+
+def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() -> None:
+    factory = CapturingFactory(action="none")
+    kernel = FakeKernel()
+    outer = GroundedDeepAgentRuntime(
+        kernel,
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        checkpointer=object(),
+        agent_factory=factory,
+    )
+
+    class ExplorationRuntime:
+        job: Any = None
+
+        def run(self, job: Any, *, on_progress: Any) -> IsolatedSubagentResult:
+            self.job = job
+            assignment = job.user_payload["invocation"]["assignment"]
+            assignment_id = assignment["assignmentId"]
+            assert assignment["objective"] == (
+                "Explore competing explanations from verified evidence."
+            )
+            population = assignment["populationScopeFingerprint"]
+            time_scope = assignment["timeScopeFingerprint"]
+            source_fingerprints = assignment["sourceArtifactFingerprints"]
+            on_progress("subagent", "started", job.job_id)
+            return IsolatedSubagentResult(
+                job_id=job.job_id,
+                thread_id=job.thread_id,
+                checkpoint={"threadId": job.thread_id, "runId": job.job_id},
+                raw_output=json.dumps(
+                    {
+                        "artifactId": "advisory.test",
+                        "assignmentId": assignment_id,
+                        "hypotheses": [
+                            {
+                                "hypothesisId": "hypothesis.test",
+                                "falsifiableStatement": (
+                                    "The verified change is concentrated in one comparison."
+                                ),
+                                "premises": ["The verified input is comparable."],
+                                "expectedObservations": [
+                                    "A comparison differs from its reference."
+                                ],
+                                "falsifyingObservations": [
+                                    "The comparison does not differ."
+                                ],
+                                "goalIds": ["analysis.primary"],
+                                "populationScopeFingerprint": population,
+                                "timeScopeFingerprint": time_scope,
+                                "competingExplanations": [
+                                    "The change is distributed across comparisons."
+                                ],
+                            }
+                        ],
+                        "evidenceRequests": [
+                            {
+                                "requestId": "request.test",
+                                "capability": "COMPARE_GROUPS",
+                                "evidenceShape": "COMPARISON_RESULT",
+                                "goalIds": ["analysis.primary"],
+                                "hypothesisIds": ["hypothesis.test"],
+                                "populationScope": {
+                                    "relation": "INHERIT",
+                                    "fingerprint": population,
+                                    "parentFingerprint": population,
+                                },
+                                "timeScope": {
+                                    "relation": "INHERIT",
+                                    "fingerprint": time_scope,
+                                    "parentFingerprint": time_scope,
+                                },
+                                "sourceArtifactFingerprints": source_fingerprints,
+                            }
+                        ],
+                        "stoppingAssessment": {
+                            "decision": "CONTINUE",
+                            "goalIds": ["analysis.primary"],
+                            "unresolvedHypothesisIds": ["hypothesis.test"],
+                            "outstandingRequestIds": ["request.test"],
+                            "rationale": "The comparison evidence is still required.",
+                        },
+                        "sourceArtifactFingerprints": source_fingerprints,
+                    },
+                    ensure_ascii=False,
+                ),
+                update_count=1,
+            )
+
+    isolated = ExplorationRuntime()
+    outer.subagent_runtime = isolated
+    kernel_session = kernel.new_session("分析已验证变化", "m-1")
+    contract = GroundedQueryContract(
+        question=kernel_session.question,
+        status="READY",
+        query_shape="SCALAR",
+    )
+    run_result = AgentRunResult(
+        merged_query_bundle=QueryBundle(
+            rows=[{"measure": 10}],
+            original_row_count=1,
+        )
+    )
+    verified = VerifiedEvidence(
+        passed=True,
+        covered_evidence=["evidence.measure"],
+    )
+    query_artifact = GroundedVerifiedQueryArtifact(
+        artifact_id="artifact.measure",
+        generation=1,
+        contract_fingerprint="contract.fingerprint",
+        sql_fingerprint="sql.fingerprint",
+        contract=contract,
+        plan=QueryPlan(),
+        run_result=run_result,
+        verified_evidence=verified,
+        output_columns=["measure"],
+    )
+    kernel_session.verified_query_ledger = [query_artifact]
+    deep_session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        artifact_goal_ids={"artifact.measure": ["metric.measure"]},
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=kernel_session.question,
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.measure",
+                    label="verified measure",
+                ),
+                AnalysisQuestionGoal(
+                    goal_id="analysis.primary",
+                    label="explore the verified change",
+                    analysis_type="OPEN_EXPLORATION",
+                    input_goal_ids=["metric.measure"],
+                ),
+            ],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-exploration",
+        run_id="run-exploration",
+        session=deep_session,
+    )
+    visible, _ = _phase_visible_tools(deep_session, outer.tools)
+    assert "delegate_grounded_exploration" in {
+        item.name for item in visible
+    }
+
+    tools = {item.name: item for item in outer.tools}
+    result = json.loads(
+        tools["delegate_grounded_exploration"].func(
+            analysis_goal_ids=["analysis.primary"],
+            source_query_artifact_ids=["artifact.measure"],
+            objective="Explore competing explanations from verified evidence.",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ADVISORY_ACCEPTED"
+    assert result["authority"] == "ADVISORY"
+    assert result["publishableAsFinal"] is False
+    assert result["queryExecuted"] is False
+    assert result["pendingCapabilityRequests"][0]["executable"] is False
+    assert result["pendingCapabilityRequests"][0]["queryDispatched"] is False
+    assert isolated.job.backend is None
+    assert isolated.job.tools == []
+    assert isolated.job.skills == []
+    assert isolated.job.permissions == []
+    assert isolated.job.subagents == []
+    assert isolated.job.model_timeout_seconds == 15.0
+    assert len(deep_session.exploration_states) == 1
+    assert len(deep_session.exploration_reports) == 1
 
 
 def test_skill_repairs_once_inside_isolation_without_query_mutation(

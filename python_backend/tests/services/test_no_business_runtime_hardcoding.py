@@ -1,5 +1,5 @@
+import ast
 import json
-import re
 from pathlib import Path
 
 
@@ -25,16 +25,24 @@ def published_business_identifiers() -> set[str]:
 
 
 def test_runtime_python_does_not_embed_published_table_or_metric_literals() -> None:
-    quoted_identifier_patterns = {
-        identifier: re.compile(r"(['\"])" + re.escape(identifier) + r"\1")
-        for identifier in published_business_identifiers()
-    }
+    published_identifiers = published_business_identifiers()
     violations: list[tuple[str, str]] = []
 
     for path in RUNTIME_ROOT.rglob("*.py"):
         source = path.read_text(encoding="utf-8")
-        for identifier, pattern in quoted_identifier_patterns.items():
-            if pattern.search(source):
-                violations.append((str(path.relative_to(BACKEND_ROOT)), identifier))
+        tree = ast.parse(source, filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(
+                node.value,
+                str,
+            ):
+                continue
+            if node.value in published_identifiers:
+                violations.append(
+                    (
+                        str(path.relative_to(BACKEND_ROOT)),
+                        node.value,
+                    )
+                )
 
     assert violations == []

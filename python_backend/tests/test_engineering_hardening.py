@@ -376,7 +376,14 @@ def test_file_runtime_state_store_supports_node_task_queue_lease_and_complete(tm
         )
     )
     claimed = store.claim_node_task("run_1", "node_1", "worker_1", lease_seconds=30)
-    completed = store.complete_node_task("run_1", "node_1", "completed", {"rows": 3})
+    completed = store.complete_node_task(
+        "run_1",
+        "node_1",
+        "completed",
+        {"rows": 3},
+        lease_owner=claimed.lease_owner,
+        lease_generation=claimed.lease_generation,
+    )
 
     assert queued.status == "queued"
     assert claimed is not None
@@ -427,7 +434,14 @@ def test_redis_runtime_state_store_uses_real_backend_protocol(monkeypatch):
     store = RedisRuntimeStateStore(Settings(redis_enabled=True, runtime_state_backend="redis"))
     store.enqueue_node_task(NodeTaskState(run_id="run_1", task_id="node_1"))
     claimed = store.claim_node_task("run_1", "node_1", "worker")
-    completed = store.complete_node_task("run_1", "node_1", "completed", {"rows": 2})
+    completed = store.complete_node_task(
+        "run_1",
+        "node_1",
+        "completed",
+        {"rows": 2},
+        lease_owner=claimed.lease_owner,
+        lease_generation=claimed.lease_generation,
+    )
 
     assert claimed is not None
     assert claimed.status == "running"

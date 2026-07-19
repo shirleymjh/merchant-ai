@@ -3,14 +3,14 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
-import re
 import subprocess
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Generic, Iterator, Optional, TypeVar
@@ -97,6 +97,8 @@ except ImportError as exc:  # pragma: no cover - exercised through constructor g
     class CompositeBackend:  # type: ignore[no-redef]
         def __init__(self, **kwargs: Any):
             self.kwargs = kwargs
+
+
 try:
     from langchain.tools import ToolRuntime, tool
 except ImportError:  # pragma: no cover - compatibility for minimal test runtime
@@ -107,19 +109,29 @@ except ImportError:  # pragma: no cover - compatibility for minimal test runtime
     class ToolRuntime(Generic[_ContextT]):  # type: ignore[no-redef]
         context: _ContextT
 
+
 from merchant_ai.models import (
     APIModel,
+    ChatContext,
     ChatResponse,
+    ClarificationRequest,
+    ConversationMessage,
+    DataSnapshotContract,
     MerchantInfo,
+    QueryBundle,
+    QueryPlan,
     RecallBundle,
     SkillLifecycleRecord,
 )
 from merchant_ai.services.answer_claims import AnswerClaimVerifier
 from merchant_ai.services.assets import normalize_semantic_path
 from merchant_ai.services.grounded_runtime_kernel import (
+    GroundedCoreSqlPreparation,
     GroundedRuntimeKernel,
     GroundedRuntimeEvent,
     GroundedRuntimeSession,
+    GroundedVerifiedEntitySet,
+    GroundedVerifiedQueryArtifact,
 )
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
@@ -129,6 +141,7 @@ from merchant_ai.services.grounded_goal_contract import (
     GoalCoverageBlocked,
     GoalCoverageVerifier,
     OriginalQuestionGoalContract,
+    RankingQuestionGoal,
     VerifiedArtifactGoalCoverage,
     canonical_goal_id,
     declare_verified_artifact_goal_coverage,
@@ -160,7 +173,11 @@ from merchant_ai.services.grounded_rule_artifact import (
     verified_rule_candidate_refs,
 )
 from merchant_ai.services.time_semantics import has_explicit_time_expression
-from merchant_ai.services.grounded_query_contract import GroundedBindingHints
+from merchant_ai.services.grounded_query_contract import (
+    GroundedBindingHints,
+    GroundedQueryContract,
+    GroundedReferenceScopeBinding,
+)
 from merchant_ai.services.grounded_query_branches import (
     GroundedBranchBudget,
     GroundedBranchBudgetExceeded,
@@ -168,13 +185,48 @@ from merchant_ai.services.grounded_query_branches import (
     GroundedBranchPrepareSpec,
     GroundedQueryBranchContext,
     GroundedQueryBranchSpec,
+    GroundedSemanticReadLedger,
+)
+from merchant_ai.services.grounded_execution_graph import (
+    GroundedExecutionEdgeSpec,
+    GroundedExecutionGraphProposal,
+    GroundedExecutionGraphReceipt,
+    GroundedExecutionNodeSpec,
+    build_grounded_execution_graph_receipt,
+    discovery_evidence_snapshot_fingerprint,
+    grounded_execution_graph_fingerprint,
+    validate_grounded_execution_graph,
+)
+from merchant_ai.services.data_snapshot_contract import (
+    derive_multi_query_snapshot_requirement,
+    validate_query_bundle_snapshots,
+)
+from merchant_ai.services.grounded_exploration_coordinator import (
+    GroundedExplorationAssignmentSpec,
+    GroundedExplorationCoordinator,
+    GroundedExplorationCoordinatorError,
+    GroundedExplorationCoordinatorState,
+    GroundedExplorationScopeAuthority,
+    InMemoryVerifiedExplorationArtifactCatalog,
+    IsolatedGroundedExplorationWorker,
+    VerifiedExplorationObservation,
+    VerifiedExplorationSourceView,
 )
 from merchant_ai.services.grounded_sql_candidate import (
+    GroundedSqlCandidate,
+    GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import (
     IsolatedSubagentJob,
     IsolatedSubagentRuntime,
+)
+from merchant_ai.services.grounded_conversation_state import (
+    GROUNDED_CONVERSATION_STATE_VERSION,
+    GroundedConversationResolution,
+    GroundedConversationStateCorruptError,
+    grounded_conversation_principal_fingerprint,
+    resolve_grounded_conversation_turn,
 )
 
 
@@ -209,9 +261,7 @@ def _validated_goal_assignment(
             "nextAction": "DECLARE_ORIGINAL_QUESTION_GOALS",
         }
     try:
-        normalized = list(
-            dict.fromkeys(canonical_goal_id(item) for item in goal_ids)
-        )
+        normalized = list(dict.fromkeys(canonical_goal_id(item) for item in goal_ids))
     except ValueError as exc:
         return [], {
             "status": "REJECTED",
@@ -277,14 +327,40 @@ def _parallel_goal_dependency_issues(
             existing.append(edge)
 
     for goal in contract.goals:
-        for upstream_goal_id in goal.depends_on_goal_ids:
-            add_edge(
-                upstream_goal_id=upstream_goal_id,
-                downstream_goal_id=goal.goal_id,
-                relation_type="DEPENDS_ON_GOAL_IDS",
-                declared_by_goal_id=goal.goal_id,
-            )
+        # Goal dependencies express answer/semantic coverage and do not by
+        # themselves require a serial query. Only a typed runtime artifact
+        # input creates an execution edge.
         if str(getattr(goal, "kind", "")) != "DEPENDENCY":
+            if (
+                isinstance(goal, RankingQuestionGoal)
+                and goal.population_scope == "VERIFIED_ENTITY_SET"
+            ):
+                for upstream_goal_id in goal.population_goal_ids:
+                    add_edge(
+                        upstream_goal_id=upstream_goal_id,
+                        downstream_goal_id=goal.goal_id,
+                        relation_type="POPULATION_ENTITY_SET",
+                        declared_by_goal_id=goal.goal_id,
+                    )
+            continue
+        dependency_type = str(
+            getattr(goal, "dependency_type", "") or ""
+        ).strip().upper()
+        artifact_kind = str(
+            getattr(goal, "artifact_kind", "") or ""
+        ).strip().upper()
+        if dependency_type in {"CONTRACT_SCOPE", "PREDICATE_SCOPE"}:
+            continue
+        if not (
+            artifact_kind
+            in {
+                "ENTITY_SET",
+                "RESULT_ARTIFACT",
+                "VERIFIED_ENTITY_SET",
+                "VERIFIED_RESULT_ARTIFACT",
+            }
+            or dependency_type in {"ENTITY_CHAIN", "RESULT_CHAIN"}
+        ):
             continue
         for upstream_goal_id in getattr(goal, "upstream_goal_ids", ()):
             for downstream_goal_id in getattr(goal, "downstream_goal_ids", ()):
@@ -300,9 +376,7 @@ def _parallel_goal_dependency_issues(
         upstream_goal_id: str,
         downstream_goal_id: str,
     ) -> list[dict[str, Any]]:
-        pending: list[tuple[str, list[dict[str, Any]]]] = [
-            (upstream_goal_id, [])
-        ]
+        pending: list[tuple[str, list[dict[str, Any]]]] = [(upstream_goal_id, [])]
         visited = {upstream_goal_id}
         cursor = 0
         while cursor < len(pending):
@@ -319,10 +393,7 @@ def _parallel_goal_dependency_issues(
                 pending.append((next_goal_id, next_path))
         return []
 
-    goal_order = {
-        goal.goal_id: index
-        for index, goal in enumerate(contract.goals)
-    }
+    goal_order = {goal.goal_id: index for index, goal in enumerate(contract.goals)}
     assigned_goal_ids = sorted(
         query_ids_by_goal_id,
         key=lambda goal_id: (goal_order.get(goal_id, len(goal_order)), goal_id),
@@ -337,27 +408,22 @@ def _parallel_goal_dependency_issues(
                 continue
             direct = len(path_edges) == 1
             path_goal_ids = [upstream_goal_id]
-            path_goal_ids.extend(
-                str(edge["downstreamGoalId"])
-                for edge in path_edges
-            )
+            path_goal_ids.extend(str(edge["downstreamGoalId"]) for edge in path_edges)
             first_edge = path_edges[0]
             if direct and first_edge["relationType"] == "DEPENDS_ON_GOAL_IDS":
                 code = "BATCH_GOAL_DEPENDS_ON_EDGE"
             elif direct and first_edge["relationType"] == "DEPENDENCY_GOAL":
                 code = "BATCH_DEPENDENCY_GOAL_EDGE"
+            elif direct and first_edge["relationType"] == "POPULATION_ENTITY_SET":
+                code = "BATCH_POPULATION_ENTITY_SET_EDGE"
             else:
                 code = "BATCH_TRANSITIVE_GOAL_DEPENDENCY_PATH"
             issue: dict[str, Any] = {
                 "code": code,
                 "upstreamGoalId": upstream_goal_id,
                 "downstreamGoalId": downstream_goal_id,
-                "upstreamQueryIds": list(
-                    query_ids_by_goal_id[upstream_goal_id]
-                ),
-                "downstreamQueryIds": list(
-                    query_ids_by_goal_id[downstream_goal_id]
-                ),
+                "upstreamQueryIds": list(query_ids_by_goal_id[upstream_goal_id]),
+                "downstreamQueryIds": list(query_ids_by_goal_id[downstream_goal_id]),
                 "requiredExecution": "SERIAL",
                 "direct": direct,
                 "pathGoalIds": path_goal_ids,
@@ -375,9 +441,7 @@ def _parallel_goal_dependency_issues(
             if direct and dependency_goal_ids:
                 dependency_goal_id = dependency_goal_ids[0]
                 issue["dependencyGoalId"] = dependency_goal_id
-                issue["dependencyGoalQueryIds"] = list(
-                    query_ids_by_goal_id.get(dependency_goal_id, [])
-                )
+                issue["dependencyGoalQueryIds"] = list(query_ids_by_goal_id.get(dependency_goal_id, []))
             issues.append(issue)
     return issues
 
@@ -404,12 +468,15 @@ def _branch_plan_validation_issues(
 
     contract = session.question_goal_contract
     if contract is None:
-        return {}, [], [
-            {"code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED"}
-        ]
+        return {}, [], [{"code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED"}]
     issues: list[dict[str, Any]] = []
     assignments: dict[str, list[str]] = {}
     allowed_topics = set(session.effective_topics())
+    discovery_evidence_by_ref = {
+        str(item.get("refId") or ""): item
+        for item in session.core_semantic_evidence
+        if str(item.get("refId") or "")
+    }
     query_ids = [str(item.query_id or "").strip() for item in specs]
     if any(not item for item in query_ids) or len(set(query_ids)) != len(query_ids):
         issues.append({"code": "QUERY_BRANCH_ID_INVALID"})
@@ -422,13 +489,7 @@ def _branch_plan_validation_issues(
         assignments[query_id] = assigned
         if goal_error:
             issues.append({"queryId": query_id, **goal_error})
-        topics = list(
-            dict.fromkeys(
-                str(item or "").strip()
-                for item in spec.topic_scope
-                if str(item or "").strip()
-            )
-        )
+        topics = list(dict.fromkeys(str(item or "").strip() for item in spec.topic_scope if str(item or "").strip()))
         if not topics:
             issues.append(
                 {
@@ -446,17 +507,47 @@ def _branch_plan_validation_issues(
                     "allowedTopics": sorted(allowed_topics),
                 }
             )
+        evidence_ref_ids = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in spec.evidence_ref_ids
+                if str(item or "").strip()
+            )
+        )
+        unread_ref_ids = [
+            ref_id
+            for ref_id in evidence_ref_ids
+            if ref_id not in discovery_evidence_by_ref
+        ]
+        if unread_ref_ids:
+            issues.append(
+                {
+                    "queryId": query_id,
+                    "code": "QUERY_BRANCH_EVIDENCE_NOT_READ",
+                    "missingRefs": unread_ref_ids,
+                }
+            )
+        evidence_topics = {
+            str(discovery_evidence_by_ref[ref_id].get("topic") or "")
+            for ref_id in evidence_ref_ids
+            if ref_id in discovery_evidence_by_ref
+            and str(discovery_evidence_by_ref[ref_id].get("topic") or "")
+        }
+        outside_topics = sorted(evidence_topics - set(topics))
+        if outside_topics:
+            issues.append(
+                {
+                    "queryId": query_id,
+                    "code": "QUERY_BRANCH_EVIDENCE_TOPIC_MISMATCH",
+                    "evidenceTopics": outside_topics,
+                }
+            )
 
-    assigned_goal_ids = {
-        goal_id
-        for goal_ids in assignments.values()
-        for goal_id in goal_ids
-    }
+    assigned_goal_ids = {goal_id for goal_ids in assignments.values() for goal_id in goal_ids}
     required_query_goal_ids = {
         goal.goal_id
         for goal in contract.goals
-        if goal.required
-        and str(goal.kind or "").upper() in _BRANCH_QUERY_GOAL_KINDS
+        if goal.required and str(goal.kind or "").upper() in _BRANCH_QUERY_GOAL_KINDS
     }
     missing = sorted(required_query_goal_ids - assigned_goal_ids)
     if missing:
@@ -479,9 +570,7 @@ def _branch_plan_validation_issues(
                 *list(getattr(goal, "dimension_goal_ids", ()) or ()),
             ]
         elif kind == "DETAIL":
-            structural_input_goal_ids = list(
-                getattr(goal, "input_goal_ids", ()) or ()
-            )
+            structural_input_goal_ids = list(getattr(goal, "input_goal_ids", ()) or ())
         else:
             # ANALYSIS/COMPARISON inputs intentionally remain portfolio-level:
             # their primitive query branches may execute independently and a
@@ -493,9 +582,7 @@ def _branch_plan_validation_issues(
                 input_goal_id,
                 set(),
             )
-            missing_colocation = sorted(
-                owner_query_ids - input_query_ids
-            )
+            missing_colocation = sorted(owner_query_ids - input_query_ids)
             if missing_colocation:
                 issues.append(
                     {
@@ -511,24 +598,56 @@ def _branch_plan_validation_issues(
                     }
                 )
 
+    spec_by_query_id = {
+        str(item.query_id or "").strip(): item for item in specs
+    }
+    for goal in contract.goals:
+        if not isinstance(goal, RankingQuestionGoal):
+            continue
+        if goal.population_scope != "SAME_AS_GOAL":
+            continue
+        owner_query_ids = query_ids_by_goal_id.get(goal.goal_id, set())
+        source_query_ids = {
+            query_id
+            for population_goal_id in goal.population_goal_ids
+            for query_id in query_ids_by_goal_id.get(population_goal_id, set())
+        }
+        required_topics = {
+            topic
+            for query_id in source_query_ids
+            for topic in (
+                spec_by_query_id[query_id].topic_scope
+                if query_id in spec_by_query_id
+                else []
+            )
+        }
+        for owner_query_id in owner_query_ids:
+            owner_spec = spec_by_query_id.get(owner_query_id)
+            owner_topics = set(owner_spec.topic_scope if owner_spec else [])
+            missing_topics = sorted(required_topics - owner_topics)
+            if missing_topics:
+                issues.append(
+                    {
+                        "code": "RANKING_POPULATION_TOPIC_NOT_IN_BRANCH_SCOPE",
+                        "goalId": goal.goal_id,
+                        "queryId": owner_query_id,
+                        "populationGoalIds": list(goal.population_goal_ids),
+                        "missingTopics": missing_topics,
+                        "instruction": (
+                            "A SAME_AS_GOAL ranking branch must include the Topic "
+                            "scope that defines its source population."
+                        ),
+                    }
+                )
+
     dependency_issues = _parallel_goal_dependency_issues(
         contract,
         assignments,
     )
-    for dependency in dependency_issues:
-        upstream_query_ids = set(dependency.get("upstreamQueryIds") or [])
-        downstream_query_ids = set(
-            dependency.get("downstreamQueryIds") or []
-        )
-        same_query_ids = sorted(upstream_query_ids.intersection(downstream_query_ids))
-        if same_query_ids:
-            issues.append(
-                {
-                    "code": "DEPENDENCY_CHAIN_MUST_USE_SEPARATE_BRANCHES",
-                    "queryIds": same_query_ids,
-                    "pathGoalIds": dependency.get("pathGoalIds") or [],
-                }
-            )
+    # A prerequisite already owned by the same branch is a local Contract
+    # dependency, not an entity-chain edge.  RANKING/DETAIL structural inputs
+    # are explicitly required to be colocated above.  Only prerequisites that
+    # are absent from the downstream branch create a cross-branch wait.
     return assignments, dependency_issues, issues
 
 
@@ -583,15 +702,24 @@ class GroundedDeepAgentSession:
     analysis_skill_headers_disclosed: bool = False
     data_collection_sealed: bool = False
     analysis_skill_started: bool = False
-    verified_analysis_ledger: list[GroundedDerivedAnalysisArtifact] = field(
+    verified_analysis_ledger: list[GroundedDerivedAnalysisArtifact] = field(default_factory=list)
+    analysis_data_input_gate_result: dict[str, Any] = field(default_factory=dict)
+    query_branch_contexts: dict[str, GroundedQueryBranchContext] = field(default_factory=dict)
+    execution_graph_generation: int = 0
+    execution_graph_fingerprint: str = ""
+    execution_graph_receipt: Optional[GroundedExecutionGraphReceipt] = None
+    execution_graph_edges: list[GroundedExecutionEdgeSpec] = field(
         default_factory=list
     )
-    analysis_data_input_gate_result: dict[str, Any] = field(
-        default_factory=dict
+    execution_graph_data_snapshot: Optional[DataSnapshotContract] = None
+    execution_graph_history: list[dict[str, Any]] = field(
+        default_factory=list
     )
-    query_branch_contexts: dict[str, GroundedQueryBranchContext] = field(
-        default_factory=dict
-    )
+    exploration_states: dict[
+        str,
+        GroundedExplorationCoordinatorState,
+    ] = field(default_factory=dict)
+    exploration_reports: list[dict[str, Any]] = field(default_factory=list)
     parallel_branches: dict[str, GroundedRuntimeSession] = field(default_factory=dict)
     parallel_branch_goal_ids: dict[str, list[str]] = field(default_factory=dict)
     artifact_goal_ids: dict[str, list[str]] = field(default_factory=dict)
@@ -602,17 +730,14 @@ class GroundedDeepAgentSession:
     operational_failure: dict[str, Any] = field(default_factory=dict)
     runtime_budget_report: dict[str, Any] = field(default_factory=dict)
     core_context_reports: list[dict[str, Any]] = field(default_factory=list)
+    conversation_context: dict[str, Any] = field(default_factory=dict)
     lock: Any = field(default_factory=RLock, repr=False)
 
     def effective_topics(self) -> list[str]:
-        return list(
-            dict.fromkeys(
-                [*self.runtime.workspace_topics, *self.opened_topics]
-            )
-        )
+        return list(dict.fromkeys([*self.runtime.workspace_topics, *self.opened_topics]))
 
     def can_expand_topic(self) -> bool:
-        if len(self.opened_topics) >= 2 or not self.runtime.attempts:
+        if not self.runtime.attempts:
             return False
         latest_attempt = self.runtime.attempts[-1]
         if latest_attempt.attempt_id in set(self.expanded_from_attempt_ids):
@@ -633,22 +758,16 @@ class GroundedDeepAgentSession:
         if not structured_gaps:
             return False
         evidence_refs = {
-            str(item.get("refId") or "")
-            for item in self.core_semantic_evidence
-            if str(item.get("refId") or "")
+            str(item.get("refId") or "") for item in self.core_semantic_evidence if str(item.get("refId") or "")
         }
         evidence_topics = {
-            str(item.get("topic") or "")
-            for item in self.core_semantic_evidence
-            if str(item.get("topic") or "")
+            str(item.get("topic") or "") for item in self.core_semantic_evidence if str(item.get("topic") or "")
         }
         for gap in structured_gaps:
             if evidence_refs.intersection(gap.rejected_ref_ids):
                 return True
             capability_refs = {
-                str(value)
-                for value in _nested_values(gap.required_capability)
-                if str(value).startswith("semantic:")
+                str(value) for value in _nested_values(gap.required_capability) if str(value).startswith("semantic:")
             }
             if evidence_refs.intersection(capability_refs):
                 return True
@@ -664,6 +783,46 @@ class GroundedDeepAgentSession:
             self.expanded_from_attempt_ids.append(attempt_id)
 
 
+class _SessionExplorationStateStore:
+    """CAS adapter that keeps advisory state inside the active run session."""
+
+    def __init__(self, session: GroundedDeepAgentSession) -> None:
+        self.session = session
+
+    def create(self, state: GroundedExplorationCoordinatorState) -> bool:
+        assignment_id = state.assignment.assignment_id
+        with self.session.lock:
+            if assignment_id in self.session.exploration_states:
+                return False
+            self.session.exploration_states[assignment_id] = state
+            return True
+
+    def load(
+        self,
+        assignment_id: str,
+    ) -> GroundedExplorationCoordinatorState | None:
+        with self.session.lock:
+            return self.session.exploration_states.get(assignment_id)
+
+    def compare_and_swap(
+        self,
+        assignment_id: str,
+        *,
+        expected_revision: int,
+        replacement: GroundedExplorationCoordinatorState,
+    ) -> bool:
+        with self.session.lock:
+            current = self.session.exploration_states.get(assignment_id)
+            if (
+                current is None
+                or current.ledger.revision != expected_revision
+                or replacement.assignment.assignment_id != assignment_id
+            ):
+                return False
+            self.session.exploration_states[assignment_id] = replacement
+            return True
+
+
 @dataclass(frozen=True)
 class GroundedDeepAgentRunContext:
     thread_id: str
@@ -675,8 +834,6 @@ class GroundedDeepAgentRunContext:
 
 class GroundedSemanticBackend:
     """Read-only semantic filesystem scoped to one Grounded Core session."""
-
-    MAX_EVIDENCE_ITEMS = 64
 
     def __init__(
         self,
@@ -825,11 +982,7 @@ class GroundedSemanticBackend:
         end = start + max(1, int(limit or 1))
         content = "".join(lines[start:end])
         complete = start == 0 and end >= len(lines) and not bool(result.get("truncated"))
-        if (
-            session is not None
-            and complete
-            and kind not in {"TOPIC_INDEX", "TOPIC_MANIFEST"}
-        ):
+        if session is not None and complete and kind not in {"TOPIC_INDEX", "TOPIC_MANIFEST"}:
             evidence = {
                 "refId": str(result.get("refId") or ""),
                 "path": str(result.get("path") or normalized).lstrip("/"),
@@ -946,13 +1099,12 @@ class GroundedSemanticBackend:
         evidence: dict[str, Any],
     ) -> None:
         with session.lock:
-            retained = [
-                item
-                for item in session.core_semantic_evidence
-                if item.get("refId") != evidence.get("refId")
-            ]
+            retained = [item for item in session.core_semantic_evidence if item.get("refId") != evidence.get("refId")]
             retained.append(dict(evidence))
-            session.core_semantic_evidence = retained[-self.MAX_EVIDENCE_ITEMS :]
+            # The run-level governed tool budget bounds discovery. Evidence
+            # referenced by a graph is never silently evicted from its
+            # immutable snapshot.
+            session.core_semantic_evidence = retained
 
     def grep(
         self,
@@ -965,8 +1117,8 @@ class GroundedSemanticBackend:
         if scope_error:
             return GrepResult(error=scope_error)
         session = self._session()
-        topics = [self._topic(normalized)] if self._topic(normalized) else (
-            session.effective_topics() if session else []
+        topics = (
+            [self._topic(normalized)] if self._topic(normalized) else (session.effective_topics() if session else [])
         )
         hits: list[dict[str, Any]] = []
         try:
@@ -989,10 +1141,7 @@ class GroundedSemanticBackend:
             if glob and not fnmatch.fnmatch(hit_path, glob):
                 continue
             snippets = hit.get("snippets") or [hit.get("summary") or hit.get("title") or ""]
-            matches.extend(
-                GrepMatch(path=hit_path, line=1, text=str(snippet)[:1000])
-                for snippet in snippets[:3]
-            )
+            matches.extend(GrepMatch(path=hit_path, line=1, text=str(snippet)[:1000]) for snippet in snippets[:3])
         return GrepResult(matches=matches[:100])
 
     def glob(self, pattern: str, path: Optional[str] = None) -> GlobResult:
@@ -1123,15 +1272,9 @@ def _compact_json_value(value: Any, *, depth: int = 0) -> Any:
             return {"omitted": True, "itemCount": len(value)}
         return str(value or "")[:240]
     if isinstance(value, dict):
-        return {
-            str(key): _compact_json_value(item, depth=depth + 1)
-            for key, item in list(value.items())[:16]
-        }
+        return {str(key): _compact_json_value(item, depth=depth + 1) for key, item in list(value.items())[:16]}
     if isinstance(value, (list, tuple)):
-        return [
-            _compact_json_value(item, depth=depth + 1)
-            for item in list(value)[:12]
-        ]
+        return [_compact_json_value(item, depth=depth + 1) for item in list(value)[:12]]
     if isinstance(value, str):
         return value[:400]
     return value
@@ -1167,6 +1310,7 @@ def _semantic_payload_summary(kind: str, content: str) -> dict[str, Any]:
         )
         navigation = payload.get("semanticNavigation")
         if isinstance(navigation, dict):
+
             def compact_leaves(value: Any) -> list[dict[str, Any]]:
                 leaves = value if isinstance(value, list) else []
                 compacted: list[dict[str, Any]] = []
@@ -1180,42 +1324,22 @@ def _semantic_payload_summary(kind: str, content: str) -> dict[str, Any]:
                     item = {
                         "key": str(leaf.get("key") or ""),
                         "aliases": [
-                            str(alias)
-                            for alias in (leaf.get("aliases") or [])[:6]
-                            if str(alias or "").strip()
+                            str(alias) for alias in (leaf.get("aliases") or [])[:6] if str(alias or "").strip()
                         ],
                         "refId": str(leaf.get("refId") or ""),
                         "path": str(leaf.get("path") or ""),
                     }
-                    compacted.append(
-                        {
-                            key: value
-                            for key, value in item.items()
-                            if value not in (None, "", [], {})
-                        }
-                    )
+                    compacted.append({key: value for key, value in item.items() if value not in (None, "", [], {})})
                 return compacted
 
             summary["semanticNavigation"] = {
                 "source": str(navigation.get("source") or ""),
-                "questionIndependent": bool(
-                    navigation.get("questionIndependent")
-                ),
-                "bindingEvidence": bool(
-                    navigation.get("bindingEvidence")
-                ),
-                "publishedCounts": dict(
-                    navigation.get("publishedCounts") or {}
-                ),
-                "advertisedCounts": dict(
-                    navigation.get("advertisedCounts") or {}
-                ),
-                "metricLeaves": compact_leaves(
-                    navigation.get("metricLeaves")
-                ),
-                "columnLeaves": compact_leaves(
-                    navigation.get("columnLeaves")
-                ),
+                "questionIndependent": bool(navigation.get("questionIndependent")),
+                "bindingEvidence": bool(navigation.get("bindingEvidence")),
+                "publishedCounts": dict(navigation.get("publishedCounts") or {}),
+                "advertisedCounts": dict(navigation.get("advertisedCounts") or {}),
+                "metricLeaves": compact_leaves(navigation.get("metricLeaves")),
+                "columnLeaves": compact_leaves(navigation.get("columnLeaves")),
             }
         return summary
     if normalized_kind == "METRIC":
@@ -1263,15 +1387,9 @@ def _semantic_payload_summary(kind: str, content: str) -> dict[str, Any]:
                 if definition.get(key) not in (None, "", [], {})
             },
         }
-        return _compact_json_value(
-            {key: value for key, value in summary.items() if value not in (None, "", [], {})}
-        )
+        return _compact_json_value({key: value for key, value in summary.items() if value not in (None, "", [], {})})
     if "INDEX" in normalized_kind or "CATALOG" in normalized_kind:
-        counts = {
-            str(key): len(value)
-            for key, value in payload.items()
-            if isinstance(value, list)
-        }
+        counts = {str(key): len(value) for key, value in payload.items() if isinstance(value, list)}
         return {
             "catalogKeys": list(payload.keys())[:16],
             "itemCounts": counts,
@@ -1319,11 +1437,7 @@ def _core_visible_semantic_receipt(evidence: Any) -> dict[str, Any]:
             content,
         ),
     }
-    return {
-        key: value
-        for key, value in receipt.items()
-        if value not in (None, "", [], {})
-    }
+    return {key: value for key, value in receipt.items() if value not in (None, "", [], {})}
 
 
 def _grounded_branch_read_control(
@@ -1344,17 +1458,14 @@ def _grounded_branch_read_control(
             "status": "READY_TO_EXECUTE",
             "nextAction": (
                 "AUTHOR_SQL_THEN_EXECUTE_BATCH"
-                if _enum_value(state.active_execution_mode)
-                == "CORE_SQL_REQUIRED"
+                if _enum_value(state.active_execution_mode) == "CORE_SQL_REQUIRED"
                 else "EXECUTE_BATCH"
             ),
             "retrievalClosed": True,
         }
     if state is not None and state.attempts:
         latest = state.attempts[-1]
-        blocking = [
-            gap for gap in latest.contract.unresolved_gaps if gap.blocking
-        ]
+        blocking = [gap for gap in latest.contract.unresolved_gaps if gap.blocking]
         if blocking:
             return {
                 "status": "NEED_MORE_EVIDENCE",
@@ -1381,18 +1492,9 @@ def _grounded_branch_read_control(
     table_count = sum(item == "TABLE_DETAIL" for item in exact_kinds)
     metric_count = sum(item == "METRIC" for item in exact_kinds)
     column_count = sum(item in {"COLUMN", "FIELD"} for item in exact_kinds)
-    checkpoint = table_count >= 1 and (metric_count >= 1 or column_count >= 2)
     return {
-        "status": (
-            "CONTRACT_CHECKPOINT_AVAILABLE"
-            if checkpoint
-            else "CONTINUE_TARGETED_RETRIEVAL"
-        ),
-        "nextAction": (
-            "PROPOSE_BRANCH_CONTRACT"
-            if checkpoint
-            else "ADD_EXACT_BRANCH_SEMANTIC_PATHS"
-        ),
+        "status": "FROZEN_EVIDENCE_READY_FOR_CONTRACT",
+        "nextAction": "PROPOSE_BRANCH_CONTRACT",
         "retrievalClosed": False,
         "evidenceCounts": {
             "tableDetails": table_count,
@@ -1418,11 +1520,7 @@ def _read_exact_branch_semantic_path(
         raise RuntimeError("BROAD_SEMANTIC_INDEX_DENIED")
     if branch.semantic_ledger.has_path(normalized):
         existing_ref = next(
-            (
-                ref_id
-                for path, ref_id in branch.semantic_ledger.ref_by_path.items()
-                if path == normalized
-            ),
+            (ref_id for path, ref_id in branch.semantic_ledger.ref_by_path.items() if path == normalized),
             "",
         )
         existing = branch.semantic_ledger.evidence([existing_ref])
@@ -1433,9 +1531,7 @@ def _read_exact_branch_semantic_path(
         offset=0,
     )
     if not isinstance(result, dict) or not result.get("success"):
-        raise RuntimeError(
-            str((result or {}).get("error") or "SEMANTIC_REF_NOT_FOUND")
-        )
+        raise RuntimeError(str((result or {}).get("error") or "SEMANTIC_REF_NOT_FOUND"))
     if bool(result.get("truncated")):
         raise RuntimeError("INCOMPLETE_SEMANTIC_DOCUMENT")
     kind = str(result.get("kind") or "").upper()
@@ -1471,13 +1567,34 @@ def _read_exact_branch_semantic_path(
 def _grounded_semantic_read_control(
     session: GroundedDeepAgentSession,
 ) -> dict[str, Any]:
-    state = session.runtime
-    if state.phase in {
-        "ACTIVE_COMPILED",
-        "ACTIVE_CORE_SQL_REQUIRED",
-        "ACTIVE_CORE_SQL_VALIDATED",
-    } and state.active_contract is not None:
+    discovery_snapshot_fingerprint = (
+        discovery_evidence_snapshot_fingerprint(
+            session.core_semantic_evidence
+        )
+    )
+
+    def with_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         return {
+            **payload,
+            "discoverySnapshotFingerprint": (
+                discovery_snapshot_fingerprint
+            ),
+            "executionGraphBaseVersion": (
+                session.execution_graph_generation
+            ),
+        }
+
+    state = session.runtime
+    if (
+        state.phase
+        in {
+            "ACTIVE_COMPILED",
+            "ACTIVE_CORE_SQL_REQUIRED",
+            "ACTIVE_CORE_SQL_VALIDATED",
+        }
+        and state.active_contract is not None
+    ):
+        return with_snapshot({
             "status": "READY_TO_EXECUTE",
             "nextAction": (
                 "SUBMIT_GROUNDED_SQL_CANDIDATE"
@@ -1488,12 +1605,12 @@ def _grounded_semantic_read_control(
             "activeAttemptId": state.active_attempt_id,
             "executionMode": state.active_execution_mode,
             "retrievalClosed": True,
-        }
+        })
     if state.attempts:
         latest = state.attempts[-1]
         blocking = [gap for gap in latest.contract.unresolved_gaps if gap.blocking]
         if blocking:
-            return {
+            return with_snapshot({
                 "status": "NEED_MORE_EVIDENCE",
                 "nextAction": "READ_ONLY_FOR_RETURNED_STRUCTURED_GAPS_THEN_RESUBMIT",
                 "attemptId": latest.attempt_id,
@@ -1511,7 +1628,7 @@ def _grounded_semantic_read_control(
                     for gap in blocking[:8]
                 ],
                 "retrievalClosed": False,
-            }
+            })
     exact_kinds = [
         str(item.get("kind") or "").upper()
         for item in session.core_semantic_evidence
@@ -1521,17 +1638,10 @@ def _grounded_semantic_read_control(
     metric_count = sum(kind == "METRIC" for kind in exact_kinds)
     column_count = sum(kind in {"COLUMN", "FIELD"} for kind in exact_kinds)
     relationship_count = sum(kind == "RELATIONSHIP" for kind in exact_kinds)
-    status = (
-        "CONTRACT_CHECKPOINT_AVAILABLE"
-        if table_count >= 1 and (metric_count >= 1 or column_count >= 2)
-        else "CONTINUE_TARGETED_RETRIEVAL"
-    )
-    return {
-        "status": status,
+    return with_snapshot({
+        "status": "DISCOVERY_OPEN",
         "nextAction": (
-            "PROPOSE_GROUNDED_CONTRACT_WITH_CURRENT_BINDINGS"
-            if status == "CONTRACT_CHECKPOINT_AVAILABLE"
-            else "READ_ONE_EXACT_LEAF_OR_USE_GREP"
+            "CONTINUE_DISCOVERY_OR_PROPOSE_CONTRACT_OR_GRAPH"
         ),
         "evidenceCounts": {
             "tableDetails": table_count,
@@ -1540,11 +1650,22 @@ def _grounded_semantic_read_control(
             "relationships": relationship_count,
         },
         "retrievalClosed": False,
-    }
+    })
 
 
 def _enum_value(value: Any) -> str:
     return str(getattr(value, "value", value) or "")
+
+
+def _stable_json_fingerprint(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _is_provider_timeout_error(exc: BaseException) -> bool:
@@ -1576,6 +1697,7 @@ def _phase_visible_tools(
     all_names = {_tool_name(item) for item in tools if _tool_name(item)}
     always_hidden = {
         "task",
+        "declare_grounded_query_branches",
         "execute",
         "write_file",
         "edit_file",
@@ -1600,34 +1722,11 @@ def _phase_visible_tools(
         # request in the run small and makes the transaction boundary explicit.
         allowed = {"declare_original_question_goals", "ask_human"}
     else:
-        query_goal_present = any(
-            str(goal.kind or "").upper() in _BRANCH_QUERY_GOAL_KINDS
-            for goal in session.question_goal_contract.goals
-        )
-        if not session.query_branch_contexts and query_goal_present:
-            allowed = {"declare_grounded_query_branches", "ask_human"}
-            blocked = (all_names - allowed) | always_hidden
-            visible = [
-                item for item in tools if _tool_name(item) not in blocked
-            ]
-            removed = sorted(
-                {
-                    _tool_name(item)
-                    for item in tools
-                    if _tool_name(item) in blocked
-                }
-            )
-            return visible, removed
-        branch_scoped = len(session.query_branch_contexts) > 1
-        allowed = {
-            "prepare_grounded_query_batch",
-            "ask_human",
-        }
+        allowed = {"ask_human"}
         if not session.query_branch_contexts:
-            allowed.add("declare_grounded_query_branches")
-        if not branch_scoped:
             allowed.update(
                 {
+                    "propose_grounded_execution_graph",
                     "ls",
                     "read_file",
                     "grep",
@@ -1636,6 +1735,16 @@ def _phase_visible_tools(
                     "propose_grounded_contract",
                 }
             )
+        else:
+            allowed.add("prepare_grounded_query_batch")
+            if (
+                session.execution_graph_receipt is not None
+                and any(
+                    context.status == "CONTRACT_GAPPED"
+                    for context in session.query_branch_contexts.values()
+                )
+            ):
+                allowed.add("reopen_grounded_execution_graph_discovery")
         if session.parallel_branches:
             allowed.add("execute_grounded_query_batch")
         if session.runtime.verified_query_ledger:
@@ -1645,15 +1754,18 @@ def _phase_visible_tools(
                     "finalize_evidence_collection",
                 }
             )
+            if (
+                session.question_goal_contract is not None
+                and any(
+                    str(getattr(goal, "kind", "") or "").upper()
+                    == "ANALYSIS"
+                    for goal in session.question_goal_contract.goals
+                )
+            ):
+                allowed.add("delegate_grounded_exploration")
     blocked = (all_names - allowed) | always_hidden
     visible = [item for item in tools if _tool_name(item) not in blocked]
-    removed = sorted(
-        {
-            _tool_name(item)
-            for item in tools
-            if _tool_name(item) in blocked
-        }
-    )
+    removed = sorted({_tool_name(item) for item in tools if _tool_name(item) in blocked})
     return visible, removed
 
 
@@ -1833,9 +1945,7 @@ def _compact_grounded_model_messages(
             if str(call.get("name") or "") != "read_file":
                 continue
             args = dict(call.get("args") or {})
-            paths_by_tool_call_id[str(call.get("id") or "")] = str(
-                args.get("file_path") or ""
-            )
+            paths_by_tool_call_id[str(call.get("id") or "")] = str(args.get("file_path") or "")
     evidence_by_path = {
         str(item.get("path") or "").lstrip("/"): item
         for item in (session.core_semantic_evidence if session is not None else [])
@@ -1946,8 +2056,8 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         if tool_name == "task":
             return ToolMessage(
                 content=(
-                    "SubAgent dispatch is disabled in this grounded runtime until "
-                    "worker evidence acceptance is independently auditable."
+                    "Generic task dispatch is disabled. Use the governed advisory "
+                    "exploration or post-query Skill isolation boundary instead."
                 ),
                 name=tool_name,
                 tool_call_id=tool_call_id,
@@ -1961,55 +2071,17 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         file_path = str(args.get("file_path") or "")
         if (
             isinstance(session, GroundedDeepAgentSession)
-            and session.question_goal_contract is not None
-            and not session.query_branch_contexts
-            and any(
-                str(goal.kind or "").upper()
-                in _BRANCH_QUERY_GOAL_KINDS
-                for goal in session.question_goal_contract.goals
-            )
-            and tool_name
-            in {
-                "ls",
-                "read_file",
-                "grep",
-                "retrieve_knowledge",
-                "propose_grounded_contract",
-                "prepare_grounded_query_batch",
-            }
-        ):
-            return ToolMessage(
-                content=json.dumps(
-                    {
-                        "status": "BLOCKED",
-                        "code": "QUERY_BRANCH_DECLARATION_REQUIRED",
-                        "message": (
-                            "Declare one or more goal and Topic query scopes "
-                            "before semantic retrieval."
-                        ),
-                        "nextAction": "DECLARE_GROUNDED_QUERY_BRANCHES",
-                    },
-                    ensure_ascii=False,
-                ),
-                name=tool_name,
-                tool_call_id=tool_call_id,
-                status="error",
-            )
-        if (
-            isinstance(session, GroundedDeepAgentSession)
-            and len(session.query_branch_contexts) > 1
-            and tool_name
-            in {"ls", "read_file", "grep", "retrieve_knowledge"}
+            and bool(session.query_branch_contexts)
+            and tool_name in {"ls", "read_file", "grep", "retrieve_knowledge"}
         ):
             return ToolMessage(
                 content=json.dumps(
                     {
                         "status": "READ_BLOCKED",
-                        "code": "BRANCH_SCOPED_RETRIEVAL_REQUIRED",
+                        "code": "EXECUTION_GRAPH_DISCOVERY_FROZEN",
                         "message": (
-                            "Multiple query branches are declared. Submit exact "
-                            "semanticPaths through prepare_grounded_query_batch so "
-                            "each branch keeps an independent Topic and read ledger."
+                            "The Execution Graph is bound to an immutable Discovery "
+                            "snapshot. Prepare only its declared nodes and evidence."
                         ),
                         "branchIds": list(session.query_branch_contexts),
                         "nextAction": "PREPARE_GROUNDED_QUERY_BATCH",
@@ -2042,8 +2114,7 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                 (
                     item
                     for item in reversed(session.core_semantic_evidence)
-                    if str(item.get("path") or "").lstrip("/") == normalized
-                    and bool(item.get("contentComplete"))
+                    if str(item.get("path") or "").lstrip("/") == normalized and bool(item.get("contentComplete"))
                 ),
                 None,
             )
@@ -2082,30 +2153,6 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                     tool_call_id=tool_call_id,
                     status="error",
                 )
-            if (
-                read_control["status"] == "CONTRACT_CHECKPOINT_AVAILABLE"
-                and normalized.endswith("/index.json")
-            ):
-                return ToolMessage(
-                    content=json.dumps(
-                        {
-                            "status": "READ_BLOCKED",
-                            "code": "CONTRACT_CHECKPOINT_REQUIRED",
-                            "message": (
-                                "Enough bindable leaf evidence is already loaded to let the Kernel "
-                                "check the candidate Contract. Submit it now; if unresolved, follow "
-                                "the returned structured gaps. Use grep for a named child instead of "
-                                "opening another broad index."
-                            ),
-                            "readControl": read_control,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    name=tool_name,
-                    tool_call_id=tool_call_id,
-                    status="error",
-                )
-
         result = handler(request)
         if tool_name != "read_file" or getattr(result, "status", "success") == "error":
             return result
@@ -2196,9 +2243,7 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
         report["removedTools"] = removed_tools
         report["toolSchemaChars"] = _tool_schema_chars(visible_tools)
         report["estimatedRequestChars"] = (
-            report["compactedMessageChars"]
-            + report["systemChars"]
-            + report["toolSchemaChars"]
+            report["compactedMessageChars"] + report["systemChars"] + report["toolSchemaChars"]
         )
         if isinstance(session, GroundedDeepAgentSession):
             with session.lock:
@@ -2215,6 +2260,32 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
 
     name = "GroundedRuntimeBudgetMiddleware"
 
+    def __init__(self, settings: Any = None) -> None:
+        self.model_call_timeout_seconds = max(
+            1.0,
+            float(
+                getattr(
+                    settings,
+                    "grounded_core_model_call_timeout_seconds",
+                    20,
+                )
+                or 20
+            ),
+        )
+        # This setting is the total number of provider attempts for one Core
+        # turn.  A value of two means one initial call plus one timeout retry.
+        self.model_retry_attempts = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "grounded_core_model_retry_attempts",
+                    2,
+                )
+                or 2
+            ),
+        )
+
     @staticmethod
     def _budget_from_runtime(runtime: Any) -> Optional[GroundedRuntimeBudget]:
         context = getattr(runtime, "context", None)
@@ -2225,16 +2296,41 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
         budget = self._budget_from_runtime(getattr(request, "runtime", None))
         if budget is None:
             return handler(request)
-        budget.consume_llm_call(name="grounded_core")
-        model_settings = dict(getattr(request, "model_settings", None) or {})
-        model_settings["timeout"] = budget.clamp_timeout_seconds(
-            model_settings.get("timeout")
-        )
-        override = getattr(request, "override", None)
-        if callable(override):
-            request = override(model_settings=model_settings)
-        with budget.stage("llm.grounded_core"):
-            return handler(request)
+        original_model_settings = dict(getattr(request, "model_settings", None) or {})
+        requested_timeout = original_model_settings.get("timeout")
+        try:
+            requested_timeout_seconds = float(requested_timeout)
+        except (TypeError, ValueError):
+            requested_timeout_seconds = 0.0
+        per_attempt_timeout = self.model_call_timeout_seconds
+        if requested_timeout_seconds > 0:
+            per_attempt_timeout = min(
+                per_attempt_timeout,
+                requested_timeout_seconds,
+            )
+
+        for attempt in range(1, self.model_retry_attempts + 1):
+            budget.consume_llm_call(name="grounded_core")
+            model_settings = dict(original_model_settings)
+            model_settings["timeout"] = budget.clamp_timeout_seconds(
+                per_attempt_timeout,
+                operation="llm:grounded_core:attempt_%s" % attempt,
+            )
+            attempt_request = request
+            override = getattr(request, "override", None)
+            if callable(override):
+                attempt_request = override(model_settings=model_settings)
+            try:
+                with budget.stage("llm.grounded_core"):
+                    with budget.stage("llm.grounded_core.attempt_%s" % attempt):
+                        return handler(attempt_request)
+            except Exception as exc:
+                if attempt >= self.model_retry_attempts or not _is_provider_timeout_error(exc):
+                    raise
+                # Do not let a retry escape the shared wall-time or LLM-call
+                # budgets.  The next loop reserves another real provider call.
+                budget.checkpoint()
+        raise RuntimeError("grounded Core model attempts exhausted")
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         budget = self._budget_from_runtime(getattr(request, "runtime", None))
@@ -2254,11 +2350,12 @@ class GroundedDeepAgentRuntime:
 The first user message already contains the automatically selected Topic L0 manifest and one Topic-scoped thin recall. Recall is navigation evidence, never planning authority.
 Before execution, inspect userInputRequirements and the progressively-read semantic capabilities. Time is required for analytical aggregates, rankings, trends and unbounded detail lists unless the user supplied it. A concrete entity lookup is different: when the selected semantic field declares an entity identity and its lookupTimePolicy permits global/unbounded lookup, do not ask for time; bind the entity filter and let the Contract gate validate that policy. Never infer this exception from a business-specific field name or value pattern.
 The first user message also contains trustedExecutionScope. It is authoritative runtime state, not a user claim. When merchantScopeBound=true, never ask the user for merchant_id and never propose bypassing tenant filtering; the executor binds the declared merchant scope automatically.
-Before proposing any query Contract, call declare_original_question_goals exactly once with a typed, complete ledger of the original question's metric, dimension, time-window, comparison, entity, dependency, rule, detail, ranking and analysis goals. Preserve explicit conjunctions and comparison operands. For every query-bearing question, next call declare_grounded_query_branches before ls, read_file, grep, retrieve_knowledge or Contract preparation. Group goals that form one coherent result shape, assign only routed Topic names, and place independent result sets in separate branches. After exact semantic refs have been read, attach them to the corresponding goals so final coverage can be checked against artifact evidence rather than labels alone. Every serial or parallel query must declare the goalIds it covers. Finalization is blocked until every required goal and dependency has a typed verified resolution.
+Before proposing any query Contract, call declare_original_question_goals exactly once with a typed, complete ledger of the original question's metric, dimension, time-window, comparison, entity, dependency, rule, detail, ranking and analysis goals. Preserve every explicit clause, conjunction, comparison operand and exact sourceSpan. A phrase such as 这里面/其中/among them is a population dependency, not merely a repeated time filter: same-turn DETAIL populations use SAME_AS_GOAL plus populationGoalIds; verified prior predicate/entity/result artifacts use VERIFIED_PREDICATE_SCOPE, VERIFIED_ENTITY_SET or VERIFIED_RESULT_ARTIFACT respectively. The Goal ledger freezes only what must be answered; it never freezes table choice, SQL topology, query count or execution order. After Goal declaration, discover exact semantic evidence with ls/read_file/grep/retrieve_knowledge. Once the read table, metric, field and relationship evidence is sufficient to decide topology, either propose one coherent Contract directly or call propose_grounded_execution_graph to freeze multiple goal-scoped query nodes. Merge or split nodes dynamically from evidence. Every serial or parallel query must declare the goalIds it covers. Finalization is blocked until every required goal and dependency has a typed verified resolution.
+RANKING.metricGoalIds must reference METRIC goals and RANKING.dimensionGoalIds must reference DIMENSION or ENTITY goals; never use a DETAIL goal as a ranking dimension. A complete detail list plus a TopN section may require one or several query nodes; decide only after reading the governed table capabilities and relationships. Keep them in one node when one logical SQL can preserve both output semantics; use independent nodes when results are genuinely independent; add a serial edge only when a downstream node consumes a verified upstream artifact. Sharing a time phrase alone never proves a population dependency.
 For a rule-only question, declare a RULE goal. Select only availableRuleEvidenceRefs returned by the goal tool or exact BUSINESS_RULE leaves read under /knowledge, then call publish_verified_rule_evidence and compose_verified_rule_answer. Never answer a rule question directly in an assistant message and never invent operational steps absent from the verified rule artifact.
-For one declared branch, native ls/read_file/grep remain available for compatibility. When two or more branches are declared, global filesystem retrieval is closed: send exact L1/L2 semanticPaths or readRefIds for each branch through prepare_grounded_query_batch. The tool retains full documents in independent branch ledgers and returns compact receipts. Read exact table detail, metric, column and relationship files before proposing bindings.
+During discovery, native ls/read_file/grep are available inside the routed Topic scope. After an execution graph is frozen, global filesystem retrieval closes: prepare each node only from the immutable evidenceRefIds declared in that graph. The tool retains full documents in independent node ledgers and returns compact receipts. Read exact table detail, metric, column and relationship files before freezing topology.
 When a table detail exposes semanticNavigation, match its question-independent aliases and batch-read the exact advertised leaves directly. Those coordinates are navigation only, not binding evidence; do not grep the same section first and do not read a support Topic when the selected fact table advertises every required field.
-Every successful semantic read includes groundedReadControl. CONTRACT_CHECKPOINT_AVAILABLE means the Kernel can now validate a coherent candidate: submit when the current bindings cover every assigned original-question goal; otherwise read only exact leaves for the explicitly uncovered goals and never scan another broad index for reassurance. Only READY_TO_EXECUTE means semantic coverage is complete; then retrieval is closed and you must execute the active Contract. A historical semantic receipt is trusted proof that the complete content remains Kernel-side; reopen it only when a new structured gap specifically requires details absent from the receipt.
+Every successful semantic read includes groundedReadControl, the current Discovery snapshot fingerprint and the graph base version. DISCOVERY_OPEN does not mean that evidence is sufficient or insufficient: you decide from the original Goals and the exact formal assets, then submit one Contract or a versioned Execution Graph. The Kernel never uses a fixed leaf count to choose that moment. Only READY_TO_EXECUTE means semantic coverage is complete; then retrieval is closed and you must execute the active Contract. A historical semantic receipt is trusted proof that the complete content remains Kernel-side; reopen it only when a new structured gap specifically requires details absent from the receipt.
 Published metric files already contain the governed formula, source columns, unit and time semantics. When metricRefs satisfy the question, do not also submit fieldAggregations for the same measures.
 One Grounded Contract represents one coherent execution shape. Never combine metrics whose timeSemantics.selectionPolicy values differ. A period_window metric is a period scalar and must not be grouped by the time dimension; a per_time_grain metric over multiple days must preserve that time dimension. If the gate returns REVISE_BINDINGS, follow requiredCapability and submit a smaller compatible binding set before execution.
 For a simple same-table scalar metric query, the expected disclosure path is table detail plus the exact metric files. Do not read schema, columns/index.json, the time column, or metric source-column files unless the question needs a field aggregation, business dimension, filter, join, or a published metric is unavailable.
@@ -2266,14 +2363,17 @@ When thinRecallCandidates already contains an exact readable path, read that pat
 Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
 Before creating a TopN -> entity lookup chain, check whether the ranked fact table itself has every requested display attribute. If it does, include those exact same-table fields in selectedFields of the single RANKED Contract and execute once. Publish an entity set and create a serial downstream lookup only when a required attribute is genuinely absent from the ranked table or the Contract returns a structured cross-table gap.
 GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC, DETERMINISTIC_MULTI_METRIC, DETERMINISTIC_GROUPED, DETERMINISTIC_TREND, DETERMINISTIC_RANKED and DETERMINISTIC_ENTITY_LOOKUP are runtime-owned deterministic compilation modes and may be executed directly; they compile only the already-grounded Contract and never plan goals or impose an execution order. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. An ACCEPTED Core SQL candidate is executed and evidence-verified atomically inside that same tool call, so do not call execute_grounded_query afterward. Implement sqlObligations exactly. The runtime will not invent semantic bindings, joins, CTEs, windows, complex dependency logic, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
-propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode and timeExpression. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. Use analysisMode=RANKED plus groupByRef for TopN/ranking, ENTITY_LOOKUP for a concrete entity lookup, and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
-Available governed tools are declare_original_question_goals, declare_grounded_query_branches, retrieve_knowledge, publish_verified_rule_evidence, compose_verified_rule_answer, propose_grounded_contract, prepare_grounded_query_batch, submit_grounded_sql_candidate, execute_grounded_query, execute_grounded_query_batch, publish_verified_entity_set, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
+propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode, timeExpression and timeFieldRef. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. If the user names a business clock such as payment time, order-created time or refund time, read that exact governed TIME column and bind it through timeFieldRef; never silently substitute the table partition column. A separate partition pruning column is only a physical optimization and is usable only when the read TIME field declares a safe pruning guarantee. Use analysisMode=RANKED plus groupByRef for TopN/ranking, ENTITY_LOOKUP for a concrete entity lookup, and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
+Available governed tools are declare_original_question_goals, propose_grounded_execution_graph, reopen_grounded_execution_graph_discovery, retrieve_knowledge, publish_verified_rule_evidence, compose_verified_rule_answer, propose_grounded_contract, prepare_grounded_query_batch, submit_grounded_sql_candidate, execute_grounded_query, execute_grounded_query_batch, publish_verified_entity_set, delegate_grounded_exploration, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy branch-planning tool, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
 One verified query may be only partial evidence for the user's question. When a later query depends on a verified entity output, call publish_verified_entity_set, progressively read the downstream target field, and propose a new Contract using upstreamEntityBindings. Do not treat a first successful TopN/entity query as the end of data collection. Each query remains an independent grounded QueryGraph chosen dynamically by you, not a fixed workflow.
-When two or more query goals are independent, declare their branches before retrieval, then prepare them together with prepare_grounded_query_batch and execute them with execute_grounded_query_batch. Semantic reads, Contract generations, Topic scopes, budgets and verified artifacts remain branch-local. Never batch an entity chain: its downstream branch remains WAITING_VERIFIED_ENTITY_SET until the upstream verified entity set is published, then it is prepared and executed serially.
+When evidence proves two or more query nodes independent, freeze them together with propose_grounded_execution_graph, prepare them with prepare_grounded_query_batch and execute them with execute_grounded_query_batch. Discovery reads may be inherited into node-local ledgers without being charged twice; later Contract generations, Topic scopes, active-stage budgets and verified artifacts remain node-local. Never batch a true artifact dependency: its downstream node remains WAITING_VERIFIED_ENTITY_SET until the upstream verified entity set is published, then it is prepared and executed serially.
+If preparation returns a typed Contract gap for an unexecuted graph, call reopen_grounded_execution_graph_discovery with the exact graphId/version. This abandons only unexecuted node attempts, preserves the graph version for CAS, and reopens retrieval only for those structured gaps. Never reopen a graph after any node has produced a verified artifact.
 Analysis Skill headers are not disclosed by an individual query. The Core cannot read SKILL.md and must never use a Skill procedure or header to choose metrics, dimensions, tables, or Contract shape. After every datum required by the original question is in the verified evidence portfolio, call finalize_evidence_collection. Only that gate may disclose Skill headers and seal data collection. Then select at most one matching Skill or compose the verified answer. run_skill is a one-way isolation boundary: after it starts, do not retrieve more knowledge, propose another Contract, execute another query, or call run_skill again. It mounts the selected full Skill for an independent subagent, workspace and checkpoint, streams progress, and publishes a structured result artifact. Do not use task for Skill execution.
+For a declared ANALYSIS Goal, delegate_grounded_exploration may be called only from verified query artifacts before evidence collection is sealed. This is not a Skill: it launches a zero-tool, zero-Skill, zero-backend advisory SubAgent. The worker may return falsifiable hypotheses, competing explanations, a stopping assessment and abstract evidence-capability requests. It cannot select a table, field, formula or SQL; cannot run a query; cannot widen population/time scope; and cannot publish an answer. Every returned request remains PENDING_ROOT_APPROVAL. Review it against the frozen graph and formal assets, then use only the normal Root discovery/Contract path for any evidence you decide is required.
+When finalize_evidence_collection returns availableAnalysisGoalIds, run one matching analysis Skill. The isolated Skill returns narrow analysisPublicationRequests containing only verified artifact/column mappings and an allowed deterministic method. It cannot submit analysisType, rows, computed results, conclusions, answer prose, or causal claims. The Kernel recomputes and publishes DerivedAnalysisArtifact, then deterministically renders the final analysis span. Correlation never proves causation. Missing baseline, normalization, comparable grain, or sample size must become typed INSUFFICIENT_EVIDENCE.
 compose_verified_answer generates final goal bindings internally from immutable verified artifacts and the actual rendered rows. Never invent or submit a renderer name or answer span. DETAIL, RANKING, ranked COMPARISON and DEPENDENCY sections are mechanically attested or deterministically rendered from their query artifacts; ANALYSIS and analysis-derived COMPARISON conclusions are accepted only from the dedicated verified derived-analysis artifact renderer. Primitive METRIC/DIMENSION/TIME_WINDOW/ENTITY bindings are generated mechanically. RULE goals may only use compose_verified_rule_answer. A normal assistant message or unbound prose can never become the final answer.
 Use retrieve_knowledge only for a targeted supplemental query; it remains inside the active Topic workspace. Governed-rule recall items marked INLINE_ONLY are usable snippets, not filesystem refs and not binding evidence. Do not read /knowledge/topics/index.json or open another Topic merely to compare alternatives. Topic expansion is allowed only after a submitted Contract returns REVISE_BINDINGS with a structured requiredCapability/searchScope gap based on evidence already read in the active Topic. A read relationship may establish that a required endpoint table is outside the current workspace; submit that relationship in the candidate Contract, then follow the returned gap to read the Topic index and exactly one relevant Topic manifest. Never expand from a normal pending request or a failed filename guess.
-Do not call task in this runtime. SubAgent dispatch is disabled until worker evidence acceptance is independently auditable.
+Do not call task in this runtime. Generic SubAgent dispatch remains disabled; only delegate_grounded_exploration and the post-query run_skill isolation boundaries are auditable.
 Never invent a formula, binding, SQL result, rule, evidence status or answer. Finish only after compose_verified_rule_answer, compose_verified_answer, a verified run_skill result, or ask_human succeeds.
 """
 
@@ -2284,9 +2384,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         semantic_catalog: Any,
         *,
         checkpointer: Any = None,
-        checkpoint_config_factory: Optional[
-            Callable[[str, str], dict[str, Any]]
-        ] = None,
+        checkpoint_config_factory: Optional[Callable[[str, str], dict[str, Any]]] = None,
         skill_root: Optional[str] = None,
         skill_run_root: Optional[str] = None,
         isolated_subagent_model: Any = None,
@@ -2294,17 +2392,17 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         settings: Any = None,
         agent_factory: Any = None,
         backend: Any = None,
+        conversation_state_store: Any = None,
     ):
         self.kernel = kernel
         self.semantic_catalog = semantic_catalog
         self.settings = settings
+        self.conversation_state_store = conversation_state_store
         self.checkpointer = checkpointer
         self.checkpoint_config_factory = checkpoint_config_factory
         self.parallel_max_workers = max(1, min(int(parallel_max_workers or 1), 8))
         self.skill_root = Path(skill_root).resolve() if skill_root else None
-        self.skill_run_root = Path(
-            skill_run_root or ".merchant-ai/skill-runs"
-        ).resolve()
+        self.skill_run_root = Path(skill_run_root or ".merchant-ai/skill-runs").resolve()
         self.skill_run_root.mkdir(parents=True, exist_ok=True)
         self.skill_headers = self._load_skill_headers()
         # Native backend reads provide content only. Root-Core evidence authority
@@ -2313,11 +2411,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             semantic_catalog,
             reader_is_core=lambda: False,
         )
-        self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(
-            self.knowledge_backend
-        )
+        self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(self.knowledge_backend)
         self.context_middleware = GroundedContextManagementMiddleware()
-        self.budget_middleware = GroundedRuntimeBudgetMiddleware()
+        self.budget_middleware = GroundedRuntimeBudgetMiddleware(settings)
         self.backend = backend or self._build_backend()
         self.tools = self._build_tools()
         self.initialization_error = ""
@@ -2328,8 +2424,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         if agent_factory is None:
             if create_deep_agent is None:
                 raise RuntimeError(
-                    "Grounded DeepAgent initialization failed: deepagents unavailable: %s"
-                    % _DEEPAGENTS_IMPORT_ERROR
+                    "Grounded DeepAgent initialization failed: deepagents unavailable: %s" % _DEEPAGENTS_IMPORT_ERROR
                 )
             agent_factory = create_deep_agent
         self._model = model
@@ -2382,9 +2477,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             )
         except Exception as exc:
             self.initialization_error = "%s:%s" % (type(exc).__name__, str(exc)[:500])
-            raise RuntimeError(
-                "Grounded DeepAgent initialization failed: %s" % self.initialization_error
-            ) from exc
+            raise RuntimeError("Grounded DeepAgent initialization failed: %s" % self.initialization_error) from exc
         if self.deep_agent_graph is None:
             raise RuntimeError("Grounded DeepAgent initialization failed: agent factory returned no graph")
 
@@ -2397,6 +2490,154 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         if hasattr(value, "chat_model"):
             return value.chat_model()
         return value
+
+    def _verified_exploration_source_views(
+        self,
+        session: GroundedDeepAgentSession,
+        artifact_ids: list[str],
+    ) -> tuple[VerifiedExplorationSourceView, ...]:
+        requested = list(
+            dict.fromkeys(
+                str(artifact_id or "").strip()
+                for artifact_id in artifact_ids
+                if str(artifact_id or "").strip()
+            )
+        )
+        artifacts = {
+            artifact.artifact_id: artifact
+            for artifact in session.runtime.verified_query_ledger
+            if artifact.verified_evidence.passed
+        }
+        if not requested or any(
+            artifact_id not in artifacts for artifact_id in requested
+        ):
+            raise GroundedExplorationCoordinatorError(
+                "VERIFIED_EXPLORATION_SOURCE_INCOMPLETE",
+                "Every exploration source must be a verified query artifact in this run.",
+            )
+        row_limit = max(
+            1,
+            min(
+                int(
+                    getattr(
+                        self.settings,
+                        "grounded_exploration_max_observation_rows",
+                        64,
+                    )
+                    or 64
+                ),
+                1000,
+            ),
+        )
+        character_limit = max(
+            1000,
+            min(
+                int(
+                    getattr(
+                        self.settings,
+                        "grounded_exploration_max_observation_chars",
+                        12000,
+                    )
+                    or 12000
+                ),
+                200000,
+            ),
+        )
+        views: list[VerifiedExplorationSourceView] = []
+        for artifact_id in requested:
+            artifact = artifacts[artifact_id]
+            goal_ids = tuple(
+                dict.fromkeys(session.artifact_goal_ids.get(artifact_id) or [])
+            )
+            if not goal_ids:
+                raise GroundedExplorationCoordinatorError(
+                    "VERIFIED_EXPLORATION_SOURCE_GOAL_MISMATCH",
+                    "A verified exploration source must retain its Goal bindings.",
+                )
+            bundle = artifact.run_result.merged_query_bundle
+            evidence_refs = tuple(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in artifact.verified_evidence.covered_evidence
+                    if str(item or "").strip()
+                )
+            )
+            observations = [
+                VerifiedExplorationObservation(
+                    observation_id="%s.metadata" % artifact_id,
+                    statement=json.dumps(
+                        {
+                            "observationType": "VERIFIED_RESULT_METADATA",
+                            "rowCount": bundle.effective_row_count(),
+                            "visibleRowCount": len(bundle.rows),
+                            "resultCoverage": str(bundle.result_coverage),
+                            "isTruncated": bool(bundle.is_truncated),
+                            "outputLabels": list(artifact.output_columns),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    evidence_refs=evidence_refs,
+                )
+            ]
+            remaining_characters = character_limit - len(
+                observations[0].statement
+            )
+            for row_index, row in enumerate(bundle.rows[:row_limit]):
+                visible_row = {
+                    str(key): value
+                    for key, value in row.items()
+                    if not str(key).startswith("__")
+                }
+                statement = json.dumps(
+                    {
+                        "observationType": "VERIFIED_RESULT_ROW",
+                        "rowIndex": row_index,
+                        "values": visible_row,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                if len(statement) > remaining_characters:
+                    break
+                observations.append(
+                    VerifiedExplorationObservation(
+                        observation_id="%s.row.%d" % (
+                            artifact_id,
+                            row_index,
+                        ),
+                        statement=statement,
+                        evidence_refs=evidence_refs,
+                    )
+                )
+                remaining_characters -= len(statement)
+            artifact_fingerprint = _stable_json_fingerprint(
+                {
+                    "artifactId": artifact.artifact_id,
+                    "contractFingerprint": artifact.contract_fingerprint,
+                    "sqlFingerprint": artifact.sql_fingerprint,
+                    "goalIds": goal_ids,
+                    "verifiedEvidence": artifact.verified_evidence.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    ),
+                    "observations": [
+                        item.model_dump(by_alias=True, mode="json")
+                        for item in observations
+                    ],
+                }
+            )
+            views.append(
+                VerifiedExplorationSourceView(
+                    artifact_id=artifact_id,
+                    artifact_fingerprint=artifact_fingerprint,
+                    goal_ids=goal_ids,
+                    observations=tuple(observations),
+                )
+            )
+        return tuple(views)
 
     def _build_backend(self) -> CompositeBackend:
         # Full Skill bodies are intentionally absent from the parent Core.
@@ -2427,19 +2668,15 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "description": description,
                     "title": str(metadata.get("title") or "").strip(),
                     "lifecyclePhase": str(
-                        metadata.get("lifecyclePhase")
-                        or metadata.get("lifecycle_phase")
-                        or "post_query_analysis"
+                        metadata.get("lifecyclePhase") or metadata.get("lifecycle_phase") or "post_query_analysis"
                     ).strip(),
                     "requiresVerifiedEvidence": str(
-                        metadata.get("requiresVerifiedEvidence")
-                        or metadata.get("requires_verified_evidence")
-                        or "true"
-                    ).strip().lower(),
+                        metadata.get("requiresVerifiedEvidence") or metadata.get("requires_verified_evidence") or "true"
+                    )
+                    .strip()
+                    .lower(),
                     "outputContract": str(
-                        metadata.get("outputContract")
-                        or metadata.get("output_contract")
-                        or ""
+                        metadata.get("outputContract") or metadata.get("output_contract") or ""
                     ).strip(),
                 }
             )
@@ -2459,10 +2696,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             try:
                 parsed = parse_original_question_goal_contract(contract)
             except Exception as exc:
-                issues = [
-                    item.model_dump(by_alias=True)
-                    for item in getattr(exc, "issues", ())
-                ]
+                issues = [item.model_dump(by_alias=True) for item in getattr(exc, "issues", ())]
                 return json.dumps(
                     {
                         "status": "REJECTED",
@@ -2487,13 +2721,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             with deep_session.lock:
                 existing = deep_session.question_goal_contract
                 if existing is not None:
-                    existing_fingerprint = (
-                        original_question_goal_contract_fingerprint(existing)
-                    )
+                    existing_fingerprint = original_question_goal_contract_fingerprint(existing)
                     if existing_fingerprint != fingerprint and (
                         deep_session.runtime.attempts
                         or deep_session.runtime.verified_query_ledger
                         or deep_session.parallel_branches
+                        or deep_session.query_branch_contexts
+                        or deep_session.execution_graph_generation > 0
                     ):
                         return json.dumps(
                             {
@@ -2504,11 +2738,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             ensure_ascii=False,
                         )
                 deep_session.question_goal_contract = parsed.model_copy(deep=True)
-            rule_goal_ids = [
-                goal.goal_id
-                for goal in parsed.goals
-                if str(goal.kind or "").upper() == "RULE"
-            ]
+            rule_goal_ids = [goal.goal_id for goal in parsed.goals if str(goal.kind or "").upper() == "RULE"]
             rule_candidates = verified_rule_candidate_refs(
                 core_semantic_evidence=deep_session.core_semantic_evidence,
                 recall_items=deep_session.runtime.recall.items,
@@ -2529,15 +2759,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         }
                         for goal in parsed.goals
                     ],
-                    "availableRuleEvidenceRefs": (
-                        rule_candidates if rule_goal_ids else []
-                    ),
+                    "availableRuleEvidenceRefs": (rule_candidates if rule_goal_ids else []),
                     "nextAction": (
                         "PUBLISH_VERIFIED_RULE_EVIDENCE"
                         if rule_goal_ids and rule_candidates
                         else "READ_EXACT_RULE_EVIDENCE"
                         if rule_goal_ids
-                        else "DECLARE_QUERY_BRANCHES_BEFORE_RETRIEVAL"
+                        else "DISCOVER_SEMANTIC_EVIDENCE"
                     ),
                 },
                 ensure_ascii=False,
@@ -2549,7 +2777,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             branches: list[GroundedQueryBranchSpec],
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
-            """Declare isolated query scopes before any semantic retrieval."""
+            """Freeze a validated execution graph after semantic discovery."""
 
             deep_session = runtime.context.session
             if deep_session.question_goal_contract is None:
@@ -2562,9 +2790,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ensure_ascii=False,
                 )
             normalized = [
-                item
-                if isinstance(item, GroundedQueryBranchSpec)
-                else GroundedQueryBranchSpec.model_validate(item)
+                item if isinstance(item, GroundedQueryBranchSpec) else GroundedQueryBranchSpec.model_validate(item)
                 for item in branches
             ]
             if not normalized:
@@ -2585,34 +2811,24 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ensure_ascii=False,
                 )
             with deep_session.lock:
-                existing_contexts = dict(
-                    deep_session.query_branch_contexts
-                )
+                existing_contexts = dict(deep_session.query_branch_contexts)
                 query_started = bool(
-                    deep_session.core_semantic_evidence
-                    or deep_session.runtime.attempts
+                    deep_session.runtime.attempts
                     or deep_session.runtime.verified_query_ledger
                     or deep_session.parallel_branches
                 )
             if existing_contexts:
                 existing_specs = {
-                    query_id: context.spec.model_dump(by_alias=False)
-                    for query_id, context in existing_contexts.items()
+                    query_id: context.spec.model_dump(by_alias=False) for query_id, context in existing_contexts.items()
                 }
                 requested_specs = {
-                    str(item.query_id or "").strip(): item.model_dump(
-                        by_alias=False
-                    )
-                    for item in normalized
+                    str(item.query_id or "").strip(): item.model_dump(by_alias=False) for item in normalized
                 }
                 if existing_specs == requested_specs:
                     return json.dumps(
                         {
                             "status": "ALREADY_DECLARED",
-                            "branches": [
-                                item.report()
-                                for item in existing_contexts.values()
-                            ],
+                            "branches": [item.report() for item in existing_contexts.values()],
                         },
                         ensure_ascii=False,
                         default=str,
@@ -2630,17 +2846,14 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "status": "REJECTED",
                         "code": "QUERY_BRANCH_DECLARATION_TOO_LATE",
                         "instruction": (
-                            "Declare branch goal and Topic scopes before any "
-                            "query semantic read or Contract attempt."
+                            "Freeze the execution graph after discovery but before any Contract attempt or query execution."
                         ),
                     },
                     ensure_ascii=False,
                 )
-            assignments, dependency_issues, issues = (
-                _branch_plan_validation_issues(
-                    deep_session,
-                    normalized,
-                )
+            assignments, dependency_issues, issues = _branch_plan_validation_issues(
+                deep_session,
+                normalized,
             )
             if issues:
                 return json.dumps(
@@ -2656,20 +2869,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             dependencies_by_query_id: dict[str, set[str]] = {}
             dependency_goals_by_query_id: dict[str, set[str]] = {}
             for issue in dependency_issues:
-                upstream_query_ids = {
-                    str(item)
-                    for item in issue.get("upstreamQueryIds") or []
-                    if str(item)
-                }
-                dependency_goal_ids = {
-                    str(item)
-                    for item in issue.get("dependencyGoalIds") or []
-                    if str(item)
-                }
-                for downstream_query_id in issue.get(
-                    "downstreamQueryIds"
-                ) or []:
+                upstream_query_ids = {str(item) for item in issue.get("upstreamQueryIds") or [] if str(item)}
+                dependency_goal_ids = {str(item) for item in issue.get("dependencyGoalIds") or [] if str(item)}
+                for downstream_query_id in issue.get("downstreamQueryIds") or []:
                     normalized_downstream = str(downstream_query_id)
+                    if normalized_downstream in upstream_query_ids:
+                        continue
                     dependencies_by_query_id.setdefault(
                         normalized_downstream,
                         set(),
@@ -2679,9 +2884,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         set(),
                     ).update(dependency_goal_ids)
 
-            limits = GroundedBranchBudgetLimits.from_settings(
-                runtime_owner.settings or object()
-            )
+            limits = GroundedBranchBudgetLimits.from_settings(runtime_owner.settings or object())
             created: dict[str, GroundedQueryBranchContext] = {}
             for raw_spec in normalized:
                 query_id = str(raw_spec.query_id or "").strip()
@@ -2700,17 +2903,20 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "goal_ids": assignments[query_id],
                         "topic_scope": list(
                             dict.fromkeys(
+                                str(item or "").strip() for item in raw_spec.topic_scope if str(item or "").strip()
+                            )
+                        ),
+                        "evidence_ref_ids": list(
+                            dict.fromkeys(
                                 str(item or "").strip()
-                                for item in raw_spec.topic_scope
+                                for item in raw_spec.evidence_ref_ids
                                 if str(item or "").strip()
                             )
                         ),
                     },
                     deep=True,
                 )
-                dependency_query_ids = sorted(
-                    dependencies_by_query_id.get(query_id, set())
-                )
+                dependency_query_ids = sorted(dependencies_by_query_id.get(query_id, set()))
                 branch_runtime: Optional[GroundedRuntimeSession] = None
                 if not dependency_query_ids:
                     try:
@@ -2727,9 +2933,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             deep_session.runtime,
                             query_id,
                         )
-                        branch_runtime.workspace_topics = list(
-                            spec.topic_scope
-                        )
+                        branch_runtime.workspace_topics = list(spec.topic_scope)
                         branch_runtime.question = spec.objective
                 context = GroundedQueryBranchContext(
                     spec=spec,
@@ -2740,40 +2944,556 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         parent=runtime.context.budget,
                     ),
                     dependency_query_ids=dependency_query_ids,
-                    dependency_goal_ids=sorted(
-                        dependency_goals_by_query_id.get(query_id, set())
-                    ),
-                    status=(
-                        "WAITING_VERIFIED_ENTITY_SET"
-                        if dependency_query_ids
-                        else "DECLARED"
-                    ),
+                    dependency_goal_ids=sorted(dependency_goals_by_query_id.get(query_id, set())),
+                    status=("WAITING_VERIFIED_ENTITY_SET" if dependency_query_ids else "DECLARED"),
                 )
+                selected_evidence_refs = set(spec.evidence_ref_ids)
+                for evidence in deep_session.core_semantic_evidence:
+                    if (
+                        selected_evidence_refs
+                        and str(evidence.get("refId") or "")
+                        not in selected_evidence_refs
+                    ):
+                        continue
+                    evidence_topic = str(evidence.get("topic") or "").strip()
+                    if evidence_topic and evidence_topic not in set(spec.topic_scope):
+                        continue
+                    context.semantic_ledger.retain(evidence)
                 created[query_id] = context
+            graph_payload = {
+                "goalContractFingerprint": original_question_goal_contract_fingerprint(
+                    deep_session.question_goal_contract
+                ),
+                "nodes": [
+                    created[query_id].spec.model_dump(by_alias=True, mode="json")
+                    for query_id in sorted(created)
+                ],
+                "discoveryEvidence": sorted(
+                    {
+                        str(item.get("contentHash") or item.get("refId") or "")
+                        for item in deep_session.core_semantic_evidence
+                        if str(item.get("contentHash") or item.get("refId") or "")
+                    }
+                ),
+            }
+            graph_fingerprint = hashlib.sha256(
+                json.dumps(
+                    graph_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
             with deep_session.lock:
                 deep_session.query_branch_contexts = created
-            ready_query_ids = [
-                query_id
-                for query_id, context in created.items()
-                if context.status == "DECLARED"
-            ]
+                deep_session.execution_graph_generation += 1
+                deep_session.execution_graph_fingerprint = graph_fingerprint
+            ready_query_ids = [query_id for query_id, context in created.items() if context.status == "DECLARED"]
             waiting_query_ids = [
-                query_id
-                for query_id, context in created.items()
-                if context.status == "WAITING_VERIFIED_ENTITY_SET"
+                query_id for query_id, context in created.items() if context.status == "WAITING_VERIFIED_ENTITY_SET"
             ]
             return json.dumps(
                 {
-                    "status": "DECLARED",
+                    "status": "FROZEN",
+                    "contractType": "GROUNDED_EXECUTION_GRAPH",
+                    "graphGeneration": deep_session.execution_graph_generation,
+                    "graphFingerprint": graph_fingerprint,
                     "branchCount": len(created),
                     "readyQueryIds": ready_query_ids,
                     "waitingForVerifiedEntitySetQueryIds": waiting_query_ids,
                     "dependencyIssues": dependency_issues,
+                    "branches": [context.report() for context in created.values()],
+                    "nextAction": ("PREPARE_READY_GRAPH_NODES"),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("propose_grounded_execution_graph")
+        def propose_grounded_execution_graph(
+            proposal: GroundedExecutionGraphProposal,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Validate and freeze a versioned graph after evidence discovery."""
+
+            deep_session = runtime.context.session
+            if deep_session.question_goal_contract is None:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED",
+                        "nextAction": "DECLARE_ORIGINAL_QUESTION_GOALS",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
+                parsed = (
+                    proposal
+                    if isinstance(
+                        proposal,
+                        GroundedExecutionGraphProposal,
+                    )
+                    else GroundedExecutionGraphProposal.model_validate(
+                        proposal
+                    )
+                )
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "EXECUTION_GRAPH_SCHEMA_INVALID",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:500]),
+                    },
+                    ensure_ascii=False,
+                )
+
+            candidate_fingerprint = (
+                grounded_execution_graph_fingerprint(parsed)
+            )
+            with deep_session.lock:
+                existing_receipt = deep_session.execution_graph_receipt
+                existing_contexts = bool(
+                    deep_session.query_branch_contexts
+                )
+                current_version = (
+                    deep_session.execution_graph_generation
+                )
+            if (
+                existing_receipt is not None
+                and existing_receipt.fingerprint
+                == candidate_fingerprint
+            ):
+                return json.dumps(
+                    {
+                        "status": "ALREADY_FROZEN",
+                        "contractType": "GROUNDED_EXECUTION_GRAPH",
+                        "receipt": existing_receipt.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            if existing_contexts:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": (
+                            "EXECUTION_GRAPH_IMMUTABLE_AFTER_FREEZE"
+                        ),
+                        "activeVersion": current_version,
+                        "activeFingerprint": (
+                            deep_session.execution_graph_fingerprint
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            validation = validate_grounded_execution_graph(
+                parsed,
+                goal_contract=deep_session.question_goal_contract,
+                discovery_evidence=(
+                    deep_session.core_semantic_evidence
+                ),
+                routed_topics=deep_session.effective_topics(),
+                current_version=current_version,
+            )
+            if not validation.valid:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "EXECUTION_GRAPH_INVALID",
+                        "issues": [
+                            issue.model_dump(by_alias=True, mode="json")
+                            for issue in validation.issues
+                        ],
+                        "nextAction": (
+                            "REVISE_EXECUTION_GRAPH_FROM_CURRENT_DISCOVERY"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            unsupported_artifact_edges = [
+                {
+                    "edgeIndex": index,
+                    "artifactKind": edge.artifact_kind,
+                }
+                for index, edge in enumerate(parsed.edges)
+                if edge.dependency_mode == "VERIFIED_ARTIFACT"
+                and edge.artifact_kind != "VERIFIED_ENTITY_SET"
+            ]
+            if unsupported_artifact_edges:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": (
+                            "EXECUTION_GRAPH_ARTIFACT_CAPABILITY_UNAVAILABLE"
+                        ),
+                        "issues": unsupported_artifact_edges,
+                        "supportedArtifactKinds": [
+                            "VERIFIED_ENTITY_SET"
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+
+            preflight_specs = [
+                GroundedQueryBranchSpec(
+                    query_id=node.client_key,
+                    objective=node.objective,
+                    goal_ids=list(node.goal_ids),
+                    topic_scope=list(node.topic_scope),
+                    evidence_ref_ids=list(node.evidence_ref_ids),
+                )
+                for node in parsed.nodes
+            ]
+            _, dependency_issues, topology_issues = (
+                _branch_plan_validation_issues(
+                    deep_session,
+                    preflight_specs,
+                )
+            )
+            if topology_issues:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": (
+                            "EXECUTION_GRAPH_GOAL_TOPOLOGY_INVALID"
+                        ),
+                        "issues": topology_issues,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            artifact_adjacency: dict[str, set[str]] = {
+                node.client_key: set() for node in parsed.nodes
+            }
+            for edge in parsed.edges:
+                if edge.dependency_mode == "VERIFIED_ARTIFACT":
+                    artifact_adjacency.setdefault(
+                        edge.source_client_key,
+                        set(),
+                    ).add(edge.target_client_key)
+
+            def has_artifact_path(
+                source_key: str,
+                target_key: str,
+            ) -> bool:
+                pending = [source_key]
+                visited = {source_key}
+                cursor = 0
+                while cursor < len(pending):
+                    current = pending[cursor]
+                    cursor += 1
+                    for candidate in artifact_adjacency.get(
+                        current,
+                        set(),
+                    ):
+                        if candidate == target_key:
+                            return True
+                        if candidate in visited:
+                            continue
+                        visited.add(candidate)
+                        pending.append(candidate)
+                return False
+
+            missing_artifact_paths: list[dict[str, Any]] = []
+            for issue in dependency_issues:
+                for source_key in issue.get(
+                    "upstreamQueryIds"
+                ) or []:
+                    for target_key in issue.get(
+                        "downstreamQueryIds"
+                    ) or []:
+                        if source_key == target_key or has_artifact_path(
+                            str(source_key),
+                            str(target_key),
+                        ):
+                            continue
+                        missing_artifact_paths.append(
+                            {
+                                "sourceClientKey": source_key,
+                                "targetClientKey": target_key,
+                                "dependency": issue,
+                            }
+                        )
+            if missing_artifact_paths:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": (
+                            "EXECUTION_GRAPH_VERIFIED_ARTIFACT_EDGE_REQUIRED"
+                        ),
+                        "issues": missing_artifact_paths,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            receipt = build_grounded_execution_graph_receipt(
+                parsed,
+                version=current_version + 1,
+            )
+            specs = [
+                GroundedQueryBranchSpec(
+                    query_id=receipt.node_ids[node.client_key],
+                    objective=node.objective,
+                    goal_ids=list(node.goal_ids),
+                    topic_scope=list(node.topic_scope),
+                    evidence_ref_ids=list(node.evidence_ref_ids),
+                )
+                for node in parsed.nodes
+            ]
+            legacy_result = json.loads(
+                declare_grounded_query_branches.func(
+                    branches=specs,
+                    runtime=runtime,
+                )
+            )
+            if legacy_result.get("status") != "FROZEN":
+                return json.dumps(
+                    legacy_result,
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            evidence_by_ref = {
+                str(item.get("refId") or ""): item
+                for item in deep_session.core_semantic_evidence
+                if str(item.get("refId") or "")
+            }
+            node_by_client_key: dict[
+                str,
+                GroundedExecutionNodeSpec,
+            ] = {
+                node.client_key: node for node in parsed.nodes
+            }
+            with deep_session.lock:
+                for client_key, query_id in receipt.node_ids.items():
+                    context = deep_session.query_branch_contexts[
+                        query_id
+                    ]
+                    node = node_by_client_key[client_key]
+                    ledger = GroundedSemanticReadLedger()
+                    for ref_id in node.evidence_ref_ids:
+                        evidence = evidence_by_ref.get(ref_id)
+                        if evidence is not None:
+                            ledger.retain(evidence)
+                    context.semantic_ledger = ledger
+                    context.contract_scope_query_ids = []
+                    context.dependency_query_ids = []
+                    context.dependency_goal_ids = []
+                    context.status = "DECLARED"
+
+                for edge in parsed.edges:
+                    source_query_id = receipt.node_ids[
+                        edge.source_client_key
+                    ]
+                    target_query_id = receipt.node_ids[
+                        edge.target_client_key
+                    ]
+                    target_context = (
+                        deep_session.query_branch_contexts[
+                            target_query_id
+                        ]
+                    )
+                    if edge.dependency_mode == "CONTRACT_SCOPE":
+                        if source_query_id not in (
+                            target_context.contract_scope_query_ids
+                        ):
+                            target_context.contract_scope_query_ids.append(
+                                source_query_id
+                            )
+                        continue
+                    if source_query_id not in (
+                        target_context.dependency_query_ids
+                    ):
+                        target_context.dependency_query_ids.append(
+                            source_query_id
+                        )
+                    target_context.runtime = None
+                    target_context.status = (
+                        "WAITING_VERIFIED_ENTITY_SET"
+                    )
+
+                deep_session.execution_graph_generation = receipt.version
+                deep_session.execution_graph_fingerprint = (
+                    receipt.fingerprint
+                )
+                deep_session.execution_graph_receipt = receipt
+                deep_session.execution_graph_edges = [
+                    edge.model_copy(deep=True)
+                    for edge in parsed.edges
+                ]
+
+            ready_query_ids = [
+                query_id
+                for query_id, context in (
+                    deep_session.query_branch_contexts.items()
+                )
+                if context.status == "DECLARED"
+            ]
+            waiting_query_ids = [
+                query_id
+                for query_id, context in (
+                    deep_session.query_branch_contexts.items()
+                )
+                if context.status == "WAITING_VERIFIED_ENTITY_SET"
+            ]
+            return json.dumps(
+                {
+                    "status": "FROZEN",
+                    "contractType": "GROUNDED_EXECUTION_GRAPH",
+                    "receipt": receipt.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    ),
+                    "clientNodeIds": dict(receipt.node_ids),
+                    "readyQueryIds": ready_query_ids,
+                    "waitingForVerifiedArtifactQueryIds": (
+                        waiting_query_ids
+                    ),
                     "branches": [
-                        context.report() for context in created.values()
+                        context.report()
+                        for context in (
+                            deep_session.query_branch_contexts.values()
+                        )
                     ],
+                    "nextAction": "PREPARE_READY_GRAPH_NODES",
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("reopen_grounded_execution_graph_discovery")
+        def reopen_grounded_execution_graph_discovery(
+            graph_id: str,
+            version: int,
+            reason: str,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Reopen Discovery only for an unexecuted graph with typed gaps."""
+
+            deep_session = runtime.context.session
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "EXECUTION_GRAPH_REOPEN_REASON_REQUIRED",
+                    },
+                    ensure_ascii=False,
+                )
+            with deep_session.lock:
+                receipt = deep_session.execution_graph_receipt
+                contexts = dict(deep_session.query_branch_contexts)
+                if receipt is None:
+                    return json.dumps(
+                        {
+                            "status": "REJECTED",
+                            "code": "EXECUTION_GRAPH_NOT_ACTIVE",
+                        },
+                        ensure_ascii=False,
+                    )
+                if (
+                    str(graph_id or "").strip() != receipt.graph_id
+                    or int(version) != receipt.version
+                ):
+                    return json.dumps(
+                        {
+                            "status": "REJECTED",
+                            "code": "EXECUTION_GRAPH_REOPEN_STALE",
+                            "activeGraphId": receipt.graph_id,
+                            "activeVersion": receipt.version,
+                        },
+                        ensure_ascii=False,
+                    )
+                gapped_contexts = [
+                    context
+                    for context in contexts.values()
+                    if context.status == "CONTRACT_GAPPED"
+                    and context.last_gaps
+                ]
+                if not gapped_contexts:
+                    return json.dumps(
+                        {
+                            "status": "REJECTED",
+                            "code": "EXECUTION_GRAPH_TYPED_GAP_REQUIRED",
+                        },
+                        ensure_ascii=False,
+                    )
+                executed_query_ids = [
+                    query_id
+                    for query_id, context in contexts.items()
+                    if context.status in {"EXECUTING", "VERIFIED"}
+                    or bool(context.verified_artifact_ids)
+                    or bool(
+                        context.runtime is not None
+                        and context.runtime.verified_query_ledger
+                    )
+                ]
+                if executed_query_ids:
+                    return json.dumps(
+                        {
+                            "status": "REJECTED",
+                            "code": (
+                                "EXECUTION_GRAPH_REOPEN_AFTER_EXECUTION_FORBIDDEN"
+                            ),
+                            "executedQueryIds": executed_query_ids,
+                        },
+                        ensure_ascii=False,
+                    )
+                gap_reports = [
+                    {
+                        "queryId": context.spec.query_id,
+                        "goalIds": list(context.spec.goal_ids),
+                        "gaps": [
+                            dict(item) for item in context.last_gaps
+                        ],
+                    }
+                    for context in gapped_contexts
+                ]
+                deep_session.execution_graph_history.append(
+                    {
+                        "status": "GAPPED_REOPENED",
+                        "receipt": receipt.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        ),
+                        "reason": normalized_reason,
+                        "gaps": gap_reports,
+                        "branches": [
+                            context.report()
+                            for context in contexts.values()
+                        ],
+                    }
+                )
+                deep_session.query_branch_contexts = {}
+                deep_session.parallel_branches = {}
+                deep_session.parallel_branch_goal_ids = {}
+                deep_session.execution_graph_receipt = None
+                deep_session.execution_graph_edges = []
+                deep_session.execution_graph_data_snapshot = None
+                deep_session.execution_graph_fingerprint = ""
+                deep_session.active_goal_ids = []
+
+            return json.dumps(
+                {
+                    "status": "DISCOVERY_REOPENED",
+                    "baseVersion": receipt.version,
+                    "previousGraphId": receipt.graph_id,
+                    "typedGaps": gap_reports,
+                    "discoverySnapshotFingerprint": (
+                        discovery_evidence_snapshot_fingerprint(
+                            deep_session.core_semantic_evidence
+                        )
+                    ),
                     "nextAction": (
-                        "PREPARE_READY_BRANCHES_WITH_EXACT_SEMANTIC_PATHS"
+                        "READ_ONLY_FOR_RETURNED_STRUCTURED_GAPS"
                     ),
                 },
                 ensure_ascii=False,
@@ -2788,10 +3508,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         ) -> str:
             """Run one targeted supplemental recall inside the active Topic scope."""
 
-            if (
-                runtime.context.session.analysis_skill_started
-                or runtime.context.session.data_collection_sealed
-            ):
+            if runtime.context.session.analysis_skill_started or runtime.context.session.data_collection_sealed:
                 return json.dumps(
                     {
                         "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
@@ -2811,8 +3528,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "RECALL_NAVIGATION_DEGRADED",
                         "code": "RECALL_BACKEND_UNAVAILABLE",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "recallCandidates": [],
                         "scope": runtime.context.session.effective_topics(),
                         "nextAction": "CONTINUE_WITH_FILESYSTEM",
@@ -2850,9 +3566,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             assert deep_session.question_goal_contract is not None
             goal_map = deep_session.question_goal_contract.goal_map()
             invalid_goal_ids = [
-                goal_id
-                for goal_id in assigned_goal_ids
-                if str(goal_map[goal_id].kind or "").upper() != "RULE"
+                goal_id for goal_id in assigned_goal_ids if str(goal_map[goal_id].kind or "").upper() != "RULE"
             ]
             if invalid_goal_ids:
                 return json.dumps(
@@ -2880,23 +3594,16 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     core_semantic_evidence=deep_session.core_semantic_evidence,
                     recall_items=bundle.items,
                 )
-            available_ref_ids = [
-                str(item.get("refId") or "") for item in candidates
-            ]
-            requested = list(
-                dict.fromkeys(
-                    str(item or "").strip()
-                    for item in rule_ref_ids
-                    if str(item or "").strip()
-                )
-            ) or available_ref_ids[:4]
+            available_ref_ids = [str(item.get("refId") or "") for item in candidates]
+            requested = (
+                list(dict.fromkeys(str(item or "").strip() for item in rule_ref_ids if str(item or "").strip()))
+                or available_ref_ids[:4]
+            )
             try:
                 artifact = build_verified_rule_artifact(
                     question=deep_session.runtime.question,
                     goal_contract_fingerprint=(
-                        original_question_goal_contract_fingerprint(
-                            deep_session.question_goal_contract
-                        )
+                        original_question_goal_contract_fingerprint(deep_session.question_goal_contract)
                     ),
                     goal_ids=assigned_goal_ids,
                     requested_ref_ids=requested,
@@ -2912,8 +3619,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "RULE_EVIDENCE_INCOMPLETE",
                         "code": "VERIFIED_RULE_ARTIFACT_REQUIRED",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                         "availableRuleEvidenceRefs": candidates,
                         "nextAction": "READ_OR_RECALL_EXACT_RULE_EVIDENCE",
                     },
@@ -2924,9 +3630,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "status": "RULE_EVIDENCE_VERIFIED",
                     "artifactId": artifact.artifact_id,
                     "goalIds": artifact.goal_ids,
-                    "ruleEvidenceRefs": [
-                        item.ref_id for item in artifact.evidence_refs
-                    ],
+                    "ruleEvidenceRefs": [item.ref_id for item in artifact.evidence_refs],
                     "nextAction": "COMPOSE_VERIFIED_RULE_ANSWER",
                 },
                 ensure_ascii=False,
@@ -2940,9 +3644,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
 
             deep_session = runtime.context.session
             try:
-                coverage = runtime_owner._require_complete_goal_coverage(
-                    deep_session
-                )
+                coverage = runtime_owner._require_complete_goal_coverage(deep_session)
             except GoalCoverageBlocked as exc:
                 result = exc.result.model_dump(by_alias=True)
                 deep_session.goal_coverage_result = result
@@ -2954,12 +3656,8 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     },
                     ensure_ascii=False,
                 )
-            answer = runtime_owner.kernel.compose_rule_answer(
-                deep_session.runtime
-            )
-            deep_session.goal_coverage_result = coverage.model_dump(
-                by_alias=True
-            )
+            answer = runtime_owner.kernel.compose_rule_answer(deep_session.runtime)
+            deep_session.goal_coverage_result = coverage.model_dump(by_alias=True)
             try:
                 answer_coverage = AnswerCoverageVerifier().require_complete(
                     deep_session.question_goal_contract,
@@ -2984,19 +3682,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     },
                     ensure_ascii=False,
                 )
-            deep_session.answer_coverage_result = answer_coverage.model_dump(
-                by_alias=True
-            )
+            deep_session.answer_coverage_result = answer_coverage.model_dump(by_alias=True)
             return json.dumps(
                 {
                     "status": "ANSWERED",
                     "answer": answer,
-                    "verifiedRuleArtifactIds": list(
-                        deep_session.runtime.answer_rule_artifact_ids
-                    ),
-                    "goalAnswerCoverage": dict(
-                        deep_session.answer_coverage_result
-                    ),
+                    "verifiedRuleArtifactIds": list(deep_session.runtime.answer_rule_artifact_ids),
+                    "goalAnswerCoverage": dict(deep_session.answer_coverage_result),
                 },
                 ensure_ascii=False,
             )
@@ -3080,6 +3772,10 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     evidence,
                     binding_hints,
                     topics=session.effective_topics(),
+                    timezone_name=str(
+                        getattr(runtime_owner.settings, "business_timezone", "")
+                        or "Asia/Shanghai"
+                    ),
                 )
                 assignment_issues = _goal_assignment_contract_issues(
                     session,
@@ -3107,9 +3803,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "status": "BLOCKED",
                         "code": "GROUNDED_CONTRACT_ACTIVATION_BLOCKED",
                         "message": str(exc)[:500],
-                        "nextAction": "STOP"
-                        if "TERMINAL_GUARD" in str(exc)
-                        else "REVISE_BINDINGS",
+                        "nextAction": "STOP" if "TERMINAL_GUARD" in str(exc) else "REVISE_BINDINGS",
                     },
                     ensure_ascii=False,
                 )
@@ -3118,8 +3812,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "BLOCKED",
                         "code": "GROUNDED_CONTRACT_INTERNAL_ERROR",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
@@ -3127,9 +3820,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             if attempt.activated:
                 with session.lock:
                     session.active_goal_ids = list(assigned_goal_ids)
-            contract_fingerprint = grounded_query_contract_fingerprint(
-                attempt.contract
-            )
+            contract_fingerprint = grounded_query_contract_fingerprint(attempt.contract)
             return json.dumps(
                 {
                     "attemptId": attempt.attempt_id,
@@ -3146,39 +3837,19 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "nextAction": attempt.next_action,
                     "activeGeneration": attempt.active_generation,
                     "contractFingerprint": contract_fingerprint,
-                    "sqlObligations": _grounded_contract_sql_obligations(
-                        attempt.contract
-                    ),
-                    "acceptedBindingHints": _core_visible_binding_hints(
-                        attempt.contract
-                    ),
+                    "sqlObligations": _grounded_contract_sql_obligations(attempt.contract),
+                    "acceptedBindingHints": _core_visible_binding_hints(attempt.contract),
                     "assignedGoalIds": list(assigned_goal_ids),
                     "semanticCoverage": {
                         "status": (
-                            "READY_TO_EXECUTE"
-                            if attempt.contract.ready and attempt.activated
-                            else "NEED_MORE_EVIDENCE"
+                            "READY_TO_EXECUTE" if attempt.contract.ready and attempt.activated else "NEED_MORE_EVIDENCE"
                         ),
-                        "retrievalClosed": bool(
-                            attempt.contract.ready and attempt.activated
-                        ),
-                        "blockingGapCount": len(
-                            [
-                                gap
-                                for gap in attempt.contract.unresolved_gaps
-                                if gap.blocking
-                            ]
-                        ),
+                        "retrievalClosed": bool(attempt.contract.ready and attempt.activated),
+                        "blockingGapCount": len([gap for gap in attempt.contract.unresolved_gaps if gap.blocking]),
                         "nextAction": attempt.next_action,
                     },
-                    "gaps": [
-                        gap.model_dump(by_alias=True)
-                        for gap in attempt.contract.unresolved_gaps
-                    ],
-                    "rejectedBindings": [
-                        item.model_dump(by_alias=True)
-                        for item in attempt.contract.rejected_bindings
-                    ],
+                    "gaps": [gap.model_dump(by_alias=True) for gap in attempt.contract.unresolved_gaps],
+                    "rejectedBindings": [item.model_dump(by_alias=True) for item in attempt.contract.rejected_bindings],
                 },
                 ensure_ascii=False,
                 default=str,
@@ -3201,9 +3872,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ensure_ascii=False,
                 )
             normalized = [
-                item
-                if isinstance(item, GroundedParallelQuerySpec)
-                else GroundedParallelQuerySpec.model_validate(item)
+                item if isinstance(item, GroundedParallelQuerySpec) else GroundedParallelQuerySpec.model_validate(item)
                 for item in queries
             ]
             if not normalized:
@@ -3235,16 +3904,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             if deep_session.query_branch_contexts:
                 with deep_session.lock:
                     branch_contexts = {
-                        query_id: deep_session.query_branch_contexts.get(
-                            query_id
-                        )
-                        for query_id in query_ids
+                        query_id: deep_session.query_branch_contexts.get(query_id) for query_id in query_ids
                     }
-                unknown_query_ids = [
-                    query_id
-                    for query_id, context in branch_contexts.items()
-                    if context is None
-                ]
+                unknown_query_ids = [query_id for query_id, context in branch_contexts.items() if context is None]
                 if unknown_query_ids:
                     return json.dumps(
                         {
@@ -3258,11 +3920,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 dependency_conflicts: list[dict[str, Any]] = []
                 for query_id, context in branch_contexts.items():
                     assert context is not None
-                    selected_dependencies = sorted(
-                        selected_query_ids.intersection(
-                            context.dependency_query_ids
-                        )
-                    )
+                    selected_dependencies = sorted(selected_query_ids.intersection(context.dependency_query_ids))
                     if selected_dependencies:
                         dependency_conflicts.append(
                             {
@@ -3290,11 +3948,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     assert context is not None
                     declared_goal_ids = list(context.spec.goal_ids)
                     if raw_item.goal_ids:
-                        assigned_goal_ids, goal_error = (
-                            _validated_goal_assignment(
-                                deep_session,
-                                raw_item.goal_ids,
-                            )
+                        assigned_goal_ids, goal_error = _validated_goal_assignment(
+                            deep_session,
+                            raw_item.goal_ids,
                         )
                         if goal_error:
                             return {"queryId": query_id, **goal_error}
@@ -3306,18 +3962,14 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                                 "declaredGoalIds": declared_goal_ids,
                                 "submittedGoalIds": assigned_goal_ids,
                             }
-                    hints = _canonical_binding_hints(
-                        raw_item.binding_hints
-                    )
+                    hints = _canonical_binding_hints(raw_item.binding_hints)
 
                     if context.status == "WAITING_VERIFIED_ENTITY_SET":
                         entity_set_ids = list(
                             dict.fromkeys(
                                 str(item.entity_set_artifact_id or "").strip()
                                 for item in hints.upstream_entity_bindings
-                                if str(
-                                    item.entity_set_artifact_id or ""
-                                ).strip()
+                                if str(item.entity_set_artifact_id or "").strip()
                             )
                         )
                         if not entity_set_ids:
@@ -3325,20 +3977,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                                 "queryId": query_id,
                                 "status": "WAITING_VERIFIED_ENTITY_SET",
                                 "code": "DEPENDENT_QUERY_REQUIRES_VERIFIED_ENTITY_SET",
-                                "dependsOnQueryIds": list(
-                                    context.dependency_query_ids
-                                ),
+                                "dependsOnQueryIds": list(context.dependency_query_ids),
                                 "nextAction": "PUBLISH_UPSTREAM_ENTITY_SET",
                             }
-                        entity_sets = {
-                            item.artifact_id: item
-                            for item in deep_session.runtime.verified_entity_sets
-                        }
-                        missing_entity_sets = [
-                            item
-                            for item in entity_set_ids
-                            if item not in entity_sets
-                        ]
+                        entity_sets = {item.artifact_id: item for item in deep_session.runtime.verified_entity_sets}
+                        missing_entity_sets = [item for item in entity_set_ids if item not in entity_sets]
                         if missing_entity_sets:
                             return {
                                 "queryId": query_id,
@@ -3346,23 +3989,14 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                                 "code": "VERIFIED_ENTITY_SET_NOT_FOUND",
                                 "missingEntitySetArtifactIds": missing_entity_sets,
                             }
-                        source_artifact_ids = {
-                            entity_sets[item].source_query_artifact_id
-                            for item in entity_set_ids
-                        }
+                        source_artifact_ids = {entity_sets[item].source_query_artifact_id for item in entity_set_ids}
                         source_mismatches: list[str] = []
                         for dependency_query_id in context.dependency_query_ids:
-                            upstream_context = (
-                                deep_session.query_branch_contexts.get(
-                                    dependency_query_id
-                                )
-                            )
+                            upstream_context = deep_session.query_branch_contexts.get(dependency_query_id)
                             if upstream_context is None or not source_artifact_ids.intersection(
                                 upstream_context.verified_artifact_ids
                             ):
-                                source_mismatches.append(
-                                    dependency_query_id
-                                )
+                                source_mismatches.append(dependency_query_id)
                         if source_mismatches:
                             return {
                                 "queryId": query_id,
@@ -3395,15 +4029,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         return {
                             "queryId": query_id,
                             "status": "PREPARED",
-                            "queryShape": (
-                                contract.query_shape if contract else ""
-                            ),
+                            "queryShape": (contract.query_shape if contract else ""),
                             "executionMode": state.active_execution_mode,
                             "activeGeneration": state.active_generation,
                             "contractFingerprint": (
-                                grounded_query_contract_fingerprint(contract)
-                                if contract is not None
-                                else ""
+                                grounded_query_contract_fingerprint(contract) if contract is not None else ""
                             ),
                             "goalIds": declared_goal_ids,
                             "alreadyPrepared": True,
@@ -3423,8 +4053,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             if str(item or "").strip()
                         )
                     )
-                    unresolved_ref_ids: list[str] = []
-                    for ref_id in list(
+                    requested_ref_ids = list(
                         dict.fromkeys(
                             _canonical_progressive_ref(
                                 str(item or "").strip()
@@ -3432,7 +4061,36 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             for item in raw_item.read_ref_ids
                             if str(item or "").strip()
                         )
-                    ):
+                    )
+                    if deep_session.execution_graph_receipt is not None:
+                        undeclared_paths = [
+                            path
+                            for path in semantic_paths
+                            if not context.semantic_ledger.has_path(path)
+                        ]
+                        declared_refs = set(
+                            context.semantic_ledger.refs()
+                        )
+                        undeclared_refs = [
+                            ref_id
+                            for ref_id in requested_ref_ids
+                            if ref_id not in declared_refs
+                        ]
+                        if undeclared_paths or undeclared_refs:
+                            return {
+                                "queryId": query_id,
+                                "status": "REJECTED",
+                                "code": (
+                                    "EXECUTION_NODE_EVIDENCE_OUTSIDE_FROZEN_GRAPH"
+                                ),
+                                "undeclaredPaths": undeclared_paths,
+                                "undeclaredRefs": undeclared_refs,
+                                "discoverySnapshotFingerprint": (
+                                    deep_session.execution_graph_receipt.discovery_snapshot_fingerprint
+                                ),
+                            }
+                    unresolved_ref_ids: list[str] = []
+                    for ref_id in requested_ref_ids:
                         if ref_id in set(context.semantic_ledger.refs()):
                             continue
                         try:
@@ -3443,13 +4101,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             )
                         except Exception:
                             resolved = {}
-                        resolved_path = str(
-                            (resolved or {}).get("path") or ""
-                        ).strip()
+                        resolved_path = str((resolved or {}).get("path") or "").strip()
                         if resolved_path:
-                            semantic_paths.append(
-                                _knowledge_relative_path(resolved_path)
-                            )
+                            semantic_paths.append(_knowledge_relative_path(resolved_path))
                         else:
                             unresolved_ref_ids.append(ref_id)
                     if unresolved_ref_ids:
@@ -3464,16 +4118,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     try:
                         with context.budget.stage("semantic_retrieval"):
                             for semantic_path in semantic_paths:
-                                evidence, newly_read = (
-                                    _read_exact_branch_semantic_path(
-                                        runtime_owner.semantic_catalog,
-                                        context,
-                                        semantic_path,
-                                    )
+                                evidence, newly_read = _read_exact_branch_semantic_path(
+                                    runtime_owner.semantic_catalog,
+                                    context,
+                                    semantic_path,
                                 )
-                                receipt = _core_visible_semantic_receipt(
-                                    evidence
-                                )
+                                receipt = _core_visible_semantic_receipt(evidence)
                                 receipt["newlyRead"] = newly_read
                                 receipt["branchId"] = query_id
                                 read_receipts.append(receipt)
@@ -3484,13 +4134,15 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                                 context.semantic_ledger.evidence(),
                                 hints,
                                 topics=context.effective_topics(),
+                                timezone_name=str(
+                                    getattr(runtime_owner.settings, "business_timezone", "")
+                                    or "Asia/Shanghai"
+                                ),
                             )
-                            assignment_issues = (
-                                _goal_assignment_contract_issues(
-                                    deep_session,
-                                    declared_goal_ids,
-                                    attempt.contract,
-                                )
+                            assignment_issues = _goal_assignment_contract_issues(
+                                deep_session,
+                                declared_goal_ids,
+                                attempt.contract,
                             )
                             if assignment_issues:
                                 with context.lock:
@@ -3527,17 +4179,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "queryId": query_id,
                             "status": "BLOCKED",
                             "code": "PARALLEL_CONTRACT_PREPARATION_FAILED",
-                            "message": "%s:%s"
-                            % (type(exc).__name__, str(exc)[:400]),
+                            "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                             "semanticReceipts": read_receipts,
                             "branchBudget": context.budget.report(),
                         }
 
                     if not attempt.activated:
-                        gaps = [
-                            gap.model_dump(by_alias=True)
-                            for gap in attempt.contract.unresolved_gaps
-                        ]
+                        gaps = [gap.model_dump(by_alias=True) for gap in attempt.contract.unresolved_gaps]
                         with context.lock:
                             context.status = "CONTRACT_GAPPED"
                             context.last_gaps = gaps
@@ -3547,45 +4195,30 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "code": "PARALLEL_CONTRACT_NOT_READY",
                             "gaps": gaps,
                             "semanticReceipts": read_receipts,
-                            "branchReadControl": _grounded_branch_read_control(
-                                context
-                            ),
+                            "branchReadControl": _grounded_branch_read_control(context),
                             "branchBudget": context.budget.report(),
                         }
                     with context.lock:
                         context.status = "PREPARED"
                         context.last_gaps = []
                     with deep_session.lock:
-                        deep_session.parallel_branches[
-                            query_id
-                        ] = context.runtime
-                        deep_session.parallel_branch_goal_ids[
-                            query_id
-                        ] = declared_goal_ids
+                        deep_session.parallel_branches[query_id] = context.runtime
+                        deep_session.parallel_branch_goal_ids[query_id] = declared_goal_ids
                     return {
                         "queryId": query_id,
                         "status": "PREPARED",
                         "queryShape": attempt.contract.query_shape,
                         "executionMode": attempt.execution_mode,
                         "activeGeneration": attempt.active_generation,
-                        "contractFingerprint": (
-                            grounded_query_contract_fingerprint(
-                                attempt.contract
-                            )
-                        ),
-                        "sqlObligations": _grounded_contract_sql_obligations(
-                            attempt.contract
-                        ),
+                        "contractFingerprint": (grounded_query_contract_fingerprint(attempt.contract)),
+                        "sqlObligations": _grounded_contract_sql_obligations(attempt.contract),
                         "goalIds": declared_goal_ids,
                         "semanticReceipts": read_receipts,
-                        "branchReadControl": _grounded_branch_read_control(
-                            context
-                        ),
+                        "branchReadControl": _grounded_branch_read_control(context),
                         "branchBudget": context.budget.report(),
                         "nextAction": (
                             "EXECUTE_BATCH"
-                            if attempt.execution_mode
-                            != "CORE_SQL_REQUIRED"
+                            if attempt.execution_mode != "CORE_SQL_REQUIRED"
                             else "AUTHOR_SQL_THEN_EXECUTE_BATCH"
                         ),
                     }
@@ -3598,29 +4231,15 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ),
                     thread_name_prefix="grounded-prepare",
                 ) as pool:
-                    futures = {
-                        pool.submit(prepare_declared_branch, item): item.query_id
-                        for item in normalized
-                    }
+                    futures = {pool.submit(prepare_declared_branch, item): item.query_id for item in normalized}
                     for future in as_completed(futures):
                         declared_results.append(future.result())
-                declared_results.sort(
-                    key=lambda item: query_ids.index(
-                        str(item.get("queryId") or "")
-                    )
-                )
-                ready_count = sum(
-                    item.get("status") == "PREPARED"
-                    for item in declared_results
-                )
+                declared_results.sort(key=lambda item: query_ids.index(str(item.get("queryId") or "")))
+                ready_count = sum(item.get("status") == "PREPARED" for item in declared_results)
                 return json.dumps(
                     {
                         "status": (
-                            "PREPARED"
-                            if ready_count == len(normalized)
-                            else "PARTIAL"
-                            if ready_count
-                            else "BLOCKED"
+                            "PREPARED" if ready_count == len(normalized) else "PARTIAL" if ready_count else "BLOCKED"
                         ),
                         "compatMode": "BRANCH_SCOPED_V2",
                         "preparedCount": ready_count,
@@ -3733,6 +4352,10 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         [evidence_by_ref[ref_id] for ref_id in requested],
                         hints,
                         topics=deep_session.effective_topics(),
+                        timezone_name=str(
+                            getattr(runtime_owner.settings, "business_timezone", "")
+                            or "Asia/Shanghai"
+                        ),
                     )
                     assignment_issues = _goal_assignment_contract_issues(
                         deep_session,
@@ -3762,8 +4385,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "queryId": query_id,
                             "status": "BLOCKED",
                             "code": "PARALLEL_CONTRACT_PREPARATION_FAILED",
-                            "message": "%s:%s"
-                            % (type(exc).__name__, str(exc)[:400]),
+                            "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         }
                     )
                     continue
@@ -3773,18 +4395,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "queryId": query_id,
                             "status": attempt.contract.status,
                             "code": "PARALLEL_CONTRACT_NOT_READY",
-                            "gaps": [
-                                gap.model_dump(by_alias=True)
-                                for gap in attempt.contract.unresolved_gaps
-                            ],
+                            "gaps": [gap.model_dump(by_alias=True) for gap in attempt.contract.unresolved_gaps],
                         }
                     )
                     continue
                 with deep_session.lock:
                     deep_session.parallel_branches[query_id] = branch
-                    deep_session.parallel_branch_goal_ids[query_id] = list(
-                        assigned_goal_ids
-                    )
+                    deep_session.parallel_branch_goal_ids[query_id] = list(assigned_goal_ids)
                 prepared.append(
                     {
                         "queryId": query_id,
@@ -3792,17 +4409,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "queryShape": attempt.contract.query_shape,
                         "executionMode": attempt.execution_mode,
                         "activeGeneration": attempt.active_generation,
-                        "contractFingerprint": grounded_query_contract_fingerprint(
-                            attempt.contract
-                        ),
-                        "sqlObligations": _grounded_contract_sql_obligations(
-                            attempt.contract
-                        ),
+                        "contractFingerprint": grounded_query_contract_fingerprint(attempt.contract),
+                        "sqlObligations": _grounded_contract_sql_obligations(attempt.contract),
                         "goalIds": list(assigned_goal_ids),
                         "nextAction": (
                             "EXECUTE_BATCH"
-                            if attempt.execution_mode
-                            != "CORE_SQL_REQUIRED"
+                            if attempt.execution_mode != "CORE_SQL_REQUIRED"
                             else "AUTHOR_SQL_THEN_EXECUTE_BATCH"
                         ),
                     }
@@ -3861,17 +4473,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ensure_ascii=False,
                 )
             with deep_session.lock:
-                branch_by_id = {
-                    query_id: deep_session.parallel_branches.get(query_id)
-                    for query_id in query_ids
-                }
+                branch_by_id = {query_id: deep_session.parallel_branches.get(query_id) for query_id in query_ids}
                 branch_context_by_id = {
-                    query_id: deep_session.query_branch_contexts.get(query_id)
-                    for query_id in query_ids
+                    query_id: deep_session.query_branch_contexts.get(query_id) for query_id in query_ids
                 }
-            missing_branches = [
-                query_id for query_id, branch in branch_by_id.items() if branch is None
-            ]
+            missing_branches = [query_id for query_id, branch in branch_by_id.items() if branch is None]
             if missing_branches:
                 return json.dumps(
                     {
@@ -3881,6 +4487,148 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     },
                     ensure_ascii=False,
                 )
+
+            snapshot_requirement = None
+            shared_data_snapshot = None
+            with deep_session.lock:
+                graph_receipt = (
+                    deep_session.execution_graph_receipt.model_copy(deep=True)
+                    if deep_session.execution_graph_receipt is not None
+                    else None
+                )
+                graph_edges = [
+                    edge.model_copy(deep=True)
+                    for edge in deep_session.execution_graph_edges
+                ]
+                goal_contract = (
+                    deep_session.question_goal_contract.model_copy(deep=True)
+                    if deep_session.question_goal_contract is not None
+                    else None
+                )
+                goal_ids_by_query_id = {
+                    query_id: list(context.spec.goal_ids)
+                    for query_id, context in (
+                        deep_session.query_branch_contexts.items()
+                    )
+                }
+                graph_fingerprint = deep_session.execution_graph_fingerprint
+                retained_graph_snapshot = (
+                    deep_session.execution_graph_data_snapshot.model_copy(
+                        deep=True
+                    )
+                    if deep_session.execution_graph_data_snapshot is not None
+                    else None
+                )
+            graph_query_ids = (
+                list(graph_receipt.node_ids.values())
+                if graph_receipt is not None
+                else []
+            )
+            if graph_receipt is not None and len(graph_query_ids) > 1:
+                if goal_contract is None:
+                    return json.dumps(
+                        {
+                            "status": "BLOCKED",
+                            "code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED",
+                        },
+                        ensure_ascii=False,
+                    )
+                snapshot_requirement = derive_multi_query_snapshot_requirement(
+                    graph_query_ids,
+                    receipt_node_ids=graph_receipt.node_ids,
+                    graph_edges=graph_edges,
+                    goal_contract=goal_contract,
+                    goal_ids_by_query_id=goal_ids_by_query_id,
+                )
+                shared_data_snapshot = retained_graph_snapshot
+                if shared_data_snapshot is None:
+                    capture_snapshot = getattr(
+                        runtime_owner.kernel,
+                        "capture_data_snapshot",
+                        None,
+                    )
+                    if callable(capture_snapshot):
+                        candidate_snapshot = capture_snapshot(
+                            graph_fingerprint
+                        )
+                        with deep_session.lock:
+                            if (
+                                deep_session.execution_graph_data_snapshot
+                                is None
+                            ):
+                                deep_session.execution_graph_data_snapshot = (
+                                    candidate_snapshot.model_copy(deep=True)
+                                )
+                            shared_data_snapshot = (
+                                deep_session.execution_graph_data_snapshot.model_copy(
+                                    deep=True
+                                )
+                            )
+                snapshot_preflight_issues = validate_query_bundle_snapshots(
+                    [
+                        QueryBundle(data_snapshot=shared_data_snapshot)
+                        if shared_data_snapshot is not None
+                        else QueryBundle()
+                        for _query_id in graph_query_ids
+                    ],
+                    require_atomic_multi_query=(
+                        snapshot_requirement.require_atomic_multi_query
+                    ),
+                )
+                if snapshot_preflight_issues:
+                    gap_payload = [
+                        {
+                            "code": issue,
+                            "message": (
+                                "The frozen multi-query graph cannot preserve the "
+                                "required data-snapshot semantics with the active "
+                                "datasource capability."
+                            ),
+                            "blocking": True,
+                            "requiredCapability": {
+                                "atomicMultiQuery": (
+                                    snapshot_requirement.require_atomic_multi_query
+                                )
+                            },
+                        }
+                        for issue in snapshot_preflight_issues
+                    ]
+                    with deep_session.lock:
+                        for query_id in graph_query_ids:
+                            branch_context = deep_session.query_branch_contexts.get(
+                                query_id
+                            )
+                            if branch_context is None:
+                                continue
+                            with branch_context.lock:
+                                branch_context.status = "CONTRACT_GAPPED"
+                                branch_context.last_gaps = [
+                                    dict(item) for item in gap_payload
+                                ]
+                    return json.dumps(
+                        {
+                            "status": "BLOCKED",
+                            "code": "MULTI_QUERY_SNAPSHOT_CONTRACT_UNSATISFIED",
+                            "snapshotIssues": snapshot_preflight_issues,
+                            "snapshotRequirement": snapshot_requirement.model_dump(
+                                by_alias=True,
+                                mode="json",
+                            ),
+                            "consistencyMode": str(
+                                getattr(
+                                    shared_data_snapshot,
+                                    "consistency_mode",
+                                    "UNSUPPORTED",
+                                )
+                                or "UNSUPPORTED"
+                            ),
+                            "nextAction": (
+                                "REOPEN_GRAPH_AND_MERGE_ATOMIC_GOALS_OR_CONFIGURE_"
+                                "TRUSTED_SNAPSHOT_CAPABILITY"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
 
             def execute_one(
                 item: GroundedParallelExecutionSpec,
@@ -3893,19 +4641,26 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     if branch_context is not None:
                         with branch_context.lock:
                             branch_context.status = "EXECUTING"
-                    if str(
-                        getattr(
-                            branch.active_execution_mode,
-                            "value",
-                            branch.active_execution_mode,
+                    if (
+                        str(
+                            getattr(
+                                branch.active_execution_mode,
+                                "value",
+                                branch.active_execution_mode,
+                            )
                         )
-                    ) == "CORE_SQL_REQUIRED":
+                        == "CORE_SQL_REQUIRED"
+                    ):
                         if not str(item.sql or "").strip():
-                            return query_id, branch, {
-                                "queryId": query_id,
-                                "status": "BLOCKED",
-                                "code": "CORE_SQL_CANDIDATE_REQUIRED",
-                            }
+                            return (
+                                query_id,
+                                branch,
+                                {
+                                    "queryId": query_id,
+                                    "status": "BLOCKED",
+                                    "code": "CORE_SQL_CANDIDATE_REQUIRED",
+                                },
+                            )
                         contract = branch.active_contract
                         if contract is None:
                             raise RuntimeError("parallel branch has no active Contract")
@@ -3913,96 +4668,97 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             branch,
                             item.sql,
                             expected_generation=branch.active_generation,
-                            expected_contract_fingerprint=(
-                                grounded_query_contract_fingerprint(contract)
-                            ),
+                            expected_contract_fingerprint=(grounded_query_contract_fingerprint(contract)),
                             rationale=item.rationale or reason,
                             evidence_refs=item.evidence_ref_ids,
                         )
                         if submitted.status != "ACCEPTED":
-                            return query_id, branch, {
-                                "queryId": query_id,
-                                "status": submitted.status,
-                                "nextAction": submitted.next_action,
-                                "gaps": submitted.validation_gaps,
-                            }
+                            return (
+                                query_id,
+                                branch,
+                                {
+                                    "queryId": query_id,
+                                    "status": submitted.status,
+                                    "nextAction": submitted.next_action,
+                                    "gaps": submitted.validation_gaps,
+                                },
+                            )
                     budget = runtime.context.budget
                     if branch_context is not None:
                         branch_context.budget.consume_doris_query()
                     elif budget is not None:
-                        budget.consume_doris_query(
-                            name="parallel.%s" % query_id
-                        )
+                        budget.consume_doris_query(name="parallel.%s" % query_id)
                     if branch_context is not None:
                         with branch_context.budget.stage("doris"):
                             run_result = runtime_owner.kernel.execute_active(
                                 branch,
-                                run_id="%s__%s"
-                                % (runtime.context.run_id, query_id),
+                                run_id="%s__%s" % (runtime.context.run_id, query_id),
                                 runtime_budget=budget,
+                                data_snapshot_contract=shared_data_snapshot,
                             )
                         with branch_context.budget.stage("evidence"):
-                            verified = runtime_owner.kernel.verify_active(
-                                branch
-                            )
+                            verified = runtime_owner.kernel.verify_active(branch)
                     elif budget is None:
                         run_result = runtime_owner.kernel.execute_active(
                             branch,
                             run_id="%s__%s" % (runtime.context.run_id, query_id),
+                            data_snapshot_contract=shared_data_snapshot,
                         )
                         verified = runtime_owner.kernel.verify_active(branch)
                     else:
                         with budget.stage("doris.parallel.%s" % query_id):
                             run_result = runtime_owner.kernel.execute_active(
                                 branch,
-                                run_id="%s__%s"
-                                % (runtime.context.run_id, query_id),
+                                run_id="%s__%s" % (runtime.context.run_id, query_id),
                                 runtime_budget=budget,
+                                data_snapshot_contract=shared_data_snapshot,
                             )
                         with budget.stage("evidence.parallel.%s" % query_id):
                             verified = runtime_owner.kernel.verify_active(branch)
-                    artifact = runtime_owner.kernel.latest_verified_query_artifact(
-                        branch
+                    artifact = runtime_owner.kernel.latest_verified_query_artifact(branch)
+                    return (
+                        query_id,
+                        branch,
+                        {
+                            "queryId": query_id,
+                            "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
+                            "queryArtifactId": artifact.artifact_id if artifact else "",
+                            "rowCount": len(run_result.merged_query_bundle.rows),
+                            "tables": list(run_result.merged_query_bundle.tables),
+                            "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
+                            "branchBudget": (branch_context.budget.report() if branch_context is not None else {}),
+                        },
                     )
-                    return query_id, branch, {
-                        "queryId": query_id,
-                        "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
-                        "queryArtifactId": artifact.artifact_id if artifact else "",
-                        "rowCount": len(run_result.merged_query_bundle.rows),
-                        "tables": list(run_result.merged_query_bundle.tables),
-                        "blockingGaps": [
-                            gap.model_dump(by_alias=True)
-                            for gap in verified.blocking_gaps
-                        ],
-                        "branchBudget": (
-                            branch_context.budget.report()
-                            if branch_context is not None
-                            else {}
-                        ),
-                    }
                 except GroundedRuntimeBudgetExceeded:
                     raise
                 except GroundedBranchBudgetExceeded as exc:
                     if branch_context is not None:
                         with branch_context.lock:
                             branch_context.status = "BUDGET_BLOCKED"
-                    return query_id, branch, {
-                        "queryId": query_id,
-                        "status": "BLOCKED",
-                        "code": exc.code,
-                        "branchBudget": exc.report,
-                    }
+                    return (
+                        query_id,
+                        branch,
+                        {
+                            "queryId": query_id,
+                            "status": "BLOCKED",
+                            "code": exc.code,
+                            "branchBudget": exc.report,
+                        },
+                    )
                 except Exception as exc:
                     if branch_context is not None:
                         with branch_context.lock:
                             branch_context.status = "FAILED"
-                    return query_id, branch, {
-                        "queryId": query_id,
-                        "status": "FAILED",
-                        "code": "PARALLEL_QUERY_EXECUTION_FAILED",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
-                    }
+                    return (
+                        query_id,
+                        branch,
+                        {
+                            "queryId": query_id,
+                            "status": "FAILED",
+                            "code": "PARALLEL_QUERY_EXECUTION_FAILED",
+                            "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
+                        },
+                    )
 
             results: list[dict[str, Any]] = []
             successful_branches: list[GroundedRuntimeSession] = []
@@ -4018,13 +4774,64 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         successful_branches.append(branch)
             successful_branches.sort(
                 key=lambda branch: query_ids.index(
-                    next(
-                        query_id
-                        for query_id, candidate in branch_by_id.items()
-                        if candidate is branch
-                    )
+                    next(query_id for query_id, candidate in branch_by_id.items() if candidate is branch)
                 )
             )
+            if (
+                graph_receipt is not None
+                and len(graph_query_ids) > 1
+                and successful_branches
+            ):
+                snapshot_postflight_issues = validate_query_bundle_snapshots(
+                    [
+                        QueryBundle(
+                            data_snapshot=shared_data_snapshot
+                            if shared_data_snapshot is not None
+                            else DataSnapshotContract()
+                        ),
+                        *[
+                            branch.run_result.merged_query_bundle
+                            for branch in successful_branches
+                            if branch.run_result is not None
+                        ],
+                    ],
+                    require_atomic_multi_query=bool(
+                        snapshot_requirement
+                        and snapshot_requirement.require_atomic_multi_query
+                    ),
+                )
+                if snapshot_postflight_issues:
+                    with deep_session.lock:
+                        for query_id in query_ids:
+                            branch_context = deep_session.query_branch_contexts.get(
+                                query_id
+                            )
+                            if branch_context is not None:
+                                with branch_context.lock:
+                                    branch_context.status = "SNAPSHOT_BLOCKED"
+                    results.sort(
+                        key=lambda item: query_ids.index(
+                            str(item.get("queryId") or "")
+                        )
+                    )
+                    return json.dumps(
+                        {
+                            "status": "BLOCKED",
+                            "code": "MULTI_QUERY_SNAPSHOT_POSTFLIGHT_FAILED",
+                            "snapshotIssues": snapshot_postflight_issues,
+                            "snapshotRequirement": snapshot_requirement.model_dump(
+                                by_alias=True,
+                                mode="json",
+                            )
+                            if snapshot_requirement is not None
+                            else {},
+                            "adoptedArtifactIds": [],
+                            "queries": results,
+                            "nextAction": "STOP_WITH_OPERATIONAL_FAILURE",
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
             adopted = runtime_owner.kernel.adopt_verified_branches(
                 deep_session.runtime,
                 successful_branches,
@@ -4038,41 +4845,25 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         deep_session.artifact_goal_ids[artifact_id] = list(
                             deep_session.parallel_branch_goal_ids.get(query_id) or []
                         )
-                        branch_context = deep_session.query_branch_contexts.get(
-                            query_id
-                        )
+                        branch_context = deep_session.query_branch_contexts.get(query_id)
                         if branch_context is not None:
                             with branch_context.lock:
                                 branch_context.status = "VERIFIED"
                                 if artifact_id not in branch_context.verified_artifact_ids:
-                                    branch_context.verified_artifact_ids.append(
-                                        artifact_id
-                                    )
+                                    branch_context.verified_artifact_ids.append(artifact_id)
                 for query_id in query_ids:
                     deep_session.parallel_branches.pop(query_id, None)
                     deep_session.parallel_branch_goal_ids.pop(query_id, None)
             results.sort(key=lambda item: query_ids.index(str(item.get("queryId") or "")))
             return json.dumps(
                 {
-                    "status": (
-                        "VERIFIED"
-                        if len(adopted) == len(normalized)
-                        else "PARTIAL"
-                        if adopted
-                        else "FAILED"
-                    ),
+                    "status": ("VERIFIED" if len(adopted) == len(normalized) else "PARTIAL" if adopted else "FAILED"),
                     "reason": str(reason or "")[:500],
                     "executedInParallel": len(normalized) > 1,
-                    "workerCount": min(
-                        len(normalized), runtime_owner.parallel_max_workers
-                    ),
+                    "workerCount": min(len(normalized), runtime_owner.parallel_max_workers),
                     "adoptedArtifactIds": [item.artifact_id for item in adopted],
                     "queries": results,
-                    "nextAction": (
-                        "CONTINUE_QUERYING_OR_FINALIZE"
-                        if adopted
-                        else "REVISE_BINDINGS_OR_SQL"
-                    ),
+                    "nextAction": ("CONTINUE_QUERYING_OR_FINALIZE" if adopted else "REVISE_BINDINGS_OR_SQL"),
                 },
                 ensure_ascii=False,
                 default=str,
@@ -4126,11 +4917,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         ),
                         "message": message[:500],
                         "nextAction": (
-                            "USE_LATEST_CONTRACT"
-                            if stale
-                            else "STOP"
-                            if terminal
-                            else "PROPOSE_GROUNDED_CONTRACT"
+                            "USE_LATEST_CONTRACT" if stale else "STOP" if terminal else "PROPOSE_GROUNDED_CONTRACT"
                         ),
                     },
                     ensure_ascii=False,
@@ -4140,8 +4927,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "BLOCKED",
                         "code": "SQL_CANDIDATE_INTERNAL_ERROR",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
@@ -4150,15 +4936,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             candidate_payload = {
                 "candidateId": attempt.candidate_id,
                 "status": "BLOCKED" if internal_error else attempt.status,
-                "code": (
-                    "SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR"
-                    if internal_error
-                    else ""
-                ),
+                "code": ("SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR" if internal_error else ""),
                 "activeGeneration": attempt.active_generation,
-                "nextAction": (
-                    "STOP_INTERNAL" if internal_error else attempt.next_action
-                ),
+                "nextAction": ("STOP_INTERNAL" if internal_error else attempt.next_action),
                 "astFingerprint": attempt.ast_fingerprint,
                 "contractFingerprint": attempt.contract_fingerprint,
                 "outputColumns": attempt.output_columns,
@@ -4252,17 +5032,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "code": (
                             "SQL_EXECUTION_NO_PROGRESS"
                             if no_progress
-                            else
-                            "CORE_SQL_CANDIDATE_REQUIRED"
+                            else "CORE_SQL_CANDIDATE_REQUIRED"
                             if core_sql_required
                             else "GROUNDED_EXECUTION_COMPATIBILITY_BLOCKED"
                         ),
                         "message": message[:500],
-                        "nextAction": (
-                            "SUBMIT_GROUNDED_SQL_CANDIDATE"
-                            if core_sql_required
-                            else "REVISE_BINDINGS"
-                        ),
+                        "nextAction": ("SUBMIT_GROUNDED_SQL_CANDIDATE" if core_sql_required else "REVISE_BINDINGS"),
                         "instruction": (
                             (
                                 "Submit a materially changed SQL candidate; executing the same accepted AST again is forbidden."
@@ -4284,17 +5059,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "BLOCKED",
                         "code": "GROUNDED_EXECUTION_INTERNAL_ERROR",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
                 )
-            failed_results = [
-                item
-                for item in run_result.task_results
-                if item.query_bundle.failed or not item.success
-            ]
+            failed_results = [item for item in run_result.task_results if item.query_bundle.failed or not item.success]
             if failed_results:
                 failure_codes = [
                     result.error_code
@@ -4305,19 +5075,24 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 failure_code = failure_codes[0] if failure_codes else "QUERY_EXECUTION_FAILED"
                 access_denied = failure_code in {
                     "ACCESS_DENIED",
+                    "ACL_POLICY_UNAVAILABLE",
+                    "ACL_SQL_PARSE_FAILED",
                     "MERCHANT_SCOPE_DENIED",
                     "TABLE_DENIED",
                     "TABLE_NOT_ALLOWED",
                     "TABLE_ROLE_DENIED",
                     "COLUMN_DENIED",
                 }
-                core_sql_mode = str(
-                    getattr(
-                        session.active_execution_mode,
-                        "value",
-                        session.active_execution_mode,
+                core_sql_mode = (
+                    str(
+                        getattr(
+                            session.active_execution_mode,
+                            "value",
+                            session.active_execution_mode,
+                        )
                     )
-                ) == "CORE_SQL_REQUIRED"
+                    == "CORE_SQL_REQUIRED"
+                )
                 return json.dumps(
                     {
                         "status": (
@@ -4336,14 +5111,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             else "REVISE_BINDINGS"
                         ),
                         "message": str(
-                            failed_results[0].query_bundle.error
-                            or failed_results[0].summary
-                            or failure_code
+                            failed_results[0].query_bundle.error or failed_results[0].summary or failure_code
                         )[:500],
-                        "blockingGaps": [
-                            gap.model_dump(by_alias=True)
-                            for gap in verified.blocking_gaps
-                        ],
+                        "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                         "instruction": (
                             "Access denial is terminal for this request; do not alter SQL to bypass policy."
                             if access_denied
@@ -4361,44 +5131,24 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "latest_verified_query_artifact",
                 None,
             )
-            query_artifact = (
-                latest_artifact(session)
-                if verified.passed and callable(latest_artifact)
-                else None
-            )
+            query_artifact = latest_artifact(session) if verified.passed and callable(latest_artifact) else None
             if query_artifact is not None:
                 with deep_session.lock:
-                    deep_session.artifact_goal_ids[
-                        query_artifact.artifact_id
-                    ] = list(deep_session.active_goal_ids)
+                    deep_session.artifact_goal_ids[query_artifact.artifact_id] = list(deep_session.active_goal_ids)
             return json.dumps(
                 {
                     "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
                     "reason": str(reason or "")[:500],
-                    "queryArtifactId": (
-                        query_artifact.artifact_id if query_artifact else ""
-                    ),
-                    "coveredGoalIds": list(
-                        deep_session.active_goal_ids if query_artifact else []
-                    ),
+                    "queryArtifactId": (query_artifact.artifact_id if query_artifact else ""),
+                    "coveredGoalIds": list(deep_session.active_goal_ids if query_artifact else []),
                     "rowCount": len(run_result.merged_query_bundle.rows),
                     "tables": list(run_result.merged_query_bundle.tables),
-                    "outputColumns": (
-                        list(query_artifact.output_columns)
-                        if query_artifact
-                        else []
-                    ),
+                    "outputColumns": (list(query_artifact.output_columns) if query_artifact else []),
                     "entitySetEligibleOutputs": (
-                        sorted(query_artifact.output_entity_identities)
-                        if query_artifact
-                        else []
+                        sorted(query_artifact.output_entity_identities) if query_artifact else []
                     ),
-                    "blockingGaps": [
-                        gap.model_dump(by_alias=True) for gap in verified.blocking_gaps
-                    ],
-                    "warningGaps": [
-                        gap.model_dump(by_alias=True) for gap in verified.warning_gaps
-                    ],
+                    "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
+                    "warningGaps": [gap.model_dump(by_alias=True) for gap in verified.warning_gaps],
                     "dataCollectionStatus": "OPEN",
                     "nextAction": (
                         "PUBLISH_ENTITY_SET_OR_CONTINUE_QUERYING_OR_FINALIZE"
@@ -4452,7 +5202,8 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "USE_LATEST_VERIFIED_QUERY_ARTIFACT"
                             if code == "VERIFIED_QUERY_ARTIFACT_NOT_FOUND"
                             else "REVISE_BINDINGS"
-                            if code in {
+                            if code
+                            in {
                                 "VERIFIED_ENTITY_OUTPUT_COLUMN_NOT_FOUND",
                                 "VERIFIED_ENTITY_SEMANTIC_LINEAGE_REQUIRED",
                                 "VERIFIED_ENTITY_IDENTITY_REQUIRED",
@@ -4469,8 +5220,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "BLOCKED",
                         "code": "VERIFIED_ENTITY_SET_INTERNAL_ERROR",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
@@ -4502,6 +5252,351 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 default=str,
             )
 
+        @tool("delegate_grounded_exploration")
+        def delegate_grounded_exploration(
+            analysis_goal_ids: list[str],
+            source_query_artifact_ids: list[str],
+            objective: str,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Run a zero-capability SubAgent that may emit advisory hypotheses only."""
+
+            deep_session = runtime.context.session
+            goal_contract = deep_session.question_goal_contract
+            if deep_session.analysis_skill_started or deep_session.data_collection_sealed:
+                return json.dumps(
+                    {
+                        "status": "POST_QUERY_SKILL_BOUNDARY_CLOSED",
+                        "nextAction": "USE_SKILL_RESULT_OR_VERIFIED_FALLBACK",
+                    },
+                    ensure_ascii=False,
+                )
+            if goal_contract is None:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED",
+                    },
+                    ensure_ascii=False,
+                )
+            normalized_goal_ids = list(
+                dict.fromkeys(
+                    str(goal_id or "").strip()
+                    for goal_id in analysis_goal_ids
+                    if str(goal_id or "").strip()
+                )
+            )
+            normalized_artifact_ids = list(
+                dict.fromkeys(
+                    str(artifact_id or "").strip()
+                    for artifact_id in source_query_artifact_ids
+                    if str(artifact_id or "").strip()
+                )
+            )
+            normalized_objective = str(objective or "").strip()
+            if not normalized_objective:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "EXPLORATION_OBJECTIVE_REQUIRED",
+                    },
+                    ensure_ascii=False,
+                )
+            goal_map = goal_contract.goal_map()
+            invalid_goal_ids = [
+                goal_id
+                for goal_id in normalized_goal_ids
+                if goal_id not in goal_map
+                or str(getattr(goal_map[goal_id], "kind", "") or "").upper()
+                != "ANALYSIS"
+            ]
+            if not normalized_goal_ids or invalid_goal_ids:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "EXPLORATION_ANALYSIS_GOAL_INVALID",
+                        "invalidGoalIds": invalid_goal_ids,
+                    },
+                    ensure_ascii=False,
+                )
+            if runtime_owner.checkpointer is None:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "EXPLORATION_CHECKPOINT_REQUIRED",
+                    },
+                    ensure_ascii=False,
+                )
+            try:
+                source_views = runtime_owner._verified_exploration_source_views(
+                    deep_session,
+                    normalized_artifact_ids,
+                )
+                goal_fingerprint = (
+                    original_question_goal_contract_fingerprint(goal_contract)
+                )
+                assignment_fingerprint = _stable_json_fingerprint(
+                    {
+                        "goalContractFingerprint": goal_fingerprint,
+                        "objective": normalized_objective,
+                        "analysisGoalIds": sorted(normalized_goal_ids),
+                        "sourceArtifactFingerprints": sorted(
+                            item.artifact_fingerprint for item in source_views
+                        ),
+                    }
+                )
+                assignment_id = "exploration_%s" % assignment_fingerprint[:24]
+                max_assignments = max(
+                    1,
+                    min(
+                        int(
+                            getattr(
+                                runtime_owner.settings,
+                                "grounded_exploration_max_assignments",
+                                2,
+                            )
+                            or 2
+                        ),
+                        16,
+                    ),
+                )
+                if (
+                    assignment_id not in deep_session.exploration_states
+                    and len(deep_session.exploration_states) >= max_assignments
+                ):
+                    return json.dumps(
+                        {
+                            "status": "BLOCKED",
+                            "code": "EXPLORATION_ASSIGNMENT_BUDGET_EXHAUSTED",
+                            "maxAssignments": max_assignments,
+                        },
+                        ensure_ascii=False,
+                    )
+                cached_report = next(
+                    (
+                        item
+                        for item in reversed(deep_session.exploration_reports)
+                        if item.get("assignmentId") == assignment_id
+                    ),
+                    None,
+                )
+                if cached_report is not None:
+                    return json.dumps(
+                        {
+                            **dict(cached_report),
+                            "status": "IDEMPOTENT_REPLAY",
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                population_scope_fingerprint = _stable_json_fingerprint(
+                    {
+                        "sourceArtifactFingerprints": [
+                            item.artifact_fingerprint for item in source_views
+                        ],
+                        "goalPopulationScopes": [
+                            {
+                                "goalId": goal_id,
+                                "populationScope": str(
+                                    getattr(
+                                        goal_map[goal_id],
+                                        "population_scope",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                                "populationGoalIds": list(
+                                    getattr(
+                                        goal_map[goal_id],
+                                        "population_goal_ids",
+                                        (),
+                                    )
+                                    or ()
+                                ),
+                            }
+                            for goal_id in normalized_goal_ids
+                        ],
+                    }
+                )
+                artifact_by_id = {
+                    artifact.artifact_id: artifact
+                    for artifact in deep_session.runtime.verified_query_ledger
+                }
+                time_scope_fingerprint = _stable_json_fingerprint(
+                    [
+                        {
+                            "artifactId": artifact_id,
+                            "timeRange": artifact_by_id[
+                                artifact_id
+                            ].contract.time_range.model_dump(
+                                by_alias=True,
+                                mode="json",
+                            ),
+                            "timeField": artifact_by_id[
+                                artifact_id
+                            ].contract.time_field.model_dump(
+                                by_alias=True,
+                                mode="json",
+                            ),
+                        }
+                        for artifact_id in normalized_artifact_ids
+                    ]
+                )
+
+                def progress_event(
+                    stage: str,
+                    status: str,
+                    detail: str,
+                ) -> None:
+                    _emit_runtime_listener(
+                        runtime.context.listener,
+                        "exploration.progress",
+                        "EXPLORATION_SUBAGENT",
+                        {
+                            "assignmentId": assignment_id,
+                            "stage": stage,
+                            "status": status,
+                            "detail": str(detail or "")[:500],
+                        },
+                    )
+
+                budget = runtime.context.budget
+                configured_timeout = max(
+                    1.0,
+                    float(
+                        getattr(
+                            runtime_owner.settings,
+                            "grounded_exploration_timeout_seconds",
+                            15,
+                        )
+                        or 15
+                    ),
+                )
+                exploration_timeout = (
+                    budget.clamp_timeout_seconds(
+                        configured_timeout,
+                        minimum_seconds=0.001,
+                        operation="exploration_subagent_timeout",
+                    )
+                    if budget is not None
+                    else configured_timeout
+                )
+                worker = IsolatedGroundedExplorationWorker(
+                    runtime_owner.subagent_runtime,
+                    parent_thread_id=runtime.context.thread_id,
+                    model_timeout_seconds=exploration_timeout,
+                    on_progress=progress_event,
+                )
+                coordinator = GroundedExplorationCoordinator(
+                    artifact_catalog=(
+                        InMemoryVerifiedExplorationArtifactCatalog(source_views)
+                    ),
+                    state_store=_SessionExplorationStateStore(deep_session),
+                    worker=worker,
+                )
+                state = deep_session.exploration_states.get(assignment_id)
+                if state is None:
+                    receipt = coordinator.issue_assignment(
+                        goal_contract,
+                        GroundedExplorationAssignmentSpec(
+                            assignment_id=assignment_id,
+                            objective=normalized_objective,
+                            authorized_goal_ids=tuple(normalized_goal_ids),
+                            source_artifact_ids=tuple(normalized_artifact_ids),
+                            scope_authority=GroundedExplorationScopeAuthority(
+                                population_scope_fingerprint=(
+                                    population_scope_fingerprint
+                                ),
+                                time_scope_fingerprint=time_scope_fingerprint,
+                            ),
+                        ),
+                    )
+                    expected_revision = receipt.ledger_revision
+                else:
+                    expected_revision = state.ledger.revision
+                if budget is None:
+                    report = coordinator.run_assignment(
+                        assignment_id,
+                        goal_contract,
+                        expected_revision=expected_revision,
+                    )
+                else:
+                    budget.consume_llm_call(name="exploration_subagent")
+                    with budget.stage("llm.exploration_subagent"):
+                        report = coordinator.run_assignment(
+                            assignment_id,
+                            goal_contract,
+                            expected_revision=expected_revision,
+                        )
+            except GroundedExplorationCoordinatorError as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": exc.code,
+                        "message": exc.message,
+                        "issues": [
+                            item.model_dump(by_alias=True, mode="json")
+                            for item in exc.issues
+                        ],
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except GroundedRuntimeBudgetExceeded:
+                raise
+            except Exception as exc:
+                return json.dumps(
+                    {
+                        "status": "BLOCKED",
+                        "code": "EXPLORATION_INTERNAL_ERROR",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                    },
+                    ensure_ascii=False,
+                )
+            response = {
+                "status": report.status,
+                "assignmentId": report.assignment_id,
+                "ledgerRevision": report.ledger_revision,
+                "authority": report.authority,
+                "publishableAsFinal": report.publishable_as_final,
+                "queryExecuted": report.query_executed,
+                "hypotheses": [
+                    item.model_dump(by_alias=True, mode="json")
+                    for item in report.artifact.hypotheses
+                ],
+                "analysisPlan": (
+                    report.artifact.analysis_plan.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                    if report.artifact.analysis_plan is not None
+                    else {}
+                ),
+                "stoppingAssessment": (
+                    report.artifact.stopping_assessment.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                ),
+                "pendingCapabilityRequests": [
+                    item.model_dump(by_alias=True, mode="json")
+                    for item in report.pending_capability_requests
+                ],
+                "nextAction": (
+                    "ROOT_REVIEW_REQUESTS_AGAINST_FROZEN_GRAPH"
+                    if deep_session.query_branch_contexts
+                    else "ROOT_TRANSLATE_APPROVED_REQUESTS_TO_NORMAL_DISCOVERY"
+                ),
+            }
+            with deep_session.lock:
+                deep_session.exploration_reports.append(dict(response))
+            return json.dumps(
+                response,
+                ensure_ascii=False,
+                default=str,
+            )
+
         @tool("compose_verified_answer", return_direct=True)
         def compose_verified_answer(
             allow_llm: bool,
@@ -4516,9 +5611,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             """
 
             try:
-                goal_coverage = runtime_owner._require_complete_goal_coverage(
-                    runtime.context.session
-                )
+                goal_coverage = runtime_owner._require_complete_goal_coverage(runtime.context.session)
             except GoalCoverageBlocked as exc:
                 result = exc.result.model_dump(by_alias=True)
                 runtime.context.session.goal_coverage_result = result
@@ -4526,9 +5619,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "GOAL_COVERAGE_INCOMPLETE",
                         "code": "ORIGINAL_QUESTION_GOALS_UNCOVERED",
-                        "missingRequiredGoalIds": result.get(
-                            "missingRequiredGoalIds", []
-                        ),
+                        "missingRequiredGoalIds": result.get("missingRequiredGoalIds", []),
                         "issues": result.get("issues", []),
                         "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
                     },
@@ -4560,17 +5651,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 return json.dumps(
                     {
                         "status": "EVIDENCE_INCOMPLETE" if incomplete else "BLOCKED",
-                        "code": (
-                            "EVIDENCE_PORTFOLIO_INCOMPLETE"
-                            if incomplete
-                            else "ANSWER_COMPOSITION_BLOCKED"
-                        ),
+                        "code": ("EVIDENCE_PORTFOLIO_INCOMPLETE" if incomplete else "ANSWER_COMPOSITION_BLOCKED"),
                         "message": message[:500],
-                        "nextAction": (
-                            "CONTINUE_PROGRESSIVE_QUERYING"
-                            if incomplete
-                            else "STOP"
-                        ),
+                        "nextAction": ("CONTINUE_PROGRESSIVE_QUERYING" if incomplete else "STOP"),
                     },
                     ensure_ascii=False,
                 )
@@ -4579,8 +5662,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     {
                         "status": "BLOCKED",
                         "code": "ANSWER_COMPOSITION_INTERNAL_ERROR",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
@@ -4618,19 +5700,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ensure_ascii=False,
                     default=str,
                 )
-            runtime.context.session.answer_coverage_result = (
-                answer_coverage.model_dump(by_alias=True)
-            )
+            runtime.context.session.answer_coverage_result = answer_coverage.model_dump(by_alias=True)
             return json.dumps(
                 {
                     "status": "ANSWERED",
                     "answer": answer,
-                    "verifiedQueryArtifactIds": list(
-                        state.answer_artifact_ids
-                    ),
-                    "goalAnswerCoverage": dict(
-                        runtime.context.session.answer_coverage_result
-                    ),
+                    "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
+                    "goalAnswerCoverage": dict(runtime.context.session.answer_coverage_result),
                 },
                 ensure_ascii=False,
             )
@@ -4653,18 +5729,14 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 )
             analysis_gate = None
             try:
-                coverage = runtime_owner._require_complete_goal_coverage(
-                    deep_session
-                )
+                coverage = runtime_owner._require_complete_goal_coverage(deep_session)
             except GoalCoverageBlocked as exc:
                 coverage = exc.result
                 analysis_gate = verify_grounded_analysis_data_input_coverage(
                     goal_contract=deep_session.question_goal_contract,
                     query_goal_coverage=coverage,
                 )
-                deep_session.analysis_data_input_gate_result = (
-                    analysis_gate.model_dump(by_alias=True)
-                )
+                deep_session.analysis_data_input_gate_result = analysis_gate.model_dump(by_alias=True)
                 if not analysis_gate.skill_start_allowed:
                     result = coverage.model_dump(by_alias=True)
                     deep_session.goal_coverage_result = result
@@ -4672,13 +5744,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         {
                             "status": "EVIDENCE_INCOMPLETE",
                             "code": "ORIGINAL_QUESTION_GOALS_UNCOVERED",
-                            "missingRequiredGoalIds": result.get(
-                                "missingRequiredGoalIds", []
-                            ),
+                            "missingRequiredGoalIds": result.get("missingRequiredGoalIds", []),
                             "issues": result.get("issues", []),
-                            "analysisDataInputGate": (
-                                analysis_gate.model_dump(by_alias=True)
-                            ),
+                            "analysisDataInputGate": (analysis_gate.model_dump(by_alias=True)),
                             "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
                         },
                         ensure_ascii=False,
@@ -4694,18 +5762,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     ensure_ascii=False,
                 )
             try:
-                plan, run_result, verified, artifact_ids = (
-                    runtime_owner.kernel.verify_portfolio(
-                        deep_session.runtime
-                    )
-                )
+                plan, run_result, verified, artifact_ids = runtime_owner.kernel.verify_portfolio(deep_session.runtime)
             except Exception as exc:
                 return json.dumps(
                     {
                         "status": "EVIDENCE_INCOMPLETE",
                         "code": "VERIFIED_EVIDENCE_PORTFOLIO_UNAVAILABLE",
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:400]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
                         "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
                     },
                     ensure_ascii=False,
@@ -4717,10 +5780,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "code": "EVIDENCE_PORTFOLIO_INCOMPLETE",
                         "reason": str(reason or "")[:500],
                         "artifactIds": artifact_ids,
-                        "blockingGaps": [
-                            item.model_dump(by_alias=True)
-                            for item in verified.blocking_gaps
-                        ],
+                        "blockingGaps": [item.model_dump(by_alias=True) for item in verified.blocking_gaps],
                         "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
                     },
                     ensure_ascii=False,
@@ -4730,17 +5790,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 deep_session.data_collection_sealed = True
                 deep_session.analysis_skill_headers_disclosed = True
                 deep_session.runtime.answer_plan = plan.model_copy(deep=True)
-                deep_session.runtime.answer_run_result = run_result.model_copy(
-                    deep=True
-                )
-                deep_session.runtime.answer_verified_evidence = (
-                    verified.model_copy(deep=True)
-                )
+                deep_session.runtime.answer_run_result = run_result.model_copy(deep=True)
+                deep_session.runtime.answer_verified_evidence = verified.model_copy(deep=True)
                 deep_session.runtime.answer_artifact_ids = list(artifact_ids)
                 if analysis_gate is not None:
-                    deep_session.analysis_data_input_gate_result = (
-                        analysis_gate.model_dump(by_alias=True)
-                    )
+                    deep_session.analysis_data_input_gate_result = analysis_gate.model_dump(by_alias=True)
             return json.dumps(
                 {
                     "status": "EVIDENCE_COLLECTION_SEALED",
@@ -4748,20 +5802,14 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "verifiedQueryArtifactIds": artifact_ids,
                     "goalCoverage": coverage.model_dump(by_alias=True),
                     "analysisDataInputGate": (
-                        analysis_gate.model_dump(by_alias=True)
-                        if analysis_gate is not None
-                        else {}
+                        analysis_gate.model_dump(by_alias=True) if analysis_gate is not None else {}
                     ),
                     "availableAnalysisGoalIds": (
-                        list(analysis_gate.deferred_goal_ids)
-                        if analysis_gate is not None
-                        else []
+                        list(analysis_gate.deferred_goal_ids) if analysis_gate is not None else []
                     ),
                     "rowCount": len(run_result.merged_query_bundle.rows),
                     "tables": list(run_result.merged_query_bundle.tables),
-                    "availableAnalysisSkillHeaders": list(
-                        runtime_owner.skill_headers
-                    ),
+                    "availableAnalysisSkillHeaders": list(runtime_owner.skill_headers),
                     "nextAction": "RUN_ONE_MATCHING_SKILL_OR_COMPOSE_ANSWER",
                 },
                 ensure_ascii=False,
@@ -4781,9 +5829,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 runtime.context,
                 skill_name=str(skill_name or "").strip(),
                 objective=str(objective or "").strip(),
-                analysis_publication_requests=(
-                    list(analysis_publication_requests or [])
-                ),
+                analysis_publication_requests=(list(analysis_publication_requests or [])),
             )
             return json.dumps(result, ensure_ascii=False, default=str)
 
@@ -4836,6 +5882,8 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
 
         return [
             declare_original_question_goals,
+            propose_grounded_execution_graph,
+            reopen_grounded_execution_graph_discovery,
             declare_grounded_query_branches,
             retrieve_knowledge,
             publish_verified_rule_evidence,
@@ -4846,6 +5894,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             execute_grounded_query,
             execute_grounded_query_batch,
             publish_verified_entity_set,
+            delegate_grounded_exploration,
             finalize_evidence_collection,
             compose_verified_answer,
             run_skill,
@@ -4858,9 +5907,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         *,
         skill_name: str,
         objective: str,
-        analysis_publication_requests: Optional[
-            list[dict[str, Any]]
-        ] = None,
+        analysis_publication_requests: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         session = context.session
         state = session.runtime
@@ -4917,20 +5964,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
 
         metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
         lifecycle_phase = str(
-            metadata.get("lifecyclePhase")
-            or metadata.get("lifecycle_phase")
-            or "post_query_analysis"
+            metadata.get("lifecyclePhase") or metadata.get("lifecycle_phase") or "post_query_analysis"
         ).strip()
         requires_verified = str(
-            metadata.get("requiresVerifiedEvidence")
-            or metadata.get("requires_verified_evidence")
-            or "true"
+            metadata.get("requiresVerifiedEvidence") or metadata.get("requires_verified_evidence") or "true"
         ).strip().lower() not in {"false", "0", "no"}
-        output_contract = str(
-            metadata.get("outputContract")
-            or metadata.get("output_contract")
-            or ""
-        ).strip()
+        output_contract = str(metadata.get("outputContract") or metadata.get("output_contract") or "").strip()
         if (
             lifecycle_phase != "post_query_analysis"
             or not requires_verified
@@ -4946,7 +5985,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             }
 
         skill_run_id = "skill_%s_%s" % (
-            re.sub(r"[^a-z0-9-]+", "-", normalized_name).strip("-") or "run",
+            _normalized_skill_name(normalized_name) or "run",
             uuid.uuid4().hex[:12],
         )
         skill_thread_id = "%s__%s" % (context.thread_id, skill_run_id)
@@ -4957,8 +5996,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             return {
                 "status": "SKILL_WORKSPACE_FAILED",
                 "skillName": normalized_name,
-                "message": "%s:%s"
-                % (type(exc).__name__, str(exc)[:400]),
+                "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
             }
         input_path = workspace / "input.json"
         script_output_path = workspace / "script-output.json"
@@ -5004,8 +6042,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             return {
                 "status": "SKILL_INPUT_ARTIFACT_FAILED",
                 "skillName": normalized_name,
-                "message": "%s:%s"
-                % (type(exc).__name__, str(exc)[:400]),
+                "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
             }
         progress_event("workspace", "completed", str(workspace))
         with session.lock:
@@ -5017,9 +6054,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 }
             session.analysis_skill_started = True
         execution_mode = str(
-            metadata.get("executionMode")
-            or metadata.get("execution_mode")
-            or "structured_renderer"
+            metadata.get("executionMode") or metadata.get("execution_mode") or "structured_renderer"
         ).strip()
         script_result: dict[str, Any] = {}
         if execution_mode == "python_script":
@@ -5118,9 +6153,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "mountedSkill": "/skills/%s/SKILL.md" % normalized_name,
                 "objective": objective,
                 "inputArtifact": "/input.json",
-                "scriptOutputArtifact": (
-                    "/script-output.json" if script_output_path.exists() else ""
-                ),
+                "scriptOutputArtifact": ("/script-output.json" if script_output_path.exists() else ""),
                 "resultContract": {
                     "required": [
                         "answerMarkdown",
@@ -5133,11 +6166,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "gaps",
                         "executionConfidence",
                     ],
-                    "conditional": {
-                        "whenInputAnalysisGoalsPresent": [
-                            "analysisPublicationRequests"
-                        ]
-                    },
+                    "conditional": {"whenInputAnalysisGoalsPresent": ["analysisPublicationRequests"]},
                 },
             },
             backend=isolated_backend,
@@ -5200,11 +6229,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             allow_script_fallback: bool,
         ) -> tuple[dict[str, Any], str, list[str], Any, list[dict[str, Any]]]:
             structured_output = _parse_skill_result(raw)
-            if (
-                allow_script_fallback
-                and not structured_output.get("answerMarkdown")
-                and script_result.get("payload")
-            ):
+            if allow_script_fallback and not structured_output.get("answerMarkdown") and script_result.get("payload"):
                 structured_output["answerMarkdown"] = str(
                     (script_result.get("payload") or {}).get("answerMarkdown") or ""
                 )
@@ -5215,47 +6240,23 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             expected_analysis_goal_ids = {
                 str(item.get("analysisGoalId") or "")
                 for item in skill_payload.get("analysisGoals") or []
-                if isinstance(item, dict)
-                and str(item.get("analysisGoalId") or "")
+                if isinstance(item, dict) and str(item.get("analysisGoalId") or "")
             }
-            publication_requests = list(
-                analysis_publication_requests or []
-            )
+            publication_requests = list(analysis_publication_requests or [])
             if not publication_requests:
-                raw_requests = structured_output.get(
-                    "analysisPublicationRequests"
-                ) or []
+                raw_requests = structured_output.get("analysisPublicationRequests") or []
                 if isinstance(raw_requests, dict):
                     raw_requests = [raw_requests]
                 if isinstance(raw_requests, list):
-                    publication_requests = [
-                        dict(item)
-                        for item in raw_requests
-                        if isinstance(item, dict)
-                    ]
-            if (
-                not publication_requests
-                and allow_script_fallback
-                and isinstance(script_result.get("payload"), dict)
-            ):
-                raw_requests = (
-                    script_result.get("payload") or {}
-                ).get("analysisPublicationRequests") or []
+                    publication_requests = [dict(item) for item in raw_requests if isinstance(item, dict)]
+            if not publication_requests and allow_script_fallback and isinstance(script_result.get("payload"), dict):
+                raw_requests = (script_result.get("payload") or {}).get("analysisPublicationRequests") or []
                 if isinstance(raw_requests, dict):
                     raw_requests = [raw_requests]
                 if isinstance(raw_requests, list):
-                    publication_requests = [
-                        dict(item)
-                        for item in raw_requests
-                        if isinstance(item, dict)
-                    ]
+                    publication_requests = [dict(item) for item in raw_requests if isinstance(item, dict)]
             submitted_goal_ids = {
-                str(
-                    item.get("analysisGoalId")
-                    or item.get("analysis_goal_id")
-                    or ""
-                )
-                for item in publication_requests
+                str(item.get("analysisGoalId") or item.get("analysis_goal_id") or "") for item in publication_requests
             }
             if expected_analysis_goal_ids != submitted_goal_ids:
                 contract_issues.append(
@@ -5265,17 +6266,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "Return exactly one narrow analysis publication "
                             "request for every typed deferred analysis goal."
                         ),
-                        "expectedAnalysisGoalIds": sorted(
-                            expected_analysis_goal_ids
-                        ),
-                        "submittedAnalysisGoalIds": sorted(
-                            item for item in submitted_goal_ids if item
-                        ),
+                        "expectedAnalysisGoalIds": sorted(expected_analysis_goal_ids),
+                        "submittedAnalysisGoalIds": sorted(item for item in submitted_goal_ids if item),
                     }
                 )
-            structured_output[
-                "_groundedAnalysisPublicationRequests"
-            ] = publication_requests
+            structured_output["_groundedAnalysisPublicationRequests"] = publication_requests
             for key in (
                 "observations",
                 "semanticDisclosures",
@@ -5286,12 +6281,8 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "gaps",
             ):
                 structured_output.setdefault(key, [])
-            structured_output["executionConfidence"] = _confidence(
-                structured_output.get("executionConfidence")
-            )
-            rendered_answer = str(
-                structured_output.get("answerMarkdown") or ""
-            ).strip()
+            structured_output["executionConfidence"] = _confidence(structured_output.get("executionConfidence"))
+            rendered_answer = str(structured_output.get("answerMarkdown") or "").strip()
             if not rendered_answer:
                 contract_issues.append(
                     {
@@ -5326,8 +6317,8 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 contract_issues,
             )
 
-        structured, answer, untrusted_refs, claim_verification, contract_issues = (
-            assess_output(raw_output, allow_script_fallback=True)
+        structured, answer, untrusted_refs, claim_verification, contract_issues = assess_output(
+            raw_output, allow_script_fallback=True
         )
         repair_attempted = False
         if untrusted_refs or not claim_verification.passed or contract_issues:
@@ -5343,10 +6334,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             feedback = {
                 "contractIssues": contract_issues,
                 "untrustedEvidenceRefs": untrusted_refs,
-                "unsupportedClaims": [
-                    item.model_dump(by_alias=True)
-                    for item in claim_verification.unsupported_claims
-                ],
+                "unsupportedClaims": [item.model_dump(by_alias=True) for item in claim_verification.unsupported_claims],
                 "repairPolicy": (
                     "Revise presentation only from the same immutable /input.json. "
                     "Do not request more data, add metrics, or alter governed formulas."
@@ -5361,8 +6349,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 job_id="%s_repair1" % skill_run_id,
                 thread_id="%s__repair1" % skill_thread_id,
                 system_prompt=(
-                    isolated_job.system_prompt
-                    + " This is the only permitted repair attempt. Read /draft-output.json "
+                    isolated_job.system_prompt + " This is the only permitted repair attempt. Read /draft-output.json "
                     "and /verification-feedback.json, then return a corrected JSON object. "
                     "Use exactly the same immutable evidence and never ask the parent to query."
                 ),
@@ -5380,11 +6367,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         on_progress=progress_event,
                     )
                 checkpoint_ref = dict(repaired_result.checkpoint)
-                structured, answer, untrusted_refs, claim_verification, contract_issues = (
-                    assess_output(
-                        repaired_result.raw_output,
-                        allow_script_fallback=False,
-                    )
+                structured, answer, untrusted_refs, claim_verification, contract_issues = assess_output(
+                    repaired_result.raw_output,
+                    allow_script_fallback=False,
                 )
             except Exception as exc:
                 contract_issues.append(
@@ -5413,10 +6398,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "queryMutationAllowed": False,
                 "contractIssues": contract_issues,
                 "untrustedEvidenceRefs": untrusted_refs,
-                "unsupportedClaims": [
-                    item.model_dump(by_alias=True)
-                    for item in claim_verification.unsupported_claims
-                ],
+                "unsupportedClaims": [item.model_dump(by_alias=True) for item in claim_verification.unsupported_claims],
                 "progress": progress,
             }
             result_path.write_text(
@@ -5426,9 +6408,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             self._record_skill_run(session, fallback)
             return fallback
 
-        publication_requests = list(
-            structured.get("_groundedAnalysisPublicationRequests") or []
-        )
+        publication_requests = list(structured.get("_groundedAnalysisPublicationRequests") or [])
         try:
             if session.question_goal_contract is None:
                 # Compatibility for direct unit/legacy harness construction.
@@ -5464,8 +6444,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "workspace": str(workspace),
                 "artifact": str(result_path),
                 "queryMutationAllowed": False,
-                "error": "%s:%s"
-                % (type(exc).__name__, str(exc)[:500]),
+                "error": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                 "progress": progress,
             }
             result_path.write_text(
@@ -5489,18 +6468,10 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             "workspace": str(workspace),
             "artifact": str(result_path),
             "answerMarkdown": answer,
-            "verifiedAnalysisArtifactIds": [
-                item.artifact_id for item in analysis_artifacts
-            ],
-            "goalCoverage": (
-                final_goal_coverage.model_dump(by_alias=True)
-                if final_goal_coverage is not None
-                else {}
-            ),
+            "verifiedAnalysisArtifactIds": [item.artifact_id for item in analysis_artifacts],
+            "goalCoverage": (final_goal_coverage.model_dump(by_alias=True) if final_goal_coverage is not None else {}),
             "answerCoverage": (
-                final_answer_coverage.model_dump(by_alias=True)
-                if final_answer_coverage is not None
-                else {}
+                final_answer_coverage.model_dump(by_alias=True) if final_answer_coverage is not None else {}
             ),
             "observations": structured.get("observations") or [],
             "semanticDisclosures": structured.get("semanticDisclosures") or [],
@@ -5532,9 +6503,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
 
         published: list[GroundedDerivedAnalysisArtifact] = []
         for raw_request in publication_requests:
-            request = GroundedRunSkillAnalysisPublicationRequest.model_validate(
-                raw_request
-            )
+            request = GroundedRunSkillAnalysisPublicationRequest.model_validate(raw_request)
             artifact = publish_grounded_analysis_from_skill(
                 goal_contract=session.question_goal_contract,
                 publication_request=request,
@@ -5543,17 +6512,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             )
             with session.lock:
                 existing = next(
-                    (
-                        item
-                        for item in session.verified_analysis_ledger
-                        if item.artifact_id == artifact.artifact_id
-                    ),
+                    (item for item in session.verified_analysis_ledger if item.artifact_id == artifact.artifact_id),
                     None,
                 )
                 if existing is None:
-                    session.verified_analysis_ledger.append(
-                        artifact.model_copy(deep=True)
-                    )
+                    session.verified_analysis_ledger.append(artifact.model_copy(deep=True))
                 else:
                     artifact = existing.model_copy(deep=True)
             published.append(artifact)
@@ -5571,11 +6534,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         bindings = list(query_render.bindings)
         for artifact in session.verified_analysis_ledger:
             rendered = render_grounded_analysis_artifact(artifact)
-            answer = "\n\n".join(
-                item
-                for item in (answer, rendered.answer_markdown)
-                if str(item or "").strip()
-            )
+            answer = "\n\n".join(item for item in (answer, rendered.answer_markdown) if str(item or "").strip())
             bindings.append(rendered.binding)
         answer_coverage = AnswerCoverageVerifier().require_complete(
             session.question_goal_contract,
@@ -5589,9 +6548,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             state.answer = answer
             state.phase = "ANSWERED"
             session.goal_coverage_result = coverage.model_dump(by_alias=True)
-            session.answer_coverage_result = answer_coverage.model_dump(
-                by_alias=True
-            )
+            session.answer_coverage_result = answer_coverage.model_dump(by_alias=True)
         return answer, published, coverage, answer_coverage
 
     def _skill_directory(self, skill_name: str) -> Optional[Path]:
@@ -5618,43 +6575,25 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         active_contract = state.active_contract
         verified = state.answer_verified_evidence or state.verified_evidence
         selected_artifact_ids = set(state.answer_artifact_ids)
-        selected_artifacts = [
-            item
-            for item in state.verified_query_ledger
-            if item.artifact_id in selected_artifact_ids
-        ]
+        selected_artifacts = [item for item in state.verified_query_ledger if item.artifact_id in selected_artifact_ids]
         allowed_evidence_refs = list(
-            dict.fromkeys(
-                ref_id
-                for artifact in selected_artifacts
-                for ref_id in artifact.contract.evidence_refs
-            )
+            dict.fromkeys(ref_id for artifact in selected_artifacts for ref_id in artifact.contract.evidence_refs)
         )
         analysis_inputs: list[dict[str, Any]] = []
         if session.question_goal_contract is not None:
-            coverage = GroundedDeepAgentRuntime._goal_coverage_snapshot(
-                session
-            )
+            coverage = GroundedDeepAgentRuntime._goal_coverage_snapshot(session)
             gate = verify_grounded_analysis_data_input_coverage(
                 goal_contract=session.question_goal_contract,
                 query_goal_coverage=coverage,
             )
             if gate.skill_start_allowed:
                 for goal_id in gate.deferred_goal_ids:
-                    input_goal_ids = (
-                        gate.deferred_input_goal_ids_by_goal_id.get(
-                            goal_id, []
-                        )
-                    )
+                    input_goal_ids = gate.deferred_input_goal_ids_by_goal_id.get(goal_id, [])
                     requested_ids = list(
                         dict.fromkeys(
                             artifact_id
                             for input_goal_id in input_goal_ids
-                            for artifact_id in (
-                                coverage.coverage_by_goal_id.get(
-                                    input_goal_id, []
-                                )
-                            )
+                            for artifact_id in (coverage.coverage_by_goal_id.get(input_goal_id, []))
                         )
                     )
                     analysis_input = build_grounded_analysis_skill_input(
@@ -5664,9 +6603,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         verified_query_artifacts=state.verified_query_ledger,
                         artifact_goal_ids=session.artifact_goal_ids,
                     )
-                    analysis_inputs.append(
-                        analysis_input.model_dump(by_alias=True)
-                    )
+                    analysis_inputs.append(analysis_input.model_dump(by_alias=True))
         return {
             "skillName": skill_name,
             "skillRunId": skill_run_id,
@@ -5680,24 +6617,14 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     else str(active_contract.query_shape if active_contract else "")
                 ),
                 "analysisMode": str(active_contract.analysis_mode if active_contract else ""),
-                "tables": list(
-                    run_result.merged_query_bundle.tables
-                    if run_result is not None
-                    else []
-                ),
+                "tables": list(run_result.merged_query_bundle.tables if run_result is not None else []),
                 "timeRange": (
-                    active_contract.time_range.model_dump(by_alias=True)
-                    if active_contract is not None
-                    else {}
+                    active_contract.time_range.model_dump(by_alias=True) if active_contract is not None else {}
                 ),
                 "evidenceRefs": allowed_evidence_refs,
                 "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
             },
-            "dataRows": (
-                list(run_result.merged_query_bundle.rows)[:200]
-                if run_result is not None
-                else []
-            ),
+            "dataRows": (list(run_result.merged_query_bundle.rows)[:200] if run_result is not None else []),
             "metricDisclosures": [
                 dict(spec)
                 for intent in (plan.intents if plan is not None else [])
@@ -5710,21 +6637,17 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "derivedEvidence": list(verified.derived_evidence) if verified is not None else [],
                 "requiredDisclosures": list(verified.required_disclosures) if verified is not None else [],
                 "blockingGaps": [
-                    gap.model_dump(by_alias=True)
-                    for gap in (verified.blocking_gaps if verified is not None else [])
+                    gap.model_dump(by_alias=True) for gap in (verified.blocking_gaps if verified is not None else [])
                 ],
                 "warningGaps": [
-                    gap.model_dump(by_alias=True)
-                    for gap in (verified.warning_gaps if verified is not None else [])
+                    gap.model_dump(by_alias=True) for gap in (verified.warning_gaps if verified is not None else [])
                 ],
             },
             "evidenceGaps": [
                 gap.model_dump(by_alias=True)
                 for gap in (run_result.evidence_gaps[:32] if run_result is not None else [])
             ],
-            "allowedEvidenceRefs": list(
-                allowed_evidence_refs
-            ),
+            "allowedEvidenceRefs": list(allowed_evidence_refs),
             "analysisGoals": analysis_inputs,
         }
 
@@ -5778,10 +6701,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
     ) -> None:
         with session.lock:
             session.skill_runs.append(dict(result))
-            run_result = (
-                session.runtime.answer_run_result
-                or session.runtime.run_result
-            )
+            run_result = session.runtime.answer_run_result or session.runtime.run_result
             if run_result is not None:
                 run_result.skill_lifecycle_records.append(
                     SkillLifecycleRecord(
@@ -5793,8 +6713,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         isolated_run_id=str(result.get("skillRunId") or ""),
                         workspace_path=str(result.get("workspace") or ""),
                         progress=[
-                            "%s:%s"
-                            % (item.get("stage") or "", item.get("status") or "")
+                            "%s:%s" % (item.get("stage") or "", item.get("status") or "")
                             for item in result.get("progress") or []
                             if isinstance(item, dict)
                         ],
@@ -5839,9 +6758,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         declarations: list[VerifiedArtifactGoalCoverage] = []
         query_artifacts = list(session.runtime.verified_query_ledger)
         for artifact in query_artifacts:
-            assigned_goal_ids = (
-                session.artifact_goal_ids.get(artifact.artifact_id) or []
-            )
+            assigned_goal_ids = session.artifact_goal_ids.get(artifact.artifact_id) or []
             declarations.append(
                 declare_verified_artifact_goal_coverage(
                     contract,
@@ -5858,15 +6775,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 )
             )
         for artifact in session.runtime.verified_rule_ledger:
-            evidence_refs = [
-                item.ref_id for item in artifact.evidence_refs
-            ]
+            evidence_refs = [item.ref_id for item in artifact.evidence_refs]
             declarations.append(
                 VerifiedArtifactGoalCoverage(
                     artifact_id=artifact.artifact_id,
-                    goal_contract_fingerprint=(
-                        artifact.goal_contract_fingerprint
-                    ),
+                    goal_contract_fingerprint=(artifact.goal_contract_fingerprint),
                     covered_goal_ids=list(artifact.goal_ids),
                     verification_passed=artifact.verification_passed,
                     evidence_refs=evidence_refs,
@@ -5885,9 +6798,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 )
             )
         for artifact in session.verified_analysis_ledger:
-            declarations.append(
-                grounded_analysis_goal_coverage(contract, artifact)
-            )
+            declarations.append(grounded_analysis_goal_coverage(contract, artifact))
         return declarations
 
     @staticmethod
@@ -5924,6 +6835,164 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         thread_id: str = "",
         run_id: str = "",
         listener: Optional[Callable[[str, str, dict[str, Any]], None]] = None,
+        request_context: Optional[ChatContext] = None,
+        message_history: Optional[list[ConversationMessage]] = None,
+    ) -> ChatResponse:
+        actual_thread_id = thread_id or "thread_%s" % uuid.uuid4().hex
+        actual_run_id = run_id or "run_%s" % uuid.uuid4().hex
+        store = self.conversation_state_store
+        transaction = store.locked(actual_thread_id) if store is not None else nullcontext()
+        with transaction:
+            persisted_snapshot: dict[str, Any] = {}
+            persisted_revision = 0
+            if store is not None:
+                try:
+                    persisted = store.load(actual_thread_id)
+                except GroundedConversationStateCorruptError:
+                    clarification = ClarificationRequest(
+                        question=(
+                            "当前会话的服务端状态无法安全恢复。为避免沿用错误的数据范围，"
+                            "请重新说明这次查询的完整时间范围和筛选条件。"
+                        ),
+                        stage="conversation_state",
+                        type="conversation_state_corrupt",
+                        pending_question=str(question or "").strip(),
+                    )
+                    return ChatResponse(
+                        answer=clarification.question,
+                        clarification=clarification,
+                        debug_trace={
+                            "harness": {
+                                "runtime": "grounded_deepagent",
+                                "threadId": actual_thread_id,
+                                "runId": actual_run_id,
+                                "conversationResolution": {
+                                    "status": "CORRUPT_STATE_REJECTED",
+                                },
+                            }
+                        },
+                    )
+                if persisted is not None:
+                    persisted_snapshot = dict(persisted.snapshot)
+                    persisted_revision = int(persisted.revision)
+                    expected_principal = str(persisted_snapshot.get("principalFingerprint") or "")
+                    actual_principal = grounded_conversation_principal_fingerprint(
+                        merchant_id,
+                        user_scope,
+                    )
+                    if expected_principal and expected_principal != actual_principal:
+                        raise PermissionError(
+                            "GROUNDED_CONVERSATION_PRINCIPAL_SCOPE_MISMATCH"
+                        )
+            resolution = resolve_grounded_conversation_turn(
+                question,
+                persisted_snapshot=persisted_snapshot,
+                persisted_revision=persisted_revision,
+                message_history=message_history,
+                request_context=request_context,
+            )
+            if resolution.needs_clarification:
+                clarification = ClarificationRequest(
+                    question=resolution.clarification_question,
+                    stage="conversation_reference",
+                    type="ambiguous_reference",
+                    options=list(resolution.clarification_options),
+                    pending_question=resolution.original_question,
+                )
+                response = ChatResponse(
+                    answer=clarification.question,
+                    clarification=clarification,
+                    debug_trace={
+                        "harness": {
+                            "runtime": "grounded_deepagent",
+                            "threadId": actual_thread_id,
+                            "runId": actual_run_id,
+                            "conversationResolution": resolution.trace(),
+                        }
+                    },
+                )
+                self._persist_conversation_state(
+                    actual_thread_id,
+                    actual_run_id,
+                    merchant_id,
+                    user_scope,
+                    resolution,
+                    response,
+                    previous_snapshot=persisted_snapshot,
+                    expected_revision=persisted_revision,
+                    session=None,
+                )
+                return response
+            try:
+                reference_scope = _trusted_reference_scope_binding(
+                    resolution,
+                    persisted_snapshot,
+                )
+            except (TypeError, ValueError) as exc:
+                clarification = ClarificationRequest(
+                    question=(
+                        "上一轮结果的验证信息已经失效或不完整，不能安全地继续沿用。"
+                        "请重新说明要分析的时间范围和筛选条件。"
+                    ),
+                    stage="conversation_reference",
+                    type="reference_artifact_invalid",
+                    pending_question=resolution.original_question,
+                )
+                response = ChatResponse(
+                    answer=clarification.question,
+                    clarification=clarification,
+                    debug_trace={
+                        "harness": {
+                            "runtime": "grounded_deepagent",
+                            "threadId": actual_thread_id,
+                            "runId": actual_run_id,
+                            "conversationResolution": resolution.trace(),
+                            "referenceBindingError": str(exc)[:240],
+                        }
+                    },
+                )
+                self._persist_conversation_state(
+                    actual_thread_id,
+                    actual_run_id,
+                    merchant_id,
+                    user_scope,
+                    resolution,
+                    response,
+                    previous_snapshot=persisted_snapshot,
+                    expected_revision=persisted_revision,
+                    session=None,
+                )
+                return response
+            return self._run_once(
+                resolution.effective_question,
+                merchant_id,
+                merchant=merchant,
+                access_role=access_role,
+                user_scope=user_scope,
+                thread_id=actual_thread_id,
+                run_id=actual_run_id,
+                listener=listener,
+                conversation_resolution=resolution,
+                previous_conversation_snapshot=persisted_snapshot,
+                expected_conversation_revision=persisted_revision,
+                reference_scope=reference_scope,
+            )
+
+    def _run_once(
+        self,
+        question: str,
+        merchant_id: str,
+        *,
+        merchant: Optional[MerchantInfo] = None,
+        access_role: str = "merchant_analyst",
+        user_scope: Optional[dict[str, Any]] = None,
+        thread_id: str = "",
+        run_id: str = "",
+        listener: Optional[Callable[[str, str, dict[str, Any]], None]] = None,
+        conversation_resolution: Optional[GroundedConversationResolution] = None,
+        previous_conversation_snapshot: Optional[dict[str, Any]] = None,
+        expected_conversation_revision: int = 0,
+        reference_scope: Optional[GroundedReferenceScopeBinding] = None,
     ) -> ChatResponse:
         actual_thread_id = thread_id or "thread_%s" % uuid.uuid4().hex
         actual_run_id = run_id or "run_%s" % uuid.uuid4().hex
@@ -5932,12 +7001,17 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         session: Optional[GroundedDeepAgentSession] = None
         try:
             with budget.stage("bootstrap.session"):
+                session_kwargs: dict[str, Any] = {
+                    "merchant": merchant,
+                    "access_role": access_role,
+                    "user_scope": user_scope,
+                }
+                if reference_scope is not None and reference_scope.enabled:
+                    session_kwargs["reference_scope"] = reference_scope
                 kernel_session = self.kernel.new_session(
                     question,
                     merchant_id,
-                    merchant=merchant,
-                    access_role=access_role,
-                    user_scope=user_scope,
+                    **session_kwargs,
                 )
             with budget.stage("routing.topic"):
                 if isinstance(self.kernel, GroundedRuntimeKernel):
@@ -5960,11 +7034,25 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         sequence=len(kernel_session.events) + 1,
                         stage="recall_navigation",
                         status="DEGRADED",
-                        detail="%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
+                        detail="%s:%s" % (type(exc).__name__, str(exc)[:500]),
                     )
                 )
-            session = GroundedDeepAgentSession(runtime=kernel_session)
+            session = GroundedDeepAgentSession(
+                runtime=kernel_session,
+                conversation_context=(
+                    {
+                        "resolution": conversation_resolution.trace(),
+                        "activeScope": dict(
+                            (previous_conversation_snapshot or {}).get(
+                                "activeScope"
+                            )
+                            or {}
+                        ),
+                    }
+                    if conversation_resolution is not None
+                    else {}
+                ),
+            )
             context = GroundedDeepAgentRunContext(
                 thread_id=actual_thread_id,
                 run_id=actual_run_id,
@@ -6009,7 +7097,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "GROUNDED_CORE",
                     failure,
                 )
-                return ChatResponse(
+                response = ChatResponse(
                     answer=(
                         "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
                         "请缩小查询范围，或稍后重试。"
@@ -6021,11 +7109,23 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "runId": actual_run_id,
                             "legacyFallbackUsed": False,
                             "runtimeBudget": report,
+                            "performance": {
+                                "totalDurationMs": report.get(
+                                    "elapsedMs",
+                                    0,
+                                ),
+                                "runtimeBudget": report,
+                            },
                             "goalCoverage": {},
                             "operationalFailure": failure,
                         }
                     },
                 )
+                if conversation_resolution is not None:
+                    response.debug_trace["harness"]["conversationResolution"] = (
+                        conversation_resolution.trace()
+                    )
+                return response
             session.operational_failure = {
                 **failure,
                 "report": report,
@@ -6038,17 +7138,24 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "GROUNDED_CORE",
                 session.operational_failure,
             )
-            return self._governed_response(
+            response = self._governed_response(
                 session,
                 actual_thread_id,
                 actual_run_id,
             )
+            return self._finalize_conversation_response(
+                response,
+                session=session,
+                resolution=conversation_resolution,
+                thread_id=actual_thread_id,
+                run_id=actual_run_id,
+                merchant_id=merchant_id,
+                user_scope=user_scope,
+                previous_snapshot=previous_conversation_snapshot or {},
+                expected_revision=expected_conversation_revision,
+            )
         except Exception as exc:
-            if (
-                session is not None
-                and session.runtime.answer
-                and self._answer_is_attested(session)
-            ):
+            if session is not None and session.runtime.answer and self._answer_is_attested(session):
                 # compose_verified_answer is terminal, but preserve a verified
                 # answer if a provider/framework performs an unnecessary tail
                 # turn and that tail fails.  A post-answer transport error must
@@ -6084,7 +7191,275 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             if session is not None and not session.runtime_budget_report:
                 session.runtime_budget_report = budget.finish()
         assert session is not None
-        return self._governed_response(session, actual_thread_id, actual_run_id)
+        response = self._governed_response(session, actual_thread_id, actual_run_id)
+        return self._finalize_conversation_response(
+            response,
+            session=session,
+            resolution=conversation_resolution,
+            thread_id=actual_thread_id,
+            run_id=actual_run_id,
+            merchant_id=merchant_id,
+            user_scope=user_scope,
+            previous_snapshot=previous_conversation_snapshot or {},
+            expected_revision=expected_conversation_revision,
+        )
+
+    def _finalize_conversation_response(
+        self,
+        response: ChatResponse,
+        *,
+        session: GroundedDeepAgentSession,
+        resolution: Optional[GroundedConversationResolution],
+        thread_id: str,
+        run_id: str,
+        merchant_id: str,
+        user_scope: Optional[dict[str, Any]],
+        previous_snapshot: dict[str, Any],
+        expected_revision: int,
+    ) -> ChatResponse:
+        harness = dict((response.debug_trace or {}).get("harness") or {})
+        if resolution is not None:
+            harness["conversationResolution"] = resolution.trace()
+        response.debug_trace = {
+            **dict(response.debug_trace or {}),
+            "harness": harness,
+        }
+        if resolution is not None:
+            self._persist_conversation_state(
+                thread_id,
+                run_id,
+                merchant_id,
+                user_scope,
+                resolution,
+                response,
+                previous_snapshot=previous_snapshot,
+                expected_revision=expected_revision,
+                session=session,
+            )
+        return response
+
+    def _persist_conversation_state(
+        self,
+        thread_id: str,
+        run_id: str,
+        merchant_id: str,
+        user_scope: Optional[dict[str, Any]],
+        resolution: GroundedConversationResolution,
+        response: ChatResponse,
+        *,
+        previous_snapshot: dict[str, Any],
+        expected_revision: int,
+        session: Optional[GroundedDeepAgentSession],
+    ) -> None:
+        store = self.conversation_state_store
+        if store is None:
+            return
+        previous = dict(previous_snapshot or {})
+        now = datetime.now(timezone.utc)
+        ttl_seconds = max(
+            60,
+            int(
+                getattr(
+                    self.settings,
+                    "thread_context_summary_ttl_seconds",
+                    2_592_000,
+                )
+                or 2_592_000
+            ),
+        )
+        operational_failure = bool(
+            ((response.debug_trace or {}).get("harness") or {}).get(
+                "operationalFailure"
+            )
+        )
+        verified_scope = (
+            self._verified_conversation_scope(session)
+            if session is not None and not operational_failure
+            else {}
+        )
+        active_scope = (
+            verified_scope
+            if verified_scope.get("artifactIds")
+            else dict(previous.get("activeScope") or {})
+        )
+        pending: dict[str, Any] = {}
+        if response.clarification is not None:
+            pending = {
+                "stage": str(response.clarification.stage or ""),
+                "type": str(response.clarification.type or ""),
+                "pendingQuestion": str(
+                    response.clarification.pending_question
+                    or resolution.effective_question
+                ),
+                "options": list(response.clarification.options),
+                "sourceRunId": run_id,
+            }
+        turn_status = (
+            "CLARIFICATION_REQUIRED"
+            if response.clarification is not None
+            else "FAILED"
+            if operational_failure
+            else "VERIFIED"
+            if verified_scope.get("artifactIds")
+            else "COMPLETED"
+        )
+        turns = [
+            dict(item)
+            for item in (previous.get("turns") or [])
+            if isinstance(item, dict)
+        ][-11:]
+        turns.append(
+            {
+                "runId": run_id,
+                "originalQuestion": resolution.original_question,
+                "effectiveQuestion": resolution.effective_question,
+                "resolutionStatus": resolution.status,
+                "status": turn_status,
+                "artifactIds": list(verified_scope.get("artifactIds") or []),
+                "createdAt": now.isoformat().replace("+00:00", "Z"),
+            }
+        )
+        snapshot = {
+            "stateVersion": GROUNDED_CONVERSATION_STATE_VERSION,
+            "merchantId": str(merchant_id or "").strip(),
+            "principalFingerprint": grounded_conversation_principal_fingerprint(
+                merchant_id,
+                user_scope,
+            ),
+            "lastTurn": turns[-1],
+            "turns": turns,
+            "activeScope": active_scope,
+            "pendingClarification": pending,
+            "expiresAt": (now + timedelta(seconds=ttl_seconds))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        store.save_snapshot(
+            thread_id,
+            snapshot,
+            expected_revision=expected_revision,
+        )
+
+    @staticmethod
+    def _verified_conversation_scope(
+        session: Optional[GroundedDeepAgentSession],
+    ) -> dict[str, Any]:
+        if session is None:
+            return {}
+        state = session.runtime
+        selected_ids = set(state.answer_artifact_ids)
+        artifacts = [
+            item
+            for item in state.verified_query_ledger
+            if item.verified_evidence.passed
+            and (not selected_ids or item.artifact_id in selected_ids)
+        ][:8]
+        if not artifacts:
+            return {}
+        result_sets: list[dict[str, Any]] = []
+        source_artifacts: list[dict[str, Any]] = []
+        all_times: list[str] = []
+        all_filters: list[str] = []
+        for artifact in artifacts:
+            contract = artifact.contract
+            time_range = contract.time_range
+            absolute_time = ""
+            if bool(time_range.explicit):
+                start = str(
+                    time_range.execution_start_date
+                    or time_range.start_date
+                    or ""
+                ).strip()
+                end = str(
+                    time_range.execution_end_date
+                    or time_range.end_date
+                    or ""
+                ).strip()
+                absolute_time = (
+                    "%s 至 %s" % (start, end)
+                    if start and end and start != end
+                    else start or end or str(time_range.label or "").strip()
+                )
+            filter_summaries = [
+                _conversation_filter_summary(item)
+                for item in contract.entity_filters
+            ]
+            filter_summaries = [item for item in filter_summaries if item]
+            times = [absolute_time] if absolute_time else []
+            goal_ids = list(session.artifact_goal_ids.get(artifact.artifact_id) or [])
+            bundle = artifact.run_result.merged_query_bundle
+            result_set = {
+                "label": "%s %s" % (
+                    "/".join(contract.topics),
+                    str(contract.query_shape or ""),
+                ),
+                "queryShape": str(contract.query_shape or ""),
+                "topics": list(contract.topics),
+                "tables": list(bundle.tables),
+                "timeExpressions": times,
+                "filterSummaries": filter_summaries,
+                "goalIds": goal_ids,
+                "queryArtifactId": artifact.artifact_id,
+                "contractFingerprint": artifact.contract_fingerprint,
+                "sqlFingerprint": artifact.sql_fingerprint,
+                "previewRowCount": len(bundle.rows),
+                "completeRowCount": int(bundle.effective_row_count()),
+                "offloaded": bool(bundle.offloaded_files),
+                "coverageStatus": str(
+                    getattr(bundle, "coverage_status", "")
+                    or getattr(bundle, "result_coverage", "")
+                    or (
+                        "TOP_N"
+                        if str(contract.query_shape or "").upper() == "RANKED"
+                        else "PREVIEW"
+                        if bool(getattr(bundle, "is_truncated", False))
+                        else "UNKNOWN"
+                    )
+                ).upper(),
+                "hasMore": bool(
+                    getattr(bundle, "has_more", False)
+                    or getattr(bundle, "is_truncated", False)
+                ),
+                "entityIdentities": list(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in artifact.output_entity_identities.values()
+                        if str(item).strip()
+                    )
+                ),
+                "outputEntityIdentities": dict(
+                    artifact.output_entity_identities
+                ),
+                "dataGrains": list(
+                    dict.fromkeys(
+                        str(item.data_grain or "").strip()
+                        for item in contract.tables
+                        if str(item.data_grain or "").strip()
+                    )
+                ),
+                "snapshotSemantics": "ABSOLUTE_PREDICATE_SNAPSHOT",
+            }
+            result_sets.append(result_set)
+            source_artifacts.append(
+                {
+                    "queryArtifactId": artifact.artifact_id,
+                    "contractFingerprint": artifact.contract_fingerprint,
+                    "sqlFingerprint": artifact.sql_fingerprint,
+                    "goalIds": goal_ids,
+                    "contract": contract.model_dump(by_alias=True, mode="json"),
+                }
+            )
+            all_times.extend(times)
+            all_filters.extend(filter_summaries)
+        return {
+            "artifactIds": [item.artifact_id for item in artifacts],
+            "timeExpressions": list(dict.fromkeys(all_times)),
+            "filterSummaries": list(dict.fromkeys(all_filters)),
+            "resultSets": result_sets,
+            "sourceArtifacts": source_artifacts,
+            "scopeSemantics": "VERIFIED_QUERY_PREDICATE_SNAPSHOT",
+            "previewRowsAreCompletePopulation": False,
+        }
 
     def _initial_context(self, session: GroundedDeepAgentSession) -> str:
         manifests: list[dict[str, Any]] = []
@@ -6095,10 +7470,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 offset=0,
             )
             if not isinstance(result, dict) or not result.get("success"):
-                raise RuntimeError(
-                    "Grounded bootstrap failed: Topic L0 manifest unavailable for %s"
-                    % topic_name
-                )
+                raise RuntimeError("Grounded bootstrap failed: Topic L0 manifest unavailable for %s" % topic_name)
             manifests.append(
                 {
                     "topic": topic_name,
@@ -6109,12 +7481,54 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             )
         if not manifests:
             raise RuntimeError("Grounded bootstrap failed: no routed Topic L0 manifest")
+        conversation_context = dict(session.conversation_context or {})
+        active_conversation_scope = dict(
+            conversation_context.get("activeScope") or {}
+        )
+        compact_source_artifacts = [
+            {
+                "queryArtifactId": str(item.get("queryArtifactId") or ""),
+                "contractFingerprint": str(
+                    item.get("contractFingerprint") or ""
+                ),
+                "sqlFingerprint": str(item.get("sqlFingerprint") or ""),
+                "goalIds": list(item.get("goalIds") or []),
+            }
+            for item in active_conversation_scope.get("sourceArtifacts") or []
+            if isinstance(item, dict)
+        ][:8]
         payload = {
             "question": session.runtime.question,
-            "userInputRequirements": {
-                "explicitTimeExpression": has_explicit_time_expression(
-                    session.runtime.question
+            "trustedConversationContext": {
+                "resolution": dict(
+                    conversation_context.get("resolution") or {}
                 ),
+                "activeScope": {
+                    "scopeSemantics": str(
+                        active_conversation_scope.get("scopeSemantics") or ""
+                    ),
+                    "artifactIds": list(
+                        active_conversation_scope.get("artifactIds") or []
+                    ),
+                    "timeExpressions": list(
+                        active_conversation_scope.get("timeExpressions") or []
+                    ),
+                    "filterSummaries": list(
+                        active_conversation_scope.get("filterSummaries") or []
+                    ),
+                    "resultSets": list(
+                        active_conversation_scope.get("resultSets") or []
+                    )[:8],
+                    "sourceArtifacts": compact_source_artifacts,
+                    "previewRowsAreCompletePopulation": False,
+                },
+                "authority": (
+                    "Server-generated from verified query artifacts. Reuse the full "
+                    "predicate scope; never infer population membership from preview rows."
+                ),
+            },
+            "userInputRequirements": {
+                "explicitTimeExpression": has_explicit_time_expression(session.runtime.question),
                 "timeRequirementPolicy": {
                     "analyticalOrDetailList": "EXPLICIT_TIME_REQUIRED",
                     "resolvedEntityLookup": "USE_FIELD_LOOKUP_TIME_POLICY",
@@ -6134,9 +7548,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "authorizedStoreIds": [
                     str(item)
                     for item in (
-                        session.runtime.user_scope.get("storeIds")
-                        or session.runtime.user_scope.get("store_ids")
-                        or []
+                        session.runtime.user_scope.get("storeIds") or session.runtime.user_scope.get("store_ids") or []
                     )
                     if str(item or "").strip()
                 ],
@@ -6167,9 +7579,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "branchDeclarationRequiredBeforeRetrieval": True,
                 "branchTopicScopeAuthority": "CORE_LLM_WITHIN_ROUTED_TOPICS",
                 "finalizationRequiresVerifiedCoverage": True,
-                "parallelRule": (
-                    "Only goals without dependency/upstream entity bindings may share a batch."
-                ),
+                "parallelRule": ("Only goals without dependency/upstream entity bindings may share a batch."),
             },
             "analysisSkillPolicy": {
                 "lifecyclePhase": "post_query_analysis",
@@ -6208,12 +7618,10 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "legacyFallbackUsed": False,
                 "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
                 "verifiedQueryArtifactCount": len(state.answer_artifact_ids),
-                "verifiedRuleArtifactIds": list(
-                    state.answer_rule_artifact_ids
-                ),
-                "verifiedRuleArtifactCount": len(
-                    state.answer_rule_artifact_ids
-                ),
+                "verifiedRuleArtifactIds": list(state.answer_rule_artifact_ids),
+                "verifiedRuleArtifactCount": len(state.answer_rule_artifact_ids),
+                "verifiedAnalysisArtifactIds": [item.artifact_id for item in session.verified_analysis_ledger],
+                "verifiedAnalysisArtifactCount": len(session.verified_analysis_ledger),
                 "skillRuns": [
                     {
                         "skillName": item.get("skillName"),
@@ -6226,33 +7634,31 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     for item in session.skill_runs
                 ],
                 "runtimeBudget": dict(session.runtime_budget_report),
-                "queryBranches": [
-                    context.report()
-                    for context in session.query_branch_contexts.values()
-                ],
+                "performance": {
+                    "totalDurationMs": session.runtime_budget_report.get(
+                        "elapsedMs",
+                        0,
+                    ),
+                    "runtimeBudget": dict(
+                        session.runtime_budget_report
+                    ),
+                },
+                "queryBranches": [context.report() for context in session.query_branch_contexts.values()],
                 "goalCoverage": dict(session.goal_coverage_result),
                 "answerCoverage": dict(session.answer_coverage_result),
+                "analysisDataInputGate": dict(session.analysis_data_input_gate_result),
                 "contextManagement": {
                     "modelCallCount": len(session.core_context_reports),
-                    "latest": (
-                        dict(session.core_context_reports[-1])
-                        if session.core_context_reports
-                        else {}
-                    ),
-                    "calls": [
-                        dict(item) for item in session.core_context_reports[-16:]
-                    ],
+                    "latest": (dict(session.core_context_reports[-1]) if session.core_context_reports else {}),
+                    "calls": [dict(item) for item in session.core_context_reports[-16:]],
                 },
             }
         }
         if session.operational_failure:
-            trace["harness"]["operationalFailure"] = dict(
-                session.operational_failure
-            )
+            trace["harness"]["operationalFailure"] = dict(session.operational_failure)
             return ChatResponse(
                 answer=(
-                    "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；"
-                    "请稍后重试。"
+                    "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；请稍后重试。"
                     if session.operational_failure.get("code") == "GROUNDED_PROVIDER_TIMEOUT"
                     else "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
                     "请缩小查询范围，或稍后重试。"
@@ -6267,30 +7673,15 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 clarification=state.clarification,
                 debug_trace=trace,
             )
-        if state.answer and GroundedDeepAgentRuntime._answer_is_attested(
-            session
-        ):
+        if state.answer and GroundedDeepAgentRuntime._answer_is_attested(session):
             display_run = state.answer_run_result or state.run_result
-            rows = (
-                list(display_run.merged_query_bundle.rows)
-                if display_run is not None
-                else []
-            )
-            tables = (
-                list(display_run.merged_query_bundle.tables)
-                if display_run is not None
-                else []
-            )
+            rows = list(display_run.merged_query_bundle.rows) if display_run is not None else []
+            tables = list(display_run.merged_query_bundle.tables) if display_run is not None else []
             sections = [
                 {
-                    "title": (
-                        artifact.contract.query_shape
-                        or "Verified query evidence"
-                    ),
+                    "title": (artifact.contract.query_shape or "Verified query evidence"),
                     "resultRole": "verified_query_artifact",
-                    "dorisTables": list(
-                        artifact.run_result.merged_query_bundle.tables
-                    ),
+                    "dorisTables": list(artifact.run_result.merged_query_bundle.tables),
                     "dataRows": [
                         {
                             **dict(row),
@@ -6298,19 +7689,10 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         }
                         for row in artifact.run_result.merged_query_bundle.rows
                     ],
-                    "offloaded": bool(
-                        artifact.run_result.merged_query_bundle.offloaded_files
-                    ),
-                    "offloadedFiles": list(
-                        artifact.run_result.merged_query_bundle.offloaded_files
-                    ),
-                    "originalRowCount": (
-                        artifact.run_result.merged_query_bundle.effective_row_count()
-                    ),
-                    "resultSummary": (
-                        "artifact=%s; verified=true"
-                        % artifact.artifact_id
-                    ),
+                    "offloaded": bool(artifact.run_result.merged_query_bundle.offloaded_files),
+                    "offloadedFiles": list(artifact.run_result.merged_query_bundle.offloaded_files),
+                    "originalRowCount": (artifact.run_result.merged_query_bundle.effective_row_count()),
+                    "resultSummary": ("artifact=%s; verified=true" % artifact.artifact_id),
                 }
                 for artifact in state.verified_query_ledger
                 if artifact.artifact_id in set(state.answer_artifact_ids)
@@ -6324,12 +7706,8 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 debug_trace=trace,
             )
         if state.answer:
-            raise RuntimeError(
-                "Grounded final answer exists without a matching answer-coverage attestation"
-            )
-        raise RuntimeError(
-            "Grounded DeepAgent Core ended without verified answer or typed clarification"
-        )
+            raise RuntimeError("Grounded final answer exists without a matching answer-coverage attestation")
+        raise RuntimeError("Grounded DeepAgent Core ended without verified answer or typed clarification")
 
 
 def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
@@ -6339,22 +7717,13 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
         dict.fromkeys(
             [
                 *[str(item.metric_key or "") for item in contract.metrics],
-                *[
-                    str(item.output_alias or item.column or "")
-                    for item in contract.selected_fields
-                ],
-                *[
-                    str(item.column or "")
-                    for item in contract.dimensions
-                    if item.usage == "group_by"
-                ],
+                *[str(item.output_alias or item.column or "") for item in contract.selected_fields],
+                *[str(item.column or "") for item in contract.dimensions if item.usage == "group_by"],
             ]
         )
     )
     return {
-        "requiredFinalOutputAliases": [
-            item for item in required_outputs if item
-        ],
+        "requiredFinalOutputAliases": [item for item in required_outputs if item],
         "tables": [
             {
                 "table": item.table,
@@ -6410,22 +7779,67 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
             for item in contract.relationships
         ],
         "timeRange": contract.time_range.model_dump(by_alias=True),
+        "timeField": contract.time_field.model_dump(by_alias=True),
+        "referenceScope": (
+            {
+                "enabled": True,
+                "referentType": contract.reference_scope.referent_type,
+                "downstreamOperation": contract.reference_scope.downstream_operation,
+                "sourceArtifactId": contract.reference_scope.source_artifact_id,
+                "sourceContractFingerprint": contract.reference_scope.source_contract_fingerprint,
+                "sourceSqlFingerprint": contract.reference_scope.source_sql_fingerprint,
+                "sourceQueryShape": contract.reference_scope.source_query_shape,
+                "sourceTables": [
+                    {
+                        "topic": item.topic,
+                        "table": item.table,
+                        "timeColumn": item.time_column,
+                        "tenantColumn": item.merchant_filter_column,
+                        "dataGrain": item.data_grain,
+                    }
+                    for item in contract.reference_scope.source_tables
+                ],
+                "sourceTimeRange": contract.reference_scope.source_time_range.model_dump(
+                    by_alias=True
+                ),
+                "sourceTimeColumns": dict(
+                    contract.reference_scope.source_time_columns
+                ),
+                "sourceEntityFilters": [
+                    {
+                        "semanticRefId": item.semantic_ref_id,
+                        "table": item.table,
+                        "column": item.column,
+                        "operator": item.operator,
+                        "literalValue": item.literal_value,
+                    }
+                    for item in contract.reference_scope.source_entity_filters
+                ],
+                "coverageStatus": contract.reference_scope.coverage_status,
+                "snapshotSemantics": contract.reference_scope.snapshot_semantics,
+                "populationRequired": contract.reference_scope.population_required,
+                "membershipHandleType": contract.reference_scope.membership_handle_type,
+                "membershipHandleId": contract.reference_scope.membership_handle_id,
+                "membershipValuesHash": contract.reference_scope.membership_values_hash,
+                "instruction": (
+                    "Preserve this typed source lineage exactly. Predicate scope means the full "
+                    "verified source predicate, never the visible preview rows."
+                ),
+            }
+            if contract.reference_scope.enabled
+            else {"enabled": False}
+        ),
     }
 
 
 def _core_visible_binding_hints(contract: Any) -> dict[str, Any]:
     """Keep kernel-owned upstream values out of the parent Core context."""
 
-    upstream_refs = {
-        str(item.target_field_ref or "")
-        for item in contract.upstream_entity_bindings
-    }
+    upstream_refs = {str(item.target_field_ref or "") for item in contract.upstream_entity_bindings}
     hints = contract.binding_hints.model_copy(
         update={
             "entity_filters": [
-                item
-                for item in contract.binding_hints.entity_filters
-                if item.field_ref not in upstream_refs
+                item for item in contract.binding_hints.entity_filters if item.field_ref not in upstream_refs
             ]
         },
         deep=True,
@@ -6434,10 +7848,7 @@ def _core_visible_binding_hints(contract: Any) -> dict[str, Any]:
 
 
 def _core_visible_entity_filter_obligations(contract: Any) -> list[dict[str, Any]]:
-    upstream_by_ref = {
-        str(item.target_field_ref or ""): item
-        for item in contract.upstream_entity_bindings
-    }
+    upstream_by_ref = {str(item.target_field_ref or ""): item for item in contract.upstream_entity_bindings}
     result: list[dict[str, Any]] = []
     for item in contract.entity_filters:
         upstream = upstream_by_ref.get(item.semantic_ref_id)
@@ -6538,50 +7949,28 @@ def _canonical_binding_hints(hints: GroundedBindingHints) -> GroundedBindingHint
             "table_refs": [_canonical_progressive_ref(item) for item in hints.table_refs],
             "metric_refs": [_canonical_progressive_ref(item) for item in hints.metric_refs],
             "field_aggregations": [
-                item.model_copy(
-                    update={"field_ref": _canonical_progressive_ref(item.field_ref)}
-                )
+                item.model_copy(update={"field_ref": _canonical_progressive_ref(item.field_ref)})
                 for item in hints.field_aggregations
             ],
-            "dimension_refs": [
-                _canonical_progressive_ref(item) for item in hints.dimension_refs
-            ],
+            "dimension_refs": [_canonical_progressive_ref(item) for item in hints.dimension_refs],
             "selected_fields": [
-                item.model_copy(
-                    update={"field_ref": _canonical_progressive_ref(item.field_ref)}
-                )
+                item.model_copy(update={"field_ref": _canonical_progressive_ref(item.field_ref)})
                 for item in hints.selected_fields
             ],
             "entity_filters": [
-                item.model_copy(
-                    update={"field_ref": _canonical_progressive_ref(item.field_ref)}
-                )
+                item.model_copy(update={"field_ref": _canonical_progressive_ref(item.field_ref)})
                 for item in hints.entity_filters
             ],
             "upstream_entity_bindings": [
-                item.model_copy(
-                    update={
-                        "target_field_ref": _canonical_progressive_ref(
-                            item.target_field_ref
-                        )
-                    }
-                )
+                item.model_copy(update={"target_field_ref": _canonical_progressive_ref(item.target_field_ref)})
                 for item in hints.upstream_entity_bindings
             ],
             "group_by_ref": _canonical_progressive_ref(hints.group_by_ref),
-            "label_refs": {
-                _canonical_progressive_ref(key): value
-                for key, value in hints.label_refs.items()
-            },
-            "relationship_refs": [
-                _canonical_progressive_ref(item) for item in hints.relationship_refs
-            ],
+            "time_field_ref": _canonical_progressive_ref(hints.time_field_ref),
+            "label_refs": {_canonical_progressive_ref(key): value for key, value in hints.label_refs.items()},
+            "relationship_refs": [_canonical_progressive_ref(item) for item in hints.relationship_refs],
             "ranking": hints.ranking.model_copy(
-                update={
-                    "metric_ref": _canonical_progressive_ref(
-                        hints.ranking.metric_ref
-                    )
-                }
+                update={"metric_ref": _canonical_progressive_ref(hints.ranking.metric_ref)}
             ),
         }
     )
@@ -6639,6 +8028,149 @@ def _nested_values(value: Any) -> Iterator[Any]:
         yield value
 
 
+def _reference_contract_time_columns(
+    contract: GroundedQueryContract,
+) -> dict[str, list[str]]:
+    table_bindings = {item.table: item for item in contract.tables if item.table}
+    result: dict[str, list[str]] = {}
+
+    def add(table: str, column: str) -> None:
+        table_name = str(table or "").strip()
+        column_name = str(column or "").strip()
+        if not table_name or not column_name:
+            return
+        result.setdefault(table_name, [])
+        if column_name not in result[table_name]:
+            result[table_name].append(column_name)
+
+    for metric in contract.metrics:
+        table = table_bindings.get(metric.table)
+        add(metric.table, metric.time_column or (table.time_column if table else ""))
+    primary = table_bindings.get(contract.primary_table)
+    if primary is not None:
+        add(primary.table, primary.time_column)
+    for entity_filter in contract.entity_filters:
+        table = table_bindings.get(entity_filter.table)
+        if table is not None:
+            add(table.table, table.time_column)
+    if not result:
+        for table in contract.tables:
+            add(table.table, table.time_column)
+    return result
+
+
+def _trusted_reference_scope_binding(
+    resolution: GroundedConversationResolution,
+    persisted_snapshot: Optional[dict[str, Any]],
+) -> GroundedReferenceScopeBinding:
+    """Rehydrate one typed reference only from a sealed server artifact.
+
+    The model-visible conversation text is intentionally irrelevant here.  A
+    source Contract must still be present, parseable and byte-semantically
+    equivalent to its stored fingerprint after a restart or deployment.
+    """
+
+    reference = resolution.reference_contract
+    if not reference.bound or not reference.source_artifact_id:
+        return GroundedReferenceScopeBinding()
+    active_scope = dict((persisted_snapshot or {}).get("activeScope") or {})
+    source_records = [
+        dict(item)
+        for item in active_scope.get("sourceArtifacts") or []
+        if isinstance(item, dict)
+        and str(item.get("queryArtifactId") or "").strip()
+        == reference.source_artifact_id
+    ]
+    if len(source_records) != 1:
+        raise ValueError("REFERENCE_SOURCE_ARTIFACT_NOT_UNIQUE")
+    source_record = source_records[0]
+    raw_contract = source_record.get("contract")
+    if not isinstance(raw_contract, dict):
+        raise ValueError("REFERENCE_SOURCE_CONTRACT_MISSING")
+    source_contract = GroundedQueryContract.model_validate(raw_contract)
+    actual_fingerprint = grounded_query_contract_fingerprint(source_contract)
+    expected_fingerprints = {
+        str(reference.source_contract_fingerprint or "").strip(),
+        str(source_record.get("contractFingerprint") or "").strip(),
+    }
+    expected_fingerprints.discard("")
+    if not expected_fingerprints or expected_fingerprints != {actual_fingerprint}:
+        raise ValueError("REFERENCE_SOURCE_CONTRACT_FINGERPRINT_MISMATCH")
+    expected_sql = str(reference.source_sql_fingerprint or "").strip()
+    stored_sql = str(source_record.get("sqlFingerprint") or "").strip()
+    if expected_sql and stored_sql and expected_sql != stored_sql:
+        raise ValueError("REFERENCE_SOURCE_SQL_FINGERPRINT_MISMATCH")
+    if source_contract.status != "READY" or not source_contract.ready:
+        raise ValueError("REFERENCE_SOURCE_CONTRACT_NOT_READY")
+    return GroundedReferenceScopeBinding(
+        enabled=True,
+        status="BOUND",
+        referent_type=reference.referent_type,
+        downstream_operation=reference.downstream_operation,
+        source_artifact_id=reference.source_artifact_id,
+        source_contract_fingerprint=actual_fingerprint,
+        source_sql_fingerprint=stored_sql or expected_sql,
+        source_query_shape=reference.source_query_shape
+        or source_contract.query_shape,
+        source_contract_version=source_contract.contract_version,
+        source_topics=list(reference.source_topics or source_contract.topics),
+        source_tables=[item.model_copy(deep=True) for item in source_contract.tables],
+        source_entity_filters=[
+            item.model_copy(deep=True) for item in source_contract.entity_filters
+        ],
+        source_time_range=source_contract.time_range.model_copy(deep=True),
+        source_time_columns=_reference_contract_time_columns(source_contract),
+        source_goal_ids=list(reference.source_goal_ids),
+        source_entity_identities=list(reference.source_entity_identities),
+        source_data_grains=(
+            list(reference.source_data_grains)
+            or [
+                str(item.data_grain or "").strip()
+                for item in source_contract.tables
+                if str(item.data_grain or "").strip()
+            ]
+        ),
+        source_evidence_refs=list(source_contract.evidence_refs),
+        coverage_status=reference.coverage_status,
+        snapshot_semantics=reference.snapshot_semantics,
+        population_required=reference.population_required,
+        complete_membership_required=reference.complete_membership_required,
+        membership_handle_type=reference.membership_handle_type,
+        membership_handle_id=reference.membership_handle_id,
+        membership_values_hash=reference.membership_values_hash,
+        current_turn_explicit_time=has_explicit_time_expression(
+            resolution.original_question
+        ),
+        verified_server_side=True,
+    )
+
+
+def _conversation_filter_summary(binding: Any) -> str:
+    """Render one verified non-tenant predicate for reference resolution."""
+
+    phrase = str(getattr(binding, "requested_phrase", "") or "").strip()
+    if phrase:
+        return phrase[:300]
+    label = str(
+        getattr(binding, "business_name", "")
+        or getattr(binding, "column", "")
+        or getattr(binding, "semantic_ref_id", "")
+        or ""
+    ).strip()
+    operator = str(getattr(binding, "operator", "") or "EQ").strip().upper()
+    value = getattr(binding, "literal_value", None)
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        rendered = ",".join(str(item)[:80] for item in items[:10])
+        if len(items) > 10:
+            rendered += ",…(%d values)" % len(items)
+    else:
+        rendered = str(value)[:300]
+    if not label or value is None:
+        return ""
+    return "%s %s %s" % (label, operator, rendered)
+
+
 def _deepagent_reader_is_core() -> bool:
     """Fail closed for filesystem reads originating from a subagent graph."""
 
@@ -6650,11 +8182,7 @@ def _deepagent_reader_is_core() -> bool:
         return False
     configurable = dict(config.get("configurable") or {})
     metadata = dict(config.get("metadata") or {})
-    checkpoint_ns = str(
-        configurable.get("checkpoint_ns")
-        or configurable.get("checkpointNamespace")
-        or ""
-    ).lower()
+    checkpoint_ns = str(configurable.get("checkpoint_ns") or configurable.get("checkpointNamespace") or "").lower()
     identity_text = json.dumps(
         {"configurable": configurable, "metadata": metadata},
         ensure_ascii=False,
@@ -6672,8 +8200,19 @@ def _deepagent_reader_is_core() -> bool:
 
 
 def _normalized_skill_name(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower())
-    return re.sub(r"-+", "-", normalized).strip("-")
+    output: list[str] = []
+    separator_pending = False
+    for character in str(value or "").strip().lower():
+        if character.isascii() and (
+            character.islower() or character.isdigit()
+        ):
+            if separator_pending and output:
+                output.append("-")
+            output.append(character)
+            separator_pending = False
+            continue
+        separator_pending = bool(output)
+    return "".join(output).strip("-")
 
 
 def _load_skill_frontmatter(path: Path) -> dict[str, str]:
@@ -6698,7 +8237,12 @@ def _load_skill_frontmatter(path: Path) -> dict[str, str]:
 def _parse_skill_result(raw_output: str) -> dict[str, Any]:
     text = str(raw_output or "").strip()
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+        lines = text.splitlines()
+        if lines and lines[0].strip().lower() in {"```", "```json"}:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
     candidates = [text]
     if "{" in text and "}" in text:
         candidates.append(text[text.find("{") : text.rfind("}") + 1])
@@ -6719,11 +8263,7 @@ def _skill_claim_support_context(state: GroundedRuntimeSession) -> str:
         {
             "merchantId": state.merchant_id,
             "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
-            "timeRange": (
-                contract.time_range.model_dump(by_alias=True)
-                if contract is not None
-                else {}
-            ),
+            "timeRange": (contract.time_range.model_dump(by_alias=True) if contract is not None else {}),
             "metricSpecs": [
                 dict(spec)
                 for intent in (plan.intents if plan is not None else [])
@@ -6766,12 +8306,9 @@ def _skill_output_contract_issues(
         if isinstance(spec, dict)
     ]
     formula_by_ref = {
-        str(spec.get("semanticRefId") or ""): _normalized_formula(
-            spec.get("metricFormula") or ""
-        )
+        str(spec.get("semanticRefId") or ""): _normalized_formula(spec.get("metricFormula") or "")
         for spec in specs
-        if str(spec.get("semanticRefId") or "")
-        and str(spec.get("metricFormula") or "").strip()
+        if str(spec.get("semanticRefId") or "") and str(spec.get("metricFormula") or "").strip()
     }
     allowed_formulas = {formula for formula in formula_by_ref.values() if formula}
 
@@ -6784,19 +8321,10 @@ def _skill_output_contract_issues(
                 }
             )
             continue
-        ref_id = str(
-            item.get("metricRef")
-            or item.get("semanticRefId")
-            or item.get("evidenceRef")
-            or ""
-        )
+        ref_id = str(item.get("metricRef") or item.get("semanticRefId") or item.get("evidenceRef") or "")
         disclosure_text = str(item.get("definition") or "")
         raw_formula = str(item.get("formula") or "")
-        if not raw_formula and re.search(
-            r"\b(?:SUM|COUNT|AVG|MIN|MAX|NULLIF|COALESCE)\s*\(",
-            disclosure_text,
-            flags=re.I,
-        ):
+        if not raw_formula and _contains_sql_formula_call(disclosure_text):
             raw_formula = disclosure_text
         formula = _normalized_formula(raw_formula)
         if ref_id not in formula_by_ref:
@@ -6834,8 +8362,10 @@ def _skill_output_contract_issues(
                 }
             )
 
-    for raw_formula in re.findall(r"`([^`]+)`", str(structured.get("answerMarkdown") or "")):
-        if not re.search(r"\b(?:SUM|COUNT|AVG|MIN|MAX|NULLIF|COALESCE)\s*\(", raw_formula, flags=re.I):
+    for raw_formula in _backtick_segments(
+        str(structured.get("answerMarkdown") or "")
+    ):
+        if not _contains_sql_formula_call(raw_formula):
             continue
         normalized = _normalized_formula(raw_formula)
         if normalized and normalized not in allowed_formulas:
@@ -6850,7 +8380,64 @@ def _skill_output_contract_issues(
 
 
 def _normalized_formula(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "")).strip("`").upper()
+    return "".join(str(value or "").split()).strip("`").upper()
+
+
+_GOVERNED_SQL_FORMULA_FUNCTIONS = {
+    "SUM",
+    "COUNT",
+    "AVG",
+    "MIN",
+    "MAX",
+    "NULLIF",
+    "COALESCE",
+}
+
+
+def _contains_sql_formula_call(value: Any) -> bool:
+    text = str(value or "")
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if not (character.isascii() and (character.isalpha() or character == "_")):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text):
+            candidate = text[end]
+            if not (
+                candidate.isascii()
+                and (candidate.isalnum() or candidate == "_")
+            ):
+                break
+            end += 1
+        token = text[index:end].upper()
+        cursor = end
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if (
+            token in _GOVERNED_SQL_FORMULA_FUNCTIONS
+            and cursor < len(text)
+            and text[cursor] == "("
+        ):
+            return True
+        index = end
+    return False
+
+
+def _backtick_segments(value: Any) -> list[str]:
+    text = str(value or "")
+    segments: list[str] = []
+    start: Optional[int] = None
+    for index, character in enumerate(text):
+        if character != "`":
+            continue
+        if start is None:
+            start = index + 1
+            continue
+        segments.append(text[start:index])
+        start = None
+    return segments
 
 
 def _confidence(value: Any) -> float:

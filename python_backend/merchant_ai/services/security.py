@@ -176,10 +176,13 @@ def identity_from_claims(claims: Dict[str, Any]) -> UserIdentity:
 class Principal:
     merchant_id: str = ""
     roles: Set[str] = field(default_factory=lambda: {"merchant_analyst"})
+    permissions: Set[Permission] = field(default_factory=set)
     is_ops: bool = False
 
     def has_permission(self, permission: Permission) -> bool:
         if self.is_ops:
+            return True
+        if permission in self.permissions:
             return True
         return any(permission in ROLE_PERMISSIONS.get(role, set()) for role in self.roles)
 
@@ -191,6 +194,50 @@ def merchant_principal(merchant_id: str, roles: Iterable[str] | None = None) -> 
 
 def ops_principal() -> Principal:
     return Principal(roles={"ops_admin"}, is_ops=True)
+
+
+def principal_from_authenticated_identity(identity: UserIdentity) -> Principal:
+    """Translate a verified API identity into the authorization principal model.
+
+    ``merchantId`` from a request is never used here.  A normal merchant
+    principal is scoped only by the merchant claim in the verified identity;
+    platform operators remain the sole cross-merchant identity role.
+    """
+
+    role = str(identity.role or "merchant_operator").strip()
+    if role == "platform_operator":
+        return ops_principal()
+    merchant_id = str(identity.merchant_id or "").strip()
+    if not merchant_id:
+        raise HTTPException(status_code=403, detail="authenticated identity has no merchant scope")
+    principal_role = "merchant_admin" if role == "merchant_owner" else "merchant_analyst"
+    explicit_permissions: Set[Permission] = set()
+    for value in identity.permissions:
+        try:
+            explicit_permissions.add(Permission(str(value)))
+        except ValueError:
+            continue
+    return Principal(
+        merchant_id=merchant_id,
+        roles={principal_role},
+        permissions=explicit_permissions,
+    )
+
+
+def authorize_authenticated_merchant_access(
+    settings: Settings,
+    identity: UserIdentity,
+    merchant_id: str,
+    permission: Permission,
+) -> str:
+    """Authorize one merchant target using only a previously verified identity."""
+
+    return authorize_merchant_access(
+        settings,
+        principal_from_authenticated_identity(identity),
+        merchant_id,
+        permission,
+    )
 
 
 def authorize_merchant_access(settings: Settings, principal: Principal, merchant_id: str, permission: Permission) -> str:

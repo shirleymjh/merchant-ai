@@ -79,6 +79,7 @@ def test_catalog_blocks_cross_topic_ratio_alias_with_different_families(tmp_path
         {
             "topic": "profile",
             "tableName": "merchant_daily",
+            "status": "PUBLISHED",
             "metrics": [
                 {
                     "metricKey": "merchant_return_rate",
@@ -95,6 +96,7 @@ def test_catalog_blocks_cross_topic_ratio_alias_with_different_families(tmp_path
         {
             "topic": "refund",
             "tableName": "refund_detail",
+            "status": "PUBLISHED",
             "metrics": [
                 {
                     "metricKey": "product_refund_share",
@@ -123,6 +125,7 @@ def test_catalog_blocks_cross_topic_unmapped_ratio_term_alias(tmp_path):
         {
             "topic": "profile",
             "tableName": "merchant_daily",
+            "status": "PUBLISHED",
             "metrics": [
                 {
                     "metricKey": "merchant_return_rate",
@@ -138,6 +141,7 @@ def test_catalog_blocks_cross_topic_unmapped_ratio_term_alias(tmp_path):
         {
             "topic": "refund",
             "tableName": "refund_detail",
+            "status": "PUBLISHED",
             "terms": [{"term": "未治理退款口径", "aliases": ["退款率"]}],
         },
     )

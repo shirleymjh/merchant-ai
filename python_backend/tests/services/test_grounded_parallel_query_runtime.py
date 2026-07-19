@@ -9,7 +9,13 @@ from typing import Any
 
 import pytest
 
-from merchant_ai.models import AgentRunResult, QueryBundle, QueryPlan, VerifiedEvidence
+from merchant_ai.models import (
+    AgentRunResult,
+    DataSnapshotContract,
+    QueryBundle,
+    QueryPlan,
+    VerifiedEvidence,
+)
 from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentRunContext,
     GroundedDeepAgentRuntime,
@@ -17,6 +23,14 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedParallelExecutionSpec,
 )
 from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
+from merchant_ai.services.grounded_execution_graph import (
+    GroundedExecutionEdgeSpec,
+    GroundedExecutionGraphReceipt,
+)
+from merchant_ai.services.grounded_goal_contract import (
+    MetricQuestionGoal,
+    OriginalQuestionGoalContract,
+)
 from merchant_ai.services.grounded_query_contract import GroundedQueryContract
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
@@ -50,6 +64,8 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
         *,
         failed_query_ids: set[str] | None = None,
         require_overlap: bool = True,
+        data_snapshot: DataSnapshotContract | None = None,
+        returned_snapshot_by_query_id: dict[str, DataSnapshotContract] | None = None,
     ) -> None:
         super().__init__(
             object(),
@@ -58,6 +74,11 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
         )
         self.failed_query_ids = set(failed_query_ids or set())
         self.require_overlap = require_overlap
+        self.data_snapshot = data_snapshot
+        self.returned_snapshot_by_query_id = dict(
+            returned_snapshot_by_query_id or {}
+        )
+        self.snapshot_capture_calls = 0
         self.probe_lock = RLock()
         self.two_workers_active = Event()
         self.active_workers = 0
@@ -101,6 +122,11 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
                 merged_query_bundle=QueryBundle(
                     rows=[{"query_id": query_id, "value": 1}],
                     tables=["table_%s" % query_id],
+                    data_snapshot=(
+                        self.returned_snapshot_by_query_id.get(query_id)
+                        or kwargs.get("data_snapshot_contract")
+                        or DataSnapshotContract()
+                    ),
                 )
             )
             session.run_result = result
@@ -108,6 +134,20 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
         finally:
             with self.probe_lock:
                 self.active_workers -= 1
+
+    def capture_data_snapshot(
+        self,
+        semantic_activation_fingerprint: str,
+    ) -> DataSnapshotContract:
+        del semantic_activation_fingerprint
+        self.snapshot_capture_calls += 1
+        return (
+            self.data_snapshot.model_copy(deep=True)
+            if self.data_snapshot is not None
+            else DataSnapshotContract(
+                unsupported_reason="TEST_SNAPSHOT_CAPABILITY_UNAVAILABLE"
+            )
+        )
 
     def verify_active(self, session: GroundedRuntimeSession) -> VerifiedEvidence:
         query_id = str(session.user_scope["queryId"])
@@ -229,6 +269,69 @@ def _execute_batch(
     )
 
 
+def _execute_query_ids(
+    runtime: GroundedDeepAgentRuntime,
+    context: GroundedDeepAgentRunContext,
+    query_ids: list[str],
+) -> dict[str, Any]:
+    tools = {item.name: item for item in runtime.tools}
+    return json.loads(
+        tools["execute_grounded_query_batch"].func(
+            queries=[
+                GroundedParallelExecutionSpec(query_id=query_id)
+                for query_id in query_ids
+            ],
+            reason="selected graph frontier",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+
+def _snapshot(mode: str) -> DataSnapshotContract:
+    return DataSnapshotContract(
+        datasource_fingerprint="datasource",
+        datasource_environment="test",
+        data_epoch="epoch-1",
+        consistency_mode=mode,
+        semantic_activation_fingerprint="graph-semantic-v1",
+        cache_generation="cache-v1",
+    )
+
+
+def _freeze_test_graph(
+    context: GroundedDeepAgentRunContext,
+    *,
+    contract_scope: bool,
+) -> None:
+    context.session.question_goal_contract = OriginalQuestionGoalContract(
+        question=context.session.runtime.question,
+        goals=[
+            MetricQuestionGoal(goal_id="goal.first", label="first"),
+            MetricQuestionGoal(goal_id="goal.second", label="second"),
+        ],
+    )
+    context.session.execution_graph_fingerprint = "graph-semantic-v1"
+    context.session.execution_graph_receipt = GroundedExecutionGraphReceipt(
+        graph_id="graph-test",
+        version=1,
+        fingerprint="graph-semantic-v1",
+        discovery_snapshot_fingerprint="discovery-v1",
+        node_ids={"first_node": "first", "second_node": "second"},
+        parallel_frontier=["first", "second"],
+    )
+    context.session.execution_graph_edges = (
+        [
+            GroundedExecutionEdgeSpec(
+                source_client_key="first_node",
+                target_client_key="second_node",
+                dependency_mode="CONTRACT_SCOPE",
+            )
+        ]
+        if contract_scope
+        else []
+    )
+
+
 def test_parallel_batch_overlaps_workers_and_adopts_only_verified_success() -> None:
     kernel = ConcurrentBranchKernel(failed_query_ids={"second"})
     runtime = _runtime(kernel)
@@ -252,6 +355,113 @@ def test_parallel_batch_overlaps_workers_and_adopts_only_verified_success() -> N
     assert context.session.artifact_goal_ids == {
         "artifact_first": ["goal.first"]
     }
+
+
+def test_contract_scope_batch_is_blocked_before_doris_without_atomic_snapshot() -> None:
+    kernel = ConcurrentBranchKernel(
+        require_overlap=False,
+        data_snapshot=_snapshot("OBSERVED_EPOCH"),
+    )
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=True)
+
+    result = _execute_batch(runtime, context)
+
+    assert result["status"] == "BLOCKED"
+    assert result["code"] == "MULTI_QUERY_SNAPSHOT_CONTRACT_UNSATISFIED"
+    assert result["snapshotIssues"] == [
+        "ATOMIC_MULTI_QUERY_SNAPSHOT_UNSUPPORTED"
+    ]
+    assert result["snapshotRequirement"]["requireAtomicMultiQuery"] is True
+    assert kernel.execute_query_ids == []
+    assert parent.verified_query_ledger == []
+
+
+def test_contract_scope_cannot_bypass_atomic_gate_by_executing_one_node_at_a_time() -> None:
+    kernel = ConcurrentBranchKernel(
+        require_overlap=False,
+        data_snapshot=_snapshot("OBSERVED_EPOCH"),
+    )
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=True)
+
+    result = _execute_query_ids(runtime, context, ["first"])
+
+    assert result["status"] == "BLOCKED"
+    assert result["snapshotIssues"] == [
+        "ATOMIC_MULTI_QUERY_SNAPSHOT_UNSUPPORTED"
+    ]
+    assert kernel.execute_query_ids == []
+    assert parent.verified_query_ledger == []
+
+
+def test_independent_graph_nodes_share_observed_epoch_and_still_run_in_parallel() -> None:
+    kernel = ConcurrentBranchKernel(data_snapshot=_snapshot("OBSERVED_EPOCH"))
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=False)
+
+    result = _execute_batch(runtime, context)
+
+    assert result["status"] == "VERIFIED"
+    assert result["executedInParallel"] is True
+    assert kernel.max_active_workers == 2
+    assert len(parent.verified_query_ledger) == 2
+
+
+def test_independent_nodes_executed_separately_reuse_one_frozen_snapshot() -> None:
+    kernel = ConcurrentBranchKernel(
+        require_overlap=False,
+        data_snapshot=_snapshot("OBSERVED_EPOCH"),
+    )
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=False)
+
+    first = _execute_query_ids(runtime, context, ["first"])
+    second = _execute_query_ids(runtime, context, ["second"])
+
+    assert first["status"] == "VERIFIED"
+    assert second["status"] == "VERIFIED"
+    assert kernel.snapshot_capture_calls == 1
+    assert [
+        artifact.artifact_id for artifact in parent.verified_query_ledger
+    ] == ["artifact_first", "artifact_second"]
+
+
+def test_contract_scope_batch_runs_when_adapter_proves_one_as_of_snapshot() -> None:
+    kernel = ConcurrentBranchKernel(data_snapshot=_snapshot("AS_OF_READ"))
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=True)
+
+    result = _execute_batch(runtime, context)
+
+    assert result["status"] == "VERIFIED"
+    assert kernel.max_active_workers == 2
+    assert len(parent.verified_query_ledger) == 2
+
+
+def test_snapshot_mismatch_after_execution_prevents_parent_adoption() -> None:
+    shared = _snapshot("AS_OF_READ")
+    changed = shared.model_copy(update={"data_epoch": "epoch-2"})
+    kernel = ConcurrentBranchKernel(
+        data_snapshot=shared,
+        returned_snapshot_by_query_id={"second": changed},
+    )
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=True)
+
+    result = _execute_batch(runtime, context)
+
+    assert result["status"] == "BLOCKED"
+    assert result["code"] == "MULTI_QUERY_SNAPSHOT_POSTFLIGHT_FAILED"
+    assert result["snapshotIssues"] == ["DATA_SNAPSHOT_MISMATCH"]
+    assert result["adoptedArtifactIds"] == []
+    assert parent.verified_query_ledger == []
 
 
 def test_parallel_branches_keep_generation_and_session_mutations_isolated() -> None:

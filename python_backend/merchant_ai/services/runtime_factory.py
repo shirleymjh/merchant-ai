@@ -15,6 +15,9 @@ from merchant_ai.services.assets import (
 from merchant_ai.services.checkpoints import CheckpointManager
 from merchant_ai.services.evidence import EvidenceVerifier
 from merchant_ai.services.grounded_deep_agent_runtime import GroundedDeepAgentRuntime
+from merchant_ai.services.grounded_conversation_state import (
+    GroundedConversationStateStore,
+)
 from merchant_ai.services.grounded_query_executor import GroundedQueryExecutionKernel
 from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeKernel
 from merchant_ai.services.llm import LlmClient
@@ -114,10 +117,12 @@ class GroundedApplicationRuntime:
                 merchant=merchant,
                 access_role=access_role,
                 user_scope=user_scope,
-                thread_id=actual_thread_id,
-                run_id=actual_run_id,
-                listener=listener,
-            )
+            thread_id=actual_thread_id,
+            run_id=actual_run_id,
+            listener=listener,
+            request_context=context,
+            message_history=list(message_history or []),
+        )
         except Exception as exc:
             _emit(
                 listener,
@@ -133,7 +138,27 @@ class GroundedApplicationRuntime:
 
         if not response.id:
             response.id = "qa_%s" % uuid.uuid4().hex
-        response.context = context
+        response_context = (context or ChatContext()).model_copy(deep=True)
+        if response.clarification is not None:
+            response_context.pending_clarification_stage = str(
+                response.clarification.stage or ""
+            )
+            response_context.pending_clarification_type = str(
+                response.clarification.type or ""
+            )
+            response_context.pending_question = str(
+                response.clarification.pending_question or question
+            )
+            response_context.pending_clarification_options = list(
+                response.clarification.options
+            )
+            response_context.clarification_resolved = False
+        else:
+            response_context.pending_clarification_stage = ""
+            response_context.pending_clarification_type = ""
+            response_context.pending_question = ""
+            response_context.pending_clarification_options = []
+        response.context = response_context
         harness = dict((response.debug_trace or {}).get("harness") or {})
         harness.update(
             {
@@ -296,6 +321,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         skill_run_root=str(settings.resolved_workspace_path / "skill_runs"),
         parallel_max_workers=int(settings.tool_max_concurrency or 4),
         settings=settings,
+        conversation_state_store=GroundedConversationStateStore(settings),
     )
     return GroundedApplicationRuntime(
         settings=settings,

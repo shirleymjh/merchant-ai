@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -14,7 +15,13 @@ from typing import Any, Callable, Dict, Iterable, Literal, Optional, Union
 
 from merchant_ai.config import Settings
 from merchant_ai.models import SubAgentResultEnvelope
-from merchant_ai.services.runtime_state import NodeTaskState, RuntimeStateStore, create_runtime_state_store, safe_name
+from merchant_ai.services.runtime_state import (
+    NodeTaskState,
+    RuntimeStateStore,
+    StaleNodeTaskFence,
+    create_runtime_state_store,
+    safe_name,
+)
 
 
 TERMINAL_TASK_STATUSES = {"completed", "partial", "failed", "timeout", "canceled"}
@@ -22,6 +29,17 @@ TERMINAL_TASK_STATUSES = {"completed", "partial", "failed", "timeout", "canceled
 
 class DistributedTaskError(RuntimeError):
     pass
+
+
+def _payload_fingerprint(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -143,7 +161,9 @@ class DistributedArtifactStore:
             return "s3://%s/%s" % (self._bucket(), key)
         path = self.root / key
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
         return str(path)
 
     def read_json(self, uri: str) -> Dict[str, Any]:
@@ -196,7 +216,13 @@ class DistributedSubAgentClient:
         request: Dict[str, Any],
         timeout_seconds: Optional[int] = None,
     ) -> NodeTaskState:
-        request_uri = self.artifact_store.write_json(run_id, task_id, "request", request)
+        request_fingerprint = _payload_fingerprint(request)
+        request_uri = self.artifact_store.write_json(
+            run_id,
+            task_id,
+            "request_%s" % request_fingerprint,
+            request,
+        )
         state = NodeTaskState(
             run_id=run_id,
             task_id=task_id,
@@ -205,6 +231,7 @@ class DistributedSubAgentClient:
             payload={
                 "taskKind": str(task_kind),
                 "requestArtifactUri": request_uri,
+                "requestFingerprint": request_fingerprint,
                 "timeoutSeconds": int(timeout_seconds or self.settings.distributed_worker_result_timeout_seconds),
                 "submittedAt": time.time(),
             },
@@ -230,7 +257,23 @@ class DistributedSubAgentClient:
             if state and state.status in TERMINAL_TASK_STATUSES:
                 return self._result_from_state(state, read_artifact=read_artifact)
             time.sleep(poll)
-        self.state_store.complete_node_task(run_id, task_id, "timeout", {"error": "distributed worker result timeout"})
+        current = self.state_store.get_node_task(run_id, task_id)
+        if current:
+            try:
+                current = self.state_store.fence_node_task(
+                    run_id,
+                    task_id,
+                    "timeout",
+                    {"error": "distributed worker result timeout"},
+                    expected_generation=current.lease_generation,
+                )
+            except StaleNodeTaskFence:
+                current = self.state_store.get_node_task(run_id, task_id)
+            if current and current.status in TERMINAL_TASK_STATUSES:
+                return self._result_from_state(
+                    current,
+                    read_artifact=read_artifact,
+                )
         error = "distributed worker result timeout"
         contract = normalize_subagent_result("", "timeout", {}, error)
         return DistributedTaskResult(run_id, task_id, "timeout", {}, error=error, contract=contract)
@@ -337,10 +380,10 @@ class DistributedSubAgentWorker:
         task_kind = str(state.payload.get("taskKind") or "")
         handler = self.handlers.get(task_kind)
         if not handler:
-            self.state_store.complete_node_task(state.run_id, state.task_id, "failed", {"error": "unsupported task kind: %s" % task_kind})
+            self._complete_claimed(state, "failed", {"error": "unsupported task kind: %s" % task_kind})
             return
         if self.state_store.run_canceled(state.run_id):
-            self.state_store.complete_node_task(state.run_id, state.task_id, "canceled", {"error": "run canceled before execution"})
+            self._complete_claimed(state, "canceled", {"error": "run canceled before execution"})
             return
         request = self.artifact_store.read_json(str(state.payload.get("requestArtifactUri") or ""))
         heartbeat_stop = threading.Event()
@@ -348,18 +391,25 @@ class DistributedSubAgentWorker:
         heartbeat.start()
         try:
             outcome = coerce_handler_outcome(self._run_handler_isolated(state, handler, request))
-            if self.state_store.run_canceled(state.run_id):
-                self.state_store.complete_node_task(state.run_id, state.task_id, "canceled", {"error": "run canceled during execution"})
+            if self._task_canceled(state):
                 return
             contract = normalize_subagent_result(task_kind, outcome.status, outcome.payload, outcome.error)
-            result_uri = self.artifact_store.write_json(state.run_id, state.task_id, "result", contract)
+            result_fingerprint = _payload_fingerprint(contract)
+            result_uri = self.artifact_store.write_json(
+                state.run_id,
+                state.task_id,
+                "result_g%s_%s" % (
+                    state.lease_generation,
+                    result_fingerprint,
+                ),
+                contract,
+            )
             summary_contract = {key: value for key, value in contract.items() if key != "payload"}
             summary_contract["artifactRefs"] = list(summary_contract.get("artifactRefs") or []) + [
                 {"uri": result_uri, "kind": "subagent_result"}
             ]
-            self.state_store.complete_node_task(
-                state.run_id,
-                state.task_id,
+            self._complete_claimed(
+                state,
                 str(contract.get("status") or outcome.status),
                 {
                     "resultArtifactUri": result_uri,
@@ -369,16 +419,14 @@ class DistributedSubAgentWorker:
                 },
             )
         except TimeoutError as exc:
-            self.state_store.complete_node_task(
-                state.run_id,
-                state.task_id,
+            self._complete_claimed(
+                state,
                 "timeout",
                 {"error": str(exc)[:1000], "workerId": self.worker_id, "taskKind": task_kind},
             )
         except Exception as exc:
-            self.state_store.complete_node_task(
-                state.run_id,
-                state.task_id,
+            self._complete_claimed(
+                state,
                 "failed",
                 {"error": "%s: %s" % (type(exc).__name__, str(exc)[:1000]), "workerId": self.worker_id, "taskKind": task_kind},
             )
@@ -436,7 +484,12 @@ class DistributedSubAgentWorker:
         if self._stop.is_set() or self.state_store.run_canceled(state.run_id):
             return True
         current = self.state_store.get_node_task(state.run_id, state.task_id)
-        return bool(current and current.status in {"canceled", "timeout"})
+        return bool(
+            current is None
+            or current.status != "running"
+            or current.lease_owner != state.lease_owner
+            or current.lease_generation != state.lease_generation
+        )
 
     def _heartbeat_loop(self, state: NodeTaskState, stop: threading.Event) -> None:
         interval = max(0.2, min(float(self.settings.tool_heartbeat_interval_seconds or 5), self.settings.distributed_worker_lease_seconds / 3))
@@ -446,8 +499,30 @@ class DistributedSubAgentWorker:
                 state.task_id,
                 self.worker_id,
                 lease_seconds=self.settings.distributed_worker_lease_seconds,
+                lease_generation=state.lease_generation,
             ):
                 return
+
+    def _complete_claimed(
+        self,
+        state: NodeTaskState,
+        status: str,
+        payload: Dict[str, Any],
+    ) -> NodeTaskState:
+        try:
+            return self.state_store.complete_node_task(
+                state.run_id,
+                state.task_id,
+                status,
+                payload,
+                lease_owner=state.lease_owner,
+                lease_generation=state.lease_generation,
+            )
+        except StaleNodeTaskFence:
+            current = self.state_store.get_node_task(state.run_id, state.task_id)
+            if current:
+                return current
+            raise
 
 
 def builtin_worker_handlers(settings: Settings) -> Dict[str, TaskHandler]:

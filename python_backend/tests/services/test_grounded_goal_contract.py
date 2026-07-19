@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import merchant_ai.services.grounded_goal_contract as goal_contract_module
 from merchant_ai.services.grounded_goal_contract import (
     AnalysisQuestionGoal,
     ComparisonQuestionGoal,
     DetailQuestionGoal,
     DependencyQuestionGoal,
+    GoalContractIssue,
     GoalContractValidationError,
     GoalCoverageBlocked,
     GoalCoverageVerifier,
@@ -155,41 +159,447 @@ def test_unknown_references_and_dependency_cycles_fail_closed() -> None:
     assert "GOAL_DEPENDENCY_CYCLE" in {issue.code for issue in cyclic.issues}
 
 
-def test_explicit_time_and_comparison_cues_require_structural_goals() -> None:
+def test_question_semantics_are_delegated_to_explicit_fail_closed_verifier() -> None:
+    payload = {
+        "question": "Compare metric alpha for the last 30 days versus the previous 30 days",
+        "metrics": [{"goalId": "metric.alpha", "label": "metric alpha"}],
+    }
+    local_result = validate_original_question_goal_contract(payload)
+
+    class IncompleteDeclarationVerifier:
+        def verify(self, contract):
+            assert contract.question == payload["question"]
+            return [
+                GoalContractIssue(
+                    code="QUESTION_GOAL_DECLARATION_INCOMPLETE",
+                    message="the external semantic verifier found omitted typed goals",
+                )
+            ]
+
+    verified_result = validate_original_question_goal_contract(
+        payload,
+        question_verifier=IncompleteDeclarationVerifier(),
+    )
+
+    assert local_result.valid is True
+    assert local_result.issues == []
+    assert verified_result.valid is False
+    assert {issue.code for issue in verified_result.issues} == {
+        "QUESTION_GOAL_DECLARATION_INCOMPLETE"
+    }
+
+    coverage = GoalCoverageVerifier().verify(verified_result.contract, [])
+    assert coverage.finalization_allowed is False
+
+
+def test_question_verifier_failure_and_malformed_output_fail_closed() -> None:
+    payload = {
+        "question": "Return alpha",
+        "metrics": [{"goalId": "metric.alpha", "label": "metric alpha"}],
+    }
+
+    class FailedVerifier:
+        def verify(self, contract):
+            raise RuntimeError("unavailable")
+
+    class MalformedVerifier:
+        def verify(self, contract):
+            return "not a typed issue sequence"
+
+    for verifier in (FailedVerifier(), MalformedVerifier()):
+        result = validate_original_question_goal_contract(
+            payload,
+            question_verifier=verifier,
+        )
+        assert result.valid is False
+        assert {issue.code for issue in result.issues} == {
+            "GOAL_CONTRACT_QUESTION_VERIFIER_FAILED"
+        }
+
+
+def test_unicode_question_inspection_is_non_authoritative_and_vocabulary_free() -> None:
     result = validate_original_question_goal_contract(
         {
-            "question": "Compare metric alpha for the last 30 days versus the previous 30 days",
-            "metrics": [{"goalId": "metric.alpha", "label": "metric alpha"}],
+            "question": "Alpha 42；β ٣!",
+            "metrics": [{"goalId": "metric.alpha", "label": "alpha"}],
+        }
+    )
+    hints = inspect_question_structure("Alpha 42；β ٣!")
+
+    assert result.valid is True
+    assert result.issues == []
+    assert hints.token_count == 6
+    assert hints.number_tokens == ["42", "٣"]
+    assert hints.punctuation_tokens == ["；", "!"]
+    assert hints.clause_count == 2
+
+
+def test_goal_contract_module_has_no_pattern_engine_dependency_or_calls() -> None:
+    source_path = Path(goal_contract_module.__file__).resolve()
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    blocked_modules = {"re", "regex"}
+    imported_modules = {
+        alias.name.split(".", maxsplit=1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported_modules.update(
+        str(node.module or "").split(".", maxsplit=1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    )
+    blocked_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in blocked_modules
+    ]
+
+    assert imported_modules.isdisjoint(blocked_modules)
+    assert blocked_calls == []
+
+
+def test_ranking_limit_is_never_silently_defaulted() -> None:
+    result = validate_original_question_goal_contract(
+        {
+            "question": "Return a ranked result",
+            "goals": [
+                {"goalId": "metric.alpha", "kind": "METRIC", "label": "alpha"},
+                {
+                    "goalId": "ranking.alpha",
+                    "kind": "RANKING",
+                    "label": "rank alpha",
+                    "metricGoalIds": ["metric.alpha"],
+                    "populationScope": "ALL_MATCHING_ROWS",
+                },
+            ],
         }
     )
 
     assert result.valid is False
-    assert {issue.code for issue in result.issues} >= {
-        "STRUCTURAL_TIME_GOAL_MISSING",
-        "STRUCTURAL_COMPARISON_GOAL_MISSING",
-    }
-
-    coverage = GoalCoverageVerifier().verify(result.contract, [])
-    assert coverage.finalization_allowed is False
-    assert {issue.code for issue in coverage.issues} >= {
-        "STRUCTURAL_TIME_GOAL_MISSING",
-        "STRUCTURAL_COMPARISON_GOAL_MISSING",
-    }
+    assert result.contract is not None
+    assert result.contract.goal_map()["ranking.alpha"].limit == 0
+    assert "RANKING_LIMIT_REQUIRED" in {issue.code for issue in result.issues}
 
 
-def test_conjunction_hint_only_requests_review_and_never_invents_business_goals() -> None:
+def test_ranking_population_scope_must_be_declared_by_core() -> None:
     result = validate_original_question_goal_contract(
         {
-            "question": "Return alpha and beta",
-            "metrics": [{"goalId": "metric.alpha", "label": "alpha"}],
+            "question": "Return a ranked result",
+            "goals": [
+                {"goalId": "metric.alpha", "kind": "METRIC", "label": "alpha"},
+                {
+                    "goalId": "ranking.alpha",
+                    "kind": "RANKING",
+                    "label": "rank alpha",
+                    "metricGoalIds": ["metric.alpha"],
+                    "limit": 3,
+                },
+            ],
         }
     )
-    hints = inspect_question_structure("Return alpha and beta")
+
+    assert result.valid is False
+    assert result.contract is None
+    assert {issue.code for issue in result.issues} == {
+        "GOAL_CONTRACT_SCHEMA_INVALID"
+    }
+
+
+def test_explicit_all_matching_rows_population_is_accepted() -> None:
+    result = validate_original_question_goal_contract(
+        {
+            "question": "Return a ranked result",
+            "goals": [
+                {"goalId": "metric.alpha", "kind": "METRIC", "label": "alpha"},
+                {
+                    "goalId": "ranking.alpha",
+                    "kind": "RANKING",
+                    "label": "rank alpha",
+                    "metricGoalIds": ["metric.alpha"],
+                    "limit": 3,
+                    "populationScope": "ALL_MATCHING_ROWS",
+                },
+            ],
+        }
+    )
 
     assert result.valid is True
-    issue = next(issue for issue in result.issues if issue.code == "STRUCTURAL_CONJUNCTION_REVIEW_REQUIRED")
-    assert issue.blocking is False
-    assert hints.conjunction_cues == ["and"]
+    assert result.contract is not None
+    assert result.contract.goal_map()["ranking.alpha"].population_scope == (
+        "ALL_MATCHING_ROWS"
+    )
+
+
+def test_ranking_can_bind_an_explicit_prior_goal_population() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "Return two typed outputs over one declared population",
+            "goals": [
+                {"goalId": "detail.rows", "kind": "DETAIL", "label": "rows"},
+                {"goalId": "metric.alpha", "kind": "METRIC", "label": "alpha"},
+                {
+                    "goalId": "ranking.alpha",
+                    "kind": "RANKING",
+                    "label": "rank alpha",
+                    "metricGoalIds": ["metric.alpha"],
+                    "limit": 3,
+                    "populationScope": "SAME_AS_GOAL",
+                    "populationGoalIds": ["detail.rows"],
+                },
+            ],
+        }
+    )
+
+    ranking = contract.goal_map()["ranking.alpha"]
+    assert ranking.population_goal_ids == ["detail.rows"]
+    assert required_goal_ids(contract) == [
+        "detail.rows",
+        "metric.alpha",
+        "ranking.alpha",
+    ]
+
+
+def test_multi_clause_detail_then_rank_cannot_drop_either_operation() -> None:
+    question = "我想看最近7天的订单明细，然后告诉我这里面退款最多的三单"
+
+    class RequiredKindsVerifier:
+        def verify(self, contract):
+            declared_kinds = {goal.kind for goal in contract.goals}
+            return [
+                GoalContractIssue(
+                    code="QUESTION_REQUIRED_KIND_MISSING",
+                    message=f"required typed kind {kind} was not declared",
+                )
+                for kind in ("DETAIL", "RANKING")
+                if kind not in declared_kinds
+            ]
+
+    missing_ranking = validate_original_question_goal_contract(
+        {
+            "question": question,
+            "goals": [
+                {"goalId": "detail.orders", "kind": "detail", "label": "订单明细"},
+                {
+                    "goalId": "time.7d",
+                    "kind": "time_window",
+                    "label": "最近7天",
+                    "timeExpression": "最近7天",
+                    "appliesToGoalIds": ["detail.orders"],
+                },
+            ],
+        },
+        question_verifier=RequiredKindsVerifier(),
+    )
+    missing_detail = validate_original_question_goal_contract(
+        {
+            "question": question,
+            "goals": [
+                {"goalId": "metric.refund", "kind": "metric", "label": "退款金额"},
+                {
+                    "goalId": "ranking.refund",
+                    "kind": "ranking",
+                    "label": "退款最多三单",
+                    "metricGoalIds": ["metric.refund"],
+                    "limit": 3,
+                    "populationScope": "VERIFIED_PREDICATE_SCOPE",
+                },
+                {
+                    "goalId": "time.7d",
+                    "kind": "time_window",
+                    "label": "最近7天",
+                    "timeExpression": "最近7天",
+                    "appliesToGoalIds": ["ranking.refund"],
+                },
+            ],
+        },
+        question_verifier=RequiredKindsVerifier(),
+    )
+
+    assert missing_ranking.valid is False
+    assert missing_detail.valid is False
+    assert {item.code for item in missing_ranking.issues} == {
+        "QUESTION_REQUIRED_KIND_MISSING"
+    }
+    assert {item.code for item in missing_detail.issues} == {
+        "QUESTION_REQUIRED_KIND_MISSING"
+    }
+
+
+def test_typed_same_turn_population_scope_requires_population_goal_reference() -> None:
+    question = "我想看最近7天的订单明细，然后告诉我这里面退款最多的三单"
+    result = validate_original_question_goal_contract(
+        {
+            "question": question,
+            "goals": [
+                {"goalId": "metric.refund", "kind": "metric", "label": "退款金额"},
+                {"goalId": "detail.orders", "kind": "detail", "label": "订单明细"},
+                {
+                    "goalId": "ranking.refund",
+                    "kind": "ranking",
+                    "label": "退款最多三单",
+                    "metricGoalIds": ["metric.refund"],
+                    "limit": 3,
+                    "populationScope": "SAME_AS_GOAL",
+                },
+                {
+                    "goalId": "time.7d",
+                    "kind": "time_window",
+                    "label": "最近7天",
+                    "timeExpression": "最近7天",
+                    "appliesToGoalIds": ["detail.orders", "ranking.refund"],
+                },
+            ],
+        }
+    )
+
+    assert "RANKING_POPULATION_GOALS_REQUIRED" in {
+        item.code for item in result.issues
+    }
+
+
+def test_complete_same_turn_detail_rank_contract_passes_structural_audit() -> None:
+    question = "我想看最近7天的订单明细，然后告诉我这里面退款最多的三单"
+    result = validate_original_question_goal_contract(
+        {
+            "question": question,
+            "goals": [
+                {
+                    "goalId": "metric.refund",
+                    "kind": "metric",
+                    "label": "退款金额",
+                    "sourceSpans": ["退款最多"],
+                },
+                {
+                    "goalId": "detail.orders",
+                    "kind": "detail",
+                    "label": "订单明细",
+                    "sourceSpans": ["订单明细"],
+                },
+                {
+                    "goalId": "ranking.refund",
+                    "kind": "ranking",
+                    "label": "退款最多三单",
+                    "sourceSpans": ["这里面退款最多的三单"],
+                    "metricGoalIds": ["metric.refund"],
+                    "limit": 3,
+                    "populationScope": "SAME_AS_GOAL",
+                    "populationGoalIds": ["detail.orders"],
+                },
+                {
+                    "goalId": "time.7d",
+                    "kind": "time_window",
+                    "label": "最近7天",
+                    "sourceSpans": ["最近7天"],
+                    "timeExpression": "最近7天",
+                    "appliesToGoalIds": ["detail.orders", "ranking.refund"],
+                },
+            ],
+        }
+    )
+
+    assert result.valid is True, [item.model_dump() for item in result.issues]
+
+
+def test_external_verifier_can_enforce_question_specific_scope_and_limit() -> None:
+    question = "这里面退款最多的三单"
+
+    class ExpectedRankingVerifier:
+        def verify(self, contract):
+            ranking = contract.goal_map().get("ranking.refund")
+            if not isinstance(ranking, RankingQuestionGoal):
+                return [
+                    GoalContractIssue(
+                        code="QUESTION_RANKING_DECLARATION_MISSING",
+                        message="the expected typed ranking declaration is missing",
+                    )
+                ]
+            issues = []
+            if ranking.limit != 3:
+                issues.append(
+                    GoalContractIssue(
+                        code="QUESTION_RANKING_LIMIT_MISMATCH",
+                        message="the typed ranking limit does not match the verified question semantics",
+                    )
+                )
+            if ranking.population_scope != "VERIFIED_PREDICATE_SCOPE":
+                issues.append(
+                    GoalContractIssue(
+                        code="QUESTION_POPULATION_SCOPE_MISMATCH",
+                        message="the typed population scope does not match the verified question semantics",
+                    )
+                )
+            return issues
+
+    unsafe = validate_original_question_goal_contract(
+        {
+            "question": question,
+            "goals": [
+                {"goalId": "metric.refund", "kind": "metric", "label": "退款金额"},
+                {
+                    "goalId": "ranking.refund",
+                    "kind": "ranking",
+                    "label": "退款排名",
+                    "metricGoalIds": ["metric.refund"],
+                    "limit": 5,
+                    "populationScope": "ALL_MATCHING_ROWS",
+                },
+            ],
+        },
+        question_verifier=ExpectedRankingVerifier(),
+    )
+    safe = validate_original_question_goal_contract(
+        {
+            "question": question,
+            "goals": [
+                {"goalId": "metric.refund", "kind": "metric", "label": "退款金额"},
+                {
+                    "goalId": "ranking.refund",
+                    "kind": "ranking",
+                    "label": "退款最多三单",
+                    "metricGoalIds": ["metric.refund"],
+                    "limit": 3,
+                    "populationScope": "VERIFIED_PREDICATE_SCOPE",
+                },
+            ],
+        },
+        question_verifier=ExpectedRankingVerifier(),
+    )
+
+    unsafe_codes = {item.code for item in unsafe.issues}
+    assert "QUESTION_POPULATION_SCOPE_MISMATCH" in unsafe_codes
+    assert "QUESTION_RANKING_LIMIT_MISMATCH" in unsafe_codes
+    assert safe.valid is True, [item.model_dump() for item in safe.issues]
+
+
+def test_goal_source_span_must_be_verbatim_from_question() -> None:
+    result = validate_original_question_goal_contract(
+        {
+            "question": "最近7天订单明细",
+            "goals": [
+                {
+                    "goalId": "detail.orders",
+                    "kind": "detail",
+                    "label": "订单明细",
+                    "sourceSpans": ["最近30天"],
+                },
+                {
+                    "goalId": "time.7d",
+                    "kind": "time_window",
+                    "label": "最近7天",
+                    "timeExpression": "最近7天",
+                    "appliesToGoalIds": ["detail.orders"],
+                },
+            ],
+        }
+    )
+
+    assert "GOAL_SOURCE_SPAN_NOT_IN_QUESTION" in {
+        item.code for item in result.issues
+    }
 
 
 def test_required_goals_include_entity_chain_dependency_closure() -> None:
@@ -315,10 +725,7 @@ def test_declared_goal_semantic_refs_require_matching_artifact_evidence() -> Non
 
     assert mismatched.finalization_allowed is False
     assert mismatched.missing_required_goal_ids == ["metric.gmv"]
-    assert any(
-        issue.code == "GOAL_SEMANTIC_EVIDENCE_UNCOVERED"
-        for issue in mismatched.issues
-    )
+    assert any(issue.code == "GOAL_SEMANTIC_EVIDENCE_UNCOVERED" for issue in mismatched.issues)
 
     matched = GoalCoverageVerifier().verify(
         contract,
@@ -510,9 +917,7 @@ def test_anomaly_proof_requires_baseline_and_normalization() -> None:
         [
             VerifiedArtifactGoalCoverage(
                 artifact_id="artifact-unscaled-comparison",
-                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
-                    contract
-                ),
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(contract),
                 covered_goal_ids=goal_ids,
                 verification_passed=True,
                 goal_resolutions=[
@@ -543,17 +948,13 @@ def test_anomaly_proof_requires_baseline_and_normalization() -> None:
 
 def test_explicit_insufficient_evidence_resolves_but_does_not_prove_goal() -> None:
     contract = anomaly_contract()
-    primitive_goal_ids = [
-        goal.goal_id for goal in contract.goals if goal.kind != "COMPARISON"
-    ]
+    primitive_goal_ids = [goal.goal_id for goal in contract.goals if goal.kind != "COMPARISON"]
     result = GoalCoverageVerifier().verify(
         contract,
         [
             VerifiedArtifactGoalCoverage(
                 artifact_id="artifact-no-baseline",
-                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
-                    contract
-                ),
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(contract),
                 covered_goal_ids=[
                     *primitive_goal_ids,
                     "comparison.most_anomalous",
@@ -576,19 +977,12 @@ def test_explicit_insufficient_evidence_resolves_but_does_not_prove_goal() -> No
     assert result.passed is False
     assert result.missing_required_goal_ids == []
     assert result.unproved_required_goal_ids == ["comparison.most_anomalous"]
-    assert result.insufficient_evidence_goal_ids == [
-        "comparison.most_anomalous"
-    ]
+    assert result.insufficient_evidence_goal_ids == ["comparison.most_anomalous"]
     assert "comparison.most_anomalous" in result.resolved_goal_ids
     assert "comparison.most_anomalous" not in result.covered_goal_ids
     assert "comparison.most_anomalous" in result.claimed_covered_goal_ids
-    assert (
-        result.resolution_by_goal_id["comparison.most_anomalous"]
-        == "INSUFFICIENT_EVIDENCE"
-    )
-    assert "INSUFFICIENT_EVIDENCE_CANNOT_PROVE_GOAL" in {
-        issue.code for issue in result.issues
-    }
+    assert result.resolution_by_goal_id["comparison.most_anomalous"] == "INSUFFICIENT_EVIDENCE"
+    assert "INSUFFICIENT_EVIDENCE_CANNOT_PROVE_GOAL" in {issue.code for issue in result.issues}
 
 
 def dependency_contract() -> OriginalQuestionGoalContract:
@@ -597,22 +991,31 @@ def dependency_contract() -> OriginalQuestionGoalContract:
             "question": "查销量最高商品，再查这些商品的退款明细",
             "goals": [
                 {
-                    "goalId": "metric.top_products",
+                    "goalId": "metric.sales",
                     "kind": "metric",
+                    "label": "销量",
+                    "required": False,
+                },
+                {
+                    "goalId": "ranking.top_products",
+                    "kind": "ranking",
                     "label": "销量最高商品",
                     "required": False,
+                    "metricGoalIds": ["metric.sales"],
+                    "limit": 1,
+                    "populationScope": "ALL_MATCHING_ROWS",
                 },
                 {
                     "goalId": "chain.product_refunds",
                     "kind": "dependency",
                     "label": "商品集合传给退款查询",
                     "required": False,
-                    "upstreamGoalIds": ["metric.top_products"],
-                    "downstreamGoalIds": ["entity.refund_rows"],
+                    "upstreamGoalIds": ["ranking.top_products"],
+                    "downstreamGoalIds": ["detail.refund_rows"],
                 },
                 {
-                    "goalId": "entity.refund_rows",
-                    "kind": "entity",
+                    "goalId": "detail.refund_rows",
+                    "kind": "detail",
                     "label": "对应退款明细",
                 },
             ],
@@ -627,9 +1030,7 @@ def test_dependency_proof_without_artifact_lineage_is_rejected() -> None:
         [
             VerifiedArtifactGoalCoverage(
                 artifact_id="artifact-flat-result",
-                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
-                    contract
-                ),
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(contract),
                 covered_goal_ids=[goal.goal_id for goal in contract.goals],
                 verification_passed=True,
                 goal_resolutions=[
@@ -660,15 +1061,27 @@ def test_dependency_proof_with_verified_lineage_is_accepted() -> None:
             VerifiedArtifactGoalCoverage(
                 artifact_id="artifact-top-products",
                 goal_contract_fingerprint=fingerprint,
-                covered_goal_ids=["metric.top_products"],
+                covered_goal_ids=["metric.sales", "ranking.top_products"],
                 verification_passed=True,
+                goal_resolutions=[
+                    {
+                        "goalId": "ranking.top_products",
+                        "goalKind": "ranking",
+                        "resolution": "proved",
+                        "orderByGoalIds": ["metric.sales"],
+                        "direction": "DESC",
+                        "limit": 1,
+                        "rowSetRef": "artifact-top-products",
+                        "populationScope": "ALL_MATCHING_ROWS",
+                    }
+                ],
             ),
             VerifiedArtifactGoalCoverage(
                 artifact_id="artifact-refund-details",
                 goal_contract_fingerprint=fingerprint,
                 covered_goal_ids=[
                     "chain.product_refunds",
-                    "entity.refund_rows",
+                    "detail.refund_rows",
                 ],
                 verification_passed=True,
                 goal_resolutions=[
@@ -679,6 +1092,14 @@ def test_dependency_proof_with_verified_lineage_is_accepted() -> None:
                         "upstreamArtifactIds": ["artifact-top-products"],
                         "downstreamArtifactIds": ["artifact-refund-details"],
                         "lineageRefs": ["entity-set:verified:top-products"],
+                    },
+                    {
+                        "goalId": "detail.refund_rows",
+                        "goalKind": "detail",
+                        "resolution": "proved",
+                        "outputFields": ["refund_id"],
+                        "rowSetRef": "artifact-refund-details",
+                        "rowCount": 3,
                     }
                 ],
             ),
@@ -688,9 +1109,10 @@ def test_dependency_proof_with_verified_lineage_is_accepted() -> None:
     assert result.finalization_allowed is True
     assert result.passed is True
     assert result.covered_goal_ids == [
-        "metric.top_products",
+        "metric.sales",
+        "ranking.top_products",
         "chain.product_refunds",
-        "entity.refund_rows",
+        "detail.refund_rows",
     ]
 
 
@@ -713,6 +1135,7 @@ def test_rule_detail_ranking_and_analysis_goal_kinds_are_strictly_normalized() -
                     "label": "top 3",
                     "metricGoalIds": ["metric.alpha"],
                     "limit": 3,
+                    "populationScope": "ALL_MATCHING_ROWS",
                 }
             ],
             "analyses": [
@@ -744,3 +1167,36 @@ def test_rule_detail_ranking_and_analysis_goal_kinds_are_strictly_normalized() -
                 ],
             }
         )
+
+
+def test_ranking_inputs_must_reference_metric_and_dimension_goal_kinds() -> None:
+    result = validate_original_question_goal_contract(
+        {
+            "question": "退款明细并找金额最高前5单",
+            "goals": [
+                {
+                    "goalId": "detail.refunds",
+                    "kind": "DETAIL",
+                    "label": "退款明细",
+                },
+                {
+                    "goalId": "metric.refund_amount",
+                    "kind": "METRIC",
+                    "label": "退款金额",
+                },
+                {
+                    "goalId": "ranking.top5",
+                    "kind": "RANKING",
+                    "label": "退款最高前5单",
+                    "metricGoalIds": ["metric.refund_amount"],
+                    "dimensionGoalIds": ["detail.refunds"],
+                    "direction": "DESC",
+                    "limit": 5,
+                    "populationScope": "ALL_MATCHING_ROWS",
+                },
+            ],
+        }
+    )
+
+    assert result.valid is False
+    assert "RANKING_DIMENSION_GOAL_KIND_INVALID" in {issue.code for issue in result.issues}

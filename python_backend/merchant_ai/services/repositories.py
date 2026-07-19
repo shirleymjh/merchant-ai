@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import inspect
-import re
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -12,7 +11,7 @@ from threading import Event, RLock, Thread
 from typing import Any, Dict, Iterable, List, Optional
 
 from merchant_ai.config import Settings, jdbc_to_pymysql_kwargs
-from merchant_ai.models import MerchantInfo, PendingAnswer
+from merchant_ai.models import DataSnapshotContract, MerchantInfo, PendingAnswer
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
@@ -127,6 +126,7 @@ class DorisRepository:
         self.query_cache = build_ttl_cache("doris_select", settings, settings.cache_doris_select_ttl_seconds)
         self.last_cache_hit = False
         self.last_cache_key = ""
+        self.last_data_snapshot = DataSnapshotContract()
         self.last_degraded_reason: Dict[str, Any] = {}
 
     def query(
@@ -135,12 +135,29 @@ class DorisRepository:
         params: Optional[Iterable[Any]] = None,
         cancel_events: Optional[Iterable[Any]] = None,
         timeout_seconds: Optional[int] = None,
+        data_snapshot_contract: Optional[DataSnapshotContract] = None,
     ) -> List[Dict[str, Any]]:
         self.last_cache_hit = False
         self.last_cache_key = ""
         params_list = list(params or [])
-        cacheable = self._cacheable_query(sql)
-        cache_key = stable_cache_key("doris", {"sql": normalize_sql_for_cache(sql), "params": params_list}) if cacheable else ""
+        snapshot = data_snapshot_contract or DataSnapshotContract(
+            unsupported_reason="DATA_SNAPSHOT_CONTRACT_NOT_SUPPLIED"
+        )
+        self.last_data_snapshot = snapshot.model_copy(deep=True)
+        snapshot_current = self._snapshot_is_current(snapshot)
+        cacheable = self._cacheable_query(sql) and snapshot_current
+        cache_key = (
+            stable_cache_key(
+                "doris",
+                {
+                    "sql": normalize_sql_for_cache(sql),
+                    "params": params_list,
+                    "snapshot": snapshot.cache_identity(),
+                },
+            )
+            if cacheable
+            else ""
+        )
         if cache_key:
             cached = self.query_cache.get(cache_key)
             if cached is not None:
@@ -168,6 +185,125 @@ class DorisRepository:
         rows = self.query(sql, params)
         return rows[0] if rows else {}
 
+    def datasource_fingerprint(self) -> str:
+        connection = jdbc_to_pymysql_kwargs(
+            self.settings.doris_jdbc_url,
+            self.settings.doris_username,
+            self.settings.doris_password,
+        )
+        return stable_cache_key(
+            "doris_datasource",
+            {
+                "host": str(connection.get("host") or ""),
+                "port": int(connection.get("port") or 0),
+                "database": str(connection.get("database") or ""),
+                "environment": str(
+                    getattr(self.settings, "doris_datasource_environment", "") or ""
+                ).strip(),
+            },
+        )
+
+    def capture_data_snapshot(
+        self,
+        semantic_activation_fingerprint: str,
+    ) -> DataSnapshotContract:
+        """Observe a configured data generation without claiming atomic reads.
+
+        The epoch SQL and result column are deployment capabilities, not table
+        heuristics. Missing or malformed capability configuration fails closed
+        for result caching and is explicitly represented as ``UNSUPPORTED``.
+        """
+
+        environment = str(
+            getattr(self.settings, "doris_datasource_environment", "") or ""
+        ).strip()
+        epoch_sql = str(getattr(self.settings, "doris_data_epoch_sql", "") or "").strip()
+        epoch_column = str(
+            getattr(self.settings, "doris_data_epoch_column", "") or ""
+        ).strip()
+        cache_generation = str(
+            getattr(self.settings, "doris_cache_generation", "") or ""
+        ).strip()
+        semantic_fingerprint = str(semantic_activation_fingerprint or "").strip()
+        base = {
+            "datasource_fingerprint": self.datasource_fingerprint(),
+            "datasource_environment": environment,
+            "semantic_activation_fingerprint": semantic_fingerprint,
+            "cache_generation": cache_generation,
+            "captured_at": datetime.now().isoformat(),
+        }
+        missing = [
+            name
+            for name, value in (
+                ("DATASOURCE_ENVIRONMENT", environment),
+                ("DATA_EPOCH_SQL", epoch_sql),
+                ("DATA_EPOCH_COLUMN", epoch_column),
+                ("SEMANTIC_ACTIVATION_FINGERPRINT", semantic_fingerprint),
+                ("CACHE_GENERATION", cache_generation),
+            )
+            if not value
+        ]
+        if missing:
+            return DataSnapshotContract(
+                **base,
+                unsupported_reason="MISSING_" + "_AND_".join(missing),
+            )
+        if not self._cacheable_query(epoch_sql):
+            return DataSnapshotContract(
+                **base,
+                unsupported_reason="DATA_EPOCH_SQL_MUST_BE_SINGLE_READ_ONLY_QUERY",
+            )
+        try:
+            rows = self.db.query(epoch_sql)
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded(
+                "doris_repository", "capture_data_snapshot", exc
+            )
+            return DataSnapshotContract(
+                **base,
+                unsupported_reason="DATA_EPOCH_QUERY_FAILED",
+            )
+        if len(rows) != 1 or epoch_column not in rows[0]:
+            return DataSnapshotContract(
+                **base,
+                unsupported_reason="DATA_EPOCH_RESULT_INVALID",
+            )
+        data_epoch = str(rows[0].get(epoch_column) or "").strip()
+        if not data_epoch:
+            return DataSnapshotContract(
+                **base,
+                unsupported_reason="DATA_EPOCH_EMPTY",
+            )
+        return DataSnapshotContract(
+            **base,
+            data_epoch=data_epoch,
+            consistency_mode="OBSERVED_EPOCH",
+        )
+
+    def _snapshot_is_current(self, snapshot: DataSnapshotContract) -> bool:
+        if not snapshot.cache_identity_complete():
+            return False
+        if snapshot.consistency_mode == "AS_OF_READ":
+            raise RuntimeError(
+                "AS_OF_READ_UNSUPPORTED: generic Doris repository cannot enforce an as-of read"
+            )
+        if snapshot.datasource_fingerprint != self.datasource_fingerprint():
+            raise RuntimeError(
+                "DATA_SNAPSHOT_DATASOURCE_MISMATCH: snapshot belongs to another datasource"
+            )
+        current = self.capture_data_snapshot(
+            snapshot.semantic_activation_fingerprint
+        )
+        if not current.cache_identity_complete():
+            raise RuntimeError(
+                "DATA_SNAPSHOT_REVALIDATION_FAILED: current data generation is unavailable"
+            )
+        if current.cache_identity() != snapshot.cache_identity():
+            raise RuntimeError(
+                "DATA_SNAPSHOT_STALE: data, semantic or cache generation changed before query"
+            )
+        return True
+
     def show_full_columns(self, table_name: str) -> List[Dict[str, Any]]:
         safe_table = safe_identifier(table_name)
         return self.query("SHOW FULL COLUMNS FROM `%s`" % safe_table)
@@ -176,14 +312,51 @@ class DorisRepository:
         safe_table = safe_identifier(table_name)
         return self.query("SHOW CREATE TABLE `%s`" % safe_table)
 
-    def sample_rows(self, table_name: str, merchant_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def show_indexes(self, table_name: str) -> List[Dict[str, Any]]:
         safe_table = safe_identifier(table_name)
-        return self.query("SELECT * FROM `%s` LIMIT %s" % (safe_table, max(1, min(limit, 100))))
+        return self.query("SHOW INDEX FROM `%s`" % safe_table)
+
+    def show_partitions(self, table_name: str) -> List[Dict[str, Any]]:
+        safe_table = safe_identifier(table_name)
+        return self.query("SHOW PARTITIONS FROM `%s`" % safe_table)
+
+    def explain_verbose(self, sql: str) -> List[Dict[str, Any]]:
+        statement = str(sql or "").strip()
+        if not statement:
+            raise ValueError("sql is required for EXPLAIN VERBOSE")
+        return self.query("EXPLAIN VERBOSE %s" % statement)
+
+    def sample_rows(
+        self,
+        table_name: str,
+        merchant_id: str,
+        merchant_filter_column: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return a bounded sample from exactly one governed tenant scope.
+
+        Topic Builder is an administrative workflow, but its profiling queries
+        still touch production data.  Requiring the semantic tenant column at
+        this repository boundary prevents a future caller from accidentally
+        turning a merchant-scoped sample into a table-wide sample.
+        """
+
+        safe_table = safe_identifier(table_name)
+        safe_merchant_column = safe_identifier(merchant_filter_column)
+        scoped_merchant_id = str(merchant_id or "").strip()
+        if not scoped_merchant_id:
+            raise ValueError("merchant_id is required for tenant-scoped sampling")
+        return self.query(
+            "SELECT * FROM `%s` WHERE `%s` = %%s LIMIT %s"
+            % (safe_table, safe_merchant_column, max(1, min(limit, 100))),
+            [scoped_merchant_id],
+        )
 
     def profile_enum_candidates(
         self,
         table_name: str,
         merchant_id: str,
+        merchant_filter_column: str,
         columns: List[str],
         limit: int = 20,
     ) -> Dict[str, Any]:
@@ -193,14 +366,24 @@ class DorisRepository:
         UNREVIEWED until the semantic asset is enriched from governed business knowledge.
         """
         safe_table = safe_identifier(table_name)
+        safe_merchant_column = safe_identifier(merchant_filter_column)
+        scoped_merchant_id = str(merchant_id or "").strip()
+        if not scoped_merchant_id:
+            raise ValueError("merchant_id is required for tenant-scoped enum profiling")
         value_limit = max(1, min(int(limit or 20), 100))
         result: Dict[str, Any] = {}
         for raw_column in list(columns or [])[:24]:
             safe_column = safe_identifier(str(raw_column))
+            if safe_column == safe_merchant_column:
+                # Tenant identifiers are access-control inputs, not business
+                # enums, and must never be surfaced as discovered values.
+                continue
             sample_source = "`%s` TABLESAMPLE(10 PERCENT)" % safe_table
             stats = self.query_one(
-                "SELECT COUNT(`%s`) AS scanned_rows, COUNT(DISTINCT `%s`) AS distinct_count FROM %s"
-                % (safe_column, safe_column, sample_source)
+                "SELECT COUNT(`%s`) AS scanned_rows, COUNT(DISTINCT `%s`) AS distinct_count FROM %s "
+                "WHERE `%s` = %%s"
+                % (safe_column, safe_column, sample_source, safe_merchant_column),
+                [scoped_merchant_id],
             )
             distinct_count = int(stats.get("distinct_count") or 0)
             scanned_rows = int(stats.get("scanned_rows") or 0)
@@ -208,8 +391,17 @@ class DorisRepository:
                 continue
             rows = self.query(
                 "SELECT `%s` AS enum_value, COUNT(*) AS value_count FROM %s "
-                "WHERE `%s` IS NOT NULL GROUP BY `%s` ORDER BY value_count DESC LIMIT %s"
-                % (safe_column, sample_source, safe_column, safe_column, value_limit)
+                "WHERE `%s` = %%s AND `%s` IS NOT NULL GROUP BY `%s` "
+                "ORDER BY value_count DESC LIMIT %s"
+                % (
+                    safe_column,
+                    sample_source,
+                    safe_merchant_column,
+                    safe_column,
+                    safe_column,
+                    value_limit,
+                ),
+                [scoped_merchant_id],
             )
             result[str(raw_column)] = {
                 "values": [row.get("enum_value") for row in rows if row.get("enum_value") is not None],
@@ -229,6 +421,10 @@ class DorisRepository:
         trace = self.query_cache.trace()
         trace["lastCacheHit"] = self.last_cache_hit
         trace["lastCacheKey"] = self.last_cache_key
+        trace["lastDataSnapshot"] = self.last_data_snapshot.model_dump(
+            by_alias=True,
+            exclude={"captured_at"},
+        )
         if self.last_degraded_reason:
             trace["lastDegradedReason"] = self.last_degraded_reason
         return trace
@@ -246,7 +442,7 @@ class DorisRepository:
 
 
 def normalize_sql_for_cache(sql: str) -> str:
-    return re.sub(r"\s+", " ", str(sql or "").strip())
+    return " ".join(str(sql or "").split())
 
 
 class AnswerRepository:

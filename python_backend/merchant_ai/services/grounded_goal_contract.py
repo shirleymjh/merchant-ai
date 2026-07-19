@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import unicodedata
 from enum import Enum
-from typing import Annotated, Any, Literal, Mapping, Sequence, TypeAlias
+from typing import Annotated, Any, Literal, Mapping, Protocol, Sequence, TypeAlias
 
 from pydantic import ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
@@ -30,6 +30,15 @@ class _StrictGoalModel(APIModel):
     model_config = ConfigDict(extra="forbid")
 
 
+PopulationScope: TypeAlias = Literal[
+    "ALL_MATCHING_ROWS",
+    "SAME_AS_GOAL",
+    "VERIFIED_ENTITY_SET",
+    "VERIFIED_PREDICATE_SCOPE",
+    "VERIFIED_RESULT_ARTIFACT",
+]
+
+
 class QuestionGoalBase(_StrictGoalModel):
     goal_id: str
     kind: str
@@ -39,6 +48,8 @@ class QuestionGoalBase(_StrictGoalModel):
     source_spans: list[str] = Field(default_factory=list)
     semantic_ref_ids: list[str] = Field(default_factory=list)
     rationale: str = ""
+    population_scope: PopulationScope = "ALL_MATCHING_ROWS"
+    population_goal_ids: list[str] = Field(default_factory=list)
 
 
 class MetricQuestionGoal(QuestionGoalBase):
@@ -100,10 +111,12 @@ class DetailQuestionGoal(QuestionGoalBase):
 
 class RankingQuestionGoal(QuestionGoalBase):
     kind: Literal["RANKING"] = "RANKING"
+    population_scope: PopulationScope
     metric_goal_ids: list[str] = Field(default_factory=list)
     dimension_goal_ids: list[str] = Field(default_factory=list)
     direction: str = "DESC"
     limit: int = 0
+    limit_source: Literal["USER_EXPLICIT", "SYSTEM_DEFAULT"] = "USER_EXPLICIT"
 
 
 class AnalysisQuestionGoal(QuestionGoalBase):
@@ -161,12 +174,33 @@ class GoalContractValidationResult(APIModel):
     issues: list[GoalContractIssue] = Field(default_factory=list)
 
 
-class QuestionStructuralHints(APIModel):
-    """Conservative syntax-only hints; never business-goal inference."""
+class GoalContractQuestionVerifier(Protocol):
+    """Optional semantic completeness verifier owned outside the Kernel.
 
-    time_cues: list[str] = Field(default_factory=list)
-    comparison_cues: list[str] = Field(default_factory=list)
-    conjunction_cues: list[str] = Field(default_factory=list)
+    Implementations may use a grounded model or another language-aware
+    service to compare the retained question with Core's typed declaration.
+    The Kernel treats verifier errors and malformed verifier output as
+    blocking, but contains no language or business vocabulary itself.
+    """
+
+    def verify(
+        self,
+        contract: OriginalQuestionGoalContract,
+    ) -> Sequence[GoalContractIssue | Mapping[str, Any]]: ...
+
+
+class QuestionStructuralHints(APIModel):
+    """Non-authoritative Unicode shape audit of the retained question.
+
+    Goal kinds and relationships cannot be inferred reliably from surface
+    words. This model therefore exposes only language-agnostic token and
+    punctuation facts. It is suitable for observability, never for allowing
+    or blocking a Goal Contract.
+    """
+
+    token_count: int = 0
+    number_tokens: list[str] = Field(default_factory=list)
+    punctuation_tokens: list[str] = Field(default_factory=list)
     clause_count: int = 1
 
 
@@ -251,6 +285,9 @@ class RankingGoalProofResolution(GoalProofResolutionBase):
     direction: str = ""
     limit: int = 0
     row_set_ref: str = ""
+    population_scope: str = ""
+    population_goal_ids: list[str] = Field(default_factory=list)
+    population_lineage_refs: list[str] = Field(default_factory=list)
 
 
 class AnalysisGoalProofResolution(GoalProofResolutionBase):
@@ -296,9 +333,7 @@ class VerifiedArtifactGoalCoverage(_StrictGoalModel):
         normalized = dict(value)
         raw = normalized.get("goal_resolutions", normalized.get("goalResolutions", []))
         if raw is not None:
-            normalized["goal_resolutions"] = [
-                _normalize_goal_resolution_payload(item) for item in raw
-            ]
+            normalized["goal_resolutions"] = [_normalize_goal_resolution_payload(item) for item in raw]
         normalized.pop("goalResolutions", None)
         return normalized
 
@@ -327,18 +362,10 @@ class GoalCoverageResult(APIModel):
     artifact_ids: list[str] = Field(default_factory=list)
     coverage_by_goal_id: dict[str, list[str]] = Field(default_factory=dict)
     resolution_by_goal_id: dict[str, str] = Field(default_factory=dict)
-    resolution_proof_types_by_goal_id: dict[str, list[str]] = Field(
-        default_factory=dict
-    )
-    resolution_artifact_ids_by_goal_id: dict[str, list[str]] = Field(
-        default_factory=dict
-    )
-    resolution_evidence_refs_by_goal_id: dict[str, list[str]] = Field(
-        default_factory=dict
-    )
-    insufficiency_reason_by_goal_id: dict[str, str] = Field(
-        default_factory=dict
-    )
+    resolution_proof_types_by_goal_id: dict[str, list[str]] = Field(default_factory=dict)
+    resolution_artifact_ids_by_goal_id: dict[str, list[str]] = Field(default_factory=dict)
+    resolution_evidence_refs_by_goal_id: dict[str, list[str]] = Field(default_factory=dict)
+    insufficiency_reason_by_goal_id: dict[str, str] = Field(default_factory=dict)
     issues: list[GoalCoverageIssue] = Field(default_factory=list)
 
 
@@ -415,60 +442,43 @@ _GROUPED_GOAL_FIELDS = {
     "analysis_goals": "ANALYSIS",
 }
 
-_GOAL_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}\Z")
-_SPACE_PATTERN = re.compile(r"\s+")
-_TIME_CUE_PATTERNS = (
-    re.compile(r"\b(?:last|past|previous|next)\s+\d+\s*(?:days?|weeks?|months?|years?)\b", re.IGNORECASE),
-    re.compile(r"(?:最近|过去|未来|前|后)\s*\d+\s*(?:天|日|周|星期|个月|月|年)"),
-    re.compile(
-        r"\b\d{4}-\d{1,2}-\d{1,2}\b\s*(?:to|through|until|[-–—~～至到])\s*\b\d{4}-\d{1,2}-\d{1,2}\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:today|yesterday|this\s+(?:week|month|year)|last\s+(?:week|month|year))\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?:今天|昨天|本周|上周|本月|上月|今年|去年)"),
-)
-_COMPARISON_CUE_PATTERNS = (
-    re.compile(r"\b(?:vs\.?|versus|compared\s+(?:to|with)|compare|comparison)\b", re.IGNORECASE),
-    re.compile(r"(?:同比|环比|对比|比较)"),
-)
-_CONJUNCTION_CUE_PATTERNS = (
-    re.compile(r"\b(?:and|plus|as\s+well\s+as)\b", re.IGNORECASE),
-    re.compile(r"(?:以及|并且|同时)"),
-)
-
-
 def canonical_goal_id(value: Any) -> str:
     """Normalize a Core/artifact goal ID into one stable ledger key."""
 
-    normalized = _SPACE_PATTERN.sub("_", str(value or "").strip().lower())
-    if not _GOAL_ID_PATTERN.fullmatch(normalized):
-        raise ValueError(
-            "goal IDs must be 1-128 ASCII letters/digits with optional '.', '_', ':', or '-' separators"
+    raw = str(value or "").strip().lower()
+    characters: list[str] = []
+    previous_was_space = False
+    for character in raw:
+        if character.isspace():
+            if not previous_was_space:
+                characters.append("_")
+            previous_was_space = True
+            continue
+        characters.append(character)
+        previous_was_space = False
+    normalized = "".join(characters)
+    allowed_tail = {".", "_", ":", "-"}
+    if (
+        not 1 <= len(normalized) <= 128
+        or not _is_ascii_letter_or_digit(normalized[0])
+        or any(
+            not _is_ascii_letter_or_digit(character) and character not in allowed_tail
+            for character in normalized[1:]
         )
+    ):
+        raise ValueError("goal IDs must be 1-128 ASCII letters/digits with optional '.', '_', ':', or '-' separators")
     return normalized
 
 
 def inspect_question_structure(question: str) -> QuestionStructuralHints:
-    """Return syntax-only cues that can audit a Core-authored contract.
+    """Inspect language-agnostic Unicode shape without inferring intent."""
 
-    This intentionally never guesses metric names, dimensions, entities, or
-    semantic references. It only recognizes explicit time/comparison syntax
-    and a small set of unambiguous conjunction tokens.
-    """
-
-    normalized = str(question or "").strip()
-    time_cues = _matched_cues(normalized, _TIME_CUE_PATTERNS)
-    comparison_cues = _matched_cues(normalized, _COMPARISON_CUE_PATTERNS)
-    conjunction_cues = _matched_cues(normalized, _CONJUNCTION_CUE_PATTERNS)
-    clauses = [part.strip() for part in re.split(r"[;；。!?！？]+", normalized) if part.strip()]
+    tokens = _unicode_question_tokens(str(question or "").strip())
     return QuestionStructuralHints(
-        time_cues=time_cues,
-        comparison_cues=comparison_cues,
-        conjunction_cues=conjunction_cues,
-        clause_count=max(1, len(clauses)),
+        token_count=len(tokens),
+        number_tokens=[value for kind, value in tokens if kind == "NUMBER"],
+        punctuation_tokens=[value for kind, value in tokens if kind == "PUNCTUATION"],
+        clause_count=_unicode_clause_count(tokens),
     )
 
 
@@ -476,8 +486,13 @@ def validate_original_question_goal_contract(
     payload: OriginalQuestionGoalContract | Mapping[str, Any] | str,
     *,
     structural_checks: bool = True,
+    question_verifier: GoalContractQuestionVerifier | None = None,
 ) -> GoalContractValidationResult:
-    """Parse, normalize, and cross-validate one Core-supplied contract."""
+    """Parse and cross-validate one Core-supplied typed contract.
+
+    ``structural_checks`` is retained for caller compatibility. It controls an
+    optional question verifier, not an embedded keyword heuristic.
+    """
 
     try:
         normalized = _normalize_contract_payload(payload)
@@ -495,8 +510,8 @@ def validate_original_question_goal_contract(
         )
 
     issues = _contract_issues(contract)
-    if structural_checks:
-        issues.extend(_structural_contract_issues(contract))
+    if structural_checks and question_verifier is not None:
+        issues.extend(_question_verifier_issues(contract, question_verifier))
     return GoalContractValidationResult(
         valid=not any(issue.blocking for issue in issues),
         contract=contract,
@@ -508,8 +523,13 @@ def parse_original_question_goal_contract(
     payload: OriginalQuestionGoalContract | Mapping[str, Any] | str,
     *,
     structural_checks: bool = True,
+    question_verifier: GoalContractQuestionVerifier | None = None,
 ) -> OriginalQuestionGoalContract:
-    result = validate_original_question_goal_contract(payload, structural_checks=structural_checks)
+    result = validate_original_question_goal_contract(
+        payload,
+        structural_checks=structural_checks,
+        question_verifier=question_verifier,
+    )
     if not result.valid or result.contract is None:
         raise GoalContractValidationError(result.issues)
     return result.contract
@@ -569,12 +589,8 @@ def declare_verified_artifact_goal_coverage(
     if not verification_passed:
         raise ValueError("goal coverage may only be declared by a verified query artifact")
     canonical_covered = _canonical_goal_id_list(covered_goal_ids)
-    normalized_resolutions = [
-        _normalize_goal_resolution_payload(item) for item in goal_resolutions
-    ]
-    resolution_goal_ids = {
-        canonical_goal_id(item.get("goal_id")) for item in normalized_resolutions
-    }
+    normalized_resolutions = [_normalize_goal_resolution_payload(item) for item in goal_resolutions]
+    resolution_goal_ids = {canonical_goal_id(item.get("goal_id")) for item in normalized_resolutions}
     goal_map = parsed.goal_map()
     for goal_id in canonical_covered:
         goal = goal_map.get(goal_id)
@@ -694,9 +710,9 @@ class GoalCoverageVerifier:
 
         accepted_artifact_id_set = set(accepted_artifact_ids)
         claimed: set[str] = set()
-        resolution_candidates: dict[
-            str, list[tuple[str, GoalProofResolution]]
-        ] = {goal.goal_id: [] for goal in parsed.goals}
+        resolution_candidates: dict[str, list[tuple[str, GoalProofResolution]]] = {
+            goal.goal_id: [] for goal in parsed.goals
+        }
         for declaration in accepted_declarations:
             artifact_id = declaration.artifact_id
             if not declaration.covered_goal_ids and not declaration.goal_resolutions:
@@ -717,8 +733,7 @@ class GoalCoverageVerifier:
                         GoalCoverageIssue(
                             code="DUPLICATE_ARTIFACT_GOAL_RESOLUTION",
                             message=(
-                                f"artifact {artifact_id!r} contains more than one resolution "
-                                f"for goal {goal_id!r}"
+                                f"artifact {artifact_id!r} contains more than one resolution for goal {goal_id!r}"
                             ),
                             goal_id=goal_id,
                             artifact_id=artifact_id,
@@ -860,30 +875,17 @@ class GoalCoverageVerifier:
             insufficient = [
                 (artifact_id, resolution)
                 for artifact_id, resolution in candidates
-                if resolution.resolution
-                == GoalResolutionStatus.INSUFFICIENT_EVIDENCE.value
+                if resolution.resolution == GoalResolutionStatus.INSUFFICIENT_EVIDENCE.value
             ]
             if proved:
                 raw_resolution_by_goal_id[goal.goal_id] = GoalResolutionStatus.PROVED.value
-                coverage_by_goal_id[goal.goal_id] = list(
-                    dict.fromkeys(artifact_id for artifact_id, _ in proved)
-                )
-                resolution_artifact_ids_by_goal_id[goal.goal_id] = list(
-                    coverage_by_goal_id[goal.goal_id]
-                )
+                coverage_by_goal_id[goal.goal_id] = list(dict.fromkeys(artifact_id for artifact_id, _ in proved))
+                resolution_artifact_ids_by_goal_id[goal.goal_id] = list(coverage_by_goal_id[goal.goal_id])
                 resolution_evidence_refs_by_goal_id[goal.goal_id] = list(
-                    dict.fromkeys(
-                        evidence_ref
-                        for _, resolution in proved
-                        for evidence_ref in resolution.evidence_refs
-                    )
+                    dict.fromkeys(evidence_ref for _, resolution in proved for evidence_ref in resolution.evidence_refs)
                 )
                 resolution_proof_types_by_goal_id[goal.goal_id] = list(
-                    dict.fromkeys(
-                        resolution.proof_type
-                        for _, resolution in proved
-                        if resolution.proof_type
-                    )
+                    dict.fromkeys(resolution.proof_type for _, resolution in proved if resolution.proof_type)
                 )
                 if insufficient:
                     issues.append(
@@ -898,33 +900,21 @@ class GoalCoverageVerifier:
                         )
                     )
             elif insufficient:
-                raw_resolution_by_goal_id[
-                    goal.goal_id
-                ] = GoalResolutionStatus.INSUFFICIENT_EVIDENCE.value
+                raw_resolution_by_goal_id[goal.goal_id] = GoalResolutionStatus.INSUFFICIENT_EVIDENCE.value
                 resolution_artifact_ids_by_goal_id[goal.goal_id] = list(
                     dict.fromkeys(artifact_id for artifact_id, _ in insufficient)
                 )
                 resolution_evidence_refs_by_goal_id[goal.goal_id] = list(
                     dict.fromkeys(
-                        evidence_ref
-                        for _, resolution in insufficient
-                        for evidence_ref in resolution.evidence_refs
+                        evidence_ref for _, resolution in insufficient for evidence_ref in resolution.evidence_refs
                     )
                 )
                 insufficiency_reason_by_goal_id[goal.goal_id] = next(
-                    (
-                        resolution.reason
-                        for _, resolution in insufficient
-                        if resolution.reason
-                    ),
+                    (resolution.reason for _, resolution in insufficient if resolution.reason),
                     "",
                 )
                 resolution_proof_types_by_goal_id[goal.goal_id] = list(
-                    dict.fromkeys(
-                        resolution.proof_type
-                        for _, resolution in insufficient
-                        if resolution.proof_type
-                    )
+                    dict.fromkeys(resolution.proof_type for _, resolution in insufficient if resolution.proof_type)
                 )
 
         graph = _goal_dependency_graph(parsed)
@@ -935,9 +925,7 @@ class GoalCoverageVerifier:
         }
         while True:
             invalid = {
-                goal_id
-                for goal_id in effective_covered
-                if not graph.get(goal_id, set()).issubset(effective_covered)
+                goal_id for goal_id in effective_covered if not graph.get(goal_id, set()).issubset(effective_covered)
             }
             if not invalid:
                 break
@@ -947,8 +935,7 @@ class GoalCoverageVerifier:
         for goal_id in [
             goal.goal_id
             for goal in parsed.goals
-            if raw_resolution_by_goal_id.get(goal.goal_id)
-            == GoalResolutionStatus.PROVED.value
+            if raw_resolution_by_goal_id.get(goal.goal_id) == GoalResolutionStatus.PROVED.value
             and goal.goal_id not in effective_covered
         ]:
             missing_dependencies = sorted(graph.get(goal_id, set()) - effective_covered)
@@ -976,20 +963,14 @@ class GoalCoverageVerifier:
                     code="COVERED_GOAL_DEPENDENCY_UNCOVERED",
                     message=f"goal {goal_id!r} was claimed covered while prerequisite goals remain uncovered",
                     goal_id=goal_id,
-                    details={
-                        "missingDependencyGoalIds": sorted(
-                            graph.get(goal_id, set()) - effective_covered
-                        )
-                    },
+                    details={"missingDependencyGoalIds": sorted(graph.get(goal_id, set()) - effective_covered)},
                 )
             )
 
         effective_resolved = set(raw_resolution_by_goal_id)
         while True:
             unresolved = {
-                goal_id
-                for goal_id in effective_resolved
-                if not graph.get(goal_id, set()).issubset(effective_resolved)
+                goal_id for goal_id in effective_resolved if not graph.get(goal_id, set()).issubset(effective_resolved)
             }
             if not unresolved:
                 break
@@ -1005,16 +986,9 @@ class GoalCoverageVerifier:
             issues.append(
                 GoalCoverageIssue(
                     code="RESOLVED_GOAL_DEPENDENCY_UNRESOLVED",
-                    message=(
-                        f"goal {goal_id!r} has a typed resolution while prerequisite "
-                        "goals remain unresolved"
-                    ),
+                    message=(f"goal {goal_id!r} has a typed resolution while prerequisite goals remain unresolved"),
                     goal_id=goal_id,
-                    details={
-                        "missingDependencyGoalIds": sorted(
-                            graph.get(goal_id, set()) - effective_resolved
-                        )
-                    },
+                    details={"missingDependencyGoalIds": sorted(graph.get(goal_id, set()) - effective_resolved)},
                 )
             )
 
@@ -1034,8 +1008,7 @@ class GoalCoverageVerifier:
             goal.goal_id
             for goal in parsed.goals
             if goal.goal_id in effective_resolved
-            and raw_resolution_by_goal_id.get(goal.goal_id)
-            == GoalResolutionStatus.INSUFFICIENT_EVIDENCE.value
+            and raw_resolution_by_goal_id.get(goal.goal_id) == GoalResolutionStatus.INSUFFICIENT_EVIDENCE.value
         ]
         for goal_id in insufficient_evidence:
             issues.append(
@@ -1050,9 +1023,7 @@ class GoalCoverageVerifier:
                 )
             )
 
-        unproved_required = [
-            goal_id for goal_id in required if goal_id not in effective_covered
-        ]
+        unproved_required = [goal_id for goal_id in required if goal_id not in effective_covered]
 
         optional_uncovered = [
             goal.goal_id
@@ -1102,8 +1073,7 @@ class GoalCoverageVerifier:
             insufficiency_reason_by_goal_id={
                 goal_id: insufficiency_reason_by_goal_id[goal_id]
                 for goal_id in [goal.goal_id for goal in parsed.goals]
-                if goal_id in effective_resolved
-                and goal_id in insufficiency_reason_by_goal_id
+                if goal_id in effective_resolved and goal_id in insufficiency_reason_by_goal_id
             },
             issues=issues,
         )
@@ -1195,6 +1165,7 @@ def _normalize_goal_payload(payload: Any) -> dict[str, Any]:
         "baseline_goal_ids",
         "metric_goal_ids",
         "dimension_goal_ids",
+        "population_goal_ids",
     )
     string_list_fields = (
         "source_spans",
@@ -1216,6 +1187,21 @@ def _normalize_goal_payload(payload: Any) -> dict[str, Any]:
     for field_name, value in list(normalized.items()):
         if isinstance(value, str):
             normalized[field_name] = value.strip()
+    if normalized.get("kind") == "RANKING":
+        try:
+            limit = int(normalized.get("limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        normalized["limit"] = limit
+        normalized.setdefault("limit_source", "USER_EXPLICIT")
+        if "direction" in normalized:
+            normalized["direction"] = str(normalized.get("direction") or "").strip().upper()
+        population_scope = str(
+            normalized.get("population_scope")
+            or normalized.pop("populationScope", "")
+        ).strip().upper()
+        if population_scope:
+            normalized["population_scope"] = population_scope
     return normalized
 
 
@@ -1258,6 +1244,7 @@ def _contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContrac
         )
 
     goal_id_set = set(goal_ids)
+    goal_by_id = contract.goal_map()
     for goal in contract.goals:
         if not goal.label:
             issues.append(
@@ -1267,9 +1254,19 @@ def _contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContrac
                     goal_id=goal.goal_id,
                 )
             )
-        if isinstance(goal, TimeWindowQuestionGoal) and not (
-            goal.time_expression or (goal.start and goal.end)
-        ):
+        for source_span in goal.source_spans:
+            if source_span not in contract.question:
+                issues.append(
+                    GoalContractIssue(
+                        code="GOAL_SOURCE_SPAN_NOT_IN_QUESTION",
+                        message=(
+                            f"goal {goal.goal_id!r} sourceSpan {source_span!r} is not present in the original question"
+                        ),
+                        goal_id=goal.goal_id,
+                        path="sourceSpans",
+                    )
+                )
+        if isinstance(goal, TimeWindowQuestionGoal) and not (goal.time_expression or (goal.start and goal.end)):
             issues.append(
                 GoalContractIssue(
                     code="TIME_WINDOW_DEFINITION_MISSING",
@@ -1277,9 +1274,7 @@ def _contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContrac
                     goal_id=goal.goal_id,
                 )
             )
-        if isinstance(goal, ComparisonQuestionGoal) and (
-            not goal.left_goal_ids or not goal.right_goal_ids
-        ):
+        if isinstance(goal, ComparisonQuestionGoal) and (not goal.left_goal_ids or not goal.right_goal_ids):
             issues.append(
                 GoalContractIssue(
                     code="COMPARISON_OPERANDS_MISSING",
@@ -1287,9 +1282,7 @@ def _contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContrac
                     goal_id=goal.goal_id,
                 )
             )
-        if isinstance(goal, DependencyQuestionGoal) and (
-            not goal.upstream_goal_ids or not goal.downstream_goal_ids
-        ):
+        if isinstance(goal, DependencyQuestionGoal) and (not goal.upstream_goal_ids or not goal.downstream_goal_ids):
             issues.append(
                 GoalContractIssue(
                     code="DEPENDENCY_ENDPOINTS_MISSING",
@@ -1306,14 +1299,112 @@ def _contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContrac
                         goal_id=goal.goal_id,
                     )
                 )
-            if goal.limit <= 0:
+            if goal.direction not in {"ASC", "DESC"}:
                 issues.append(
                     GoalContractIssue(
-                        code="RANKING_LIMIT_INVALID",
-                        message=f"ranking goal {goal.goal_id!r} requires a positive limit",
+                        code="RANKING_DIRECTION_INVALID",
+                        message=f"ranking goal {goal.goal_id!r} requires ASC or DESC direction",
                         goal_id=goal.goal_id,
                     )
                 )
+            if goal.limit <= 0:
+                issues.append(
+                    GoalContractIssue(
+                        code="RANKING_LIMIT_REQUIRED",
+                        message=f"ranking goal {goal.goal_id!r} requires an explicit positive limit",
+                        goal_id=goal.goal_id,
+                    )
+                )
+            if goal.population_scope == "ALL_MATCHING_ROWS":
+                if goal.population_goal_ids:
+                    issues.append(
+                        GoalContractIssue(
+                            code="RANKING_POPULATION_GOALS_UNEXPECTED",
+                            message=(
+                                f"ranking goal {goal.goal_id!r} declares ALL_MATCHING_ROWS "
+                                "but also supplies populationGoalIds"
+                            ),
+                            goal_id=goal.goal_id,
+                        )
+                    )
+            elif goal.population_scope in {
+                "SAME_AS_GOAL",
+                "VERIFIED_ENTITY_SET",
+            } and not goal.population_goal_ids:
+                issues.append(
+                    GoalContractIssue(
+                        code="RANKING_POPULATION_GOALS_REQUIRED",
+                        message=(
+                            f"ranking goal {goal.goal_id!r} populationScope "
+                            f"{goal.population_scope!r} requires populationGoalIds"
+                        ),
+                        goal_id=goal.goal_id,
+                    )
+                )
+            elif goal.population_scope in {
+                "VERIFIED_PREDICATE_SCOPE",
+                "VERIFIED_RESULT_ARTIFACT",
+            } and goal.population_goal_ids:
+                issues.append(
+                    GoalContractIssue(
+                        code="RANKING_CROSS_TURN_POPULATION_GOALS_UNEXPECTED",
+                        message=(
+                            f"ranking goal {goal.goal_id!r} uses a verified prior artifact "
+                            "and must not reference current-turn populationGoalIds"
+                        ),
+                        goal_id=goal.goal_id,
+                    )
+                )
+            for population_goal_id in goal.population_goal_ids:
+                population_goal = goal_by_id.get(population_goal_id)
+                if population_goal is not None and not isinstance(
+                    population_goal,
+                    (DetailQuestionGoal, EntityQuestionGoal, RankingQuestionGoal),
+                ):
+                    issues.append(
+                        GoalContractIssue(
+                            code="RANKING_POPULATION_GOAL_KIND_INVALID",
+                            message=(
+                                f"ranking goal {goal.goal_id!r} populationGoalId "
+                                f"{population_goal_id!r} must reference DETAIL, "
+                                "ENTITY or RANKING"
+                            ),
+                            goal_id=goal.goal_id,
+                            reference_goal_id=population_goal_id,
+                        )
+                    )
+            for metric_goal_id in goal.metric_goal_ids:
+                referenced = goal_by_id.get(metric_goal_id)
+                if referenced is not None and not isinstance(referenced, MetricQuestionGoal):
+                    issues.append(
+                        GoalContractIssue(
+                            code="RANKING_METRIC_GOAL_KIND_INVALID",
+                            message=(
+                                f"ranking goal {goal.goal_id!r} metricGoalId "
+                                f"{metric_goal_id!r} must reference a METRIC goal"
+                            ),
+                            goal_id=goal.goal_id,
+                            reference_goal_id=metric_goal_id,
+                        )
+                    )
+            for dimension_goal_id in goal.dimension_goal_ids:
+                referenced = goal_by_id.get(dimension_goal_id)
+                if referenced is not None and not isinstance(
+                    referenced,
+                    (DimensionQuestionGoal, EntityQuestionGoal),
+                ):
+                    issues.append(
+                        GoalContractIssue(
+                            code="RANKING_DIMENSION_GOAL_KIND_INVALID",
+                            message=(
+                                f"ranking goal {goal.goal_id!r} dimensionGoalId "
+                                f"{dimension_goal_id!r} must reference a "
+                                "DIMENSION or ENTITY goal"
+                            ),
+                            goal_id=goal.goal_id,
+                            reference_goal_id=dimension_goal_id,
+                        )
+                    )
         if isinstance(goal, AnalysisQuestionGoal):
             if not goal.analysis_type:
                 issues.append(
@@ -1365,41 +1456,37 @@ def _contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContrac
     return issues
 
 
-def _structural_contract_issues(contract: OriginalQuestionGoalContract) -> list[GoalContractIssue]:
-    hints = inspect_question_structure(contract.question)
-    kinds = {str(goal.kind) for goal in contract.goals}
-    issues: list[GoalContractIssue] = []
-    if hints.time_cues and QuestionGoalKind.TIME_WINDOW.value not in kinds:
-        issues.append(
+def _question_verifier_issues(
+    contract: OriginalQuestionGoalContract,
+    verifier: GoalContractQuestionVerifier,
+) -> list[GoalContractIssue]:
+    """Invoke an explicit semantic verifier and fail closed on its failure."""
+
+    try:
+        raw_issues = verifier.verify(contract.model_copy(deep=True))
+        if isinstance(raw_issues, (str, bytes)) or not isinstance(raw_issues, Sequence):
+            raise TypeError("question verifier must return a sequence of typed issues")
+        issues: list[GoalContractIssue] = []
+        for raw_issue in raw_issues:
+            issue = (
+                raw_issue.model_copy(deep=True)
+                if isinstance(raw_issue, GoalContractIssue)
+                else GoalContractIssue.model_validate(raw_issue)
+            )
+            issue.code = str(issue.code or "").strip()
+            issue.message = str(issue.message or "").strip()
+            if not issue.code or not issue.message:
+                raise ValueError("question verifier issues require non-empty code and message")
+            issues.append(issue)
+        return issues
+    except Exception as exc:
+        return [
             GoalContractIssue(
-                code="STRUCTURAL_TIME_GOAL_MISSING",
-                message="the original question has an explicit time cue but the Core contract has no TIME_WINDOW goal",
+                code="GOAL_CONTRACT_QUESTION_VERIFIER_FAILED",
+                message=f"the configured question verifier failed closed: {exc}",
                 path="question",
             )
-        )
-    if hints.comparison_cues and QuestionGoalKind.COMPARISON.value not in kinds:
-        issues.append(
-            GoalContractIssue(
-                code="STRUCTURAL_COMPARISON_GOAL_MISSING",
-                message="the original question has an explicit comparison cue but the Core contract has no COMPARISON goal",
-                path="question",
-            )
-        )
-    required_answer_goals = [
-        goal
-        for goal in contract.goals
-        if goal.required and not isinstance(goal, (TimeWindowQuestionGoal, DependencyQuestionGoal))
-    ]
-    if hints.conjunction_cues and len(required_answer_goals) < 2:
-        issues.append(
-            GoalContractIssue(
-                code="STRUCTURAL_CONJUNCTION_REVIEW_REQUIRED",
-                message="the original question has a conjunction cue but fewer than two required answer goals; Core should review coverage",
-                blocking=False,
-                path="question",
-            )
-        )
-    return issues
+        ]
 
 
 def _goal_dependency_graph(contract: OriginalQuestionGoalContract) -> dict[str, set[str]]:
@@ -1422,6 +1509,7 @@ def _goal_dependency_graph(contract: OriginalQuestionGoalContract) -> dict[str, 
         elif isinstance(goal, RankingQuestionGoal):
             graph[goal.goal_id].update(goal.metric_goal_ids)
             graph[goal.goal_id].update(goal.dimension_goal_ids)
+            graph[goal.goal_id].update(goal.population_goal_ids)
         elif isinstance(goal, AnalysisQuestionGoal):
             graph[goal.goal_id].update(goal.input_goal_ids)
             graph[goal.goal_id].update(goal.baseline_goal_ids)
@@ -1445,6 +1533,7 @@ def _all_goal_references(goal: QuestionGoal) -> list[str]:
     elif isinstance(goal, RankingQuestionGoal):
         references.extend(goal.metric_goal_ids)
         references.extend(goal.dimension_goal_ids)
+        references.extend(goal.population_goal_ids)
     elif isinstance(goal, AnalysisQuestionGoal):
         references.extend(goal.input_goal_ids)
         references.extend(goal.baseline_goal_ids)
@@ -1490,9 +1579,7 @@ def _coerce_artifact_coverage(artifact: Any) -> VerifiedArtifactGoalCoverage:
                 artifact, "goal_contract_fingerprint", "goalContractFingerprint"
             ),
             "covered_goal_ids": _object_value(artifact, "covered_goal_ids", "coveredGoalIds"),
-            "verification_passed": _object_value(
-                artifact, "verification_passed", "verificationPassed"
-            ),
+            "verification_passed": _object_value(artifact, "verification_passed", "verificationPassed"),
             "evidence_refs": _object_value(
                 artifact,
                 "evidence_refs",
@@ -1564,8 +1651,7 @@ def _coerce_artifact_coverage(artifact: Any) -> VerifiedArtifactGoalCoverage:
     payload["covered_goal_ids"] = _canonical_goal_id_list(payload.get("covered_goal_ids") or [])
     payload["evidence_refs"] = _normalized_string_list(payload.get("evidence_refs") or [])
     payload["goal_resolutions"] = [
-        _normalize_goal_resolution_payload(item)
-        for item in payload.get("goal_resolutions") or []
+        _normalize_goal_resolution_payload(item) for item in payload.get("goal_resolutions") or []
     ]
     return VerifiedArtifactGoalCoverage.model_validate(payload)
 
@@ -1591,9 +1677,7 @@ def _normalize_goal_resolution_payload(payload: Any) -> dict[str, Any]:
 
     normalized["goal_id"] = canonical_goal_id(normalized.get("goal_id"))
     normalized["goal_kind"] = _canonical_goal_kind(normalized.get("goal_kind"))
-    normalized["resolution"] = _canonical_resolution_status(
-        normalized.get("resolution")
-    )
+    normalized["resolution"] = _canonical_resolution_status(normalized.get("resolution"))
 
     goal_id_list_fields = (
         "operand_goal_ids",
@@ -1621,14 +1705,10 @@ def _normalize_goal_resolution_payload(payload: Any) -> dict[str, Any]:
             normalized[snake_name] = normalized.pop(camel_name)
     for field_name in goal_id_list_fields:
         if field_name in normalized:
-            normalized[field_name] = _canonical_goal_id_list(
-                normalized[field_name]
-            )
+            normalized[field_name] = _canonical_goal_id_list(normalized[field_name])
     for field_name in string_list_fields:
         if field_name in normalized:
-            normalized[field_name] = _normalized_string_list(
-                normalized[field_name]
-            )
+            normalized[field_name] = _normalized_string_list(normalized[field_name])
     for field_name, value in list(normalized.items()):
         if isinstance(value, str):
             normalized[field_name] = value.strip()
@@ -1640,9 +1720,7 @@ def _normalize_goal_resolution_payload(payload: Any) -> dict[str, Any]:
 def _parse_goal_resolution(payload: GoalProofResolution | Mapping[str, Any]) -> GoalProofResolution:
     if isinstance(payload, GoalProofResolutionBase):
         return payload
-    return TypeAdapter(GoalProofResolution).validate_python(
-        _normalize_goal_resolution_payload(payload)
-    )
+    return TypeAdapter(GoalProofResolution).validate_python(_normalize_goal_resolution_payload(payload))
 
 
 def _legacy_primitive_goal_resolution(
@@ -1669,21 +1747,15 @@ def _legacy_primitive_goal_resolution(
     if isinstance(goal, MetricQuestionGoal):
         base.update(
             {
-                "metric_ref_ids": _normalized_string_list(
-                    [goal.metric_ref_id, *goal.semantic_ref_ids]
-                ),
+                "metric_ref_ids": _normalized_string_list([goal.metric_ref_id, *goal.semantic_ref_ids]),
                 "value_refs": [f"{artifact_ref}:metric-value"],
             }
         )
     elif isinstance(goal, DimensionQuestionGoal):
         base.update(
             {
-                "dimension_ref_ids": _normalized_string_list(
-                    [goal.dimension_ref_id, *goal.semantic_ref_ids]
-                ),
-                "output_fields": [
-                    goal.dimension_ref_id or f"{artifact_ref}:dimension-output"
-                ],
+                "dimension_ref_ids": _normalized_string_list([goal.dimension_ref_id, *goal.semantic_ref_ids]),
+                "output_fields": [goal.dimension_ref_id or f"{artifact_ref}:dimension-output"],
             }
         )
     elif isinstance(goal, TimeWindowQuestionGoal):
@@ -1699,14 +1771,8 @@ def _legacy_primitive_goal_resolution(
     elif isinstance(goal, EntityQuestionGoal):
         base.update(
             {
-                "entity_ref_ids": _normalized_string_list(
-                    [goal.entity_ref_id, *goal.semantic_ref_ids]
-                ),
-                "identity_fields": [
-                    goal.entity_identity
-                    or goal.entity_ref_id
-                    or f"{artifact_ref}:entity-identity"
-                ],
+                "entity_ref_ids": _normalized_string_list([goal.entity_ref_id, *goal.semantic_ref_ids]),
+                "identity_fields": [goal.entity_identity or goal.entity_ref_id or f"{artifact_ref}:entity-identity"],
                 "entity_set_ref": f"{artifact_ref}:entity-set",
             }
         )
@@ -1734,18 +1800,13 @@ def _semantic_evidence_issue(
     resolution_evidence_refs: Sequence[str],
 ) -> GoalCoverageIssue | None:
     declared_semantic_refs = _goal_semantic_refs(goal)
-    evidence = set(
-        _normalized_string_list(
-            [*artifact_evidence_refs, *resolution_evidence_refs]
-        )
-    )
+    evidence = set(_normalized_string_list([*artifact_evidence_refs, *resolution_evidence_refs]))
     if not declared_semantic_refs or declared_semantic_refs.intersection(evidence):
         return None
     return GoalCoverageIssue(
         code="GOAL_SEMANTIC_EVIDENCE_UNCOVERED",
         message=(
-            f"artifact {artifact_id!r} claimed goal {goal.goal_id!r} "
-            "without any of its declared semantic evidence refs"
+            f"artifact {artifact_id!r} claimed goal {goal.goal_id!r} without any of its declared semantic evidence refs"
         ),
         goal_id=goal.goal_id,
         artifact_id=artifact_id,
@@ -1797,18 +1858,13 @@ def _goal_resolution_issues(
                 f"dimension goal {goal.goal_id!r} has no verified output field",
             )
     elif isinstance(resolution, TimeWindowGoalProofResolution):
-        if not resolution.time_expression and not (
-            resolution.start and resolution.end
-        ):
+        if not resolution.time_expression and not (resolution.start and resolution.end):
             add(
                 "TIME_WINDOW_PROOF_BOUNDARY_MISSING",
                 f"time goal {goal.goal_id!r} has no verified expression or boundaries",
             )
     elif isinstance(resolution, ComparisonGoalProofResolution):
-        expected_operands = set(
-            getattr(goal, "left_goal_ids", [])
-            + getattr(goal, "right_goal_ids", [])
-        )
+        expected_operands = set(getattr(goal, "left_goal_ids", []) + getattr(goal, "right_goal_ids", []))
         actual_operands = set(resolution.operand_goal_ids)
         if not expected_operands.issubset(actual_operands):
             add(
@@ -1860,9 +1916,7 @@ def _goal_resolution_issues(
                 "DEPENDENCY_PROOF_LINEAGE_MISSING",
                 f"dependency goal {goal.goal_id!r} has no verified entity/artifact lineage reference",
             )
-        referenced_artifacts = set(resolution.upstream_artifact_ids) | set(
-            resolution.downstream_artifact_ids
-        )
+        referenced_artifacts = set(resolution.upstream_artifact_ids) | set(resolution.downstream_artifact_ids)
         unknown_artifacts = sorted(referenced_artifacts - accepted_artifact_ids)
         if unknown_artifacts:
             add(
@@ -1916,6 +1970,30 @@ def _goal_resolution_issues(
                 "RANKING_PROOF_ROW_SET_MISSING",
                 f"ranking goal {goal.goal_id!r} has no verified ordered row set",
             )
+        if resolution.population_scope != goal.population_scope:
+            add(
+                "RANKING_PROOF_POPULATION_SCOPE_MISMATCH",
+                f"ranking goal {goal.goal_id!r} does not prove its declared population scope",
+                expectedPopulationScope=goal.population_scope,
+                actualPopulationScope=resolution.population_scope,
+            )
+        if not set(goal.population_goal_ids).issubset(
+            set(resolution.population_goal_ids)
+        ):
+            add(
+                "RANKING_PROOF_POPULATION_GOALS_MISSING",
+                f"ranking goal {goal.goal_id!r} does not prove its population goals",
+                expectedPopulationGoalIds=list(goal.population_goal_ids),
+                actualPopulationGoalIds=list(resolution.population_goal_ids),
+            )
+        if (
+            goal.population_scope != "ALL_MATCHING_ROWS"
+            and not resolution.population_lineage_refs
+        ):
+            add(
+                "RANKING_PROOF_POPULATION_LINEAGE_MISSING",
+                f"ranking goal {goal.goal_id!r} has no verified population lineage",
+            )
     elif isinstance(resolution, AnalysisGoalProofResolution):
         expected_inputs = set(getattr(goal, "input_goal_ids", []))
         if not expected_inputs.issubset(set(resolution.input_goal_ids)):
@@ -1954,40 +2032,20 @@ def _is_anomaly_goal(
     resolution: GoalProofResolution,
 ) -> bool:
     capability_types = {
-        _canonical_analysis_capability(
-            getattr(goal, "comparison_type", "")
-        ),
-        _canonical_analysis_capability(
-            getattr(goal, "analysis_type", "")
-        ),
-        _canonical_analysis_capability(
-            getattr(resolution, "comparison_type", "")
-        ),
-        _canonical_analysis_capability(
-            getattr(resolution, "analysis_type", "")
-        ),
+        _canonical_analysis_capability(getattr(goal, "comparison_type", "")),
+        _canonical_analysis_capability(getattr(goal, "analysis_type", "")),
+        _canonical_analysis_capability(getattr(resolution, "comparison_type", "")),
+        _canonical_analysis_capability(getattr(resolution, "analysis_type", "")),
     }
-    return any(
-        value == "ANOMALY" or value.startswith("ANOMALY_")
-        for value in capability_types
-        if value
-    )
+    return any(value == "ANOMALY" or value.startswith("ANOMALY_") for value in capability_types if value)
 
 
 def _canonical_analysis_capability(value: Any) -> str:
-    return re.sub(
-        r"[^A-Z0-9]+",
-        "_",
-        str(value or "").strip().upper(),
-    ).strip("_")
+    return _canonical_ascii_symbol(value)
 
 
 def _canonical_resolution_status(value: Any) -> str:
-    normalized = re.sub(
-        r"[^A-Z0-9]+",
-        "_",
-        str(getattr(value, "value", value) or "").strip().upper(),
-    ).strip("_")
+    normalized = _canonical_ascii_symbol(getattr(value, "value", value))
     aliases = {
         "PROVED": GoalResolutionStatus.PROVED.value,
         "VERIFIED": GoalResolutionStatus.PROVED.value,
@@ -2002,7 +2060,7 @@ def _canonical_resolution_status(value: Any) -> str:
 
 
 def _canonical_goal_kind(value: Any) -> str:
-    normalized = re.sub(r"[^A-Z0-9]+", "_", str(getattr(value, "value", value) or "").strip().upper()).strip("_")
+    normalized = _canonical_ascii_symbol(getattr(value, "value", value))
     kind = _GOAL_KIND_ALIASES.get(normalized)
     if not kind:
         raise ValueError(f"unsupported goal kind {value!r}")
@@ -2021,11 +2079,81 @@ def _normalized_string_list(values: Any) -> list[str]:
     return list(dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip()))
 
 
-def _matched_cues(text: str, patterns: Sequence[re.Pattern[str]]) -> list[str]:
-    matches: list[str] = []
-    for pattern in patterns:
-        matches.extend(match.group(0) for match in pattern.finditer(text))
-    return list(dict.fromkeys(matches))
+def _canonical_ascii_symbol(value: Any) -> str:
+    """Canonicalize a typed enum-like value without a pattern engine."""
+
+    result: list[str] = []
+    separator_pending = False
+    for character in str(value or "").strip().upper():
+        if _is_ascii_letter_or_digit(character):
+            if separator_pending and result and result[-1] != "_":
+                result.append("_")
+            result.append(character)
+            separator_pending = False
+        elif result:
+            separator_pending = True
+    return "".join(result)
+
+
+def _is_ascii_letter_or_digit(character: str) -> bool:
+    if len(character) != 1:
+        return False
+    codepoint = ord(character)
+    return (
+        ord("a") <= codepoint <= ord("z")
+        or ord("A") <= codepoint <= ord("Z")
+        or ord("0") <= codepoint <= ord("9")
+    )
+
+
+def _unicode_question_tokens(text: str) -> list[tuple[str, str]]:
+    """Tokenize by Unicode character classes, independent of any language."""
+
+    tokens: list[tuple[str, str]] = []
+    current_kind = ""
+    current_characters: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_kind, current_characters
+        if current_characters:
+            tokens.append((current_kind, "".join(current_characters)))
+        current_kind = ""
+        current_characters = []
+
+    for character in text:
+        if character.isspace():
+            flush()
+            continue
+        category = unicodedata.category(character)
+        if category.startswith("N"):
+            kind = "NUMBER"
+        elif category.startswith("P"):
+            kind = "PUNCTUATION"
+        elif category.startswith("S"):
+            kind = "SYMBOL"
+        else:
+            kind = "TEXT"
+        if current_kind and kind != current_kind:
+            flush()
+        current_kind = kind
+        current_characters.append(character)
+    flush()
+    return tokens
+
+
+def _unicode_clause_count(tokens: Sequence[tuple[str, str]]) -> int:
+    clauses = 0
+    has_content = False
+    for kind, _ in tokens:
+        if kind == "PUNCTUATION":
+            if has_content:
+                clauses += 1
+                has_content = False
+        else:
+            has_content = True
+    if has_content:
+        clauses += 1
+    return max(1, clauses)
 
 
 def _validation_error_path(error: BaseException) -> str:

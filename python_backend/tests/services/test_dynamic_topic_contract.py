@@ -38,6 +38,7 @@ def write_topic_asset(
     asset = {
         **manifest_item,
         "topic": topic,
+        "status": "PUBLISHED",
         "questionCategory": category_id,
         "semanticColumns": [
             {

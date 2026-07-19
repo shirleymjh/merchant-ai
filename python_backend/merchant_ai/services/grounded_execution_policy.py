@@ -52,6 +52,7 @@ class GroundedFastPathReason(str, Enum):
     ENTITY_FILTER_VALUE_LIMIT_EXCEEDED = "ENTITY_FILTER_VALUE_LIMIT_EXCEEDED"
     ENTITY_FILTER_HINT_MISMATCH = "ENTITY_FILTER_HINT_MISMATCH"
     UPSTREAM_ENTITY_BINDINGS_PRESENT = "UPSTREAM_ENTITY_BINDINGS_PRESENT"
+    REFERENCE_SCOPE_PRESENT = "REFERENCE_SCOPE_PRESENT"
     TYPED_ENTITY_FILTER_MISSING = "TYPED_ENTITY_FILTER_MISSING"
     EXECUTION_SHAPE_NOT_DETERMINISTIC = "EXECUTION_SHAPE_NOT_DETERMINISTIC"
     METRICS_MISSING = "METRICS_MISSING"
@@ -145,6 +146,8 @@ def evaluate_single_metric_fast_path(
 
     if not contract.ready:
         reject(GroundedFastPathReason.CONTRACT_NOT_READY)
+    if contract.reference_scope.enabled:
+        reject(GroundedFastPathReason.REFERENCE_SCOPE_PRESENT)
 
     if str(contract.query_shape or "").strip().upper() != "SCALAR":
         reject(GroundedFastPathReason.QUERY_SHAPE_NOT_SCALAR)
@@ -235,6 +238,21 @@ def evaluate_deterministic_execution(
     """
 
     shape = str(contract.query_shape or "").strip().upper()
+    if contract.reference_scope.enabled:
+        return _execution_decision(
+            contract,
+            GroundedFastPathDecision(
+                eligible=False,
+                reason_codes=[GroundedFastPathReason.REFERENCE_SCOPE_PRESENT.value],
+                reason_details={
+                    GroundedFastPathReason.REFERENCE_SCOPE_PRESENT.value: (
+                        "typed cross-turn references require SQL lineage validation"
+                    )
+                },
+            ),
+            GroundedExecutionMode.UNDECIDED,
+            GroundedExecutionReason.COMPLEX_QUERY_REQUIRES_CORE_SQL,
+        )
     if shape == "SCALAR" and len(contract.metrics) == 1:
         return _execution_decision(
             contract,

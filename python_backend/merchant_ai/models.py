@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Literal, Optional
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field
 from pydantic_core import core_schema
@@ -166,6 +166,21 @@ class ResultScope(str, Enum):
     DAILY = "DAILY"
     DETAIL = "DETAIL"
     TOPN = "TOPN"
+
+
+class ResultCoverage(str, Enum):
+    """How completely a query bundle represents its requested row set.
+
+    Row counts cannot establish this property: a query that returns exactly
+    its ``LIMIT`` may either have exhausted the population or merely reached
+    the cap.  Producers must therefore declare coverage explicitly and the
+    safe default remains ``UNKNOWN``.
+    """
+
+    UNKNOWN = "UNKNOWN"
+    ALL_ROWS = "ALL_ROWS"
+    PREVIEW = "PREVIEW"
+    TOP_N = "TOP_N"
 
 
 class AgentRunStatus(str, Enum):
@@ -460,6 +475,7 @@ class TopicBuildRequest(APIModel):
     topic: str = ""
     table_name: str = ""
     merchant_id: str = ""
+    merchant_filter_column: str = ""
     sample_limit: int = 20
     manual_notes: str = ""
     business_knowledge: str = ""
@@ -2084,6 +2100,58 @@ class SqlDraft(APIModel):
     reason: str = ""
 
 
+class DataSnapshotContract(APIModel):
+    """Identity and consistency capability for one governed Doris read set.
+
+    ``OBSERVED_EPOCH`` can safely version a result-cache entry, but it is not a
+    database snapshot and therefore cannot prove that several independently
+    executed queries observed one atomic state. ``AS_OF_READ`` is reserved for
+    a datasource adapter that actually enforces as-of reads; the generic Doris
+    repository never asserts that capability by itself.
+    """
+
+    datasource_fingerprint: str = ""
+    datasource_environment: str = ""
+    data_epoch: str = ""
+    consistency_mode: Literal[
+        "UNSUPPORTED",
+        "OBSERVED_EPOCH",
+        "AS_OF_READ",
+    ] = "UNSUPPORTED"
+    semantic_activation_fingerprint: str = ""
+    cache_generation: str = ""
+    captured_at: str = ""
+    unsupported_reason: str = ""
+
+    def cache_identity_complete(self) -> bool:
+        return bool(
+            self.consistency_mode in {"OBSERVED_EPOCH", "AS_OF_READ"}
+            and self.datasource_fingerprint
+            and self.datasource_environment
+            and self.data_epoch
+            and self.semantic_activation_fingerprint
+            and self.cache_generation
+        )
+
+    def supports_atomic_multi_query(self) -> bool:
+        return bool(
+            self.consistency_mode == "AS_OF_READ"
+            and self.cache_identity_complete()
+        )
+
+    def cache_identity(self) -> Dict[str, str]:
+        if not self.cache_identity_complete():
+            return {}
+        return {
+            "datasourceFingerprint": self.datasource_fingerprint,
+            "datasourceEnvironment": self.datasource_environment,
+            "dataEpoch": self.data_epoch,
+            "consistencyMode": self.consistency_mode,
+            "semanticActivationFingerprint": self.semantic_activation_fingerprint,
+            "cacheGeneration": self.cache_generation,
+        }
+
+
 class QueryBundle(APIModel):
     sql: str = ""
     params: List[Any] = Field(default_factory=list)
@@ -2095,20 +2163,36 @@ class QueryBundle(APIModel):
     offloaded_files: List[str] = Field(default_factory=list)
     original_row_count: int = 0
     is_truncated: bool = False
+    result_coverage: ResultCoverage = ResultCoverage.UNKNOWN
     lineage_complete: bool = True
     source_row_counts: Dict[str, int] = Field(default_factory=dict)
     source_artifact_refs: Dict[str, List[str]] = Field(default_factory=dict)
     duration_ms: int = 0
     cache_hit: bool = False
     cache_key: str = ""
+    data_snapshot: DataSnapshotContract = Field(default_factory=DataSnapshotContract)
     runtime_events: List[Dict[str, Any]] = Field(default_factory=list)
 
     def model_post_init(self, __context: Any) -> None:
+        # PREVIEW is an explicit statement that matching rows may be absent,
+        # even when the visible count happens to equal original_row_count.
+        # Never infer ALL_ROWS from counts in the opposite direction.
+        if self.result_coverage == ResultCoverage.PREVIEW.value:
+            self.is_truncated = True
         if self.original_row_count > len(self.rows):
             self.is_truncated = True
 
     def effective_row_count(self) -> int:
         return self.original_row_count or len(self.rows)
+
+    def has_complete_detail_coverage(self) -> bool:
+        """Return true only for an explicitly complete, inline detail set."""
+
+        return (
+            self.result_coverage == ResultCoverage.ALL_ROWS.value
+            and not self.is_truncated
+            and not self.failed
+        )
 
 
 class ReActStep(APIModel):

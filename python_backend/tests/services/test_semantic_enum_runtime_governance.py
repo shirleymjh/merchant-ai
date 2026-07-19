@@ -17,6 +17,7 @@ def test_runtime_asset_quarantines_unapproved_enums_and_keeps_approved_values(tm
         {
             "topic": "domain",
             "tableName": "events",
+            "status": "PUBLISHED",
             "semanticColumns": [
                 {
                     "columnName": "unreviewed_state",
@@ -56,6 +57,7 @@ def test_semantic_read_never_exposes_unapproved_enum_values(tmp_path: Path) -> N
         {
             "topic": "domain",
             "tableName": "events",
+            "status": "PUBLISHED",
             "semanticColumns": [
                 {
                     "columnName": "state",

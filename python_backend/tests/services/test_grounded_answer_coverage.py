@@ -319,6 +319,7 @@ def test_ranked_answer_binding_is_generated_from_real_rows_not_model_provenance(
                     "label": "销量最高前3个商品",
                     "metricGoalIds": ["metric.sales"],
                     "limit": 3,
+                    "populationScope": "ALL_MATCHING_ROWS",
                 },
             ],
         }

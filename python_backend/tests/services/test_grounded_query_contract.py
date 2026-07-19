@@ -140,6 +140,110 @@ def column_read(
     )
 
 
+def _business_time_detail_contract(
+    *,
+    include_time_field: bool,
+    pruning_policy: str = "EXACT_EQUIVALENT",
+):
+    topic = "交易明细"
+    table = "fact_order_detail"
+    order_id = column_read(
+        topic,
+        table,
+        "order_id",
+        "订单号",
+        ["订单ID"],
+        role="ENTITY_UNIQUE_KEY",
+    )
+    pay_time = column_read(
+        topic,
+        table,
+        "pay_time",
+        "支付时间",
+        ["付款时间"],
+        role="DATETIME",
+        extra_definition={
+            "timezone": "Australia/Melbourne",
+            "partitionPruning": {
+                "column": "pt",
+                **({"policy": pruning_policy} if pruning_policy else {}),
+            },
+        },
+    )
+    detail = core_read(
+        "semantic:%s:%s:detail" % (topic, table),
+        "TABLE_DETAIL",
+        topic,
+        table,
+        {
+            "topic": topic,
+            "tableName": table,
+            "title": table,
+            "dataGrain": "order_detail",
+            "timeColumn": "pt",
+            "merchantFilterColumn": "seller_id",
+            "semanticNavigation": {
+                "source": "published_asset",
+                "bindingEvidence": False,
+                "columnLeaves": [
+                    {
+                        "key": "pay_time",
+                        "aliases": ["支付时间", "付款时间"],
+                        "semanticRole": "DATETIME",
+                        "refId": pay_time["refId"],
+                    }
+                ],
+            },
+        },
+    )
+    evidence = [detail, order_id, *([pay_time] if include_time_field else [])]
+    hints: dict[str, object] = {
+        "tableRefs": [detail["refId"]],
+        "selectedFields": [{"fieldRef": order_id["refId"]}],
+        "analysisMode": "DETAIL",
+        "timeExpression": "最近7天",
+    }
+    if include_time_field:
+        hints["timeFieldRef"] = pay_time["refId"]
+    return GroundedQueryContractBuilder().build(
+        "按支付时间看最近7天订单明细",
+        [topic],
+        evidence,
+        binding_hints=hints,
+        timezone_name="Australia/Melbourne",
+        now=datetime(2026, 7, 19, 12, tzinfo=timezone.utc),
+    )
+
+
+def test_named_business_time_is_bound_separately_from_partition_time() -> None:
+    contract = _business_time_detail_contract(include_time_field=True)
+
+    assert contract.ready
+    assert contract.time_field.column == "pay_time"
+    assert contract.time_field.timezone == "Australia/Melbourne"
+    assert contract.time_field.partition_pruning_column == "pt"
+    assert contract.time_field.partition_pruning_policy == "EXACT_EQUIVALENT"
+
+
+def test_named_business_time_cannot_fall_back_to_table_partition_column() -> None:
+    contract = _business_time_detail_contract(include_time_field=False)
+
+    assert "TIME_FIELD_BINDING_REQUIRED" in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+
+
+def test_separate_partition_pruning_column_requires_correctness_proof() -> None:
+    contract = _business_time_detail_contract(
+        include_time_field=True,
+        pruning_policy="",
+    )
+
+    assert "TIME_PARTITION_PRUNING_GUARANTEE_REQUIRED" in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+
+
 def entity_lookup_evidence() -> tuple[list[dict[str, object]], dict[str, object]]:
     order_topic = "电商交易"
     goods_topic = "商品管理"

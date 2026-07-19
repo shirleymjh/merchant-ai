@@ -85,6 +85,28 @@ export YSHOPPING_REDIS_RATE_LIMIT_ENABLED=true
 
 Redis 默认关闭。开启后，召回、语义资产包、Doris SELECT、LLM 响应、工具语义缓存会优先写 Redis；ToolRuntime 的工具缓存和限流状态也会跨实例共享。Redis 不可用时会回退到进程内内存缓存，避免本地开发环境直接启动失败。
 
+## 查询 ACL 策略
+
+在线查询必须在工作区的 `ops/access_control/merchant_acl.json` 提供版本化 ACL。文件缺失、JSON 损坏、版本未知或 `defaultEffect` 不是 `DENY` 时，查询会以 `ACL_POLICY_UNAVAILABLE` 拒绝；本地和测试环境也没有隐式放行开关。
+
+最小策略结构如下。商户、表和角色必须显式授权；`allowedColumns` 可选，提供后会作为该表的列白名单：
+
+```json
+{
+  "schemaVersion": 1,
+  "defaultEffect": "DENY",
+  "allowedMerchantIds": ["merchant-id"],
+  "tables": {
+    "published_table_name": {
+      "allowedRoles": ["published-role"],
+      "allowedColumns": ["column_name"]
+    }
+  }
+}
+```
+
+部署升级时必须先发布策略文件，再切换应用版本。拒绝事件写入同目录的 `query_audit.jsonl`；即使审计文件暂时不可写，授权结果仍保持拒绝。
+
 ## 历史分布式 Worker（非当前在线查数主链路）
 
 仓库仍保留旧 NodeWorker、SkillWorker、文档分析和受控 Python Batch 的 Durable Worker 能力，但当前 `GroundedDeepAgentRuntime` 的在线查数不向这些 worker 派发查询任务。以下配置只适用于仍显式使用旧 worker 的离线/兼容场景：

@@ -15,6 +15,7 @@ ACTIVE_FIXTURE_FILES = {
     "topic/tables/events/asset.json": {
         "topic": "topic",
         "tableName": "events",
+        "status": "PUBLISHED",
         "timeColumn": "event_day",
     },
     "topic/tables/events/schema.json": [{"columnName": "event_day"}],

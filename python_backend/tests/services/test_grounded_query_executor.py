@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from merchant_ai.config import get_settings
-from merchant_ai.models import ResolvedTimeRange
+from merchant_ai.models import ResolvedTimeRange, ResultCoverage
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.assets import TopicAssetService
 from merchant_ai.services.evidence import EvidenceVerifier
@@ -17,6 +19,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedRelationshipBinding,
     GroundedSelectedFieldBinding,
     GroundedTableBinding,
+    GroundedTimeFieldBinding,
     compile_deterministic_grounded_query,
     compile_grounded_query,
     materialize_grounded_asset_pack,
@@ -53,12 +56,53 @@ class FakeDetailDoris(FakeDoris):
         ]
 
 
+class FakeCappedDetailDoris(FakeDoris):
+    def query(self, sql: str, *, timeout_seconds: int) -> list[dict[str, object]]:
+        self.calls.append((sql, timeout_seconds))
+        return [
+            {
+                "entity_id": "entity_100",
+                "related_id": "related_%d" % index,
+                "detail_status": "completed",
+                "published_at": "2026-01-05 10:30:00",
+            }
+            for index in range(101)
+        ]
+
+
 class ManualClock:
     def __init__(self, value: float = 0.0) -> None:
         self.value = value
 
     def __call__(self) -> float:
         return self.value
+
+
+def explicit_test_access_control(
+    settings,
+    root,
+    contract: GroundedQueryContract,
+    *,
+    merchant_id: str,
+    role: str,
+) -> AccessControlService:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "merchant_acl.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "defaultEffect": "DENY",
+                "allowedMerchantIds": [merchant_id],
+                "tables": {
+                    table.table: {"allowedRoles": [role]}
+                    for table in contract.tables
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return AccessControlService(settings, root=root)
 
 
 def scalar_contract() -> GroundedQueryContract:
@@ -208,7 +252,13 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
     executor = GroundedQueryExecutionKernel(
         repository,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
     )
 
     result = executor.execute_contract(
@@ -244,6 +294,101 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
     assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
 
 
+def test_business_time_filter_and_proven_partition_pruning_are_separate(
+    tmp_path,
+) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    contract.time_field = GroundedTimeFieldBinding(
+        semantic_ref_id="semantic:经营画像:ads_merchant_profile:field:pay_time",
+        topic="经营画像",
+        table="ads_merchant_profile",
+        column="pay_time",
+        business_name="支付时间",
+        role="DATETIME",
+        time_role="BUSINESS_EVENT",
+        timezone="Australia/Melbourne",
+        partition_pruning_column="pt",
+        partition_pruning_policy="EXACT_EQUIVALENT",
+    )
+    contract.evidence_refs.append(contract.time_field.semantic_ref_id)
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
+    )
+
+    executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-business-time",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    sql = repository.calls[0][0]
+    assert "`pay_time` >= '2026-06-18 00:00:00'" in sql
+    assert "`pay_time` < '2026-07-18 00:00:00'" in sql
+    assert "`pt` BETWEEN '2026-06-18' AND '2026-07-17'" in sql
+
+
+def test_business_time_does_not_add_unproven_partition_predicate(tmp_path) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    contract.time_field = GroundedTimeFieldBinding(
+        semantic_ref_id="semantic:经营画像:ads_merchant_profile:field:event_at",
+        topic="经营画像",
+        table="ads_merchant_profile",
+        column="event_at",
+        role="DATETIME",
+        time_role="BUSINESS_EVENT",
+        timezone="Australia/Melbourne",
+    )
+    contract.evidence_refs.append(contract.time_field.semantic_ref_id)
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
+    )
+
+    executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-business-time-no-pruning-proof",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    sql = repository.calls[0][0]
+    assert "`event_at` >= '2026-06-18 00:00:00'" in sql
+    assert "`pt` BETWEEN" not in sql
+    assert "SELECT MAX(`pt`)" not in sql
+
+
 def test_direct_executor_clamps_doris_timeout_to_shared_runtime_remaining_time(
     tmp_path,
 ) -> None:
@@ -255,7 +400,13 @@ def test_direct_executor_clamps_doris_timeout_to_shared_runtime_remaining_time(
     executor = GroundedQueryExecutionKernel(
         repository,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
     )
     clock = ManualClock()
     budget = GroundedRuntimeBudget(
@@ -292,7 +443,13 @@ def test_direct_executor_fails_before_doris_when_runtime_has_under_one_second(
     executor = GroundedQueryExecutionKernel(
         repository,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
     )
     clock = ManualClock()
     budget = GroundedRuntimeBudget(
@@ -327,7 +484,13 @@ def test_direct_executor_compiles_and_proves_literal_metric_filters(tmp_path) ->
     executor = GroundedQueryExecutionKernel(
         repository,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
     )
 
     result = executor.execute_contract(
@@ -509,7 +672,13 @@ def test_detail_executor_compiles_typed_entity_filter_and_governed_join(tmp_path
     executor = GroundedQueryExecutionKernel(
         repository,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="merchant_1",
+            role="merchant_admin",
+        ),
     )
 
     result = executor.execute_contract(
@@ -533,10 +702,83 @@ def test_detail_executor_compiles_typed_entity_filter_and_governed_join(tmp_path
     assert "t0.`seller_id` = 'merchant_1'" in sql
     assert "t1.`seller_id` = 'merchant_1'" in sql
     assert "BETWEEN" not in sql
+    assert "LIMIT 101" in sql
     assert result.merged_query_bundle.tables == [
         "fact_entity_detail",
         "dim_related_entity",
     ]
+    assert result.merged_query_bundle.result_coverage == ResultCoverage.ALL_ROWS.value
+    assert result.merged_query_bundle.original_row_count == 1
+    assert result.merged_query_bundle.is_truncated is False
     assert result.task_results[0].entity_filter_verification.verified is True
     verified = EvidenceVerifier().verify(contract.question, preparation.plan, result)
     assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
+
+
+def test_detail_executor_uses_sentinel_row_to_mark_capped_result_as_preview(
+    tmp_path,
+) -> None:
+    settings = get_settings()
+    contract = detail_lookup_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeCappedDetailDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="merchant_1",
+            role="merchant_admin",
+        ),
+    )
+
+    result = executor.execute_contract(
+        "merchant_1",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-detail-capped",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    bundle = result.merged_query_bundle
+    assert "LIMIT 101" in repository.calls[0][0]
+    assert len(bundle.rows) == 100
+    assert bundle.result_coverage == ResultCoverage.PREVIEW.value
+    assert bundle.is_truncated is True
+    assert bundle.original_row_count == 0
+    assert bundle.effective_row_count() == 100
+    assert bundle.runtime_events[0]["fetchedRowCount"] == 101
+
+
+@pytest.mark.parametrize(
+    ("sql", "returned_rows", "expected"),
+    [
+        ("SELECT entity_id FROM fact_entity_detail LIMIT 100", 100, "PREVIEW"),
+        ("SELECT entity_id FROM fact_entity_detail LIMIT 100", 99, "ALL_ROWS"),
+        (
+            "SELECT entity_id FROM (SELECT entity_id FROM fact_entity_detail LIMIT 100) q",
+            50,
+            "PREVIEW",
+        ),
+        (
+            "SELECT entity_id FROM fact_entity_detail LIMIT 100 OFFSET 1",
+            20,
+            "PREVIEW",
+        ),
+    ],
+)
+def test_core_sql_detail_coverage_is_fail_closed_for_ambiguous_limits(
+    sql: str,
+    returned_rows: int,
+    expected: str,
+) -> None:
+    assert (
+        GroundedQueryExecutionKernel._core_sql_detail_coverage(sql, returned_rows)
+        == expected
+    )

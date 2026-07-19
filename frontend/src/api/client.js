@@ -1,11 +1,9 @@
 const DEFAULT_MERCHANT_ID = '100'
-const OPS_TOKEN = import.meta.env.VITE_OPS_TOKEN || ''
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
     headers: {
       'Content-Type': 'application/json',
-      ...(OPS_TOKEN ? { 'X-Ops-Token': OPS_TOKEN } : {}),
       ...(options.headers || {})
     },
     ...options
@@ -42,7 +40,7 @@ export async function startAsyncRun(message, context, options = {}) {
 export async function streamChatRun(message, context, options = {}, onEvent = () => {}) {
   const response = await fetch('/api/chat/stream', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(OPS_TOKEN ? { 'X-Ops-Token': OPS_TOKEN } : {}) },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       message,
       merchantId: DEFAULT_MERCHANT_ID,
@@ -81,7 +79,7 @@ export async function uploadAttachment(file, signal) {
   const params = new URLSearchParams({ name: file.name, type: file.type || 'application/octet-stream', merchantId: DEFAULT_MERCHANT_ID })
   const response = await fetch(`/api/attachments?${params}`, {
     method: 'POST',
-    headers: { 'Content-Type': file.type || 'application/octet-stream', ...(OPS_TOKEN ? { 'X-Ops-Token': OPS_TOKEN } : {}) },
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
     body: file,
     signal
   })

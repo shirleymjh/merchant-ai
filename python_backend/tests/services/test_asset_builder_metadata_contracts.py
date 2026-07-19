@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from merchant_ai.config import get_settings
-from merchant_ai.models import PlanningAssetPack, TopicBuildRequest
+from merchant_ai.models import PlanningAssetEntry, PlanningAssetPack, TopicBuildRequest
 from merchant_ai.services.assets import (
     PlanningAssetPackBuilder,
     TopicAssetService,
@@ -11,6 +11,7 @@ from merchant_ai.services.assets import (
     semantic_asset_builder_tool,
     semantic_catalog_conflict_detection,
 )
+from merchant_ai.services.query import semantic_table_access_hint
 
 
 def write_json(path: Path, payload) -> None:
@@ -19,6 +20,9 @@ def write_json(path: Path, payload) -> None:
 
 
 class NeutralDoris:
+    def __init__(self):
+        self.sample_calls = 0
+
     def show_full_columns(self, table):
         return [
             {"Field": "tenant_key", "Type": "varchar", "Comment": "tenant"},
@@ -45,8 +49,26 @@ DISTRIBUTED BY HASH(`tenant_key`) BUCKETS 4
             }
         ]
 
-    def sample_rows(self, table, merchant_id, limit=20):
-        return [{"tenant_key": "t-1", "event_day": "2026-07-01", "entity_key": "e-1", "value_x": 3.0}]
+    def show_indexes(self, table):
+        return [
+            {
+                "Key_name": "idx_entity_key",
+                "Column_name": "entity_key",
+                "Index_type": "INVERTED",
+                "Properties": "parser=none",
+            }
+        ]
+
+    def show_partitions(self, table):
+        return [
+            {"PartitionName": "p20260701", "Buckets": 4},
+            {"PartitionName": "p20260702", "Buckets": 4},
+        ]
+
+    def sample_rows(self, table, merchant_id, merchant_filter_column, limit=20):
+        self.sample_calls += 1
+        rows = [{"tenant_key": "t-1", "event_day": "2026-07-01", "entity_key": "e-1", "value_x": 3.0}]
+        return [row for row in rows if str(row.get(merchant_filter_column)) == str(merchant_id)][:limit]
 
 
 def test_topic_builder_metric_schema_requires_generic_execution_semantics() -> None:
@@ -82,6 +104,36 @@ def test_topic_builder_metric_schema_requires_generic_execution_semantics() -> N
     assert "preserve_observed_zero" in time_semantics["properties"]["zeroValuePolicy"]["enum"]
 
 
+def test_access_hint_reads_published_physical_metadata_without_semantic_inference() -> None:
+    pack = PlanningAssetPack(
+        tables=[
+            PlanningAssetEntry(
+                key="fact_x",
+                table="fact_x",
+                columns=["tenant_key", "entity_key", "event_day"],
+                metadata={
+                    "merchantFilterColumn": "tenant_key",
+                    "physicalMetadata": {
+                        "bucketColumns": ["tenant_key"],
+                        "partitionColumns": ["event_day"],
+                        "invertedIndexColumns": ["entity_key"],
+                    },
+                },
+            )
+        ]
+    )
+
+    hint = semantic_table_access_hint(
+        pack,
+        "fact_x",
+        {"tenant_key", "entity_key", "event_day"},
+    )
+
+    assert hint["distributionKeys"] == ["tenant_key"]
+    assert hint["invertedIndexes"] == ["entity_key"]
+    assert hint["fallbackFilters"] == ["tenant_key", "event_day"]
+
+
 def test_builder_uses_physical_metadata_and_leaves_business_contracts_undeclared(tmp_path):
     settings = get_settings().model_copy(
         update={"topic_path": str(tmp_path / "topics"), "harness_workspace_path": str(tmp_path / "workspace")}
@@ -93,20 +145,59 @@ def test_builder_uses_physical_metadata_and_leaves_business_contracts_undeclared
         llm=type("DisabledLlm", (), {"configured": False})(),
     )
 
-    result = workflow.build(TopicBuildRequest(topic="neutral", table_name="opaque_source", merchant_id="t-1"))
+    result = workflow.build(
+        TopicBuildRequest(
+            topic="neutral",
+            table_name="opaque_source",
+            merchant_id="t-1",
+            merchant_filter_column="tenant_key",
+        )
+    )
 
     asset = json.loads(Path(result["path"], "asset.json").read_text(encoding="utf-8"))
     columns = {item["columnName"]: item for item in asset["semanticColumns"]}
-    assert asset["timeColumn"] == "event_day"
-    assert asset["merchantFilterColumn"] == ""
-    assert asset["rowAccessPolicy"] == {}
+    assert asset["timeColumn"] == ""
+    assert asset["merchantFilterColumn"] == "tenant_key"
+    assert asset["rowAccessPolicy"]["filterColumn"] == "tenant_key"
+    assert asset["samplingGovernance"]["merchantFilterColumnSource"] == "ADMIN_REQUEST"
     assert asset["dataGrain"] == "UNDECLARED"
     assert asset["tableUsageProfile"]["queryableByAgent"] is False
     assert asset["tableUsageProfile"]["businessLayer"] == "UNDECLARED"
-    assert columns["tenant_key"]["semanticRole"] == "KEY"
-    assert columns["event_day"]["semanticRole"] == "TIME"
+    assert columns["tenant_key"]["semanticRole"] == "UNDECLARED"
+    assert columns["event_day"]["semanticRole"] == "UNDECLARED"
     assert columns["value_x"]["semanticRole"] == "UNDECLARED"
     assert columns["entity_key"]["defaultVisible"] is False
+    assert asset["physicalMetadata"]["partitionColumns"] == ["event_day"]
+    assert asset["physicalMetadata"]["bucketCount"] == 4
+    assert asset["physicalMetadata"]["invertedIndexColumns"] == ["entity_key"]
+    assert asset["physicalMetadata"]["ddlHash"]
+
+
+def test_topic_builder_fails_before_sampling_without_governed_tenant_column(tmp_path):
+    settings = get_settings().model_copy(
+        update={"topic_path": str(tmp_path / "topics"), "harness_workspace_path": str(tmp_path / "workspace")}
+    )
+    doris = NeutralDoris()
+
+    class CountingLlm:
+        configured = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def tool_json_chat(self, *args, **kwargs):
+            self.calls += 1
+            return {}
+
+    llm = CountingLlm()
+    workflow = TopicBuilderWorkflow(settings, doris, TopicAssetService(settings), llm=llm)
+
+    result = workflow.build(TopicBuildRequest(topic="neutral", table_name="opaque_source", merchant_id="t-1"))
+
+    assert result["success"] is False
+    assert result["code"] == "TENANT_FILTER_COLUMN_REQUIRED"
+    assert doris.sample_calls == 0
+    assert llm.calls == 0
 
 
 def test_asset_pack_entity_keys_come_from_declared_semantic_roles(tmp_path):
@@ -118,6 +209,7 @@ def test_asset_pack_entity_keys_come_from_declared_semantic_roles(tmp_path):
         {
             "topic": "neutral",
             "tableName": "opaque_source",
+            "status": "PUBLISHED",
             "tableUsageProfile": {
                 "contractStatus": "APPROVED",
                 "businessLayer": "CURATED",
@@ -154,6 +246,7 @@ def test_table_usage_and_global_alias_ownership_fail_closed_without_metadata(tmp
             {
                 "topic": topic,
                 "tableName": table,
+                "status": "PUBLISHED",
                 "metrics": [{"metricKey": metric_key, "formula": "1", "aliases": ["shared label"]}],
             },
         )

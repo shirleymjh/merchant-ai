@@ -41,6 +41,29 @@ class QueueBuilder:
         return self.contract.model_copy(deep=True)
 
 
+def explicit_test_access_control(
+    settings,
+    root: Path,
+    contract: GroundedQueryContract,
+) -> AccessControlService:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "merchant_acl.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "defaultEffect": "DENY",
+                "allowedMerchantIds": ["merchant-1"],
+                "tables": {
+                    table.table: {"allowedRoles": ["merchant_analyst"]}
+                    for table in contract.tables
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return AccessControlService(settings, root=root)
+
+
 class NoTemplateCompiler:
     def __call__(self, contract: GroundedQueryContract, pack: PlanningAssetPack) -> Any:
         raise AssertionError("complex Core SQL must never invoke the template compiler")
@@ -209,7 +232,11 @@ def test_complex_contract_accepts_core_sql_and_executes_without_template(
     executor = GroundedQueryExecutionKernel(
         doris,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path / "acl"),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path / "acl",
+            contract,
+        ),
     )
     kernel = GroundedRuntimeKernel(
         object(),
@@ -321,7 +348,11 @@ def test_upstream_entity_set_is_injected_without_disclosing_values_to_core_sql(
     executor = GroundedQueryExecutionKernel(
         doris,
         settings,
-        access_control=AccessControlService(settings, root=tmp_path / "acl"),
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path / "acl",
+            contract,
+        ),
     )
     kernel = GroundedRuntimeKernel(
         object(),
@@ -674,16 +705,39 @@ def test_post_scope_validation_does_not_union_multitable_columns() -> None:
     assert result.unknown_columns == ["b.only_a"]
 
 
-def test_access_denial_sets_terminal_guard(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("policy_payload", "expected_code"),
+    [
+        (
+            {
+                "schemaVersion": 1,
+                "defaultEffect": "DENY",
+                "allowedMerchantIds": ["merchant-1"],
+                "deniedTables": ["fact_orders"],
+                "tables": {
+                    "fact_orders": {"allowedRoles": ["merchant_analyst"]}
+                },
+            },
+            "TABLE_DENIED",
+        ),
+        (None, "ACL_POLICY_UNAVAILABLE"),
+    ],
+)
+def test_access_denial_sets_terminal_guard(
+    tmp_path: Path,
+    policy_payload: dict[str, Any] | None,
+    expected_code: str,
+) -> None:
     contract = grouped_contract()
     pack = grouped_pack()
     settings = get_settings()
     acl_root = tmp_path / "acl"
     acl_root.mkdir(parents=True)
-    (acl_root / "merchant_acl.json").write_text(
-        json.dumps({"deniedTables": ["fact_orders"]}),
-        encoding="utf-8",
-    )
+    if policy_payload is not None:
+        (acl_root / "merchant_acl.json").write_text(
+            json.dumps(policy_payload),
+            encoding="utf-8",
+        )
     executor = GroundedQueryExecutionKernel(
         FakeDoris([]),
         settings,
@@ -717,11 +771,12 @@ def test_access_denial_sets_terminal_guard(tmp_path: Path) -> None:
     result = kernel.execute_active(session)
 
     assert result.task_results[0].query_bundle.failed is True
-    assert session.terminal_guard_code == "TABLE_DENIED"
-    with pytest.raises(RuntimeError, match="TERMINAL_GUARD:TABLE_DENIED"):
+    assert session.terminal_guard_code == expected_code
+    with pytest.raises(RuntimeError) as raised:
         kernel.submit_sql_candidate(
             session,
             "SELECT 1",
             expected_generation=activated.active_generation,
             expected_contract_fingerprint=fingerprint,
         )
+    assert str(raised.value) == "TERMINAL_GUARD:%s" % expected_code

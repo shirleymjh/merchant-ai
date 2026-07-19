@@ -97,6 +97,7 @@ def test_sidecar_is_authoritative_over_stale_denormalized_asset(tmp_path):
         {
             "topic": "trade",
             "tableName": "orders",
+            "status": "PUBLISHED",
             "metrics": [{"metricKey": "gmv", "formula": "SUM(stale_amt)", "aliases": ["stale"]}],
         },
     )

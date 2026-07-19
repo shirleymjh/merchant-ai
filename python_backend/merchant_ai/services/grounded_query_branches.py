@@ -4,7 +4,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from pydantic import Field
 
@@ -15,17 +15,19 @@ from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeSession
 
 
 class GroundedQueryBranchSpec(APIModel):
-    """One Core-declared query scope created before semantic retrieval.
+    """One execution node frozen after semantic discovery.
 
-    The declaration groups original-question goals and limits the Topic
-    workspace.  It deliberately does not select SQL, impose a fixed stage
-    graph, or authorize semantic bindings.
+    The node groups original-question goals, limits the Topic workspace and
+    may bind the exact immutable evidence already present in the discovery
+    ledger.  It deliberately does not select SQL or authorize semantic
+    bindings by itself.
     """
 
     query_id: str
     objective: str = ""
     goal_ids: list[str] = Field(default_factory=list)
     topic_scope: list[str] = Field(default_factory=list)
+    evidence_ref_ids: list[str] = Field(default_factory=list)
 
 
 class GroundedBranchPrepareSpec(APIModel):
@@ -53,7 +55,7 @@ class GroundedBranchBudgetExceeded(RuntimeError):
 
 @dataclass(frozen=True)
 class GroundedBranchBudgetLimits:
-    max_semantic_reads: int = 8
+    max_semantic_reads: int = 16
     max_semantic_chars: int = 200_000
     max_contract_attempts: int = 3
     max_doris_queries: int = 2
@@ -69,9 +71,9 @@ class GroundedBranchBudgetLimits:
                     getattr(
                         settings,
                         "grounded_branch_max_semantic_reads",
-                        8,
+                        16,
                     )
-                    or 8
+                    or 16
                 ),
             ),
             max_semantic_chars=max(
@@ -157,11 +159,16 @@ class GroundedBranchBudget:
         limits: GroundedBranchBudgetLimits,
         *,
         parent: Optional[GroundedRuntimeBudget] = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.branch_id = str(branch_id or "branch")
         self.limits = limits
         self.parent = parent
-        self._started = time.monotonic()
+        self._monotonic_clock = monotonic_clock
+        self._wall_started: Optional[float] = None
+        self._active_duration_seconds = 0.0
+        self._active_depth = 0
+        self._active_started = 0.0
         self._lock = RLock()
         self._semantic_reads = 0
         self._semantic_chars = 0
@@ -172,7 +179,25 @@ class GroundedBranchBudget:
         self._denied_attempts: list[dict[str, Any]] = []
 
     def _elapsed_seconds_locked(self) -> float:
-        return max(0.0, time.monotonic() - self._started)
+        elapsed = self._active_duration_seconds
+        if self._active_depth > 0:
+            elapsed += max(
+                0.0,
+                float(self._monotonic_clock()) - self._active_started,
+            )
+        return max(0.0, elapsed)
+
+    def _wall_elapsed_seconds_locked(self) -> float:
+        if self._wall_started is None:
+            return 0.0
+        return max(
+            0.0,
+            float(self._monotonic_clock()) - self._wall_started,
+        )
+
+    def _start_wall_clock_locked(self) -> None:
+        if self._wall_started is None:
+            self._wall_started = float(self._monotonic_clock())
 
     def _deny(self, code: str, operation: str) -> None:
         report = self.report()
@@ -193,6 +218,7 @@ class GroundedBranchBudget:
 
     def _check_time(self, operation: str) -> None:
         with self._lock:
+            self._start_wall_clock_locked()
             if self._elapsed_seconds_locked() >= self.limits.max_duration_seconds:
                 code = "BRANCH_DURATION_EXHAUSTED"
             else:
@@ -257,7 +283,13 @@ class GroundedBranchBudget:
     @contextmanager
     def stage(self, name: str) -> Iterator["GroundedBranchBudget"]:
         stage_name = str(name or "unknown")
-        started = time.monotonic()
+        started = float(self._monotonic_clock())
+        with self._lock:
+            if self._wall_started is None:
+                self._wall_started = started
+            if self._active_depth == 0:
+                self._active_started = started
+            self._active_depth += 1
         parent_stage = (
             self.parent.stage("branch.%s.%s" % (self.branch_id, stage_name))
             if self.parent is not None
@@ -270,8 +302,16 @@ class GroundedBranchBudget:
                 with parent_stage:
                     yield self
         finally:
-            duration = max(0.0, time.monotonic() - started)
+            finished = float(self._monotonic_clock())
+            duration = max(0.0, finished - started)
             with self._lock:
+                self._active_depth = max(0, self._active_depth - 1)
+                if self._active_depth == 0:
+                    self._active_duration_seconds += max(
+                        0.0,
+                        finished - self._active_started,
+                    )
+                    self._active_started = 0.0
                 self._stage_calls[stage_name] = (
                     self._stage_calls.get(stage_name, 0) + 1
                 )
@@ -288,6 +328,10 @@ class GroundedBranchBudget:
         return {
             "branchId": self.branch_id,
             "elapsedMs": round(self._elapsed_seconds_locked() * 1000, 3),
+            "wallElapsedMs": round(
+                self._wall_elapsed_seconds_locked() * 1000,
+                3,
+            ),
             "limits": self.limits.as_dict(),
             "usage": {
                 "semanticReads": self._semantic_reads,
@@ -359,6 +403,7 @@ class GroundedQueryBranchContext:
         default_factory=GroundedSemanticReadLedger
     )
     opened_topics: list[str] = field(default_factory=list)
+    contract_scope_query_ids: list[str] = field(default_factory=list)
     dependency_query_ids: list[str] = field(default_factory=list)
     dependency_goal_ids: list[str] = field(default_factory=list)
     status: str = "DECLARED"
@@ -383,6 +428,9 @@ class GroundedQueryBranchContext:
                 "goalIds": list(self.spec.goal_ids),
                 "topicScope": self.effective_topics(),
                 "status": self.status,
+                "contractScopeQueryIds": list(
+                    self.contract_scope_query_ids
+                ),
                 "dependencyQueryIds": list(self.dependency_query_ids),
                 "dependencyGoalIds": list(self.dependency_goal_ids),
                 "semanticRefIds": self.semantic_ledger.refs(),

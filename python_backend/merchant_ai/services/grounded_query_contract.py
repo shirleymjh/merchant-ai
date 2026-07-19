@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -147,6 +148,22 @@ class GroundedEntityFilterBinding(APIModel):
     lookup_time_policy: dict[str, Any] = Field(default_factory=dict)
 
 
+class GroundedTimeFieldBinding(APIModel):
+    semantic_ref_id: str = ""
+    topic: str = ""
+    table: str = ""
+    column: str = ""
+    business_name: str = ""
+    role: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    time_role: str = "BUSINESS_EVENT"
+    timezone: str = ""
+    partition_pruning_column: str = ""
+    partition_pruning_policy: str = "NONE"
+    partition_lower_expansion_days: int = 0
+    partition_upper_expansion_days: int = 0
+
+
 class GroundedRelationshipBinding(APIModel):
     semantic_ref_id: str
     topic: str
@@ -168,6 +185,59 @@ class GroundedRankingBinding(APIModel):
     limit: int = 0
     metric_ref_id: str = ""
     dimension_ref_id: str = ""
+
+
+class GroundedReferenceScopeBinding(APIModel):
+    """Server-verified cross-turn input to a query Contract.
+
+    This is deliberately broader than a ranking population.  BI follow-ups may
+    refer to a predicate scope, an exact entity set, a result artifact, a
+    metric value or a comparison baseline.  The compiler/validator must handle
+    each kind explicitly instead of converting conversational text into a
+    best-effort time filter.
+    """
+
+    enabled: bool = False
+    status: str = "NONE"
+    referent_type: str = "NONE"
+    downstream_operation: str = "UNSPECIFIED"
+    source_artifact_id: str = ""
+    source_contract_fingerprint: str = ""
+    source_sql_fingerprint: str = ""
+    source_query_shape: str = ""
+    source_contract_version: str = ""
+    source_topics: list[str] = Field(default_factory=list)
+    source_tables: list[GroundedTableBinding] = Field(default_factory=list)
+    source_entity_filters: list[GroundedEntityFilterBinding] = Field(
+        default_factory=list
+    )
+    source_time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
+    source_time_columns: dict[str, list[str]] = Field(default_factory=dict)
+    source_goal_ids: list[str] = Field(default_factory=list)
+    source_entity_identities: list[str] = Field(default_factory=list)
+    source_data_grains: list[str] = Field(default_factory=list)
+    source_evidence_refs: list[str] = Field(default_factory=list)
+    coverage_status: str = "UNKNOWN"
+    snapshot_semantics: str = "ABSOLUTE_PREDICATE_SNAPSHOT"
+    population_required: bool = False
+    complete_membership_required: bool = False
+    membership_handle_type: str = ""
+    membership_handle_id: str = ""
+    membership_values_hash: str = ""
+    current_turn_explicit_time: bool = False
+    verified_server_side: bool = False
+    provenance: str = "verified_conversation_artifact"
+
+    @computed_field
+    @property
+    def executable(self) -> bool:
+        return bool(
+            self.enabled
+            and self.status == "BOUND"
+            and self.verified_server_side
+            and self.source_artifact_id
+            and self.source_contract_fingerprint
+        )
 
 
 class GroundedRankingHint(APIModel):
@@ -239,6 +309,7 @@ class GroundedBindingHints(APIModel):
     ranking: GroundedRankingHint = Field(default_factory=GroundedRankingHint)
     analysis_mode: str = ""
     time_expression: str = ""
+    time_field_ref: str = ""
 
 
 class GroundedQueryContract(APIModel):
@@ -261,7 +332,13 @@ class GroundedQueryContract(APIModel):
     )
     relationships: list[GroundedRelationshipBinding] = Field(default_factory=list)
     time_range: ResolvedTimeRange = Field(default_factory=ResolvedTimeRange)
+    time_field: GroundedTimeFieldBinding = Field(
+        default_factory=GroundedTimeFieldBinding
+    )
     ranking: GroundedRankingBinding = Field(default_factory=GroundedRankingBinding)
+    reference_scope: GroundedReferenceScopeBinding = Field(
+        default_factory=GroundedReferenceScopeBinding
+    )
     evidence_refs: list[str] = Field(default_factory=list)
     evidence: list[GroundedEvidenceRef] = Field(default_factory=list)
     unresolved_gaps: list[GroundedContractGap] = Field(default_factory=list)
@@ -351,6 +428,7 @@ class GroundedQueryContractBuilder:
             *(item.field_ref for item in hints.entity_filters),
             *(item.target_field_ref for item in hints.upstream_entity_bindings),
             *hints.relationship_refs,
+            *([hints.time_field_ref] if hints.time_field_ref else []),
             *hints.label_refs.keys(),
             *([hints.group_by_ref] if hints.group_by_ref else []),
         }
@@ -368,6 +446,30 @@ class GroundedQueryContractBuilder:
         hints = _canonicalize_binding_hints(hints, document_refs)
         document_kinds = {document.ref.ref_id: document.ref.kind for document in documents}
         discovery_gaps.extend(_missing_binding_ref_gaps(hints, document_kinds))
+        named_time_refs = _governed_named_time_refs(str(question or ""), documents)
+        if named_time_refs and not any(
+            _semantic_refs_equivalent(hints.time_field_ref, ref_id)
+            for ref_id in named_time_refs
+        ):
+            discovery_gaps.append(
+                _gap(
+                    (
+                        "TIME_FIELD_BINDING_AMBIGUOUS"
+                        if len(named_time_refs) > 1 and not hints.time_field_ref
+                        else "TIME_FIELD_BINDING_REQUIRED"
+                    ),
+                    (
+                        "Multiple governed TIME aliases occur in the question; select one exact timeFieldRef"
+                        if len(named_time_refs) > 1 and not hints.time_field_ref
+                        else "A governed TIME alias occurs in the question; read and bind its exact timeFieldRef"
+                    ),
+                    "COLUMN",
+                    required_capability={"candidateTimeFieldRefs": named_time_refs},
+                    rejected_ref_ids=(
+                        [hints.time_field_ref] if hints.time_field_ref else []
+                    ),
+                )
+            )
         table_details = self._table_details(documents)
         metrics = self._metric_bindings(
             documents,
@@ -414,6 +516,16 @@ class GroundedQueryContractBuilder:
             hints.entity_filters,
         )
         discovery_gaps.extend(entity_filter_gaps)
+        time_field, time_field_gaps = self._time_field_binding(
+            documents,
+            hints.time_field_ref,
+            table_details,
+        )
+        if time_field.semantic_ref_id and not time_field.timezone:
+            time_field = time_field.model_copy(
+                update={"timezone": str(timezone_name or "").strip()}
+            )
+        discovery_gaps.extend(time_field_gaps)
         ranking = self._ranking_binding(hints, metrics, dimensions)
 
         selected_tables = _dedupe(
@@ -421,6 +533,7 @@ class GroundedQueryContractBuilder:
             + [binding.table for binding in dimensions]
             + [binding.table for binding in selected_fields]
             + [binding.table for binding in entity_filters]
+            + ([time_field.table] if time_field.table else [])
             + [
                 detail.table
                 for detail in table_details.values()
@@ -479,6 +592,7 @@ class GroundedQueryContractBuilder:
             + [dimension.semantic_ref_id for dimension in dimensions]
             + [field.semantic_ref_id for field in selected_fields]
             + [item.semantic_ref_id for item in entity_filters]
+            + ([time_field.semantic_ref_id] if time_field.semantic_ref_id else [])
             + [relationship.semantic_ref_id for relationship in relationships]
         )
         evidence_by_ref = {document.ref.ref_id: document.ref for document in documents}
@@ -521,6 +635,7 @@ class GroundedQueryContractBuilder:
             entity_filters=entity_filters,
             relationships=relationships,
             time_range=time_range,
+            time_field=time_field,
             ranking=ranking,
             evidence_refs=supporting_refs,
             evidence=evidence,
@@ -1019,6 +1134,153 @@ class GroundedQueryContractBuilder:
         return bindings, gaps
 
     @staticmethod
+    def _time_field_binding(
+        documents: Sequence[_EvidenceDocument],
+        selected_ref: str,
+        table_details: Mapping[str, GroundedTableBinding],
+    ) -> tuple[GroundedTimeFieldBinding, list[GroundedContractGap]]:
+        ref_id = str(selected_ref or "").strip()
+        if not ref_id:
+            return GroundedTimeFieldBinding(), []
+        document = next(
+            (
+                item
+                for item in documents
+                if item.ref.ref_id == ref_id and item.ref.kind == "COLUMN"
+            ),
+            None,
+        )
+        if document is None:
+            return GroundedTimeFieldBinding(), [
+                _gap(
+                    "TIME_FIELD_EVIDENCE_REQUIRED",
+                    "Selected business time field was not read as trusted COLUMN evidence",
+                    "COLUMN",
+                    rejected_ref_ids=[ref_id],
+                )
+            ]
+        payload = document.payload if isinstance(document.payload, dict) else {}
+        definition = (
+            payload.get("definition")
+            if isinstance(payload.get("definition"), dict)
+            else {}
+        )
+        column = str(
+            definition.get("columnName") or definition.get("Field") or ""
+        ).strip()
+        table = str(payload.get("tableName") or document.ref.table or "").strip()
+        role = str(
+            definition.get("role") or definition.get("semanticRole") or ""
+        ).strip().upper()
+        if not column or not table or role not in {
+            "TIME",
+            "DATE",
+            "DATETIME",
+            "TIMESTAMP",
+        }:
+            return GroundedTimeFieldBinding(), [
+                _gap(
+                    "TIME_FIELD_ROLE_INVALID",
+                    "Selected timeFieldRef must resolve to a governed TIME column",
+                    "COLUMN",
+                    document.ref.topic,
+                    table,
+                    rejected_ref_ids=[ref_id],
+                )
+            ]
+        detail = table_details.get(table)
+        partition_column = str(
+            (detail.time_column if detail is not None else "") or ""
+        ).strip()
+        declared_time_role = str(
+            definition.get("timeRole")
+            or definition.get("timeSemanticRole")
+            or definition.get("time_role")
+            or ""
+        ).strip().upper()
+        time_role = declared_time_role or (
+            "PARTITION" if partition_column and column == partition_column else "BUSINESS_EVENT"
+        )
+        pruning = (
+            definition.get("partitionPruning")
+            if isinstance(definition.get("partitionPruning"), dict)
+            else {}
+        )
+        pruning_column = str(
+            pruning.get("column")
+            or pruning.get("partitionColumn")
+            or definition.get("partitionPruningColumn")
+            or ""
+        ).strip()
+        pruning_policy = str(
+            pruning.get("policy")
+            or pruning.get("guarantee")
+            or definition.get("partitionPruningPolicy")
+            or "NONE"
+        ).strip().upper()
+        if pruning_column and pruning_column != column and pruning_policy not in {
+            "EXACT_EQUIVALENT",
+            "SAFE_SUPERSET",
+        }:
+            return GroundedTimeFieldBinding(), [
+                _gap(
+                    "TIME_PARTITION_PRUNING_GUARANTEE_REQUIRED",
+                    "A separate partition column may be used only with an explicit equivalence or safe-superset guarantee",
+                    "COLUMN",
+                    document.ref.topic,
+                    table,
+                    rejected_ref_ids=[ref_id],
+                )
+            ]
+        return (
+            GroundedTimeFieldBinding(
+                semantic_ref_id=ref_id,
+                topic=str(payload.get("topic") or document.ref.topic or ""),
+                table=table,
+                column=column,
+                business_name=str(
+                    definition.get("businessName") or column
+                ).strip(),
+                role=role,
+                aliases=_dedupe(
+                    [
+                        column,
+                        str(definition.get("businessName") or ""),
+                        *[
+                            str(item)
+                            for item in definition.get("aliases") or []
+                        ],
+                    ]
+                ),
+                time_role=time_role,
+                timezone=str(definition.get("timezone") or "").strip(),
+                partition_pruning_column=(
+                    pruning_column if pruning_column != column else ""
+                ),
+                partition_pruning_policy=(
+                    pruning_policy if pruning_column != column else "NONE"
+                ),
+                partition_lower_expansion_days=max(
+                    0,
+                    int(
+                        pruning.get("lowerExpansionDays")
+                        or definition.get("partitionLowerExpansionDays")
+                        or 0
+                    ),
+                ),
+                partition_upper_expansion_days=max(
+                    0,
+                    int(
+                        pruning.get("upperExpansionDays")
+                        or definition.get("partitionUpperExpansionDays")
+                        or 0
+                    ),
+                ),
+            ),
+            [],
+        )
+
+    @staticmethod
     def _relationship_bindings(
         documents: Sequence[_EvidenceDocument],
         selected_tables: Sequence[str],
@@ -1318,6 +1580,57 @@ class GroundedQueryContractValidator:
                 )
             )
         table_by_name = {table.table: table for table in contract.tables}
+        if contract.time_field.semantic_ref_id:
+            time_field = contract.time_field
+            if time_field.semantic_ref_id not in evidence_refs:
+                gaps.append(
+                    _binding_ref_gap(
+                        "TIME_FIELD_EVIDENCE_REF_MISSING",
+                        time_field.semantic_ref_id,
+                        time_field.topic,
+                        time_field.table,
+                    )
+                )
+            if time_field.table not in table_by_name:
+                gaps.append(
+                    _gap(
+                        "TIME_FIELD_TABLE_BINDING_REQUIRED",
+                        "The selected business time field has no trusted owner-table binding",
+                        "TABLE_DETAIL",
+                        time_field.topic,
+                        time_field.table,
+                    )
+                )
+            if time_field.role.upper() not in {
+                "TIME",
+                "DATE",
+                "DATETIME",
+                "TIMESTAMP",
+            }:
+                gaps.append(
+                    _gap(
+                        "TIME_FIELD_ROLE_INVALID",
+                        "The selected business clock is not declared as a governed TIME field",
+                        "COLUMN",
+                        time_field.topic,
+                        time_field.table,
+                    )
+                )
+            if (
+                time_field.partition_pruning_column
+                and time_field.partition_pruning_column != time_field.column
+                and time_field.partition_pruning_policy
+                not in {"EXACT_EQUIVALENT", "SAFE_SUPERSET"}
+            ):
+                gaps.append(
+                    _gap(
+                        "TIME_PARTITION_PRUNING_GUARANTEE_REQUIRED",
+                        "A separate partition predicate requires a declared correctness guarantee",
+                        "COLUMN",
+                        time_field.topic,
+                        time_field.table,
+                    )
+                )
         for metric in contract.metrics:
             if metric.semantic_ref_id not in evidence_refs:
                 gaps.append(_binding_ref_gap("METRIC_EVIDENCE_REF_MISSING", metric.semantic_ref_id, metric.topic, metric.table))
@@ -1328,7 +1641,12 @@ class GroundedQueryContractValidator:
             table = table_by_name.get(metric.table)
             if table is None or not table.detail_ref_id:
                 gaps.append(_gap("TABLE_DETAIL_EVIDENCE_REQUIRED", "Metric owner table %s lacks TABLE_DETAIL evidence" % metric.table, "TABLE_DETAIL", metric.topic, metric.table))
-            effective_time_column = metric.time_column or (table.time_column if table else "")
+            effective_time_column = (
+                contract.time_field.column
+                if contract.time_field.table == metric.table
+                and contract.time_field.column
+                else metric.time_column or (table.time_column if table else "")
+            )
             if not effective_time_column:
                 gaps.append(_gap("TIME_COLUMN_EVIDENCE_REQUIRED", "Metric %s has no grounded time column" % metric.metric_key, "METRIC", metric.topic, metric.table))
         for table in contract.tables:
@@ -1471,7 +1789,82 @@ class GroundedQueryContractValidator:
                 gaps.append(_gap("RANKING_DIRECTION_REQUIRED", "Ranking requires an explicit ASC or DESC direction"))
             if contract.ranking.limit <= 0:
                 gaps.append(_gap("RANKING_LIMIT_REQUIRED", "Ranking requires an explicit positive limit"))
+        reference_scope = contract.reference_scope
+        if reference_scope.enabled:
+            if not reference_scope.executable:
+                gaps.append(
+                    _gap(
+                        "REFERENCE_SCOPE_NOT_VERIFIED",
+                        "Cross-turn scope must be bound to one server-verified query artifact",
+                        "VERIFIED_QUERY_ARTIFACT",
+                    )
+                )
+            if reference_scope.referent_type not in {
+                "PREDICATE_SCOPE",
+                "ENTITY_SET",
+                "RESULT_ARTIFACT",
+                "METRIC_VALUE",
+                "COMPARISON_BASELINE",
+            }:
+                gaps.append(
+                    _gap(
+                        "REFERENCE_SCOPE_TYPE_UNSUPPORTED",
+                        "Cross-turn reference has no supported typed referent",
+                        "VERIFIED_QUERY_ARTIFACT",
+                    )
+                )
+            if (
+                reference_scope.population_required
+                and reference_scope.referent_type == "METRIC_VALUE"
+            ):
+                gaps.append(
+                    _gap(
+                        "REFERENCE_SCALAR_POPULATION_INVALID",
+                        "A scalar metric result cannot authorize a downstream row population",
+                        "VERIFIED_QUERY_ARTIFACT",
+                    )
+                )
+            if (
+                reference_scope.complete_membership_required
+                and reference_scope.coverage_status
+                not in {"ALL_ROWS", "TOP_N", "COMPLETE", "EXACT_ENTITY_SET"}
+            ):
+                gaps.append(
+                    _gap(
+                        "REFERENCE_MEMBERSHIP_INCOMPLETE",
+                        "The referenced artifact does not prove complete row membership",
+                        "VERIFIED_QUERY_ARTIFACT",
+                    )
+                )
+            if (
+                reference_scope.complete_membership_required
+                and not reference_scope.membership_handle_id
+            ):
+                gaps.append(
+                    _gap(
+                        "REFERENCE_MEMBERSHIP_HANDLE_REQUIRED",
+                        "Exact result membership requires a verified entity-set or result-relation handle",
+                        "VERIFIED_ENTITY_SET",
+                    )
+                )
+            if (
+                reference_scope.referent_type == "PREDICATE_SCOPE"
+                and not reference_scope.source_tables
+            ):
+                gaps.append(
+                    _gap(
+                        "REFERENCE_PREDICATE_SOURCE_TABLE_REQUIRED",
+                        "A predicate-scope reference must retain its verified source table bindings",
+                        "TABLE_DETAIL",
+                    )
+                )
         selected_tables = {table.table for table in contract.tables if table.table}
+        if contract.reference_scope.enabled:
+            selected_tables.update(
+                table.table
+                for table in contract.reference_scope.source_tables
+                if table.table
+            )
         for relationship in contract.relationships:
             for endpoint in (relationship.left_table, relationship.right_table):
                 if endpoint in selected_tables:
@@ -1591,6 +1984,23 @@ def materialize_grounded_asset_pack(
         )
         for column in required_columns[table.table]:
             column_evidence[(table.table, column)] = table.detail_ref_id
+    if grounded.time_field.table and grounded.time_field.column:
+        time_field = grounded.time_field
+        required_columns.setdefault(time_field.table, [])
+        required_columns[time_field.table] = _dedupe(
+            [
+                *required_columns[time_field.table],
+                time_field.column,
+                time_field.partition_pruning_column,
+            ]
+        )
+        column_evidence[(time_field.table, time_field.column)] = (
+            time_field.semantic_ref_id
+        )
+        if time_field.partition_pruning_column:
+            column_evidence[
+                (time_field.table, time_field.partition_pruning_column)
+            ] = time_field.semantic_ref_id
     for metric in grounded.metrics:
         required_columns.setdefault(metric.table, [])
         required_columns[metric.table] = _dedupe(
@@ -1615,7 +2025,9 @@ def materialize_grounded_asset_pack(
         required_columns[entity_filter.table] = _dedupe(
             [*required_columns[entity_filter.table], entity_filter.column]
         )
-        column_evidence[(entity_filter.table, entity_filter.column)] = entity_filter.semantic_ref_id
+        column_evidence[(entity_filter.table, entity_filter.column)] = (
+            entity_filter.semantic_ref_id
+        )
     relationship_key_columns: set[tuple[str, str]] = set()
     for relationship in grounded.relationships:
         for left, right in relationship.keys:
@@ -1640,6 +2052,18 @@ def materialize_grounded_asset_pack(
         }
         for dimension in grounded.dimensions
     }
+    if grounded.time_field.table and grounded.time_field.column:
+        time_field = grounded.time_field
+        dimension_semantics[(time_field.table, time_field.column)] = {
+            "columnName": time_field.column,
+            "businessName": time_field.business_name or time_field.column,
+            "aliases": list(time_field.aliases),
+            "role": time_field.role,
+            "timeRole": time_field.time_role,
+            "timezone": time_field.timezone,
+            "usage": "business_time_filter",
+            "groundedEvidenceRef": time_field.semantic_ref_id,
+        }
     for selected in grounded.selected_fields:
         dimension_semantics[(selected.table, selected.column)] = {
             "columnName": selected.column,
@@ -1705,6 +2129,7 @@ def materialize_grounded_asset_pack(
             "visibilityPolicy": deepcopy(asset.get("visibilityPolicy")),
             "allowedRoles": deepcopy(asset.get("allowedRoles")),
             "requiredPermissions": deepcopy(asset.get("requiredPermissions")),
+            "physicalMetadata": deepcopy(asset.get("physicalMetadata") or {}),
             "groundedEvidenceRef": table.detail_ref_id,
         }
         pack.tables.append(
@@ -1754,7 +2179,11 @@ def materialize_grounded_asset_pack(
             "aggregationPolicy": metric.aggregation_policy,
             "metricGrain": metric.metric_grain,
             "applicableTimeGrain": metric.applicable_time_grain,
-            "timeColumn": metric.time_column,
+            "timeColumn": _effective_contract_time_column(
+                grounded,
+                metric.table,
+                metric.time_column,
+            ),
             "unit": metric.unit,
             "aliases": list(metric.aliases),
             "timeSemantics": (
@@ -2053,7 +2482,11 @@ def compile_grounded_query(
                 "aggregationPolicy": metric.aggregation_policy,
                 "metricGrain": metric.metric_grain,
                 "applicableTimeGrain": metric.applicable_time_grain,
-                "timeColumn": metric.time_column or table_binding.time_column,
+                "timeColumn": _effective_contract_time_column(
+                    grounded,
+                    metric.table,
+                    metric.time_column or table_binding.time_column,
+                ),
                 "timeSemantics": (
                     dict(metric.time_semantics)
                     if metric.time_semantics
@@ -2086,7 +2519,11 @@ def compile_grounded_query(
             "aggregationPolicy": metric.aggregation_policy,
             "metricGrain": metric.metric_grain,
             "applicableTimeGrain": metric.applicable_time_grain,
-            "timeColumn": metric.time_column or table_binding.time_column,
+            "timeColumn": _effective_contract_time_column(
+                grounded,
+                metric.table,
+                metric.time_column or table_binding.time_column,
+            ),
             "timeSemantics": (
                 dict(metric.time_semantics)
                 if metric.time_semantics
@@ -2756,6 +3193,18 @@ def _validate_grounded_plan_projection(
         *([expected_group] if expected_group else []),
         *([table_binding.time_column] if table_binding and table_binding.time_column else []),
         *(
+            [contract.time_field.column]
+            if contract.time_field.table == expected_table
+            and contract.time_field.column
+            else []
+        ),
+        *(
+            [contract.time_field.partition_pruning_column]
+            if contract.time_field.table == expected_table
+            and contract.time_field.partition_pruning_column
+            else []
+        ),
+        *(
             [table_binding.merchant_filter_column]
             if table_binding and table_binding.merchant_filter_column
             else []
@@ -2988,6 +3437,17 @@ def _canonical_query_shape(
     if metrics:
         return "SCALAR"
     return "UNRESOLVED"
+
+
+def _effective_contract_time_column(
+    contract: GroundedQueryContract,
+    table: str,
+    fallback: str = "",
+) -> str:
+    time_field = contract.time_field
+    if time_field.table == str(table or "") and time_field.column:
+        return str(time_field.column)
+    return str(fallback or "")
 
 
 def _normalize_binding_hints(
@@ -3273,6 +3733,7 @@ def _canonicalize_binding_hints(
             ],
             "group_by_ref": canonical(hints.group_by_ref),
             "relationship_refs": _dedupe(canonical(item) for item in hints.relationship_refs),
+            "time_field_ref": canonical(hints.time_field_ref),
             "label_refs": {
                 canonical(ref_id): label
                 for ref_id, label in hints.label_refs.items()
@@ -3308,6 +3769,11 @@ def _missing_binding_ref_gaps(
             "UPSTREAM_ENTITY_TARGET_REF_NOT_READ",
             "COLUMN",
             [item.target_field_ref for item in hints.upstream_entity_bindings],
+        ),
+        (
+            "TIME_FIELD_REF_NOT_READ",
+            "COLUMN",
+            [hints.time_field_ref] if hints.time_field_ref else [],
         ),
         ("RELATIONSHIP_BINDING_REF_NOT_READ", "RELATIONSHIPS", hints.relationship_refs),
     ]
@@ -3349,6 +3815,82 @@ def _missing_binding_ref_gaps(
             )
             gaps.append(_gap(code, message, "COLUMN"))
     return gaps
+
+
+def _normalized_governed_alias(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if not character.isspace()
+        and not unicodedata.category(character).startswith(("P", "S"))
+    )
+
+
+def _governed_alias_occurs(question: str, alias: str) -> bool:
+    normalized_question = _normalized_governed_alias(question)
+    normalized_alias = _normalized_governed_alias(alias)
+    return bool(normalized_alias and normalized_alias in normalized_question)
+
+
+def _semantic_refs_equivalent(left: str, right: str) -> bool:
+    first = str(left or "").strip().replace(":column:", ":field:", 1)
+    second = str(right or "").strip().replace(":column:", ":field:", 1)
+    return bool(first and first == second)
+
+
+def _governed_named_time_refs(
+    question: str,
+    documents: Sequence[_EvidenceDocument],
+) -> list[str]:
+    """Match only published aliases; this layer contains no language patterns."""
+
+    candidates: list[str] = []
+    for document in documents:
+        payload = document.payload if isinstance(document.payload, dict) else {}
+        if document.ref.kind == "TABLE_DETAIL":
+            navigation = (
+                payload.get("semanticNavigation")
+                if isinstance(payload.get("semanticNavigation"), dict)
+                else {}
+            )
+            entries = navigation.get("columnLeaves") or []
+        elif document.ref.kind == "COLUMN":
+            definition = (
+                payload.get("definition")
+                if isinstance(payload.get("definition"), dict)
+                else {}
+            )
+            entries = [
+                {
+                    "refId": document.ref.ref_id,
+                    "key": definition.get("columnName") or definition.get("Field"),
+                    "aliases": [
+                        definition.get("businessName"),
+                        *(definition.get("aliases") or []),
+                    ],
+                    "semanticRole": definition.get("semanticRole")
+                    or definition.get("role"),
+                }
+            ]
+        else:
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            role = str(
+                entry.get("semanticRole") or entry.get("role") or ""
+            ).strip().upper()
+            if role not in {"TIME", "DATE", "DATETIME", "TIMESTAMP"}:
+                continue
+            ref_id = str(entry.get("refId") or "").strip()
+            aliases = [entry.get("key"), *(entry.get("aliases") or [])]
+            if ref_id and any(
+                _governed_alias_occurs(question, str(alias or ""))
+                for alias in aliases
+            ):
+                candidates.append(ref_id)
+    return _dedupe(candidates)
 
 
 def _normalize_field_aggregation(value: str) -> str:

@@ -643,7 +643,11 @@ class EsKnowledgeRetrievalService:
                     candidate = resolve_metric_candidate(metric, topic, table, query)
                     if candidate is None:
                         continue
-                    candidate["governance"] = {**table_governance, **recall_governance_metadata(metric)}
+                    candidate["governance"] = {
+                        **table_governance,
+                        **recall_governance_metadata(metric),
+                        "assetStatus": str(table_governance.get("status") or ""),
+                    }
                     semantic_ref_id = str(candidate["semanticRefId"])
                     current = by_id.get(semantic_ref_id)
                     if current is None or float(candidate.get("metricResolutionConfidence") or 0.0) > float(current.get("metricResolutionConfidence") or 0.0):
@@ -653,7 +657,11 @@ class EsKnowledgeRetrievalService:
                     if candidate is None:
                         continue
                     resolved_metric = candidate.get("metric") if isinstance(candidate.get("metric"), dict) else {}
-                    candidate["governance"] = {**table_governance, **recall_governance_metadata(resolved_metric)}
+                    candidate["governance"] = {
+                        **table_governance,
+                        **recall_governance_metadata(resolved_metric),
+                        "assetStatus": str(table_governance.get("status") or ""),
+                    }
                     semantic_ref_id = str(candidate["semanticRefId"])
                     current = by_id.get(semantic_ref_id)
                     if current is None or float(candidate.get("metricResolutionConfidence") or 0.0) > float(current.get("metricResolutionConfidence") or 0.0):
@@ -1829,7 +1837,16 @@ def recall_governance_block_reason(item: RecallItem, request: KnowledgeRetrieval
     }
     if status in blocked_statuses:
         return "status"
-    if str(metadata.get("assetStatus") or "").strip().lower() in blocked_statuses:
+    asset_status = str(metadata.get("assetStatus") or "").strip().upper()
+    semantic_kind = str(metadata.get("semanticKind") or "").strip().upper()
+    source_type = str(item.source_type or "").strip().upper()
+    requires_published_asset = bool(
+        source_type in {"SEMANTIC_TABLE_ASSET", "SEMANTIC_METRIC"}
+        or semantic_kind in {"TABLE_ASSET", "TABLE_DETAIL", "METRIC"}
+    )
+    if requires_published_asset and asset_status not in {"ACTIVE", "PUBLISHED"}:
+        return "semantic_activation"
+    if asset_status and asset_status.lower() in blocked_statuses:
         return "status"
 
     expires_at = metadata.get("expiresAt") or metadata.get("expiryAt")

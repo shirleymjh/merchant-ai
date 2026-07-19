@@ -123,9 +123,7 @@ class _BudgetGraph:
     ) -> None:
         self.action = action
         self.tools = {item.name: item for item in tools}
-        self.budget_middleware = next(
-            item for item in middleware if isinstance(item, GroundedRuntimeBudgetMiddleware)
-        )
+        self.budget_middleware = next(item for item in middleware if isinstance(item, GroundedRuntimeBudgetMiddleware))
 
     def invoke(self, payload: dict[str, Any], *, config: Any, context: Any) -> None:
         del payload, config
@@ -301,6 +299,116 @@ def test_core_model_request_timeout_is_clamped_to_remaining_run_budget() -> None
     assert original.model_settings["timeout"] == 60
 
 
+def test_core_model_request_without_timeout_uses_per_attempt_hard_cap() -> None:
+    budget = GroundedRuntimeBudget(_limits(max_duration_seconds=90))
+    middleware = GroundedRuntimeBudgetMiddleware(
+        SimpleNamespace(
+            grounded_core_model_call_timeout_seconds=20,
+            grounded_core_model_retry_attempts=2,
+        )
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    original = SimpleNamespace(runtime=runtime, model_settings={})
+
+    def override(**updates: Any) -> Any:
+        return SimpleNamespace(
+            runtime=original.runtime,
+            model_settings=updates["model_settings"],
+            override=override,
+        )
+
+    original.override = override
+    captured: list[Any] = []
+
+    middleware.wrap_model_call(
+        original,
+        lambda request: captured.append(request) or object(),
+    )
+
+    assert len(captured) == 1
+    assert 0 < captured[0].model_settings["timeout"] <= 20
+
+
+def test_core_model_timeout_retries_once_and_counts_each_provider_call() -> None:
+    budget = GroundedRuntimeBudget(_limits(max_duration_seconds=90))
+    middleware = GroundedRuntimeBudgetMiddleware(
+        SimpleNamespace(
+            grounded_core_model_call_timeout_seconds=20,
+            grounded_core_model_retry_attempts=2,
+        )
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    original = SimpleNamespace(runtime=runtime, model_settings={})
+
+    def override(**updates: Any) -> Any:
+        return SimpleNamespace(
+            runtime=original.runtime,
+            model_settings=updates["model_settings"],
+            override=override,
+        )
+
+    original.override = override
+    attempts: list[float] = []
+
+    def handler(request: Any) -> object:
+        attempts.append(float(request.model_settings["timeout"]))
+        if len(attempts) == 1:
+            raise TimeoutError("provider read operation timed out")
+        return object()
+
+    result = middleware.wrap_model_call(original, handler)
+
+    assert result is not None
+    assert len(attempts) == 2
+    assert all(0 < timeout <= 20 for timeout in attempts)
+    report = budget.report()
+    assert report["usage"]["llmCallsByName"] == {"grounded_core": 2}
+    assert report["stages"]["llm.grounded_core"]["calls"] == 2
+    assert report["stages"]["llm.grounded_core"]["errors"] == 1
+    assert report["stages"]["llm.grounded_core"]["successes"] == 1
+    assert report["stages"]["llm.grounded_core.attempt_1"]["errors"] == 1
+    assert report["stages"]["llm.grounded_core.attempt_2"]["successes"] == 1
+
+
+def test_core_model_does_not_retry_non_timeout_provider_error() -> None:
+    budget = GroundedRuntimeBudget(_limits(max_duration_seconds=90))
+    middleware = GroundedRuntimeBudgetMiddleware()
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    request = SimpleNamespace(runtime=runtime, model_settings={})
+    calls = 0
+
+    def handler(_: Any) -> object:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider rejected request")
+
+    with pytest.raises(RuntimeError, match="provider rejected request"):
+        middleware.wrap_model_call(request, handler)
+
+    assert calls == 1
+    assert budget.report()["usage"]["llmCalls"] == 1
+
+
+def test_core_model_timeout_does_not_retry_without_llm_call_budget() -> None:
+    budget = GroundedRuntimeBudget(_limits(max_duration_seconds=90, max_llm_calls=1))
+    middleware = GroundedRuntimeBudgetMiddleware(SimpleNamespace(grounded_core_model_retry_attempts=2))
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    request = SimpleNamespace(runtime=runtime, model_settings={})
+    calls = 0
+
+    def handler(_: Any) -> object:
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("provider timed out")
+
+    with pytest.raises(GroundedRuntimeBudgetExceeded) as raised:
+        middleware.wrap_model_call(request, handler)
+
+    assert raised.value.breaches == ("llm_calls",)
+    assert calls == 1
+    assert budget.report()["usage"]["llmCalls"] == 1
+
+
 def test_budget_exhaustion_before_session_creation_returns_controlled_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -355,9 +463,7 @@ def test_operational_budget_failure_takes_precedence_over_stale_answer_state() -
     assert response.answer != state.answer
     assert "未完成或未验证的结果" in response.answer
     assert response.data_rows == []
-    assert response.debug_trace["harness"]["operationalFailure"]["code"] == (
-        "GROUNDED_RUNTIME_BUDGET_EXHAUSTED"
-    )
+    assert response.debug_trace["harness"]["operationalFailure"]["code"] == ("GROUNDED_RUNTIME_BUDGET_EXHAUSTED")
 
 
 class _AnswerLlm:
@@ -378,13 +484,9 @@ class _AnswerLlm:
 def test_answer_composer_reserves_budget_and_clamps_provider_timeout() -> None:
     llm = _AnswerLlm()
     composer = AnswerComposeService(llm)  # type: ignore[arg-type]
-    budget = GroundedRuntimeBudget(
-        _limits(max_duration_seconds=1, max_llm_calls=1)
-    )
+    budget = GroundedRuntimeBudget(_limits(max_duration_seconds=1, max_llm_calls=1))
     plan = QueryPlan()
-    run_result = AgentRunResult(
-        merged_query_bundle=QueryBundle(rows=[{"value": 1}], tables=["orders"])
-    )
+    run_result = AgentRunResult(merged_query_bundle=QueryBundle(rows=[{"value": 1}], tables=["orders"]))
 
     composer._compose_llm_business_answer(
         "why did orders change",

@@ -14,6 +14,7 @@ from sqlglot.optimizer.scope import traverse_scope
 
 from merchant_ai.models import APIModel
 from merchant_ai.services.grounded_query_contract import (
+    GroundedEntityFilterBinding,
     GroundedQueryContract,
     GroundedRelationshipBinding,
 )
@@ -151,6 +152,10 @@ class _ValidationContext:
     relationship_refs: set[str] = field(default_factory=set)
     entity_predicate_coverage: dict[int, set[str]] = field(default_factory=dict)
     entity_scans: dict[int, set[str]] = field(default_factory=dict)
+    entity_obligations: list[GroundedEntityFilterBinding] = field(
+        default_factory=list
+    )
+    runtime_injected_entity_refs: set[str] = field(default_factory=set)
     metric_formula_obligations: list[_MetricFormulaObligation] = field(default_factory=list)
     metric_formula_coverage: set[int] = field(default_factory=set)
     metric_formula_scopes: dict[int, set[int]] = field(default_factory=dict)
@@ -162,6 +167,7 @@ class _ValidationContext:
     final_outputs: dict[str, _Output] = field(default_factory=dict)
     final_output_columns: list[str] = field(default_factory=list)
     join_proofs: list[tuple[_JoinProof, _ScopeState]] = field(default_factory=list)
+    required_reference_tables: set[str] = field(default_factory=set)
 
 
 class GroundedSqlCandidateValidator:
@@ -227,7 +233,9 @@ class GroundedSqlCandidateValidator:
         self._validate_metric_fanout(context)
         self._validate_entity_obligations(context)
         self._validate_time_obligations(context)
+        self._validate_reference_scope(context)
         self._validate_final_outputs(context)
+        self._validate_ranking_obligations(parsed, context)
 
         gaps = _dedupe_gaps(context.gaps)
         return GroundedSqlValidationResult(
@@ -395,7 +403,7 @@ class GroundedSqlCandidateValidator:
                     base_tables={table},
                     scan_ids={scan_id},
                 )
-                for obligation_index, obligation in enumerate(context.contract.entity_filters):
+                for obligation_index, obligation in enumerate(context.entity_obligations):
                     if _identifier(obligation.table) == table:
                         context.entity_scans.setdefault(obligation_index, set()).add(scan_id)
                 for obligation in context.time_obligations:
@@ -712,17 +720,14 @@ class GroundedSqlCandidateValidator:
             wrapper = select.args.get(key)
             if isinstance(wrapper, exp.Expression) and isinstance(wrapper.this, exp.Expression):
                 roots.append(wrapper.this)
-        runtime_injected_refs = {
-            item.target_field_ref
-            for item in context.contract.upstream_entity_bindings
-        }
+        runtime_injected_refs = context.runtime_injected_entity_refs
         for root in roots:
             for term in _and_terms(root):
                 signature = _predicate_signature(term, state, context.allowed_columns)
                 if signature is None:
                     continue
                 origins, operator, values = signature
-                for obligation_index, obligation in enumerate(context.contract.entity_filters):
+                for obligation_index, obligation in enumerate(context.entity_obligations):
                     expected_origin = (_identifier(obligation.table), _identifier(obligation.column))
                     matching_origins = {
                         origin
@@ -879,11 +884,8 @@ class GroundedSqlCandidateValidator:
         return outputs
 
     def _validate_entity_obligations(self, context: _ValidationContext) -> None:
-        runtime_injected_refs = {
-            item.target_field_ref
-            for item in context.contract.upstream_entity_bindings
-        }
-        for index, obligation in enumerate(context.contract.entity_filters):
+        runtime_injected_refs = context.runtime_injected_entity_refs
+        for index, obligation in enumerate(context.entity_obligations):
             if obligation.semantic_ref_id in runtime_injected_refs:
                 continue
             expected_scans = context.entity_scans.get(index, set())
@@ -1014,6 +1016,50 @@ class GroundedSqlCandidateValidator:
                 )
             )
 
+    def _validate_reference_scope(self, context: _ValidationContext) -> None:
+        reference = context.contract.reference_scope
+        if not reference.enabled:
+            return
+        if not reference.executable:
+            context.gaps.append(
+                _gap(
+                    "SQL_REFERENCE_SCOPE_NOT_VERIFIED",
+                    "SQL cannot consume an unverified cross-turn reference",
+                    resolution="Rebind the reference from one verified server artifact.",
+                )
+            )
+            return
+        if reference.population_required and reference.referent_type != "PREDICATE_SCOPE":
+            context.gaps.append(
+                _gap(
+                    "SQL_REFERENCE_MEMBERSHIP_RUNTIME_REQUIRED",
+                    "Exact entity/result membership must be injected by the trusted runtime, not authored by Core SQL",
+                    details={
+                        "referentType": reference.referent_type,
+                        "membershipHandleType": reference.membership_handle_type,
+                        "membershipHandleId": reference.membership_handle_id,
+                    },
+                    resolution="Restore the verified entity set or result relation into the runtime ledger before execution.",
+                )
+            )
+            return
+        if reference.referent_type != "PREDICATE_SCOPE":
+            return
+        referenced = {_identifier(item) for item in context.referenced_tables}
+        missing = sorted(context.required_reference_tables - referenced)
+        if missing:
+            context.gaps.append(
+                _gap(
+                    "SQL_REFERENCE_POPULATION_TABLE_MISSING",
+                    "SQL does not scan every table required by the referenced predicate scope",
+                    details={
+                        "sourceArtifactId": reference.source_artifact_id,
+                        "missingTables": missing,
+                    },
+                    resolution="Build the downstream population from the verified source predicate and governed joins.",
+                )
+            )
+
     def _validate_final_outputs(self, context: _ValidationContext) -> None:
         required: list[tuple[str, str, str, str]] = []
         required.extend(
@@ -1135,6 +1181,201 @@ class GroundedSqlCandidateValidator:
                 )
             )
 
+    def _validate_ranking_obligations(
+        self,
+        parsed: exp.Expression,
+        context: _ValidationContext,
+    ) -> None:
+        ranking = context.contract.ranking
+        if not bool(ranking.enabled):
+            return
+
+        final_select = parsed if isinstance(parsed, exp.Select) else None
+        final_state = next(
+            (
+                state
+                for state in context.scope_states.values()
+                if getattr(state.scope, "parent", None) is None
+                and state.scope.expression is final_select
+            ),
+            None,
+        )
+        if final_select is None or final_state is None:
+            context.gaps.append(
+                _gap(
+                    "SQL_RANKING_FINAL_SELECT_REQUIRED",
+                    "A ranked contract requires one resolvable final SELECT",
+                    resolution="Return the ranked rows from one final SELECT with the contract-bound ORDER BY and LIMIT.",
+                )
+            )
+            return
+
+        order = final_select.args.get("order")
+        order_items = list(order.expressions) if isinstance(order, exp.Order) else []
+        if not order_items:
+            context.gaps.append(
+                _gap(
+                    "SQL_RANKING_ORDER_BY_MISSING",
+                    "Ranked SQL must apply ORDER BY in the final SELECT",
+                    details={
+                        "metricRefId": ranking.metric_ref_id,
+                        "expectedDirection": ranking.direction,
+                    },
+                    resolution="Order the final result by the bound ranking metric and direction.",
+                )
+            )
+        elif len(order_items) != 1:
+            context.gaps.append(
+                _gap(
+                    "SQL_RANKING_ORDER_SET_MISMATCH",
+                    "Final ORDER BY must contain exactly the contract-bound ranking metric",
+                    details={
+                        "actualOrderExpressions": [item.sql(dialect=self.dialect) for item in order_items],
+                        "expectedMetricRefId": ranking.metric_ref_id,
+                    },
+                    resolution="Remove unbound ranking and tie-break expressions from the final ORDER BY.",
+                )
+            )
+        else:
+            ordered = order_items[0]
+            order_expression = ordered.this if isinstance(ordered, exp.Ordered) else ordered
+            expected_direction = str(ranking.direction or "").strip().upper()
+            raw_desc = ordered.args.get("desc") if isinstance(ordered, exp.Ordered) else None
+            actual_direction = "DESC" if raw_desc is True else "ASC" if raw_desc is False else ""
+            if actual_direction != expected_direction:
+                context.gaps.append(
+                    _gap(
+                        "SQL_RANKING_ORDER_DIRECTION_MISMATCH",
+                        "Final ORDER BY direction does not match the grounded ranking contract",
+                        details={
+                            "actualDirection": actual_direction or "UNSPECIFIED",
+                            "expectedDirection": expected_direction,
+                        },
+                        resolution="Use the exact ASC or DESC direction bound in GroundedQueryContract.ranking.",
+                    )
+                )
+            if not _ranking_order_expression_matches(
+                order_expression,
+                final_state,
+                context,
+                ranking.metric_ref_id,
+            ):
+                context.gaps.append(
+                    _gap(
+                        "SQL_RANKING_ORDER_EXPRESSION_MISMATCH",
+                        "Final ORDER BY expression is not the contract-bound ranking metric",
+                        details={
+                            "actualExpression": order_expression.sql(dialect=self.dialect),
+                            "expectedMetricRefId": ranking.metric_ref_id,
+                        },
+                        resolution="Order by the exact governed metric expression or its exact final output alias.",
+                    )
+                )
+
+        limit = final_select.args.get("limit")
+        actual_limit = _literal_positive_integer(
+            limit.expression if isinstance(limit, exp.Limit) else None
+        )
+        if limit is None:
+            context.gaps.append(
+                _gap(
+                    "SQL_RANKING_LIMIT_MISSING",
+                    "Ranked SQL must apply LIMIT in the final SELECT",
+                    details={"expectedLimit": ranking.limit},
+                    resolution="Apply the exact positive limit bound in GroundedQueryContract.ranking.",
+                )
+            )
+        elif actual_limit != int(ranking.limit or 0):
+            context.gaps.append(
+                _gap(
+                    "SQL_RANKING_LIMIT_MISMATCH",
+                    "Final LIMIT does not exactly match the grounded ranking contract",
+                    details={
+                        "actualLimit": actual_limit,
+                        "expectedLimit": ranking.limit,
+                        "actualExpression": (
+                            limit.expression.sql(dialect=self.dialect)
+                            if isinstance(limit, exp.Limit) and limit.expression is not None
+                            else ""
+                        ),
+                    },
+                    resolution="Use the exact integer limit bound in GroundedQueryContract.ranking.",
+                )
+            )
+        if final_select.args.get("offset") is not None:
+            context.gaps.append(
+                _gap(
+                    "SQL_RANKING_OFFSET_FORBIDDEN",
+                    "A ranking contract does not authorize an OFFSET",
+                    resolution="Remove OFFSET so the result is the requested first Top/Bottom N rows.",
+                )
+            )
+
+        self._validate_ranking_group_grain(context)
+
+    def _validate_ranking_group_grain(self, context: _ValidationContext) -> None:
+        ranking = context.contract.ranking
+        dimension = next(
+            (
+                item
+                for item in context.contract.dimensions
+                if item.semantic_ref_id == ranking.dimension_ref_id
+            ),
+            None,
+        )
+        metric_index = next(
+            (
+                index
+                for index, item in enumerate(context.contract.metrics)
+                if item.semantic_ref_id == ranking.metric_ref_id
+            ),
+            None,
+        )
+        if dimension is None or metric_index is None:
+            # Contract readiness validation owns missing semantic bindings.  A
+            # SQL-shape assertion is only made when its grain can be derived.
+            return
+        metric_scope_ids = context.metric_formula_scopes.get(metric_index, set())
+        metric_states = [
+            context.scope_states[scope_id]
+            for scope_id in metric_scope_ids
+            if scope_id in context.scope_states
+        ]
+        if len(metric_states) != 1:
+            return
+        metric_state = metric_states[0]
+        metric_select = metric_state.scope.expression
+        if not isinstance(metric_select, exp.Select):
+            return
+        group = metric_select.args.get("group")
+        group_expressions = list(group.expressions) if isinstance(group, exp.Group) else []
+        matches_dimension = (
+            len(group_expressions) == 1
+            and _ranking_group_expression_matches(
+                group_expressions[0],
+                metric_state,
+                context,
+                dimension.semantic_ref_id,
+            )
+        )
+        if matches_dimension:
+            return
+        context.gaps.append(
+            _gap(
+                "SQL_RANKING_GROUP_GRAIN_MISMATCH",
+                "The ranking metric is not aggregated at exactly the requested dimension grain",
+                table=dimension.table,
+                column=dimension.column,
+                details={
+                    "actualGroupExpressions": [
+                        item.sql(dialect=self.dialect) for item in group_expressions
+                    ],
+                    "expectedDimensionRefId": dimension.semantic_ref_id,
+                },
+                resolution="Group the governed ranking metric by exactly the bound ranking dimension.",
+            )
+        )
+
 
 def grounded_query_contract_fingerprint(contract: GroundedQueryContract) -> str:
     """Fingerprint only the semantic authority relevant to SQL generation."""
@@ -1143,6 +1384,7 @@ def grounded_query_contract_fingerprint(contract: GroundedQueryContract) -> str:
         "version": contract.contract_version,
         "status": contract.status,
         "queryShape": contract.query_shape,
+        "executionShape": contract.execution_shape,
         "primaryTable": contract.primary_table,
         "tables": [
             {
@@ -1164,6 +1406,12 @@ def grounded_query_contract_fingerprint(contract: GroundedQueryContract) -> str:
         ],
         "relationships": [item.model_dump(by_alias=True, mode="json") for item in contract.relationships],
         "timeRange": contract.time_range.model_dump(by_alias=True, mode="json"),
+        "timeField": contract.time_field.model_dump(by_alias=True, mode="json"),
+        "ranking": contract.ranking.model_dump(by_alias=True, mode="json"),
+        "referenceScope": contract.reference_scope.model_dump(
+            by_alias=True,
+            mode="json",
+        ),
         "evidenceRefs": sorted(contract.evidence_refs),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
@@ -1173,11 +1421,22 @@ def grounded_query_contract_fingerprint(contract: GroundedQueryContract) -> str:
 def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
     trusted_refs = set(contract.evidence_refs)
     trusted_refs.update(str(item.ref_id) for item in contract.evidence)
+    reference = contract.reference_scope
+    reference_predicate_enabled = bool(
+        reference.executable
+        and reference.referent_type == "PREDICATE_SCOPE"
+        and reference.population_required
+    )
+    if reference_predicate_enabled:
+        trusted_refs.update(reference.source_evidence_refs)
     allowed_tables: dict[str, str] = {}
     allowed_columns: dict[str, set[str]] = {}
     merchant_columns: dict[str, str] = {}
     column_binding_refs: dict[tuple[str, str], set[str]] = {}
-    for binding in contract.tables:
+    table_bindings = list(contract.tables)
+    if reference_predicate_enabled:
+        table_bindings.extend(reference.source_tables)
+    for binding in table_bindings:
         table = _identifier(binding.table)
         if not table or not binding.detail_ref_id or binding.detail_ref_id not in trusted_refs:
             continue
@@ -1189,6 +1448,26 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
             merchant = _identifier(binding.merchant_filter_column)
             allowed_columns[table].add(merchant)
             merchant_columns[table] = merchant
+
+    time_field = contract.time_field
+    if (
+        time_field.semantic_ref_id
+        and time_field.semantic_ref_id in trusted_refs
+        and _identifier(time_field.table)
+        and _identifier(time_field.column)
+    ):
+        time_table = _identifier(time_field.table)
+        allowed_columns.setdefault(time_table, set()).add(
+            _identifier(time_field.column)
+        )
+        column_binding_refs.setdefault(
+            (time_table, _identifier(time_field.column)),
+            set(),
+        ).add(time_field.semantic_ref_id)
+        if time_field.partition_pruning_column:
+            allowed_columns.setdefault(time_table, set()).add(
+                _identifier(time_field.partition_pruning_column)
+            )
 
     metric_formula_obligations: list[_MetricFormulaObligation] = []
     for metric_index, metric in enumerate(contract.metrics):
@@ -1216,7 +1495,35 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
                 parse_error=parse_error,
             )
         )
-    for binding in [*contract.dimensions, *contract.selected_fields, *contract.entity_filters]:
+    entity_obligations = [item.model_copy(deep=True) for item in contract.entity_filters]
+    if reference_predicate_enabled:
+        existing_entity_keys = {
+            (
+                item.semantic_ref_id,
+                item.table,
+                item.column,
+                item.operator,
+                json.dumps(item.literal_value, ensure_ascii=False, sort_keys=True, default=str),
+            )
+            for item in entity_obligations
+        }
+        for item in reference.source_entity_filters:
+            identity = (
+                item.semantic_ref_id,
+                item.table,
+                item.column,
+                item.operator,
+                json.dumps(item.literal_value, ensure_ascii=False, sort_keys=True, default=str),
+            )
+            if identity in existing_entity_keys:
+                continue
+            existing_entity_keys.add(identity)
+            entity_obligations.append(item.model_copy(deep=True))
+    for binding in [
+        *contract.dimensions,
+        *contract.selected_fields,
+        *entity_obligations,
+    ]:
         if binding.semantic_ref_id not in trusted_refs:
             continue
         table = _identifier(binding.table)
@@ -1247,24 +1554,36 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
             if _identifier(item.table)
         }
         relevant: list[tuple[str, str]] = []
-        for metric in contract.metrics:
-            table = _identifier(metric.table)
-            table_binding = table_bindings.get(table)
-            column = _identifier(
-                metric.time_column
-                or (table_binding.time_column if table_binding else "")
+        if (
+            time_field.semantic_ref_id
+            and time_field.semantic_ref_id in trusted_refs
+            and time_field.table
+            and time_field.column
+        ):
+            relevant.append(
+                (_identifier(time_field.table), _identifier(time_field.column))
             )
-            if table and column:
-                relevant.append((table, column))
-        primary_table = _identifier(contract.primary_table)
-        primary_binding = table_bindings.get(primary_table)
-        if primary_binding and primary_binding.time_column:
-            relevant.append((primary_table, _identifier(primary_binding.time_column)))
-        for entity_filter in contract.entity_filters:
-            table = _identifier(entity_filter.table)
-            binding = table_bindings.get(table)
-            if binding and binding.time_column:
-                relevant.append((table, _identifier(binding.time_column)))
+        else:
+            for metric in contract.metrics:
+                table = _identifier(metric.table)
+                table_binding = table_bindings.get(table)
+                column = _identifier(
+                    metric.time_column
+                    or (table_binding.time_column if table_binding else "")
+                )
+                if table and column:
+                    relevant.append((table, column))
+            primary_table = _identifier(contract.primary_table)
+            primary_binding = table_bindings.get(primary_table)
+            if primary_binding and primary_binding.time_column:
+                relevant.append(
+                    (primary_table, _identifier(primary_binding.time_column))
+                )
+            for entity_filter in contract.entity_filters:
+                table = _identifier(entity_filter.table)
+                binding = table_bindings.get(table)
+                if binding and binding.time_column:
+                    relevant.append((table, _identifier(binding.time_column)))
         start_value = str(
             contract.time_range.execution_start_value
             or contract.time_range.execution_start_date
@@ -1287,6 +1606,49 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
                     end_value=end_value,
                 )
             )
+    if reference_predicate_enabled and bool(reference.source_time_range.explicit):
+        start_value = str(
+            reference.source_time_range.execution_start_value
+            or reference.source_time_range.execution_start_date
+            or reference.source_time_range.start_date
+            or ""
+        ).strip()
+        end_value = str(
+            reference.source_time_range.execution_end_value
+            or reference.source_time_range.execution_end_date
+            or reference.source_time_range.end_date
+            or ""
+        ).strip()
+        reference_pairs: list[tuple[str, str]] = []
+        for raw_table, raw_columns in reference.source_time_columns.items():
+            for raw_column in raw_columns:
+                table = _identifier(raw_table)
+                column = _identifier(raw_column)
+                if table and column:
+                    allowed_columns.setdefault(table, set()).add(column)
+                    reference_pairs.append((table, column))
+        for table, column in _dedupe_pairs(reference_pairs):
+            identity = (table, column, start_value, end_value)
+            if any(
+                (
+                    item.table,
+                    item.column,
+                    item.start_value,
+                    item.end_value,
+                )
+                == identity
+                for item in time_obligations
+            ):
+                continue
+            time_obligations.append(
+                _TimeObligation(
+                    obligation_index=len(time_obligations),
+                    table=table,
+                    column=column,
+                    start_value=start_value,
+                    end_value=end_value,
+                )
+            )
 
     return _ValidationContext(
         contract=contract,
@@ -1294,11 +1656,106 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
         allowed_tables=allowed_tables,
         allowed_columns=allowed_columns,
         merchant_columns=merchant_columns,
+        entity_obligations=entity_obligations,
+        runtime_injected_entity_refs={
+            item.target_field_ref for item in contract.upstream_entity_bindings
+        },
         relationships=relationships,
         metric_formula_obligations=metric_formula_obligations,
         time_obligations=time_obligations,
         column_binding_refs=column_binding_refs,
+        required_reference_tables=(
+            {
+                _identifier(item.table)
+                for item in reference.source_tables
+                if _identifier(item.table)
+            }
+            if reference_predicate_enabled
+            else set()
+        ),
     )
+
+
+def _ranking_order_expression_matches(
+    expression: exp.Expression,
+    state: _ScopeState,
+    context: _ValidationContext,
+    metric_ref_id: str,
+) -> bool:
+    current = _unwrap(expression)
+    if isinstance(current, exp.Column) and not isinstance(current.this, exp.Star):
+        output_alias = _identifier(current.name)
+        if not _identifier(current.table):
+            output = context.final_outputs.get(output_alias)
+            if output is not None and metric_ref_id in output.exact_metric_refs:
+                return True
+        if metric_ref_id in _exact_metric_refs_for_column(current, state):
+            return True
+
+    obligation = next(
+        (
+            item
+            for item in context.metric_formula_obligations
+            if item.semantic_ref_id == metric_ref_id
+        ),
+        None,
+    )
+    if obligation is None or obligation.parse_error:
+        return False
+    if _resolved_expression_signature(
+        current,
+        state,
+        context.allowed_columns,
+    ) != obligation.signature:
+        return False
+    resolved_origins: set[_Origin] = set()
+    for column in _direct_columns(current):
+        resolved = _resolve_column(column, state, context.allowed_columns)
+        if resolved.status != "ok":
+            return False
+        resolved_origins.update(resolved.origins)
+    if resolved_origins:
+        return all(
+            origin.table == obligation.table
+            and origin.column in obligation.source_columns
+            for origin in resolved_origins
+        )
+    return obligation.table in state.base_tables
+
+
+def _ranking_group_expression_matches(
+    expression: exp.Expression,
+    state: _ScopeState,
+    context: _ValidationContext,
+    dimension_ref_id: str,
+) -> bool:
+    current = _unwrap(expression)
+    if not isinstance(current, exp.Column) or isinstance(current.this, exp.Star):
+        return False
+    if (
+        dimension_ref_id in _semantic_refs_for_column(current, state, context)
+        and _column_is_passthrough(current, state)
+    ):
+        return True
+    if _identifier(current.table):
+        return False
+    output = state.outputs.get(_identifier(current.name))
+    return bool(
+        output
+        and output.passthrough
+        and dimension_ref_id in output.semantic_refs
+    )
+
+
+def _literal_positive_integer(expression: exp.Expression | None) -> int | None:
+    current = _unwrap(expression) if isinstance(expression, exp.Expression) else None
+    if not isinstance(current, exp.Literal) or current.is_string:
+        return None
+    raw = str(current.this or "").strip()
+    if not re.fullmatch(r"[0-9]+", raw):
+        return None
+    value = int(raw)
+    return value if value > 0 else None
 
 
 def _resolve_column(

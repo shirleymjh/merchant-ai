@@ -8,12 +8,20 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib import request as url_request
 
 from merchant_ai.config import Settings
 from merchant_ai.services.cache import json_cache_dumps, json_cache_loads
+from merchant_ai.services.runtime_state import (
+    ExecutionJournalClaim,
+    MemoryRuntimeStateStore,
+    RuntimeStateStore,
+    StaleExecutionFence,
+    create_runtime_state_store,
+)
 from merchant_ai.models import (
     CircuitBreakerState,
     LoadBalancerTarget,
@@ -31,6 +39,106 @@ from merchant_ai.services.tools import ToolRegistry, canonical_tool_registry, va
 
 _TOOL_RUNTIME_SCOPE: ContextVar[Optional[Dict[str, str]]] = ContextVar("merchant_ai_tool_runtime_scope", default=None)
 _TOOL_CANCEL_EVENT: ContextVar[Any] = ContextVar("merchant_ai_tool_cancel_event", default=None)
+_TOOL_EXECUTION_FENCE: ContextVar[Optional[Dict[str, Any]]] = ContextVar("merchant_ai_tool_execution_fence", default=None)
+
+
+def _canonical_identity_values(values: Sequence[Any] | None) -> Tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                str(value).strip()
+                for value in (values or ())
+                if str(value or "").strip()
+            }
+        )
+    )
+
+
+def _canonical_payload_fingerprint(payload: Mapping[str, Any] | None) -> str:
+    encoded = json.dumps(
+        dict(payload or {}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ExecutionIdentityFingerprint:
+    """Opaque, versioned digest of a server-authoritative execution identity."""
+
+    value: str
+    version: str = "v1"
+
+
+@dataclass(frozen=True)
+class ExecutionIdentity:
+    """Server-authoritative identity bound to tool execution and replay.
+
+    This value is deliberately separate from tool arguments. A caller may send
+    an argument named ``_scope``, but it cannot grant authority or select a
+    previously committed result because it never populates this identity.
+    """
+
+    merchant_id: str = ""
+    tenant_id: str = ""
+    principal_id: str = ""
+    role: str = ""
+    permissions: Tuple[str, ...] = ()
+    region: str = ""
+    store_ids: Tuple[str, ...] = ()
+    row_policy_fingerprint: str = ""
+    datasource_environment: str = ""
+    semantic_activation_fingerprint: str = ""
+
+    @classmethod
+    def from_server_context(
+        cls,
+        *,
+        merchant_id: str = "",
+        tenant_id: str = "",
+        principal_id: str = "",
+        role: str = "",
+        permissions: Sequence[Any] | None = None,
+        region: str = "",
+        store_ids: Sequence[Any] | None = None,
+        row_policy: Mapping[str, Any] | None = None,
+        datasource_environment: str = "",
+        semantic_activation_fingerprint: str = "",
+    ) -> "ExecutionIdentity":
+        return cls(
+            merchant_id=str(merchant_id or "").strip(),
+            tenant_id=str(tenant_id or "").strip(),
+            principal_id=str(principal_id or "").strip(),
+            role=str(role or "").strip(),
+            permissions=_canonical_identity_values(permissions),
+            region=str(region or "").strip(),
+            store_ids=_canonical_identity_values(store_ids),
+            row_policy_fingerprint=_canonical_payload_fingerprint(row_policy),
+            datasource_environment=str(datasource_environment or "").strip(),
+            semantic_activation_fingerprint=str(
+                semantic_activation_fingerprint or ""
+            ).strip(),
+        )
+
+    def fingerprint(self) -> ExecutionIdentityFingerprint:
+        payload = {
+            "merchantId": self.merchant_id,
+            "tenantId": self.tenant_id,
+            "principalId": self.principal_id,
+            "role": self.role,
+            "permissions": list(self.permissions),
+            "region": self.region,
+            "storeIds": list(self.store_ids),
+            "rowPolicyFingerprint": self.row_policy_fingerprint,
+            "datasourceEnvironment": self.datasource_environment,
+            "semanticActivationFingerprint": self.semantic_activation_fingerprint,
+        }
+        return ExecutionIdentityFingerprint(
+            value=_canonical_payload_fingerprint(payload)
+        )
 
 
 @contextmanager
@@ -56,6 +164,10 @@ def current_tool_cancel_event() -> Any:
     return _TOOL_CANCEL_EVENT.get()
 
 
+def current_tool_execution_fence() -> Dict[str, Any]:
+    return dict(_TOOL_EXECUTION_FENCE.get() or {})
+
+
 @contextmanager
 def tool_cancel_scope(cancel_event: Any):
     token = _TOOL_CANCEL_EVENT.set(cancel_event)
@@ -63,6 +175,15 @@ def tool_cancel_scope(cancel_event: Any):
         yield
     finally:
         _TOOL_CANCEL_EVENT.reset(token)
+
+
+@contextmanager
+def tool_execution_fence_scope(fence: Dict[str, Any]):
+    token = _TOOL_EXECUTION_FENCE.set(dict(fence or {}))
+    try:
+        yield
+    finally:
+        _TOOL_EXECUTION_FENCE.reset(token)
 
 
 def scoped_rate_limit_key(
@@ -129,30 +250,36 @@ def classify_timeout_type(error: Exception | str, service_name: str = "", source
     return "tool_timeout"
 
 
-def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", target: str = "") -> Dict[str, str]:
+def normalize_tool_context(
+    tool_name: str,
+    args: Any,
+    service_name: str = "",
+    target: str = "",
+    execution_identity: ExecutionIdentity | None = None,
+) -> Dict[str, str]:
     safe_args = args if isinstance(args, dict) else {}
+    runtime_scope = current_tool_runtime_scope()
     raw_target = safe_args.get("_target") if isinstance(safe_args, dict) else {}
     target_name = target
     if not target_name and isinstance(raw_target, dict):
         target_name = str(raw_target.get("name") or raw_target.get("endpoint") or "")
     service = service_name or str(safe_args.get("_service") or safe_args.get("service") or "")
-    scope = safe_args.get("_scope") if isinstance(safe_args.get("_scope"), dict) else {}
-    principal_id = str(
-        scope.get("principalId")
-        or scope.get("tenantId")
-        or safe_args.get("principalId")
-        or safe_args.get("tenantId")
-        or ""
+    identity = execution_identity or ExecutionIdentity.from_server_context(
+        merchant_id=str(runtime_scope.get("merchantId") or "")
     )
-    thread_id = str(safe_args.get("threadId") or safe_args.get("thread_id") or "")
+    identity_fingerprint = identity.fingerprint().value
+    principal_id = str(identity.merchant_id or identity.tenant_id or "")
+    thread_id = str(safe_args.get("threadId") or safe_args.get("thread_id") or runtime_scope.get("threadId") or "")
+    run_id = str(runtime_scope.get("runId") or "")
     params_hash = tool_params_hash(safe_args)
     service = service or "tool"
-    circuit_key = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s" % (
+    circuit_key = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s|identity=%s" % (
         tool_name,
         service,
         target_name or "default",
         principal_id or "*",
         thread_id or "*",
+        identity_fingerprint,
     )
     fingerprint = "%s|params=%s" % (circuit_key, params_hash)
     return {
@@ -161,6 +288,8 @@ def normalize_tool_context(tool_name: str, args: Any, service_name: str = "", ta
         "target": target_name or "default",
         "merchantId": principal_id,
         "threadId": thread_id,
+        "runId": run_id,
+        "identityFingerprint": identity_fingerprint,
         "paramsHash": params_hash,
         "circuitKey": circuit_key,
         "fingerprint": fingerprint,
@@ -184,8 +313,14 @@ def tool_idempotency_key(tool_name: str, call_id: str, context: Dict[str, str]) 
         str(call_id or ""),
         "service",
         str(context.get("serviceName") or ""),
-        "target",
-        str(context.get("target") or ""),
+        "merchant",
+        str(context.get("merchantId") or ""),
+        "thread",
+        str(context.get("threadId") or ""),
+        "run",
+        str(context.get("runId") or ""),
+        "identity",
+        str(context.get("identityFingerprint") or ""),
         "params",
         str(context.get("paramsHash") or ""),
     ]
@@ -200,7 +335,16 @@ def tool_contract_enforced(contract: Dict[str, Any]) -> bool:
 def sanitize_tool_args(args: Any) -> Any:
     if not isinstance(args, dict):
         return args
-    return {key: value for key, value in args.items() if not str(key).startswith("_")}
+    sanitized: Dict[str, Any] = {}
+    for key, value in args.items():
+        normalized_key = str(key)
+        if normalized_key == "_scope" and isinstance(value, dict):
+            # Retain caller scope as an ordinary parameter for compatibility.
+            # It is untrusted and never populates ExecutionIdentity.
+            sanitized[normalized_key] = dict(value)
+        elif not normalized_key.startswith("_"):
+            sanitized[normalized_key] = value
+    return sanitized
 
 
 def recovery_action_for(tool_name: str, error_type: str, tool_kind: str = "") -> ToolRecoveryAction:
@@ -950,8 +1094,17 @@ class ToolFailureRegistry:
         target: str = "",
         merchant_id: str = "",
         thread_id: str = "",
+        execution_identity: ExecutionIdentity | None = None,
     ) -> str:
-        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        context = self.context(
+            tool_name,
+            args,
+            service_name,
+            target,
+            merchant_id,
+            thread_id,
+            execution_identity,
+        )
         return context["fingerprint"]
 
     def context(
@@ -962,19 +1115,31 @@ class ToolFailureRegistry:
         target: str = "",
         merchant_id: str = "",
         thread_id: str = "",
+        execution_identity: ExecutionIdentity | None = None,
     ) -> Dict[str, str]:
         scope = current_tool_runtime_scope()
-        context = normalize_tool_context(tool_name, args, service_name, target)
+        identity = execution_identity
+        if identity is None and merchant_id:
+            identity = ExecutionIdentity.from_server_context(merchant_id=merchant_id)
+        context = normalize_tool_context(
+            tool_name,
+            args,
+            service_name,
+            target,
+            execution_identity=identity,
+        )
         context["merchantId"] = str(merchant_id or context.get("merchantId") or scope.get("merchantId") or "")
         context["threadId"] = str(thread_id or context.get("threadId") or scope.get("threadId") or "")
         run_id = str(scope.get("runId") or "")
-        context["circuitKey"] = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s|run=%s" % (
+        context["runId"] = run_id
+        context["circuitKey"] = "tool=%s|service=%s|target=%s|merchant=%s|thread=%s|run=%s|identity=%s" % (
             tool_name,
             context["serviceName"] or "tool",
             context["target"] or "default",
             context["merchantId"] or "*",
             context["threadId"] or "*",
             run_id or "*",
+            context["identityFingerprint"],
         )
         context["fingerprint"] = "%s|params=%s" % (context["circuitKey"], context["paramsHash"])
         return context
@@ -987,8 +1152,17 @@ class ToolFailureRegistry:
         target: str = "",
         merchant_id: str = "",
         thread_id: str = "",
+        execution_identity: ExecutionIdentity | None = None,
     ) -> CircuitBreakerState | None:
-        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        context = self.context(
+            tool_name,
+            args,
+            service_name,
+            target,
+            merchant_id,
+            thread_id,
+            execution_identity,
+        )
         with self._lock:
             circuit = self.circuits.get(context["circuitKey"])
             if circuit and circuit.state == "open":
@@ -1032,8 +1206,17 @@ class ToolFailureRegistry:
         target: str = "",
         merchant_id: str = "",
         thread_id: str = "",
+        execution_identity: ExecutionIdentity | None = None,
     ) -> CircuitBreakerState | None:
-        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        context = self.context(
+            tool_name,
+            args,
+            service_name,
+            target,
+            merchant_id,
+            thread_id,
+            execution_identity,
+        )
         with self._lock:
             self.records.pop(context["fingerprint"], None)
             circuit = self.circuits.get(context["circuitKey"])
@@ -1058,8 +1241,17 @@ class ToolFailureRegistry:
         target: str = "",
         merchant_id: str = "",
         thread_id: str = "",
+        execution_identity: ExecutionIdentity | None = None,
     ) -> ToolFailureRecord:
-        context = self.context(tool_name, args, service_name, target, merchant_id, thread_id)
+        context = self.context(
+            tool_name,
+            args,
+            service_name,
+            target,
+            merchant_id,
+            thread_id,
+            execution_identity,
+        )
         fingerprint = context["fingerprint"]
         recovery = recovery_action_for(tool_name, error_type, context["serviceName"])
         timestamp = now_ms()
@@ -1156,6 +1348,7 @@ class ToolRuntimeService:
         load_balancer: RoundRobinLoadBalancer | None = None,
         metrics: RuntimeMetricsAggregator | None = None,
         tool_registry: ToolRegistry | None = None,
+        execution_journal: RuntimeStateStore | None = None,
     ):
         self.settings = settings
         self.policy_registry = policy_registry or ToolRuntimePolicyRegistry(settings)
@@ -1170,10 +1363,23 @@ class ToolRuntimeService:
         self.metrics = metrics or RuntimeMetricsAggregator()
         self.alert_manager = RuntimeAlertManager(settings, self.metrics)
         self.tool_registry = tool_registry or canonical_tool_registry()
+        if execution_journal is not None:
+            self.execution_journal = execution_journal
+        else:
+            # The selected state backend is the idempotency authority.  Never
+            # silently replace a shared backend with a per-runtime memory
+            # journal, which would allow duplicate execution across workers.
+            self.execution_journal = create_runtime_state_store(settings)
         self._events: List[Dict[str, Any]] = []
         self._events_lock = threading.RLock()
 
-    def cache_key(self, tool_name: str, args: Dict[str, Any], policy: ToolCachePolicy | None = None) -> str:
+    def cache_key(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        policy: ToolCachePolicy | None = None,
+        execution_identity: ExecutionIdentity | None = None,
+    ) -> str:
         cache_policy = policy or ToolCachePolicy()
         source: Dict[str, Any]
         if cache_policy.key_fields:
@@ -1181,6 +1387,11 @@ class ToolRuntimeService:
         else:
             source = dict(args or {})
         source.setdefault("semanticVersion", args.get("semanticVersion") or args.get("semantic_version") or "")
+        source["__executionIdentityFingerprint"] = (
+            execution_identity or ExecutionIdentity.from_server_context(
+                merchant_id=current_tool_runtime_scope().get("merchantId", "")
+            )
+        ).fingerprint().value
         try:
             raw = json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
         except Exception:
@@ -1197,13 +1408,32 @@ class ToolRuntimeService:
         cache_policy: ToolCachePolicy | None = None,
         target_kind: str = "",
         cancel_event: Any = None,
+        execution_identity: ExecutionIdentity | None = None,
     ) -> ToolCallExecutionResult:
-        call = ToolCallRequest(id=call_id or tool_name, name=tool_name, args=args or {})
+        resolved_call_id = str(call_id or "").strip()
+        supplied_call_id = bool(resolved_call_id)
+        if not resolved_call_id:
+            resolved_call_id = hashlib.sha256(
+                ("%s:%s:%s" % (tool_name, threading.get_ident(), time.time_ns())).encode("utf-8")
+            ).hexdigest()[:24]
+        call = ToolCallRequest(id=resolved_call_id, name=tool_name, args=args or {})
         service_name = target_kind or self._tool_kind(tool_name)
         selected_target = self.load_balancer.select(service_name)
-        context = self.failure_registry.context(tool_name, call.args, service_name=service_name, target=selected_target.name)
+        context = self.failure_registry.context(
+            tool_name,
+            call.args,
+            service_name=service_name,
+            target=selected_target.name,
+            execution_identity=execution_identity,
+        )
         idempotency_key = tool_idempotency_key(tool_name, call.id, context)
-        blocked = self.failure_registry.should_block(tool_name, call.args, service_name=service_name, target=selected_target.name)
+        blocked = self.failure_registry.should_block(
+            tool_name,
+            call.args,
+            service_name=service_name,
+            target=selected_target.name,
+            execution_identity=execution_identity,
+        )
         pre_runtime_events: List[Dict[str, Any]] = [
             self._record_event(
                 "tool.started",
@@ -1220,6 +1450,40 @@ class ToolRuntimeService:
                 {"idempotencyKey": idempotency_key, "paramsHash": context["paramsHash"]},
             )
         ]
+        capability = self.tool_registry.capability(tool_name)
+        if capability.side_effect_level == "unknown":
+            return self._capability_blocked_result(
+                call,
+                context,
+                selected_target,
+                service_name,
+                idempotency_key,
+                "UNCLASSIFIED_TOOL_CAPABILITY",
+                "tool execution requires an explicitly classified capability card",
+                pre_runtime_events,
+            )
+        if (
+            capability.side_effect_level
+            not in {"none", "read", "external_read"}
+            and not supplied_call_id
+        ):
+            return self._capability_blocked_result(
+                call,
+                context,
+                selected_target,
+                service_name,
+                idempotency_key,
+                "IDEMPOTENCY_CALL_ID_REQUIRED",
+                "side-effecting tool execution requires a stable caller-supplied call id",
+                pre_runtime_events,
+            )
+        existing_execution = self.execution_journal.get_execution(idempotency_key)
+        if existing_execution and existing_execution.status != "in_progress":
+            return self._replay_execution_result(
+                call,
+                ExecutionJournalClaim("replay", existing_execution),
+                pre_runtime_events,
+            )
         if blocked:
             recovery = recovery_action_for(tool_name, "CIRCUIT_OPEN", service_name)
             details = tool_error_details(tool_name, call.args, "CIRCUIT_OPEN", blocked.reason, context=context, call_id=call.id)
@@ -1319,12 +1583,23 @@ class ToolRuntimeService:
                 return result
         cache_key = ""
         if cache_policy and cache_policy.enabled and self.settings.cache_enabled:
-            cache_key = self.cache_key(tool_name, call.args, cache_policy)
+            cache_key = self.cache_key(
+                tool_name,
+                call.args,
+                cache_policy,
+                execution_identity=execution_identity,
+            )
             cached = self.cache_store.get(cache_key)
             if cached is not None:
                 closed_circuit = None
                 if probe_circuit and probe_circuit.state == "half_open":
-                    closed_circuit = self.failure_registry.record_success(tool_name, call.args, service_name=service_name, target=selected_target.name)
+                    closed_circuit = self.failure_registry.record_success(
+                        tool_name,
+                        call.args,
+                        service_name=service_name,
+                        target=selected_target.name,
+                        execution_identity=execution_identity,
+                    )
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
@@ -1348,14 +1623,57 @@ class ToolRuntimeService:
                 result.result_hash = str(contract.get("resultHash") or "")
                 self.metrics.record(tool_name, result.status, 0, cache_hit=True)
                 return result
-        started = time.monotonic()
         policy = self.policy_registry.policy_for(tool_name)
+        execution_owner = hashlib.sha256(
+            ("%s:%s:%s" % (id(self), threading.get_ident(), time.time_ns())).encode("utf-8")
+        ).hexdigest()[:24]
+        allow_expired_takeover = capability.side_effect_level in {"none", "read", "external_read"}
+        execution_claim = self.execution_journal.claim_execution(
+            idempotency_key,
+            execution_owner,
+            lease_seconds=tool_policy_budget_seconds(policy),
+            allow_expired_takeover=allow_expired_takeover,
+        )
+        if execution_claim.outcome == "replay":
+            return self._replay_execution_result(call, execution_claim, pre_runtime_events)
+        if not execution_claim.acquired:
+            return self._blocked_execution_result(
+                call,
+                context,
+                selected_target,
+                service_name,
+                idempotency_key,
+                execution_claim,
+                pre_runtime_events,
+            )
+        pre_runtime_events.append(
+            self._record_event(
+                "tool.idempotency.claimed",
+                ToolCallExecutionResult(
+                    id=call.id,
+                    name=tool_name,
+                    status="running",
+                    idempotency_key=idempotency_key,
+                    params_hash=context["paramsHash"],
+                    target=selected_target.name,
+                    service_name=service_name,
+                    circuit_key=context["circuitKey"],
+                ),
+                {
+                    "idempotencyKey": idempotency_key,
+                    "fencingGeneration": execution_claim.entry.lease_generation,
+                },
+            )
+        )
+        started = time.monotonic()
         attempts = max(1, policy.max_retries + 1)
+        attempts_used = 0
         last_error = ""
         last_error_type = "ERROR"
         last_timeout_type = ""
         all_attempt_events: List[Dict[str, Any]] = []
         for attempt in range(attempts):
+            attempts_used = attempt + 1
             attempt_events: List[Dict[str, Any]] = []
             try:
                 next_args = dict(call.args)
@@ -1382,14 +1700,23 @@ class ToolRuntimeService:
                             {"elapsedMs": elapsed_ms, "timeoutSeconds": timeout_seconds, "attempt": attempt + 1},
                         )
                     ),
+                    execution_fence={
+                        "idempotencyKey": idempotency_key,
+                        "leaseOwner": execution_claim.entry.lease_owner,
+                        "fencingGeneration": execution_claim.entry.lease_generation,
+                    },
                 )
                 duration_ms = int((time.monotonic() - started) * 1000)
-                closed_circuit = self.failure_registry.record_success(tool_name, call.args, service_name=service_name, target=selected_target.name)
+                closed_circuit = self.failure_registry.record_success(
+                    tool_name,
+                    call.args,
+                    service_name=service_name,
+                    target=selected_target.name,
+                    execution_identity=execution_identity,
+                )
                 contract = validate_tool_result_contract(tool_name, value or {}, self.tool_registry)
                 if not contract.get("valid", True) and tool_contract_enforced(contract):
                     raise RuntimeError("TOOL_CONTRACT_VIOLATION missing=%s" % ",".join(contract.get("missingKeys") or []))
-                if cache_key and cache_policy:
-                    self.cache_store.set(cache_key, value or {}, cache_policy.ttl_seconds or self.settings.semantic_cache_ttl_seconds)
                 result = ToolCallExecutionResult(
                     id=call.id,
                     name=tool_name,
@@ -1412,6 +1739,10 @@ class ToolRuntimeService:
                 if closed_circuit and closed_circuit.state == "closed":
                     event = self._record_event("tool.circuit.closed", result, {"circuit": closed_circuit.model_dump(by_alias=True)})
                     result.runtime_events.append(event)
+                if not self._commit_execution_result(execution_claim, result, "succeeded"):
+                    return self._stale_execution_result(result)
+                if cache_key and cache_policy:
+                    self.cache_store.set(cache_key, value or {}, cache_policy.ttl_seconds or self.settings.semantic_cache_ttl_seconds)
                 self.metrics.record(tool_name, result.status, duration_ms, attempts=result.attempts, target=selected_target.name)
                 self.alert_manager.evaluate()
                 return result
@@ -1420,6 +1751,8 @@ class ToolRuntimeService:
                 last_error = str(exc)
                 last_error_type = classify_tool_error(exc)
                 last_timeout_type = classify_timeout_type(exc, service_name) if last_error_type == "TIMEOUT" else ""
+                if last_error_type == "TIMEOUT":
+                    break
                 if last_error_type in policy.non_retryable_errors or attempt >= attempts - 1:
                     break
                 if policy.retryable_errors and last_error_type not in policy.retryable_errors:
@@ -1445,7 +1778,15 @@ class ToolRuntimeService:
                     {"nextAttempt": attempt + 2},
                 )
         duration_ms = int((time.monotonic() - started) * 1000)
-        record = self.failure_registry.record_failure(tool_name, call.args, last_error_type, last_error, service_name=service_name, target=selected_target.name)
+        record = self.failure_registry.record_failure(
+            tool_name,
+            call.args,
+            last_error_type,
+            last_error,
+            service_name=service_name,
+            target=selected_target.name,
+            execution_identity=execution_identity,
+        )
         recovery = recovery_action_for(tool_name, last_error_type, service_name)
         details = tool_error_details(tool_name, call.args, last_error_type, last_error[:500], timeout_type=last_timeout_type, context=context, call_id=call.id)
         tool_message = structured_tool_message(tool_name, "failed", last_error_type, last_error[:500], recovery, record.circuit_key, tool_call_id=call.id, details=details)
@@ -1459,7 +1800,7 @@ class ToolRuntimeService:
             error_message=last_error[:500],
             timeout_type=last_timeout_type,
             duration_ms=duration_ms,
-            attempts=attempts,
+            attempts=attempts_used,
             cache_key=cache_key,
             target=selected_target.name,
             service_name=service_name,
@@ -1478,8 +1819,191 @@ class ToolRuntimeService:
         circuit = self.failure_registry.circuits.get(record.circuit_key)
         if circuit and circuit.open:
             result.runtime_events.append(self._record_event("tool.circuit.open", result, {"circuit": circuit.model_dump(by_alias=True)}))
+        terminal_status = "timed_out" if result.error_type == "TIMEOUT" else "canceled" if result.error_type == "CANCELED" else "failed"
+        if not self._commit_execution_result(execution_claim, result, terminal_status):
+            return self._stale_execution_result(result)
         self.metrics.record(tool_name, result.status, duration_ms, result.error_type, attempts=result.attempts, target=selected_target.name)
         self.alert_manager.evaluate()
+        return result
+
+    def _commit_execution_result(
+        self,
+        claim: ExecutionJournalClaim,
+        result: ToolCallExecutionResult,
+        status: str,
+    ) -> bool:
+        serialized = result.model_dump(by_alias=True, mode="json")
+        serialized["runtimeEvents"] = []
+        try:
+            self.execution_journal.complete_execution(
+                claim.entry.idempotency_key,
+                claim.entry.lease_owner,
+                claim.entry.lease_generation,
+                status,
+                {"toolCallResult": serialized},
+                result_hash=result.result_hash,
+            )
+            result.runtime_events.append(
+                self._record_event(
+                    "tool.idempotency.committed",
+                    result,
+                    {
+                        "idempotencyKey": claim.entry.idempotency_key,
+                        "fencingGeneration": claim.entry.lease_generation,
+                        "journalStatus": status,
+                    },
+                )
+            )
+            return True
+        except StaleExecutionFence:
+            return False
+
+    def _capability_blocked_result(
+        self,
+        call: ToolCallRequest,
+        context: Dict[str, str],
+        selected_target: LoadBalancerTarget,
+        service_name: str,
+        idempotency_key: str,
+        error_type: str,
+        message: str,
+        pre_runtime_events: List[Dict[str, Any]],
+    ) -> ToolCallExecutionResult:
+        result = ToolCallExecutionResult(
+            id=call.id,
+            name=call.name,
+            status="blocked",
+            idempotency_key=idempotency_key,
+            params_hash=context["paramsHash"],
+            error_type=error_type,
+            error_message=message,
+            target=selected_target.name,
+            service_name=service_name,
+            circuit_key=context["circuitKey"],
+            retryable=False,
+            recommended_action="register_and_review_the_tool_capability",
+            runtime_events=list(pre_runtime_events),
+        )
+        result.runtime_events.append(
+            self._record_event(
+                "tool.capability.blocked",
+                result,
+                {
+                    "idempotencyKey": idempotency_key,
+                    "errorType": error_type,
+                },
+            )
+        )
+        self.metrics.record(call.name, result.status, 0, error_type)
+        return result
+
+    def _replay_execution_result(
+        self,
+        call: ToolCallRequest,
+        claim: ExecutionJournalClaim,
+        pre_runtime_events: List[Dict[str, Any]],
+    ) -> ToolCallExecutionResult:
+        stored = claim.entry.payload.get("toolCallResult") if isinstance(claim.entry.payload, dict) else None
+        if not isinstance(stored, dict):
+            result = ToolCallExecutionResult(
+                id=call.id,
+                name=call.name,
+                status="failed",
+                idempotency_key=claim.entry.idempotency_key,
+                error_type="IDEMPOTENCY_JOURNAL_INVALID",
+                error_message="committed execution journal result is unavailable",
+                retryable=False,
+                recommended_action="use_a_new_tool_call_id_after_operator_review",
+                runtime_events=list(pre_runtime_events),
+            )
+        else:
+            result = ToolCallExecutionResult.model_validate(stored)
+            result.id = call.id
+            result.name = call.name
+            result.idempotency_key = claim.entry.idempotency_key
+            result.attempts = 0
+            result.runtime_events = list(pre_runtime_events)
+        result.runtime_events.append(
+            self._record_event(
+                "tool.idempotency.replayed",
+                result,
+                {
+                    "idempotencyKey": claim.entry.idempotency_key,
+                    "fencingGeneration": claim.entry.lease_generation,
+                    "journalStatus": claim.entry.status,
+                },
+            )
+        )
+        self.metrics.record(call.name, result.status, 0, result.error_type, attempts=0, target=result.target)
+        return result
+
+    def _blocked_execution_result(
+        self,
+        call: ToolCallRequest,
+        context: Dict[str, str],
+        selected_target: LoadBalancerTarget,
+        service_name: str,
+        idempotency_key: str,
+        claim: ExecutionJournalClaim,
+        pre_runtime_events: List[Dict[str, Any]],
+    ) -> ToolCallExecutionResult:
+        unsafe_expiry = claim.outcome == "expired_unsafe"
+        error_type = "IDEMPOTENCY_OUTCOME_UNKNOWN" if unsafe_expiry else "IDEMPOTENCY_IN_PROGRESS"
+        result = ToolCallExecutionResult(
+            id=call.id,
+            name=call.name,
+            status="blocked",
+            idempotency_key=idempotency_key,
+            params_hash=context["paramsHash"],
+            error_type=error_type,
+            error_message=(
+                "prior side-effecting execution expired without a terminal outcome"
+                if unsafe_expiry
+                else "an execution with the same idempotency key is still in progress"
+            ),
+            target=selected_target.name,
+            service_name=service_name,
+            circuit_key=context["circuitKey"],
+            retryable=not unsafe_expiry,
+            recommended_action=(
+                "use_a_new_tool_call_id_after_operator_review"
+                if unsafe_expiry
+                else "wait_for_the_in_flight_execution"
+            ),
+            details={
+                "idempotencyKey": idempotency_key,
+                "fencingGeneration": claim.entry.lease_generation,
+                "journalStatus": claim.entry.status,
+            },
+            runtime_events=list(pre_runtime_events),
+        )
+        result.runtime_events.append(
+            self._record_event(
+                "tool.idempotency.blocked",
+                result,
+                dict(result.details),
+            )
+        )
+        self.metrics.record(call.name, result.status, 0, result.error_type, target=selected_target.name)
+        return result
+
+    def _stale_execution_result(self, original: ToolCallExecutionResult) -> ToolCallExecutionResult:
+        result = ToolCallExecutionResult(
+            id=original.id,
+            name=original.name,
+            status="failed",
+            idempotency_key=original.idempotency_key,
+            params_hash=original.params_hash,
+            error_type="STALE_EXECUTION_FENCE",
+            error_message="execution result was rejected because its fencing generation is stale",
+            target=original.target,
+            service_name=original.service_name,
+            circuit_key=original.circuit_key,
+            retryable=False,
+            recommended_action="read_the_committed_execution_journal",
+            runtime_events=list(original.runtime_events),
+        )
+        result.runtime_events.append(self._record_event("tool.idempotency.stale_result_rejected", result))
         return result
 
     def execute_many(
@@ -1487,6 +2011,7 @@ class ToolRuntimeService:
         tool_calls: Iterable[ToolCallRequest],
         handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
         cache_policies: Dict[str, ToolCachePolicy] | None = None,
+        execution_identity: ExecutionIdentity | None = None,
     ) -> List[ToolCallExecutionResult]:
         calls = list(tool_calls)
         if not calls:
@@ -1517,6 +2042,9 @@ class ToolRuntimeService:
                     handler,
                     call.id,
                     (cache_policies or {}).get(call.name),
+                    "",
+                    None,
+                    execution_identity,
                 )] = call
             for future in as_completed(futures):
                 try:
@@ -1585,6 +2113,7 @@ class ToolRuntimeService:
         timeout_seconds: int,
         cancel_event: Any = None,
         heartbeat: Optional[Callable[[int, int], None]] = None,
+        execution_fence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
         execution_cancel_event = cancel_event or threading.Event()
@@ -1592,8 +2121,9 @@ class ToolRuntimeService:
 
         def invoke_handler() -> None:
             try:
-                with tool_cancel_scope(execution_cancel_event):
-                    result_queue.put(("ok", handler(args)))
+                with tool_execution_fence_scope(execution_fence or {}):
+                    with tool_cancel_scope(execution_cancel_event):
+                        result_queue.put(("ok", handler(args)))
             except Exception as exc:
                 result_queue.put(("error", exc))
 
@@ -1648,15 +2178,25 @@ class ToolRuntimeService:
 class ToolCallExecutor:
     """Execute multiple native tool_calls with result pairing and failure isolation."""
 
-    def __init__(self, policy_registry: ToolRuntimePolicyRegistry, failure_registry: ToolFailureRegistry, max_concurrency: int = 3):
+    def __init__(
+        self,
+        policy_registry: ToolRuntimePolicyRegistry,
+        failure_registry: ToolFailureRegistry,
+        max_concurrency: int = 3,
+        execution_journal: RuntimeStateStore | None = None,
+        tool_registry: ToolRegistry | None = None,
+    ):
         self.policy_registry = policy_registry
         self.failure_registry = failure_registry
         self.max_concurrency = max(1, max_concurrency)
+        self.execution_journal = execution_journal or MemoryRuntimeStateStore()
+        self.tool_registry = tool_registry or canonical_tool_registry()
 
     def execute(
         self,
         tool_calls: Iterable[ToolCallRequest],
         handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
+        execution_identity: ExecutionIdentity | None = None,
     ) -> List[ToolCallExecutionResult]:
         calls = list(tool_calls)
         if not calls:
@@ -1668,9 +2208,18 @@ class ToolCallExecutor:
         cancel_events: Dict[Any, threading.Event] = {}
         try:
             for call in calls:
-                context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+                context = normalize_tool_context(
+                    call.name,
+                    call.args,
+                    service_name=infer_tool_kind(call.name),
+                    execution_identity=execution_identity,
+                )
                 idempotency_key = tool_idempotency_key(call.name, call.id, context)
-                blocked = self.failure_registry.should_block(call.name, call.args)
+                blocked = self.failure_registry.should_block(
+                    call.name,
+                    call.args,
+                    execution_identity=execution_identity,
+                )
                 if blocked:
                     recovery = recovery_action_for(call.name, "CIRCUIT_OPEN", infer_tool_kind(call.name))
                     details = tool_error_details(call.name, call.args, "CIRCUIT_OPEN", blocked.reason, context=context, call_id=call.id)
@@ -1716,7 +2265,14 @@ class ToolCallExecutor:
                     )
                     continue
                 cancel_event = threading.Event()
-                future = submit_with_current_context(executor, self._run_one, call, handler, cancel_event)
+                future = submit_with_current_context(
+                    executor,
+                    self._run_one,
+                    call,
+                    handler,
+                    cancel_event,
+                    execution_identity,
+                )
                 futures[future] = call
                 cancel_events[future] = cancel_event
             if futures:
@@ -1731,9 +2287,20 @@ class ToolCallExecutor:
                         try:
                             results.append(future.result(timeout=0))
                         except Exception as exc:
-                            self.failure_registry.record_failure(call.name, call.args, "ERROR", str(exc))
+                            self.failure_registry.record_failure(
+                                call.name,
+                                call.args,
+                                "ERROR",
+                                str(exc),
+                                execution_identity=execution_identity,
+                            )
                             recovery = recovery_action_for(call.name, "ERROR", infer_tool_kind(call.name))
-                            error_context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+                            error_context = normalize_tool_context(
+                                call.name,
+                                call.args,
+                                service_name=infer_tool_kind(call.name),
+                                execution_identity=execution_identity,
+                            )
                             details = tool_error_details(call.name, call.args, "ERROR", str(exc)[:500], context=error_context, call_id=call.id)
                             results.append(
                                 ToolCallExecutionResult(
@@ -1759,9 +2326,20 @@ class ToolCallExecutor:
                         continue
                     cancel_events[future].set()
                     future.cancel()
-                    self.failure_registry.record_failure(call.name, call.args, "TIMEOUT", "tool execution timed out")
+                    self.failure_registry.record_failure(
+                        call.name,
+                        call.args,
+                        "TIMEOUT",
+                        "tool execution timed out",
+                        execution_identity=execution_identity,
+                    )
                     recovery = recovery_action_for(call.name, "TIMEOUT", infer_tool_kind(call.name))
-                    timeout_context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+                    timeout_context = normalize_tool_context(
+                        call.name,
+                        call.args,
+                        service_name=infer_tool_kind(call.name),
+                        execution_identity=execution_identity,
+                    )
                     timeout_type = classify_timeout_type("tool execution timed out", infer_tool_kind(call.name))
                     details = tool_error_details(call.name, call.args, "TIMEOUT", "tool execution timed out", timeout_type=timeout_type, context=timeout_context, call_id=call.id)
                     results.append(
@@ -1795,16 +2373,85 @@ class ToolCallExecutor:
         call: ToolCallRequest,
         handler: Callable[[Dict[str, Any]], Dict[str, Any]],
         batch_cancel_event: threading.Event,
+        execution_identity: ExecutionIdentity | None = None,
     ) -> ToolCallExecutionResult:
         started = time.monotonic()
         policy = self.policy_registry.policy_for(call.name)
-        context = normalize_tool_context(call.name, call.args, service_name=infer_tool_kind(call.name))
+        context = normalize_tool_context(
+            call.name,
+            call.args,
+            service_name=infer_tool_kind(call.name),
+            execution_identity=execution_identity,
+        )
         idempotency_key = tool_idempotency_key(call.name, call.id, context)
+        capability = self.tool_registry.capability(call.name)
+        if capability.side_effect_level == "unknown":
+            return ToolCallExecutionResult(
+                id=call.id,
+                name=call.name,
+                status="blocked",
+                idempotency_key=idempotency_key,
+                params_hash=context["paramsHash"],
+                error_type="UNCLASSIFIED_TOOL_CAPABILITY",
+                error_message=(
+                    "tool execution requires an explicitly classified capability card"
+                ),
+                service_name=infer_tool_kind(call.name),
+                retryable=False,
+                recommended_action="register_and_review_the_tool_capability",
+            )
+        execution_owner = hashlib.sha256(
+            ("%s:%s:%s" % (id(self), threading.get_ident(), time.time_ns())).encode("utf-8")
+        ).hexdigest()[:24]
+        claim = self.execution_journal.claim_execution(
+            idempotency_key,
+            execution_owner,
+            lease_seconds=tool_policy_budget_seconds(policy),
+            allow_expired_takeover=capability.side_effect_level in {"none", "read", "external_read"},
+        )
+        if claim.outcome == "replay":
+            stored = claim.entry.payload.get("toolCallResult") if isinstance(claim.entry.payload, dict) else None
+            if isinstance(stored, dict):
+                replayed = ToolCallExecutionResult.model_validate(stored)
+                replayed.id = call.id
+                replayed.name = call.name
+                replayed.idempotency_key = idempotency_key
+                replayed.attempts = 0
+                return replayed
+            return ToolCallExecutionResult(
+                id=call.id,
+                name=call.name,
+                status="failed",
+                idempotency_key=idempotency_key,
+                params_hash=context["paramsHash"],
+                error_type="IDEMPOTENCY_JOURNAL_INVALID",
+                error_message="committed execution journal result is unavailable",
+                retryable=False,
+            )
+        if not claim.acquired:
+            unsafe_expiry = claim.outcome == "expired_unsafe"
+            return ToolCallExecutionResult(
+                id=call.id,
+                name=call.name,
+                status="blocked",
+                idempotency_key=idempotency_key,
+                params_hash=context["paramsHash"],
+                error_type="IDEMPOTENCY_OUTCOME_UNKNOWN" if unsafe_expiry else "IDEMPOTENCY_IN_PROGRESS",
+                error_message=(
+                    "prior side-effecting execution expired without a terminal outcome"
+                    if unsafe_expiry
+                    else "an execution with the same idempotency key is still in progress"
+                ),
+                service_name=infer_tool_kind(call.name),
+                retryable=not unsafe_expiry,
+            )
         attempts = max(1, policy.max_retries + 1)
+        attempts_used = 0
         last_error = ""
         last_error_type = "ERROR"
         last_timeout_type = ""
         for attempt in range(attempts):
+            attempts_used = attempt + 1
             if batch_cancel_event.is_set():
                 last_error = "tool execution canceled after batch timeout"
                 last_error_type = "TIMEOUT"
@@ -1816,12 +2463,21 @@ class ToolCallExecutor:
                     call.args,
                     policy.timeout_seconds,
                     batch_cancel_event=batch_cancel_event,
+                    execution_fence={
+                        "idempotencyKey": idempotency_key,
+                        "leaseOwner": claim.entry.lease_owner,
+                        "fencingGeneration": claim.entry.lease_generation,
+                    },
                 )
-                self.failure_registry.record_success(call.name, call.args)
+                self.failure_registry.record_success(
+                    call.name,
+                    call.args,
+                    execution_identity=execution_identity,
+                )
                 contract = validate_tool_result_contract(call.name, result or {}, canonical_tool_registry())
                 if not contract.get("valid", True) and tool_contract_enforced(contract):
                     raise RuntimeError("TOOL_CONTRACT_VIOLATION missing=%s" % ",".join(contract.get("missingKeys") or []))
-                return ToolCallExecutionResult(
+                completed = ToolCallExecutionResult(
                     id=call.id,
                     name=call.name,
                     status="success",
@@ -1829,15 +2485,21 @@ class ToolCallExecutor:
                     idempotency_key=idempotency_key,
                     params_hash=context["paramsHash"],
                     duration_ms=int((time.monotonic() - started) * 1000),
+                    attempts=attempts_used,
                     service_name=infer_tool_kind(call.name),
                     contract=contract,
                     result_hash=str(contract.get("resultHash") or ""),
                     tool_message={"toolName": call.name, "status": "success"},
                 )
+                if not self._commit_executor_result(claim, completed, "succeeded"):
+                    return self._executor_stale_result(completed)
+                return completed
             except Exception as exc:
                 last_error = str(exc)
                 last_error_type = classify_tool_error(exc)
                 last_timeout_type = classify_timeout_type(exc, infer_tool_kind(call.name)) if last_error_type == "TIMEOUT" else ""
+                if last_error_type == "TIMEOUT":
+                    break
                 if last_error_type in policy.non_retryable_errors or attempt >= attempts - 1:
                     break
                 if policy.retryable_errors and last_error_type not in policy.retryable_errors:
@@ -1849,10 +2511,16 @@ class ToolCallExecutor:
                         last_timeout_type = "tool_timeout"
                         break
         if not batch_cancel_event.is_set():
-            self.failure_registry.record_failure(call.name, call.args, last_error_type, last_error)
+            self.failure_registry.record_failure(
+                call.name,
+                call.args,
+                last_error_type,
+                last_error,
+                execution_identity=execution_identity,
+            )
         recovery = recovery_action_for(call.name, last_error_type, infer_tool_kind(call.name))
         details = tool_error_details(call.name, call.args, last_error_type, last_error[:500], timeout_type=last_timeout_type, context=context, call_id=call.id)
-        return ToolCallExecutionResult(
+        failed = ToolCallExecutionResult(
             id=call.id,
             name=call.name,
             status="failed",
@@ -1862,6 +2530,7 @@ class ToolCallExecutor:
             error_message=last_error[:500],
             timeout_type=last_timeout_type,
             duration_ms=int((time.monotonic() - started) * 1000),
+            attempts=attempts_used,
             service_name=infer_tool_kind(call.name),
             retryable=recovery.retryable,
             recommended_action=recovery.action,
@@ -1869,6 +2538,10 @@ class ToolCallExecutor:
             details=details,
             tool_message=structured_tool_message(call.name, "failed", last_error_type, last_error[:500], recovery, tool_call_id=call.id, details=details),
         )
+        terminal_status = "timed_out" if last_error_type == "TIMEOUT" else "canceled" if last_error_type == "CANCELED" else "failed"
+        if not self._commit_executor_result(claim, failed, terminal_status):
+            return self._executor_stale_result(failed)
+        return failed
 
     def _call_with_timeout(
         self,
@@ -1876,6 +2549,7 @@ class ToolCallExecutor:
         args: Dict[str, Any],
         timeout_seconds: int,
         batch_cancel_event: Optional[threading.Event] = None,
+        execution_fence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
         execution_cancel_event = threading.Event()
@@ -1883,8 +2557,9 @@ class ToolCallExecutor:
 
         def invoke_handler() -> None:
             try:
-                with tool_cancel_scope(execution_cancel_event):
-                    result_queue.put(("ok", handler(args)))
+                with tool_execution_fence_scope(execution_fence or {}):
+                    with tool_cancel_scope(execution_cancel_event):
+                        result_queue.put(("ok", handler(args)))
             except Exception as exc:
                 result_queue.put(("error", exc))
 
@@ -1907,6 +2582,41 @@ class ToolCallExecutor:
             if status == "error":
                 raise value
             return value
+
+    def _commit_executor_result(
+        self,
+        claim: ExecutionJournalClaim,
+        result: ToolCallExecutionResult,
+        status: str,
+    ) -> bool:
+        serialized = result.model_dump(by_alias=True, mode="json")
+        serialized["runtimeEvents"] = []
+        try:
+            self.execution_journal.complete_execution(
+                claim.entry.idempotency_key,
+                claim.entry.lease_owner,
+                claim.entry.lease_generation,
+                status,
+                {"toolCallResult": serialized},
+                result.result_hash,
+            )
+            return True
+        except StaleExecutionFence:
+            return False
+
+    @staticmethod
+    def _executor_stale_result(original: ToolCallExecutionResult) -> ToolCallExecutionResult:
+        return ToolCallExecutionResult(
+            id=original.id,
+            name=original.name,
+            status="failed",
+            idempotency_key=original.idempotency_key,
+            params_hash=original.params_hash,
+            error_type="STALE_EXECUTION_FENCE",
+            error_message="execution result was rejected because its fencing generation is stale",
+            service_name=original.service_name,
+            retryable=False,
+        )
 
 
 def tool_policy_budget_seconds(policy: ToolRuntimePolicy) -> int:

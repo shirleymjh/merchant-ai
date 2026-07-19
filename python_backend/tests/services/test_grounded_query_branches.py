@@ -18,6 +18,17 @@ from merchant_ai.services.grounded_runtime_budget import (
 )
 
 
+class _ManualClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 def test_branch_budget_charges_each_internal_read_to_parent_budget() -> None:
     parent = GroundedRuntimeBudget(
         GroundedRuntimeBudgetLimits(
@@ -156,3 +167,29 @@ def test_branch_context_report_exposes_local_scope_and_budget_only() -> None:
     assert report["topicScope"] == ["电商交易"]
     assert report["dependencyQueryIds"] == ["top-products"]
     assert report["status"] == "WAITING_VERIFIED_ENTITY_SET"
+
+
+def test_branch_budget_clock_starts_at_first_active_operation() -> None:
+    clock = _ManualClock()
+    branch = GroundedBranchBudget(
+        "orders",
+        GroundedBranchBudgetLimits(
+            max_duration_seconds=1,
+            finalization_reserve_seconds=0,
+        ),
+        monotonic_clock=clock,
+    )
+
+    clock.advance(65)
+
+    assert branch.report()["elapsedMs"] == 0
+    assert branch.report()["wallElapsedMs"] == 0
+
+    with branch.stage("semantic_retrieval"):
+        clock.advance(0.04)
+    branch.consume_doris_query()
+
+    report = branch.report()
+    assert report["elapsedMs"] == 40
+    assert report["wallElapsedMs"] == 40
+    assert report["usage"]["dorisQueries"] == 1
