@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 
 MERCHANT_URI_SCHEME = "merchant://"
@@ -164,8 +163,46 @@ def context_lineage_record(stage: str, source: Dict[str, Any], action: str = "")
 
 def _slug(value: str) -> str:
     text = str(value or "").strip().replace("\\", "/")
-    text = re.sub(r"/+", "/", text)
+    text = _collapse_character_runs(text, "/")
     text = text.strip("/")
-    text = re.sub(r"\s+", "_", text)
-    text = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff/]+", "_", text)
+    text = _replace_runs(text, str.isspace, "_")
+    text = _replace_runs(text, lambda character: not _is_context_slug_character(character), "_")
     return text or "unknown"
+
+
+def _collapse_character_runs(value: str, character: str) -> str:
+    output: list[str] = []
+    previous_was_target = False
+    for current in value:
+        if current == character:
+            if not previous_was_target:
+                output.append(current)
+            previous_was_target = True
+            continue
+        output.append(current)
+        previous_was_target = False
+    return "".join(output)
+
+
+def _replace_runs(value: str, should_replace: Callable[[str], bool], replacement: str) -> str:
+    output: list[str] = []
+    replacing = False
+    for character in value:
+        if should_replace(character):
+            if not replacing:
+                output.append(replacement)
+            replacing = True
+            continue
+        output.append(character)
+        replacing = False
+    return "".join(output)
+
+
+def _is_context_slug_character(character: str) -> bool:
+    return (
+        "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or "0" <= character <= "9"
+        or character in "_.-/"
+        or "\u4e00" <= character <= "\u9fff"
+    )

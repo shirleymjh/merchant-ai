@@ -262,6 +262,7 @@ from merchant_ai.services.skill_evaluation import SkillEvaluationService
 from merchant_ai.services.repositories import DorisRepository
 from merchant_ai.services.routing import KeywordExtractService, PreflightUnderstandingService, QuestionRoutingService, RouteSlotExtractor, SemanticPreflightRouteClassifier, TopicRouterService
 from merchant_ai.services.tool_runtime import (
+    ExecutionIdentity,
     RoundRobinLoadBalancer,
     ToolCallExecutor,
     ToolFailureRegistry,
@@ -14329,13 +14330,46 @@ def test_tool_failure_registry_blocks_repeated_identical_failures():
 
 def test_tool_failure_registry_separates_merchant_thread_and_target():
     registry = ToolFailureRegistry(repeat_threshold=2, circuit_threshold=5)
-    args_a = {"taskId": "anchor", "sql": "SELECT * FROM x", "merchantId": "seller_a", "threadId": "thread_a"}
-    args_b = {"taskId": "anchor", "sql": "SELECT * FROM x", "merchantId": "seller_b", "threadId": "thread_a"}
-    registry.record_failure("execute_sql", args_a, "TIMEOUT", "slow", service_name="doris", target="primary")
-    registry.record_failure("execute_sql", args_a, "TIMEOUT", "slow", service_name="doris", target="primary")
+    args = {"taskId": "anchor", "sql": "SELECT * FROM x"}
+    identity_a = ExecutionIdentity.from_server_context(merchant_id="seller_a")
+    identity_b = ExecutionIdentity.from_server_context(merchant_id="seller_b")
+    registry.record_failure(
+        "execute_sql",
+        args,
+        "TIMEOUT",
+        "slow",
+        service_name="doris",
+        target="primary",
+        thread_id="thread_a",
+        execution_identity=identity_a,
+    )
+    registry.record_failure(
+        "execute_sql",
+        args,
+        "TIMEOUT",
+        "slow",
+        service_name="doris",
+        target="primary",
+        thread_id="thread_a",
+        execution_identity=identity_a,
+    )
 
-    blocked_a = registry.should_block("execute_sql", args_a, service_name="doris", target="primary")
-    blocked_b = registry.should_block("execute_sql", args_b, service_name="doris", target="primary")
+    blocked_a = registry.should_block(
+        "execute_sql",
+        args,
+        service_name="doris",
+        target="primary",
+        thread_id="thread_a",
+        execution_identity=identity_a,
+    )
+    blocked_b = registry.should_block(
+        "execute_sql",
+        args,
+        service_name="doris",
+        target="primary",
+        thread_id="thread_a",
+        execution_identity=identity_b,
+    )
 
     assert blocked_a is not None
     assert blocked_a.merchant_id == "seller_a"

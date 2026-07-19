@@ -111,6 +111,7 @@ except ImportError:  # pragma: no cover - compatibility for minimal test runtime
 
 
 from merchant_ai.models import (
+    AgentRunResult,
     APIModel,
     ChatContext,
     ChatResponse,
@@ -119,19 +120,16 @@ from merchant_ai.models import (
     DataSnapshotContract,
     MerchantInfo,
     QueryBundle,
-    QueryPlan,
     RecallBundle,
     SkillLifecycleRecord,
 )
 from merchant_ai.services.answer_claims import AnswerClaimVerifier
 from merchant_ai.services.assets import normalize_semantic_path
+from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.grounded_runtime_kernel import (
-    GroundedCoreSqlPreparation,
     GroundedRuntimeKernel,
     GroundedRuntimeEvent,
     GroundedRuntimeSession,
-    GroundedVerifiedEntitySet,
-    GroundedVerifiedQueryArtifact,
 )
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
@@ -213,8 +211,6 @@ from merchant_ai.services.grounded_exploration_coordinator import (
     VerifiedExplorationSourceView,
 )
 from merchant_ai.services.grounded_sql_candidate import (
-    GroundedSqlCandidate,
-    GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import (
@@ -227,6 +223,21 @@ from merchant_ai.services.grounded_conversation_state import (
     GroundedConversationStateCorruptError,
     grounded_conversation_principal_fingerprint,
     resolve_grounded_conversation_turn,
+)
+from merchant_ai.services.grounded_context_workspace import (
+    GroundedContextWorkspace,
+    GroundedContextWorkspaceError,
+)
+from merchant_ai.services.grounded_context_compaction import (
+    ProviderAwareContextTokenCounter,
+    build_grounded_model_recovery_message,
+    build_grounded_recovery_payload,
+    compact_summary_to_reference_only,
+    persist_grounded_recovery_payload,
+)
+from merchant_ai.services.context_filesystem import (
+    ContextPathOutsideRootError,
+    resolve_context_path,
 )
 
 
@@ -694,6 +705,8 @@ def _goal_assignment_contract_issues(
 @dataclass
 class GroundedDeepAgentSession:
     runtime: GroundedRuntimeSession
+    context_workspace: Optional[GroundedContextWorkspace] = None
+    context_artifact_inline_max_rows: int = 1
     core_semantic_evidence: list[dict[str, Any]] = field(default_factory=list)
     opened_topics: list[str] = field(default_factory=list)
     topic_index_read: bool = False
@@ -1233,6 +1246,535 @@ class GroundedSemanticBackend:
         return self.grep_raw(pattern, path, glob)
 
 
+class GroundedRunFilesystemBackend:
+    """Context-aware run filesystem used for artifacts and Core scratch.
+
+    The backend never chooses semantic bindings or query topology. It only
+    exposes the identity-bound workspace already created by the server for the
+    active run. Query artifacts are read-only; `/workspace` is the durable
+    scratch/offload surface owned by Deep Agents middleware.
+    """
+
+    MAX_GREP_FILES = 200
+    MAX_GREP_MATCHES = 100
+    MAX_PAGE_CHARS_CEILING = 64_000
+
+    def __init__(
+        self,
+        *,
+        root_kind: str,
+        read_only: bool,
+        settings: Any = None,
+    ) -> None:
+        if root_kind not in {"artifacts", "scratch"}:
+            raise ValueError("unsupported grounded filesystem root kind")
+        self.root_kind = root_kind
+        self.read_only = bool(read_only)
+        self.settings = settings
+
+    @staticmethod
+    def _session() -> Optional[GroundedDeepAgentSession]:
+        return _SEMANTIC_SCOPE.get()
+
+    def _root(self) -> tuple[Optional[Path], str]:
+        session = self._session()
+        if session is None or session.context_workspace is None:
+            return None, "GROUNDED_CONTEXT_WORKSPACE_REQUIRED"
+        workspace = session.context_workspace
+        root = (
+            workspace.artifacts_root
+            if self.root_kind == "artifacts"
+            else workspace.core_scratch_root
+        )
+        return root, ""
+
+    def _relative_path(self, value: str) -> str:
+        normalized = str(value or "").strip().replace("\\", "/").strip("/")
+        prefix = "artifacts" if self.root_kind == "artifacts" else "workspace"
+        if normalized == prefix:
+            return ""
+        if normalized.startswith(prefix + "/"):
+            return normalized[len(prefix) + 1 :]
+        return normalized
+
+    def _resolve(self, value: str) -> tuple[Optional[Path], Optional[Path], str]:
+        root, error = self._root()
+        if root is None:
+            return None, None, error
+        try:
+            target = resolve_context_path(root, self._relative_path(value))
+        except ContextPathOutsideRootError:
+            return root, None, "GROUNDED_CONTEXT_PATH_OUTSIDE_ROOT"
+        return root, target, ""
+
+    @staticmethod
+    def _internal(path: Path) -> bool:
+        return path.name.startswith(
+            (
+                ".artifact-write-",
+                ".artifact-lock-",
+                ".artifact-immutable-",
+                ".context-",
+            )
+        )
+
+    @staticmethod
+    def _file_info(root: Path, path: Path) -> FileInfo:
+        return FileInfo(
+            path="/" + str(path.relative_to(root)).replace("\\", "/") + (
+                "/" if path.is_dir() else ""
+            ),
+            is_dir=path.is_dir(),
+            size=0 if path.is_dir() else int(path.stat().st_size),
+            modified_at="",
+        )
+
+    def _page_chars(self, requested: int) -> int:
+        configured = int(
+            getattr(
+                self.settings,
+                "context_file_inline_max_chars",
+                12_000,
+            )
+            or 12_000
+        )
+        return max(
+            1,
+            min(
+                max(1, int(requested or configured)),
+                max(1, configured),
+                self.MAX_PAGE_CHARS_CEILING,
+            ),
+        )
+
+    def _artifact_store(
+        self,
+        root: Path,
+    ) -> Optional[WorkspaceArtifactStore]:
+        if self.settings is None:
+            return None
+        return WorkspaceArtifactStore(self.settings, root)
+
+    def _artifact_file_valid(self, root: Path, path: Path) -> bool:
+        if self._internal(path) or not path.is_file():
+            return False
+        store = self._artifact_store(root)
+        if store is None:
+            return False
+        result = store.read(
+            str(path.relative_to(root)),
+            offset=0,
+            max_chars=1,
+            require_immutable=True,
+        )
+        return bool(result.get("success"))
+
+    def _artifact_directory_has_valid_file(
+        self,
+        root: Path,
+        path: Path,
+    ) -> bool:
+        if not path.is_dir():
+            return False
+        for candidate in path.rglob("*"):
+            try:
+                safe_candidate = resolve_context_path(root, candidate)
+            except ContextPathOutsideRootError:
+                continue
+            if self._artifact_file_valid(root, safe_candidate):
+                return True
+        return False
+
+    def ls(self, path: str) -> LsResult:
+        root, target, error = self._resolve(path)
+        if error:
+            return LsResult(error=error)
+        assert root is not None and target is not None
+        if not target.exists():
+            return LsResult(error="GROUNDED_CONTEXT_FILE_NOT_FOUND")
+        if target.is_file():
+            if self._internal(target):
+                return LsResult(error="GROUNDED_CONTEXT_FILE_NOT_FOUND")
+            if (
+                self.root_kind == "artifacts"
+                and not self._artifact_file_valid(root, target)
+            ):
+                return LsResult(error="GROUNDED_CONTEXT_ARTIFACT_INVALID")
+            return LsResult(entries=[self._file_info(root, target)])
+        entries: list[FileInfo] = []
+        try:
+            for child in sorted(target.iterdir(), key=lambda item: item.name):
+                safe_child = resolve_context_path(root, child)
+                if self._internal(safe_child):
+                    continue
+                if self.root_kind == "artifacts":
+                    if safe_child.is_file() and not self._artifact_file_valid(
+                        root,
+                        safe_child,
+                    ):
+                        continue
+                    if (
+                        safe_child.is_dir()
+                        and not self._artifact_directory_has_valid_file(
+                            root,
+                            safe_child,
+                        )
+                    ):
+                        continue
+                entries.append(self._file_info(root, safe_child))
+        except (ContextPathOutsideRootError, OSError) as exc:
+            return LsResult(
+                error="GROUNDED_CONTEXT_LS_FAILED:%s" % str(exc)[:160]
+            )
+        return LsResult(entries=entries)
+
+    def read(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> ReadResult:
+        root, target, error = self._resolve(file_path)
+        if error:
+            return ReadResult(error=error)
+        assert root is not None and target is not None
+        if self._internal(target) or not target.is_file():
+            return ReadResult(error="GROUNDED_CONTEXT_FILE_NOT_FOUND")
+        start = max(0, int(offset or 0))
+        page_chars = self._page_chars(limit)
+        try:
+            if self.settings is not None:
+                store = self._artifact_store(root)
+                if store is None:
+                    return ReadResult(
+                        error="GROUNDED_CONTEXT_ARTIFACT_STORE_REQUIRED"
+                    )
+                read_result = store.read(
+                    str(target.relative_to(root)),
+                    offset=start,
+                    max_chars=page_chars,
+                    require_immutable=self.root_kind == "artifacts",
+                )
+                if not read_result.get("success"):
+                    return ReadResult(
+                        error=str(
+                            read_result.get("error")
+                            or "GROUNDED_CONTEXT_READ_FAILED"
+                        )
+                    )
+                text = str(read_result.get("content") or "")
+                next_offset = read_result.get("nextContentOffsetChars")
+                content_hash = str(read_result.get("sha256") or "")
+                estimated_chars = int(
+                    read_result.get("estimatedChars") or len(text)
+                )
+            else:
+                with target.open("r", encoding="utf-8") as stream:
+                    if start:
+                        stream.read(start)
+                    text = stream.read(page_chars)
+                    has_more = bool(stream.read(1))
+                next_offset = start + len(text) if has_more else None
+                content_hash = ""
+                estimated_chars = (
+                    int(target.stat().st_size) if has_more else start + len(text)
+                )
+        except (OSError, UnicodeError) as exc:
+            return ReadResult(
+                error="GROUNDED_CONTEXT_READ_FAILED:%s" % str(exc)[:160]
+            )
+        file_data: dict[str, Any] = {
+            "content": text,
+            "encoding": "utf-8",
+        }
+        if start or next_offset is not None:
+            file_data.update(
+                {
+                    "cursorSemantics": "CHAR_OFFSET",
+                    "contentOffsetChars": start,
+                    "nextContentOffsetChars": next_offset,
+                    "estimatedChars": estimated_chars,
+                    "contentHash": content_hash,
+                    "resultCoverage": (
+                        "PREVIEW"
+                        if next_offset is not None
+                        else "ALL_CHARS"
+                    ),
+                }
+            )
+        return ReadResult(file_data=file_data)
+
+    def grep(
+        self,
+        pattern: str,
+        path: Optional[str] = None,
+        glob: Optional[str] = None,
+    ) -> GrepResult:
+        root, target, error = self._resolve(path or "")
+        if error:
+            return GrepResult(error=error)
+        assert root is not None and target is not None
+        needle = str(pattern or "")[:500].casefold()
+        if not needle:
+            return GrepResult(matches=[])
+        if self.root_kind == "artifacts":
+            store = self._artifact_store(root)
+            if store is None:
+                return GrepResult(
+                    error="GROUNDED_CONTEXT_ARTIFACT_STORE_REQUIRED"
+                )
+            relative_scope = str(target.relative_to(root)).strip(".")
+            hits = store.grep(
+                needle,
+                limit=self.MAX_GREP_MATCHES,
+                require_immutable=True,
+            )
+            matches: list[GrepMatch] = []
+            for hit in hits:
+                relative = str(hit.get("relativePath") or "").replace(
+                    "\\",
+                    "/",
+                )
+                if relative_scope and not (
+                    relative == relative_scope
+                    or relative.startswith(relative_scope.rstrip("/") + "/")
+                ):
+                    continue
+                routed_path = "/" + relative.lstrip("/")
+                if glob and not fnmatch.fnmatch(routed_path, glob):
+                    continue
+                for snippet in list(hit.get("snippets") or []):
+                    matches.append(
+                        GrepMatch(
+                            path=routed_path,
+                            line=1,
+                            text=str(snippet)[:5_000],
+                        )
+                    )
+                    if len(matches) >= self.MAX_GREP_MATCHES:
+                        return GrepResult(matches=matches)
+            return GrepResult(matches=matches)
+        candidates = [target] if target.is_file() else target.rglob("*")
+        inspected = 0
+        matches: list[GrepMatch] = []
+        for candidate in candidates:
+            if (
+                inspected >= self.MAX_GREP_FILES
+                or len(matches) >= self.MAX_GREP_MATCHES
+            ):
+                break
+            try:
+                safe_candidate = resolve_context_path(root, candidate)
+            except ContextPathOutsideRootError:
+                continue
+            if self._internal(safe_candidate) or not safe_candidate.is_file():
+                continue
+            relative = "/" + str(safe_candidate.relative_to(root)).replace(
+                "\\", "/"
+            )
+            if glob and not fnmatch.fnmatch(relative, glob):
+                continue
+            inspected += 1
+            try:
+                with safe_candidate.open("r", encoding="utf-8") as stream:
+                    lines = stream.read(
+                        self.MAX_PAGE_CHARS_CEILING
+                    ).splitlines()
+            except (OSError, UnicodeError):
+                continue
+            for line_number, line in enumerate(lines, start=1):
+                if needle not in line[:20_000].casefold():
+                    continue
+                matches.append(
+                    GrepMatch(
+                        path=relative,
+                        line=line_number,
+                        text=line[:5_000],
+                    )
+                )
+                if len(matches) >= self.MAX_GREP_MATCHES:
+                    break
+        return GrepResult(matches=matches)
+
+    def glob(
+        self,
+        pattern: str,
+        path: Optional[str] = None,
+    ) -> GlobResult:
+        root, target, error = self._resolve(path or "")
+        if error:
+            return GlobResult(error=error)
+        assert root is not None and target is not None
+        if self.root_kind == "artifacts":
+            candidates = (
+                [target] if target.is_file() else target.rglob("*")
+            )
+            matches: list[FileInfo] = []
+            for candidate in candidates:
+                try:
+                    safe_candidate = resolve_context_path(root, candidate)
+                except ContextPathOutsideRootError:
+                    continue
+                if not self._artifact_file_valid(root, safe_candidate):
+                    continue
+                routed_path = "/" + str(
+                    safe_candidate.relative_to(root)
+                ).replace("\\", "/").lstrip("/")
+                if fnmatch.fnmatch(routed_path, pattern):
+                    matches.append(
+                        FileInfo(
+                            path=routed_path,
+                            is_dir=False,
+                            size=int(safe_candidate.stat().st_size),
+                            modified_at="",
+                        )
+                    )
+                if len(matches) >= 500:
+                    break
+            return GlobResult(matches=matches)
+        candidates = [target] if target.is_file() else target.rglob("*")
+        matches: list[FileInfo] = []
+        for candidate in candidates:
+            try:
+                safe_candidate = resolve_context_path(root, candidate)
+            except ContextPathOutsideRootError:
+                continue
+            if self._internal(safe_candidate):
+                continue
+            info = self._file_info(root, safe_candidate)
+            if fnmatch.fnmatch(info.path, pattern):
+                matches.append(info)
+        return GlobResult(matches=matches[:500])
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        if self.read_only:
+            return WriteResult(
+                error="GROUNDED_CONTEXT_FILESYSTEM_READ_ONLY",
+                path=file_path,
+            )
+        session = self._session()
+        if session is None or session.context_workspace is None:
+            return WriteResult(
+                error="GROUNDED_CONTEXT_WORKSPACE_REQUIRED",
+                path=file_path,
+            )
+        try:
+            target = session.context_workspace.write_core_scratch(
+                self._relative_path(file_path),
+                content,
+            )
+        except GroundedContextWorkspaceError as exc:
+            return WriteResult(error=str(exc), path=file_path)
+        return WriteResult(path="/" + str(target.relative_to(session.context_workspace.core_scratch_root)).replace("\\", "/"))
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if self.read_only:
+            return EditResult(
+                error="GROUNDED_CONTEXT_FILESYSTEM_READ_ONLY",
+                path=file_path,
+            )
+        read_result = self.read(file_path, offset=0, limit=2_000_000)
+        if read_result.error or not read_result.file_data:
+            return EditResult(error=read_result.error, path=file_path)
+        if read_result.file_data.get("nextContentOffsetChars") is not None:
+            return EditResult(
+                error="GROUNDED_CONTEXT_EDIT_REQUIRES_COMPLETE_FILE",
+                path=file_path,
+            )
+        content = str(read_result.file_data.get("content") or "")
+        if not old_string or old_string not in content:
+            return EditResult(
+                error="GROUNDED_CONTEXT_EDIT_TARGET_NOT_FOUND",
+                path=file_path,
+            )
+        replacement = (
+            content.replace(old_string, new_string)
+            if replace_all
+            else content.replace(old_string, new_string, 1)
+        )
+        written = self.write(file_path, replacement)
+        return EditResult(error=written.error, path=written.path)
+
+    def ls_info(self, path: str) -> list[FileInfo]:
+        result = self.ls(path)
+        return [] if result.error else list(result.entries)
+
+    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
+        result = self.glob(pattern, path)
+        return [] if result.error else list(result.matches or [])
+
+    def grep_raw(
+        self,
+        pattern: str,
+        path: Optional[str] = None,
+        glob: Optional[str] = None,
+    ) -> Any:
+        result = self.grep(pattern, path, glob)
+        return result.error or list(result.matches)
+
+    async def als(self, path: str) -> LsResult:
+        return self.ls(path)
+
+    async def aread(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> ReadResult:
+        return self.read(file_path, offset, limit)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: Optional[str] = None,
+        glob: Optional[str] = None,
+    ) -> GrepResult:
+        return self.grep(pattern, path, glob)
+
+    async def aglob(
+        self,
+        pattern: str,
+        path: Optional[str] = None,
+    ) -> GlobResult:
+        return self.glob(pattern, path)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return self.write(file_path, content)
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        return self.edit(file_path, old_string, new_string, replace_all)
+
+    async def als_info(self, path: str) -> list[FileInfo]:
+        return self.ls_info(path)
+
+    async def aglob_info(
+        self,
+        pattern: str,
+        path: str = "/",
+    ) -> list[FileInfo]:
+        return self.glob_info(pattern, path)
+
+    async def agrep_raw(
+        self,
+        pattern: str,
+        path: Optional[str] = None,
+        glob: Optional[str] = None,
+    ) -> Any:
+        return self.grep_raw(pattern, path, glob)
+
+
 def _message_content_text(message: Any) -> str:
     if message is None:
         return ""
@@ -1252,6 +1794,25 @@ def _knowledge_relative_path(value: str) -> str:
     if normalized.startswith("knowledge/"):
         return normalized[len("knowledge/") :]
     return normalized
+
+
+def _filesystem_tool_namespace(
+    tool_name: str,
+    args: dict[str, Any],
+) -> str:
+    if tool_name == "retrieve_knowledge":
+        return "knowledge"
+    raw = str(
+        args.get("file_path")
+        or args.get("path")
+        or ""
+    ).strip().replace("\\", "/").strip("/")
+    if not raw:
+        return "unknown"
+    first = raw.split("/", 1)[0]
+    if first in {"knowledge", "artifacts", "workspace"}:
+        return first
+    return "unknown"
 
 
 def _replace_message_content(message: Any, content: str) -> Any:
@@ -1657,6 +2218,79 @@ def _enum_value(value: Any) -> str:
     return str(getattr(value, "value", value) or "")
 
 
+def _grounded_artifact_execution_kwargs(
+    session: GroundedDeepAgentSession,
+) -> dict[str, str]:
+    workspace = session.context_workspace
+    if workspace is None:
+        return {}
+    return {
+        "artifact_root": str(workspace.artifacts_root),
+        "context_owner_fingerprint": workspace.owner_fingerprint,
+    }
+
+
+def _grounded_result_artifact_receipts(
+    run_result: AgentRunResult,
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    fingerprints: set[str] = set()
+    for bundle in [
+        *list(run_result.query_bundles or []),
+        run_result.merged_query_bundle,
+    ]:
+        for event in bundle.runtime_events or []:
+            raw = event.get("resultArtifact") if isinstance(event, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            fingerprint = str(raw.get("artifactFingerprint") or "").strip()
+            if not fingerprint or fingerprint in fingerprints:
+                continue
+            fingerprints.add(fingerprint)
+            receipts.append(dict(raw))
+    return receipts
+
+
+def _public_grounded_result_artifact_receipts(
+    run_result: AgentRunResult,
+) -> list[dict[str, Any]]:
+    public: list[dict[str, Any]] = []
+    for receipt in _grounded_result_artifact_receipts(run_result):
+        item = {
+            key: receipt.get(key)
+            for key in (
+                "artifactFingerprint",
+                "manifestRef",
+                "rowsRef",
+                "storedRowCount",
+                "resultCoverage",
+                "rowsSha256",
+                "manifestSha256",
+            )
+            if receipt.get(key) not in (None, "", [], {})
+        }
+        for key in ("manifestRef", "rowsRef"):
+            value = str(item.get(key) or "")
+            if value and not value.startswith("merchant://"):
+                item.pop(key, None)
+        if item.get("artifactFingerprint"):
+            public.append(item)
+    return public
+
+
+def _public_grounded_result_refs(
+    receipts: list[dict[str, Any]],
+) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(receipt.get(key) or "")
+            for receipt in receipts
+            for key in ("rowsRef", "manifestRef")
+            if str(receipt.get(key) or "").startswith("merchant://")
+        )
+    )
+
+
 def _stable_json_fingerprint(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -1754,6 +2388,12 @@ def _phase_visible_tools(
                     "finalize_evidence_collection",
                 }
             )
+            if session.query_branch_contexts:
+                # A frozen graph closes governed knowledge discovery, but a
+                # later verified analysis may still need the immutable result
+                # artifacts or the run-scoped recovery summary.  The tool
+                # boundary independently rejects /knowledge in this phase.
+                allowed.update({"ls", "read_file", "grep"})
             if (
                 session.question_goal_contract is not None
                 and any(
@@ -2069,10 +2709,12 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         session = getattr(context, "session", None)
         args = dict(tool_call.get("args") or {})
         file_path = str(args.get("file_path") or "")
+        filesystem_namespace = _filesystem_tool_namespace(tool_name, args)
         if (
             isinstance(session, GroundedDeepAgentSession)
             and bool(session.query_branch_contexts)
             and tool_name in {"ls", "read_file", "grep", "retrieve_knowledge"}
+            and filesystem_namespace not in {"artifacts", "workspace"}
         ):
             return ToolMessage(
                 content=json.dumps(
@@ -2092,7 +2734,11 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                 tool_call_id=tool_call_id,
                 status="error",
             )
-        if tool_name == "read_file" and isinstance(session, GroundedDeepAgentSession):
+        if (
+            tool_name == "read_file"
+            and filesystem_namespace == "knowledge"
+            and isinstance(session, GroundedDeepAgentSession)
+        ):
             normalized = _knowledge_relative_path(file_path)
             read_control = _grounded_semantic_read_control(session)
             if read_control["status"] == "READY_TO_EXECUTE":
@@ -2156,6 +2802,8 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         result = handler(request)
         if tool_name != "read_file" or getattr(result, "status", "success") == "error":
             return result
+        if filesystem_namespace != "knowledge":
+            return result
         if not isinstance(session, GroundedDeepAgentSession):
             return result
         receipt = self.semantic_backend.record_core_read_receipt(
@@ -2210,45 +2858,226 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
 
 
 class GroundedContextManagementMiddleware(AgentMiddleware):
-    """Keep the Core working set bounded while preserving the durable raw log.
+    """Apply token-watermark compaction to the ephemeral model request only.
 
-    Deep Agents intentionally leaves the checkpoint message log intact.  This
-    middleware changes only the request sent to the model: prior-run tool
-    arguments are reduced to receipts, older semantic reads are replaced by
-    Kernel-backed references, and only the newest tool-result batch remains
-    verbatim.  Durable semantic assets stay under /knowledge and the current
-    Kernel evidence ledger remains complete.
+    The durable Deep Agents checkpoint and raw tool log are never rewritten.
+    Once the configured watermark is reached, the middleware first persists a
+    deterministic identity-bound recovery artifact and only then replaces the
+    model working set with its summary and filesystem reference.
     """
 
     name = "GroundedContextManagementMiddleware"
+
+    def __init__(
+        self,
+        settings: Any = None,
+        *,
+        model: Any = None,
+        provider_token_counter: Optional[
+            Callable[[list[Any], Any, list[Any]], int]
+        ] = None,
+    ) -> None:
+        self.settings = settings
+        self.token_counter = ProviderAwareContextTokenCounter(
+            model,
+            provider_counter=provider_token_counter,
+        )
+
+    def bind_model(self, model: Any) -> None:
+        self.token_counter.model = model
+
+    @staticmethod
+    def _record_report(
+        session: Optional[GroundedDeepAgentSession],
+        report: dict[str, Any],
+    ) -> None:
+        if not isinstance(session, GroundedDeepAgentSession):
+            return
+        with session.lock:
+            session.core_context_reports.append(report)
+            session.core_context_reports = session.core_context_reports[-32:]
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         original = list(getattr(request, "messages", None) or [])
         runtime = getattr(request, "runtime", None)
         context = getattr(runtime, "context", None)
-        session = getattr(context, "session", None)
-        compacted, report = _compact_grounded_model_messages(
-            original,
-            session if isinstance(session, GroundedDeepAgentSession) else None,
+        candidate_session = getattr(context, "session", None)
+        session = (
+            candidate_session
+            if isinstance(candidate_session, GroundedDeepAgentSession)
+            else None
         )
         original_tools = list(getattr(request, "tools", None) or [])
         visible_tools, removed_tools = _phase_visible_tools(
-            session if isinstance(session, GroundedDeepAgentSession) else None,
+            session,
             original_tools,
         )
         system_message = getattr(request, "system_message", None)
-        report["systemChars"] = len(_message_content_text(system_message))
-        report["toolCountBefore"] = len(original_tools)
-        report["toolCountAfter"] = len(visible_tools)
-        report["removedTools"] = removed_tools
-        report["toolSchemaChars"] = _tool_schema_chars(visible_tools)
-        report["estimatedRequestChars"] = (
-            report["compactedMessageChars"] + report["systemChars"] + report["toolSchemaChars"]
+        before_count = self.token_counter.count(
+            original,
+            system_message,
+            visible_tools,
         )
-        if isinstance(session, GroundedDeepAgentSession):
-            with session.lock:
-                session.core_context_reports.append(report)
-                session.core_context_reports = session.core_context_reports[-32:]
+        window_tokens = max(
+            1,
+            int(
+                getattr(self.settings, "context_window_tokens", 16_000)
+                or 16_000
+            ),
+        )
+        threshold_ratio = float(
+            getattr(
+                self.settings,
+                "context_compaction_threshold_ratio",
+                0.85,
+            )
+            or 0.85
+        )
+        threshold_ratio = min(1.0, max(0.01, threshold_ratio))
+        target_ratio = float(
+            getattr(
+                self.settings,
+                "context_compaction_target_ratio",
+                0.4,
+            )
+            or 0.4
+        )
+        target_ratio = min(threshold_ratio, max(0.01, target_ratio))
+        before_ratio = before_count.tokens / window_tokens
+        original_message_chars = sum(
+            _message_context_chars(item) for item in original
+        )
+        report: dict[str, Any] = {
+            "messageCount": len(original),
+            "originalMessageChars": original_message_chars,
+            "compactedMessageChars": original_message_chars,
+            "savedChars": 0,
+            "semanticReadMessagesCompacted": 0,
+            "toolCallMessagesCompacted": 0,
+            "priorRunMessagesCompacted": 0,
+            "systemChars": len(_message_content_text(system_message)),
+            "toolCountBefore": len(original_tools),
+            "toolCountAfter": len(visible_tools),
+            "removedTools": removed_tools,
+            "toolSchemaChars": _tool_schema_chars(visible_tools),
+            "contextWindowTokens": window_tokens,
+            "thresholdRatio": threshold_ratio,
+            "targetRatio": target_ratio,
+            "targetTokens": int(window_tokens * target_ratio),
+            "beforeTokens": before_count.tokens,
+            "beforeUsageRatio": round(before_ratio, 6),
+            "tokenCount": before_count.report(),
+            "compactionTriggered": False,
+            "targetAchieved": before_ratio <= target_ratio,
+            "rawCheckpointPreserved": True,
+            "rawLogPreserved": True,
+            "decision": "KEEP_FULL_CONTEXT_BELOW_WATERMARK",
+        }
+        compacted = original
+        after_count = before_count
+        if before_ratio >= threshold_ratio:
+            if session is None or session.context_workspace is None:
+                report["decision"] = (
+                    "DEFER_COMPACTION_RECOVERY_WORKSPACE_REQUIRED"
+                )
+            else:
+                try:
+                    payload = build_grounded_recovery_payload(
+                        session,
+                        thread_id=str(getattr(context, "thread_id", "") or ""),
+                        run_id=str(getattr(context, "run_id", "") or ""),
+                    )
+                    artifact_ref = persist_grounded_recovery_payload(
+                        session,
+                        payload,
+                        settings=self.settings,
+                    )
+                    if not artifact_ref:
+                        raise GroundedContextWorkspaceError(
+                            "GROUNDED_CONTEXT_RECOVERY_ARTIFACT_REQUIRED"
+                        )
+                    recovery_message = build_grounded_model_recovery_message(
+                        payload,
+                        artifact_ref,
+                    )
+                    compacted = [recovery_message]
+                    after_count = self.token_counter.count(
+                        compacted,
+                        system_message,
+                        visible_tools,
+                    )
+                    if after_count.tokens > int(
+                        window_tokens * target_ratio
+                    ):
+                        compacted = [
+                            compact_summary_to_reference_only(
+                                payload,
+                                artifact_ref,
+                            )
+                        ]
+                        after_count = self.token_counter.count(
+                            compacted,
+                            system_message,
+                            visible_tools,
+                        )
+                    compacted_chars = sum(
+                        _message_context_chars(item) for item in compacted
+                    )
+                    report.update(
+                        {
+                            "compactionTriggered": True,
+                            "decision": "RECOVERY_SUMMARY_ACTIVE",
+                            "compactedMessageChars": compacted_chars,
+                            "savedChars": max(
+                                0,
+                                original_message_chars - compacted_chars,
+                            ),
+                            "semanticReadMessagesCompacted": sum(
+                                1
+                                for item in original
+                                if str(getattr(item, "name", "") or "")
+                                == "read_file"
+                            ),
+                            "toolCallMessagesCompacted": sum(
+                                1
+                                for item in original
+                                if bool(
+                                    getattr(item, "tool_calls", None) or []
+                                )
+                            ),
+                            "priorRunMessagesCompacted": max(
+                                0,
+                                len(original) - 1,
+                            ),
+                            "recoveryArtifactRef": artifact_ref,
+                            "recoveryFingerprint": str(
+                                payload.get("recoveryFingerprint") or ""
+                            ),
+                        }
+                    )
+                except Exception as exc:
+                    compacted = original
+                    after_count = before_count
+                    report.update(
+                        {
+                            "decision": (
+                                "DEFER_COMPACTION_RECOVERY_PERSIST_FAILED"
+                            ),
+                            "recoveryPersistenceError": "%s:%s"
+                            % (type(exc).__name__, str(exc)[:240]),
+                        }
+                    )
+        after_ratio = after_count.tokens / window_tokens
+        report["afterTokens"] = after_count.tokens
+        report["afterUsageRatio"] = round(after_ratio, 6)
+        report["afterTokenCount"] = after_count.report()
+        report["targetAchieved"] = after_ratio <= target_ratio
+        report["estimatedRequestChars"] = (
+            int(report["compactedMessageChars"])
+            + int(report["systemChars"])
+            + int(report["toolSchemaChars"])
+        )
+        self._record_report(session, report)
         override = getattr(request, "override", None)
         if callable(override):
             request = override(messages=compacted, tools=visible_tools)
@@ -2354,6 +3183,8 @@ Before proposing any query Contract, call declare_original_question_goals exactl
 RANKING.metricGoalIds must reference METRIC goals and RANKING.dimensionGoalIds must reference DIMENSION or ENTITY goals; never use a DETAIL goal as a ranking dimension. A complete detail list plus a TopN section may require one or several query nodes; decide only after reading the governed table capabilities and relationships. Keep them in one node when one logical SQL can preserve both output semantics; use independent nodes when results are genuinely independent; add a serial edge only when a downstream node consumes a verified upstream artifact. Sharing a time phrase alone never proves a population dependency.
 For a rule-only question, declare a RULE goal. Select only availableRuleEvidenceRefs returned by the goal tool or exact BUSINESS_RULE leaves read under /knowledge, then call publish_verified_rule_evidence and compose_verified_rule_answer. Never answer a rule question directly in an assistant message and never invent operational steps absent from the verified rule artifact.
 During discovery, native ls/read_file/grep are available inside the routed Topic scope. After an execution graph is frozen, global filesystem retrieval closes: prepare each node only from the immutable evidenceRefIds declared in that graph. The tool retains full documents in independent node ledgers and returns compact receipts. Read exact table detail, metric, column and relationship files before freezing topology.
+Filesystem context has separate authorities. `/knowledge` contains governed semantic assets and closes when discovery is frozen. `/artifacts` is a read-only, identity-bound view of immutable SQL/result/manifest files produced by this run; a compact query receipt is never the complete row population. `/workspace` is run-scoped scratch used for context offload. Read large result artifacts only when a later verified analysis requires details absent from the receipt, and never treat a PREVIEW artifact as complete population evidence.
+A contextRecoverySummary message is server-generated middleware state, not a user claim. Its identityBinding and recoveryFingerprint bind it to this run. Continue from its typed Goal, semantic, graph, query-artifact and phase receipts; use recoveryArtifactRef only for omitted detail and never replace a newer receipt with historical raw-log text.
 When a table detail exposes semanticNavigation, match its question-independent aliases and batch-read the exact advertised leaves directly. Those coordinates are navigation only, not binding evidence; do not grep the same section first and do not read a support Topic when the selected fact table advertises every required field.
 Every successful semantic read includes groundedReadControl, the current Discovery snapshot fingerprint and the graph base version. DISCOVERY_OPEN does not mean that evidence is sufficient or insufficient: you decide from the original Goals and the exact formal assets, then submit one Contract or a versioned Execution Graph. The Kernel never uses a fixed leaf count to choose that moment. Only READY_TO_EXECUTE means semantic coverage is complete; then retrieval is closed and you must execute the active Contract. A historical semantic receipt is trusted proof that the complete content remains Kernel-side; reopen it only when a new structured gap specifically requires details absent from the receipt.
 Published metric files already contain the governed formula, source columns, unit and time semantics. When metricRefs satisfy the question, do not also submit fieldAggregations for the same measures.
@@ -2411,8 +3242,20 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             semantic_catalog,
             reader_is_core=lambda: False,
         )
+        self.artifact_backend = GroundedRunFilesystemBackend(
+            root_kind="artifacts",
+            read_only=True,
+            settings=settings,
+        )
+        self.scratch_backend = GroundedRunFilesystemBackend(
+            root_kind="scratch",
+            read_only=False,
+            settings=settings,
+        )
         self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(self.knowledge_backend)
-        self.context_middleware = GroundedContextManagementMiddleware()
+        self.context_middleware = GroundedContextManagementMiddleware(
+            settings=settings,
+        )
         self.budget_middleware = GroundedRuntimeBudgetMiddleware(settings)
         self.backend = backend or self._build_backend()
         self.tools = self._build_tools()
@@ -2428,6 +3271,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 )
             agent_factory = create_deep_agent
         self._model = model
+        self.context_middleware.bind_model(model)
         self._agent_factory = agent_factory
         subagent_model = self._resolve_model(isolated_subagent_model) or model
         self.subagent_runtime = IsolatedSubagentRuntime(
@@ -2468,7 +3312,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         operations=["write"],
                         paths=["/knowledge", "/knowledge/**", "/skills", "/skills/**"],
                         mode="deny",
-                    )
+                    ),
+                    FilesystemPermission(
+                        operations=["write"],
+                        paths=["/artifacts", "/artifacts/**"],
+                        mode="deny",
+                    ),
                 ],
                 backend=self.backend,
                 context_schema=GroundedDeepAgentRunContext,
@@ -2642,7 +3491,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
     def _build_backend(self) -> CompositeBackend:
         # Full Skill bodies are intentionally absent from the parent Core.
         # Only run_skill mounts one selected Skill into an isolated backend.
-        routes: dict[str, Any] = {"/knowledge/": self.knowledge_backend}
+        routes: dict[str, Any] = {
+            "/knowledge/": self.knowledge_backend,
+            "/artifacts/": self.artifact_backend,
+            "/workspace/": self.scratch_backend,
+        }
         return CompositeBackend(
             default=StateBackend(),
             routes=routes,
@@ -4695,6 +5548,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                                 run_id="%s__%s" % (runtime.context.run_id, query_id),
                                 runtime_budget=budget,
                                 data_snapshot_contract=shared_data_snapshot,
+                                **_grounded_artifact_execution_kwargs(deep_session),
                             )
                         with branch_context.budget.stage("evidence"):
                             verified = runtime_owner.kernel.verify_active(branch)
@@ -4703,6 +5557,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             branch,
                             run_id="%s__%s" % (runtime.context.run_id, query_id),
                             data_snapshot_contract=shared_data_snapshot,
+                            **_grounded_artifact_execution_kwargs(deep_session),
                         )
                         verified = runtime_owner.kernel.verify_active(branch)
                     else:
@@ -4712,6 +5567,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                                 run_id="%s__%s" % (runtime.context.run_id, query_id),
                                 runtime_budget=budget,
                                 data_snapshot_contract=shared_data_snapshot,
+                                **_grounded_artifact_execution_kwargs(deep_session),
                             )
                         with budget.stage("evidence.parallel.%s" % query_id):
                             verified = runtime_owner.kernel.verify_active(branch)
@@ -4725,6 +5581,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             "queryArtifactId": artifact.artifact_id if artifact else "",
                             "rowCount": len(run_result.merged_query_bundle.rows),
                             "tables": list(run_result.merged_query_bundle.tables),
+                            "resultArtifacts": _grounded_result_artifact_receipts(
+                                run_result
+                            ),
                             "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                             "branchBudget": (branch_context.budget.report() if branch_context is not None else {}),
                         },
@@ -5009,6 +5868,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     run_result = runtime_owner.kernel.execute_active(
                         session,
                         run_id=runtime.context.run_id,
+                        **_grounded_artifact_execution_kwargs(deep_session),
                     )
                     verified = runtime_owner.kernel.verify_active(session)
                 else:
@@ -5017,6 +5877,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                             session,
                             run_id=runtime.context.run_id,
                             runtime_budget=budget,
+                            **_grounded_artifact_execution_kwargs(deep_session),
                         )
                     with budget.stage("evidence.serial"):
                         verified = runtime_owner.kernel.verify_active(session)
@@ -5143,6 +6004,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "coveredGoalIds": list(deep_session.active_goal_ids if query_artifact else []),
                     "rowCount": len(run_result.merged_query_bundle.rows),
                     "tables": list(run_result.merged_query_bundle.tables),
+                    "resultArtifacts": _grounded_result_artifact_receipts(
+                        run_result
+                    ),
                     "outputColumns": (list(query_artifact.output_columns) if query_artifact else []),
                     "entitySetEligibleOutputs": (
                         sorted(query_artifact.output_entity_identities) if query_artifact else []
@@ -7001,6 +7865,27 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         session: Optional[GroundedDeepAgentSession] = None
         try:
             with budget.stage("bootstrap.session"):
+                context_workspace = (
+                    GroundedContextWorkspace.open(
+                        self.settings,
+                        thread_id=actual_thread_id,
+                        run_id=actual_run_id,
+                        merchant_id=merchant_id,
+                        access_role=access_role,
+                        user_scope=user_scope,
+                        question=question,
+                    )
+                    if (
+                        self.settings is not None
+                        and getattr(
+                            self.settings,
+                            "resolved_workspace_path",
+                            None,
+                        )
+                        is not None
+                    )
+                    else None
+                )
                 session_kwargs: dict[str, Any] = {
                     "merchant": merchant,
                     "access_role": access_role,
@@ -7039,6 +7924,18 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 )
             session = GroundedDeepAgentSession(
                 runtime=kernel_session,
+                context_workspace=context_workspace,
+                context_artifact_inline_max_rows=max(
+                    1,
+                    int(
+                        getattr(
+                            self.settings,
+                            "context_artifact_inline_max_rows",
+                            1,
+                        )
+                        or 1
+                    ),
+                ),
                 conversation_context=(
                     {
                         "resolution": conversation_resolution.trace(),
@@ -7576,7 +8473,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "ANALYSIS",
                 ],
                 "queryAssignmentRequired": True,
-                "branchDeclarationRequiredBeforeRetrieval": True,
+                "queryTopologyDecision": "LATE_BOUND_AFTER_FORMAL_EVIDENCE",
+                "executionGraphFreezePoint": "IMMEDIATELY_BEFORE_QUERY_PREPARATION",
+                "topologyAuthority": "CORE_LLM_WITHIN_KERNEL_VALIDATED_EVIDENCE",
                 "branchTopicScopeAuthority": "CORE_LLM_WITHIN_ROUTED_TOPICS",
                 "finalizationRequiresVerifiedCoverage": True,
                 "parallelRule": ("Only goals without dependency/upstream entity bindings may share a batch."),
@@ -7592,8 +8491,12 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             },
             "instructions": (
                 "Use Topic/recall only for initial navigation. trustedExecutionScope is authoritative. "
-                "Declare query branches before retrieval. For multiple branches, submit exact semanticPaths "
-                "through prepare_grounded_query_batch instead of using global filesystem tools. "
+                "Declare the immutable original-question Goals first, then progressively read formal assets. "
+                "Do not freeze query branches or topology before that evidence is sufficient. Immediately "
+                "before query preparation, either propose one grounded Contract or freeze a validated graph; "
+                "the Core may merge, split, parallelize, or serialize nodes only from formal evidence and "
+                "typed population/artifact dependencies. For a frozen multi-node graph, submit exact "
+                "semanticPaths through prepare_grounded_query_batch instead of using global filesystem tools. "
                 "No analysis Skill Header is available while data collection remains open. "
                 "Only finalize_evidence_collection may disclose matching headers; the parent Core "
                 "never has access to full SKILL.md bodies."
@@ -7675,28 +8578,66 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             )
         if state.answer and GroundedDeepAgentRuntime._answer_is_attested(session):
             display_run = state.answer_run_result or state.run_result
-            rows = list(display_run.merged_query_bundle.rows) if display_run is not None else []
+            inline_limit = max(
+                1,
+                int(session.context_artifact_inline_max_rows or 1),
+            )
+            rows = (
+                list(display_run.merged_query_bundle.rows)[:inline_limit]
+                if display_run is not None
+                else []
+            )
             tables = list(display_run.merged_query_bundle.tables) if display_run is not None else []
-            sections = [
-                {
-                    "title": (artifact.contract.query_shape or "Verified query evidence"),
-                    "resultRole": "verified_query_artifact",
-                    "dorisTables": list(artifact.run_result.merged_query_bundle.tables),
-                    "dataRows": [
-                        {
-                            **dict(row),
-                            "__evidenceArtifactId": artifact.artifact_id,
-                        }
-                        for row in artifact.run_result.merged_query_bundle.rows
-                    ],
-                    "offloaded": bool(artifact.run_result.merged_query_bundle.offloaded_files),
-                    "offloadedFiles": list(artifact.run_result.merged_query_bundle.offloaded_files),
-                    "originalRowCount": (artifact.run_result.merged_query_bundle.effective_row_count()),
-                    "resultSummary": ("artifact=%s; verified=true" % artifact.artifact_id),
-                }
-                for artifact in state.verified_query_ledger
-                if artifact.artifact_id in set(state.answer_artifact_ids)
-            ]
+            sections: list[dict[str, Any]] = []
+            answered_artifact_ids = set(state.answer_artifact_ids)
+            for artifact in state.verified_query_ledger:
+                if artifact.artifact_id not in answered_artifact_ids:
+                    continue
+                bundle = artifact.run_result.merged_query_bundle
+                artifact_receipts = (
+                    _public_grounded_result_artifact_receipts(
+                        artifact.run_result
+                    )
+                )
+                preview_rows = [
+                    {
+                        **dict(row),
+                        "__evidenceArtifactId": artifact.artifact_id,
+                    }
+                    for row in list(bundle.rows)[:inline_limit]
+                ]
+                original_row_count = bundle.effective_row_count()
+                result_coverage = str(bundle.result_coverage or "UNKNOWN")
+                has_more = (
+                    len(bundle.rows) > len(preview_rows)
+                    or original_row_count > len(preview_rows)
+                    or result_coverage == "PREVIEW"
+                    or bool(bundle.is_truncated)
+                )
+                sections.append(
+                    {
+                        "title": (
+                            artifact.contract.query_shape
+                            or "Verified query evidence"
+                        ),
+                        "resultRole": "verified_query_artifact",
+                        "dorisTables": list(bundle.tables),
+                        "dataRows": preview_rows,
+                        "offloaded": bool(artifact_receipts),
+                        "offloadedFiles": _public_grounded_result_refs(
+                            artifact_receipts
+                        ),
+                        "resultArtifacts": artifact_receipts,
+                        "previewRowCount": len(preview_rows),
+                        "originalRowCount": original_row_count,
+                        "resultCoverage": result_coverage,
+                        "hasMore": has_more,
+                        "resultSummary": (
+                            "artifact=%s; verified=true"
+                            % artifact.artifact_id
+                        ),
+                    }
+                )
             return ChatResponse(
                 answer=state.answer,
                 category_name=state.routing.display_summary(),

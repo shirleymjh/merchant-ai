@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any, Iterable
 
 import sqlglot
@@ -32,6 +35,7 @@ from merchant_ai.models import (
     SqlValidationResult,
 )
 from merchant_ai.services.access_control import AccessControlService
+from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.assets import (
     default_row_access_policy,
     normalize_row_access_policy,
@@ -49,7 +53,10 @@ from merchant_ai.services.grounded_query_contract import (
     grounded_detail_relationship_candidates,
 )
 from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudget
-from merchant_ai.services.grounded_sql_candidate import GroundedSqlValidationResult
+from merchant_ai.services.grounded_sql_candidate import (
+    GroundedSqlValidationResult,
+    grounded_query_contract_fingerprint,
+)
 from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
 from merchant_ai.services.time_semantics import (
@@ -117,6 +124,8 @@ class GroundedQueryExecutionKernel:
         question: str,
         *,
         run_id: str = "",
+        artifact_root: str = "",
+        context_owner_fingerprint: str = "",
         access_role: str = "merchant_analyst",
         user_scope: dict[str, Any] | None = None,
         execution_preparation: Any = None,
@@ -339,14 +348,62 @@ class GroundedQueryExecutionKernel:
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         task_id = intent.plan_task_id
+        artifact_paths: list[str] = []
+        artifact_refs: list[str] = []
+        artifact_receipt: dict[str, Any] = {}
+        if artifact_root:
+            try:
+                (
+                    artifact_paths,
+                    artifact_refs,
+                    artifact_receipt,
+                ) = self._write_grounded_result_artifacts(
+                    artifact_root=artifact_root,
+                    run_id=run_id,
+                    task_id=task_id,
+                    context_owner_fingerprint=context_owner_fingerprint,
+                    contract=contract,
+                    compilation=compilation,
+                    execution_preparation=execution_preparation,
+                    data_snapshot=active_data_snapshot,
+                    rows=rows,
+                    result_coverage=result_coverage,
+                    result_is_truncated=result_is_truncated,
+                    exact_result_row_count=exact_result_row_count,
+                )
+            except Exception as exc:
+                message = "%s:%s" % (type(exc).__name__, str(exc)[:300])
+                artifact_validation = SqlValidationResult(
+                    valid=False,
+                    error_code="QUERY_RESULT_ARTIFACT_WRITE_FAILED",
+                    message=message,
+                    base_tables=list(compilation.tables),
+                )
+                for decision in decisions:
+                    self.access_control.record_query_audit(
+                        decision,
+                        row_count=len(rows),
+                        status="artifact_persistence_failed",
+                    )
+                return self._failed_result(
+                    plan,
+                    compilation,
+                    artifact_validation,
+                    artifact_validation.error_code,
+                    artifact_validation.message,
+                    duration_ms=duration_ms,
+                    data_snapshot=active_data_snapshot,
+                )
         bundle = QueryBundle(
             sql=compilation.sql,
             tables=list(compilation.tables),
             rows=rows,
+            offloaded_files=artifact_paths,
             original_row_count=exact_result_row_count,
             is_truncated=result_is_truncated,
             result_coverage=result_coverage,
             source_row_counts={task_id: len(rows)},
+            source_artifact_refs={task_id: artifact_refs},
             duration_ms=duration_ms,
             cache_hit=bool(getattr(self.doris_repository, "last_cache_hit", False)),
             cache_key=str(getattr(self.doris_repository, "last_cache_key", "") or ""),
@@ -366,6 +423,7 @@ class GroundedQueryExecutionKernel:
                         ResultCoverage.TOP_N.value,
                     },
                     "plannerLlmCalls": 0,
+                    "resultArtifact": artifact_receipt,
                     "sqlLlmCalls": (
                         1
                         if isinstance(candidate_validation, GroundedSqlValidationResult)
@@ -2079,6 +2137,164 @@ class GroundedQueryExecutionKernel:
                 )
             ],
             node_plan_contracts=[compilation.node_contract.model_copy(deep=True)],
+        )
+
+    def _write_grounded_result_artifacts(
+        self,
+        *,
+        artifact_root: str,
+        run_id: str,
+        task_id: str,
+        context_owner_fingerprint: str,
+        contract: GroundedQueryContract,
+        compilation: GroundedSqlCompilation,
+        execution_preparation: Any,
+        data_snapshot: DataSnapshotContract,
+        rows: list[dict[str, Any]],
+        result_coverage: str,
+        result_is_truncated: bool,
+        exact_result_row_count: int,
+    ) -> tuple[list[str], list[str], dict[str, Any]]:
+        root = Path(str(artifact_root or "")).resolve()
+        workspace_root = self.settings.resolved_workspace_path.resolve()
+        try:
+            root.relative_to(workspace_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "QUERY_RESULT_ARTIFACT_ROOT_OUTSIDE_WORKSPACE"
+            ) from exc
+        root.mkdir(parents=True, exist_ok=True)
+        if not str(context_owner_fingerprint or "").strip():
+            raise RuntimeError("QUERY_RESULT_CONTEXT_OWNER_REQUIRED")
+        store = WorkspaceArtifactStore(self.settings, root)
+        rows_text = json.dumps(
+            rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        rows_canonical_hash = hashlib.sha256(
+            rows_text.encode("utf-8")
+        ).hexdigest()
+        sql_hash = hashlib.sha256(
+            str(compilation.sql or "").encode("utf-8")
+        ).hexdigest()
+        contract_fingerprint = grounded_query_contract_fingerprint(contract)
+        preparation_fingerprint = str(
+            getattr(execution_preparation, "asset_pack_fingerprint", "") or ""
+        )
+        if not preparation_fingerprint:
+            raise RuntimeError(
+                "QUERY_RESULT_SEMANTIC_ACTIVATION_FINGERPRINT_REQUIRED"
+            )
+        result_identity = {
+            "contractFingerprint": contract_fingerprint,
+            "sqlSha256": sql_hash,
+            "rowsCanonicalSha256": rows_canonical_hash,
+            "contextOwnerFingerprint": str(
+                context_owner_fingerprint or ""
+            ),
+            "semanticActivationFingerprint": preparation_fingerprint,
+            "dataSnapshot": {
+                **data_snapshot.cache_identity(),
+                "consistencyMode": str(
+                    data_snapshot.consistency_mode or "UNSUPPORTED"
+                ),
+                "unsupportedReason": str(
+                    data_snapshot.unsupported_reason or ""
+                ),
+            },
+            "resultCoverage": str(result_coverage or ""),
+            "resultIsTruncated": bool(result_is_truncated),
+            "storedRowCount": len(rows),
+            "exactResultRowCount": max(0, int(exact_result_row_count or 0)),
+        }
+        identity_hash = hashlib.sha256(
+            json.dumps(
+                result_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        rows_artifact = store.write_json(
+            "query_results",
+            "result_%s_rows.json" % identity_hash,
+            rows,
+            preview_chars=0,
+            immutable=True,
+        )
+        sql_artifact = store.write_text(
+            "query_results",
+            "result_%s.sql" % identity_hash,
+            compilation.sql,
+            preview_chars=0,
+            immutable=True,
+        )
+        if not rows_artifact.get("success") or not sql_artifact.get("success"):
+            raise RuntimeError("QUERY_RESULT_CONTENT_WRITE_FAILED")
+        manifest = {
+            "schemaVersion": 1,
+            "artifactKind": "GROUNDED_QUERY_RESULT",
+            "artifactFingerprint": identity_hash,
+            "runFingerprint": hashlib.sha256(
+                str(run_id or "").encode("utf-8")
+            ).hexdigest(),
+            "taskFingerprint": hashlib.sha256(
+                str(task_id or "").encode("utf-8")
+            ).hexdigest(),
+            **result_identity,
+            "rowsArtifact": {
+                "relativePath": rows_artifact.get("relativePath"),
+                "merchantUri": rows_artifact.get("merchantUri"),
+                "sha256": rows_artifact.get("sha256"),
+                "contentAddress": rows_artifact.get("contentAddress"),
+                "bytes": rows_artifact.get("bytes"),
+            },
+            "sqlArtifact": {
+                "relativePath": sql_artifact.get("relativePath"),
+                "merchantUri": sql_artifact.get("merchantUri"),
+                "sha256": sql_artifact.get("sha256"),
+                "contentAddress": sql_artifact.get("contentAddress"),
+                "bytes": sql_artifact.get("bytes"),
+            },
+            "rowsSha256": rows_artifact.get("sha256"),
+        }
+        manifest_artifact = store.write_json(
+            "query_results",
+            "result_%s.manifest.json" % identity_hash,
+            manifest,
+            preview_chars=0,
+            immutable=True,
+        )
+        if not manifest_artifact.get("success"):
+            raise RuntimeError("QUERY_RESULT_MANIFEST_WRITE_FAILED")
+        paths = [
+            str(rows_artifact.get("path") or ""),
+            str(sql_artifact.get("path") or ""),
+            str(manifest_artifact.get("path") or ""),
+        ]
+        refs = [
+            str(rows_artifact.get("merchantUri") or ""),
+            str(sql_artifact.get("merchantUri") or ""),
+            str(manifest_artifact.get("merchantUri") or ""),
+        ]
+        receipt = {
+            "artifactFingerprint": identity_hash,
+            "manifestRef": str(manifest_artifact.get("merchantUri") or ""),
+            "rowsRef": str(rows_artifact.get("merchantUri") or ""),
+            "storedRowCount": len(rows),
+            "resultCoverage": str(result_coverage or ""),
+            "rowsSha256": str(rows_artifact.get("sha256") or ""),
+            "manifestSha256": str(
+                manifest_artifact.get("sha256") or ""
+            ),
+        }
+        return (
+            [item for item in paths if item],
+            [item for item in refs if item],
+            receipt,
         )
 
     @staticmethod

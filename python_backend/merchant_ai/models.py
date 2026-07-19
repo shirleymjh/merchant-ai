@@ -267,7 +267,11 @@ class ChatDataSection(APIModel):
     data_rows: List[Dict[str, Any]] = Field(default_factory=list)
     offloaded: bool = False
     offloaded_files: List[str] = Field(default_factory=list)
+    result_artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    preview_row_count: int = 0
     original_row_count: int = 0
+    result_coverage: str = "UNKNOWN"
+    has_more: bool = False
     result_summary: str = ""
 
 

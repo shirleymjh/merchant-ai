@@ -42,6 +42,163 @@ _TOOL_CANCEL_EVENT: ContextVar[Any] = ContextVar("merchant_ai_tool_cancel_event"
 _TOOL_EXECUTION_FENCE: ContextVar[Optional[Dict[str, Any]]] = ContextVar("merchant_ai_tool_execution_fence", default=None)
 
 
+READ_ONLY_SIDE_EFFECT_LEVELS = frozenset({"none", "read", "external_read"})
+
+
+@dataclass(frozen=True)
+class SideEffectSinkContract:
+    """Server-owned proof that a sink can safely consume execution intents.
+
+    A side-effecting callback is not accepted merely because it has a stable
+    call id. Its sink must deduplicate the journal idempotency key and either
+    atomically persist an outbox intent or reject obsolete fencing tokens.
+    The contract is deliberately infrastructure-generic; it contains no tool
+    names or business semantics.
+    """
+
+    sink_name: str
+    transactional_outbox: bool = False
+    idempotency_key_enforced: bool = False
+    fencing_token_enforced: bool = False
+
+    @property
+    def fail_closed_ready(self) -> bool:
+        return bool(
+            self.idempotency_key_enforced
+            and (self.transactional_outbox or self.fencing_token_enforced)
+        )
+
+    def trace(self) -> Dict[str, Any]:
+        return {
+            "sinkName": str(self.sink_name or ""),
+            "transactionalOutbox": bool(self.transactional_outbox),
+            "idempotencyKeyEnforced": bool(self.idempotency_key_enforced),
+            "fencingTokenEnforced": bool(self.fencing_token_enforced),
+            "failClosedReady": self.fail_closed_ready,
+        }
+
+
+@dataclass(frozen=True)
+class SideEffectExecutionIntent:
+    """Typed intent handed to a guarded sink for every external mutation."""
+
+    idempotency_key: str
+    lease_owner: str
+    fencing_generation: int
+    cancel_event: Any
+
+    @property
+    def cancellation_requested(self) -> bool:
+        return bool(getattr(self.cancel_event, "is_set", lambda: False)())
+
+    def fence(self) -> Dict[str, Any]:
+        return {
+            "idempotencyKey": self.idempotency_key,
+            "leaseOwner": self.lease_owner,
+            "fencingGeneration": self.fencing_generation,
+        }
+
+
+@dataclass(frozen=True)
+class GuardedSideEffectHandler:
+    """Adapter requiring a sink to receive the durable intent and fence."""
+
+    callback: Callable[[Dict[str, Any], SideEffectExecutionIntent], Dict[str, Any]]
+    sink_contract: SideEffectSinkContract
+
+    def __call__(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        fence = current_tool_execution_fence()
+        intent = SideEffectExecutionIntent(
+            idempotency_key=str(fence.get("idempotencyKey") or ""),
+            lease_owner=str(fence.get("leaseOwner") or ""),
+            fencing_generation=int(fence.get("fencingGeneration") or 0),
+            cancel_event=current_tool_cancel_event(),
+        )
+        if (
+            not intent.idempotency_key
+            or not intent.lease_owner
+            or intent.fencing_generation <= 0
+        ):
+            raise RuntimeError("SIDE_EFFECT_EXECUTION_INTENT_MISSING")
+        return self.callback(args, intent)
+
+
+def guarded_side_effect_handler(
+    callback: Callable[[Dict[str, Any], SideEffectExecutionIntent], Dict[str, Any]],
+    sink_contract: SideEffectSinkContract,
+) -> GuardedSideEffectHandler:
+    """Create the only callback form accepted for side-effecting tools."""
+
+    return GuardedSideEffectHandler(callback=callback, sink_contract=sink_contract)
+
+
+def is_side_effecting_level(side_effect_level: str) -> bool:
+    return str(side_effect_level or "unknown") not in READ_ONLY_SIDE_EFFECT_LEVELS
+
+
+def side_effect_sink_contract(
+    side_effect_level: str,
+    handler: Any,
+) -> Optional[SideEffectSinkContract]:
+    if not is_side_effecting_level(side_effect_level):
+        return None
+    if not isinstance(handler, GuardedSideEffectHandler):
+        return None
+    contract = handler.sink_contract
+    if not str(contract.sink_name or "").strip() or not contract.fail_closed_ready:
+        return None
+    return contract
+
+
+def mark_side_effect_outcome_unknown(
+    result: ToolCallExecutionResult,
+    claim: ExecutionJournalClaim,
+    sink_contract: SideEffectSinkContract,
+) -> ToolCallExecutionResult:
+    """Make an indeterminate mutation terminal and non-replayable.
+
+    Python cannot stop a handler thread.  Once a guarded mutation has started,
+    any timeout, cancellation, or exception may have happened before or after
+    the sink committed.  Recording a normal failure would therefore be false
+    and could invite a duplicate operation.
+    """
+
+    original_error_type = str(result.error_type or "ERROR")
+    original_error_message = str(result.error_message or "")
+    result.status = "outcome_unknown"
+    result.error_type = "SIDE_EFFECT_OUTCOME_UNKNOWN"
+    result.error_code = result.error_type
+    result.error_message = (
+        "side-effecting handler ended without a confirmed sink outcome; "
+        "the same execution intent will not be run again"
+    )
+    result.retryable = False
+    result.recommended_action = "reconcile_the_sink_by_idempotency_key_before_any_new_call_id"
+    result.details = {
+        **dict(result.details or {}),
+        "idempotencyKey": claim.entry.idempotency_key,
+        "leaseOwner": claim.entry.lease_owner,
+        "fencingGeneration": claim.entry.lease_generation,
+        "journalStatus": "outcome_unknown",
+        "cancellationRequested": original_error_type in {"TIMEOUT", "CANCELED"},
+        "handlerMayStillBeRunning": original_error_type in {"TIMEOUT", "CANCELED"},
+        "originalErrorType": original_error_type,
+        "originalErrorMessage": original_error_message[:500],
+        "sinkContract": sink_contract.trace(),
+    }
+    result.tool_message = {
+        "toolCallId": result.id,
+        "toolName": result.name,
+        "status": result.status,
+        "errorType": result.error_type,
+        "message": result.error_message,
+        "retryable": False,
+        "recommendedAction": result.recommended_action,
+        "details": dict(result.details),
+    }
+    return result
+
+
 def _canonical_identity_values(values: Sequence[Any] | None) -> Tuple[str, ...]:
     return tuple(
         sorted(
@@ -71,6 +228,9 @@ class ExecutionIdentityFingerprint:
 
     value: str
     version: str = "v1"
+
+    def key(self) -> str:
+        return "%s:%s" % (self.version, self.value)
 
 
 @dataclass(frozen=True)
@@ -267,7 +427,7 @@ def normalize_tool_context(
     identity = execution_identity or ExecutionIdentity.from_server_context(
         merchant_id=str(runtime_scope.get("merchantId") or "")
     )
-    identity_fingerprint = identity.fingerprint().value
+    identity_fingerprint = identity.fingerprint().key()
     principal_id = str(identity.merchant_id or identity.tenant_id or "")
     thread_id = str(safe_args.get("threadId") or safe_args.get("thread_id") or runtime_scope.get("threadId") or "")
     run_id = str(runtime_scope.get("runId") or "")
@@ -1391,7 +1551,7 @@ class ToolRuntimeService:
             execution_identity or ExecutionIdentity.from_server_context(
                 merchant_id=current_tool_runtime_scope().get("merchantId", "")
             )
-        ).fingerprint().value
+        ).fingerprint().key()
         try:
             raw = json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
         except Exception:
@@ -1464,7 +1624,7 @@ class ToolRuntimeService:
             )
         if (
             capability.side_effect_level
-            not in {"none", "read", "external_read"}
+            not in READ_ONLY_SIDE_EFFECT_LEVELS
             and not supplied_call_id
         ):
             return self._capability_blocked_result(
@@ -1475,6 +1635,24 @@ class ToolRuntimeService:
                 idempotency_key,
                 "IDEMPOTENCY_CALL_ID_REQUIRED",
                 "side-effecting tool execution requires a stable caller-supplied call id",
+                pre_runtime_events,
+            )
+        sink_contract = side_effect_sink_contract(
+            capability.side_effect_level,
+            handler,
+        )
+        if is_side_effecting_level(capability.side_effect_level) and sink_contract is None:
+            return self._capability_blocked_result(
+                call,
+                context,
+                selected_target,
+                service_name,
+                idempotency_key,
+                "SIDE_EFFECT_SINK_CONTRACT_REQUIRED",
+                (
+                    "side-effecting tool execution requires a guarded sink with "
+                    "idempotent transactional outbox or idempotency-and-fencing enforcement"
+                ),
                 pre_runtime_events,
             )
         existing_execution = self.execution_journal.get_execution(idempotency_key)
@@ -1582,7 +1760,12 @@ class ToolRuntimeService:
                 self.metrics.record(tool_name, result.status, 0, result.error_type, rate_limited=True)
                 return result
         cache_key = ""
-        if cache_policy and cache_policy.enabled and self.settings.cache_enabled:
+        if (
+            capability.side_effect_level in READ_ONLY_SIDE_EFFECT_LEVELS
+            and cache_policy
+            and cache_policy.enabled
+            and self.settings.cache_enabled
+        ):
             cache_key = self.cache_key(
                 tool_name,
                 call.args,
@@ -1627,7 +1810,7 @@ class ToolRuntimeService:
         execution_owner = hashlib.sha256(
             ("%s:%s:%s" % (id(self), threading.get_ident(), time.time_ns())).encode("utf-8")
         ).hexdigest()[:24]
-        allow_expired_takeover = capability.side_effect_level in {"none", "read", "external_read"}
+        allow_expired_takeover = capability.side_effect_level in READ_ONLY_SIDE_EFFECT_LEVELS
         execution_claim = self.execution_journal.claim_execution(
             idempotency_key,
             execution_owner,
@@ -1812,14 +1995,29 @@ class ToolRuntimeService:
             tool_message=tool_message,
             runtime_events=list(pre_runtime_events) + all_attempt_events,
         )
-        failed_event = self._record_event("tool.failed", result, {"failure": record.model_dump(by_alias=True)})
+        if sink_contract is not None:
+            mark_side_effect_outcome_unknown(result, execution_claim, sink_contract)
+        event_type = (
+            "tool.side_effect.outcome_unknown"
+            if result.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+            else "tool.failed"
+        )
+        failed_event = self._record_event(event_type, result, {"failure": record.model_dump(by_alias=True)})
         result.runtime_events.append(failed_event)
         if record.recovery_action:
             result.runtime_events.append(self._record_event("tool.recovery.recommended", result, {"recommendedAction": record.recovery_action}))
         circuit = self.failure_registry.circuits.get(record.circuit_key)
         if circuit and circuit.open:
             result.runtime_events.append(self._record_event("tool.circuit.open", result, {"circuit": circuit.model_dump(by_alias=True)}))
-        terminal_status = "timed_out" if result.error_type == "TIMEOUT" else "canceled" if result.error_type == "CANCELED" else "failed"
+        terminal_status = (
+            "outcome_unknown"
+            if result.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+            else "timed_out"
+            if result.error_type == "TIMEOUT"
+            else "canceled"
+            if result.error_type == "CANCELED"
+            else "failed"
+        )
         if not self._commit_execution_result(execution_claim, result, terminal_status):
             return self._stale_execution_result(result)
         self.metrics.record(tool_name, result.status, duration_ms, result.error_type, attempts=result.attempts, target=selected_target.name)
@@ -1834,13 +2032,27 @@ class ToolRuntimeService:
     ) -> bool:
         serialized = result.model_dump(by_alias=True, mode="json")
         serialized["runtimeEvents"] = []
+        journal_payload: Dict[str, Any] = {"toolCallResult": serialized}
+        if status == "outcome_unknown":
+            journal_payload["sideEffectIntent"] = {
+                "idempotencyKey": claim.entry.idempotency_key,
+                "leaseOwner": claim.entry.lease_owner,
+                "fencingGeneration": claim.entry.lease_generation,
+                "sinkContract": dict(result.details.get("sinkContract") or {}),
+                "cancellationRequested": bool(
+                    result.details.get("cancellationRequested")
+                ),
+                "handlerMayStillBeRunning": bool(
+                    result.details.get("handlerMayStillBeRunning")
+                ),
+            }
         try:
             self.execution_journal.complete_execution(
                 claim.entry.idempotency_key,
                 claim.entry.lease_owner,
                 claim.entry.lease_generation,
                 status,
-                {"toolCallResult": serialized},
+                journal_payload,
                 result_hash=result.result_hash,
             )
             result.runtime_events.append(
@@ -2400,6 +2612,41 @@ class ToolCallExecutor:
                 retryable=False,
                 recommended_action="register_and_review_the_tool_capability",
             )
+        sink_contract = side_effect_sink_contract(
+            capability.side_effect_level,
+            handler,
+        )
+        if is_side_effecting_level(capability.side_effect_level) and not str(
+            call.id or ""
+        ).strip():
+            return ToolCallExecutionResult(
+                id=call.id,
+                name=call.name,
+                status="blocked",
+                idempotency_key=idempotency_key,
+                params_hash=context["paramsHash"],
+                error_type="IDEMPOTENCY_CALL_ID_REQUIRED",
+                error_message=(
+                    "side-effecting tool execution requires a stable caller-supplied call id"
+                ),
+                service_name=infer_tool_kind(call.name),
+                retryable=False,
+            )
+        if is_side_effecting_level(capability.side_effect_level) and sink_contract is None:
+            return ToolCallExecutionResult(
+                id=call.id,
+                name=call.name,
+                status="blocked",
+                idempotency_key=idempotency_key,
+                params_hash=context["paramsHash"],
+                error_type="SIDE_EFFECT_SINK_CONTRACT_REQUIRED",
+                error_message=(
+                    "side-effecting tool execution requires a guarded sink with "
+                    "idempotent transactional outbox or idempotency-and-fencing enforcement"
+                ),
+                service_name=infer_tool_kind(call.name),
+                retryable=False,
+            )
         execution_owner = hashlib.sha256(
             ("%s:%s:%s" % (id(self), threading.get_ident(), time.time_ns())).encode("utf-8")
         ).hexdigest()[:24]
@@ -2407,7 +2654,7 @@ class ToolCallExecutor:
             idempotency_key,
             execution_owner,
             lease_seconds=tool_policy_budget_seconds(policy),
-            allow_expired_takeover=capability.side_effect_level in {"none", "read", "external_read"},
+            allow_expired_takeover=capability.side_effect_level in READ_ONLY_SIDE_EFFECT_LEVELS,
         )
         if claim.outcome == "replay":
             stored = claim.entry.payload.get("toolCallResult") if isinstance(claim.entry.payload, dict) else None
@@ -2538,7 +2785,17 @@ class ToolCallExecutor:
             details=details,
             tool_message=structured_tool_message(call.name, "failed", last_error_type, last_error[:500], recovery, tool_call_id=call.id, details=details),
         )
-        terminal_status = "timed_out" if last_error_type == "TIMEOUT" else "canceled" if last_error_type == "CANCELED" else "failed"
+        if sink_contract is not None:
+            mark_side_effect_outcome_unknown(failed, claim, sink_contract)
+        terminal_status = (
+            "outcome_unknown"
+            if failed.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+            else "timed_out"
+            if last_error_type == "TIMEOUT"
+            else "canceled"
+            if last_error_type == "CANCELED"
+            else "failed"
+        )
         if not self._commit_executor_result(claim, failed, terminal_status):
             return self._executor_stale_result(failed)
         return failed
@@ -2591,13 +2848,27 @@ class ToolCallExecutor:
     ) -> bool:
         serialized = result.model_dump(by_alias=True, mode="json")
         serialized["runtimeEvents"] = []
+        journal_payload: Dict[str, Any] = {"toolCallResult": serialized}
+        if status == "outcome_unknown":
+            journal_payload["sideEffectIntent"] = {
+                "idempotencyKey": claim.entry.idempotency_key,
+                "leaseOwner": claim.entry.lease_owner,
+                "fencingGeneration": claim.entry.lease_generation,
+                "sinkContract": dict(result.details.get("sinkContract") or {}),
+                "cancellationRequested": bool(
+                    result.details.get("cancellationRequested")
+                ),
+                "handlerMayStillBeRunning": bool(
+                    result.details.get("handlerMayStillBeRunning")
+                ),
+            }
         try:
             self.execution_journal.complete_execution(
                 claim.entry.idempotency_key,
                 claim.entry.lease_owner,
                 claim.entry.lease_generation,
                 status,
-                {"toolCallResult": serialized},
+                journal_payload,
                 result.result_hash,
             )
             return True

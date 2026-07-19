@@ -34,7 +34,6 @@ class AcceptanceCase:
     question: str
     suite: str
     expected_goal_kinds: tuple[str, ...]
-    minimum_branch_count: int = 0
     requires_analysis_artifact: bool = False
     requires_entity_lineage: bool = False
 
@@ -45,7 +44,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近30天订单量和退款金额分别是多少，并分析退款有没有影响订单表现。",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=1,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -53,7 +51,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近10天保证金缴纳流水和退款金额有没有明显关系？",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -61,7 +58,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "上个月销售额最高的前3个商品，以及这些商品最近7天退款量是多少？",
         "user15",
         ("METRIC", "TIME_WINDOW", "RANKING", "ENTITY", "DEPENDENCY"),
-        minimum_branch_count=2,
         requires_entity_lineage=True,
     ),
     AcceptanceCase(
@@ -69,7 +65,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近7天按工单状态统计工单量，再看催单工单量有没有升高。",
         "user15",
         ("METRIC", "DIMENSION", "TIME_WINDOW", "RANKING", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -77,14 +72,12 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近10天商品审核拒绝明细给我看一下，再告诉我拒绝最多的商品有哪些。",
         "user15",
         ("DETAIL", "RANKING", "TIME_WINDOW"),
-        minimum_branch_count=2,
     ),
     AcceptanceCase(
         "real_06_orders_returns_ship_timeout_cause",
         "最近30天订单量、退货量、发货超时订单量为什么一起上升？",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -92,7 +85,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近7天履约量、发货超时订单量和催单工单量分别是多少，并分析是不是履约问题导致催单增加。",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -100,7 +92,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近10天退款最多的商品有哪些？再给我看这些商品对应的退款明细。",
         "user15",
         ("RANKING", "ENTITY", "DETAIL", "DEPENDENCY", "TIME_WINDOW"),
-        minimum_branch_count=2,
         requires_entity_lineage=True,
     ),
     AcceptanceCase(
@@ -108,14 +99,12 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近7天支付订单量和交易成功订单量分别是多少，差异大不大？",
         "user15",
         ("METRIC", "COMPARISON", "TIME_WINDOW"),
-        minimum_branch_count=1,
     ),
     AcceptanceCase(
         "real_10_deposit_appeal_punish_anomaly",
         "最近30天保证金充值流水、申诉次数和处罚次数分别是多少，有没有异常？",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -123,14 +112,12 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近7天订单明细和退款明细都给我看一下，并找出退款金额最高的前3单。",
         "user15",
         ("DETAIL", "RANKING", "TIME_WINDOW"),
-        minimum_branch_count=2,
     ),
     AcceptanceCase(
         "real_12_goods_audit_listing_analysis",
         "最近7天商品审核通过量、审核拒绝量和上架商品量分别是多少，帮我分析商品侧有没有问题。",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=1,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -138,14 +125,12 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近10天工单明细给我看一下，再按工单状态统计数量。",
         "user15",
         ("DETAIL", "DIMENSION", "RANKING", "TIME_WINDOW"),
-        minimum_branch_count=2,
     ),
     AcceptanceCase(
         "real_14_gmv_refund_ship_timeout",
         "最近30天 GMV 下降是不是和退款金额、发货超时订单量有关？",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
     AcceptanceCase(
@@ -153,7 +138,6 @@ USER_ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
         "最近7天优惠金额、优惠订单量和 GMV 分别是多少，优惠有没有带来成交提升？",
         "user15",
         ("METRIC", "TIME_WINDOW", "ANALYSIS"),
-        minimum_branch_count=2,
         requires_analysis_artifact=True,
     ),
 )
@@ -165,35 +149,30 @@ SUPPLEMENTAL_CASES: tuple[AcceptanceCase, ...] = (
         "最近7天订单量是多少？",
         "supplemental",
         ("METRIC", "TIME_WINDOW"),
-        minimum_branch_count=1,
     ),
     AcceptanceCase(
         "base_same_table_two_metrics",
         "最近7天订单量和 GMV 分别是多少？",
         "supplemental",
         ("METRIC", "TIME_WINDOW"),
-        minimum_branch_count=1,
     ),
     AcceptanceCase(
         "base_cross_table",
         "最近7天订单量和发货超时订单量分别是多少？",
         "supplemental",
         ("METRIC", "TIME_WINDOW"),
-        minimum_branch_count=2,
     ),
     AcceptanceCase(
         "base_multiple_details",
         "最近7天订单明细和工单明细分别给我看一下。",
         "supplemental",
         ("DETAIL", "TIME_WINDOW"),
-        minimum_branch_count=2,
     ),
     AcceptanceCase(
         "base_topn_entity_chain",
         "最近30天退款金额最高的前5个商品，再看这些商品最近7天的工单量。",
         "supplemental",
         ("RANKING", "ENTITY", "DEPENDENCY", "METRIC", "TIME_WINDOW"),
-        minimum_branch_count=2,
         requires_entity_lineage=True,
     ),
     AcceptanceCase(
@@ -295,6 +274,46 @@ def _goal_kinds(trace: Mapping[str, Any], harness: Mapping[str, Any]) -> tuple[l
     return sorted(set(direct_kinds).union(kinds_by_id.values())), kinds_by_id
 
 
+def _normalized_goal(raw: Any) -> dict[str, Any]:
+    goal = _mapping(raw)
+    return {
+        "goalId": str(_pick(goal, "goalId", "goal_id", "id", default="") or ""),
+        "kind": str(_pick(goal, "kind", "goalKind", "goal_kind", default="") or "").upper(),
+        "required": bool(_pick(goal, "required", default=True)),
+        "dependsOnGoalIds": _strings(
+            _pick(goal, "dependsOnGoalIds", "depends_on_goal_ids", default=[])
+        ),
+        "populationScope": str(
+            _pick(goal, "populationScope", "population_scope", default="") or ""
+        ).upper(),
+        "populationGoalIds": _strings(
+            _pick(goal, "populationGoalIds", "population_goal_ids", default=[])
+        ),
+        "upstreamGoalIds": _strings(
+            _pick(goal, "upstreamGoalIds", "upstream_goal_ids", default=[])
+        ),
+        "downstreamGoalIds": _strings(
+            _pick(goal, "downstreamGoalIds", "downstream_goal_ids", default=[])
+        ),
+        "dependencyType": str(
+            _pick(goal, "dependencyType", "dependency_type", default="") or ""
+        ).upper(),
+        "artifactKind": str(
+            _pick(goal, "artifactKind", "artifact_kind", default="") or ""
+        ).upper(),
+    }
+
+
+def _goals(trace: Mapping[str, Any], harness: Mapping[str, Any]) -> list[dict[str, Any]]:
+    contract = _goal_contract(trace, harness)
+    raw_goals = _pick(
+        contract,
+        "goals",
+        default=_pick(harness, "originalQuestionGoals", "goals", default=[]),
+    )
+    return [_normalized_goal(raw) for raw in _sequence(raw_goals)]
+
+
 def _normalized_branch(raw: Any) -> dict[str, Any]:
     branch = _mapping(raw)
     history = _sequence(_pick(branch, "statusHistory", "status_history", "history", "transitions", default=[]))
@@ -383,6 +402,7 @@ def parse_acceptance_response(
     budget = _mapping(_pick(harness, "runtimeBudget", "runtime_budget", default={}))
     usage = _mapping(_pick(budget, "usage", default={}))
     goal_kinds, goal_kinds_by_id = _goal_kinds(trace, harness)
+    goals = _goals(trace, harness)
 
     branches = [
         _normalized_branch(raw)
@@ -424,6 +444,7 @@ def parse_acceptance_response(
         "topicRouting": topic_routing,
         "goalKinds": goal_kinds,
         "goalKindsById": goal_kinds_by_id,
+        "goals": goals,
         "branches": branches,
         "artifactIds": all_artifact_ids,
         "queryArtifactIds": _dedupe(query_artifact_ids),
@@ -500,6 +521,82 @@ def _typed_analysis_insufficiency(summary: Mapping[str, Any]) -> bool:
     return False
 
 
+def _goal_coverage_map(
+    goal_coverage: Mapping[str, Any],
+    camel: str,
+    snake: str,
+) -> dict[str, Any]:
+    return _mapping(_coverage_value(goal_coverage, camel, snake, {}))
+
+
+def _branch_relation_is_declared(
+    *,
+    upstream_goal_id: str,
+    downstream_goal_id: str,
+    branches: Sequence[Mapping[str, Any]],
+) -> bool:
+    upstream_query_ids = {
+        str(branch.get("queryId") or "")
+        for branch in branches
+        if upstream_goal_id in _strings(branch.get("goalIds"))
+    }
+    downstream_branches = [
+        branch
+        for branch in branches
+        if downstream_goal_id in _strings(branch.get("goalIds"))
+    ]
+    if not upstream_query_ids or not downstream_branches:
+        return False
+    if any(
+        str(branch.get("queryId") or "") in upstream_query_ids
+        for branch in downstream_branches
+    ):
+        return True
+    return all(
+        bool(
+            upstream_query_ids.intersection(
+                _strings(branch.get("dependencyQueryIds"))
+            )
+        )
+        for branch in downstream_branches
+    )
+
+
+def _typed_lineage_relations(goals: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
+    relations: list[tuple[str, str, str]] = []
+    for goal in goals:
+        goal_id = str(goal.get("goalId") or "")
+        kind = str(goal.get("kind") or "").upper()
+        if kind == "RANKING" and str(goal.get("populationScope") or "") != "ALL_MATCHING_ROWS":
+            relations.extend(
+                (population_goal_id, goal_id, "RANKING_POPULATION")
+                for population_goal_id in _strings(goal.get("populationGoalIds"))
+            )
+        if kind != "DEPENDENCY":
+            continue
+        dependency_type = str(goal.get("dependencyType") or "")
+        artifact_kind = str(goal.get("artifactKind") or "")
+        if dependency_type in {"CONTRACT_SCOPE", "PREDICATE_SCOPE"}:
+            continue
+        if not (
+            dependency_type in {"ENTITY_CHAIN", "RESULT_CHAIN"}
+            or artifact_kind
+            in {
+                "ENTITY_SET",
+                "RESULT_ARTIFACT",
+                "VERIFIED_ENTITY_SET",
+                "VERIFIED_RESULT_ARTIFACT",
+            }
+        ):
+            continue
+        relations.extend(
+            (upstream_goal_id, downstream_goal_id, goal_id)
+            for upstream_goal_id in _strings(goal.get("upstreamGoalIds"))
+            for downstream_goal_id in _strings(goal.get("downstreamGoalIds"))
+        )
+    return list(dict.fromkeys(relations))
+
+
 def architecture_violations(case: AcceptanceCase, summary: Mapping[str, Any]) -> list[str]:
     """Return only architectural safety failures; numeric values are never asserted."""
 
@@ -536,15 +633,209 @@ def architecture_violations(case: AcceptanceCase, summary: Mapping[str, Any]) ->
     goal_kinds = {str(item).upper() for item in _sequence(summary.get("goalKinds"))}
     if not goal_kinds:
         violations.append("GOAL_KINDS_NOT_EXPOSED")
+    missing_expected_kinds = {
+        str(item).upper() for item in case.expected_goal_kinds
+    } - goal_kinds
+    if missing_expected_kinds:
+        violations.append("EXPECTED_GOAL_KINDS_MISSING")
+
+    goals = [_mapping(raw) for raw in _sequence(summary.get("goals"))]
+    goal_by_id = {
+        str(goal.get("goalId") or ""): goal
+        for goal in goals
+        if str(goal.get("goalId") or "")
+    }
+    if not goal_by_id or len(goal_by_id) != len(goals):
+        violations.append("TYPED_GOAL_CONTRACT_NOT_EXPOSED")
+    required_goal_ids = {
+        goal_id
+        for goal_id, goal in goal_by_id.items()
+        if bool(goal.get("required", True))
+    }
+
     artifact_ids = set(_strings(summary.get("artifactIds")))
     if not artifact_ids:
         violations.append("FINAL_ANSWER_HAS_NO_VERIFIED_ARTIFACT")
+
+    coverage_required_goal_ids = set(
+        _strings(
+            _coverage_value(
+                goal_coverage,
+                "requiredGoalIds",
+                "required_goal_ids",
+                [],
+            )
+        )
+    )
+    if required_goal_ids != coverage_required_goal_ids:
+        violations.append("GOAL_COVERAGE_REQUIRED_SET_MISMATCH")
+    resolutions = _goal_coverage_map(
+        goal_coverage,
+        "resolutionByGoalId",
+        "resolution_by_goal_id",
+    )
+    proof_types_by_goal = _goal_coverage_map(
+        goal_coverage,
+        "resolutionProofTypesByGoalId",
+        "resolution_proof_types_by_goal_id",
+    )
+    artifact_ids_by_goal = _goal_coverage_map(
+        goal_coverage,
+        "resolutionArtifactIdsByGoalId",
+        "resolution_artifact_ids_by_goal_id",
+    )
+    evidence_refs_by_goal = _goal_coverage_map(
+        goal_coverage,
+        "resolutionEvidenceRefsByGoalId",
+        "resolution_evidence_refs_by_goal_id",
+    )
+    insufficiency_reasons = _goal_coverage_map(
+        goal_coverage,
+        "insufficiencyReasonByGoalId",
+        "insufficiency_reason_by_goal_id",
+    )
+    for goal_id in required_goal_ids:
+        resolution = str(resolutions.get(goal_id) or "").upper()
+        if resolution not in {"PROVED", "INSUFFICIENT_EVIDENCE"}:
+            violations.append("REQUIRED_GOAL_RESOLUTION_NOT_TYPED")
+            continue
+        if resolution == "PROVED":
+            proof_types = _strings(proof_types_by_goal.get(goal_id))
+            proved_artifact_ids = set(_strings(artifact_ids_by_goal.get(goal_id)))
+            if not proof_types:
+                violations.append("PROVED_GOAL_REQUIRES_TYPED_PROOF")
+            if not proved_artifact_ids:
+                violations.append("PROVED_GOAL_REQUIRES_VERIFIED_ARTIFACT")
+            elif not proved_artifact_ids.issubset(artifact_ids):
+                violations.append("GOAL_PROOF_REFERENCES_UNVERIFIED_ARTIFACT")
+        elif not (
+            str(insufficiency_reasons.get(goal_id) or "").strip()
+            and _strings(evidence_refs_by_goal.get(goal_id))
+        ):
+            violations.append("INSUFFICIENT_GOAL_REQUIRES_TYPED_EVIDENCE_GAP")
+
+    answer_required_goal_ids = set(
+        _strings(
+            _coverage_value(
+                answer_coverage,
+                "requiredGoalIds",
+                "required_goal_ids",
+                [],
+            )
+        )
+    )
+    if answer_required_goal_ids != required_goal_ids:
+        violations.append("ANSWER_COVERAGE_REQUIRED_SET_MISMATCH")
+    binding_by_goal_id: dict[str, dict[str, Any]] = {}
     for raw in _sequence(answer_coverage.get("bindings")):
         binding = _mapping(raw)
-        supplied = set(_strings(_pick(binding, "artifactIds", "artifact_ids", default=[])))
-        if not supplied.issubset(artifact_ids):
+        goal_id = str(_pick(binding, "goalId", "goal_id", default="") or "")
+        if not goal_id or goal_id in binding_by_goal_id:
+            violations.append("ANSWER_BINDING_GOAL_ID_INVALID")
+            continue
+        binding_by_goal_id[goal_id] = binding
+        supplied_artifacts = set(
+            _strings(_pick(binding, "artifactIds", "artifact_ids", default=[]))
+        )
+        supplied_refs = set(
+            _strings(_pick(binding, "evidenceRefs", "evidence_refs", default=[]))
+        )
+        if not supplied_artifacts.issubset(artifact_ids):
             violations.append("ANSWER_BINDING_REFERENCES_UNVERIFIED_ARTIFACT")
-            break
+        allowed_artifacts = set(_strings(artifact_ids_by_goal.get(goal_id)))
+        allowed_refs = set(_strings(evidence_refs_by_goal.get(goal_id)))
+        if not supplied_artifacts.issubset(allowed_artifacts) or not supplied_refs.issubset(allowed_refs):
+            violations.append("ANSWER_BINDING_REFERENCES_DIFFERENT_GOAL_EVIDENCE")
+        resolution = str(resolutions.get(goal_id) or "").upper()
+        if str(_pick(binding, "resolution", default="") or "").upper() != resolution:
+            violations.append("ANSWER_BINDING_RESOLUTION_MISMATCH")
+        if resolution == "PROVED" and not (
+            supplied_artifacts.intersection(allowed_artifacts)
+            or supplied_refs.intersection(allowed_refs)
+        ):
+            violations.append("ANSWER_BINDING_REQUIRES_FINAL_RESULT_EVIDENCE")
+        if resolution == "INSUFFICIENT_EVIDENCE" and str(
+            _pick(binding, "insufficiencyRef", "insufficiency_ref", default="") or ""
+        ) not in allowed_refs:
+            violations.append("ANSWER_BINDING_REQUIRES_TYPED_INSUFFICIENCY_REF")
+    if required_goal_ids - set(binding_by_goal_id):
+        violations.append("FINAL_ANSWER_MISSING_REQUIRED_GOAL_BINDING")
+
+    for goal in goals:
+        if str(goal.get("kind") or "") != "RANKING":
+            continue
+        goal_id = str(goal.get("goalId") or "")
+        population_scope = str(goal.get("populationScope") or "")
+        valid_population_scopes = {
+            "ALL_MATCHING_ROWS",
+            "SAME_AS_GOAL",
+            "VERIFIED_ENTITY_SET",
+            "VERIFIED_PREDICATE_SCOPE",
+            "VERIFIED_RESULT_ARTIFACT",
+        }
+        if not population_scope:
+            violations.append("RANKING_POPULATION_SCOPE_NOT_DECLARED")
+        elif population_scope not in valid_population_scopes:
+            violations.append("RANKING_POPULATION_SCOPE_INVALID")
+        population_goal_ids = set(_strings(goal.get("populationGoalIds")))
+        if not population_goal_ids.issubset(goal_by_id):
+            violations.append("RANKING_POPULATION_GOAL_UNKNOWN")
+        if population_scope in {"SAME_AS_GOAL", "VERIFIED_ENTITY_SET"} and not population_goal_ids:
+            violations.append("RANKING_POPULATION_GOAL_REQUIRED")
+        if population_scope in {
+            "ALL_MATCHING_ROWS",
+            "VERIFIED_PREDICATE_SCOPE",
+            "VERIFIED_RESULT_ARTIFACT",
+        } and population_goal_ids:
+            violations.append("RANKING_POPULATION_GOAL_UNEXPECTED")
+        if any(
+            str(goal_by_id[population_goal_id].get("kind") or "")
+            not in {"DETAIL", "ENTITY", "RANKING"}
+            for population_goal_id in population_goal_ids.intersection(goal_by_id)
+        ):
+            violations.append("RANKING_POPULATION_GOAL_KIND_INVALID")
+        if population_goal_ids and any(
+            str(resolutions.get(goal_id) or "").upper() != "PROVED"
+            for goal_id in population_goal_ids
+        ):
+            violations.append("RANKING_POPULATION_GOALS_NOT_PROVED")
+        proof_types = {
+            item.upper() for item in _strings(proof_types_by_goal.get(goal_id))
+        }
+        if (
+            str(resolutions.get(goal_id) or "").upper() == "PROVED"
+            and "VERIFIED_ORDERED_ROW_SET" not in proof_types
+        ):
+            violations.append("RANKING_REQUIRES_VERIFIED_POPULATION_PROOF")
+        if population_scope != "ALL_MATCHING_ROWS" and not _strings(
+            evidence_refs_by_goal.get(goal_id)
+        ):
+            violations.append("RANKING_POPULATION_LINEAGE_NOT_ATTESTED")
+
+    dependency_goals = [
+        goal for goal in goals if str(goal.get("kind") or "") == "DEPENDENCY"
+    ]
+    for goal in dependency_goals:
+        goal_id = str(goal.get("goalId") or "")
+        referenced_goal_ids = {
+            *_strings(goal.get("upstreamGoalIds")),
+            *_strings(goal.get("downstreamGoalIds")),
+        }
+        if not referenced_goal_ids or not referenced_goal_ids.issubset(goal_by_id):
+            violations.append("DEPENDENCY_GOAL_RELATION_INCOMPLETE")
+        if referenced_goal_ids and any(
+            str(resolutions.get(reference_goal_id) or "").upper() != "PROVED"
+            for reference_goal_id in referenced_goal_ids
+        ):
+            violations.append("DEPENDENCY_RELATION_GOALS_NOT_PROVED")
+        proof_types = {
+            item.upper() for item in _strings(proof_types_by_goal.get(goal_id))
+        }
+        if (
+            str(resolutions.get(goal_id) or "").upper() == "PROVED"
+            and "VERIFIED_ARTIFACT_LINEAGE" not in proof_types
+        ):
+            violations.append("DEPENDENCY_REQUIRES_VERIFIED_ARTIFACT_LINEAGE")
 
     if case.requires_analysis_artifact:
         has_analysis_artifact = bool(_strings(summary.get("analysisArtifactIds")))
@@ -552,8 +843,6 @@ def architecture_violations(case: AcceptanceCase, summary: Mapping[str, Any]) ->
             violations.append("ANALYSIS_REQUIRES_VERIFIED_ARTIFACT_OR_TYPED_INSUFFICIENCY")
 
     branches = [_mapping(raw) for raw in _sequence(summary.get("branches"))]
-    if len(branches) < case.minimum_branch_count:
-        violations.append("INDEPENDENT_GOALS_REQUIRE_DECLARED_BRANCHES")
     for branch in branches:
         if not (
             str(branch.get("queryId") or "")
@@ -563,31 +852,31 @@ def architecture_violations(case: AcceptanceCase, summary: Mapping[str, Any]) ->
         ):
             violations.append("BRANCH_SCOPE_OR_STATUS_INCOMPLETE")
             break
+        if str(branch.get("status") or "").upper() != "VERIFIED" or not _strings(
+            branch.get("verifiedArtifactIds")
+        ):
+            violations.append("DECLARED_BRANCH_REQUIRES_VERIFIED_RESULT")
+            break
 
     kinds_by_id = _mapping(summary.get("goalKindsById"))
-    query_goal_kinds = {"METRIC", "DIMENSION", "TIME_WINDOW", "ENTITY", "DEPENDENCY", "DETAIL", "RANKING"}
+    query_goal_kinds = {"METRIC", "DIMENSION", "TIME_WINDOW", "ENTITY", "DETAIL", "RANKING"}
     query_goal_ids = {goal_id for goal_id, kind in kinds_by_id.items() if str(kind).upper() in query_goal_kinds}
     assigned_goal_ids = {goal_id for branch in branches for goal_id in _strings(branch.get("goalIds"))}
-    if query_goal_ids - assigned_goal_ids:
+    if branches and query_goal_ids - assigned_goal_ids:
         violations.append("QUERY_GOALS_MUST_BE_ASSIGNED_TO_BRANCH")
 
-    if case.requires_entity_lineage:
-        branch_by_id = {str(branch.get("queryId") or ""): branch for branch in branches}
-        dependent = [branch for branch in branches if _strings(branch.get("dependencyQueryIds"))]
-        lineage_safe = False
-        for branch in dependent:
-            dependencies = _strings(branch.get("dependencyQueryIds"))
-            upstream_verified = all(
-                dependency in branch_by_id and _strings(branch_by_id[dependency].get("verifiedArtifactIds"))
-                for dependency in dependencies
-            )
-            lineage_bound = bool(
-                branch.get("lineageWaitObserved")
-                and (upstream_verified or _strings(branch.get("upstreamEntityArtifactIds")))
-            )
-            lineage_safe = lineage_safe or lineage_bound
-        if not lineage_safe:
-            violations.append("ENTITY_CHAIN_MUST_WAIT_FOR_VERIFIED_LINEAGE")
+    lineage_relations = _typed_lineage_relations(goals)
+    if case.requires_entity_lineage and not lineage_relations:
+        violations.append("ENTITY_LINEAGE_RELATION_NOT_DECLARED")
+    if branches and any(
+        not _branch_relation_is_declared(
+            upstream_goal_id=upstream_goal_id,
+            downstream_goal_id=downstream_goal_id,
+            branches=branches,
+        )
+        for upstream_goal_id, downstream_goal_id, _ in lineage_relations
+    ):
+        violations.append("CROSS_NODE_LINEAGE_REQUIRES_EXECUTION_DEPENDENCY")
 
     return _dedupe(violations)
 

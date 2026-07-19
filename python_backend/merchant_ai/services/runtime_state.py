@@ -14,7 +14,9 @@ from typing import Any, Dict, Iterator, List, Optional
 from merchant_ai.config import Settings
 
 
-TERMINAL_EXECUTION_STATUSES = frozenset({"succeeded", "failed", "timed_out", "canceled"})
+TERMINAL_EXECUTION_STATUSES = frozenset(
+    {"succeeded", "failed", "timed_out", "canceled", "outcome_unknown"}
+)
 
 
 class StaleNodeTaskFence(RuntimeError):

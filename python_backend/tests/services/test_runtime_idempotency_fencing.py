@@ -12,6 +12,7 @@ from merchant_ai.config import Settings
 from merchant_ai.services.runtime_state import (
     MemoryRuntimeStateStore,
     NodeTaskState,
+    NodeTaskRequestConflict,
     PostgresRuntimeStateStore,
     RedisRuntimeStateStore,
     StaleExecutionFence,
@@ -22,13 +23,25 @@ from merchant_ai.services.distributed_workers import (
     DistributedSubAgentClient,
     DistributedSubAgentWorker,
 )
-from merchant_ai.models import ToolCallRequest
+from merchant_ai.models import (
+    NodeExecutionContext,
+    NodePlanContract,
+    PlanningAssetPack,
+    ToolCallRequest,
+)
+from merchant_ai.services.query import (
+    execution_asset_pack_fingerprint,
+    node_tool_execution_identity,
+)
 from merchant_ai.services.tool_runtime import (
+    ExecutionIdentity,
+    SideEffectSinkContract,
     ToolCallExecutor,
     ToolFailureRegistry,
     ToolRuntimePolicyRegistry,
     ToolRuntimeService,
     current_tool_execution_fence,
+    guarded_side_effect_handler,
     normalize_tool_context,
     tool_idempotency_key,
 )
@@ -45,6 +58,27 @@ def _custom_read_registry() -> ToolRegistry:
                 fail_closed=True,
             )
         ]
+    )
+
+
+def _custom_side_effect_registry() -> ToolRegistry:
+    return ToolRegistry(
+        [
+            ToolCapability(
+                name="custom_tool",
+                side_effect_level="governed_write",
+                cache_policy="disabled",
+                fail_closed=True,
+            )
+        ]
+    )
+
+
+def _fenced_sink_contract() -> SideEffectSinkContract:
+    return SideEffectSinkContract(
+        sink_name="test_sink",
+        idempotency_key_enforced=True,
+        fencing_token_enforced=True,
     )
 
 
@@ -174,6 +208,26 @@ def test_stale_distributed_worker_cannot_publish_over_winning_artifact(
     assert result_files == [Path(result_uri)]
 
 
+def test_distributed_task_key_rejects_a_different_immutable_request(
+    tmp_path: Path,
+):
+    settings = Settings(
+        harness_workspace_path=str(tmp_path),
+        runtime_state_backend="memory",
+    )
+    store = MemoryRuntimeStateStore()
+    artifacts = DistributedArtifactStore(settings)
+    client = DistributedSubAgentClient(settings, store, artifacts)
+
+    first = client.submit("run", "task", "analysis", {"input": 1})
+    replay = client.submit("run", "task", "analysis", {"input": 1})
+
+    assert replay.request_fingerprint == first.request_fingerprint
+    assert replay.payload["requestArtifactUri"] == first.payload["requestArtifactUri"]
+    with pytest.raises(NodeTaskRequestConflict):
+        client.submit("run", "task", "analysis", {"input": 2})
+
+
 def test_concurrent_duplicate_tool_call_executes_handler_once_and_replays_result():
     settings = Settings(
         cache_enabled=False,
@@ -248,7 +302,134 @@ def test_timed_out_tool_call_is_not_automatically_executed_again():
     assert journal.get_execution(first.idempotency_key).status == "timed_out"
 
 
-def test_authorization_scope_is_bound_into_the_idempotency_key():
+def test_side_effecting_tool_without_a_sink_contract_fails_before_handler():
+    settings = Settings(
+        cache_enabled=False,
+        tool_rate_limit_enabled=False,
+        runtime_state_backend="memory",
+    )
+    journal = MemoryRuntimeStateStore()
+    runtime = ToolRuntimeService(
+        settings,
+        execution_journal=journal,
+        tool_registry=_custom_side_effect_registry(),
+    )
+    calls = {"count": 0}
+
+    def unsafe_handler(_args):
+        calls["count"] += 1
+        return {"value": 1}
+
+    result = runtime.execute(
+        "custom_tool",
+        {},
+        unsafe_handler,
+        call_id="stable-call",
+    )
+
+    assert result.status == "blocked"
+    assert result.error_type == "SIDE_EFFECT_SINK_CONTRACT_REQUIRED"
+    assert calls["count"] == 0
+    assert journal.get_execution(result.idempotency_key) is None
+
+
+def test_incomplete_sink_contract_is_rejected_fail_closed():
+    settings = Settings(
+        cache_enabled=False,
+        tool_rate_limit_enabled=False,
+        runtime_state_backend="memory",
+    )
+    runtime = ToolRuntimeService(
+        settings,
+        execution_journal=MemoryRuntimeStateStore(),
+        tool_registry=_custom_side_effect_registry(),
+    )
+    guarded = guarded_side_effect_handler(
+        lambda _args, _intent: {"value": 1},
+        SideEffectSinkContract(
+            sink_name="incomplete_sink",
+            idempotency_key_enforced=True,
+        ),
+    )
+
+    result = runtime.execute(
+        "custom_tool",
+        {},
+        guarded,
+        call_id="stable-call",
+    )
+
+    assert result.status == "blocked"
+    assert result.error_type == "SIDE_EFFECT_SINK_CONTRACT_REQUIRED"
+
+
+def test_side_effect_timeout_is_outcome_unknown_and_late_completion_cannot_rewrite_journal():
+    settings = Settings(
+        cache_enabled=False,
+        tool_rate_limit_enabled=False,
+        agent_node_timeout_seconds=1,
+        runtime_state_backend="memory",
+    )
+    journal = MemoryRuntimeStateStore()
+    runtime = ToolRuntimeService(
+        settings,
+        execution_journal=journal,
+        tool_registry=_custom_side_effect_registry(),
+    )
+    release = threading.Event()
+    late_completion = threading.Event()
+    effects = []
+
+    def sink(_args, intent):
+        release.wait(timeout=3)
+        effects.append(intent.fence())
+        late_completion.set()
+        return {"value": 1}
+
+    handler = guarded_side_effect_handler(sink, _fenced_sink_contract())
+    first = runtime.execute(
+        "custom_tool",
+        {"value": 1},
+        handler,
+        call_id="stable-call",
+    )
+    replayed_while_handler_is_alive = runtime.execute(
+        "custom_tool",
+        {"value": 1},
+        handler,
+        call_id="stable-call",
+    )
+
+    assert first.status == "outcome_unknown"
+    assert first.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+    assert first.retryable is False
+    assert first.details["handlerMayStillBeRunning"] is True
+    assert replayed_while_handler_is_alive.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+    assert replayed_while_handler_is_alive.attempts == 0
+    entry = journal.get_execution(first.idempotency_key)
+    assert entry is not None
+    assert entry.status == "outcome_unknown"
+    assert entry.payload["sideEffectIntent"]["idempotencyKey"] == first.idempotency_key
+    assert entry.payload["sideEffectIntent"]["sinkContract"]["failClosedReady"] is True
+
+    release.set()
+    assert late_completion.wait(timeout=1)
+    assert len(effects) == 1
+    assert effects[0]["idempotencyKey"] == first.idempotency_key
+    assert journal.get_execution(first.idempotency_key).status == "outcome_unknown"
+
+    replayed_after_late_completion = runtime.execute(
+        "custom_tool",
+        {"value": 1},
+        handler,
+        call_id="stable-call",
+    )
+    assert replayed_after_late_completion.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+    assert replayed_after_late_completion.attempts == 0
+    assert len(effects) == 1
+
+
+def test_client_scope_is_only_an_untrusted_parameter_not_execution_authority():
     first = normalize_tool_context(
         "custom_tool",
         {"value": 1, "_scope": {"role": "analyst", "storeIds": ["one"]}},
@@ -258,9 +439,152 @@ def test_authorization_scope_is_bound_into_the_idempotency_key():
         {"value": 1, "_scope": {"role": "viewer", "storeIds": ["two"]}},
     )
 
+    assert first["merchantId"] == second["merchantId"] == ""
+    assert first["identityFingerprint"] == second["identityFingerprint"]
     assert first["paramsHash"] != second["paramsHash"]
     assert tool_idempotency_key("custom_tool", "call", first) != tool_idempotency_key(
         "custom_tool", "call", second
+    )
+
+
+def _server_identity(**overrides):
+    values = {
+        "merchant_id": "merchant-a",
+        "tenant_id": "tenant-a",
+        "principal_id": "principal-a",
+        "role": "analyst",
+        "permissions": ["read", "export"],
+        "region": "north",
+        "store_ids": ["store-1", "store-2"],
+        "row_policy": {"mode": "required", "filterColumn": "tenant_key"},
+        "datasource_environment": "production",
+        "semantic_activation_fingerprint": "semantic-v1",
+    }
+    values.update(overrides)
+    return ExecutionIdentity.from_server_context(**values)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"merchant_id": "merchant-b"},
+        {"tenant_id": "tenant-b"},
+        {"principal_id": "principal-b"},
+        {"role": "viewer"},
+        {"permissions": ["read"]},
+        {"region": "south"},
+        {"store_ids": ["store-1"]},
+        {"row_policy": {"mode": "required", "filterColumn": "region_key"}},
+        {"datasource_environment": "staging"},
+        {"semantic_activation_fingerprint": "semantic-v2"},
+    ],
+)
+def test_every_server_identity_dimension_fences_idempotent_replay(changed):
+    baseline = normalize_tool_context(
+        "custom_tool",
+        {"value": 1},
+        execution_identity=_server_identity(),
+    )
+    variant = normalize_tool_context(
+        "custom_tool",
+        {"value": 1},
+        execution_identity=_server_identity(**changed),
+    )
+
+    assert baseline["paramsHash"] == variant["paramsHash"]
+    assert baseline["identityFingerprint"] != variant["identityFingerprint"]
+    assert tool_idempotency_key("custom_tool", "call", baseline) != tool_idempotency_key(
+        "custom_tool", "call", variant
+    )
+
+
+def test_identity_collection_order_is_canonical():
+    first = _server_identity(
+        permissions=["export", "read", "read"],
+        store_ids=["store-2", "store-1"],
+        row_policy={"filterColumn": "tenant_key", "mode": "required"},
+    )
+    second = _server_identity(
+        permissions=["read", "export"],
+        store_ids=["store-1", "store-2"],
+        row_policy={"mode": "required", "filterColumn": "tenant_key"},
+    )
+
+    assert first.fingerprint() == second.fingerprint()
+
+
+def test_committed_result_cannot_replay_across_server_identity():
+    settings = Settings(
+        cache_enabled=False,
+        tool_rate_limit_enabled=False,
+        runtime_state_backend="memory",
+    )
+    runtime = ToolRuntimeService(
+        settings,
+        execution_journal=MemoryRuntimeStateStore(),
+        tool_registry=_custom_read_registry(),
+    )
+    calls = {"count": 0}
+
+    def handler(_args):
+        calls["count"] += 1
+        return {"value": calls["count"]}
+
+    first = runtime.execute(
+        "custom_tool",
+        {"_scope": {"role": "victim"}},
+        handler,
+        call_id="same-call",
+        execution_identity=_server_identity(principal_id="victim"),
+    )
+    second = runtime.execute(
+        "custom_tool",
+        {"_scope": {"role": "victim"}},
+        handler,
+        call_id="same-call",
+        execution_identity=_server_identity(principal_id="attacker"),
+    )
+
+    assert first.idempotency_key != second.idempotency_key
+    assert first.result == {"value": 1}
+    assert second.result == {"value": 2}
+    assert calls["count"] == 2
+
+
+def test_query_node_builds_identity_from_server_contract_and_runtime_assets():
+    contract = NodePlanContract(
+        merchant_id="merchant-a",
+        effective_user_id="principal-a",
+        access_role="analyst",
+        authorized_region="north",
+        authorized_store_ids=["store-2", "store-1"],
+        row_scope_policy={"mode": "required", "filterColumn": "tenant_key"},
+    )
+    context = NodeExecutionContext(
+        merchant_id="merchant-a",
+        context_package={
+            "userScope": {
+                "tenantId": "tenant-a",
+                "permissions": ["export", "read"],
+            }
+        },
+    )
+    asset_pack = PlanningAssetPack(table_manifest={"topic": "versioned"})
+    settings = Settings(doris_datasource_environment="production")
+
+    identity = node_tool_execution_identity(contract, context, asset_pack, settings)
+
+    assert identity.merchant_id == "merchant-a"
+    assert identity.tenant_id == "tenant-a"
+    assert identity.principal_id == "principal-a"
+    assert identity.role == "analyst"
+    assert identity.permissions == ("export", "read")
+    assert identity.region == "north"
+    assert identity.store_ids == ("store-1", "store-2")
+    assert identity.row_policy_fingerprint
+    assert identity.datasource_environment == "production"
+    assert identity.semantic_activation_fingerprint == execution_asset_pack_fingerprint(
+        asset_pack
     )
 
 
@@ -320,6 +644,43 @@ def test_batch_tool_executor_replays_committed_call_instead_of_invoking_handler_
     assert first.result == replayed.result == {"value": 1}
     assert replayed.attempts == 0
     assert calls["count"] == 1
+
+
+def test_batch_executor_persists_unknown_outcome_for_a_late_side_effect():
+    settings = Settings(agent_node_timeout_seconds=1)
+    journal = MemoryRuntimeStateStore()
+    executor = ToolCallExecutor(
+        ToolRuntimePolicyRegistry(settings),
+        ToolFailureRegistry(),
+        max_concurrency=1,
+        execution_journal=journal,
+        tool_registry=_custom_side_effect_registry(),
+    )
+    release = threading.Event()
+    completed = threading.Event()
+    effects = []
+
+    def sink(_args, intent):
+        release.wait(timeout=3)
+        effects.append(intent.idempotency_key)
+        completed.set()
+        return {"value": 1}
+
+    handler = guarded_side_effect_handler(sink, _fenced_sink_contract())
+    request = ToolCallRequest(id="same", name="custom_tool", args={"input": 1})
+    first = executor.execute([request], {"custom_tool": handler})[0]
+    replayed = executor.execute([request], {"custom_tool": handler})[0]
+
+    assert first.status == "outcome_unknown"
+    assert first.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+    assert replayed.error_type == "SIDE_EFFECT_OUTCOME_UNKNOWN"
+    assert replayed.attempts == 0
+    assert journal.get_execution(first.idempotency_key).status == "outcome_unknown"
+
+    release.set()
+    assert completed.wait(timeout=1)
+    assert effects == [first.idempotency_key]
+    assert journal.get_execution(first.idempotency_key).status == "outcome_unknown"
 
 
 def test_expired_side_effecting_execution_requires_review_instead_of_takeover():

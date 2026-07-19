@@ -563,6 +563,15 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
     assert "automatically binds" in first["trustedExecutionScope"]["tenantFilterPolicy"]
     assert first["topicL0Manifests"][0]["topic"] == "客服工单"
     assert first["thinRecallCandidates"][0]["refId"] == "semantic:客服工单:tickets:detail"
+    goal_policy = first["originalQuestionGoalPolicy"]
+    assert goal_policy["queryTopologyDecision"] == (
+        "LATE_BOUND_AFTER_FORMAL_EVIDENCE"
+    )
+    assert goal_policy["executionGraphFreezePoint"] == (
+        "IMMEDIATELY_BEFORE_QUERY_PREPARATION"
+    )
+    assert "branchDeclarationRequiredBeforeRetrieval" not in goal_policy
+    assert "Do not freeze query branches" in first["instructions"]
     assert "availableSkillHeaders" not in first
     assert first["analysisSkillPolicy"] == {
         "lifecyclePhase": "post_query_analysis",
@@ -1080,7 +1089,7 @@ def test_catalog_pagination_is_rejected_in_favor_of_targeted_grep() -> None:
     assert "grep" in payload["message"]
 
 
-def test_context_middleware_compacts_old_reads_and_hides_retrieval_tools_when_ready() -> None:
+def test_context_middleware_keeps_messages_below_watermark_and_hides_retrieval_tools_when_ready() -> None:
     contract = GroundedQueryContract(
         question="工单量",
         status="READY",
@@ -1177,12 +1186,13 @@ def test_context_middleware_compacts_old_reads_and_hides_retrieval_tools_when_re
     updated = captured["request"]
 
     assert result == "ok"
-    assert len(str(updated.messages[2].content)) < 1_000
+    assert updated.messages == messages
     assert str(updated.messages[4].content) == '{"status":"VERIFIED"}'
     assert [_tool.name for _tool in updated.tools] == ["execute_grounded_query"]
     report = session.core_context_reports[-1]
-    assert report["savedChars"] > 15_000
-    assert report["semanticReadMessagesCompacted"] == 1
+    assert report["compactionTriggered"] is False
+    assert report["savedChars"] == 0
+    assert report["semanticReadMessagesCompacted"] == 0
     assert report["removedTools"] == [
         "grep",
         "read_file",

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from merchant_ai.config import get_settings
+from merchant_ai.config import Settings, get_settings
 from merchant_ai.models import ResolvedTimeRange, ResultCoverage
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.assets import TopicAssetService
@@ -292,6 +293,117 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
 
     verified = EvidenceVerifier().verify(contract.question, preparation.plan, result)
     assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
+
+
+def test_grounded_query_persists_complete_masked_result_with_manifest(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(harness_workspace_path=str(tmp_path / "workspace"))
+    contract = scalar_contract()
+    pack = materialize_grounded_asset_pack(
+        contract,
+        TopicAssetService(settings),
+    )
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path / "acl",
+            contract,
+            merchant_id="merchant-1",
+            role="merchant_admin",
+        ),
+    )
+    artifact_root = (
+        settings.resolved_workspace_path
+        / "threads"
+        / "thread-1"
+        / "runs"
+        / "run-1"
+        / "outputs"
+        / "artifacts"
+    )
+
+    result = executor.execute_contract(
+        "merchant-1",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-1",
+        artifact_root=str(artifact_root),
+        context_owner_fingerprint="owner-fingerprint",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    bundle = result.merged_query_bundle
+    assert bundle.failed is False
+    assert len(bundle.offloaded_files) == 3
+    assert all(Path(path).is_file() for path in bundle.offloaded_files)
+    rows_path = next(
+        Path(path)
+        for path in bundle.offloaded_files
+        if path.endswith("_rows.json")
+    )
+    manifest_path = next(
+        Path(path)
+        for path in bundle.offloaded_files
+        if path.endswith(".manifest.json")
+    )
+    stored_rows = json.loads(rows_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert stored_rows == bundle.rows
+    assert manifest["artifactKind"] == "GROUNDED_QUERY_RESULT"
+    assert manifest["contextOwnerFingerprint"] == "owner-fingerprint"
+    assert manifest["storedRowCount"] == len(bundle.rows)
+    assert manifest["rowsSha256"] == manifest["rowsArtifact"]["sha256"]
+    receipt = bundle.runtime_events[0]["resultArtifact"]
+    assert receipt["artifactFingerprint"] == manifest["artifactFingerprint"]
+    assert receipt["rowsRef"].startswith("merchant://artifact/query_results/")
+
+
+def test_grounded_query_fails_closed_when_result_root_escapes_workspace(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(harness_workspace_path=str(tmp_path / "workspace"))
+    contract = scalar_contract()
+    pack = materialize_grounded_asset_pack(
+        contract,
+        TopicAssetService(settings),
+    )
+    preparation = compile_grounded_query(contract, pack)
+    executor = GroundedQueryExecutionKernel(
+        FakeDoris(),
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path / "acl",
+            contract,
+            merchant_id="merchant-1",
+            role="merchant_admin",
+        ),
+    )
+
+    result = executor.execute_contract(
+        "merchant-1",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        artifact_root=str(tmp_path / "outside"),
+        context_owner_fingerprint="owner-fingerprint",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    assert result.merged_query_bundle.failed is True
+    assert "QUERY_RESULT_ARTIFACT_WRITE_FAILED" in (
+        result.merged_query_bundle.error
+    )
 
 
 def test_business_time_filter_and_proven_partition_pruning_are_separate(
@@ -754,6 +866,61 @@ def test_detail_executor_uses_sentinel_row_to_mark_capped_result_as_preview(
     assert bundle.original_row_count == 0
     assert bundle.effective_row_count() == 100
     assert bundle.runtime_events[0]["fetchedRowCount"] == 101
+
+
+def test_preview_result_artifact_cannot_claim_complete_population(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(harness_workspace_path=str(tmp_path / "workspace"))
+    contract = detail_lookup_contract()
+    pack = materialize_grounded_asset_pack(
+        contract,
+        TopicAssetService(settings),
+    )
+    preparation = compile_grounded_query(contract, pack)
+    executor = GroundedQueryExecutionKernel(
+        FakeCappedDetailDoris(),
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path / "acl",
+            contract,
+            merchant_id="merchant_1",
+            role="merchant_admin",
+        ),
+    )
+    artifact_root = settings.resolved_workspace_path / "artifacts"
+
+    result = executor.execute_contract(
+        "merchant_1",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-preview",
+        artifact_root=str(artifact_root),
+        context_owner_fingerprint="owner-fingerprint",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    bundle = result.merged_query_bundle
+    manifest_path = next(
+        Path(path)
+        for path in bundle.offloaded_files
+        if path.endswith(".manifest.json")
+    )
+    rows_path = next(
+        Path(path)
+        for path in bundle.offloaded_files
+        if path.endswith("_rows.json")
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    stored_rows = json.loads(rows_path.read_text(encoding="utf-8"))
+    assert len(stored_rows) == 100
+    assert manifest["resultCoverage"] == ResultCoverage.PREVIEW.value
+    assert manifest["resultIsTruncated"] is True
+    assert manifest["exactResultRowCount"] == 0
 
 
 @pytest.mark.parametrize(

@@ -1423,6 +1423,8 @@ class GroundedRuntimeKernel:
         *,
         knowledge_context: str = "",
         run_id: str = "",
+        artifact_root: str = "",
+        context_owner_fingerprint: str = "",
         runtime_budget: Any = None,
         data_snapshot_contract: DataSnapshotContract | None = None,
     ) -> AgentRunResult:
@@ -1497,6 +1499,11 @@ class GroundedRuntimeKernel:
             "user_scope": dict(session.user_scope),
             "execution_preparation": runtime_preparation,
         }
+        if artifact_root:
+            execution_kwargs["artifact_root"] = artifact_root
+            execution_kwargs["context_owner_fingerprint"] = (
+                context_owner_fingerprint
+            )
         # Keep non-budget callers fully backward-compatible. Grounded tools
         # explicitly pass the one shared run budget so the executor can clamp
         # Doris immediately before the repository call.
