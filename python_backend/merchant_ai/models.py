@@ -270,6 +270,7 @@ class ChatDataSection(APIModel):
     result_artifacts: List[Dict[str, Any]] = Field(default_factory=list)
     preview_row_count: int = 0
     original_row_count: int = 0
+    original_row_count_exact: bool = False
     result_coverage: str = "UNKNOWN"
     has_more: bool = False
     result_summary: str = ""

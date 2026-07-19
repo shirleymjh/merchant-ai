@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -194,6 +196,8 @@ class WorkspaceArtifactStore:
             return {"success": False, "error": "ARTIFACT_NOT_FOUND", "path": path}
         if not target.exists() or not target.is_file():
             return {"success": False, "error": "ARTIFACT_NOT_FOUND", "path": path}
+        start = max(0, int(offset or 0))
+        limit = max(1, int(max_chars or self.settings.context_file_inline_max_chars))
         try:
             with _artifact_target_lock(target):
                 target = self._resolve(path)
@@ -201,14 +205,21 @@ class WorkspaceArtifactStore:
                 immutable_digest = _read_immutable_digest(marker_path)
                 if require_immutable and immutable_digest is None:
                     raise _ImmutableStateInvalidError
-                encoded = target.read_bytes()
-                actual_digest = hashlib.sha256(encoded).hexdigest()
+                (
+                    text,
+                    total_chars,
+                    actual_digest,
+                    byte_count,
+                ) = _read_text_page_and_digest(
+                    target,
+                    start=start,
+                    limit=limit,
+                )
                 if (
                     immutable_digest is not None
                     and actual_digest != immutable_digest
                 ):
                     raise _ImmutableStateInvalidError
-                text = encoded.decode("utf-8")
         except _ImmutableStateInvalidError:
             return {
                 "success": False,
@@ -217,19 +228,18 @@ class WorkspaceArtifactStore:
             }
         except (OSError, UnicodeError):
             return {"success": False, "error": "ARTIFACT_READ_FAILED", "path": path}
-        start = max(0, int(offset or 0))
-        limit = max(1, int(max_chars or self.settings.context_file_inline_max_chars))
-        end = min(len(text), start + limit)
+        end = min(total_chars, start + len(text))
         return {
             "success": True,
             "path": str(target),
             "relativePath": str(target.relative_to(self.root)) if self._is_under_root(target) else str(target),
             "merchantUri": merchant_uri_for_artifact(str(target.relative_to(self.root)) if self._is_under_root(target) else str(target)),
-            "content": text[start:end],
+            "content": text,
             "contentOffsetChars": start,
-            "nextContentOffsetChars": end if end < len(text) else None,
-            "truncated": end < len(text),
-            "estimatedChars": len(text),
+            "nextContentOffsetChars": end if end < total_chars else None,
+            "truncated": end < total_chars,
+            "estimatedChars": total_chars,
+            "bytes": byte_count,
             "sha256": actual_digest,
             "contentAddress": "sha256:%s" % actual_digest,
             "immutable": immutable_digest is not None,
@@ -255,17 +265,22 @@ class WorkspaceArtifactStore:
                 continue
             if not path.is_file():
                 continue
-            relative_path = str(path.relative_to(self.root))
-            read_result = self.read(
-                relative_path,
-                max_chars=max(1, int(path.stat().st_size) + 1),
-                require_immutable=require_immutable,
-            )
-            if not read_result.get("success"):
+            try:
+                with _artifact_target_lock(path):
+                    path = self._resolve(str(path.relative_to(self.root)))
+                    search_result = _grep_text_file_and_digest(
+                        path,
+                        terms,
+                        require_immutable=require_immutable,
+                    )
+            except (
+                ContextPathOutsideRootError,
+                OSError,
+                UnicodeError,
+                _ImmutableStateInvalidError,
+            ):
                 continue
-            text = str(read_result.get("content") or "")
-            lower = text.lower()
-            score = sum(lower.count(term) for term in terms)
+            score, snippets = search_result
             if score <= 0:
                 continue
             hits.append(
@@ -274,7 +289,7 @@ class WorkspaceArtifactStore:
                     "relativePath": str(path.relative_to(self.root)),
                     "merchantUri": merchant_uri_for_artifact(str(path.relative_to(self.root))),
                     "score": score,
-                    "snippets": artifact_snippets(text, terms, 3),
+                    "snippets": snippets,
                 }
             )
         hits.sort(key=lambda item: item["score"], reverse=True)
@@ -520,6 +535,179 @@ def _file_digest(path: Path) -> tuple[str, int]:
     except OSError as exc:
         raise _ImmutableStateInvalidError from exc
     return digest.hexdigest(), byte_count
+
+
+def _open_regular_file_for_read(path: Path) -> int:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise _ImmutableStateInvalidError
+    return descriptor
+
+
+def _read_text_page_and_digest(
+    path: Path,
+    *,
+    start: int,
+    limit: int,
+) -> tuple[str, int, str, int]:
+    """Stream one character page while hashing the complete UTF-8 file."""
+
+    descriptor = _open_regular_file_for_read(path)
+    digest = hashlib.sha256()
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    page: list[str] = []
+    total_chars = 0
+    byte_count = 0
+
+    def consume(decoded: str) -> None:
+        nonlocal total_chars
+        chunk_start = total_chars
+        chunk_end = chunk_start + len(decoded)
+        requested_end = start + limit
+        overlap_start = max(start, chunk_start)
+        overlap_end = min(requested_end, chunk_end)
+        if overlap_start < overlap_end:
+            page.append(
+                decoded[
+                    overlap_start - chunk_start : overlap_end - chunk_start
+                ]
+            )
+        total_chars = chunk_end
+
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            byte_count += len(chunk)
+            consume(decoder.decode(chunk, final=False))
+        consume(decoder.decode(b"", final=True))
+    finally:
+        os.close(descriptor)
+    return "".join(page), total_chars, digest.hexdigest(), byte_count
+
+
+def _grep_text_file_and_digest(
+    path: Path,
+    terms: Iterable[str],
+    *,
+    require_immutable: bool,
+) -> tuple[int, list[str]]:
+    """Literal-search a complete artifact with bounded memory and hash proof."""
+
+    immutable_digest = _read_immutable_digest(_immutable_marker_path(path))
+    if require_immutable and immutable_digest is None:
+        raise _ImmutableStateInvalidError
+    normalized_terms = tuple(
+        dict.fromkeys(
+            str(term or "").lower()
+            for term in terms
+            if str(term or "")
+        )
+    )
+    if not normalized_terms:
+        return 0, []
+
+    descriptor = _open_regular_file_for_read(path)
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    digest = hashlib.sha256()
+    score = 0
+    snippets: list[str] = []
+    total_chars = 0
+    processed_until = 0
+    carry = ""
+    future_margin = max(
+        160,
+        max(len(term) for term in normalized_terms) - 1,
+    )
+
+    def inspect(
+        window: str,
+        *,
+        window_start: int,
+        lower_bound: int,
+        upper_bound: int,
+    ) -> None:
+        nonlocal score
+        lowered = window.lower()
+        for term in normalized_terms:
+            cursor = 0
+            while True:
+                position = lowered.find(term, cursor)
+                if position < 0:
+                    break
+                absolute_position = window_start + position
+                if (
+                    absolute_position >= lower_bound
+                    and absolute_position < upper_bound
+                ):
+                    score += 1
+                    if len(snippets) < 3:
+                        snippet_start = max(0, position - 100)
+                        snippet_end = min(
+                            len(window),
+                            position + len(term) + 160,
+                        )
+                        snippet = (
+                            window[snippet_start:snippet_end]
+                            .replace("\n", " ")
+                            .strip()
+                        )
+                        if snippet and snippet not in snippets:
+                            snippets.append(snippet)
+                cursor = position + max(1, len(term))
+
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            decoded = decoder.decode(chunk, final=False)
+            window = carry + decoded
+            window_start = total_chars - len(carry)
+            total_chars += len(decoded)
+            safe_until = max(
+                processed_until,
+                total_chars - future_margin,
+            )
+            inspect(
+                window,
+                window_start=window_start,
+                lower_bound=processed_until,
+                upper_bound=safe_until,
+            )
+            processed_until = safe_until
+            carry_start = max(0, processed_until - 100)
+            carry = window[
+                max(0, carry_start - window_start) :
+            ]
+
+        decoded = decoder.decode(b"", final=True)
+        window = carry + decoded
+        window_start = total_chars - len(carry)
+        total_chars += len(decoded)
+        inspect(
+            window,
+            window_start=window_start,
+            lower_bound=processed_until,
+            upper_bound=total_chars,
+        )
+    finally:
+        os.close(descriptor)
+
+    actual_digest = digest.hexdigest()
+    if (
+        immutable_digest is not None
+        and actual_digest != immutable_digest
+    ):
+        raise _ImmutableStateInvalidError
+    return score, snippets
 
 
 def _is_internal_artifact_path(path: Path | str) -> bool:

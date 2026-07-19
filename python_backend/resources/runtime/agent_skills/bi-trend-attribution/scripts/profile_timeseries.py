@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import re
+import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List
@@ -21,8 +22,17 @@ def main() -> None:
 
 
 def build_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
-    rows = [row for row in payload.get("dataRows") or [] if isinstance(row, dict)]
-    date_key = first_present_key(rows, ["pt", "date", "dt", "biz_date"])
+    runtime_rows = verified_runtime_rows()
+    rows = (
+        runtime_rows
+        if runtime_rows is not None
+        else [
+            row
+            for row in payload.get("dataRows") or []
+            if isinstance(row, dict)
+        ]
+    )
+    date_key = explicit_observation_key(payload, rows)
     labels = metric_labels(payload, rows)
     metric_keys = numeric_metric_keys(rows, payload, exclude={date_key, "seller_id", "merchant_id"})
     metrics = [metric_profile(rows, date_key, key, labels) for key in metric_keys[:6]]
@@ -119,7 +129,7 @@ def build_findings(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def render_answer(payload: Dict[str, Any], metrics: List[Dict[str, Any]], findings: List[Dict[str, Any]], caveats: List[str]) -> str:
     lines = []
-    time_phrase = extract_question_time_phrase(str(payload.get("question") or ""))
+    time_phrase = structured_time_label(payload)
     if metrics:
         primary = metrics[0]
         label = primary.get("label") or primary.get("metric") or "指标"
@@ -155,7 +165,7 @@ def render_answer(payload: Dict[str, Any], metrics: List[Dict[str, Any]], findin
     else:
         lines.append("当前查询结果还不足以判断趋势。")
     disclosures = payload.get("metricDisclosures") or []
-    if disclosures and question_asks_metric_disclosure(str(payload.get("question") or "")):
+    if disclosures:
         lines.append("")
         lines.append("口径：")
         for item in disclosures[:6]:
@@ -193,72 +203,37 @@ def metric_labels(payload: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[s
 
 
 def fallback_metric_label(metric_key: str) -> str:
-    mapping = {
-        "order_gmv_amt_1d": "GMV",
-        "pay_gmv_amt_1d": "支付GMV",
-        "trade_success_gmv_amt_1d": "交易成功GMV",
-        "refund_amt_1d": "退款金额",
-        "pay_amt": "退款金额",
-        "seller_repay_amt_1d": "赔付金额",
-        "cs_ticket_cnt_1d": "咨询工单量",
-        "order_detail_cnt": "订单量",
-    }
-    if metric_key in mapping:
-        return mapping[metric_key]
-    text = str(metric_key or "")
-    dictionary = {
-        "order": "订单",
-        "detail": "明细",
-        "cnt": "数量",
-        "amt": "金额",
-        "gmv": "GMV",
-        "refund": "退款",
-        "trade": "交易",
-        "success": "成功",
-        "pay": "支付",
-        "ticket": "工单",
-    }
-    label = "".join(dictionary.get(part, "") for part in re.split(r"[_\s]+", text.lower()))
-    return label or text
-
-
-def question_asks_metric_disclosure(question: str) -> bool:
-    return bool(re.search(r"(口径|怎么算|计算方式|字段|来源表|SQL|sql)", str(question or ""), flags=re.I))
+    return str(metric_key or "")
 
 
 def numeric_metric_keys(rows: List[Dict[str, Any]], payload: Dict[str, Any], exclude: set[str]) -> List[str]:
     disclosed = disclosed_metric_keys(payload)
+    if not disclosed:
+        return []
     keys: List[str] = []
     for row in rows[:40]:
         for key, value in row.items():
             name = str(key)
             if name in exclude or name in keys:
                 continue
-            if entity_or_code_key(name):
-                continue
-            if disclosed and name not in disclosed:
-                continue
-            if not disclosed and not metric_shaped_key(name):
+            if name not in disclosed:
                 continue
             if decimal_value(value) is not None:
                 keys.append(name)
     return keys
 
 
-def extract_question_time_phrase(question: str) -> str:
-    for pattern in [
-        r"最近\s*\d+\s*[天日周月]",
-        r"近\s*\d+\s*[天日周月]",
-        r"过去\s*\d+\s*[天日周月]",
-        r"昨天",
-        r"今日",
-        r"今天",
-        r"本周",
-        r"本月",
-    ]:
-        match = re.search(pattern, str(question or ""))
-        if match:
-            return re.sub(r"\s+", "", match.group(0))
+def structured_time_label(payload: Dict[str, Any]) -> str:
+    summary = payload.get("groundedSummary")
+    if not isinstance(summary, dict):
+        return ""
+    time_range = summary.get("timeRange")
+    if not isinstance(time_range, dict):
+        return ""
+    for field in ("displayLabel", "requestedPhrase", "resolvedLabel"):
+        value = str(time_range.get(field) or "").strip()
+        if value:
+            return value
     return ""
 
 
@@ -299,23 +274,64 @@ def disclosed_metric_keys(payload: Dict[str, Any]) -> set[str]:
     return keys
 
 
-def entity_or_code_key(name: str) -> bool:
-    text = str(name or "").strip().lower()
-    if not text:
-        return True
-    return text == "id" or text.endswith("_id") or text.endswith("_code") or text.endswith("_no")
-
-
-def metric_shaped_key(name: str) -> bool:
-    text = str(name or "").strip().lower()
-    return text.endswith(("_cnt", "_amt", "_rate", "_gmv")) or "gmv" in text
-
-
-def first_present_key(rows: List[Dict[str, Any]], candidates: List[str]) -> str:
+def explicit_observation_key(
+    payload: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> str:
+    summary = payload.get("groundedSummary")
+    if not isinstance(summary, dict):
+        return ""
+    candidates = summary.get("observationColumns")
+    if not isinstance(candidates, list):
+        return ""
     for candidate in candidates:
-        if any(candidate in row for row in rows[:10]):
-            return candidate
+        key = str(candidate or "").strip()
+        if key and any(key in row for row in rows[:10]):
+            return key
     return ""
+
+
+def verified_runtime_rows() -> List[Dict[str, Any]] | None:
+    manifest_value = str(
+        os.environ.get("MERCHANT_ANALYSIS_INPUT_MANIFEST") or ""
+    ).strip()
+    if not manifest_value:
+        return None
+    manifest_path = Path(manifest_value).resolve(strict=True)
+    manifest_bytes = manifest_path.read_bytes()
+    expected_manifest_hash = str(
+        os.environ.get(
+            "MERCHANT_ANALYSIS_INPUT_MANIFEST_SHA256"
+        )
+        or ""
+    ).strip()
+    if hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_hash:
+        raise ValueError("verified input manifest hash mismatch")
+    manifest = json.loads(manifest_bytes)
+    inputs = manifest.get("inputs") if isinstance(manifest, dict) else None
+    if not isinstance(inputs, list):
+        raise ValueError("verified input manifest is invalid")
+    rows: List[Dict[str, Any]] = []
+    root = manifest_path.parent
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise ValueError("verified input entry is invalid")
+        relative = Path(str(item.get("rowsPath") or ""))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("verified input rows path is invalid")
+        rows_path = (root / relative).resolve(strict=True)
+        if root != rows_path and root not in rows_path.parents:
+            raise ValueError("verified input rows path is outside input root")
+        rows_bytes = rows_path.read_bytes()
+        if hashlib.sha256(rows_bytes).hexdigest() != str(
+            item.get("rowsSha256") or ""
+        ):
+            raise ValueError("verified input rows hash mismatch")
+        payload = json.loads(rows_bytes)
+        if not isinstance(payload, list):
+            raise ValueError("verified input rows are invalid")
+        rows.extend(row for row in payload if isinstance(row, dict))
+    return rows
 
 
 def decimal_value(value: Any) -> Decimal | None:

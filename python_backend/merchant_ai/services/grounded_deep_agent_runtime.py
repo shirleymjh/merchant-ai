@@ -3,8 +3,6 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
-import subprocess
-import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
@@ -238,6 +236,10 @@ from merchant_ai.services.grounded_context_compaction import (
 from merchant_ai.services.context_filesystem import (
     ContextPathOutsideRootError,
     resolve_context_path,
+)
+from merchant_ai.services.sandbox import (
+    MerchantAnalysisSandbox,
+    SandboxArtifactAccess,
 )
 
 
@@ -1265,12 +1267,25 @@ class GroundedRunFilesystemBackend:
         root_kind: str,
         read_only: bool,
         settings: Any = None,
+        allowed_artifact_digests: Optional[Mapping[str, str]] = None,
     ) -> None:
         if root_kind not in {"artifacts", "scratch"}:
             raise ValueError("unsupported grounded filesystem root kind")
         self.root_kind = root_kind
         self.read_only = bool(read_only)
         self.settings = settings
+        self.allowed_artifact_digests = (
+            {
+                str(Path(str(path))).replace("\\", "/").lstrip("/"): str(
+                    digest
+                )
+                for path, digest in dict(
+                    allowed_artifact_digests or {}
+                ).items()
+            }
+            if allowed_artifact_digests is not None
+            else None
+        )
 
     @staticmethod
     def _session() -> Optional[GroundedDeepAgentSession]:
@@ -1367,7 +1382,27 @@ class GroundedRunFilesystemBackend:
             max_chars=1,
             require_immutable=True,
         )
-        return bool(result.get("success"))
+        if not result.get("success"):
+            return False
+        if self.allowed_artifact_digests is None:
+            return True
+        relative = str(path.relative_to(root)).replace("\\", "/")
+        expected = self.allowed_artifact_digests.get(relative)
+        return bool(expected) and str(result.get("sha256") or "") == expected
+
+    def _path_allowed(self, root: Path, path: Path) -> bool:
+        if self.root_kind != "artifacts" or self.allowed_artifact_digests is None:
+            return True
+        relative = str(path.relative_to(root)).replace("\\", "/")
+        if path.is_file():
+            return relative in self.allowed_artifact_digests
+        prefix = relative.rstrip("/")
+        if not prefix or prefix == ".":
+            return bool(self.allowed_artifact_digests)
+        return any(
+            item.startswith(prefix + "/")
+            for item in self.allowed_artifact_digests
+        )
 
     def _artifact_directory_has_valid_file(
         self,
@@ -1392,6 +1427,8 @@ class GroundedRunFilesystemBackend:
         assert root is not None and target is not None
         if not target.exists():
             return LsResult(error="GROUNDED_CONTEXT_FILE_NOT_FOUND")
+        if not self._path_allowed(root, target):
+            return LsResult(error="GROUNDED_CONTEXT_FILE_NOT_ALLOWED")
         if target.is_file():
             if self._internal(target):
                 return LsResult(error="GROUNDED_CONTEXT_FILE_NOT_FOUND")
@@ -1406,6 +1443,8 @@ class GroundedRunFilesystemBackend:
             for child in sorted(target.iterdir(), key=lambda item: item.name):
                 safe_child = resolve_context_path(root, child)
                 if self._internal(safe_child):
+                    continue
+                if not self._path_allowed(root, safe_child):
                     continue
                 if self.root_kind == "artifacts":
                     if safe_child.is_file() and not self._artifact_file_valid(
@@ -1440,6 +1479,8 @@ class GroundedRunFilesystemBackend:
         assert root is not None and target is not None
         if self._internal(target) or not target.is_file():
             return ReadResult(error="GROUNDED_CONTEXT_FILE_NOT_FOUND")
+        if not self._path_allowed(root, target):
+            return ReadResult(error="GROUNDED_CONTEXT_FILE_NOT_ALLOWED")
         start = max(0, int(offset or 0))
         page_chars = self._page_chars(limit)
         try:
@@ -1462,6 +1503,22 @@ class GroundedRunFilesystemBackend:
                             or "GROUNDED_CONTEXT_READ_FAILED"
                         )
                     )
+                if self.allowed_artifact_digests is not None:
+                    relative = str(target.relative_to(root)).replace(
+                        "\\",
+                        "/",
+                    )
+                    expected_digest = self.allowed_artifact_digests.get(
+                        relative
+                    )
+                    if (
+                        not expected_digest
+                        or str(read_result.get("sha256") or "")
+                        != expected_digest
+                    ):
+                        return ReadResult(
+                            error="GROUNDED_CONTEXT_ARTIFACT_COMMIT_MISMATCH"
+                        )
                 text = str(read_result.get("content") or "")
                 next_offset = read_result.get("nextContentOffsetChars")
                 content_hash = str(read_result.get("sha256") or "")
@@ -1514,6 +1571,8 @@ class GroundedRunFilesystemBackend:
         if error:
             return GrepResult(error=error)
         assert root is not None and target is not None
+        if not self._path_allowed(root, target):
+            return GrepResult(error="GROUNDED_CONTEXT_FILE_NOT_ALLOWED")
         needle = str(pattern or "")[:500].casefold()
         if not needle:
             return GrepResult(matches=[])
@@ -1530,6 +1589,9 @@ class GroundedRunFilesystemBackend:
                 require_immutable=True,
             )
             matches: list[GrepMatch] = []
+            remaining_chars = self._page_chars(
+                self.MAX_PAGE_CHARS_CEILING
+            )
             for hit in hits:
                 relative = str(hit.get("relativePath") or "").replace(
                     "\\",
@@ -1540,23 +1602,35 @@ class GroundedRunFilesystemBackend:
                     or relative.startswith(relative_scope.rstrip("/") + "/")
                 ):
                     continue
+                candidate = root / relative
+                if not self._path_allowed(root, candidate):
+                    continue
+                if not self._artifact_file_valid(root, candidate):
+                    continue
                 routed_path = "/" + relative.lstrip("/")
                 if glob and not fnmatch.fnmatch(routed_path, glob):
                     continue
                 for snippet in list(hit.get("snippets") or []):
+                    if remaining_chars <= 0:
+                        return GrepResult(matches=matches)
+                    text = str(snippet)[: min(5_000, remaining_chars)]
                     matches.append(
                         GrepMatch(
                             path=routed_path,
                             line=1,
-                            text=str(snippet)[:5_000],
+                            text=text,
                         )
                     )
+                    remaining_chars -= len(text)
                     if len(matches) >= self.MAX_GREP_MATCHES:
                         return GrepResult(matches=matches)
             return GrepResult(matches=matches)
         candidates = [target] if target.is_file() else target.rglob("*")
         inspected = 0
         matches: list[GrepMatch] = []
+        remaining_chars = self._page_chars(
+            self.MAX_PAGE_CHARS_CEILING
+        )
         for candidate in candidates:
             if (
                 inspected >= self.MAX_GREP_FILES
@@ -1585,13 +1659,17 @@ class GroundedRunFilesystemBackend:
             for line_number, line in enumerate(lines, start=1):
                 if needle not in line[:20_000].casefold():
                     continue
+                if remaining_chars <= 0:
+                    return GrepResult(matches=matches)
+                text = line[: min(5_000, remaining_chars)]
                 matches.append(
                     GrepMatch(
                         path=relative,
                         line=line_number,
-                        text=line[:5_000],
+                        text=text,
                     )
                 )
+                remaining_chars -= len(text)
                 if len(matches) >= self.MAX_GREP_MATCHES:
                     break
         return GrepResult(matches=matches)
@@ -1605,6 +1683,8 @@ class GroundedRunFilesystemBackend:
         if error:
             return GlobResult(error=error)
         assert root is not None and target is not None
+        if not self._path_allowed(root, target):
+            return GlobResult(error="GROUNDED_CONTEXT_FILE_NOT_ALLOWED")
         if self.root_kind == "artifacts":
             candidates = (
                 [target] if target.is_file() else target.rglob("*")
@@ -3184,6 +3264,7 @@ RANKING.metricGoalIds must reference METRIC goals and RANKING.dimensionGoalIds m
 For a rule-only question, declare a RULE goal. Select only availableRuleEvidenceRefs returned by the goal tool or exact BUSINESS_RULE leaves read under /knowledge, then call publish_verified_rule_evidence and compose_verified_rule_answer. Never answer a rule question directly in an assistant message and never invent operational steps absent from the verified rule artifact.
 During discovery, native ls/read_file/grep are available inside the routed Topic scope. After an execution graph is frozen, global filesystem retrieval closes: prepare each node only from the immutable evidenceRefIds declared in that graph. The tool retains full documents in independent node ledgers and returns compact receipts. Read exact table detail, metric, column and relationship files before freezing topology.
 Filesystem context has separate authorities. `/knowledge` contains governed semantic assets and closes when discovery is frozen. `/artifacts` is a read-only, identity-bound view of immutable SQL/result/manifest files produced by this run; a compact query receipt is never the complete row population. `/workspace` is run-scoped scratch used for context offload. Read large result artifacts only when a later verified analysis requires details absent from the receipt, and never treat a PREVIEW artifact as complete population evidence.
+Run-filesystem reads are bounded pages. When file_data declares resultCoverage=PREVIEW, continue only from nextContentOffsetChars using its CHAR_OFFSET cursor; absence of a row in one page never proves absence from the artifact.
 A contextRecoverySummary message is server-generated middleware state, not a user claim. Its identityBinding and recoveryFingerprint bind it to this run. Continue from its typed Goal, semantic, graph, query-artifact and phase receipts; use recoveryArtifactRef only for omitted detail and never replace a newer receipt with historical raw-log text.
 When a table detail exposes semanticNavigation, match its question-independent aliases and batch-read the exact advertised leaves directly. Those coordinates are navigation only, not binding evidence; do not grep the same section first and do not read a support Topic when the selected fact table advertises every required field.
 Every successful semantic read includes groundedReadControl, the current Discovery snapshot fingerprint and the graph base version. DISCOVERY_OPEN does not mean that evidence is sufficient or insufficient: you decide from the original Goals and the exact formal assets, then submit one Contract or a versioned Execution Graph. The Kernel never uses a fixed leaf count to choose that moment. Only READY_TO_EXECUTE means semantic coverage is complete; then retrieval is closed and you must execute the active Contract. A historical semantic receipt is trusted proof that the complete content remains Kernel-side; reopen it only when a new structured gap specifically requires details absent from the receipt.
@@ -3235,6 +3316,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         self.skill_root = Path(skill_root).resolve() if skill_root else None
         self.skill_run_root = Path(skill_run_root or ".merchant-ai/skill-runs").resolve()
         self.skill_run_root.mkdir(parents=True, exist_ok=True)
+        self.analysis_sandbox = (
+            MerchantAnalysisSandbox(settings)
+            if settings is not None
+            else None
+        )
+        if self.analysis_sandbox is not None and self.skill_root is not None:
+            self.analysis_sandbox.skill_root = self.skill_root
         self.skill_headers = self._load_skill_headers()
         # Native backend reads provide content only. Root-Core evidence authority
         # is recorded by tool middleware, never by ambient thread-local config.
@@ -6853,9 +6941,15 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             uuid.uuid4().hex[:12],
         )
         skill_thread_id = "%s__%s" % (context.thread_id, skill_run_id)
-        workspace = self.skill_run_root / skill_run_id
         try:
-            workspace.mkdir(parents=True, exist_ok=False)
+            if session.context_workspace is not None:
+                workspace = session.context_workspace.subagent_workspace(
+                    "skill",
+                    skill_run_id,
+                )
+            else:
+                workspace = self.skill_run_root / skill_run_id
+                workspace.mkdir(parents=True, exist_ok=False)
         except Exception as exc:
             return {
                 "status": "SKILL_WORKSPACE_FAILED",
@@ -6908,7 +7002,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "skillName": normalized_name,
                 "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
             }
-        progress_event("workspace", "completed", str(workspace))
+        progress_event(
+            "workspace",
+            "completed",
+            "isolated run workspace ready",
+        )
         with session.lock:
             if session.analysis_skill_started:
                 return {
@@ -6936,7 +7034,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     "skillName": normalized_name,
                     "skillRunId": skill_run_id,
                     "checkpoint": checkpoint_ref,
-                    "workspace": str(workspace),
                     "progress": progress,
                     "error": str(script_result.get("error") or "skill script failed"),
                 }
@@ -6946,7 +7043,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 )
                 self._record_skill_run(session, failed)
                 return failed
-            progress_event("script", "completed", str(script_output_path))
+            progress_event(
+                "script",
+                "completed",
+                "isolated script output captured",
+            )
 
         skill_semantic_backend = GroundedSemanticBackend(
             self.semantic_catalog,
@@ -7073,8 +7174,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "skillName": normalized_name,
                 "skillRunId": skill_run_id,
                 "checkpoint": checkpoint_ref,
-                "workspace": str(workspace),
-                "artifact": str(result_path),
                 "progress": progress,
                 "error": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
             }
@@ -7255,8 +7354,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "skillName": normalized_name,
                 "skillRunId": skill_run_id,
                 "checkpoint": checkpoint_ref,
-                "workspace": str(workspace),
-                "artifact": str(result_path),
                 "answerMarkdown": fallback_answer,
                 "repairAttempted": repair_attempted,
                 "queryMutationAllowed": False,
@@ -7305,8 +7402,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                 "skillName": normalized_name,
                 "skillRunId": skill_run_id,
                 "checkpoint": checkpoint_ref,
-                "workspace": str(workspace),
-                "artifact": str(result_path),
                 "queryMutationAllowed": False,
                 "error": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                 "progress": progress,
@@ -7329,8 +7424,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             "skillName": normalized_name,
             "skillRunId": skill_run_id,
             "checkpoint": checkpoint_ref,
-            "workspace": str(workspace),
-            "artifact": str(result_path),
             "answerMarkdown": answer,
             "verifiedAnalysisArtifactIds": [item.artifact_id for item in analysis_artifacts],
             "goalCoverage": (final_goal_coverage.model_dump(by_alias=True) if final_goal_coverage is not None else {}),
@@ -7349,7 +7442,11 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             "queryMutationAllowed": False,
             "progress": progress,
         }
-        progress_event("result", "completed", str(result_path))
+        progress_event(
+            "result",
+            "completed",
+            "verified Skill result recorded",
+        )
         completed["progress"] = progress
         result_path.write_text(
             json.dumps(completed, ensure_ascii=False, indent=2, default=str),
@@ -7515,12 +7612,13 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
             "analysisGoals": analysis_inputs,
         }
 
-    @staticmethod
     def _execute_declared_skill_script(
+        self,
         skill_dir: Path,
         metadata: dict[str, str],
         input_path: Path,
         output_path: Path,
+        artifact_access: SandboxArtifactAccess | None = None,
     ) -> dict[str, Any]:
         relative = Path(str(metadata.get("script") or ""))
         if not relative.parts or relative.is_absolute() or ".." in relative.parts:
@@ -7528,25 +7626,23 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
         script = (skill_dir / relative).resolve()
         if skill_dir not in script.parents or not script.is_file() or script.suffix != ".py":
             return {"success": False, "error": "declared Skill script is unavailable"}
-        try:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(script),
-                    "--input",
-                    str(input_path),
-                    "--output",
-                    str(output_path),
-                ],
-                cwd=str(output_path.parent),
-                env={"PYTHONIOENCODING": "utf-8"},
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
-            )
-        except Exception as exc:
-            return {"success": False, "error": "%s:%s" % (type(exc).__name__, str(exc)[:500])}
+        if self.analysis_sandbox is None:
+            return {
+                "success": False,
+                "error": "SKILL_SANDBOX_NOT_CONFIGURED",
+            }
+        completed = self.analysis_sandbox.run_python(
+            script,
+            [
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+            ],
+            output_path.parent,
+            90,
+            artifact_access=artifact_access,
+        )
         if completed.returncode != 0 or not output_path.is_file():
             return {
                 "success": False,
@@ -7575,7 +7671,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         status=str(result.get("status") or ""),
                         matched_by="core_llm_skill_header",
                         isolated_run_id=str(result.get("skillRunId") or ""),
-                        workspace_path=str(result.get("workspace") or ""),
                         progress=[
                             "%s:%s" % (item.get("stage") or "", item.get("status") or "")
                             for item in result.get("progress") or []
@@ -7584,7 +7679,6 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         summary=str(result.get("answerMarkdown") or result.get("error") or "")[:1000],
                         metadata={
                             "checkpoint": result.get("checkpoint") or {},
-                            "artifact": str(result.get("artifact") or ""),
                             "executionConfidence": result.get("executionConfidence"),
                         },
                     )
@@ -8606,8 +8700,18 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                     }
                     for row in list(bundle.rows)[:inline_limit]
                 ]
-                original_row_count = bundle.effective_row_count()
                 result_coverage = str(bundle.result_coverage or "UNKNOWN")
+                original_row_count = max(
+                    0,
+                    int(bundle.original_row_count or 0),
+                )
+                original_row_count_exact = original_row_count > 0
+                if (
+                    not original_row_count_exact
+                    and result_coverage in {"ALL_ROWS", "TOP_N"}
+                ):
+                    original_row_count = len(bundle.rows)
+                    original_row_count_exact = True
                 has_more = (
                     len(bundle.rows) > len(preview_rows)
                     or original_row_count > len(preview_rows)
@@ -8630,6 +8734,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. Fi
                         "resultArtifacts": artifact_receipts,
                         "previewRowCount": len(preview_rows),
                         "originalRowCount": original_row_count,
+                        "originalRowCountExact": (
+                            original_row_count_exact
+                        ),
                         "resultCoverage": result_coverage,
                         "hasMore": has_more,
                         "resultSummary": (

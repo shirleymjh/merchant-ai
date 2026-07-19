@@ -395,6 +395,7 @@ def test_governed_response_returns_configured_preview_and_safe_artifact_refs(
     assert len(response.data_sections[0].data_rows) == 2
     assert response.data_sections[0].preview_row_count == 2
     assert response.data_sections[0].original_row_count == 5
+    assert response.data_sections[0].original_row_count_exact is True
     assert response.data_sections[0].result_coverage == coverage
     assert response.data_sections[0].has_more is True
     assert response.data_sections[0].offloaded_files

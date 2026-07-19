@@ -295,7 +295,7 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
     assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
 
 
-def test_grounded_query_persists_complete_masked_result_with_manifest(
+def test_grounded_query_stages_before_verified_manifest_publication(
     tmp_path: Path,
 ) -> None:
     settings = Settings(harness_workspace_path=str(tmp_path / "workspace"))
@@ -338,31 +338,75 @@ def test_grounded_query_persists_complete_masked_result_with_manifest(
         context_owner_fingerprint="owner-fingerprint",
         access_role="merchant_admin",
         execution_preparation=preparation,
+        execution_generation=1,
+        execution_attempt_id="attempt-1",
     )
 
     bundle = result.merged_query_bundle
     assert bundle.failed is False
-    assert len(bundle.offloaded_files) == 3
-    assert all(Path(path).is_file() for path in bundle.offloaded_files)
-    rows_path = next(
-        Path(path)
-        for path in bundle.offloaded_files
-        if path.endswith("_rows.json")
-    )
-    manifest_path = next(
-        Path(path)
-        for path in bundle.offloaded_files
-        if path.endswith(".manifest.json")
+    assert bundle.offloaded_files == []
+    assert bundle.source_artifact_refs == {}
+    assert not list(artifact_root.rglob("*.json"))
+    pending = bundle.runtime_events[0][
+        "_serverPrivatePendingResultArtifact"
+    ]
+    staging_root = Path(pending["stagingRoot"])
+    rows_path = staging_root / pending["rowsArtifact"]["relativePath"]
+    pending_manifest_path = (
+        staging_root
+        / pending["pendingManifestArtifact"]["relativePath"]
     )
     stored_rows = json.loads(rows_path.read_text(encoding="utf-8"))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pending_manifest = json.loads(
+        pending_manifest_path.read_text(encoding="utf-8")
+    )
     assert stored_rows == bundle.rows
-    assert manifest["artifactKind"] == "GROUNDED_QUERY_RESULT"
-    assert manifest["contextOwnerFingerprint"] == "owner-fingerprint"
-    assert manifest["storedRowCount"] == len(bundle.rows)
-    assert manifest["rowsSha256"] == manifest["rowsArtifact"]["sha256"]
-    receipt = bundle.runtime_events[0]["resultArtifact"]
-    assert receipt["artifactFingerprint"] == manifest["artifactFingerprint"]
+    assert pending_manifest["artifactKind"] == "GROUNDED_QUERY_RESULT_PENDING"
+    assert pending_manifest["contextOwnerFingerprint"] == "owner-fingerprint"
+
+    verified = EvidenceVerifier().verify(
+        contract.question,
+        preparation.plan,
+        result,
+    )
+    receipt = executor.publish_pending_result_artifact(
+        pending,
+        verified_evidence=verified,
+        expected_generation=1,
+        expected_attempt_id="attempt-1",
+        expected_contract_fingerprint=(
+            grounded_query_contract_fingerprint(contract)
+        ),
+        expected_sql_fingerprint=pending["identity"][
+            "sqlEvidenceFingerprint"
+        ],
+        expected_context_owner_fingerprint="owner-fingerprint",
+        expected_semantic_activation_fingerprint=(
+            preparation.asset_pack_fingerprint
+        ),
+        expected_data_snapshot=bundle.data_snapshot,
+        expected_result_coverage=str(bundle.result_coverage),
+        expected_result_is_truncated=bundle.is_truncated,
+        expected_stored_row_count=len(bundle.rows),
+        expected_exact_result_row_count=bundle.original_row_count,
+        expected_rows_canonical_sha256=hashlib.sha256(
+            json.dumps(
+                bundle.rows,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+    manifest_path = artifact_root / receipt["manifestRelativePath"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["artifactKind"] == "GROUNDED_QUERY_RESULT_VERIFIED"
+    assert manifest["publicationStatus"] == "VERIFIED"
+    assert receipt["queryManifestSha256"] == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    assert receipt["rowsSha256"] == manifest["rowsArtifact"]["sha256"]
     assert receipt["rowsRef"].startswith("merchant://artifact/query_results/")
 
 
@@ -401,7 +445,7 @@ def test_grounded_query_fails_closed_when_result_root_escapes_workspace(
     )
 
     assert result.merged_query_bundle.failed is True
-    assert "QUERY_RESULT_ARTIFACT_WRITE_FAILED" in (
+    assert "QUERY_RESULT_ARTIFACT_STAGING_FAILED" in (
         result.merged_query_bundle.error
     )
 
@@ -902,19 +946,21 @@ def test_preview_result_artifact_cannot_claim_complete_population(
         context_owner_fingerprint="owner-fingerprint",
         access_role="merchant_admin",
         execution_preparation=preparation,
+        execution_generation=1,
+        execution_attempt_id="attempt-preview",
     )
 
     bundle = result.merged_query_bundle
-    manifest_path = next(
-        Path(path)
-        for path in bundle.offloaded_files
-        if path.endswith(".manifest.json")
+    assert bundle.offloaded_files == []
+    pending = bundle.runtime_events[0][
+        "_serverPrivatePendingResultArtifact"
+    ]
+    staging_root = Path(pending["stagingRoot"])
+    manifest_path = (
+        staging_root
+        / pending["pendingManifestArtifact"]["relativePath"]
     )
-    rows_path = next(
-        Path(path)
-        for path in bundle.offloaded_files
-        if path.endswith("_rows.json")
-    )
+    rows_path = staging_root / pending["rowsArtifact"]["relativePath"]
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     stored_rows = json.loads(rows_path.read_text(encoding="utf-8"))
     assert len(stored_rows) == 100

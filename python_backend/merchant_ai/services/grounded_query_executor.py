@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
+import stat
 import time
+import uuid
+import fcntl
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -33,9 +37,18 @@ from merchant_ai.models import (
     ReActStep,
     ResultCoverage,
     SqlValidationResult,
+    VerifiedEvidence,
 )
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
+from merchant_ai.services.grounded_context_workspace import (
+    GroundedContextWorkspaceError,
+    _atomic_write_at,
+    _open_directory_beneath,
+    _read_regular_file_at,
+    validated_grounded_query_artifact_roots,
+)
 from merchant_ai.services.assets import (
     default_row_access_policy,
     normalize_row_access_policy,
@@ -131,6 +144,8 @@ class GroundedQueryExecutionKernel:
         execution_preparation: Any = None,
         runtime_budget: GroundedRuntimeBudget | None = None,
         data_snapshot_contract: DataSnapshotContract | None = None,
+        execution_generation: int = 0,
+        execution_attempt_id: str = "",
     ) -> AgentRunResult:
         if execution_preparation is None or not bool(
             getattr(execution_preparation, "executable", False)
@@ -348,16 +363,10 @@ class GroundedQueryExecutionKernel:
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         task_id = intent.plan_task_id
-        artifact_paths: list[str] = []
-        artifact_refs: list[str] = []
-        artifact_receipt: dict[str, Any] = {}
+        pending_artifact_receipt: dict[str, Any] = {}
         if artifact_root:
             try:
-                (
-                    artifact_paths,
-                    artifact_refs,
-                    artifact_receipt,
-                ) = self._write_grounded_result_artifacts(
+                pending_artifact_receipt = self._stage_grounded_result_artifacts(
                     artifact_root=artifact_root,
                     run_id=run_id,
                     task_id=task_id,
@@ -370,12 +379,14 @@ class GroundedQueryExecutionKernel:
                     result_coverage=result_coverage,
                     result_is_truncated=result_is_truncated,
                     exact_result_row_count=exact_result_row_count,
+                    execution_generation=execution_generation,
+                    execution_attempt_id=execution_attempt_id,
                 )
             except Exception as exc:
                 message = "%s:%s" % (type(exc).__name__, str(exc)[:300])
                 artifact_validation = SqlValidationResult(
                     valid=False,
-                    error_code="QUERY_RESULT_ARTIFACT_WRITE_FAILED",
+                    error_code="QUERY_RESULT_ARTIFACT_STAGING_FAILED",
                     message=message,
                     base_tables=list(compilation.tables),
                 )
@@ -398,12 +409,14 @@ class GroundedQueryExecutionKernel:
             sql=compilation.sql,
             tables=list(compilation.tables),
             rows=rows,
-            offloaded_files=artifact_paths,
+            # Execution only creates server-private staging. No path or
+            # reference becomes Core-visible before independent verification.
+            offloaded_files=[],
             original_row_count=exact_result_row_count,
             is_truncated=result_is_truncated,
             result_coverage=result_coverage,
             source_row_counts={task_id: len(rows)},
-            source_artifact_refs={task_id: artifact_refs},
+            source_artifact_refs={},
             duration_ms=duration_ms,
             cache_hit=bool(getattr(self.doris_repository, "last_cache_hit", False)),
             cache_key=str(getattr(self.doris_repository, "last_cache_key", "") or ""),
@@ -423,7 +436,15 @@ class GroundedQueryExecutionKernel:
                         ResultCoverage.TOP_N.value,
                     },
                     "plannerLlmCalls": 0,
-                    "resultArtifact": artifact_receipt,
+                    **(
+                        {
+                            "_serverPrivatePendingResultArtifact": (
+                                pending_artifact_receipt
+                            )
+                        }
+                        if pending_artifact_receipt
+                        else {}
+                    ),
                     "sqlLlmCalls": (
                         1
                         if isinstance(candidate_validation, GroundedSqlValidationResult)
@@ -2139,7 +2160,7 @@ class GroundedQueryExecutionKernel:
             node_plan_contracts=[compilation.node_contract.model_copy(deep=True)],
         )
 
-    def _write_grounded_result_artifacts(
+    def _stage_grounded_result_artifacts(
         self,
         *,
         artifact_root: str,
@@ -2154,29 +2175,28 @@ class GroundedQueryExecutionKernel:
         result_coverage: str,
         result_is_truncated: bool,
         exact_result_row_count: int,
-    ) -> tuple[list[str], list[str], dict[str, Any]]:
-        root = Path(str(artifact_root or "")).resolve()
-        workspace_root = self.settings.resolved_workspace_path.resolve()
+        execution_generation: int,
+        execution_attempt_id: str,
+    ) -> dict[str, Any]:
         try:
-            root.relative_to(workspace_root)
-        except ValueError as exc:
-            raise RuntimeError(
-                "QUERY_RESULT_ARTIFACT_ROOT_OUTSIDE_WORKSPACE"
-            ) from exc
-        root.mkdir(parents=True, exist_ok=True)
+            publication_root, staging_root = (
+                validated_grounded_query_artifact_roots(
+                    self.settings.resolved_workspace_path,
+                    artifact_root,
+                )
+            )
+        except GroundedContextWorkspaceError as exc:
+            raise RuntimeError(str(exc)) from exc
         if not str(context_owner_fingerprint or "").strip():
             raise RuntimeError("QUERY_RESULT_CONTEXT_OWNER_REQUIRED")
-        store = WorkspaceArtifactStore(self.settings, root)
-        rows_text = json.dumps(
-            rows,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        rows_canonical_hash = hashlib.sha256(
-            rows_text.encode("utf-8")
-        ).hexdigest()
+        generation = int(execution_generation or 0)
+        attempt_id = str(execution_attempt_id or "").strip()
+        if generation <= 0:
+            raise RuntimeError("QUERY_RESULT_EXECUTION_GENERATION_REQUIRED")
+        if not attempt_id:
+            raise RuntimeError("QUERY_RESULT_EXECUTION_ATTEMPT_REQUIRED")
+        store = WorkspaceArtifactStore(self.settings, staging_root)
+        rows_canonical_hash = self._canonical_json_sha256(rows)
         sql_hash = hashlib.sha256(
             str(compilation.sql or "").encode("utf-8")
         ).hexdigest()
@@ -2188,29 +2208,45 @@ class GroundedQueryExecutionKernel:
             raise RuntimeError(
                 "QUERY_RESULT_SEMANTIC_ACTIVATION_FINGERPRINT_REQUIRED"
             )
+        candidate_validation = getattr(
+            execution_preparation,
+            "candidate_validation",
+            None,
+        )
+        sql_evidence_fingerprint = str(
+            getattr(candidate_validation, "ast_fingerprint", "") or ""
+        ).strip()
+        if not sql_evidence_fingerprint:
+            sql_evidence_fingerprint = hashlib.sha256(
+                ("%s:%s" % (contract_fingerprint, compilation.sql)).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+        snapshot_identity = self._artifact_snapshot_identity(data_snapshot)
         result_identity = {
             "contractFingerprint": contract_fingerprint,
             "sqlSha256": sql_hash,
+            "sqlEvidenceFingerprint": sql_evidence_fingerprint,
             "rowsCanonicalSha256": rows_canonical_hash,
             "contextOwnerFingerprint": str(
                 context_owner_fingerprint or ""
             ),
             "semanticActivationFingerprint": preparation_fingerprint,
-            "dataSnapshot": {
-                **data_snapshot.cache_identity(),
-                "consistencyMode": str(
-                    data_snapshot.consistency_mode or "UNSUPPORTED"
-                ),
-                "unsupportedReason": str(
-                    data_snapshot.unsupported_reason or ""
-                ),
-            },
+            "dataSnapshot": snapshot_identity,
             "resultCoverage": str(result_coverage or ""),
             "resultIsTruncated": bool(result_is_truncated),
             "storedRowCount": len(rows),
             "exactResultRowCount": max(0, int(exact_result_row_count or 0)),
+            "executionGeneration": generation,
+            "executionAttemptId": attempt_id,
+            "runFingerprint": hashlib.sha256(
+                str(run_id or "").encode("utf-8")
+            ).hexdigest(),
+            "taskFingerprint": hashlib.sha256(
+                str(task_id or "").encode("utf-8")
+            ).hexdigest(),
         }
-        identity_hash = hashlib.sha256(
+        pending_id = "pending_query_%s" % hashlib.sha256(
             json.dumps(
                 result_identity,
                 ensure_ascii=False,
@@ -2218,84 +2254,383 @@ class GroundedQueryExecutionKernel:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        namespace = pending_id
         rows_artifact = store.write_json(
-            "query_results",
-            "result_%s_rows.json" % identity_hash,
+            namespace,
+            "rows.json",
             rows,
             preview_chars=0,
             immutable=True,
         )
         sql_artifact = store.write_text(
-            "query_results",
-            "result_%s.sql" % identity_hash,
+            namespace,
+            "query.sql",
             compilation.sql,
             preview_chars=0,
             immutable=True,
         )
         if not rows_artifact.get("success") or not sql_artifact.get("success"):
             raise RuntimeError("QUERY_RESULT_CONTENT_WRITE_FAILED")
-        manifest = {
-            "schemaVersion": 1,
-            "artifactKind": "GROUNDED_QUERY_RESULT",
-            "artifactFingerprint": identity_hash,
-            "runFingerprint": hashlib.sha256(
-                str(run_id or "").encode("utf-8")
-            ).hexdigest(),
-            "taskFingerprint": hashlib.sha256(
-                str(task_id or "").encode("utf-8")
-            ).hexdigest(),
+        pending_manifest = {
+            "schemaVersion": 2,
+            "artifactKind": "GROUNDED_QUERY_RESULT_PENDING",
+            "pendingArtifactId": pending_id,
             **result_identity,
-            "rowsArtifact": {
-                "relativePath": rows_artifact.get("relativePath"),
-                "merchantUri": rows_artifact.get("merchantUri"),
-                "sha256": rows_artifact.get("sha256"),
-                "contentAddress": rows_artifact.get("contentAddress"),
-                "bytes": rows_artifact.get("bytes"),
-            },
-            "sqlArtifact": {
-                "relativePath": sql_artifact.get("relativePath"),
-                "merchantUri": sql_artifact.get("merchantUri"),
-                "sha256": sql_artifact.get("sha256"),
-                "contentAddress": sql_artifact.get("contentAddress"),
-                "bytes": sql_artifact.get("bytes"),
-            },
+            "rowsArtifact": self._private_artifact_receipt(rows_artifact),
+            "sqlArtifact": self._private_artifact_receipt(sql_artifact),
             "rowsSha256": rows_artifact.get("sha256"),
         }
-        manifest_artifact = store.write_json(
-            "query_results",
-            "result_%s.manifest.json" % identity_hash,
-            manifest,
+        pending_manifest_artifact = store.write_json(
+            namespace,
+            "pending.manifest.json",
+            pending_manifest,
             preview_chars=0,
             immutable=True,
         )
-        if not manifest_artifact.get("success"):
-            raise RuntimeError("QUERY_RESULT_MANIFEST_WRITE_FAILED")
-        paths = [
-            str(rows_artifact.get("path") or ""),
-            str(sql_artifact.get("path") or ""),
-            str(manifest_artifact.get("path") or ""),
-        ]
-        refs = [
-            str(rows_artifact.get("merchantUri") or ""),
-            str(sql_artifact.get("merchantUri") or ""),
-            str(manifest_artifact.get("merchantUri") or ""),
-        ]
-        receipt = {
-            "artifactFingerprint": identity_hash,
-            "manifestRef": str(manifest_artifact.get("merchantUri") or ""),
-            "rowsRef": str(rows_artifact.get("merchantUri") or ""),
-            "storedRowCount": len(rows),
-            "resultCoverage": str(result_coverage or ""),
-            "rowsSha256": str(rows_artifact.get("sha256") or ""),
-            "manifestSha256": str(
-                manifest_artifact.get("sha256") or ""
+        if not pending_manifest_artifact.get("success"):
+            raise RuntimeError("QUERY_RESULT_PENDING_MANIFEST_WRITE_FAILED")
+        # This receipt is deliberately server-private. The runtime kernel
+        # removes it from QueryBundle events before the result can reach Core.
+        # Absolute roots are retained solely so the verifier gate can reopen
+        # and validate the exact staged bytes without trusting caller paths.
+        return {
+            "pendingArtifactId": pending_id,
+            "publicationRoot": str(publication_root),
+            "stagingRoot": str(staging_root),
+            "identity": result_identity,
+            "rowsArtifact": self._private_artifact_receipt(rows_artifact),
+            "sqlArtifact": self._private_artifact_receipt(sql_artifact),
+            "pendingManifestArtifact": self._private_artifact_receipt(
+                pending_manifest_artifact
             ),
         }
-        return (
-            [item for item in paths if item],
-            [item for item in refs if item],
-            receipt,
+
+    def publish_pending_result_artifact(
+        self,
+        pending_receipt: dict[str, Any],
+        *,
+        verified_evidence: VerifiedEvidence,
+        expected_generation: int,
+        expected_attempt_id: str,
+        expected_contract_fingerprint: str,
+        expected_sql_fingerprint: str,
+        expected_context_owner_fingerprint: str,
+        expected_semantic_activation_fingerprint: str,
+        expected_data_snapshot: DataSnapshotContract,
+        expected_result_coverage: str,
+        expected_result_is_truncated: bool,
+        expected_stored_row_count: int,
+        expected_exact_result_row_count: int,
+        expected_rows_canonical_sha256: str,
+    ) -> dict[str, Any]:
+        """Verify exact staged bytes and publish a verifier-bound receipt.
+
+        Files do not authorize consumption by existing on disk. Only the
+        returned receipt, committed into the verified ledger by the kernel,
+        is a visibility capability for the read backend and Sandbox.
+        """
+
+        if not verified_evidence.passed:
+            raise RuntimeError("QUERY_RESULT_VERIFIED_EVIDENCE_REQUIRED")
+        receipt = dict(pending_receipt or {})
+        identity = dict(receipt.get("identity") or {})
+        expected_identity = {
+            "contractFingerprint": str(expected_contract_fingerprint or ""),
+            "sqlEvidenceFingerprint": str(expected_sql_fingerprint or ""),
+            "contextOwnerFingerprint": str(
+                expected_context_owner_fingerprint or ""
+            ),
+            "semanticActivationFingerprint": str(
+                expected_semantic_activation_fingerprint or ""
+            ),
+            "dataSnapshot": self._artifact_snapshot_identity(
+                expected_data_snapshot
+            ),
+            "resultCoverage": str(expected_result_coverage or ""),
+            "resultIsTruncated": bool(expected_result_is_truncated),
+            "storedRowCount": max(0, int(expected_stored_row_count or 0)),
+            "exactResultRowCount": max(
+                0,
+                int(expected_exact_result_row_count or 0),
+            ),
+            "executionGeneration": int(expected_generation or 0),
+            "executionAttemptId": str(expected_attempt_id or ""),
+            "rowsCanonicalSha256": str(
+                expected_rows_canonical_sha256 or ""
+            ),
+        }
+        for key, expected in expected_identity.items():
+            if identity.get(key) != expected:
+                raise RuntimeError(
+                    "QUERY_RESULT_PENDING_BINDING_MISMATCH:%s" % key
+                )
+        publication_root, staging_root = self._validated_artifact_roots(
+            receipt
         )
+        staging_store = WorkspaceArtifactStore(self.settings, staging_root)
+        pending_manifest_text = self._read_private_staged_artifact(
+            staging_store,
+            dict(receipt.get("pendingManifestArtifact") or {}),
+        )
+        try:
+            pending_manifest = json.loads(pending_manifest_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "QUERY_RESULT_PENDING_MANIFEST_INVALID"
+            ) from exc
+        pending_id = str(receipt.get("pendingArtifactId") or "").strip()
+        if (
+            not pending_id
+            or pending_manifest.get("pendingArtifactId") != pending_id
+            or any(
+                pending_manifest.get(key) != value
+                for key, value in identity.items()
+            )
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_MANIFEST_MISMATCH")
+        rows_artifact_receipt = dict(receipt.get("rowsArtifact") or {})
+        sql_artifact_receipt = dict(receipt.get("sqlArtifact") or {})
+        if pending_manifest.get("rowsArtifact") != rows_artifact_receipt:
+            raise RuntimeError("QUERY_RESULT_PENDING_ROWS_BINDING_MISMATCH")
+        if pending_manifest.get("sqlArtifact") != sql_artifact_receipt:
+            raise RuntimeError("QUERY_RESULT_PENDING_SQL_BINDING_MISMATCH")
+        if str(sql_artifact_receipt.get("sha256") or "") != str(
+            identity.get("sqlSha256") or ""
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_SQL_SHA_MISMATCH")
+
+        verified_payload = verified_evidence.model_dump(
+            by_alias=True,
+            mode="json",
+        )
+        verified_sha = self._stable_artifact_hash(verified_payload)
+        publication_fingerprint = hashlib.sha256(
+            ("%s:%s" % (pending_id, verified_sha)).encode("utf-8")
+        ).hexdigest()
+        published_rows = self._publish_staged_artifact_streaming(
+            staging_root,
+            publication_root,
+            rows_artifact_receipt,
+            "result_%s_rows.json" % publication_fingerprint,
+        )
+        published_sql = self._publish_staged_artifact_streaming(
+            staging_root,
+            publication_root,
+            sql_artifact_receipt,
+            "result_%s.sql" % publication_fingerprint,
+        )
+        final_manifest = {
+            "schemaVersion": 2,
+            "artifactKind": "GROUNDED_QUERY_RESULT",
+            "publicationStatus": "VERIFIED",
+            "artifactFingerprint": publication_fingerprint,
+            "pendingArtifactId": pending_id,
+            **identity,
+            "verifiedEvidence": verified_payload,
+            "verifiedEvidenceSha256": verified_sha,
+            "pendingManifestSha256": str(
+                dict(receipt.get("pendingManifestArtifact") or {}).get(
+                    "sha256"
+                )
+                or ""
+            ),
+            "rowsArtifact": self._manifest_child_receipt(published_rows),
+            "sqlArtifact": self._manifest_child_receipt(published_sql),
+        }
+        manifest_text = json.dumps(
+            final_manifest,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        exact_manifest_sha256 = hashlib.sha256(
+            manifest_text.encode("utf-8")
+        ).hexdigest()
+        publication_store = WorkspaceArtifactStore(
+            self.settings,
+            publication_root,
+        )
+        published_manifest = publication_store.write_text(
+            "query_results",
+            "result_%s.manifest.json" % exact_manifest_sha256,
+            manifest_text,
+            preview_chars=0,
+            immutable=True,
+        )
+        if (
+            not published_manifest.get("success")
+            or published_manifest.get("sha256")
+            != exact_manifest_sha256
+        ):
+            raise RuntimeError("QUERY_RESULT_MANIFEST_PUBLICATION_FAILED")
+        return {
+            "artifactFingerprint": publication_fingerprint,
+            "pendingArtifactId": pending_id,
+            "manifestRelativePath": str(
+                published_manifest.get("relativePath") or ""
+            ),
+            "manifestRef": str(published_manifest.get("merchantUri") or ""),
+            "rowsRelativePath": str(
+                published_rows.get("relativePath") or ""
+            ),
+            "rowsRef": str(published_rows.get("merchantUri") or ""),
+            "sqlRelativePath": str(
+                published_sql.get("relativePath") or ""
+            ),
+            "sqlRef": str(published_sql.get("merchantUri") or ""),
+            "queryManifestSha256": str(
+                published_manifest.get("sha256") or ""
+            ),
+            # Compatibility projection for existing response formatting.
+            "manifestSha256": str(published_manifest.get("sha256") or ""),
+            "rowsSha256": str(published_rows.get("sha256") or ""),
+            "sqlSha256": str(published_sql.get("sha256") or ""),
+            "manifestContentAddress": str(
+                published_manifest.get("contentAddress") or ""
+            ),
+            "rowsContentAddress": str(
+                published_rows.get("contentAddress") or ""
+            ),
+            "sqlContentAddress": str(
+                published_sql.get("contentAddress") or ""
+            ),
+            "storedRowCount": int(identity.get("storedRowCount") or 0),
+            "exactResultRowCount": int(
+                identity.get("exactResultRowCount") or 0
+            ),
+            "resultCoverage": str(identity.get("resultCoverage") or ""),
+            "resultIsTruncated": bool(
+                identity.get("resultIsTruncated")
+            ),
+            "executionGeneration": int(
+                identity.get("executionGeneration") or 0
+            ),
+            "attemptFingerprint": hashlib.sha256(
+                str(identity.get("executionAttemptId") or "").encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+            "contractFingerprint": str(
+                identity.get("contractFingerprint") or ""
+            ),
+            "sqlEvidenceFingerprint": str(
+                identity.get("sqlEvidenceFingerprint") or ""
+            ),
+            "contextOwnerFingerprint": str(
+                identity.get("contextOwnerFingerprint") or ""
+            ),
+            "semanticActivationFingerprint": str(
+                identity.get("semanticActivationFingerprint") or ""
+            ),
+            "dataSnapshotFingerprint": self._stable_artifact_hash(
+                identity.get("dataSnapshot") or {}
+            ),
+            "verifiedEvidenceSha256": verified_sha,
+        }
+
+    def _validated_artifact_roots(
+        self,
+        receipt: dict[str, Any],
+    ) -> tuple[Path, Path]:
+        try:
+            publication_root, staging_root = (
+                validated_grounded_query_artifact_roots(
+                    self.settings.resolved_workspace_path,
+                    str(receipt.get("publicationRoot") or ""),
+                )
+            )
+        except GroundedContextWorkspaceError as exc:
+            raise RuntimeError(str(exc)) from exc
+        received_staging_root = Path(
+            os.path.abspath(str(receipt.get("stagingRoot") or ""))
+        )
+        if staging_root != received_staging_root:
+            raise RuntimeError("QUERY_RESULT_STAGING_ROOT_MISMATCH")
+        return publication_root, staging_root
+
+    @staticmethod
+    def _private_artifact_receipt(
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "relativePath": str(artifact.get("relativePath") or ""),
+            "sha256": str(artifact.get("sha256") or ""),
+            "contentAddress": str(artifact.get("contentAddress") or ""),
+            "bytes": max(0, int(artifact.get("bytes") or 0)),
+        }
+
+    @staticmethod
+    def _manifest_child_receipt(
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "relativePath": str(artifact.get("relativePath") or ""),
+            "merchantUri": str(artifact.get("merchantUri") or ""),
+            "sha256": str(artifact.get("sha256") or ""),
+            "contentAddress": str(artifact.get("contentAddress") or ""),
+            "bytes": max(0, int(artifact.get("bytes") or 0)),
+        }
+
+    @staticmethod
+    def _read_private_staged_artifact(
+        store: WorkspaceArtifactStore,
+        artifact: dict[str, Any],
+    ) -> str:
+        relative_path = str(artifact.get("relativePath") or "").strip()
+        expected_bytes = max(0, int(artifact.get("bytes") or 0))
+        expected_sha = str(artifact.get("sha256") or "").strip()
+        expected_address = str(artifact.get("contentAddress") or "").strip()
+        if (
+            not relative_path
+            or not expected_sha
+            or expected_address != "sha256:%s" % expected_sha
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_RECEIPT_INVALID")
+        result = store.read(
+            relative_path,
+            max_chars=max(1, expected_bytes + 1),
+            require_immutable=True,
+        )
+        if not result.get("success"):
+            raise RuntimeError(
+                "QUERY_RESULT_PENDING_ARTIFACT_INVALID:%s"
+                % str(result.get("error") or "READ_FAILED")
+            )
+        content = str(result.get("content") or "")
+        encoded = content.encode("utf-8")
+        if (
+            bool(result.get("truncated"))
+            or len(encoded) != expected_bytes
+            or hashlib.sha256(encoded).hexdigest() != expected_sha
+            or result.get("contentAddress") != expected_address
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_ARTIFACT_SHA_MISMATCH")
+        return content
+
+    @staticmethod
+    def _artifact_snapshot_identity(
+        data_snapshot: DataSnapshotContract,
+    ) -> dict[str, Any]:
+        return {
+            **data_snapshot.cache_identity(),
+            "consistencyMode": str(
+                data_snapshot.consistency_mode or "UNSUPPORTED"
+            ),
+            "unsupportedReason": str(
+                data_snapshot.unsupported_reason or ""
+            ),
+        }
+
+    @staticmethod
+    def _stable_artifact_hash(value: Any) -> str:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _detail_display_limit(intent: Any) -> int:

@@ -205,12 +205,67 @@ def grounded_context_owner_fingerprint(
     return _stable_hash(identity)
 
 
+def validated_grounded_query_artifact_roots(
+    workspace_root: Path,
+    artifact_root: Path | str,
+) -> tuple[Path, Path]:
+    """Open the pre-created publication and staging roots without symlinks."""
+
+    trusted_workspace = Path(workspace_root).resolve(strict=True)
+    requested_publication = Path(
+        os.path.abspath(str(artifact_root or ""))
+    )
+    try:
+        publication_components = tuple(
+            requested_publication.relative_to(trusted_workspace).parts
+        )
+    except ValueError as exc:
+        raise GroundedContextWorkspaceError(
+            "QUERY_RESULT_ARTIFACT_ROOT_OUTSIDE_WORKSPACE"
+        ) from exc
+    if not publication_components:
+        raise GroundedContextWorkspaceError(
+            "QUERY_RESULT_ARTIFACT_ROOT_INVALID"
+        )
+    staging_components = (
+        *publication_components[:-1],
+        "staging",
+        "query_results",
+    )
+    descriptors: list[int] = []
+    try:
+        descriptors.append(
+            _open_directory_beneath(
+                trusted_workspace,
+                publication_components,
+            )
+        )
+        descriptors.append(
+            _open_directory_beneath(
+                trusted_workspace,
+                staging_components,
+            )
+        )
+    except (OSError, GroundedContextWorkspaceError) as exc:
+        raise GroundedContextWorkspaceError(
+            "QUERY_RESULT_PRECREATED_ROOT_REQUIRED"
+        ) from exc
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    return (
+        trusted_workspace.joinpath(*publication_components),
+        trusted_workspace.joinpath(*staging_components),
+    )
+
+
 @dataclass(frozen=True)
 class GroundedContextWorkspace:
     """One identity-bound filesystem boundary for a Grounded Core run."""
 
     root: Path
     artifacts_root: Path
+    staging_root: Path
     core_scratch_root: Path
     subagents_root: Path
     thread_fingerprint: str
@@ -282,6 +337,7 @@ class GroundedContextWorkspace:
 
         directory_components = (
             ("artifacts",),
+            ("staging", "query_results"),
             ("scratch", "core"),
             ("scratch", "subagents"),
         )
@@ -298,11 +354,13 @@ class GroundedContextWorkspace:
                 "GROUNDED_CONTEXT_DIRECTORY_OUTSIDE_ROOT"
             ) from exc
         artifacts_root = root / "artifacts"
+        staging_root = root / "staging" / "query_results"
         core_scratch_root = root / "scratch" / "core"
         subagents_root = root / "scratch" / "subagents"
         return cls(
             root=root,
             artifacts_root=artifacts_root,
+            staging_root=staging_root,
             core_scratch_root=core_scratch_root,
             subagents_root=subagents_root,
             thread_fingerprint=thread_fingerprint,

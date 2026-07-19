@@ -2293,7 +2293,9 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
 
     assert result["status"] == "SKILL_COMPLETED"
     assert result["executionConfidence"] == 0.88
-    assert Path(result["artifact"]).is_file()
+    assert "artifact" not in result
+    assert "workspace" not in result
+    assert len(list((tmp_path / "skill-runs").glob("*/result.json"))) == 1
     assert result["checkpoint"]["threadId"].startswith("thread-skill__skill_")
     assert isolated.job.skills == []
     assert isolated.job.user_payload["mountedSkill"] == "/skills/risk-analysis/SKILL.md"

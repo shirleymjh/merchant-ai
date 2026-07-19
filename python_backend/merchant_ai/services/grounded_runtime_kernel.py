@@ -17,6 +17,7 @@ from merchant_ai.models import (
     AnswerMode,
     ClarificationRequest,
     DataSnapshotContract,
+    EvidenceGap,
     EntityFilterObligation,
     EntityReference,
     ExtractedKeywords,
@@ -65,6 +66,9 @@ from merchant_ai.services.routing import KeywordExtractService, TopicRouterServi
 from merchant_ai.services.grounded_rule_artifact import (
     GroundedVerifiedRuleArtifact,
     render_verified_rule_answer,
+)
+from merchant_ai.services.grounded_context_workspace import (
+    grounded_context_owner_fingerprint,
 )
 
 
@@ -121,7 +125,21 @@ class GroundedVerifiedQueryArtifact(APIModel):
     output_lineage: dict[str, list[str]] = Field(default_factory=dict)
     sealed_entity_values: dict[str, list[Any]] = Field(default_factory=dict)
     sealed_entity_values_truncated: bool = False
+    publication_status: str = "VERIFIED_IN_MEMORY"
+    result_artifact_receipts: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
     created_at: str = ""
+
+
+class GroundedPendingQueryPublication(APIModel):
+    """Server-private capability for staged, not-yet-visible query bytes."""
+
+    pending_artifact_id: str
+    generation: int
+    attempt_id: str
+    receipt: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    status: str = "PENDING"
 
 
 class GroundedVerifiedEntitySet(APIModel):
@@ -147,6 +165,7 @@ class GroundedCoreSqlPreparation:
     candidate_id: str
     sql_candidate: GroundedSqlCandidate
     candidate_validation: GroundedSqlValidationResult
+    asset_pack_fingerprint: str
 
     @property
     def executable(self) -> bool:
@@ -199,6 +218,21 @@ class GroundedRuntimeSession(APIModel):
     verified_evidence: Optional[VerifiedEvidence] = None
     verified_query_ledger: list[GroundedVerifiedQueryArtifact] = Field(
         default_factory=list
+    )
+    pending_query_publications: list[GroundedPendingQueryPublication] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+    )
+    artifact_publication_required: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
+    )
+    defer_artifact_publication: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
     )
     verified_rule_ledger: list[GroundedVerifiedRuleArtifact] = Field(
         default_factory=list
@@ -332,6 +366,7 @@ class GroundedRuntimeKernel:
             session_id="%s__branch_%s_%s"
             % (session.session_id, token[:48], uuid.uuid4().hex[:8]),
         )
+        branch.defer_artifact_publication = True
         branch.keywords = session.keywords.model_copy(deep=True)
         branch.routing = session.routing.model_copy(deep=True)
         branch.workspace_topics = _dedupe(
@@ -394,24 +429,78 @@ class GroundedRuntimeKernel:
         answer composition and a later serial entity-chain query can continue.
         """
 
-        verified_branches = [
-            branch
-            for branch in branches
-            if branch.verified_query_ledger
-            and branch.verified_evidence is not None
-            and branch.verified_evidence.passed
-        ]
-        if not verified_branches:
-            return []
-        artifacts = [
-            artifact.model_copy(deep=True)
-            for branch in verified_branches
-            for artifact in branch.verified_query_ledger
-            if artifact.verified_evidence.passed
-        ]
-        if not artifacts:
-            return []
         with self._lock:
+            verified_branches = [
+                branch
+                for branch in branches
+                if branch.verified_query_ledger
+                and branch.verified_evidence is not None
+                and branch.verified_evidence.passed
+            ]
+            if not verified_branches:
+                return []
+
+            # Snapshot postflight is performed by the graph runtime before
+            # this call. Publication remains deferred until this adoption
+            # gate, so a failed postflight leaves only unmounted staging.
+            publication_batches: list[
+                tuple[GroundedRuntimeSession, list[dict[str, Any]]]
+            ] = []
+            for branch in verified_branches:
+                if branch.run_result is None:
+                    raise RuntimeError(
+                        "VERIFIED_BRANCH_RUN_RESULT_REQUIRED"
+                    )
+                try:
+                    receipts = self._publish_pending_receipts_locked(
+                        branch,
+                        generation=branch.active_generation,
+                        run_result=branch.run_result,
+                        verified=branch.verified_evidence,
+                    )
+                except Exception as exc:
+                    # No parent allowlist/ledger mutation has happened. Files
+                    # possibly written by an earlier batch are inert because
+                    # filesystem presence is never a visibility capability.
+                    raise RuntimeError(
+                        "VERIFIED_BRANCH_ARTIFACT_PUBLICATION_FAILED:%s:%s"
+                        % (type(exc).__name__, str(exc)[:300])
+                    ) from exc
+                publication_batches.append((branch, receipts))
+
+            for branch, receipts in publication_batches:
+                if receipts and branch.run_result is not None:
+                    self._attach_published_receipts(
+                        branch.run_result,
+                        branch.pending_query_publications,
+                        receipts,
+                    )
+                    for artifact in branch.verified_query_ledger:
+                        if (
+                            artifact.generation == branch.active_generation
+                            and artifact.publication_status == "PENDING"
+                        ):
+                            artifact.publication_status = "PUBLISHED"
+                            artifact.result_artifact_receipts = [
+                                dict(item) for item in receipts
+                            ]
+                            artifact.run_result = (
+                                branch.run_result.model_copy(deep=True)
+                            )
+                    for pending in branch.pending_query_publications:
+                        if pending.generation == branch.active_generation:
+                            pending.status = "PUBLISHED"
+
+            artifacts = [
+                artifact.model_copy(deep=True)
+                for branch in verified_branches
+                for artifact in branch.verified_query_ledger
+                if artifact.verified_evidence.passed
+                and artifact.publication_status
+                in {"PUBLISHED", "VERIFIED_IN_MEMORY"}
+            ]
+            if not artifacts:
+                return []
             existing_ids = {
                 item.artifact_id for item in session.verified_query_ledger
             }
@@ -1352,6 +1441,9 @@ class GroundedRuntimeKernel:
                 candidate_id=attempt.candidate_id,
                 sql_candidate=candidate,
                 candidate_validation=validation,
+                asset_pack_fingerprint=_stable_json_hash(
+                    candidate_pack.model_dump(by_alias=True, mode="json")
+                ),
             )
         except Exception as exc:
             attempt.status = "PREPARATION_FAILED"
@@ -1504,6 +1596,10 @@ class GroundedRuntimeKernel:
             execution_kwargs["context_owner_fingerprint"] = (
                 context_owner_fingerprint
             )
+            execution_kwargs["execution_generation"] = generation
+            execution_kwargs["execution_attempt_id"] = (
+                session.active_attempt_id
+            )
         # Keep non-budget callers fully backward-compatible. Grounded tools
         # explicitly pass the one shared run budget so the executor can clamp
         # Doris immediately before the repository call.
@@ -1521,6 +1617,7 @@ class GroundedRuntimeKernel:
         )
         if not isinstance(run_result, AgentRunResult):
             run_result = AgentRunResult.model_validate(run_result)
+        pending_receipts = self._extract_pending_result_artifacts(run_result)
         access_terminal_codes = {
             "ACCESS_DENIED",
             "ACL_POLICY_UNAVAILABLE",
@@ -1553,6 +1650,19 @@ class GroundedRuntimeKernel:
             session.active_plan = runtime_preparation.plan.model_copy(deep=True)
             session.active_preparation = runtime_preparation
             session.run_result = run_result
+            session.artifact_publication_required = bool(artifact_root)
+            session.pending_query_publications = [
+                GroundedPendingQueryPublication(
+                    pending_artifact_id=str(
+                        item.get("pendingArtifactId") or ""
+                    ),
+                    generation=generation,
+                    attempt_id=session.active_attempt_id,
+                    receipt=dict(item),
+                )
+                for item in pending_receipts
+                if str(item.get("pendingArtifactId") or "").strip()
+            ]
             if terminal_code:
                 session.terminal_guard_code = terminal_code
             session.verified_evidence = None
@@ -1583,6 +1693,59 @@ class GroundedRuntimeKernel:
             verified = VerifiedEvidence.model_validate(verified)
         with self._lock:
             self._require_generation(session, generation)
+            published_receipts: list[dict[str, Any]] = []
+            publication_error = ""
+            if verified.passed and not session.defer_artifact_publication:
+                try:
+                    published_receipts = self._publish_pending_receipts_locked(
+                        session,
+                        generation=generation,
+                        run_result=session.run_result or run_result,
+                        verified=verified,
+                    )
+                except Exception as exc:
+                    publication_error = "%s:%s" % (
+                        type(exc).__name__,
+                        str(exc)[:400],
+                    )
+                    verified = VerifiedEvidence(
+                        passed=False,
+                        gaps=[
+                            EvidenceGap(
+                                code="QUERY_RESULT_ARTIFACT_PUBLICATION_FAILED",
+                                evidence=str(
+                                    session.active_attempt_id or ""
+                                ),
+                                reason=publication_error,
+                                severity="blocking",
+                            )
+                        ],
+                        blocking_gaps=[
+                            EvidenceGap(
+                                code="QUERY_RESULT_ARTIFACT_PUBLICATION_FAILED",
+                                evidence=str(
+                                    session.active_attempt_id or ""
+                                ),
+                                reason=publication_error,
+                                severity="blocking",
+                            )
+                        ],
+                        answer_guard_required=True,
+                        partial_answer_reason=(
+                            "Verified rows could not be committed to the "
+                            "artifact allowlist ledger."
+                        ),
+                    )
+            if verified.passed and published_receipts:
+                active_run_result = session.run_result or run_result
+                self._attach_published_receipts(
+                    active_run_result,
+                    session.pending_query_publications,
+                    published_receipts,
+                )
+                for pending in session.pending_query_publications:
+                    if pending.generation == generation:
+                        pending.status = "PUBLISHED"
             session.verified_evidence = verified
             if session.run_result is not None:
                 session.run_result.verified_evidence = verified.model_copy(deep=True)
@@ -1593,7 +1756,20 @@ class GroundedRuntimeKernel:
                     plan=plan,
                     run_result=session.run_result or run_result,
                     verified=verified,
+                    publication_status=(
+                        "PENDING"
+                        if session.defer_artifact_publication
+                        and session.artifact_publication_required
+                        else "PUBLISHED"
+                        if published_receipts
+                        else "VERIFIED_IN_MEMORY"
+                    ),
+                    result_artifact_receipts=published_receipts,
                 )
+            elif publication_error:
+                for pending in session.pending_query_publications:
+                    if pending.generation == generation:
+                        pending.status = "PUBLICATION_FAILED"
             session.phase = "VERIFIED" if verified.passed else "VERIFICATION_GAPPED"
             session.revision += 1
             self._event(
@@ -1603,7 +1779,7 @@ class GroundedRuntimeKernel:
                 "blocking=%d" % len(verified.blocking_gaps),
                 session.active_attempt_id,
             )
-        return verified
+        return verified.model_copy(deep=True)
 
     def latest_verified_query_artifact(
         self,
@@ -1613,6 +1789,253 @@ class GroundedRuntimeKernel:
             if not session.verified_query_ledger:
                 return None
             return session.verified_query_ledger[-1].model_copy(deep=True)
+
+    @staticmethod
+    def _all_result_bundles(
+        run_result: AgentRunResult,
+    ) -> list[QueryBundle]:
+        bundles = [
+            *[
+                item.query_bundle
+                for item in run_result.task_results
+                if item.query_bundle is not None
+            ],
+            *list(run_result.query_bundles or []),
+            run_result.merged_query_bundle,
+        ]
+        return bundles
+
+    @classmethod
+    def _extract_pending_result_artifacts(
+        cls,
+        run_result: AgentRunResult,
+    ) -> list[dict[str, Any]]:
+        """Move pending receipts out of every Core-visible result projection."""
+
+        pending: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for bundle in cls._all_result_bundles(run_result):
+            sanitized_events: list[dict[str, Any]] = []
+            for raw_event in bundle.runtime_events or []:
+                event = dict(raw_event or {})
+                raw_receipt = event.pop(
+                    "_serverPrivatePendingResultArtifact",
+                    None,
+                )
+                if isinstance(raw_receipt, dict):
+                    pending_id = str(
+                        raw_receipt.get("pendingArtifactId") or ""
+                    ).strip()
+                    if pending_id and pending_id not in seen:
+                        seen.add(pending_id)
+                        pending.append(dict(raw_receipt))
+                # An executor is not allowed to smuggle a published receipt
+                # into an unverified execution result.
+                event.pop("resultArtifact", None)
+                sanitized_events.append(event)
+            bundle.runtime_events = sanitized_events
+            bundle.offloaded_files = []
+            bundle.source_artifact_refs = {}
+        return pending
+
+    def _publish_pending_receipts_locked(
+        self,
+        session: GroundedRuntimeSession,
+        *,
+        generation: int,
+        run_result: AgentRunResult,
+        verified: VerifiedEvidence,
+    ) -> list[dict[str, Any]]:
+        if not session.artifact_publication_required:
+            return []
+        pending = [
+            item
+            for item in session.pending_query_publications
+            if item.generation == generation
+            and item.attempt_id == session.active_attempt_id
+            and item.status == "PENDING"
+        ]
+        if not pending:
+            raise RuntimeError("QUERY_RESULT_PENDING_RECEIPT_REQUIRED")
+        publish = getattr(
+            self.executor,
+            "publish_pending_result_artifact",
+            None,
+        )
+        if not callable(publish):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_GATE_UNAVAILABLE")
+        if session.active_contract is None:
+            raise RuntimeError("QUERY_RESULT_ACTIVE_CONTRACT_REQUIRED")
+        contract = session.active_contract
+        contract_fingerprint = grounded_query_contract_fingerprint(contract)
+        sql_fingerprint = self._active_sql_evidence_fingerprint(
+            session,
+            contract_fingerprint,
+            run_result,
+        )
+        semantic_activation_fingerprint = str(
+            getattr(
+                session.active_preparation,
+                "asset_pack_fingerprint",
+                "",
+            )
+            or ""
+        ).strip()
+        if not semantic_activation_fingerprint:
+            raise RuntimeError(
+                "QUERY_RESULT_SEMANTIC_ACTIVATION_FINGERPRINT_REQUIRED"
+            )
+        context_owner_fingerprint = grounded_context_owner_fingerprint(
+            session.merchant_id,
+            session.access_role,
+            session.user_scope,
+        )
+        bundle = run_result.merged_query_bundle
+        rows_canonical_sha256 = hashlib.sha256(
+            json.dumps(
+                list(bundle.rows or []),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        published: list[dict[str, Any]] = []
+        for item in pending:
+            receipt = publish(
+                dict(item.receipt),
+                verified_evidence=verified,
+                expected_generation=generation,
+                expected_attempt_id=session.active_attempt_id,
+                expected_contract_fingerprint=contract_fingerprint,
+                expected_sql_fingerprint=sql_fingerprint,
+                expected_context_owner_fingerprint=(
+                    context_owner_fingerprint
+                ),
+                expected_semantic_activation_fingerprint=(
+                    semantic_activation_fingerprint
+                ),
+                expected_data_snapshot=bundle.data_snapshot,
+                expected_result_coverage=str(
+                    bundle.result_coverage or ""
+                ),
+                expected_result_is_truncated=bool(bundle.is_truncated),
+                expected_stored_row_count=len(bundle.rows),
+                expected_exact_result_row_count=max(
+                    0,
+                    int(bundle.original_row_count or 0),
+                ),
+                expected_rows_canonical_sha256=rows_canonical_sha256,
+            )
+            self._validate_published_receipt(receipt)
+            published.append(dict(receipt))
+        return published
+
+    @staticmethod
+    def _active_sql_evidence_fingerprint(
+        session: GroundedRuntimeSession,
+        contract_fingerprint: str,
+        run_result: AgentRunResult,
+    ) -> str:
+        validation = session.active_sql_validation
+        if validation is not None and validation.ast_fingerprint:
+            return str(validation.ast_fingerprint)
+        return hashlib.sha256(
+            (
+                "%s:%s"
+                % (
+                    contract_fingerprint,
+                    run_result.merged_query_bundle.sql,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _validate_published_receipt(receipt: Any) -> None:
+        if not isinstance(receipt, dict):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_RECEIPT_INVALID")
+        required = (
+            "artifactFingerprint",
+            "queryManifestSha256",
+            "rowsSha256",
+            "sqlSha256",
+            "resultCoverage",
+            "manifestRelativePath",
+            "manifestRef",
+            "rowsRef",
+            "sqlRef",
+            "verifiedEvidenceSha256",
+        )
+        if any(not str(receipt.get(key) or "").strip() for key in required):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_RECEIPT_INCOMPLETE")
+        for key in ("manifestRef", "rowsRef", "sqlRef"):
+            if not str(receipt.get(key) or "").startswith("merchant://"):
+                raise RuntimeError("QUERY_RESULT_PUBLICATION_REF_INVALID")
+        for key in (
+            "artifactFingerprint",
+            "queryManifestSha256",
+            "rowsSha256",
+            "sqlSha256",
+            "verifiedEvidenceSha256",
+        ):
+            value = str(receipt.get(key) or "")
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in value
+            ):
+                raise RuntimeError(
+                    "QUERY_RESULT_PUBLICATION_DIGEST_INVALID:%s" % key
+                )
+        for key, value in receipt.items():
+            if "path" in str(key).lower() and str(value or "").startswith(
+                "/"
+            ):
+                raise RuntimeError(
+                    "QUERY_RESULT_PUBLICATION_ABSOLUTE_PATH_FORBIDDEN"
+                )
+
+    @classmethod
+    def _attach_published_receipts(
+        cls,
+        run_result: AgentRunResult,
+        pending: Sequence[GroundedPendingQueryPublication],
+        published: Sequence[dict[str, Any]],
+    ) -> None:
+        by_pending_id = {
+            str(item.get("pendingArtifactId") or ""): dict(item)
+            for item in published
+            if str(item.get("pendingArtifactId") or "").strip()
+        }
+        task_fingerprints = {
+            item.pending_artifact_id: str(
+                item.receipt.get("identity", {}).get("taskFingerprint")
+                or ""
+            )
+            for item in pending
+        }
+        for bundle in cls._all_result_bundles(run_result):
+            bundle.offloaded_files = []
+            for event in bundle.runtime_events or []:
+                task_id = str(event.get("taskId") or "")
+                task_fingerprint = hashlib.sha256(
+                    task_id.encode("utf-8")
+                ).hexdigest()
+                matches = [
+                    receipt
+                    for pending_id, receipt in by_pending_id.items()
+                    if task_fingerprints.get(pending_id) == task_fingerprint
+                ]
+                if len(matches) == 1:
+                    event["resultArtifact"] = dict(matches[0])
+                    refs = [
+                        str(matches[0].get(key) or "")
+                        for key in ("manifestRef", "rowsRef", "sqlRef")
+                        if str(matches[0].get(key) or "").startswith(
+                            "merchant://"
+                        )
+                    ]
+                    if task_id and refs:
+                        bundle.source_artifact_refs[task_id] = refs
 
     def publish_verified_entity_set(
         self,
@@ -1741,6 +2164,8 @@ class GroundedRuntimeKernel:
         plan: QueryPlan,
         run_result: AgentRunResult,
         verified: VerifiedEvidence,
+        publication_status: str = "VERIFIED_IN_MEMORY",
+        result_artifact_receipts: Sequence[dict[str, Any]] = (),
     ) -> GroundedVerifiedQueryArtifact:
         if session.active_contract is None:
             raise RuntimeError("verified query has no active grounded Contract")
@@ -1842,6 +2267,12 @@ class GroundedRuntimeKernel:
             output_lineage=output_lineage,
             sealed_entity_values=sealed_entity_values,
             sealed_entity_values_truncated=sealed_values_truncated,
+            publication_status=str(
+                publication_status or "VERIFIED_IN_MEMORY"
+            ),
+            result_artifact_receipts=[
+                dict(item) for item in result_artifact_receipts
+            ],
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         session.verified_query_ledger.append(artifact)

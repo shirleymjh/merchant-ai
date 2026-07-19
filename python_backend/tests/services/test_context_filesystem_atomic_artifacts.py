@@ -280,6 +280,43 @@ def test_immutable_intent_prevents_mutable_overwrite_after_data_publish_failure(
     assert target.read_text(encoding="utf-8") == "verified"
 
 
+def test_large_immutable_artifact_supports_streamed_unicode_pages_and_search(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "artifacts")
+    prefix = "订单数据" * 600_000
+    marker_text = "目标记录STREAM_TARGET_7"
+    suffix = "退款数据" * 400_000
+    artifact = store.write_text(
+        "results",
+        "large.txt",
+        prefix + marker_text + suffix,
+        immutable=True,
+        preview_chars=0,
+    )
+
+    page = store.read(
+        "results/large.txt",
+        offset=len(prefix),
+        max_chars=len(marker_text),
+        require_immutable=True,
+    )
+    hits = store.grep(
+        "STREAM_TARGET_7",
+        require_immutable=True,
+    )
+
+    assert artifact["success"] is True
+    assert page["success"] is True
+    assert page["content"] == marker_text
+    assert page["contentOffsetChars"] == len(prefix)
+    assert page["nextContentOffsetChars"] == len(prefix) + len(marker_text)
+    assert page["estimatedChars"] == len(prefix + marker_text + suffix)
+    assert [item["relativePath"] for item in hits] == [
+        "results/large.txt"
+    ]
+
+
 def test_internal_artifact_paths_are_reserved_and_not_readable(tmp_path: Path) -> None:
     store = _store(tmp_path / "artifacts")
 
