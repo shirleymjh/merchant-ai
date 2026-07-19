@@ -61,6 +61,10 @@ from merchant_ai.services.grounded_sql_candidate import (
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.routing import KeywordExtractService, TopicRouterService
+from merchant_ai.services.grounded_rule_artifact import (
+    GroundedVerifiedRuleArtifact,
+    render_verified_rule_answer,
+)
 
 
 class GroundedRuntimeAttempt(APIModel):
@@ -189,6 +193,9 @@ class GroundedRuntimeSession(APIModel):
     verified_query_ledger: list[GroundedVerifiedQueryArtifact] = Field(
         default_factory=list
     )
+    verified_rule_ledger: list[GroundedVerifiedRuleArtifact] = Field(
+        default_factory=list
+    )
     verified_entity_sets: list[GroundedVerifiedEntitySet] = Field(
         default_factory=list
     )
@@ -196,6 +203,7 @@ class GroundedRuntimeSession(APIModel):
     answer_run_result: Optional[AgentRunResult] = None
     answer_verified_evidence: Optional[VerifiedEvidence] = None
     answer_artifact_ids: list[str] = Field(default_factory=list)
+    answer_rule_artifact_ids: list[str] = Field(default_factory=list)
     answer: str = ""
     clarification: Optional[ClarificationRequest] = None
     events: list[GroundedRuntimeEvent] = Field(default_factory=list)
@@ -274,6 +282,10 @@ class GroundedRuntimeKernel:
         self,
         session: GroundedRuntimeSession,
         branch_id: str,
+        *,
+        workspace_topics: Sequence[str] | None = None,
+        objective: str = "",
+        inherit_entity_set_ids: Sequence[str] | None = None,
     ) -> GroundedRuntimeSession:
         """Create an isolated execution branch for one independent query goal.
 
@@ -287,7 +299,7 @@ class GroundedRuntimeKernel:
         if not token:
             raise ValueError("parallel query branch_id is required")
         branch = self.new_session(
-            session.question,
+            str(objective or session.question).strip(),
             session.merchant_id,
             merchant=session.merchant.model_copy(deep=True),
             access_role=session.access_role,
@@ -297,8 +309,45 @@ class GroundedRuntimeKernel:
         )
         branch.keywords = session.keywords.model_copy(deep=True)
         branch.routing = session.routing.model_copy(deep=True)
-        branch.workspace_topics = list(session.workspace_topics)
+        branch.workspace_topics = _dedupe(
+            workspace_topics or session.workspace_topics
+        )
         branch.recall = session.recall.model_copy(deep=True)
+        requested_entity_set_ids = _dedupe(inherit_entity_set_ids or [])
+        if requested_entity_set_ids:
+            with self._lock:
+                entity_sets = {
+                    item.artifact_id: item.model_copy(deep=True)
+                    for item in session.verified_entity_sets
+                    if item.artifact_id in set(requested_entity_set_ids)
+                }
+                source_query_ids = {
+                    item.source_query_artifact_id
+                    for item in entity_sets.values()
+                }
+                source_queries = [
+                    item.model_copy(deep=True)
+                    for item in session.verified_query_ledger
+                    if item.artifact_id in source_query_ids
+                    and item.verified_evidence.passed
+                ]
+            missing_entity_sets = [
+                item
+                for item in requested_entity_set_ids
+                if item not in entity_sets
+            ]
+            if missing_entity_sets:
+                raise RuntimeError(
+                    "VERIFIED_ENTITY_SET_NOT_FOUND:%s"
+                    % ",".join(missing_entity_sets)
+                )
+            if len(source_queries) != len(source_query_ids):
+                raise RuntimeError("VERIFIED_ENTITY_SET_SOURCE_QUERY_REQUIRED")
+            branch.verified_entity_sets = [
+                entity_sets[item].model_copy(deep=True)
+                for item in requested_entity_set_ids
+            ]
+            branch.verified_query_ledger = source_queries
         branch.phase = "BRANCH_CREATED"
         self._event(
             branch,
@@ -1758,6 +1807,70 @@ class GroundedRuntimeKernel:
             )
         return session.answer
 
+    def publish_rule_artifact(
+        self,
+        session: GroundedRuntimeSession,
+        artifact: GroundedVerifiedRuleArtifact,
+    ) -> GroundedVerifiedRuleArtifact:
+        if not artifact.verification_passed:
+            raise ValueError("rule artifact must be verified before publication")
+        if artifact.question.strip() != session.question.strip():
+            raise ValueError("rule artifact question does not match the active session")
+        with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in session.verified_rule_ledger
+                    if item.artifact_id == artifact.artifact_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing.model_copy(deep=True)
+            session.verified_rule_ledger.append(artifact.model_copy(deep=True))
+            session.phase = "RULE_EVIDENCE_VERIFIED"
+            session.revision += 1
+            self._event(
+                session,
+                "publish_rule_artifact",
+                "VERIFIED",
+                "artifact=%s;refs=%d"
+                % (artifact.artifact_id, len(artifact.evidence_refs)),
+            )
+        return artifact.model_copy(deep=True)
+
+    def compose_rule_answer(
+        self,
+        session: GroundedRuntimeSession,
+        *,
+        artifact_ids: Sequence[str] = (),
+    ) -> str:
+        requested = {str(item or "").strip() for item in artifact_ids if str(item or "").strip()}
+        with self._lock:
+            artifacts = [
+                item.model_copy(deep=True)
+                for item in session.verified_rule_ledger
+                if not requested or item.artifact_id in requested
+            ]
+        if not artifacts:
+            raise RuntimeError("VERIFIED_RULE_EVIDENCE_REQUIRED")
+        answer = render_verified_rule_answer(artifacts)
+        with self._lock:
+            session.answer = answer
+            session.answer_artifact_ids = []
+            session.answer_rule_artifact_ids = [
+                item.artifact_id for item in artifacts
+            ]
+            session.phase = "ANSWERED"
+            session.revision += 1
+            self._event(
+                session,
+                "compose_rule_answer",
+                "OK",
+                "chars=%d;artifacts=%d" % (len(answer), len(artifacts)),
+            )
+        return answer
+
     def verified_portfolio(
         self,
         session: GroundedRuntimeSession,
@@ -2446,7 +2559,6 @@ def _refresh_namespaced_entity_filter_proof(task_result: Any) -> None:
     new_contract_hash = entity_filter_contract_hash(contract)
     if proof.contract_hash == new_contract_hash:
         return
-    policy = entity_comparison_policy(obligations[0].reference)
     requested = {
         value
         for obligation in obligations

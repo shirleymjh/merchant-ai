@@ -113,7 +113,7 @@ def test_trade_l1_exposes_compact_exact_leaf_navigation_without_binding_evidence
     article = next(item for item in navigation["columnLeaves"] if item["key"] == "article_id")
 
     assert "销量" in metric["aliases"]
-    assert "品牌名字" in brand["aliases"]
+    assert "品牌name" in brand["aliases"]
     assert metric["path"].endswith("/metrics/sku_cnt.json")
     assert brand["path"].endswith("/columns/brand_name.json")
     assert article["path"].endswith("/columns/article_id.json")
@@ -127,6 +127,127 @@ def test_trade_l1_exposes_compact_exact_leaf_navigation_without_binding_evidence
         )
         assert exact["success"] is True
         assert exact["kind"] in {"METRIC", "COLUMN"}
+
+
+def test_every_published_table_l1_has_bounded_asset_derived_exact_navigation() -> None:
+    catalog = _catalog()
+    checked_tables = 0
+
+    for topic in catalog.topic_assets.all_topic_names():
+        for manifest_item in catalog.topic_assets.load_manifest(topic):
+            table = str(manifest_item.get("tableName") or "")
+            if not table:
+                continue
+            checked_tables += 1
+            asset = catalog.topic_assets.load_table_asset(topic, table)
+            poisoned_manifest = {
+                **manifest_item,
+                "navigationHints": {
+                    "metrics": [
+                        {
+                            "key": "manifest_only_metric",
+                            "aliases": ["MANIFEST_ONLY_ALIAS"],
+                        }
+                    ],
+                    "columns": ["manifest_only_column"],
+                },
+            }
+            ref = catalog.table_detail_ref(
+                topic,
+                table,
+                manifest_item=poisoned_manifest,
+            )
+            assert int(ref["estimatedChars"]) <= catalog.L1_DETAIL_MAX_CHARS
+            assert int(ref["estimatedChars"]) == len(str(ref["content"]))
+
+            payload = json.loads(str(ref["content"]))
+            navigation = payload["semanticNavigation"]
+            assert navigation["source"] == "published_asset"
+            assert navigation["questionIndependent"] is True
+            assert navigation["bindingEvidence"] is False
+            assert navigation["publishedCounts"] == {
+                "metrics": len(asset.get("metrics") or []),
+                "columns": len(asset.get("semanticColumns") or []),
+            }
+            assert navigation["advertisedCounts"] == {
+                "metrics": len(navigation["metricLeaves"]),
+                "columns": len(navigation["columnLeaves"]),
+            }
+
+            serialized_navigation = json.dumps(navigation, ensure_ascii=False)
+            assert "manifest_only" not in serialized_navigation
+            assert "MANIFEST_ONLY_ALIAS" not in serialized_navigation
+            for forbidden_definition_field in (
+                "formula",
+                "sourceColumns",
+                "enumValues",
+                "description",
+            ):
+                assert forbidden_definition_field not in serialized_navigation
+
+            for section, field, leaf_field in (
+                ("metrics", "metrics", "metricLeaves"),
+                ("columns", "semanticColumns", "columnLeaves"),
+            ):
+                values = [item for item in asset.get(field) or [] if isinstance(item, dict)]
+                published_keys = set(semantic_table_entry_keys(section, values))
+                leaves = navigation[leaf_field]
+                if values:
+                    assert leaves
+                for leaf in leaves:
+                    assert set(leaf) == {"key", "aliases", "refId", "path"}
+                    assert leaf["key"] in published_keys
+                    assert isinstance(leaf["aliases"], list)
+                    assert len(leaf["aliases"]) <= (catalog.L1_NAVIGATION_MAX_ALIASES_PER_LEAF)
+                    exact = catalog.read(
+                        ref_id=str(leaf["refId"]),
+                        path=str(leaf["path"]),
+                        max_chars=2_000_000,
+                    )
+                    assert exact["success"], (topic, table, leaf, exact)
+                    assert exact["kind"] in {"METRIC", "COLUMN"}
+
+    assert checked_tables >= 10
+
+
+def test_all_topic_l0_manifests_do_not_disclose_or_load_table_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _catalog()
+
+    for topic in catalog.topic_assets.all_topic_names():
+        manifest = catalog.manifest_ref(topic)
+        payload = json.loads(str(manifest["content"]))
+        assert payload["layer"] == "manifest"
+        assert "semanticNavigation" not in payload
+        l0_string_values = {value for table in payload["tables"] for value in table.values() if isinstance(value, str)}
+        for table in payload["tables"]:
+            assert set(table) <= {
+                "topic",
+                "table",
+                "title",
+                "detailRefId",
+                "detailPath",
+                "businessSummary",
+            }
+            asset = catalog.topic_assets.load_table_asset(topic, str(table["table"]))
+            for section, values in (
+                ("metrics", asset.get("metrics") or []),
+                ("columns", asset.get("semanticColumns") or []),
+            ):
+                for key in semantic_table_entry_keys(section, values):
+                    assert key not in l0_string_values
+
+    def fail_if_l0_loads_asset(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("L0 navigation must not load asset.json")
+
+    monkeypatch.setattr(
+        catalog.topic_assets,
+        "load_table_asset",
+        fail_if_l0_loads_asset,
+    )
+    assert catalog.ls(topic="电商交易")
+    catalog.grep(query="订单", topic="电商交易")
 
 
 def test_recall_navigation_has_no_host_paths_fragments_or_default_asset_coordinates() -> None:

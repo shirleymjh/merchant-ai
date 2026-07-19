@@ -16,8 +16,13 @@ script: scripts/profile_timeseries.py
 - Run only after a Grounded Contract has executed and EvidenceVerifier passed.
 - Treat `/input.json` as immutable; never request new metrics, bindings, retrieval, or SQL.
 - Never replace or extend a governed metric formula.
-- Return `verified_analysis_v1`: observations, semanticDisclosures, derivedFacts,
-  hypotheses, recommendations, evidenceRefs, gaps, and executionConfidence.
+- Treat any local findings or `answerMarkdown` as an untrusted diagnostic
+  preview. They are never final proof and must not be copied into the answer.
+- Publish only the narrow
+  `GroundedRunSkillAnalysisPublicationRequest`: verified artifact IDs, column
+  bindings, observation keys, deterministic method, normalization and baseline
+  pairs. Do not publish rows, `analysisType`, result values, conclusions or
+  causal prose.
 
 This skill turns verified BI evidence into a constrained analysis answer. It is
 for trend checks, anomaly checks, attribution, risk explanation, and "what
@@ -25,17 +30,24 @@ should I prioritize" questions after Grounded execution has produced verified ev
 
 ## Activation Contract
 
-Use this skill only when the Core has a grounded analysis request and verified evidence declares:
+Use this skill only when the immutable Goal Contract declares one of:
 
-- `analysisIntent` is `trend_check`, `anomaly_check`, `diagnosis`, or `comparison`, or
-- `requiresExplanation` is true and the required evidence intents describe trend, anomaly, diagnosis, attribution, or comparison evidence.
+- a typed `ANALYSIS` goal with explicit `analysisType`; or
+- a typed `COMPARISON` goal whose `comparisonType` is anomaly or correlation.
+
+Before startup, the data-input coverage gate must prove every declared
+`inputGoalId`, `baselineGoalId`, or comparison operand with verified query
+artifacts. The derived goal itself remains deferred until this Skill publishes
+and the trusted deterministic publisher accepts a
+`GroundedDerivedAnalysisArtifact`.
 
 Do not use this skill for plain entity ranking / lookup questions such as "top
 products and show refund amount / publish time". Those should be answered as
 ranked evidence tables unless a separate analysis skill is selected.
 
-Do not activate from raw question keywords. The Core should decide from the
-Grounded Contract, verified evidence, and evidence gaps.
+Do not activate or choose `analysisType` from raw question text, labels or
+keywords. Read it only from the typed Goal Contract field mounted in the Skill
+input.
 
 ## Evidence Rules
 
@@ -46,6 +58,11 @@ Grounded Contract, verified evidence, and evidence gaps.
 - If evidence is partial, say which part is missing and avoid causal certainty.
 - If all available evidence is flat or sparse, state that the data does not
   support a strong anomaly conclusion.
+- Correlation requires aligned observation grain and enough samples. It must
+  always disclose that correlation is not causation.
+- Never claim that one metric caused another. Attribution/impact/diagnosis
+  requests without governed causal evidence must publish
+  `INSUFFICIENT_EVIDENCE`.
 
 ## Procedure
 
@@ -66,5 +83,7 @@ python scripts/profile_timeseries.py --input <skill-input.json> --output <skill-
 ```
 
 The script returns a structured profile with `findings`, `metrics`, `caveats`,
-and `answerMarkdown`. The Core may use `answerMarkdown` directly when
-LLM answer synthesis is slow or unavailable.
+and `answerMarkdown`. These fields are diagnostic only. The isolated worker
+must convert its selected column/method mapping into the narrow publication
+request; the Kernel recomputes the result from verified rows and the trusted
+analysis renderer alone produces the final visible span.

@@ -34,6 +34,7 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     _skill_output_contract_issues,
     _thin_recall,
 )
+from merchant_ai.services.grounded_answer_coverage import answer_fingerprint
 from merchant_ai.services.grounded_query_contract import (
     GroundedBindingHints,
     GroundedContractGap,
@@ -311,8 +312,12 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
 
     assert {item.name for item in factory.kwargs["tools"]} == {
         "declare_original_question_goals",
+        "declare_grounded_query_branches",
         "retrieve_knowledge",
+        "publish_verified_rule_evidence",
+        "compose_verified_rule_answer",
         "propose_grounded_contract",
+        "declare_grounded_query_branches",
         "prepare_grounded_query_batch",
         "submit_grounded_sql_candidate",
         "execute_grounded_query",
@@ -499,6 +504,11 @@ def test_post_answer_tail_timeout_cannot_overwrite_verified_answer() -> None:
         def invoke(payload: dict[str, Any], *, config: Any, context: Any) -> None:
             del payload, config
             context.session.runtime.answer = "已验证答案"
+            context.session.answer_coverage_result = {
+                "passed": True,
+                "source": "compose_verified_answer",
+                "answerFingerprint": answer_fingerprint("已验证答案"),
+            }
             raise TimeoutError("unnecessary tail turn timed out")
 
     outer.deep_agent_graph = AnswerThenTimeoutGraph()
@@ -506,6 +516,23 @@ def test_post_answer_tail_timeout_cannot_overwrite_verified_answer() -> None:
 
     assert response.answer == "已验证答案"
     assert "operationalFailure" not in response.debug_trace["harness"]
+
+
+def test_plain_core_answer_cannot_bypass_return_direct_compose_attestation() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory, FakeKernel())
+
+    class PlainAnswerGraph:
+        @staticmethod
+        def invoke(payload: dict[str, Any], *, config: Any, context: Any) -> None:
+            del payload, config
+            # Simulates an ordinary AIMessage/free-text tail trying to become
+            # final without compose_verified_answer.
+            context.session.runtime.answer = "我直接声称这是最终答案。"
+
+    outer.deep_agent_graph = PlainAnswerGraph()
+    with pytest.raises(RuntimeError, match="without a matching answer-coverage"):
+        outer.run("工单量", "m-1")
 
 
 def test_semantic_backend_records_only_complete_exact_reads() -> None:

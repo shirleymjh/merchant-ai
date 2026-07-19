@@ -13,8 +13,12 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
 from merchant_ai.services.grounded_goal_contract import (
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
+    RankingQuestionGoal,
 )
-from merchant_ai.services.grounded_query_contract import GroundedQueryContract
+from merchant_ai.services.grounded_query_contract import (
+    GroundedQueryContract,
+    GroundedRankingBinding,
+)
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
@@ -253,14 +257,104 @@ def test_complete_verified_goal_coverage_allows_finalization_and_composition() -
         "metric.revenue",
         "metric.orders",
     ]
-    assert composed == {
-        "status": "ANSWERED",
-        "answer": "verified answer",
-        "verifiedQueryArtifactIds": ["artifact-complete"],
-    }
+    assert composed["status"] == "ANSWERED"
+    assert composed["answer"] == "verified answer"
+    assert composed["verifiedQueryArtifactIds"] == ["artifact-complete"]
+    assert composed["goalAnswerCoverage"]["passed"] is True
+    assert composed["goalAnswerCoverage"]["mappedGoalIds"] == [
+        "metric.revenue",
+        "metric.orders",
+    ]
     assert context.session.data_collection_sealed is True
     assert kernel.verify_portfolio_calls == 1
     assert kernel.compose_answer_calls == 1
+
+
+def test_ranked_compose_uses_internal_artifact_renderer_not_core_supplied_spans() -> None:
+    kernel = GoalGateKernel()
+    runtime = _runtime(kernel)
+    context = _context(kernel, question="top 3 products")
+    tools = _tools(runtime)
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=context.session.runtime.question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.sales",
+                        label="sales",
+                        required=False,
+                    ),
+                    RankingQuestionGoal(
+                        goal_id="ranking.top3",
+                        label="top 3 products",
+                        metric_goal_ids=["metric.sales"],
+                        limit=3,
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+    contract = GroundedQueryContract(
+        question=context.session.runtime.question,
+        status="READY",
+        query_shape="RANKED",
+        evidence_refs=["semantic:metric:sales"],
+        ranking=GroundedRankingBinding(
+            enabled=True,
+            direction="DESC",
+            limit=3,
+            metric_ref_id="semantic:metric:sales",
+        ),
+    )
+    artifact = GroundedVerifiedQueryArtifact(
+        artifact_id="artifact-ranked",
+        generation=1,
+        contract_fingerprint=grounded_query_contract_fingerprint(contract),
+        sql_fingerprint="a" * 64,
+        contract=contract,
+        plan=QueryPlan(),
+        run_result=AgentRunResult(
+            merged_query_bundle=QueryBundle(
+                rows=[
+                    {"product": "Product A", "sales": 30},
+                    {"product": "Product B", "sales": 20},
+                    {"product": "Product C", "sales": 10},
+                ],
+                tables=["orders"],
+            )
+        ),
+        verified_evidence=VerifiedEvidence(passed=True),
+        output_columns=["product", "sales"],
+    )
+    context.session.runtime.verified_query_ledger.append(artifact)
+    context.session.artifact_goal_ids[artifact.artifact_id] = [
+        "metric.sales",
+        "ranking.top3",
+    ]
+
+    composed = json.loads(
+        tools["compose_verified_answer"].func(
+            allow_llm=False,
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert composed["status"] == "ANSWERED"
+    assert "Product A" in composed["answer"]
+    assert "| product | sales |" in composed["answer"]
+    assert composed["goalAnswerCoverage"]["passed"] is True
+    ranking_binding = next(
+        item
+        for item in composed["goalAnswerCoverage"]["bindings"]
+        if item["goalId"] == "ranking.top3"
+    )
+    assert ranking_binding["renderer"] == "VERIFIED_RANKING_RENDERER"
+    schema = tools["compose_verified_answer"].tool_call_schema.model_json_schema()
+    assert "goal_answer_bindings" not in schema.get("properties", {})
+    assert "goalAnswerBindings" not in schema.get("properties", {})
 
 
 def test_proposal_is_blocked_when_assigned_goal_semantics_are_not_in_contract() -> None:

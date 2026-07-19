@@ -834,6 +834,13 @@ class SemanticCatalogService:
         "rules": "knowledgeRules",
     }
     OFFLOAD_THRESHOLD_CHARS = 20_000
+    # L1 is injected into the active Core context.  Keep it below the runtime's
+    # inline-read boundary so a table overview never turns into another large
+    # context offload.  Exact L2 definitions remain addressable by ref/path.
+    L1_DETAIL_MAX_CHARS = 8_000
+    L1_NAVIGATION_MAX_METRIC_LEAVES = 16
+    L1_NAVIGATION_MAX_COLUMN_LEAVES = 26
+    L1_NAVIGATION_MAX_ALIASES_PER_LEAF = 2
 
     def __init__(self, topic_assets: TopicAssetService):
         self.topic_assets = topic_assets
@@ -866,7 +873,12 @@ class SemanticCatalogService:
                     continue
                 # L0 listing must be question-independent and must never load
                 # asset.json.  It exposes only the next browse coordinate.
-                ref = self.table_detail_ref(topic_name, table, manifest_item)
+                ref = self.table_detail_ref(
+                    topic_name,
+                    table,
+                    manifest_item,
+                    _include_navigation=False,
+                )
                 if not terms or score_document(terms, ref["searchText"]) > 0:
                     refs.append(ref)
         refs.sort(key=lambda item: score_document(terms, item["searchText"]) if terms else 0.0, reverse=True)
@@ -1009,7 +1021,12 @@ class SemanticCatalogService:
         if tables_match:
             topic = tables_match.group(1)
             return [
-                self.table_detail_ref(topic, str(item.get("tableName") or ""), item)
+                self.table_detail_ref(
+                    topic,
+                    str(item.get("tableName") or ""),
+                    item,
+                    _include_navigation=False,
+                )
                 for item in self.topic_assets.load_manifest(topic)
                 if isinstance(item, dict) and str(item.get("tableName") or "")
             ]
@@ -1240,8 +1257,17 @@ class SemanticCatalogService:
         topic: str,
         table: str,
         manifest_item: Dict[str, Any] | None = None,
+        *,
+        _include_navigation: bool = True,
     ) -> Dict[str, Any]:
-        """Build the L1 table detail strictly from the published L0 manifest."""
+        """Build a compact L1 overview over the published table asset.
+
+        L0 routing metadata still comes strictly from ``manifest.json``.  Once
+        a table is chosen, L1 may inspect its active ``asset.json`` to publish
+        question-independent coordinates for a bounded set of exact metric and
+        semantic-column leaves.  Coordinates are navigation, not binding
+        evidence: callers must still read the advertised L2 leaf.
+        """
 
         item = dict(manifest_item or self._manifest_item(topic, table) or {})
         child_refs = [
@@ -1260,55 +1286,6 @@ class SemanticCatalogService:
                 "use": "read only when the plan needs a cross-table edge",
             }
         )
-        navigation_hints = item.get("navigationHints") or {}
-        semantic_navigation: Dict[str, Any] = {}
-        if isinstance(navigation_hints, dict):
-            for source_key, section, target_key in (
-                ("metrics", "metrics", "metricLeaves"),
-                ("columns", "columns", "columnLeaves"),
-            ):
-                leaves: List[Dict[str, Any]] = []
-                raw_leaves = navigation_hints.get(source_key) or []
-                if not isinstance(raw_leaves, list):
-                    continue
-                for raw_leaf in raw_leaves[:16]:
-                    if isinstance(raw_leaf, str):
-                        key = raw_leaf.strip()
-                        aliases: List[str] = []
-                    elif isinstance(raw_leaf, dict):
-                        key = str(raw_leaf.get("key") or "").strip()
-                        aliases = dedupe_strings(
-                            [str(value) for value in raw_leaf.get("aliases") or []]
-                        )[:8]
-                    else:
-                        continue
-                    if not key or not re.fullmatch(r"[A-Za-z0-9_]+", key):
-                        continue
-                    leaf = {
-                        "key": key,
-                        "refId": semantic_table_entry_ref_id(
-                            topic,
-                            table,
-                            section,
-                            key,
-                        ),
-                        "path": semantic_table_entry_path(
-                            topic,
-                            table,
-                            section,
-                            key,
-                        ),
-                    }
-                    if aliases:
-                        leaf["aliases"] = aliases
-                    leaves.append(leaf)
-                if leaves:
-                    semantic_navigation[target_key] = leaves
-        if semantic_navigation:
-            semantic_navigation["policy"] = (
-                "Navigation only. Read each exact leaf before binding it into a Contract; "
-                "do not scan the broad index when one of these aliases matches."
-            )
         payload = {
             "topic": topic,
             "tableName": table,
@@ -1326,9 +1303,17 @@ class SemanticCatalogService:
             "children": child_refs,
             "policy": "Choose only the metric/column/schema/rule index needed next. Full asset.json is not exposed to the Planner.",
         }
+        semantic_navigation = (
+            self._automatic_l1_semantic_navigation(topic, table)
+            if _include_navigation
+            else {}
+        )
         if semantic_navigation:
             payload["semanticNavigation"] = semantic_navigation
-        content = json.dumps(payload, ensure_ascii=False, indent=2)
+            self._trim_l1_navigation_to_budget(payload)
+        # Compact JSON materially increases the number of useful exact
+        # coordinates that fit under the L1 inline-context boundary.
+        content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         ref_id = semantic_table_detail_ref_id(topic, table)
         path = semantic_table_detail_path(topic, table)
         return add_context_uri(
@@ -1361,6 +1346,129 @@ class SemanticCatalogService:
             kind=self.TABLE_DETAIL_KIND,
             path=path,
         )
+
+    def _automatic_l1_semantic_navigation(
+        self,
+        topic: str,
+        table: str,
+    ) -> Dict[str, Any]:
+        """Derive stable exact-leaf navigation from the active asset only."""
+
+        asset = self.topic_assets.load_table_asset(topic, table)
+        metrics = [item for item in asset.get("metrics") or [] if isinstance(item, dict)]
+        columns = [item for item in asset.get("semanticColumns") or [] if isinstance(item, dict)]
+        metric_leaves = self._automatic_l1_leaves(
+            topic,
+            table,
+            "metrics",
+            metrics,
+            asset,
+            self.L1_NAVIGATION_MAX_METRIC_LEAVES,
+        )
+        column_leaves = self._automatic_l1_leaves(
+            topic,
+            table,
+            "columns",
+            columns,
+            asset,
+            self.L1_NAVIGATION_MAX_COLUMN_LEAVES,
+        )
+        if not metric_leaves and not column_leaves:
+            return {}
+        return {
+            "source": "published_asset",
+            "questionIndependent": True,
+            "bindingEvidence": False,
+            "publishedCounts": {
+                "metrics": len(metrics),
+                "columns": len(columns),
+            },
+            "advertisedCounts": {
+                "metrics": len(metric_leaves),
+                "columns": len(column_leaves),
+            },
+            "metricLeaves": metric_leaves,
+            "columnLeaves": column_leaves,
+            "policy": (
+                "Navigation only; read an exact leaf before Contract binding. "
+                "Use its section index only when no advertised alias matches."
+            ),
+        }
+
+    def _automatic_l1_leaves(
+        self,
+        topic: str,
+        table: str,
+        section: str,
+        values: Sequence[Dict[str, Any]],
+        asset: Dict[str, Any],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        keys = semantic_table_entry_keys(section, values)
+        indexed = [(index, value, keys[index]) for index, value in enumerate(values) if keys[index]]
+        if section == "columns":
+            indexed.sort(
+                key=lambda item: (
+                    -automatic_l1_column_priority(asset, item[1], item[2]),
+                    item[0],
+                )
+            )
+            # Repeated generated aliases (for example several address levels
+            # all called "buyer address") waste scarce L1 space.  Prefer
+            # semantic breadth first, then fill with remaining definitions.
+            diverse: List[Tuple[int, Dict[str, Any], str]] = []
+            repeated: List[Tuple[int, Dict[str, Any], str]] = []
+            seen_primary_aliases: Set[str] = set()
+            for item in indexed:
+                aliases = automatic_l1_navigation_aliases(section, item[1], item[2])
+                primary = min(aliases, key=len) if aliases else item[2]
+                if primary in seen_primary_aliases:
+                    repeated.append(item)
+                    continue
+                seen_primary_aliases.add(primary)
+                diverse.append(item)
+            indexed = [*diverse, *repeated]
+        selected: List[Dict[str, Any]] = []
+        for _index, value, key in indexed[: max(0, limit)]:
+            selected.append(
+                {
+                    "key": key,
+                    "aliases": automatic_l1_navigation_aliases(
+                        section,
+                        value,
+                        key,
+                    )[: self.L1_NAVIGATION_MAX_ALIASES_PER_LEAF],
+                    "refId": semantic_table_entry_ref_id(topic, table, section, key),
+                    "path": semantic_table_entry_path(topic, table, section, key),
+                }
+            )
+        return selected
+
+    def _trim_l1_navigation_to_budget(self, payload: Dict[str, Any]) -> None:
+        navigation = payload.get("semanticNavigation")
+        if not isinstance(navigation, dict):
+            return
+        metric_leaves = navigation.get("metricLeaves")
+        column_leaves = navigation.get("columnLeaves")
+        metric_leaves = metric_leaves if isinstance(metric_leaves, list) else []
+        column_leaves = column_leaves if isinstance(column_leaves, list) else []
+        while len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) > self.L1_DETAIL_MAX_CHARS:
+            removable = [
+                (metric_leaves, self.L1_NAVIGATION_MAX_METRIC_LEAVES, "metrics"),
+                (column_leaves, self.L1_NAVIGATION_MAX_COLUMN_LEAVES, "columns"),
+            ]
+            removable = [item for item in removable if len(item[0]) > 1]
+            if not removable:
+                break
+            leaves, _limit, _name = max(
+                removable,
+                key=lambda item: len(item[0]) / max(1, item[1]),
+            )
+            leaves.pop()
+        advertised = navigation.get("advertisedCounts")
+        if isinstance(advertised, dict):
+            advertised["metrics"] = len(metric_leaves)
+            advertised["columns"] = len(column_leaves)
 
     def table_section_ref(self, topic: str, table: str, section: str) -> Dict[str, Any] | None:
         section_name = str(section or "").strip().lower()
@@ -1726,7 +1834,14 @@ class SemanticCatalogService:
             for manifest_item in self.topic_assets.load_manifest(topic_name):
                 table = str(manifest_item.get("tableName") or "")
                 if table:
-                    refs.append(self.table_detail_ref(topic_name, table, manifest_item))
+                    refs.append(
+                        self.table_detail_ref(
+                            topic_name,
+                            table,
+                            manifest_item,
+                            _include_navigation=False,
+                        )
+                    )
                     for section in self.TABLE_SECTION_FIELDS:
                         refs.append(self._section_public_ref(topic_name, table, section, manifest_item))
             relationships = self.topic_assets.load_relationships(topic_name)
@@ -1806,7 +1921,14 @@ class SemanticCatalogService:
             item = self._manifest_item(topic, table)
             if not item:
                 return []
-            refs = [self.table_detail_ref(topic, table, item)]
+            refs = [
+                self.table_detail_ref(
+                    topic,
+                    table,
+                    item,
+                    _include_navigation=False,
+                )
+            ]
             for section in self.TABLE_SECTION_FIELDS:
                 refs.append(self._section_public_ref(topic, table, section, item))
             return [
@@ -5362,6 +5484,120 @@ def semantic_table_entry_title(section: str, value: Dict[str, Any], fallback: st
         "rules": ["title", "ruleKey"],
     }.get(section, ["title", "name", "key"])
     return next((str(value.get(key) or "").strip() for key in keys if str(value.get(key) or "").strip()), fallback)
+
+
+def automatic_l1_navigation_aliases(
+    section: str,
+    value: Dict[str, Any],
+    entry_key: str,
+) -> List[str]:
+    """Return a compact, published-only alias set for L1 navigation."""
+
+    official_fields = (
+        ("businessName", "displayName", "naturalName", "title")
+        if section == "metrics"
+        else ("businessName", "displayName", "comment", "title")
+    )
+    official = next(
+        (str(value.get(field) or "").strip() for field in official_fields if str(value.get(field) or "").strip()),
+        "",
+    )
+    raw_aliases = value.get("aliases") or []
+    if isinstance(raw_aliases, str):
+        raw_aliases = [raw_aliases]
+    candidates = dedupe_strings(
+        [
+            official,
+            *[str(item or "").strip() for item in raw_aliases],
+        ]
+    )
+    candidates = [
+        item
+        for item in candidates
+        if item and item != entry_key and len(item) <= 48 and not re.fullmatch(r"[A-Za-z0-9_]+", item)
+    ]
+    if not candidates:
+        return []
+    aliases: List[str] = []
+    if official in candidates:
+        aliases.append(official)
+    # A short published alias is generally the most useful recall label and
+    # avoids preserving only verbose generated descriptions in the L1 budget.
+    shortest = min(
+        enumerate(candidates),
+        key=lambda item: (len(item[1]), item[0]),
+    )[1]
+    if shortest not in aliases:
+        aliases.append(shortest)
+    for candidate in candidates:
+        if candidate not in aliases:
+            aliases.append(candidate)
+    return aliases
+
+
+def automatic_l1_column_priority(
+    asset: Dict[str, Any],
+    column: Dict[str, Any],
+    entry_key: str,
+) -> int:
+    """Rank published fields without looking at the user's question.
+
+    The ordering favours scope/time fields, governed entity identities and
+    human-readable labels.  It intentionally contains no domain/table/field
+    allowlist, so newly published Topics receive the same behaviour.
+    """
+
+    role = str(column.get("role") or column.get("semanticRole") or column.get("entityRole") or "").strip().upper()
+    priority = 0
+    try:
+        display_priority = int(column.get("displayPriority") or 0)
+    except (TypeError, ValueError):
+        display_priority = 0
+    if bool(column.get("defaultVisible")):
+        priority += 1_200 + max(0, display_priority)
+    if entry_key in {
+        str(asset.get("timeColumn") or "").strip(),
+        str(asset.get("merchantFilterColumn") or "").strip(),
+    }:
+        priority += 1_100
+    if column.get("canonicalEntityRef") or column.get("isUniqueEntityKey"):
+        priority += 1_000
+
+    canonical_bases = {
+        str(item.get("columnName") or "")[:-3]
+        for item in asset.get("semanticColumns") or []
+        if isinstance(item, dict)
+        and item.get("canonicalEntityRef")
+        and str(item.get("columnName") or "").endswith("_id")
+    }
+    if entry_key.endswith("_name") and entry_key[:-5] in canonical_bases:
+        priority += 900
+
+    priority += {
+        "DIMENSION": 600,
+        "KEY": 580,
+        "ENTITY": 580,
+        "ENTITY_KEY": 580,
+        "TIME": 500,
+        # Aggregate measures already have first-class metric leaves.  Keep
+        # their raw columns discoverable without crowding out dimensions.
+        "METRIC": 500,
+        "MEASURE": 500,
+    }.get(role, 200)
+    if role == "DIMENSION" and column.get("enumValues"):
+        priority += 80
+
+    aliases = automatic_l1_navigation_aliases("columns", column, entry_key)
+    shortest_alias_length = min((len(item) for item in aliases), default=100)
+    if shortest_alias_length <= 3:
+        priority += 180
+    elif shortest_alias_length <= 6:
+        priority += 80
+    elif shortest_alias_length <= 12:
+        priority += 40
+    if entry_key.endswith(("_name", "_title")):
+        priority += 30
+    return priority
 
 
 def semantic_relationship_path(topic: str) -> str:

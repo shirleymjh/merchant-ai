@@ -5,13 +5,17 @@ from types import SimpleNamespace
 import pytest
 
 from merchant_ai.services.grounded_goal_contract import (
+    AnalysisQuestionGoal,
     ComparisonQuestionGoal,
+    DetailQuestionGoal,
     DependencyQuestionGoal,
     GoalContractValidationError,
     GoalCoverageBlocked,
     GoalCoverageVerifier,
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
+    RankingQuestionGoal,
+    RuleQuestionGoal,
     TimeWindowQuestionGoal,
     VerifiedArtifactGoalCoverage,
     declare_verified_artifact_goal_coverage,
@@ -430,3 +434,313 @@ def test_verifier_can_read_coverage_fields_directly_from_kernel_artifact_shape()
 
     assert result.finalization_allowed is True
     assert result.artifact_ids == ["artifact-direct"]
+
+
+def anomaly_contract() -> OriginalQuestionGoalContract:
+    return parse_original_question_goal_contract(
+        {
+            "question": "最近7天 GMV、退款金额、催单工单量分别是多少，哪个环节最异常？",
+            "goals": [
+                {
+                    "goalId": "metric.gmv",
+                    "kind": "metric",
+                    "label": "GMV",
+                },
+                {
+                    "goalId": "metric.refund_amount",
+                    "kind": "metric",
+                    "label": "退款金额",
+                },
+                {
+                    "goalId": "metric.urge_ticket_count",
+                    "kind": "metric",
+                    "label": "催单工单量",
+                },
+                {
+                    "goalId": "time.last_7_days",
+                    "kind": "time_window",
+                    "label": "最近7天",
+                    "timeExpression": "最近7天",
+                    "appliesToGoalIds": [
+                        "metric.gmv",
+                        "metric.refund_amount",
+                        "metric.urge_ticket_count",
+                    ],
+                },
+                {
+                    "goalId": "comparison.most_anomalous",
+                    "kind": "comparison",
+                    "label": "哪个环节最异常",
+                    "comparisonType": "anomaly",
+                    "leftGoalIds": ["metric.gmv", "metric.refund_amount"],
+                    "rightGoalIds": ["metric.urge_ticket_count"],
+                },
+            ],
+        }
+    )
+
+
+def test_scalar_artifact_cannot_claim_anomaly_analysis_is_covered() -> None:
+    """Regression: three returned scalars are not an anomaly proof."""
+
+    contract = anomaly_contract()
+    goal_ids = [goal.goal_id for goal in contract.goals]
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [declaration(contract, "artifact-three-scalars", goal_ids)],
+    )
+
+    assert result.finalization_allowed is False
+    assert result.covered_goal_ids == [
+        "metric.gmv",
+        "metric.refund_amount",
+        "metric.urge_ticket_count",
+        "time.last_7_days",
+    ]
+    assert result.missing_required_goal_ids == ["comparison.most_anomalous"]
+    assert result.resolution_by_goal_id.get("comparison.most_anomalous") is None
+    assert "GOAL_TYPED_PROOF_REQUIRED" in {issue.code for issue in result.issues}
+
+
+def test_anomaly_proof_requires_baseline_and_normalization() -> None:
+    contract = anomaly_contract()
+    goal_ids = [goal.goal_id for goal in contract.goals]
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-unscaled-comparison",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=goal_ids,
+                verification_passed=True,
+                goal_resolutions=[
+                    {
+                        "goalId": "comparison.most_anomalous",
+                        "goalKind": "comparison",
+                        "resolution": "proved",
+                        "operandGoalIds": [
+                            "metric.gmv",
+                            "metric.refund_amount",
+                            "metric.urge_ticket_count",
+                        ],
+                        "comparisonMethod": "largest absolute scalar",
+                        "resultRef": "artifact:comparison-result",
+                    }
+                ],
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is False
+    assert "comparison.most_anomalous" not in result.covered_goal_ids
+    assert {issue.code for issue in result.issues} >= {
+        "ANOMALY_PROOF_BASELINE_MISSING",
+        "ANOMALY_PROOF_NORMALIZATION_MISSING",
+    }
+
+
+def test_explicit_insufficient_evidence_resolves_but_does_not_prove_goal() -> None:
+    contract = anomaly_contract()
+    primitive_goal_ids = [
+        goal.goal_id for goal in contract.goals if goal.kind != "COMPARISON"
+    ]
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-no-baseline",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=[
+                    *primitive_goal_ids,
+                    "comparison.most_anomalous",
+                ],
+                verification_passed=True,
+                goal_resolutions=[
+                    {
+                        "goalId": "comparison.most_anomalous",
+                        "goalKind": "comparison",
+                        "resolution": "insufficient_evidence",
+                        "reason": "没有上一周期或标准化基线，不能比较不同单位指标的异常程度",
+                        "evidenceRefs": ["gap:comparable-baseline-missing"],
+                    }
+                ],
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is True
+    assert result.passed is False
+    assert result.missing_required_goal_ids == []
+    assert result.unproved_required_goal_ids == ["comparison.most_anomalous"]
+    assert result.insufficient_evidence_goal_ids == [
+        "comparison.most_anomalous"
+    ]
+    assert "comparison.most_anomalous" in result.resolved_goal_ids
+    assert "comparison.most_anomalous" not in result.covered_goal_ids
+    assert "comparison.most_anomalous" in result.claimed_covered_goal_ids
+    assert (
+        result.resolution_by_goal_id["comparison.most_anomalous"]
+        == "INSUFFICIENT_EVIDENCE"
+    )
+    assert "INSUFFICIENT_EVIDENCE_CANNOT_PROVE_GOAL" in {
+        issue.code for issue in result.issues
+    }
+
+
+def dependency_contract() -> OriginalQuestionGoalContract:
+    return parse_original_question_goal_contract(
+        {
+            "question": "查销量最高商品，再查这些商品的退款明细",
+            "goals": [
+                {
+                    "goalId": "metric.top_products",
+                    "kind": "metric",
+                    "label": "销量最高商品",
+                    "required": False,
+                },
+                {
+                    "goalId": "chain.product_refunds",
+                    "kind": "dependency",
+                    "label": "商品集合传给退款查询",
+                    "required": False,
+                    "upstreamGoalIds": ["metric.top_products"],
+                    "downstreamGoalIds": ["entity.refund_rows"],
+                },
+                {
+                    "goalId": "entity.refund_rows",
+                    "kind": "entity",
+                    "label": "对应退款明细",
+                },
+            ],
+        }
+    )
+
+
+def test_dependency_proof_without_artifact_lineage_is_rejected() -> None:
+    contract = dependency_contract()
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-flat-result",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=[goal.goal_id for goal in contract.goals],
+                verification_passed=True,
+                goal_resolutions=[
+                    {
+                        "goalId": "chain.product_refunds",
+                        "goalKind": "dependency",
+                        "resolution": "proved",
+                    }
+                ],
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is False
+    assert {issue.code for issue in result.issues} >= {
+        "DEPENDENCY_PROOF_UPSTREAM_ARTIFACT_MISSING",
+        "DEPENDENCY_PROOF_DOWNSTREAM_ARTIFACT_MISSING",
+        "DEPENDENCY_PROOF_LINEAGE_MISSING",
+    }
+
+
+def test_dependency_proof_with_verified_lineage_is_accepted() -> None:
+    contract = dependency_contract()
+    fingerprint = original_question_goal_contract_fingerprint(contract)
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-top-products",
+                goal_contract_fingerprint=fingerprint,
+                covered_goal_ids=["metric.top_products"],
+                verification_passed=True,
+            ),
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-refund-details",
+                goal_contract_fingerprint=fingerprint,
+                covered_goal_ids=[
+                    "chain.product_refunds",
+                    "entity.refund_rows",
+                ],
+                verification_passed=True,
+                goal_resolutions=[
+                    {
+                        "goalId": "chain.product_refunds",
+                        "goalKind": "dependency",
+                        "resolution": "proved",
+                        "upstreamArtifactIds": ["artifact-top-products"],
+                        "downstreamArtifactIds": ["artifact-refund-details"],
+                        "lineageRefs": ["entity-set:verified:top-products"],
+                    }
+                ],
+            ),
+        ],
+    )
+
+    assert result.finalization_allowed is True
+    assert result.passed is True
+    assert result.covered_goal_ids == [
+        "metric.top_products",
+        "chain.product_refunds",
+        "entity.refund_rows",
+    ]
+
+
+def test_rule_detail_ranking_and_analysis_goal_kinds_are_strictly_normalized() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "Return rule guidance, rows, top 3, and analysis",
+            "metrics": [{"goalId": "metric.alpha", "label": "alpha"}],
+            "rules": [{"goalId": "rule.guidance", "label": "guidance"}],
+            "details": [
+                {
+                    "goalId": "detail.rows",
+                    "label": "rows",
+                    "inputGoalIds": ["metric.alpha"],
+                }
+            ],
+            "rankings": [
+                {
+                    "goalId": "ranking.top3",
+                    "label": "top 3",
+                    "metricGoalIds": ["metric.alpha"],
+                    "limit": 3,
+                }
+            ],
+            "analyses": [
+                {
+                    "goalId": "analysis.alpha",
+                    "label": "analysis",
+                    "analysisType": "diagnostic",
+                    "inputGoalIds": ["metric.alpha"],
+                }
+            ],
+        }
+    )
+
+    assert isinstance(contract.goal_map()["rule.guidance"], RuleQuestionGoal)
+    assert isinstance(contract.goal_map()["detail.rows"], DetailQuestionGoal)
+    assert isinstance(contract.goal_map()["ranking.top3"], RankingQuestionGoal)
+    assert isinstance(contract.goal_map()["analysis.alpha"], AnalysisQuestionGoal)
+
+    with pytest.raises(GoalContractValidationError):
+        parse_original_question_goal_contract(
+            {
+                "question": "bad strict rule",
+                "rules": [
+                    {
+                        "goalId": "rule.bad",
+                        "label": "bad",
+                        "inventedField": "must be rejected",
+                    }
+                ],
+            }
+        )
